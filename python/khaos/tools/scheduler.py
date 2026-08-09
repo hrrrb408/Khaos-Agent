@@ -7,15 +7,18 @@ import hashlib
 import inspect
 import json
 import logging
+import shlex
 import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from khaos.agent.approval import ApprovalBinding, StepExecutionAuthority
+from khaos.coding.execution.capability import SandboxDecision
 from khaos.coding.execution.environment import is_non_inheritable_secret_key
+from khaos.coding.execution.identity import executable_identity
 from khaos.exceptions import PermissionDeniedError
 from khaos.permissions import (
     ApprovalMode,
@@ -31,7 +34,10 @@ from khaos.permissions.resource import (
 from khaos.permissions.rules import typed_rule_from_authorization_resource
 from khaos.security.middleware import SecurityMiddleware
 from khaos.tools.registry import ToolInvocationBroker, ToolRegistry
-from khaos.tools.terminal_tools import BackgroundProcessAuthority
+from khaos.tools.terminal_tools import (
+    BackgroundProcessAuthority,
+    evaluate_command_safety,
+)
 
 ConfirmCallback = Callable[[dict], Awaitable[dict | bool] | dict | bool]
 
@@ -824,6 +830,25 @@ class ToolScheduler:
                     f"head={binding['head']} diff={binding['diff_hash']}"
                 )
 
+            try:
+                await self._prepare_sandbox_authority_inputs(
+                    tool=tool,
+                    call=normalized,
+                    tool_context=tool_context,
+                )
+            except (PermissionError, ValueError) as exc:
+                yield SchedulerEvent(
+                    event="tool_result",
+                    result=ToolResult(
+                        tool_call_id=normalized["id"],
+                        name=tool.name,
+                        success=False,
+                        error=f"Sandbox authority rejected: {exc}",
+                        arguments=normalized["arguments"],
+                    ),
+                )
+                continue
+
             # Freeze the authority after all pre-approval target/resource
             # resolution has completed.  The same immutable object is carried
             # through the approval request and into the invocation broker.
@@ -1352,6 +1377,12 @@ class ToolScheduler:
                 invocation_context["step_authority_required"] = bool(
                     call.get("_step_authority_required")
                 )
+            if call.get("_sandbox_decision") is not None:
+                invocation_context["sandbox_decision"] = call["_sandbox_decision"]
+            if call.get("_executable_identity"):
+                invocation_context["executable_identity"] = call[
+                    "_executable_identity"
+                ]
             invocation_context["effect_id"] = effect_id
             output = await asyncio.wait_for(
                 self.invocation_broker.invoke(tool.name, mode=mode, context=invocation_context, **call.get("arguments", {})),
@@ -1982,7 +2013,10 @@ class ToolScheduler:
         db = getattr(self.permission_engine, "db", None)
         claim_method = getattr(db, "claim_tool_operation", None)
         if callable(claim_method):
-            row = await claim_method(
+            claim_operation = cast(
+                Callable[..., Awaitable[dict[str, Any]]], claim_method
+            )
+            row = await claim_operation(
                 operation_id=operation_id,
                 tool_name=tool.name,
                 arguments_digest=arguments_digest,
@@ -2041,11 +2075,16 @@ class ToolScheduler:
                     or "inspect the external side effect using effect_id"
                 ),
             )
-            await db.mark_tool_operation_unknown(
-                operation_id=operation_id,
-                reconciliation_hint=orphan.reconciliation_hint,
-                result_json=self._serialize_operation_result(orphan),
-            )
+            mark_unknown = getattr(db, "mark_tool_operation_unknown", None)
+            if callable(mark_unknown):
+                mark_operation_unknown = cast(
+                    Callable[..., Awaitable[object]], mark_unknown
+                )
+                await mark_operation_unknown(
+                    operation_id=operation_id,
+                    reconciliation_hint=orphan.reconciliation_hint,
+                    result_json=self._serialize_operation_result(orphan),
+                )
             return _OperationClaim(
                 operation_id=operation_id,
                 owner_token="",
@@ -2136,7 +2175,10 @@ class ToolScheduler:
         db = getattr(self.permission_engine, "db", None)
         claim_method = getattr(db, "claim_tool_operation", None)
         if callable(claim_method):
-            row = await claim_method(
+            claim_operation = cast(
+                Callable[..., Awaitable[dict[str, Any]]], claim_method
+            )
+            row = await claim_operation(
                 operation_id=operation_id,
                 tool_name=tool.name,
                 arguments_digest=_canonical_digest(call.get("arguments", {})),
@@ -2188,7 +2230,10 @@ class ToolScheduler:
         if callable(complete_method) and claim.owner_token:
             try:
                 result_json = self._serialize_operation_result(result)
-                updated = await complete_method(
+                complete_operation = cast(
+                    Callable[..., Awaitable[object]], complete_method
+                )
+                updated = await complete_operation(
                     operation_id=claim.operation_id,
                     owner_token=claim.owner_token,
                     status=terminal_status,
@@ -2278,7 +2323,8 @@ class ToolScheduler:
         db = getattr(self.permission_engine, "db", None)
         update_method = getattr(db, "update_tool_operation_effect_id", None)
         if callable(update_method):
-            updated = await update_method(
+            update_effect_id = cast(Callable[..., Awaitable[object]], update_method)
+            updated = await update_effect_id(
                 operation_id=claim.operation_id,
                 owner_token=claim.owner_token,
                 effect_id=effect_id,
@@ -2368,14 +2414,56 @@ class ToolScheduler:
             normalized_environment_keys = ("LANG", "LC_ALL", "PATH", "TMPDIR")
 
         execution_service = tool_context.get("execution_service")
-        backend = tool_context.get("sandbox_backend")
+        backend = call.get("_sandbox_backend") or tool_context.get("sandbox_backend")
         if backend is None:
             backend = tool_context.get("execution_backend")
         if backend is None and execution_service is not None:
             backend = getattr(execution_service, "backend", None)
             if backend is None:
                 backend = getattr(execution_service, "backend_selector", None)
-        sandbox_backend = _authority_identity(backend or "backend:unspecified")
+        sandbox_decision = call.get("_sandbox_decision")
+        if sandbox_decision is None:
+            sandbox_decision = tool_context.get("sandbox_decision")
+        if sandbox_decision is not None and not isinstance(
+            sandbox_decision, SandboxDecision
+        ):
+            raise PermissionDeniedError("sandbox decision is not immutable")
+        if isinstance(sandbox_decision, SandboxDecision):
+            sandbox_backend = sandbox_decision.backend_name
+            sandbox_decision_digest = sandbox_decision.digest()
+        else:
+            sandbox_backend = _authority_identity(backend or "backend:unspecified")
+            sandbox_decision_digest = _authority_identity(
+                tool_context.get("sandbox_decision_digest")
+                or "decision:unspecified"
+            )
+
+        environment_values = tool_context.get("environment")
+        if isinstance(environment_values, dict):
+            environment_payload = {
+                str(key): str(environment_values[key])
+                for key in normalized_environment_keys
+                if key in environment_values
+                and not is_non_inheritable_secret_key(str(key))
+            }
+        else:
+            # Do not fingerprint a value that was not supplied by the trusted
+            # runtime context.  The key set remains bound separately.
+            environment_payload = {
+                "keys": normalized_environment_keys,
+                "values": "not-supplied",
+            }
+        environment_digest = _canonical_digest(environment_payload)
+        executable_scope = call.get("_executable_identity") or tool_context.get(
+            "executable_identity"
+        )
+        if not executable_scope:
+            argv = _execution_argv_for_authority(tool.name, call.get("arguments", {}))
+            executable_scope = (
+                executable_identity(argv)
+                if argv
+                else "executable:not-applicable"
+            )
 
         network_guard = tool_context.get("network_guard")
         network_authority = tool_context.get("network_authority")
@@ -2420,7 +2508,10 @@ class ToolScheduler:
             cwd_identity=cwd_identity,
             permission_profile_digest=permission_profile_digest,
             environment_keys=normalized_environment_keys,
+            environment_digest=environment_digest,
             sandbox_backend=sandbox_backend,
+            sandbox_decision_digest=sandbox_decision_digest,
+            executable_identity=str(executable_scope),
             network_authority=network_authority,
             target=target,
             approval_target=str(approval_target),
@@ -2434,6 +2525,63 @@ class ToolScheduler:
             tool_security_digest=tool.security_digest,
             approval_receipt_digest=str(approval_receipt_digest or ""),
         )
+
+    async def _prepare_sandbox_authority_inputs(
+        self,
+        *,
+        tool,
+        call: dict[str, Any],
+        tool_context: dict[str, Any],
+    ) -> None:
+        """Bind concrete sandbox evidence before the approval snapshot."""
+        process_tools = {"terminal", "terminal_argv", "terminal_shell", "test_run"}
+        argv = _execution_argv_for_authority(tool.name, call.get("arguments", {}))
+        if argv:
+            call["_executable_identity"] = executable_identity(
+                argv, tool_context.get("environment")
+            )
+        if tool.name not in process_tools:
+            return
+        service = tool_context.get("execution_service")
+        selector = getattr(service, "backend_selector", None)
+        selector_method = getattr(selector, "select_async_with_decision", None)
+        if selector is None:
+            # Explicit test/development adapters may intentionally inject a
+            # fixed backend (for example HostExecutionBackend in the
+            # deterministic approval E2E).  Production construction always
+            # supplies BackendSelector, so keep the fail-closed check on the
+            # selector boundary instead of turning the test adapter into a
+            # production sandbox claim.
+            if tool_context.get("production_runtime"):
+                raise PermissionError(
+                    "production process execution requires an evidence-bound sandbox selector"
+                )
+            return
+        if not callable(selector_method):
+            if (
+                tool_context.get("production_runtime")
+                or tool_context.get("coding_workspace_enforced")
+            ):
+                raise PermissionError(
+                    "production process execution requires an evidence-bound sandbox decision"
+                )
+            return
+        decision = call.get("_sandbox_decision") or tool_context.get(
+            "sandbox_decision"
+        )
+        if decision is not None:
+            if not isinstance(decision, SandboxDecision):
+                raise PermissionError("sandbox decision is not immutable")
+            call["_sandbox_decision"] = decision
+            call["_sandbox_backend"] = decision.backend_name
+            return
+        writable = _sandbox_writable_for_authority(tool.name, call.get("arguments", {}))
+        backend, decision = await selector.select_async_with_decision(
+            writable=writable,
+            network_mode=str(tool_context.get("network_policy") or "none"),
+        )
+        call["_sandbox_decision"] = decision
+        call["_sandbox_backend"] = backend
 
     def _verify_step_authority(
         self,
@@ -2731,6 +2879,50 @@ def _canonical_digest(value: object) -> str:
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _execution_argv_for_authority(
+    tool_name: str, arguments: dict[str, Any]
+) -> tuple[str, ...]:
+    """Extract the fixed executable argv used by process-backed tools."""
+    try:
+        if tool_name == "terminal_argv":
+            value = arguments.get("argv")
+            if isinstance(value, list) and all(
+                isinstance(item, str) and item for item in value
+            ):
+                return tuple(value)
+        if tool_name == "terminal_shell":
+            shell = str(arguments.get("shell") or "")
+            script = str(arguments.get("script") or "")
+            return (shell, "-c", script) if shell and script else ()
+        if tool_name == "test_run":
+            command = str(arguments.get("command") or "")
+            return tuple(shlex.split(command)) if command else ()
+        if tool_name == "terminal":
+            command = str(arguments.get("command") or "")
+            return tuple(shlex.split(command)) if command else ()
+    except ValueError:
+        return ()
+    return ()
+
+
+def _sandbox_writable_for_authority(
+    tool_name: str, arguments: dict[str, Any]
+) -> bool:
+    """Mirror the handler's read-only classification for authority binding."""
+    if tool_name == "test_run":
+        return True
+    argv = _execution_argv_for_authority(tool_name, arguments)
+    if not argv:
+        return True
+    command = shlex.join(argv)
+    safety = evaluate_command_safety(
+        str(arguments.get("script"))
+        if tool_name == "terminal_shell"
+        else command
+    )
+    return not bool(safety.get("read_only"))
 
 
 def _authority_identity(value: object) -> str:

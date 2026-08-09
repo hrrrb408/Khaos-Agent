@@ -4,6 +4,7 @@ from khaos.runtime.factory import (
     RuntimeConfig,
     ProductionRuntimeConfig,
     RuntimeResult,
+    build_production_runtime,
     build_runtime,
     close_runtime_or_register,
 )
@@ -14,6 +15,7 @@ __all__ = [
     "RuntimeConfig",
     "ProductionRuntimeConfig",
     "RuntimeResult",
+    "build_production_runtime",
     "build_runtime",
     "close_runtime_or_register",
 ]

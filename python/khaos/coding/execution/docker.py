@@ -10,6 +10,7 @@ import secrets
 import tempfile
 import uuid
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 
 from khaos.coding.execution.models import (
@@ -132,6 +133,34 @@ class _ContainerLease:
     cleanup_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
+class DockerBackendState(str, Enum):
+    """Lifecycle states for the Docker resource owner."""
+
+    OPEN = "OPEN"
+    CLOSING = "CLOSING"
+    QUARANTINED = "QUARANTINED"
+    CLOSED = "CLOSED"
+
+
+class DockerBackendClosedError(RuntimeError):
+    """Raised when a Docker execution is admitted after closure begins."""
+
+
+@dataclass
+class _InflightLease:
+    """Owner-held finalizer lease independent from the caller task.
+
+    The finalizer task is created while the execution is admitted.  It waits
+    on ``completion_event`` and removes the registry entry itself, so a
+    caller cancellation (including repeated cancellation) cannot cancel the
+    only task that knows how to release the in-flight marker.
+    """
+
+    execution_id: str
+    completion_event: asyncio.Event
+    finalizer_task: asyncio.Task[None]
+
+
 class DockerBackend:
     """Run fixed-argv commands in hardened, ephemeral Docker containers."""
 
@@ -143,6 +172,7 @@ class DockerBackend:
         allowed_images: set[str] | None = None,
         docker_binary: str = "docker",
         supervisor: ProcessSupervisor | None = None,
+        shutdown_timeout_seconds: float = 15.0,
     ) -> None:
         self.allowed_images = frozenset(
             allowed_images or {DEFAULT_DOCKER_IMAGE}
@@ -156,14 +186,21 @@ class DockerBackend:
             )
         self.docker_binary = docker_binary
         self.supervisor = supervisor or ProcessSupervisor()
+        if shutdown_timeout_seconds <= 0:
+            raise ValueError("Docker shutdown timeout must be positive")
+        self.shutdown_timeout_seconds = float(shutdown_timeout_seconds)
         self._active: dict[str, _ContainerLease] = {}
         self._lock = asyncio.Lock()
+        self._state = DockerBackendState.OPEN
+        self._shutdown_task: asyncio.Task[None] | None = None
         # A container lease can disappear before the execute coroutine has
-        # returned from its final cleanup block. Keep that coroutine as an
-        # explicit owner so service shutdown cannot close the shared
-        # supervisor underneath its last cleanup await.
+        # returned from its final cleanup block. Keep an owner-created
+        # finalizer task so service shutdown cannot close the shared
+        # supervisor underneath its last cleanup await.  The task is
+        # registered before the caller can reach its first await.
         self._inflight: set[str] = set()
         self._inflight_events: dict[str, asyncio.Event] = {}
+        self._inflight_leases: dict[str, _InflightLease] = {}
         self._inflight_idle = asyncio.Event()
         self._inflight_idle.set()
         self._shutdown_started = False
@@ -173,14 +210,38 @@ class DockerBackend:
     @property
     def terminal_closed(self) -> bool:
         """True only after every container lease has been externally released."""
-        return self._shutdown_complete and not self._active and not self._inflight
+        return (
+            self._state is DockerBackendState.CLOSED
+            and self._shutdown_complete
+            and not self._active
+            and not self._inflight
+            and not self._inflight_leases
+        )
+
+    @property
+    def state(self) -> str:
+        """Return the public lifecycle state used by ResourceOwner."""
+        return self._state.value
+
+    @property
+    def admission_closed(self) -> bool:
+        """True once shutdown or quarantine has closed new execution admission."""
+        return self._state is not DockerBackendState.OPEN
+
+    @property
+    def generation_admission_closed(self) -> bool:
+        """Docker has one backend generation, closed at first shutdown request."""
+        return self.admission_closed
+
+    @property
+    def child_admission_closed(self) -> bool:
+        """Docker cannot accept child resources after its backend fence closes."""
+        return self.admission_closed
 
     @property
     def is_quarantined(self) -> bool:
         """True when a container lease remains after a failed cleanup."""
-        return self._shutdown_started and not self._shutdown_complete and bool(
-            self._shutdown_error
-        )
+        return self._state is DockerBackendState.QUARANTINED
 
     def owned_resources(self) -> tuple[str, ...]:
         """Return the container leases retained by this backend."""
@@ -189,7 +250,9 @@ class DockerBackend:
             for execution_id, lease in sorted(self._active.items())
         ) + tuple(
             f"execution-finalizer:{execution_id}"
-            for execution_id in sorted(self._inflight)
+            for execution_id in sorted(
+                self._inflight | set(self._inflight_leases)
+            )
         )
 
     def owns_execution(self, execution_id: str) -> bool:
@@ -199,7 +262,11 @@ class DockerBackend:
         per-execution oracle is distinct from the backend-wide
         ``terminal_closed`` proof used during runtime shutdown.
         """
-        return execution_id in self._active or execution_id in self._inflight
+        return (
+            execution_id in self._active
+            or execution_id in self._inflight
+            or execution_id in self._inflight_leases
+        )
 
     def terminal_postcondition(self) -> bool:
         """Return the independent terminal proof for Docker ownership."""
@@ -274,8 +341,22 @@ class DockerBackend:
             *context.argv,
         ])
 
-        async with self._lock:
-            self._active[execution_id] = lease
+        try:
+            async with self._lock:
+                self._require_open_locked()
+                if execution_id in self._active:
+                    raise RuntimeError(
+                        f"Docker execution is already active: {execution_id}"
+                    )
+                self._active[execution_id] = lease
+        except BaseException:
+            # Admission can close after the env file is created but before
+            # the container lease is published.  The normal execution
+            # finally block does not own that gap, so unlink the secret-safe
+            # temporary file here before rejecting the request.
+            if env_file is not None:
+                env_file.unlink(missing_ok=True)
+            raise
         diagnostics: dict[str, object] = {
             "container_id": container_name,
             "cleanup": "pending",
@@ -288,6 +369,8 @@ class DockerBackend:
                 correlation_id=execution_id,
                 workspace_root_identity=context.workspace_root_identity,
                 workspace_cwd_identity=context.workspace_cwd_identity,
+                executable_identity=context.executable_identity,
+                sandbox_decision=context.sandbox_decision,
             )
             result = await self.supervisor.run(
                 docker_request,
@@ -361,77 +444,191 @@ class DockerBackend:
         # supervisor is shared with ExecutionService which owns its
         # lifecycle.  ExecutionService._run_shutdown() closes the
         # supervisor after docker_backend.shutdown() returns.
-        if self._shutdown_complete and not self._active and not self._inflight:
-            return
-        self._shutdown_started = True
-        self._shutdown_error = None
-        errors: list[BaseException] = []
         async with self._lock:
-            active = tuple(self._active.items())
-        for execution_id, lease in active:
-            try:
-                # Stop the host-side Docker CLI as well as the container. The
-                # caller normally does this through ExecutionService first;
-                # this direct backend path must be safe on its own too.
-                await self.supervisor.terminate(execution_id)
-                if not await self._cleanup_container(lease):
-                    raise RuntimeError(
-                        f"Docker container cleanup remained unproven: {lease.name}"
-                    )
-            except asyncio.CancelledError:
-                raise
-            except BaseException as exc:  # noqa: BLE001 — retain lease for retry
-                errors.append(exc)
-                continue
-            async with self._lock:
-                if self._active.get(execution_id) is lease:
-                    self._active.pop(execution_id, None)
-        if errors or self._active:
-            self._shutdown_error = errors[0] if errors else RuntimeError(
-                "Docker shutdown left owned container leases"
-            )
-            self._shutdown_complete = False
-            raise RuntimeError(
-                f"Docker shutdown completed with {len(errors) or 1} error(s)"
-            ) from self._shutdown_error
+            if self.terminal_closed:
+                return
+            if self._shutdown_task is None or self._shutdown_task.done():
+                # Close admission atomically with publishing the shared
+                # shutdown task.  A second caller must join this exact task,
+                # not start a competing cleanup pass.
+                self._state = DockerBackendState.CLOSING
+                self._shutdown_started = True
+                self._shutdown_complete = False
+                self._shutdown_error = None
+                self._shutdown_task = asyncio.create_task(
+                    self._shutdown_impl(),
+                    name="khaos-docker-backend-shutdown",
+                )
+            shutdown_task = self._shutdown_task
+        await asyncio.shield(shutdown_task)
+
+    async def close(self) -> None:
+        """ResourceOwner alias for :meth:`shutdown`."""
+        await self.shutdown()
+
+    async def _shutdown_impl(self) -> None:
+        errors: list[BaseException] = []
         try:
-            await asyncio.shield(self._inflight_idle.wait())
+            async with self._lock:
+                active = tuple(self._active.items())
+            for execution_id, lease in active:
+                try:
+                    # Stop the host-side Docker CLI as well as the container.
+                    # The caller normally does this through ExecutionService
+                    # first; this direct backend path must be safe on its own.
+                    await self.supervisor.terminate(execution_id)
+                    if not await self._cleanup_container(lease):
+                        raise RuntimeError(
+                            f"Docker container cleanup remained unproven: {lease.name}"
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except BaseException as exc:  # noqa: BLE001 — retain lease for retry
+                    errors.append(exc)
+                    continue
+                async with self._lock:
+                    if self._active.get(execution_id) is lease:
+                        self._active.pop(execution_id, None)
+
+            async with self._lock:
+                finalizers = tuple(
+                    lease.finalizer_task for lease in self._inflight_leases.values()
+                )
+            if finalizers:
+                done, pending = await asyncio.wait(
+                    finalizers,
+                    timeout=self.shutdown_timeout_seconds,
+                )
+                for task in done:
+                    if task.cancelled():
+                        errors.append(
+                            RuntimeError("Docker execution finalizer task was cancelled")
+                        )
+                    else:
+                        exception = task.exception()
+                        if exception is not None:
+                            errors.append(exception)
+                if pending:
+                    errors.append(
+                        TimeoutError(
+                            "Docker shutdown timed out waiting for execution finalizers"
+                        )
+                    )
+            async with self._lock:
+                stale_ownership = bool(
+                    self._active or self._inflight or self._inflight_leases
+                )
+            if stale_ownership:
+                errors.append(
+                    RuntimeError(
+                        "Docker shutdown left owned container or finalizer leases"
+                    )
+                )
+            if errors:
+                primary = errors[0]
+                async with self._lock:
+                    self._state = DockerBackendState.QUARANTINED
+                    self._shutdown_error = primary
+                    self._shutdown_complete = False
+                raise RuntimeError(
+                    f"Docker shutdown completed with {len(errors)} error(s)"
+                ) from primary
+            async with self._lock:
+                if self._active or self._inflight or self._inflight_leases:
+                    primary = RuntimeError(
+                        "Docker shutdown could not prove empty ownership registries"
+                    )
+                    self._state = DockerBackendState.QUARANTINED
+                    self._shutdown_error = primary
+                    self._shutdown_complete = False
+                    raise primary
+                self._state = DockerBackendState.CLOSED
+                self._shutdown_complete = True
+                self._shutdown_error = None
         except asyncio.CancelledError:
-            self._shutdown_error = asyncio.CancelledError()
-            self._shutdown_complete = False
+            async with self._lock:
+                self._state = DockerBackendState.QUARANTINED
+                self._shutdown_error = asyncio.CancelledError()
+                self._shutdown_complete = False
             raise
-        if self._inflight:
-            self._shutdown_error = RuntimeError(
-                "Docker shutdown left in-flight execution finalizers"
-            )
-            self._shutdown_complete = False
-            raise self._shutdown_error
-        self._shutdown_complete = True
 
     async def _begin_inflight(self, execution_id: str) -> None:
         async with self._lock:
+            self._require_open_locked()
+            if execution_id in self._inflight_leases:
+                raise RuntimeError(f"Docker execution is already in flight: {execution_id}")
+            event = asyncio.Event()
+            finalizer_task = asyncio.create_task(
+                self._finalize_inflight(execution_id, event),
+                name=f"khaos-docker-finalizer:{execution_id}",
+            )
+            lease = _InflightLease(execution_id, event, finalizer_task)
             self._inflight.add(execution_id)
-            event = self._inflight_events.get(execution_id)
-            if event is None:
-                event = asyncio.Event()
-                self._inflight_events[execution_id] = event
-            event.clear()
+            self._inflight_events[execution_id] = event
+            self._inflight_leases[execution_id] = lease
             self._inflight_idle.clear()
 
     async def _end_inflight(self, execution_id: str) -> None:
+        lease = self._mark_inflight_complete(execution_id)
+        if lease is not None:
+            await asyncio.shield(lease.finalizer_task)
+
+    def _mark_inflight_complete(self, execution_id: str) -> _InflightLease | None:
+        """Publish completion without an await or cancellation point."""
+        lease = self._inflight_leases.get(execution_id)
+        if lease is not None:
+            lease.completion_event.set()
+        return lease
+
+    async def _finalize_inflight(
+        self, execution_id: str, completion_event: asyncio.Event
+    ) -> None:
+        await completion_event.wait()
         async with self._lock:
+            lease = self._inflight_leases.get(execution_id)
+            if lease is None:
+                return
+            if lease.completion_event is not completion_event:
+                return
+            self._inflight_leases.pop(execution_id, None)
+            self._inflight_events.pop(execution_id, None)
             self._inflight.discard(execution_id)
-            event = self._inflight_events.pop(execution_id, None)
-            if event is not None:
-                event.set()
             if not self._inflight:
                 self._inflight_idle.set()
 
     async def _wait_for_execution_idle(self, execution_id: str) -> None:
         async with self._lock:
-            event = self._inflight_events.get(execution_id)
-        if event is not None:
-            await asyncio.shield(event.wait())
+            lease = self._inflight_leases.get(execution_id)
+        if lease is None:
+            return
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(lease.finalizer_task),
+                timeout=self.shutdown_timeout_seconds,
+            )
+        except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
+            await self._enter_quarantine(
+                TimeoutError(
+                    f"Docker execution finalizer did not settle: {execution_id}"
+                )
+                if isinstance(exc, asyncio.TimeoutError)
+                else exc
+            )
+            raise
+
+    async def _enter_quarantine(self, error: BaseException) -> None:
+        async with self._lock:
+            if self._state is not DockerBackendState.CLOSED:
+                self._state = DockerBackendState.QUARANTINED
+                self._shutdown_started = True
+                self._shutdown_complete = False
+                self._shutdown_error = error
+
+    def _require_open_locked(self) -> None:
+        if self._state is not DockerBackendState.OPEN:
+            raise DockerBackendClosedError(
+                f"Docker backend is not open: {self._state.value}"
+            )
 
     def _validate_context(self, context: ResolvedExecutionContext) -> None:
         profile = context.permission_profile

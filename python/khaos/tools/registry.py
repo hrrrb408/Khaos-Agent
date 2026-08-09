@@ -819,6 +819,10 @@ class ToolInvocationBroker:
             handler_params["principal_id"] = context.get("principal_id", "")
             handler_params["project_id"] = context.get("project_id", "")
             handler_params["runtime_id"] = context.get("runtime_id", "")
+            handler_params["sandbox_decision"] = context.get("sandbox_decision")
+            handler_params["executable_identity"] = context.get(
+                "executable_identity"
+            )
         if any(capability.name.startswith("vcs.") for capability in capabilities):
             handler_params["execution_service"] = context.get("execution_service")
             handler_params["task_id"] = context.get("task_id")

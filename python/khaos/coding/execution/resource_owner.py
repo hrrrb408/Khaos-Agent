@@ -1,8 +1,9 @@
 """Round-17 review §十四/§十七: unified lifecycle contract for security
 resource owners.
 
-The review identified that ExecutionService, ManagedProcessHandle, LSP,
-ProcessSupervisor, BrowserManager, and BrowserEgressProxy
+The review identified that ExecutionService, DockerBackend,
+ManagedProcessHandle, LSP, ProcessSupervisor, BrowserManager, and
+BrowserEgressProxy
 each had their own ad-hoc notion of "CLOSED" — with different state
 combinations, different cleanup semantics, and different (or missing)
 postcondition proofs.  This module defines a single :class:`ResourceOwner`
@@ -39,12 +40,14 @@ Concretely:
     server.close()    ❌
     wait_closed + no sockets + generation no longer admissible  ✅
 
-Owners that implement this protocol can be uniformly tested by the
-Resource Ownership Closure E2E suite (round-17 review §十五) against a
-single behavior matrix: cancel-before-acquisition, cancel-during-
-acquisition, cancel-after-publication, cleanup-exception, cleanup-
-CancelledError, concurrent-close, start-during-close, start-after-close,
-first-close-failure-retry, and CLOSED ⇒ no-live-owned-resource.
+Owners that implement this protocol share the same lifecycle theorem and
+external-oracle vocabulary.  The Resource Ownership Closure E2E suite
+(round-17 review §十五) keeps a common admission/terminal assertion set,
+then applies owner-specific fault injection where acquisition and cleanup
+mechanics differ.  DockerBackend has its own complete matrix, including
+double cancellation, bounded shutdown, retry, and an external container
+inspect oracle; a new owner must add explicit owner-specific fault tests
+before the suite can claim it is verified.
 """
 
 from __future__ import annotations
@@ -57,6 +60,7 @@ class ResourceOwner(Protocol):
     """Unified lifecycle contract for security resource owners.
 
     Implementations include :class:`~khaos.coding.execution.service.ExecutionService`,
+    :class:`~khaos.coding.execution.docker.DockerBackend`,
     :class:`~khaos.coding.execution.managed.ManagedProcessHandle`,
     :class:`~khaos.coding.execution.supervisor.ProcessSupervisor`,
     :class:`~khaos.coding.intelligence.lsp.client.LspClient`,

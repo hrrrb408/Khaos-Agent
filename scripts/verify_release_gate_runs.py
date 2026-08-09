@@ -55,10 +55,14 @@ def _select_successful_run(
         if run.get("head_sha") == commit
         and run.get("status") == "completed"
         and run.get("conclusion") == "success"
+        # A rerun can be green after an earlier attempt failed.  Release
+        # provenance must bind the original exact-commit gate attempt unless
+        # an explicit, separately reviewed exception is added to policy.
+        and int(run.get("run_attempt") or 0) == 1
     ]
     if not candidates:
         raise RuntimeError(
-            f"no successful completed {workflow} run exists for exact commit {commit}"
+            f"no successful completed attempt-1 {workflow} run exists for exact commit {commit}"
         )
     return max(candidates, key=_run_sort_key)
 
@@ -92,10 +96,30 @@ def _gate_record(repo: str, workflow: str, commit: str) -> dict[str, Any]:
         workflow=workflow,
     )
     run_id = int(run.get("database_id") or run["id"])
+    artifacts = _artifact_records(repo, run_id)
+    if workflow == REQUIRED_GATES["security_closure"]:
+        expected_name = f"security-evidence-{commit}"
+        matching = [
+            artifact for artifact in artifacts
+            if artifact.get("name") == expected_name
+        ]
+        if len(matching) != 1:
+            raise RuntimeError(
+                f"security gate run {run_id} is missing exact artifact {expected_name}"
+            )
+        artifact = matching[0]
+        if artifact.get("expired") is not False:
+            raise RuntimeError(
+                f"security evidence artifact {expected_name} is expired or unverifiable"
+            )
+        if not isinstance(artifact.get("digest"), str) or not artifact["digest"].strip():
+            raise RuntimeError(
+                f"security evidence artifact {expected_name} has no digest"
+            )
     record = {
         "workflow": workflow,
         "run_id": run_id,
-        "run_attempt": run.get("run_attempt"),
+        "run_attempt": int(run["run_attempt"]),
         "head_sha": run.get("head_sha"),
         "event": run.get("event"),
         "status": run.get("status"),
@@ -103,7 +127,7 @@ def _gate_record(repo: str, workflow: str, commit: str) -> dict[str, Any]:
         "url": run.get("html_url"),
         "created_at": run.get("created_at"),
         "updated_at": run.get("updated_at"),
-        "artifacts": _artifact_records(repo, run_id),
+        "artifacts": artifacts,
     }
     record["run_evidence_digest"] = _canonical_digest(record)
     return record

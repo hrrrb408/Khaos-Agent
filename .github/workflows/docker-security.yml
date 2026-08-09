@@ -37,10 +37,10 @@ jobs:
           echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
       - name: Preload allowlisted image
         run: docker pull python@sha256:eb43ff125d8d58d7449dcba7d336c23bcac412f526d861db493b9994d8010280
-      - name: Run real Docker isolation E2E
+      - name: Run real Docker and production sandbox E2E
         env:
           KHAOS_RUN_PRODUCTION_SANDBOX: "1"
-        run: python -m pytest python/tests/tools/test_sandbox_tools.py python/tests/coding/test_m4_batch3_1_trusted_verification.py -q -m docker_sandbox_real -v
+        run: python -m pytest python/tests/tools/test_sandbox_tools.py python/tests/coding/test_m4_batch3_1_trusted_verification.py -q -m "docker_sandbox_real or production_sandbox_real" -v
 
   compose-deployment:
     runs-on: ubuntu-latest

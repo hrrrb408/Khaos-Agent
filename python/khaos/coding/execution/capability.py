@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -40,6 +41,104 @@ class CapabilityEvidence:
             self.cgroup_root_device,
             self.cgroup_root_inode,
         )
+
+    def digest(self) -> str:
+        """Digest stable kernel/TCB evidence, excluding probe freshness."""
+        encoded = json.dumps(
+            self.identity, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+
+@dataclass(frozen=True)
+class SandboxDecision:
+    """Immutable backend decision carried from approval to execution.
+
+    ``backend_name`` is the concrete selected backend, not a selector class.
+    ``capability_evidence_digest`` binds the decision to the probed kernel and
+    TCB binaries; ``launcher_digest`` is retained as an explicit field for
+    audit consumers even when the evidence digest covers multiple TCB files.
+    """
+
+    backend_name: str
+    capability_evidence_digest: str
+    filesystem_mode: str
+    network_mode: str
+    kernel_enforced: bool
+    platform: str
+    launcher_digest: str
+
+    def __post_init__(self) -> None:
+        if any(
+            not isinstance(value, str) or not value
+            for value in (
+                self.backend_name,
+                self.capability_evidence_digest,
+                self.filesystem_mode,
+                self.network_mode,
+                self.platform,
+                self.launcher_digest,
+            )
+        ):
+            raise ValueError("sandbox decision identity fields must not be empty")
+        if self.filesystem_mode not in {"read-only", "workspace-write"}:
+            raise ValueError("sandbox decision filesystem mode is invalid")
+        if self.network_mode not in {
+            "none", "loopback-only", "unrestricted-with-approval"
+        }:
+            raise ValueError("sandbox decision network mode is invalid")
+        if type(self.kernel_enforced) is not bool:
+            raise ValueError("sandbox decision kernel enforcement must be boolean")
+        if not self.kernel_enforced:
+            raise ValueError("unenforced sandbox decisions cannot authorize execution")
+
+    @classmethod
+    def from_backend(
+        cls,
+        backend: object,
+        availability: BackendAvailability,
+        *,
+        writable: bool,
+        network_mode: str = "none",
+        platform: str | None = None,
+    ) -> "SandboxDecision":
+        """Build a decision only from a successful capability probe."""
+        evidence = availability.evidence
+        if (
+            not availability.available
+            or not availability.network_enforced
+            or evidence is None
+        ):
+            raise PermissionError(
+                f"sandbox backend cannot provide kernel-enforced evidence: {availability.reason}"
+            )
+        return cls(
+            backend_name=str(getattr(backend, "name", type(backend).__name__)),
+            capability_evidence_digest=evidence.digest(),
+            filesystem_mode="workspace-write" if writable else "read-only",
+            network_mode=network_mode,
+            kernel_enforced=True,
+            platform=platform or sys.platform,
+            launcher_digest=evidence.binary_digest,
+        )
+
+    def _payload(self) -> dict[str, object]:
+        return {
+            "backend_name": self.backend_name,
+            "capability_evidence_digest": self.capability_evidence_digest,
+            "filesystem_mode": self.filesystem_mode,
+            "network_mode": self.network_mode,
+            "kernel_enforced": self.kernel_enforced,
+            "platform": self.platform,
+            "launcher_digest": self.launcher_digest,
+        }
+
+    def digest(self) -> str:
+        """Return the authority digest for this exact decision."""
+        encoded = json.dumps(
+            self._payload(), sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -129,4 +228,3 @@ def _namespace_inode(path: str) -> int | None:
         return Path(path).stat().st_ino
     except OSError:
         return None
-

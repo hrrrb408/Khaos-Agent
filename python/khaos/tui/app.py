@@ -211,8 +211,8 @@ class KhaosApp(App):
     async def _bootstrap_agent_runtime(self) -> None:
         if self.db is None or self.mode_manager is None:
             return
-        from khaos.runtime import ProductionRuntimeConfig, build_runtime
-        runtime = await build_runtime(ProductionRuntimeConfig(
+        from khaos.runtime import ProductionRuntimeConfig, build_production_runtime
+        runtime = await build_production_runtime(ProductionRuntimeConfig(
             db=self.db, project_root=self.project_root, mode_manager=self.mode_manager,
             confirm_callback=self._confirm_callback,
             coding_context_builder=self._build_coding_context_builder(),

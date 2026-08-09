@@ -105,6 +105,8 @@ async def terminal(
     execution_service=None,
     task_id: str | None = None,
     workspace_id: str | None = None,
+    sandbox_decision=None,
+    executable_identity: str | None = None,
 ) -> dict[str, Any]:
     """Compatibility wrapper for explicit shell execution.
 
@@ -120,6 +122,8 @@ async def terminal(
         execution_service=execution_service,
         task_id=task_id,
         workspace_id=workspace_id,
+        sandbox_decision=sandbox_decision,
+        executable_identity=executable_identity,
     )
 
 
@@ -138,6 +142,8 @@ async def terminal_argv(
     project_id: str = "",
     runtime_id: str = "",
     _safety_command: str | None = None,
+    sandbox_decision=None,
+    executable_identity: str | None = None,
 ) -> dict[str, Any]:
     """Execute an argv vector without shell parsing or expansion."""
     if not argv or not all(isinstance(item, str) and item for item in argv):
@@ -173,6 +179,8 @@ async def terminal_argv(
         task_id=task_id,
         workspace_id=workspace_id,
         access_mode="read-only" if safety["read_only"] else "workspace-write",
+        sandbox_decision=sandbox_decision,
+        executable_identity=executable_identity or "",
     )
     if background:
         if process_authority is None:
@@ -204,6 +212,8 @@ async def terminal_shell(
     principal_id: str = "",
     project_id: str = "",
     runtime_id: str = "",
+    sandbox_decision=None,
+    executable_identity: str | None = None,
 ) -> dict[str, Any]:
     """Execute a script only through an explicitly selected absolute shell."""
     shell_path = Path(shell)
@@ -225,6 +235,8 @@ async def terminal_shell(
         project_id=project_id,
         runtime_id=runtime_id,
         _safety_command=script,
+        sandbox_decision=sandbox_decision,
+        executable_identity=executable_identity,
     )
 
 

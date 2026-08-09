@@ -16,6 +16,7 @@ from khaos.coding.execution.platform import (
     _cached_availability,
     _development_mode,
 )
+from khaos.coding.execution.capability import SandboxDecision
 
 
 def _evidence() -> CapabilityEvidence:
@@ -78,6 +79,34 @@ def test_cache_is_runtime_instance_owned() -> None:
         _evidence(),
     )
     assert second._capability_cache is None
+
+
+def test_sandbox_decision_binds_concrete_backend_and_evidence() -> None:
+    backend = type("ConcreteBackend", (), {"name": "linux-bwrap"})()
+    availability = BackendAvailability(
+        "linux-bwrap", True, True, evidence=_evidence()
+    )
+    decision = SandboxDecision.from_backend(
+        backend,
+        availability,
+        writable=True,
+        network_mode="none",
+        platform="linux",
+    )
+    changed = replace(decision, launcher_digest="b" * 64)
+    assert decision.backend_name == "linux-bwrap"
+    assert decision.filesystem_mode == "workspace-write"
+    assert decision.kernel_enforced is True
+    assert decision.digest() != changed.digest()
+
+
+def test_sandbox_decision_rejects_unenforced_probe() -> None:
+    backend = type("ConcreteBackend", (), {"name": "unsupported"})()
+    availability = BackendAvailability(
+        "unsupported", False, False, "missing", evidence=_evidence()
+    )
+    with pytest.raises(PermissionError, match="kernel-enforced"):
+        SandboxDecision.from_backend(backend, availability, writable=False)
 
 
 def test_macos_profile_does_not_grant_global_metadata_visibility(tmp_path: Path) -> None:

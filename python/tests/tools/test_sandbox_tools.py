@@ -11,6 +11,7 @@ import pytest
 from khaos.coding.execution.docker import (
     DEFAULT_DOCKER_IMAGE,
     DockerBackend,
+    DockerBackendClosedError,
     _ContainerLease,
 )
 from khaos.coding.execution.host import HostExecutionBackend
@@ -241,8 +242,11 @@ class _FakeProcess:
 
 
 class _InspectableDockerBackend(DockerBackend):
-    def __init__(self):
-        super().__init__(allowed_images={DEFAULT_DOCKER_IMAGE})
+    def __init__(self, *, shutdown_timeout_seconds=15.0):
+        super().__init__(
+            allowed_images={DEFAULT_DOCKER_IMAGE},
+            shutdown_timeout_seconds=shutdown_timeout_seconds,
+        )
         self.cli_calls = []
         self.removed = set()
         self.foreign_owner = False
@@ -451,6 +455,81 @@ async def test_docker_backend_timeout_cleanup_output_truncation_and_shutdown(tmp
     assert any(call[-1:] == ("khaos-active",) for call in backend.cli_calls)
 
 
+async def test_docker_backend_closes_admission_before_shutdown_cleanup():
+    backend = _InspectableDockerBackend()
+    await backend.shutdown()
+
+    assert backend.state == "CLOSED"
+    assert backend.admission_closed
+    assert backend.terminal_closed
+    with pytest.raises(DockerBackendClosedError, match="CLOSED"):
+        await backend._begin_inflight("after-close")
+
+
+async def test_docker_backend_concurrent_shutdown_joins_shared_task():
+    backend = _InspectableDockerBackend()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    original_shutdown_impl = backend._shutdown_impl
+
+    async def delayed_shutdown_impl():
+        started.set()
+        await release.wait()
+        await original_shutdown_impl()
+
+    backend._shutdown_impl = delayed_shutdown_impl
+    first = asyncio.create_task(backend.shutdown())
+    await started.wait()
+    shared_task = backend._shutdown_task
+    second = asyncio.create_task(backend.shutdown())
+    await asyncio.sleep(0)
+
+    assert backend.state == "CLOSING"
+    assert backend._shutdown_task is shared_task
+    release.set()
+    await asyncio.gather(first, second)
+    assert backend.terminal_closed
+
+
+async def test_docker_backend_shutdown_timeout_quarantines_and_retry_closes():
+    backend = _InspectableDockerBackend(shutdown_timeout_seconds=0.01)
+    await backend._begin_inflight("slow-finalizer")
+
+    with pytest.raises(RuntimeError, match="shutdown completed"):
+        await backend.shutdown()
+
+    assert backend.is_quarantined
+    assert not backend.terminal_closed
+    assert backend.owned_resources() == ("execution-finalizer:slow-finalizer",)
+
+    backend._mark_inflight_complete("slow-finalizer")
+    await backend.shutdown()
+    assert backend.state == "CLOSED"
+    assert backend.terminal_closed
+    assert backend.owned_resources() == ()
+
+
+async def test_docker_backend_finalizer_survives_double_cancellation():
+    backend = _InspectableDockerBackend()
+    await backend._begin_inflight("double-cancel")
+    lease = backend._inflight_leases["double-cancel"]
+    await backend._lock.acquire()
+    waiter = asyncio.create_task(backend._end_inflight("double-cancel"))
+    try:
+        await asyncio.sleep(0)
+        waiter.cancel()
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+    finally:
+        backend._lock.release()
+
+    await asyncio.wait_for(lease.finalizer_task, timeout=1)
+    assert backend._inflight == set()
+    assert backend._inflight_leases == {}
+    await backend.shutdown()
+
+
 async def test_docker_backend_truncates_output_without_unbounded_artifact(tmp_path):
     backend = _InspectableDockerBackend()
     process = _FakeProcess(stdout=b"0123456789", stderr=b"abcdefghij")
@@ -650,9 +729,16 @@ async def test_real_docker_lifecycle_cleanup_e2e(tmp_path, action):
         assert result["timed_out"] is True
         assert result["status"] == "timed-out"
         assert result["cleanup"] == "removed"
+        container_name = result["container_id"]
+        inspected = subprocess.run(
+            ["docker", "inspect", container_name], capture_output=True, check=False
+        )
+        assert inspected.returncode != 0
     # Do not inspect every ``khaos-*`` container: push and pull_request
     # workflows can legitimately share one runner/daemon concurrently.  The
     # per-execution container was checked above, and the backend registry is
     # the authoritative ownership scope for this test.
     assert backend._active == {}
     await service.shutdown()
+    assert backend.terminal_closed
+    assert backend.owned_resources() == ()

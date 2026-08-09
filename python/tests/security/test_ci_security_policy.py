@@ -70,6 +70,10 @@ def test_release_provenance_binds_exact_required_gates_and_forbids_replacement()
     assert "security-closure-gate.yml" in verifier
     assert "product-integrity-gate.yml" in verifier
     assert 'run.get("conclusion") == "success"' in verifier
+    assert 'run.get("run_attempt") or 0' in verifier
+    assert 'security-evidence-{commit}' in verifier
+    assert 'artifact.get("expired") is not False' in verifier
+    assert 'record.get("run_attempt") != 1' in generator
     assert "required_gates" in generator
     assert "run_id" in generator
     assert "evidence_digest" in generator
@@ -87,7 +91,9 @@ def test_platform_matrix_and_real_sandbox_jobs_are_mandatory():
     assert "windows-fail-closed-security" in platform
     assert "-m windows_fail_closed" in platform
     assert "KHAOS_RUN_PRODUCTION_SANDBOX" in docker
-    assert "-m docker_sandbox_real" in docker
+    assert "docker_sandbox_real" in docker
+    assert "production_sandbox_real" in docker
+    assert 'docker_sandbox_real or production_sandbox_real' in docker
 
     for required_contract in (
         "test_webhook.py",
@@ -141,6 +147,38 @@ def test_platform_matrix_and_real_sandbox_jobs_are_mandatory():
         assert required_contract in matrix
 
 
+def test_product_infra_marker_exclusions_have_dedicated_owners():
+    """Every marker excluded from the product suite must have an owner job.
+
+    The product matrix intentionally cannot provide Docker, Chromium, or
+    privileged kernel infrastructure.  This check prevents a future workflow
+    edit from turning that intentional deselection into an unowned coverage
+    hole, especially for ``production_sandbox_real`` which is distinct from
+    the lower-level Docker contract marker.
+    """
+    product = (WORKFLOWS / "product-integrity-gate.yml").read_text(
+        encoding="utf-8"
+    )
+    docker = (WORKFLOWS / "docker-security.yml").read_text(encoding="utf-8")
+    browser = (WORKFLOWS / "browser-e2e.yml").read_text(encoding="utf-8")
+    platform = (WORKFLOWS / "platform-sandbox-security.yml").read_text(
+        encoding="utf-8"
+    )
+    excluded = (
+        "browser_real",
+        "docker_sandbox_real",
+        "production_sandbox_real",
+        "kernel_real",
+        "platform_sandbox_real",
+    )
+    for marker in excluded:
+        assert marker in product
+    assert "browser_real" in browser
+    assert 'docker_sandbox_real or production_sandbox_real' in docker
+    assert "real_bwrap" in platform
+    assert "real_macos" in platform
+
+
 def test_browser_e2e_workflow_is_mandatory():
     """M4: ``browser-e2e.yml`` must exist and actually run the real
     Playwright security E2E suite.
@@ -191,6 +229,19 @@ def test_browser_e2e_workflow_is_mandatory():
         "browser-e2e.yml does not filter on the browser_real marker — "
         "the real E2E tests would not run"
     )
+
+
+def test_execution_authority_modules_are_type_checked():
+    """Round-20 authority modules must stay in the hard Pyright job."""
+    workflow = (WORKFLOWS / "type-check.yml").read_text(encoding="utf-8")
+    for module in (
+        "python/khaos/coding/execution/capability.py",
+        "python/khaos/coding/execution/docker.py",
+        "python/khaos/coding/execution/identity.py",
+        "python/khaos/coding/execution/platform.py",
+        "python/khaos/coding/execution/service.py",
+    ):
+        assert module in workflow
 
 
 def test_browser_kernel_isolation_job_runs_round6_primitives():

@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
+from khaos.coding.execution.capability import SandboxDecision
+from khaos.coding.execution.identity import executable_identity
 from khaos.coding.workspace.storage import (
     DEFAULT_WORKSPACE_BYTES,
     DEFAULT_WORKSPACE_ENTRIES,
@@ -213,6 +215,8 @@ class ExecutionRequest:
     # after the async workspace check fails closed.
     workspace_root_identity: tuple[int, int] | None = None
     workspace_cwd_identity: tuple[int, int] | None = None
+    executable_identity: str = ""
+    sandbox_decision: SandboxDecision | None = None
 
     def __post_init__(self) -> None:
         profile = self.permission_profile or PermissionProfile.from_legacy(
@@ -235,6 +239,12 @@ class ExecutionRequest:
             "correlation_id",
             self.correlation_id or uuid.uuid4().hex[:12],
         )
+        if not self.executable_identity:
+            object.__setattr__(
+                self,
+                "executable_identity",
+                executable_identity(self.argv, self.environment),
+            )
 
 
 @dataclass(frozen=True)
@@ -257,6 +267,8 @@ class ResolvedExecutionContext:
     workspace_baseline: WorkspaceStorageSnapshot | None = None
     workspace_root_identity: tuple[int, int] | None = None
     workspace_cwd_identity: tuple[int, int] | None = None
+    executable_identity: str = ""
+    sandbox_decision: SandboxDecision | None = None
 
     def __post_init__(self) -> None:
         profile = self.permission_profile or PermissionProfile.from_legacy(
