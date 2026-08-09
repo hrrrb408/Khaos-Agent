@@ -11,11 +11,13 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import cast
 
 from khaos.coding.execution.binding import open_execution_directory_binding
 from khaos.coding.execution.environment import scrub_spawn_environment
 from khaos.coding.execution.capability import (
     BackendAvailability,
+    SandboxDecision,
     _cached_availability,
     _capability_evidence,
     _CapabilityCacheEntry,
@@ -107,6 +109,45 @@ class BackendSelector:
         import asyncio
 
         return await asyncio.to_thread(self.select, writable=writable)
+
+    def select_with_decision(
+        self, *, writable: bool, network_mode: str = "none"
+    ) -> tuple[object, SandboxDecision]:
+        """Select a backend and retain the exact probe evidence it used."""
+        backend = self.select(writable=writable)
+        if isinstance(backend, UnsupportedBackend):
+            raise PermissionError(
+                "execution refused: no kernel-enforced sandbox backend "
+                f"({backend.reason})"
+            )
+        availability: BackendAvailability | None = None
+        cache = getattr(backend, "_capability_cache", None)
+        if cache is not None:
+            availability = cache.availability
+        if availability is None:
+            probe = getattr(backend, "probe_capability", None)
+            if not callable(probe):
+                raise PermissionError(
+                    "selected sandbox backend does not expose capability evidence"
+                )
+            availability = cast(BackendAvailability, probe())
+        assert availability is not None
+        return backend, SandboxDecision.from_backend(
+            backend,
+            availability,
+            writable=writable,
+            network_mode=network_mode,
+        )
+
+    async def select_async_with_decision(
+        self, *, writable: bool, network_mode: str = "none"
+    ) -> tuple[object, SandboxDecision]:
+        """Run selection and evidence binding off the event loop."""
+        return await asyncio.to_thread(
+            self.select_with_decision,
+            writable=writable,
+            network_mode=network_mode,
+        )
 
 
 class MacOSSandboxBackend:

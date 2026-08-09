@@ -143,6 +143,7 @@ class SubAgentRunner:
         from khaos.runtime import (
             ProductionRuntimeConfig,
             RuntimeConfig,
+            build_production_runtime,
             build_runtime,
             close_runtime_or_register,
         )
@@ -200,7 +201,12 @@ class SubAgentRunner:
             runtime_kwargs["memory_manager"] = (
                 self.memory_manager if self.inherit_memory else None
             )
-        runtime = await build_runtime(runtime_config_type(**runtime_kwargs))
+        if runtime_config_type is ProductionRuntimeConfig:
+            runtime = await build_production_runtime(
+                ProductionRuntimeConfig(**runtime_kwargs)
+            )
+        else:
+            runtime = await build_runtime(RuntimeConfig(**runtime_kwargs))
         try:
             logger.info(
                 "SubAgentRunner starting: task=%s session=%s goal=%r",

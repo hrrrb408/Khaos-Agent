@@ -78,8 +78,9 @@ jobs:
         # images (docker_sandbox_real / production_sandbox_real), a real
         # Chromium binary (browser_real), and a privileged Linux runner with
         # real netns/nft/cgroup-v2 (kernel_real / platform_sandbox_real).
-        # Those are covered by docker-security.yml, browser-e2e.yml and
-        # platform-sandbox-security.yml respectively.  tree_sitter_real and
+        # Those are covered by docker-security.yml (including BOTH Docker
+        # markers), browser-e2e.yml and platform-sandbox-security.yml
+        # respectively.  tree_sitter_real and
         # lsp_real tests DO run here — they only need the optional extras
         # (installed above), not external infrastructure.
         #

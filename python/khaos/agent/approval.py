@@ -29,9 +29,11 @@ class StepExecutionAuthority:
 
     Turn-level context may evolve while an approval is pending.  This object
     is the boundary between approval and execution: both sides bind to the
-    same identity, workspace, cwd, environment, backend, policy, resource,
+    same identity, workspace, cwd, environment, concrete sandbox decision,
+    executable identity, backend, policy, resource,
     tool, and argument scope.  Environment values are deliberately excluded;
-    only the final allowlisted key set is bound.
+    only non-secret allowlisted environment values are fingerprinted; secret
+    values are never copied into the authority.
     """
 
     principal_id: str
@@ -47,7 +49,10 @@ class StepExecutionAuthority:
     cwd_identity: str
     permission_profile_digest: str
     environment_keys: tuple[str, ...]
+    environment_digest: str
     sandbox_backend: str
+    sandbox_decision_digest: str
+    executable_identity: str
     network_authority: str
     target: str
     approval_target: str
@@ -72,7 +77,10 @@ class StepExecutionAuthority:
             self.workspace_id,
             self.cwd_identity,
             self.permission_profile_digest,
+            self.environment_digest,
             self.sandbox_backend,
+            self.sandbox_decision_digest,
+            self.executable_identity,
             self.network_authority,
             self.target,
             self.approval_target,
@@ -105,7 +113,10 @@ class StepExecutionAuthority:
             "cwd_identity": self.cwd_identity,
             "permission_profile_digest": self.permission_profile_digest,
             "environment_keys": self.environment_keys,
+            "environment_digest": self.environment_digest,
             "sandbox_backend": self.sandbox_backend,
+            "sandbox_decision_digest": self.sandbox_decision_digest,
+            "executable_identity": self.executable_identity,
             "network_authority": self.network_authority,
             "target": self.target,
             "approval_target": self.approval_target,

@@ -1,7 +1,8 @@
 """Round-17 review §十五: Resource Ownership Closure E2E suite.
 
-This module applies a single behavior matrix to every ``ResourceOwner``
-implementation (:class:`~khaos.coding.execution.service.ExecutionService`,
+This module applies the shared lifecycle assertions plus owner-specific fault
+matrices to every ``ResourceOwner`` implementation (:class:`~khaos.coding.execution.service.ExecutionService`,
+:class:`~khaos.coding.execution.docker.DockerBackend`,
 :class:`~khaos.coding.execution.managed.ManagedProcessHandle`,
 :class:`~khaos.coding.execution.supervisor.ProcessSupervisor`,
 :class:`~khaos.coding.intelligence.lsp.client.LspClient`,
@@ -37,8 +38,11 @@ Concretely the behavior matrix is:
 | cleanup CancelledError     | QUARANTINED (not CLOSED)        |
 | CLOSED                     | no live/owned resource          |
 
-Each owner is tested with the same assertions via the
-:class:`~khaos.coding.execution.resource_owner.ResourceOwner` protocol.
+The common assertions are applied through the
+:class:`~khaos.coding.execution.resource_owner.ResourceOwner` protocol, while
+the fault injection remains owner-specific.  DockerBackend is covered by a
+complete matrix in ``test_sandbox_tools.py`` because its container and
+finalizer oracles are different from process/socket owners.
 """
 
 from __future__ import annotations

@@ -300,6 +300,25 @@ class DockerVerificationSandboxBackend:
         self._host_paths = tuple(str(path.resolve()) for path in host_paths)
         self._grace = kill_grace_seconds
 
+    def _execution_image_reference(self, image_digest: str) -> str:
+        """Resolve the legacy profile digest to the pinned repository reference.
+
+        ``image_digest`` historically carried both a registry manifest digest
+        and a local config-image selector.  Those values may coincide for a
+        single-platform image, but Docker does not guarantee that they do.
+        Once a profile has an explicit ``repository@sha256:digest`` reference,
+        every create/inspect operation must use that reference; local config
+        IDs are reserved for attestation and ownership comparisons.
+        """
+        if image_digest == self.profile.image_digest:
+            return self.profile.effective_image_reference
+        return image_digest
+
+    async def _resolve_local_image_id(self, image_digest: str) -> str | None:
+        """Return the local config ID for a profile/reference image selector."""
+        reference = self._execution_image_reference(image_digest)
+        return await self.inspect_image(reference)
+
     # ------------------------------------------------------------------
     # §1: Explicit container lifecycle API
     # ------------------------------------------------------------------
@@ -383,7 +402,8 @@ class DockerVerificationSandboxBackend:
         Returns the container ID printed by ``docker create`` on stdout.
         """
         args = self._build_create_args(
-            instance_name=instance_name, image_digest=image_digest,
+            instance_name=instance_name,
+            image_digest=self._execution_image_reference(image_digest),
             command=command, workspace_root=workspace_root, labels=labels,
         )
         process = await asyncio.create_subprocess_exec(
@@ -453,7 +473,7 @@ class DockerVerificationSandboxBackend:
         # ImageAttestation.  The container's .Image must equal the approved
         # local_config_image_id.  We do NOT compare the manifest digest
         # against the local config image ID — they are different concepts.
-        local_image_id = await self.inspect_image(expected_image_digest)
+        local_image_id = await self._resolve_local_image_id(expected_image_digest)
         if local_image_id is None:
             await self._safe_delete_owned_container(
                 container_id_or_name, container_id,
@@ -863,10 +883,16 @@ class DockerVerificationSandboxBackend:
                 }
         # §3: verify image — mismatch → OWNERSHIP_MISMATCH (no terminate).
         container_image = info.get("Image", "")
-        if container_image and expected_image_digest and container_image != expected_image_digest:
+        expected_local_image_id = await self._resolve_local_image_id(expected_image_digest)
+        if expected_local_image_id is None:
             return {
                 "status": "ownership-mismatch", "container_id": actual_id,
-                "reason": f"image-mismatch:{container_image}!={expected_image_digest}",
+                "reason": f"image-mismatch:unavailable:{expected_image_digest}",
+            }
+        if container_image and expected_local_image_id and container_image != expected_local_image_id:
+            return {
+                "status": "ownership-mismatch", "container_id": actual_id,
+                "reason": f"image-mismatch:{container_image}!={expected_local_image_id}",
             }
         # §3: verify manifest digest label.
         actual_manifest = container_labels.get("khaos.manifest-digest", "")
@@ -1115,6 +1141,7 @@ class DockerVerificationSandboxBackend:
         captured, even on timeout.  The attestation result is only durable
         after the container absence proof (TERMINATED state persisted).
         """
+        execution_image_reference = self._execution_image_reference(image_digest)
         instance_name = self.generate_instance_name()
         labels = self.build_toolchain_attestation_labels(
             instance_id="",  # filled below after ID generation
@@ -1138,6 +1165,10 @@ class DockerVerificationSandboxBackend:
                 VerificationSandboxInstance,
             )
             sandbox_instance_id = f"vsi_{_sec.token_hex(12)}"
+            expected_local_image_id = (
+                getattr(image_attestation, "local_config_image_id", "")
+                or image_digest
+            )
             labels = self.build_toolchain_attestation_labels(
                 instance_id=sandbox_instance_id,
                 boot_id=boot.boot_id,
@@ -1153,8 +1184,8 @@ class DockerVerificationSandboxBackend:
                 backend_instance_name=instance_name,
                 runtime_epoch=boot.server_epoch,
                 boot_id=boot.boot_id,
-                image_reference=image_digest,
-                expected_image_digest=image_digest,
+                image_reference=execution_image_reference,
+                expected_image_digest=expected_local_image_id,
                 state=SandboxInstanceState.PREPARED,
                 instance_kind="toolchain-attestation",
                 toolchain_id=toolchain_id,
@@ -1173,7 +1204,7 @@ class DockerVerificationSandboxBackend:
         ]
         for key, value in labels.items():
             args.extend(("--label", f"{key}={value}"))
-        args.extend((image_digest, *argv))
+        args.extend((execution_image_reference, *argv))
         create_proc = await asyncio.create_subprocess_exec(
             *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             env=_docker_cli_environment(),

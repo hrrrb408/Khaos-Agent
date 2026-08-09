@@ -46,12 +46,15 @@ from khaos.coding.planning.trusted_verification_runner import TrustedVerificatio
 
 
 IMAGE = "sha256:eb43ff125d8d58d7449dcba7d336c23bcac412f526d861db493b9994d8010280"
+IMAGE_REFERENCE = f"python@{IMAGE}"
 
 
 def _profile(*, network=False, read_only=True):
     return SandboxProfile(
         "python-offline-v1", IMAGE, network_enabled=network,
         read_only_root=read_only, run_as_user=f"{os.getuid()}:{os.getgid()}",
+        requested_image_reference=IMAGE_REFERENCE,
+        approved_repository_digest=IMAGE,
     )
 
 
@@ -2832,16 +2835,17 @@ def _start_long_running_container(backend, *, command, workspace_root, labels):
         # attached output stream. Using launch_instance here discarded its
         # live ``docker start --attach`` process when asyncio.run closed the
         # loop, leaking transports and subprocesses under Python 3.13.
+        local_image_id = await backend.probe()
         container_id = await backend.create_instance(
             instance_name=instance_name,
-            image_digest=_profile().image_digest,
+            image_digest=backend.profile.effective_image_reference,
             command=command, workspace_root=workspace_root,
             labels=labels,
         )
         await backend.inspect_and_attest_instance(
             container_id_or_name=container_id,
             expected_labels=labels,
-            expected_image_digest=_profile().image_digest,
+            expected_image_digest=local_image_id,
             expected_manifest_digest=labels["khaos.manifest-digest"],
         )
         await backend.start_instance(container_id)

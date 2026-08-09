@@ -27,6 +27,8 @@ async def test_run(
     execution_service=None,
     task_id: str | None = None,
     workspace_id: str | None = None,
+    sandbox_decision=None,
+    executable_identity: str | None = None,
 ) -> str:
     """Run a test command and return a structured JSON summary.
 
@@ -78,6 +80,8 @@ async def test_run(
                 task_id=task_id,
                 workspace_id=workspace_id,
                 access_mode="workspace-write",
+                sandbox_decision=sandbox_decision,
+                executable_identity=executable_identity or "",
             )
         )
     except FileNotFoundError as exc:

@@ -52,11 +52,19 @@ jobs:
         # proxy, the tool registry, and the approval broker.  These are all
         # security-critical surfaces that previously had no static-type gate.
         # Round-17: added resource_owner.py (unified ResourceOwner protocol).
+        # Round-20: add the evidence-bound platform/Docker decision and
+        # executable-identity modules to the same hard type gate.  Keep the
+        # scheduler here as well: it freezes the evidence-bound authority
+        # before process dispatch and must not regress to dynamic-call errors.
         run: |
           uv run pyright \
             python/khaos/runtime/authority.py \
             python/khaos/runtime/lifecycle.py \
+            python/khaos/coding/execution/capability.py \
+            python/khaos/coding/execution/docker.py \
+            python/khaos/coding/execution/identity.py \
             python/khaos/coding/execution/managed.py \
+            python/khaos/coding/execution/platform.py \
             python/khaos/coding/execution/service.py \
             python/khaos/coding/execution/supervisor.py \
             python/khaos/coding/execution/cleanup_ledger.py \
@@ -64,4 +72,5 @@ jobs:
             python/khaos/coding/intelligence/lsp/client.py \
             python/khaos/security/browser_egress_proxy.py \
             python/khaos/tools/registry.py \
+            python/khaos/tools/scheduler.py \
             python/khaos/agent/approval.py

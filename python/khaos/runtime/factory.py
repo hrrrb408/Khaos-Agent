@@ -1172,6 +1172,25 @@ async def build_runtime(
     )._with_seal(authority_seal)
 
 
+async def build_production_runtime(cfg: ProductionRuntimeConfig) -> RuntimeResult:
+    """Build only from the structural production-safe configuration type.
+
+    Keeping this entry point separate prevents production callers from
+    accidentally widening their API back to injectable ``RuntimeConfig``
+    while preserving ``build_runtime`` for explicit test/development adapters.
+    """
+    if not isinstance(cfg, ProductionRuntimeConfig):
+        raise TypeError("build_production_runtime requires ProductionRuntimeConfig")
+    # Resolve the public compatibility hook at call time.  Tests and trusted
+    # adapters historically monkeypatch ``khaos.runtime.build_runtime``; the
+    # structural production boundary must remain usable without making that
+    # hook an implicit security injection in normal operation.
+    import khaos.runtime as runtime_module
+
+    builder = getattr(runtime_module, "build_runtime", build_runtime)
+    return await builder(cfg)
+
+
 async def close_runtime_or_register(runtime: RuntimeResult) -> None:
     """Close a production-owned runtime and retain persistent failures.
 

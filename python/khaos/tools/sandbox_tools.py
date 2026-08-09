@@ -30,6 +30,8 @@ async def sandbox_exec(
     workspace_manager=None,
     task_id: str | None = None,
     workspace_id: str | None = None,
+    sandbox_decision=None,
+    executable_identity: str | None = None,
 ) -> dict[str, Any]:
     """Execute fixed argv inside the active TaskWorkspace Docker sandbox."""
     argv = tuple(shlex.split(command))
@@ -66,6 +68,8 @@ async def sandbox_exec(
         workspace_id=workspace_id,
         access_mode="workspace-write",
         backend_hint="docker",
+        sandbox_decision=sandbox_decision,
+        executable_identity=executable_identity or "",
     )
     result = await execution_service.execute(request)
     timed_out = result.status == "timed-out"

@@ -2035,9 +2035,9 @@ class AgentService:
             # call from a different project cannot re-stamp it.
             project_id=ctx.project_id,
         )
-        from khaos.runtime import ProductionRuntimeConfig, build_runtime
+        from khaos.runtime import ProductionRuntimeConfig, build_production_runtime
 
-        return await build_runtime(ProductionRuntimeConfig(
+        return await build_production_runtime(ProductionRuntimeConfig(
             project_root=self.project_root, config_path=self.config_path,
             mode_override=mode or None, confirm_callback=self._wait_for_confirmation,
             db=self.db, audit_logger=self._audit_logger,

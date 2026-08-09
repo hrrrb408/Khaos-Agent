@@ -123,10 +123,11 @@ jobs:
             --runner-os "$RUNNER_OS" --output evidence/process_tree_escape.json
       - name: Resource Ownership Closure E2E
         # Round-17 review §十五: unified lifecycle proof matrix.
-        # Every first-class ResourceOwner (ExecutionService,
+        # Every first-class ResourceOwner (ExecutionService, DockerBackend,
         # ManagedProcessHandle, ProcessSupervisor, LspClient,
         # BrowserEgressProxy, BrowserManager, RuntimeResult) must pass the
-        # same behaviour matrix and independent external-oracle checks:
+        # shared lifecycle assertions plus owner-specific fault matrices and
+        # independent external-oracle checks:
         # start-after-close rejected, concurrent close joins same task,
         # first-close-failure retries, cleanup exception/CancelledError →
         # QUARANTINED, and CLOSED ⇒ no owned resources.  Also runs the

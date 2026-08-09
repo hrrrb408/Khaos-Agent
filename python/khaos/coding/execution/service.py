@@ -14,8 +14,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 from khaos.coding.execution.binding import open_execution_directory_binding
+from khaos.coding.execution.capability import SandboxDecision
 from khaos.coding.execution.cleanup_ledger import CleanupInvariantError, CleanupLedger
 from khaos.coding.execution.environment import scrub_spawn_environment
+from khaos.coding.execution.identity import executable_identity
 from khaos.coding.execution.managed import ManagedProcessHandle
 from khaos.coding.execution.models import (
     ExecutionRequest,
@@ -336,6 +338,8 @@ class ExecutionService:
                 workspace_baseline=storage_baseline,
                 workspace_root_identity=root_identity,
                 workspace_cwd_identity=cwd_identity,
+                executable_identity=request.executable_identity,
+                sandbox_decision=request.sandbox_decision,
             )
             assert request.task_id is not None
             assert request.workspace_id is not None
@@ -346,11 +350,33 @@ class ExecutionService:
                 profile.network, profile.resources, request.environment,
                 profile.environment_keys, request.argv, correlation_id, profile,
                 storage_baseline, root_identity, cwd_identity,
+                request.executable_identity,
+                request.sandbox_decision,
             )
         if self.backend_selector is not None:
-            backend = await self.backend_selector.select_async(
-                writable=profile.filesystem is FileSystemAccess.WORKSPACE_WRITE
-            )
+            writable = profile.filesystem is FileSystemAccess.WORKSPACE_WRITE
+            if request.sandbox_decision is not None:
+                selector_method = getattr(
+                    self.backend_selector, "select_async_with_decision", None
+                )
+                if not callable(selector_method):
+                    raise PermissionError(
+                        "sandbox decision cannot be verified by this backend selector"
+                    )
+                verified_selector = cast(
+                    Callable[..., Awaitable[tuple[Any, SandboxDecision]]],
+                    selector_method,
+                )
+                backend, observed_decision = await verified_selector(
+                    writable=writable,
+                    network_mode=profile.network.value,
+                )
+                if observed_decision.digest() != request.sandbox_decision.digest():
+                    raise PermissionError(
+                        "sandbox capability decision changed before execution"
+                    )
+            else:
+                backend = await self.backend_selector.select_async(writable=writable)
         else:
             backend = self.backend
         if backend is None:
@@ -365,6 +391,20 @@ class ExecutionService:
             backend = self.docker_backend
         if request.backend_hint == "docker" and resolved_context is None:
             raise PermissionError("Docker execution requires resolved TaskWorkspace context")
+        if request.executable_identity != executable_identity(
+            request.argv, request.environment
+        ):
+            raise PermissionError(
+                "executable identity changed before execution"
+            )
+        if request.sandbox_decision is not None:
+            if (
+                request.sandbox_decision.filesystem_mode != profile.filesystem.value
+                or request.sandbox_decision.network_mode != profile.network.value
+            ):
+                raise PermissionError(
+                    "sandbox decision does not match the resolved permission profile"
+                )
         # Round-14 §1: revalidate the worktree root inode AND Git identity as
         # the last step before the backend launches the subprocess.  ``require``
         # (above) and ``verify_git_identity`` both ran earlier in this method,

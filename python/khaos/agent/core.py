@@ -6,6 +6,7 @@ import asyncio
 import inspect
 import json
 import logging
+import os
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -520,6 +521,7 @@ class AgentLoop:
                         "sandbox_backend": execution_backend_identity,
                         "workspace_manager": self.workspace_manager,
                         "coding_workspace_enforced": self.active_workspace is not None,
+                        "production_runtime": os.environ.get("KHAOS_DEV_MODE") != "1",
                         "approval_broker": self.approval_broker,
                         "requester": session_id,
                         "principal_id": self.principal_id,

@@ -193,8 +193,29 @@ def _load_gate_evidence(path: Path, commit: str) -> dict[str, Any]:
             or record.get("head_sha") != commit
             or record.get("status") != "completed"
             or record.get("conclusion") != "success"
+            or record.get("run_attempt") != 1
         ):
             raise SystemExit(f"required release gate is not successful: {name}")
+        if name == "security_closure":
+            expected_artifact = f"security-evidence-{commit}"
+            matches = [
+                artifact for artifact in record.get("artifacts", [])
+                if isinstance(artifact, dict)
+                and artifact.get("name") == expected_artifact
+            ]
+            if len(matches) != 1:
+                raise SystemExit(
+                    f"security gate evidence artifact is missing: {expected_artifact}"
+                )
+            artifact = matches[0]
+            if (
+                artifact.get("expired") is not False
+                or not isinstance(artifact.get("digest"), str)
+                or not artifact["digest"].strip()
+            ):
+                raise SystemExit(
+                    f"security gate evidence artifact is not valid: {expected_artifact}"
+                )
     return evidence
 
 
