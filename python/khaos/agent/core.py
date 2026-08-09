@@ -479,6 +479,26 @@ class AgentLoop:
                     )
                     return
 
+                active_workspace = self.active_workspace
+                workspace_root_identity = (
+                    getattr(active_workspace, "root_device", None),
+                    getattr(active_workspace, "root_inode", None),
+                )
+                if workspace_root_identity == (None, None):
+                    workspace_root_identity = str(
+                        getattr(active_workspace, "worktree_path", "workspace:unspecified")
+                    )
+                execution_backend = getattr(self.execution_service, "backend", None)
+                if execution_backend is None:
+                    execution_backend = getattr(
+                        self.execution_service, "backend_selector", None
+                    )
+                execution_backend_identity = (
+                    f"{type(execution_backend).__module__}."
+                    f"{type(execution_backend).__qualname__}"
+                    if execution_backend is not None
+                    else "backend:unspecified"
+                )
                 stream_args = {
                     "session_id": session_id,
                     "confirm_callback": self.confirm_callback,
@@ -486,6 +506,18 @@ class AgentLoop:
                         "execution_service": self.execution_service,
                         "task_id": active_task_id,
                         "workspace_id": getattr(self.active_workspace, "id", None),
+                        # StepExecutionAuthority inputs: freeze the active
+                        # workspace generation/cwd/backend/environment at the
+                        # exact tool step, not just at turn construction.
+                        "workspace_generation": int(
+                            getattr(active_workspace, "generation", 0) or 0
+                        ),
+                        "cwd_identity": workspace_root_identity,
+                        "workspace_cwd_identity": workspace_root_identity,
+                        "environment_keys": (
+                            "LANG", "LC_ALL", "PATH", "TMPDIR"
+                        ),
+                        "sandbox_backend": execution_backend_identity,
                         "workspace_manager": self.workspace_manager,
                         "coding_workspace_enforced": self.active_workspace is not None,
                         "approval_broker": self.approval_broker,

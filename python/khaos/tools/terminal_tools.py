@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from khaos.coding.execution.environment import scrub_spawn_environment
 from khaos.permissions.engine import split_command_segments
 from khaos.security.command_guard import CommandGuard
 
@@ -93,7 +94,7 @@ def _build_safe_env() -> dict[str, str]:
     for key, value in os.environ.items():
         if key in SAFE_ENV_EXACT or any(key.startswith(prefix) for prefix in SAFE_ENV_PREFIXES):
             env[key] = value
-    return env
+    return scrub_spawn_environment(env)
 
 
 async def terminal(

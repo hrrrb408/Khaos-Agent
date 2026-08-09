@@ -105,6 +105,61 @@ async def test_shutdown_clean_close_transitions_to_closed():
     assert service._closed is True  # backward-compat property
 
 
+@pytest.mark.asyncio
+async def test_shutdown_cancelled_terminate_never_reports_closed():
+    """A cancelled terminate is retained as a retryable ownership failure."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from khaos.coding.execution.service import (
+        ExecutionServiceShutdownError,
+        _ShutdownState,
+    )
+
+    supervisor = MagicMock()
+    supervisor.shutdown = AsyncMock()
+    service = ExecutionService(
+        HostExecutionBackend(), process_supervisor=supervisor,
+    )
+    service._active = {"cancelled": ("task", "workspace", MagicMock())}
+    service.terminate = AsyncMock(side_effect=asyncio.CancelledError())  # type: ignore[assignment]
+
+    with pytest.raises(ExecutionServiceShutdownError):
+        await service.shutdown()
+
+    assert service._shutdown_state is _ShutdownState.QUARANTINED
+    assert not service.terminal_closed
+    assert service._active
+    supervisor.shutdown.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_closes_pending_managed_handle_before_closed():
+    """The acquire-to-publish handle registry is part of shutdown ownership."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from khaos.coding.execution import ManagedProcessHandle
+    from khaos.coding.execution.service import _ShutdownState
+
+    supervisor = MagicMock()
+    supervisor.shutdown = AsyncMock()
+    service = ExecutionService(
+        HostExecutionBackend(), process_supervisor=supervisor,
+    )
+    handle = MagicMock(spec=ManagedProcessHandle)
+    handle.aclose = AsyncMock()
+    handle.terminal_closed = True
+    handle.terminal_postcondition.return_value = True
+    handle.owned_resources.return_value = ()
+    service._pending_managed_handles["pending"] = handle
+
+    await service.shutdown()
+
+    handle.aclose.assert_awaited_once()
+    assert service._pending_managed_handles == {}
+    assert service._shutdown_state is _ShutdownState.CLOSED
+    assert service.terminal_postcondition()
+
+
 # ───── Round-15 P0-A: deterministic admission race regression tests ──────
 #
 # These tests use barrier events (NOT sleeps) to deterministically

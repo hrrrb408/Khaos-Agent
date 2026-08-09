@@ -123,12 +123,15 @@ jobs:
             --runner-os "$RUNNER_OS" --output evidence/process_tree_escape.json
       - name: Resource Ownership Closure E2E
         # Round-17 review §十五: unified lifecycle proof matrix.
-        # Every ResourceOwner (LSP, ProcessSupervisor, BrowserEgressProxy)
-        # must pass the same behaviour matrix: start-after-close rejected,
-        # concurrent close joins same task, first-close-failure retries,
-        # cleanup exception → QUARANTINED, CancelledError → QUARANTINED,
-        # CLOSED ⇒ no owned resources.  Also runs the CleanupLedger v2
-        # suite (run_step postcondition / generation invalidation).
+        # Every first-class ResourceOwner (ExecutionService,
+        # ManagedProcessHandle, ProcessSupervisor, LspClient,
+        # BrowserEgressProxy, BrowserManager, RuntimeResult) must pass the
+        # same behaviour matrix and independent external-oracle checks:
+        # start-after-close rejected, concurrent close joins same task,
+        # first-close-failure retries, cleanup exception/CancelledError →
+        # QUARANTINED, and CLOSED ⇒ no owned resources.  Also runs the
+        # CleanupLedger v2 suite (run_step postcondition / generation
+        # invalidation).
         run: |
           python -m pytest \
             python/tests/coding/test_resource_owner_closure.py \

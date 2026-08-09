@@ -13,11 +13,18 @@ release-ready merely because the maintainer can approve it.
    covered by `.github/CODEOWNERS`. Until then, record the independent-review
    control as an explicit release prerequisite rather than claiming that the
    single-maintainer ruleset provides it.
-4. Require signed release tags, a commit-bound SBOM/provenance attestation,
-   and retain the Security Evidence Artifact with the release record.
+4. Require signed, non-retargetable release tags, successful `Security Closure
+   Gate` and `Product Integrity Gate` runs for the exact tagged commit, a
+   commit-bound SBOM/provenance attestation, and retain the gate evidence with
+   the release record.
 5. Keep GitHub Actions pinned to immutable commit SHAs; the generated
    inventory check must fail if an unpinned action is introduced.
-6. Do not merge Docker, lockfile, workflow, permission, audit, RPC, or native
+6. Release assets are write-once: the provenance workflow must not replace an
+   existing asset (`gh release upload` without `--clobber`). Tag/release
+   immutability is enforced by repository settings and the signed-tag review
+   prerequisite; the workflow also verifies the checked-out tag SHA before
+   attesting it.
+7. Do not merge Docker, lockfile, workflow, permission, audit, RPC, or native
    helper changes while the corresponding real-kernel or supply-chain job is
    skipped, cancelled, or unavailable.
 
@@ -46,8 +53,11 @@ Export/archive evidence before reducing any window.
 - `python scripts/generate_security_inventory.py --check`
 - `python scripts/generate_browser_kernel_protocol.py --check`
 - `git diff --check`
-- Security Closure Gate passed for the release commit.
+- Security Closure Gate and Product Integrity Gate both passed for the exact
+  release commit; their run IDs and evidence digests are in the release
+  manifest.
 - Release SBOM, checksum manifest, and GitHub artifact provenance attestation
   are attached to the release; the release workflow must fail on digest drift.
-- Evidence artifact, reviewer identity, signed tag, and any CI-only skips are
-  recorded together.
+- Gate evidence artifact, reviewer identity, signed non-retargetable tag, and
+  any CI-only skips are recorded together. Existing release assets are never
+  overwritten.

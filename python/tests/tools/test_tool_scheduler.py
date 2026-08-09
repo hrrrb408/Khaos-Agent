@@ -194,6 +194,8 @@ async def test_scheduler_emits_permission_request_and_denies_without_confirm(tmp
     ]
 
     assert [event.event for event in events] == ["permission_request", "tool_result"]
+    assert events[0].permission_request is not None
+    assert events[0].permission_request.step_execution_digest
     assert events[-1].result is not None
     assert not events[-1].result.success
     await db.close()

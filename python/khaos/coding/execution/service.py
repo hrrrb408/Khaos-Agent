@@ -14,7 +14,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 from khaos.coding.execution.binding import open_execution_directory_binding
-from khaos.coding.execution.cleanup_ledger import CleanupLedger
+from khaos.coding.execution.cleanup_ledger import CleanupInvariantError, CleanupLedger
+from khaos.coding.execution.environment import scrub_spawn_environment
 from khaos.coding.execution.managed import ManagedProcessHandle
 from khaos.coding.execution.models import (
     ExecutionRequest,
@@ -71,6 +72,12 @@ class ExecutionService:
         self.docker_backend = docker_backend
         self.managed_process_factory = managed_process_factory
         self._active: dict[str, tuple[str, str, object]] = {}
+        # A managed handle owns a real process, stderr task, watchdog, and
+        # synthetic HOME before it can be published to ``_active``.  Keep a
+        # synchronous service-owned record for that acquire -> publish gap so
+        # cancellation while waiting for ``_admission_lock`` cannot orphan
+        # the handle or its temporary filesystem.
+        self._pending_managed_handles: dict[str, ManagedProcessHandle] = {}
         # Round-13 review P0-1: typed shutdown state machine (same pattern as
         # RuntimeResult and ManagedProcess).  ``_closed`` is a backward-compat
         # property that reads ``_shutdown_state``.
@@ -133,8 +140,11 @@ class ExecutionService:
 
     @property
     def terminal_closed(self) -> bool:
-        """True only after active and initializing ownership is empty."""
-        return self._shutdown_state is _ShutdownState.CLOSED
+        """True only after every child owner has a terminal proof."""
+        return (
+            self._shutdown_state is _ShutdownState.CLOSED
+            and self._terminal_ownership_proof()
+        )
 
     @property
     def is_quarantined(self) -> bool:
@@ -143,7 +153,11 @@ class ExecutionService:
 
     def owns_execution(self, execution_id: str) -> bool:
         """Expose the service ownership oracle used by parent owners."""
-        return execution_id in self._active or execution_id in self._initializing
+        return (
+            execution_id in self._active
+            or execution_id in self._initializing
+            or execution_id in self._pending_managed_handles
+        )
 
     def owned_resources(self) -> tuple[str, ...]:
         """Describe active and in-flight child ownership transactions."""
@@ -151,15 +165,27 @@ class ExecutionService:
         resources.extend(
             f"initializing:{execution_id}" for execution_id in self._initializing
         )
+        resources.extend(
+            f"pending_managed:{execution_id}"
+            for execution_id in self._pending_managed_handles
+        )
         return tuple(sorted(resources))
 
     def terminal_postcondition(self) -> bool:
         """Return the service-level terminal ownership proof."""
+        return self.terminal_closed and self._terminal_ownership_proof()
+
+    def _terminal_ownership_proof(self) -> bool:
+        """Prove that the service and its shared supervisor are terminal."""
+        if self.docker_backend is not None and not _resource_owner_terminal(
+            self.docker_backend
+        ):
+            return False
         return (
-            self.terminal_closed
-            and not self._active
+            not self._active
             and not self._initializing
-            and self.process_supervisor.terminal_closed
+            and not self._pending_managed_handles
+            and _resource_owner_terminal(self.process_supervisor)
         )
 
     async def close(self) -> None:
@@ -176,8 +202,8 @@ class ExecutionService:
             raise PermissionError(
                 "ExecutionService cannot be shared across runtime authorities"
             )
-        if self._active:
-            raise RuntimeError("cannot bind ExecutionService with active executions")
+        if self._active or self._initializing or self._pending_managed_handles:
+            raise RuntimeError("cannot bind ExecutionService with owned executions")
         self.principal_id, self.project_id, self.runtime_id = authority
         self._authority_bound = True
 
@@ -431,8 +457,22 @@ class ExecutionService:
         authority = getattr(self.workspace_manager, "storage_authority", None)
         workspace = self.workspace_manager.get(context.workspace_id)
         limits = getattr(workspace, "storage_limits", None)
+        quarantine = getattr(self.workspace_manager, "quarantine", None)
         if authority is None or limits is None:
-            await self.workspace_manager.quarantine(context.workspace_id)
+            if callable(quarantine):
+                await cast("Callable[[str], Awaitable[object]]", quarantine)(
+                    context.workspace_id
+                )
+            else:
+                # Production WorkspaceManager always exposes quarantine. A
+                # reduced adapter may not have storage accounting at all; the
+                # execution backend has already completed its own cleanup, so
+                # record the missing optional workspace observation instead of
+                # turning cancellation into an unhandled AttributeError.
+                logger.warning(
+                    "workspace quarantine unavailable after cancelled execution: %s",
+                    context.workspace_id,
+                )
             return
         violation = await asyncio.to_thread(
             authority.assess,
@@ -441,7 +481,15 @@ class ExecutionService:
             limits,
         )
         if violation is not None:
-            await self.workspace_manager.quarantine(context.workspace_id)
+            if callable(quarantine):
+                await cast("Callable[[str], Awaitable[object]]", quarantine)(
+                    context.workspace_id
+                )
+            else:
+                logger.warning(
+                    "workspace quarantine unavailable for storage violation: %s",
+                    context.workspace_id,
+                )
 
     async def _cleanup_workspace_on_storage_violation(
         self, workspace_id: str, result: ExecutionResult
@@ -483,18 +531,57 @@ class ExecutionService:
         return _on_terminal
 
     async def terminate(self, execution_id: str) -> None:
+        pending = self._pending_managed_handles.get(execution_id)
+        if pending is not None:
+            await pending.aclose()
+            if not _resource_owner_terminal(pending):
+                raise CleanupInvariantError(
+                    f"pending managed process {execution_id} lacks terminal proof"
+                )
+            async with self._admission_lock:
+                if self._pending_managed_handles.get(execution_id) is pending:
+                    self._pending_managed_handles.pop(execution_id, None)
+            return
+
         process_terminated = await self.process_supervisor.terminate(execution_id)
         active = self._active.get(execution_id)
         if active is None and process_terminated:
+            # ProcessSupervisor.terminate() proves process death but retains
+            # its registry entry until an explicit unregister proof.  Do not
+            # return while that external owner still reports the execution.
+            if _supervisor_owns(self.process_supervisor, execution_id):
+                await self.process_supervisor.unregister_process(execution_id)
+                if _supervisor_owns(self.process_supervisor, execution_id):
+                    raise CleanupInvariantError(
+                        f"execution {execution_id} remains owned by supervisor"
+                    )
             return
         backend = active[2] if active is not None else self.backend
         if backend is None and self.backend_selector is not None:
             backend = await self.backend_selector.select_async(writable=False)
         if isinstance(backend, ManagedProcessHandle):
             await backend.aclose()
+            if not _resource_owner_terminal(backend):
+                raise CleanupInvariantError(
+                    f"managed process {execution_id} lacks terminal proof"
+                )
         else:
             await cast("Any", backend).terminate(execution_id)
-        self._active.pop(execution_id, None)
+            if _has_resource_owner(backend) and not _resource_owner_released(
+                backend, execution_id
+            ):
+                raise CleanupInvariantError(
+                    f"execution backend {execution_id} retains owned resources"
+                )
+        if _supervisor_owns(self.process_supervisor, execution_id):
+            await self.process_supervisor.unregister_process(execution_id)
+            if _supervisor_owns(self.process_supervisor, execution_id):
+                raise CleanupInvariantError(
+                    f"execution {execution_id} remains owned by supervisor"
+                )
+        async with self._admission_lock:
+            if active is not None and self._active.get(execution_id) is active:
+                self._active.pop(execution_id, None)
 
     async def start_managed_process(self, request: ExecutionRequest) -> ManagedProcessHandle:
         """Start a registered LSP-style stdio process in an active TaskWorkspace.
@@ -654,7 +741,7 @@ class ExecutionService:
                     process = await asyncio.create_subprocess_exec(
                         *launch.argv,
                         cwd=launch.cwd,
-                        env=environment,
+                        env=scrub_spawn_environment(environment),
                         stdin=asyncio.subprocess.PIPE,
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
@@ -709,12 +796,17 @@ class ExecutionService:
                 await _kill_orphaned_process(spawned_process)
             shutil.rmtree(temporary_home, ignore_errors=True)
             raise
+        # This assignment is deliberately synchronous and is the first
+        # operation after handle construction/factory return.  There must be
+        # no cancellable await before the service owns the handle.
+        self._pending_managed_handles[execution_id] = handle
         # Round-15 review P0-A: publish to ``_active`` only after the
         # transaction committed.  If shutdown began between the OPEN
         # re-check above and here, the handle is fully formed — terminate
         # it immediately so the process doesn't outlive the service.
         async with self._admission_lock:
             if self._shutdown_state is _ShutdownState.OPEN:
+                self._pending_managed_handles.pop(execution_id, None)
                 self._active[execution_id] = (
                     request.task_id, request.workspace_id, handle,
                 )
@@ -728,11 +820,17 @@ class ExecutionService:
         if not published:
             try:
                 await handle.aclose()
+                if not _resource_owner_terminal(handle):
+                    raise CleanupInvariantError(
+                        f"managed process {execution_id} lacks terminal proof"
+                    )
             except Exception:  # noqa: BLE001 — retain failure for caller
                 logger.debug(
                     "managed process %s aclose failed during late shutdown detection",
                     execution_id, exc_info=True,
                 )
+            else:
+                self._pending_managed_handles.pop(execution_id, None)
             raise RuntimeError(
                 f"execution service is {self._shutdown_state.value}, "
                 f"not accepting new executions"
@@ -803,7 +901,12 @@ class ExecutionService:
         # still observed OPEN and escaped _active.
         async with self._admission_lock:
             if self._shutdown_state is _ShutdownState.CLOSED:
-                return
+                if self._terminal_ownership_proof():
+                    return
+                # A CLOSED flag without an ownership proof is itself a
+                # lifecycle invariant violation.  Retain the state as
+                # retryable quarantine rather than returning false success.
+                self._shutdown_state = _ShutdownState.QUARANTINED
             if self._shutdown_state is _ShutdownState.OPEN:
                 self._shutdown_state = _ShutdownState.CLOSING
             shutdown_task = self._shutdown_task
@@ -830,84 +933,121 @@ class ExecutionService:
         self._cleanup_ledger.reset_errors()
         cancel_requested = False
 
-        # Each active execution is terminated independently — one failure
-        # must not skip the rest.  ``_active`` serves as the per-execution
-        # ledger: a successful ``terminate()`` pops the entry, so a retry
-        # only sees the remaining (failed) executions.
-        for execution_id in tuple(self._active):
+        async def _run_step(label: str, action, verify, generation=None) -> None:
+            nonlocal cancel_requested
             try:
-                await self.terminate(execution_id)
+                await self._cleanup_ledger.run_step(
+                    label,
+                    action=action,
+                    verify=verify,
+                    resource_generation=generation,
+                )
             except asyncio.CancelledError:
+                # run_step records cancellation as an error before re-raising;
+                # continue independent cleanup, but never allow CLOSED.
                 cancel_requested = True
-                logger.debug("ExecutionService shutdown: terminate(%s) cancelled", execution_id)
-            except Exception as exc:  # noqa: BLE001 — collect, don't abort
-                self._cleanup_ledger.record_error(f"terminate:{execution_id}", exc)
+                logger.debug("ExecutionService shutdown step %s cancelled", label)
+            except Exception:  # noqa: BLE001 — run_step records the failure
                 logger.debug(
-                    "ExecutionService shutdown: terminate(%s) failed",
-                    execution_id, exc_info=True,
+                    "ExecutionService shutdown step %s failed",
+                    label,
+                    exc_info=True,
                 )
 
-        # Cancel any initializing tasks that haven't published to _active yet.
-        if not self._cleanup_ledger.is_done("initializing:cancel"):
-            try:
-                initializing = tuple(self._initializing.items())
-                for _, init_task in initializing:
-                    init_task.cancel()
-                if initializing:
-                    await asyncio.gather(
-                        *(task for _, task in initializing),
-                        return_exceptions=True,
-                    )
-                unfinished = [
-                    execution_id
-                    for execution_id, init_task in initializing
-                    if not init_task.done()
-                ]
-                if unfinished:
-                    raise RuntimeError(
-                        "initializing execution tasks remain after cancellation: "
-                        + ", ".join(sorted(unfinished))
-                    )
-                for execution_id, init_task in initializing:
-                    if self._initializing.get(execution_id) is init_task:
-                        self._initializing.pop(execution_id, None)
-                if self._initializing:
-                    raise RuntimeError(
-                        "initializing execution ownership changed during shutdown"
-                    )
-                self._cleanup_ledger.mark_done("initializing:cancel")
-            except asyncio.CancelledError:
-                cancel_requested = True
-                logger.debug("ExecutionService shutdown: initializing cancel cancelled")
-            except Exception as exc:  # noqa: BLE001
-                self._cleanup_ledger.record_error("initializing:cancel", exc)
-                logger.debug(
-                    "ExecutionService shutdown: initializing cancel failed", exc_info=True,
+        # Each active execution is terminated independently — one failure
+        # must not skip the rest.  The concrete active tuple identity binds
+        # the ledger step to the resource generation it actually cleaned.
+        for execution_id, active in tuple(self._active.items()):
+            await _run_step(
+                f"terminate:{execution_id}",
+                lambda execution_id=execution_id: self.terminate(execution_id),
+                lambda execution_id=execution_id: not self.owns_execution(execution_id),
+                generation=id(active),
+            )
+
+        async def _cancel_initializing() -> None:
+            initializing = tuple(self._initializing.items())
+            for _, init_task in initializing:
+                init_task.cancel()
+            if initializing:
+                await asyncio.gather(
+                    *(task for _, task in initializing),
+                    return_exceptions=True,
                 )
+            for execution_id, init_task in initializing:
+                if not init_task.done():
+                    raise RuntimeError(
+                        f"initializing execution task remains: {execution_id}"
+                    )
+                if self._initializing.get(execution_id) is init_task:
+                    self._initializing.pop(execution_id, None)
+            if self._initializing:
+                raise RuntimeError(
+                    "initializing execution ownership changed during shutdown"
+                )
+
+        await _run_step(
+            "initializing:cancel",
+            _cancel_initializing,
+            lambda: not self._initializing,
+            generation=id(self._initializing),
+        )
+
+        async def _close_pending_managed() -> None:
+            errors: list[BaseException] = []
+            for execution_id, handle in tuple(self._pending_managed_handles.items()):
+                try:
+                    await handle.aclose()
+                    if not _resource_owner_terminal(handle):
+                        raise CleanupInvariantError(
+                            f"pending managed process {execution_id} lacks terminal proof"
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except BaseException as exc:  # noqa: BLE001 — retain pending owner
+                    errors.append(exc)
+                    continue
+                self._pending_managed_handles.pop(execution_id, None)
+            if errors:
+                raise RuntimeError(
+                    f"{len(errors)} pending managed process(es) did not close"
+                ) from errors[0]
+
+        await _run_step(
+            "pending_managed:close",
+            _close_pending_managed,
+            lambda: not self._pending_managed_handles,
+            generation=id(self._pending_managed_handles),
+        )
 
         # Docker backend must be shut down BEFORE the supervisor — Docker
         # cleanup runs ``docker rm/stop/kill`` via ``supervisor.run()``, so
         # closing the supervisor first causes SupervisorClosedError during
         # container cleanup.  The supervisor is the last resource to close.
-        if self.docker_backend is not None and not self._cleanup_ledger.is_done("docker:shutdown"):
-            try:
-                await self.docker_backend.shutdown()
-                self._cleanup_ledger.mark_done("docker:shutdown")
-            except asyncio.CancelledError:
-                cancel_requested = True
-            except Exception as exc:  # noqa: BLE001
-                self._cleanup_ledger.record_error("docker:shutdown", exc)
-                logger.debug("ExecutionService shutdown: docker backend shutdown failed", exc_info=True)
+        if self.docker_backend is not None:
+            await _run_step(
+                "docker:shutdown",
+                self.docker_backend.shutdown,
+                lambda: _resource_owner_terminal(self.docker_backend),
+                generation=id(self.docker_backend),
+            )
 
-        if not self._cleanup_ledger.is_done("supervisor:shutdown"):
-            try:
-                await self.process_supervisor.shutdown()
-                self._cleanup_ledger.mark_done("supervisor:shutdown")
-            except asyncio.CancelledError:
-                cancel_requested = True
-            except Exception as exc:  # noqa: BLE001
-                self._cleanup_ledger.record_error("supervisor:shutdown", exc)
-                logger.debug("ExecutionService shutdown: supervisor shutdown failed", exc_info=True)
+        await _run_step(
+            "supervisor:shutdown",
+            self.process_supervisor.shutdown,
+            lambda: _resource_owner_terminal(self.process_supervisor),
+            generation=id(self.process_supervisor),
+        )
+
+        async def _terminal_proof_step() -> None:
+            return None
+
+        await _run_step(
+            "terminal:proof",
+            _terminal_proof_step,
+            self._terminal_ownership_proof,
+            generation=id(self),
+        )
 
         errors = self._cleanup_ledger.errors
         if errors:
@@ -918,7 +1058,63 @@ class ExecutionService:
                 f"error(s): " + "; ".join(type(e).__name__ for e in errors)
             ) from errors[0]
         self._shutdown_state = _ShutdownState.CLOSED
-        # If cleanup completed but a cancellation was requested, re-raise the
-        # CancelledError so structured-concurrency semantics are preserved.
+        # Cancellation is recorded by run_step and therefore normally falls
+        # through the error branch above.  Keep this guard for cancellation
+        # raised by a custom action after it has independently proven all
+        # resources terminal.
         if cancel_requested:
             raise asyncio.CancelledError()
+
+
+def _has_resource_owner(component: object) -> bool:
+    """Return whether an object exposes the ResourceOwner proof surface."""
+    return all(
+        callable(getattr(component, name, None))
+        for name in ("terminal_postcondition", "owned_resources")
+    )
+
+
+def _resource_owner_terminal(component: object) -> bool:
+    """Require both terminal proof and an empty independent resource oracle."""
+    if not _has_resource_owner(component):
+        return False
+    owner = cast("Any", component)
+    try:
+        terminal_closed = bool(getattr(owner, "terminal_closed"))
+        terminal_proof = bool(owner.terminal_postcondition())
+        resources = tuple(owner.owned_resources())
+    except Exception:  # noqa: BLE001 — an unknown owner is not terminal
+        return False
+    return terminal_closed and terminal_proof and not resources
+
+
+def _resource_owner_released(component: object, execution_id: str) -> bool:
+    """Prove one execution was released without closing its whole owner.
+
+    DockerBackend and similar multiplexed owners remain OPEN for other
+    executions after one lease is terminated. A per-execution oracle is
+    preferred; older owners can prove release through stable descriptors.
+    Backend-wide CLOSED is reserved for service shutdown.
+    """
+    owns = getattr(component, "owns_execution", None)
+    if callable(owns):
+        try:
+            return owns(execution_id) is False
+        except Exception:  # noqa: BLE001 — an unreadable oracle is unknown
+            return False
+    try:
+        resources = tuple(cast("Any", component).owned_resources())
+    except Exception:  # noqa: BLE001 — an unreadable oracle is unknown
+        return False
+    return not any(execution_id in resource for resource in resources)
+
+
+def _supervisor_owns(supervisor: object, execution_id: str) -> bool:
+    """Use a strict bool so test doubles cannot fake external ownership."""
+    owns = getattr(supervisor, "owns_execution", None)
+    if not callable(owns):
+        return False
+    try:
+        return owns(execution_id) is True
+    except Exception:  # noqa: BLE001 — treat an unreadable oracle as unknown
+        return False

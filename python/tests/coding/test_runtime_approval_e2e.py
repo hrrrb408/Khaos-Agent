@@ -122,7 +122,7 @@ async def test_fake_agent_runtime_changes_only_worktree_then_approved_apply(tmp_
     pipeline = VerificationPipeline(execution_service=execution)
     plan = VerificationPlan((VerificationStep("check", "unit-test", (sys.executable, "-c", "assert open('README.txt').read() == 'after\\n'"), workspace.worktree_path),))
     report = await pipeline.run(plan, task_id=task.id, workspace_id=workspace.id)
-    assert report[0].status == "passed"
+    assert report[0].status == "passed", report[0].diagnostics
     changeset = await manager.build_changeset(workspace.id)
     assert changeset.base_sha == workspace.base_sha
     assert changeset.content_hash

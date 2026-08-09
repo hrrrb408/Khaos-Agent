@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from khaos.agent.approval import StepExecutionAuthority
 from khaos.exceptions import ToolNotFoundError
 from khaos.permissions.resource import (
     ResourceResolver,
@@ -747,6 +748,16 @@ class ToolInvocationBroker:
 
     async def invoke(self, name: str, *, mode: str, context: dict[str, Any], **params: Any) -> Any:
         definition = self.registry.get(name)
+        if context.get("step_authority_required"):
+            authority = context.get("step_execution_authority")
+            if not isinstance(authority, StepExecutionAuthority):
+                raise PermissionError(
+                    "tool invocation requires immutable StepExecutionAuthority"
+                )
+            if context.get("step_execution_digest") != authority.digest():
+                raise PermissionError(
+                    "tool invocation received a modified StepExecutionAuthority"
+                )
         capabilities = definition.capabilities
         if not capabilities and self.registry.enforce_capabilities:
             raise PermissionError(f"tool {name} has no declared capability")

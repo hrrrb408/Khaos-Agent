@@ -221,7 +221,7 @@ class BrowserManager:
     @property
     def terminal_closed(self) -> bool:
         """True only when all browser-owned resources are released."""
-        return self._closed
+        return self._closed and not self.owned_resources()
 
     @property
     def is_quarantined(self) -> bool:

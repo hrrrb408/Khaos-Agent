@@ -24,6 +24,117 @@ class ApprovalDecision:
 
 
 @dataclass(frozen=True)
+class StepExecutionAuthority:
+    """Immutable authority snapshot for one executable tool step.
+
+    Turn-level context may evolve while an approval is pending.  This object
+    is the boundary between approval and execution: both sides bind to the
+    same identity, workspace, cwd, environment, backend, policy, resource,
+    tool, and argument scope.  Environment values are deliberately excluded;
+    only the final allowlisted key set is bound.
+    """
+
+    principal_id: str
+    project_id: str
+    session_id: str
+    task_id: str
+    turn_id: str
+    step_id: str
+    tool_call_id: str
+    tool_name: str
+    workspace_id: str
+    workspace_generation: int
+    cwd_identity: str
+    permission_profile_digest: str
+    environment_keys: tuple[str, ...]
+    sandbox_backend: str
+    network_authority: str
+    target: str
+    approval_target: str
+    arguments_digest: str
+    authorization_resource_digest: str
+    authorization_epoch: int
+    policy_digest: str
+    tool_schema_digest: str
+    tool_security_digest: str
+    approval_receipt_digest: str = ""
+
+    def __post_init__(self) -> None:
+        required = (
+            self.principal_id,
+            self.project_id,
+            self.session_id,
+            self.task_id,
+            self.turn_id,
+            self.step_id,
+            self.tool_call_id,
+            self.tool_name,
+            self.workspace_id,
+            self.cwd_identity,
+            self.permission_profile_digest,
+            self.sandbox_backend,
+            self.network_authority,
+            self.target,
+            self.approval_target,
+            self.arguments_digest,
+            self.policy_digest,
+            self.tool_schema_digest,
+            self.tool_security_digest,
+        )
+        if any(not value for value in required):
+            raise ValueError("step execution authority fields must not be empty")
+        if self.workspace_generation < 0 or self.authorization_epoch < 0:
+            raise ValueError("step execution authority generations must be non-negative")
+        if any(not isinstance(key, str) or not key for key in self.environment_keys):
+            raise ValueError("step execution environment keys must be non-empty strings")
+        if tuple(sorted(set(self.environment_keys))) != self.environment_keys:
+            raise ValueError("step execution environment keys must be sorted and unique")
+
+    def _payload(self, *, include_receipt: bool) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "principal_id": self.principal_id,
+            "project_id": self.project_id,
+            "session_id": self.session_id,
+            "task_id": self.task_id,
+            "turn_id": self.turn_id,
+            "step_id": self.step_id,
+            "tool_call_id": self.tool_call_id,
+            "tool_name": self.tool_name,
+            "workspace_id": self.workspace_id,
+            "workspace_generation": self.workspace_generation,
+            "cwd_identity": self.cwd_identity,
+            "permission_profile_digest": self.permission_profile_digest,
+            "environment_keys": self.environment_keys,
+            "sandbox_backend": self.sandbox_backend,
+            "network_authority": self.network_authority,
+            "target": self.target,
+            "approval_target": self.approval_target,
+            "arguments_digest": self.arguments_digest,
+            "authorization_resource_digest": self.authorization_resource_digest,
+            "authorization_epoch": self.authorization_epoch,
+            "policy_digest": self.policy_digest,
+            "tool_schema_digest": self.tool_schema_digest,
+            "tool_security_digest": self.tool_security_digest,
+        }
+        if include_receipt:
+            payload["approval_receipt_digest"] = self.approval_receipt_digest
+        return payload
+
+    def scope_digest(self) -> str:
+        """Digest the authority scope before an approval receipt is attached."""
+        return _canonical_digest(self._payload(include_receipt=False))
+
+    def digest(self) -> str:
+        """Digest the final step authority including its approval receipt."""
+        return _canonical_digest(self._payload(include_receipt=True))
+
+    @property
+    def step_execution_digest(self) -> str:
+        """Stable public spelling for the final step authority digest."""
+        return self.digest()
+
+
+@dataclass(frozen=True)
 class ApprovalBinding:
     """Immutable authority scope for one ordinary tool approval."""
 
@@ -52,6 +163,10 @@ class ApprovalBinding:
     # matches this value, so any post-approval mutation to a security
     # field is detected and refused.
     tool_security_digest: str = ""
+    # Scope digest of the immutable StepExecutionAuthority reviewed for this
+    # approval.  The final authority adds the broker binding digest as its
+    # approval receipt.
+    step_authority_digest: str = ""
 
     def __post_init__(self) -> None:
         required = (
@@ -91,11 +206,20 @@ class ApprovalBinding:
             "policy_digest": self.policy_digest,
             "tool_schema_digest": self.tool_schema_digest,
             "tool_security_digest": self.tool_security_digest,
+            "step_authority_digest": self.step_authority_digest,
         }
         canonical = json.dumps(
             payload, sort_keys=True, separators=(",", ":")
         ).encode("utf-8")
         return hashlib.sha256(canonical).hexdigest()
+
+
+def _canonical_digest(value: object) -> str:
+    """Return the canonical digest used by immutable step authorities."""
+    canonical = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
 
 
 @dataclass
@@ -915,13 +1039,6 @@ class ApprovalBroker:
                 record.decision = "rejected"
             record.decide_count += 1
             return True
-
-
-def _canonical_digest(value: object) -> str:
-    encoded = json.dumps(
-        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
 
 
 def _normalize_operation_binding(binding: dict, expiry: float) -> dict:

@@ -7,7 +7,7 @@ import logging
 import os
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields as dataclass_fields
 from pathlib import Path
 from typing import Any
 
@@ -190,6 +190,79 @@ class RuntimeConfig:
     project_id: str = ""
 
 
+@dataclass(frozen=True)
+class ProductionRuntimeConfig:
+    """Production-safe runtime input with no injectable security owners.
+
+    The legacy :class:`RuntimeConfig` remains available for tests and trusted
+    development adapters, where injected mocks are useful.  Production entry
+    points should construct this type instead.  It intentionally has no
+    ``tool_scheduler``, ``execution_service``, ``sandbox``, ``network_guard``,
+    ``memory_manager``, ``browser_manager``, or ``workspace_manager`` fields;
+    the factory must construct those owners from the effective policy.
+    Borrowed lifecycle authorities (audit, approval, Office, and cleanup) are
+    explicit because their ownership is validated separately by the factory.
+    """
+
+    project_root: Path = field(default_factory=Path.cwd)
+    config_path: Path | None = None
+    mode_override: str | None = None
+    confirm_callback: Any = None
+    db: Any = None
+    router: Any = None
+    mode_manager: ModeManager | None = None
+    audit_logger: AuditLogger | None = None
+    task_manager: TaskManager | None = None
+    coding_context_builder: Any = None
+    agent_config: AgentConfig | None = None
+    skill_manager: SkillManager | None = None
+    cleanup_authority: RuntimeCleanupAuthority | None = None
+    approval_broker: Any = None
+    office_authority: OfficeMutationAuthority | None = None
+    principal_id: str = ""
+    source_transport: str = "unknown"
+    foreground_session: bool = False
+    session_id: str = ""
+    runtime_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    tool_allowlist: list[str] | None = None
+    channel_registry: Any = None
+    channel_admins: frozenset[str] = field(default_factory=frozenset)
+    cron_engine: Any = None
+    subagent_spawner: Any = None
+    project_id: str = ""
+
+    def as_runtime_config(self) -> RuntimeConfig:
+        """Materialize the internal config after the structural boundary."""
+        return RuntimeConfig(
+            project_root=self.project_root,
+            config_path=self.config_path,
+            mode_override=self.mode_override,
+            confirm_callback=self.confirm_callback,
+            db=self.db,
+            router=self.router,
+            mode_manager=self.mode_manager,
+            audit_logger=self.audit_logger,
+            task_manager=self.task_manager,
+            coding_context_builder=self.coding_context_builder,
+            agent_config=self.agent_config,
+            skill_manager=self.skill_manager,
+            cleanup_authority=self.cleanup_authority,
+            approval_broker=self.approval_broker,
+            office_authority=self.office_authority,
+            principal_id=self.principal_id,
+            source_transport=self.source_transport,
+            foreground_session=self.foreground_session,
+            session_id=self.session_id,
+            runtime_id=self.runtime_id,
+            tool_allowlist=self.tool_allowlist,
+            channel_registry=self.channel_registry,
+            channel_admins=self.channel_admins,
+            cron_engine=self.cron_engine,
+            subagent_spawner=self.subagent_spawner,
+            project_id=self.project_id,
+        )
+
+
 @dataclass
 class RuntimeResult:
     loop: AgentLoop
@@ -304,8 +377,13 @@ class RuntimeResult:
 
     @property
     def terminal_closed(self) -> bool:
-        """True only after the runtime cleanup task reports CLOSED."""
-        return self._close_state is CloseState.CLOSED and self._closed
+        """True only after CLOSED plus every child owner proves terminal."""
+        return (
+            self._close_state is CloseState.CLOSED
+            and self._closed
+            and self._child_terminal_proofs_hold()
+            and not self.owned_resources()
+        )
 
     @property
     def is_quarantined(self) -> bool:
@@ -315,6 +393,9 @@ class RuntimeResult:
     def owned_resources(self) -> tuple[str, ...]:
         """Aggregate child-owner resources without hiding their references."""
         resources: list[str] = []
+        runtime_state_closed = (
+            self._close_state is CloseState.CLOSED and self._closed
+        )
         for name, component in (
             ("execution_service", self.execution_service),
             ("browser_manager", self.browser_manager),
@@ -334,9 +415,9 @@ class RuntimeResult:
             owned = getattr(component, "owned_resources", None)
             if callable(owned):
                 resources.extend(f"{name}:{item}" for item in owned())
-            elif not self.terminal_closed:
+            elif not runtime_state_closed:
                 resources.append(name)
-        if not self.terminal_closed and not resources:
+        if not runtime_state_closed and not resources:
             resources.append("runtime")
         return tuple(resources)
 
@@ -359,11 +440,13 @@ class RuntimeResult:
             if component is None:
                 continue
             proof = getattr(component, "terminal_postcondition", None)
-            if callable(proof) and not bool(proof()):
-                logger.error("runtime child %s lacks terminal proof", name)
+            terminal = getattr(component, "terminal_closed", None)
+            owned = getattr(component, "owned_resources", None)
+            if not callable(proof) or not callable(owned):
+                logger.error("runtime child %s has no complete terminal proof API", name)
                 return False
-            if not callable(proof):
-                logger.error("runtime child %s has no terminal proof API", name)
+            if not bool(terminal) or not bool(proof()) or tuple(owned()):
+                logger.error("runtime child %s lacks terminal proof", name)
                 return False
         return True
 
@@ -673,41 +756,27 @@ class RuntimeResult:
             raise
 
 
-# P1-1: the security-critical components a production RuntimeResult must own.
-# These are NEVER injected by a production caller (AgentService / SubAgent /
-# CLI / TUI all let the factory build them from the effective policy); only
-# the test suite injects mocks (under KHAOS_DEV_MODE=1).  In production mode
-# injecting any of these is rejected fail-closed — the caller must let the
-# factory construct them so they carry the authority seal implicitly.
-# BrowserManager is included explicitly because it owns browser contexts,
-# egress proxies, and their kernel-facing cleanup authority.
-_INJECTED_SECURITY_COMPONENTS: tuple[tuple[str, str], ...] = (
-    ("tool_scheduler", "ToolScheduler"),
-    ("execution_service", "ExecutionService"),
-    ("sandbox", "Sandbox"),
-    ("network_guard", "NetworkGuard"),
-    ("memory_manager", "MemoryManager"),
-    ("browser_manager", "BrowserManager"),
-)
-
-
 def _enforce_no_security_injection(cfg: RuntimeConfig) -> None:
     """Reject injected security-critical components in production mode.
 
-    P1-1 (production Runtime injection): the historical bug shape was
-    ``build_runtime(RuntimeConfig(tool_scheduler=legacy_scheduler, ...))``
-    silently reusing a scheduler with no SecurityMiddleware.  No production
-    caller does this today, but the *type* allowed it — so any future entry
-    point could re-introduce a second security authority.  This gate makes
-    the invariant structural: in production, the security-critical components
-    below MUST be constructed by the factory (they then carry the seal
-    implicitly).
+    The forbidden set is derived from the structural production type rather
+    than maintained as a manually updated deny-list.  Any field present on
+    the legacy/test config but absent from ``ProductionRuntimeConfig`` is
+    rejected automatically when non-empty.  Adding a new security owner
+    therefore requires adding it to the production-safe type deliberately;
+    forgetting to update a tuple cannot reopen this boundary.
     """
-    for field_name, type_name in _INJECTED_SECURITY_COMPONENTS:
+    production_fields = {
+        field_info.name for field_info in dataclass_fields(ProductionRuntimeConfig)
+    }
+    for field_info in dataclass_fields(RuntimeConfig):
+        field_name = field_info.name
+        if field_name in production_fields:
+            continue
         if getattr(cfg, field_name, None) is not None:
             raise PermissionError(
                 f"production RuntimeConfig.{field_name} must not be injected "
-                f"(a {type_name} built outside the factory cannot be proven "
+                f"(a {field_name} built outside the factory cannot be proven "
                 f"to carry the runtime authority seal; let build_runtime "
                 f"construct it from the effective policy).  This injection "
                 f"is permitted only in development/test mode "
@@ -749,8 +818,12 @@ def _enforce_borrowed_authority_match(
             )
 
 
-async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
+async def build_runtime(
+    cfg: RuntimeConfig | ProductionRuntimeConfig,
+) -> RuntimeResult:
     """Build and initialize a complete runtime; this is the sole loop factory."""
+    if isinstance(cfg, ProductionRuntimeConfig):
+        cfg = cfg.as_runtime_config()
     if cfg.db is None:
         raise ValueError("RuntimeConfig.db is required")
     # C-1-5a: fail-closed if principal_id is empty.  CLI/TUI explicitly

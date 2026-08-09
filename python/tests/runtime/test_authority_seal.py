@@ -59,6 +59,24 @@ def test_is_production_mode_reflects_env(monkeypatch):
     assert is_production_mode() is True
 
 
+def test_production_runtime_config_has_no_security_owner_injection_fields():
+    """The production input type cannot carry a second security authority."""
+    from dataclasses import fields
+
+    from khaos.runtime.factory import ProductionRuntimeConfig
+
+    field_names = {field.name for field in fields(ProductionRuntimeConfig)}
+    assert not field_names & {
+        "tool_scheduler",
+        "execution_service",
+        "sandbox",
+        "network_guard",
+        "memory_manager",
+        "browser_manager",
+        "workspace_manager",
+    }
+
+
 @pytest.mark.asyncio
 async def test_production_mode_rejects_injected_tool_scheduler(tmp_path, monkeypatch):
     """P1-1: in production mode, injecting a ToolScheduler is fail-closed."""

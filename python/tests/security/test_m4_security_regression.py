@@ -1065,8 +1065,13 @@ async def test_subagent_runner_passes_none_mode_manager_in_production():
     captured: dict = {}
 
     async def _fake_build_runtime(cfg):
+        from khaos.runtime import ProductionRuntimeConfig
+
+        captured["config_type"] = type(cfg)
+        captured["is_production_config"] = isinstance(cfg, ProductionRuntimeConfig)
         captured["mode_manager"] = cfg.mode_manager
-        captured["memory_manager"] = cfg.memory_manager
+        captured["has_memory_manager_field"] = hasattr(cfg, "memory_manager")
+        captured["memory_manager"] = getattr(cfg, "memory_manager", None)
         captured["principal_id"] = cfg.principal_id
         runtime = MagicMock()
         runtime.aclose = AsyncMock()
@@ -1103,8 +1108,10 @@ async def test_subagent_runner_passes_none_mode_manager_in_production():
     finally:
         runtime_mod.build_runtime = original
 
-    # C-1-5b: build_runtime receives None for mode_manager / memory_manager
-    # so it constructs per-turn instances from cfg.principal_id.
+    # C-1-5b: the structural production config has no injectable
+    # memory_manager field; build_runtime constructs the owner internally.
+    assert captured["is_production_config"] is True
+    assert captured["has_memory_manager_field"] is False
     assert captured["mode_manager"] is None
     assert captured["memory_manager"] is None
     # The per-turn principal_id comes from the task (not a server-level fallback).

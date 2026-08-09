@@ -4,7 +4,7 @@ from dataclasses import replace
 
 import pytest
 
-from khaos.agent.approval import ApprovalBinding, ApprovalBroker
+from khaos.agent.approval import ApprovalBinding, ApprovalBroker, StepExecutionAuthority
 from khaos.coding.task_manager import TaskManager, TaskStatus
 from khaos.grpc_server import TaskService
 from khaos.runtime import RequestContext
@@ -18,6 +18,39 @@ def _test_ctx(principal_id: str = "principal") -> RequestContext:
     same value — otherwise the new cross-principal guard hides the
     task as "not found"."""
     return RequestContext.for_rpc(principal_id)
+
+
+def test_step_execution_authority_digest_binds_scope_and_receipt():
+    authority = StepExecutionAuthority(
+        principal_id="principal",
+        project_id="project",
+        session_id="session",
+        task_id="task",
+        turn_id="turn",
+        step_id="attempt",
+        tool_call_id="call",
+        tool_name="terminal",
+        workspace_id="workspace",
+        workspace_generation=3,
+        cwd_identity="dev:ino",
+        permission_profile_digest="p" * 64,
+        environment_keys=("LANG", "PATH"),
+        sandbox_backend="LinuxBubblewrapBackend",
+        network_authority="n" * 64,
+        target="terminal:ls",
+        approval_target="terminal:ls",
+        arguments_digest="a" * 64,
+        authorization_resource_digest="r" * 64,
+        authorization_epoch=7,
+        policy_digest="d" * 64,
+        tool_schema_digest="s" * 64,
+        tool_security_digest="t" * 64,
+    )
+    with_receipt = replace(authority, approval_receipt_digest="b" * 64)
+    changed = replace(authority, cwd_identity="dev:other-ino")
+    assert authority.scope_digest() == with_receipt.scope_digest()
+    assert authority.digest() != with_receipt.digest()
+    assert authority.scope_digest() != changed.scope_digest()
 
 
 async def test_task_approval_resolves_waiting_tool_decision(tmp_path):

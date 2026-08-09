@@ -16,6 +16,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import re
 import secrets
 import shutil
@@ -33,8 +34,29 @@ from khaos.coding.planning.trusted_verification import (
 from khaos.coding.planning.verification_execution_models import (
     TrustedVerificationCommand,
 )
+from khaos.coding.execution.environment import scrub_spawn_environment
 
 logger = logging.getLogger(__name__)
+
+
+def _docker_cli_environment() -> dict[str, str]:
+    """Return the fixed environment used by every Docker CLI child.
+
+    Verification commands are model-reachable, so the Docker control plane
+    must not inherit provider credentials, proxy credentials, alternate
+    daemon endpoints, or user Docker configuration from the agent process.
+    The executable is already resolved to an absolute path by the backend;
+    the remaining environment is only locale, time-zone, and PATH metadata.
+    """
+    return scrub_spawn_environment(
+        {
+            "PATH": os.defpath,
+            "HOME": "/nonexistent",
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "TZ": "UTC",
+        }
+    )
 
 
 @dataclass(frozen=True)
@@ -366,6 +388,7 @@ class DockerVerificationSandboxBackend:
         )
         process = await asyncio.create_subprocess_exec(
             *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            env=_docker_cli_environment(),
         )
         stdout, stderr = await process.communicate()
         if process.returncode != 0:
@@ -552,6 +575,7 @@ class DockerVerificationSandboxBackend:
         process = await asyncio.create_subprocess_exec(
             str(self._docker), "start", container_id_or_name,
             stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+            env=_docker_cli_environment(),
         )
         _, stderr = await process.communicate()
         if process.returncode != 0:
@@ -576,6 +600,7 @@ class DockerVerificationSandboxBackend:
             str(self._docker), "attach", "--no-stdin",
             container_id_or_name,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            env=_docker_cli_environment(),
         )
         return process, process.stdout, process.stderr
 
@@ -603,6 +628,7 @@ class DockerVerificationSandboxBackend:
             container_id_or_name,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            env=_docker_cli_environment(),
         )
         return process, process.stdout, process.stderr
 
@@ -611,6 +637,7 @@ class DockerVerificationSandboxBackend:
         process = await asyncio.create_subprocess_exec(
             str(self._docker), "wait", container_id_or_name,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            env=_docker_cli_environment(),
         )
         stdout, _ = await process.communicate()
         if process.returncode != 0:
@@ -626,6 +653,7 @@ class DockerVerificationSandboxBackend:
             str(self._docker), "inspect", container_id_or_name,
             "--format", "{{json .}}",
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            env=_docker_cli_environment(),
         )
         stdout, _stderr = await process.communicate()
         if process.returncode != 0:
@@ -641,6 +669,7 @@ class DockerVerificationSandboxBackend:
             str(self._docker), "image", "inspect", image_digest,
             "--format", "{{.Id}}",
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            env=_docker_cli_environment(),
         )
         stdout, _stderr = await process.communicate()
         if process.returncode != 0:
@@ -653,6 +682,7 @@ class DockerVerificationSandboxBackend:
             killer = await asyncio.create_subprocess_exec(
                 str(self._docker), "kill", "--signal", sig, container_id_or_name,
                 stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                env=_docker_cli_environment(),
             )
             await killer.wait()
             await asyncio.sleep(0.1)
@@ -670,6 +700,7 @@ class DockerVerificationSandboxBackend:
         remover = await asyncio.create_subprocess_exec(
             str(self._docker), "rm", "-f", container_id_or_name,
             stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            env=_docker_cli_environment(),
         )
         await remover.wait()
         return await self.inspect_instance(container_id_or_name) is None
@@ -719,6 +750,7 @@ class DockerVerificationSandboxBackend:
             "--filter", "label=khaos.run-id",
             "--format", "{{.Names}}\t{{.Labels}}",
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            env=_docker_cli_environment(),
         )
         stdout, _ = await process.communicate()
         found: list[str] = []
@@ -771,6 +803,7 @@ class DockerVerificationSandboxBackend:
             "--filter", "label=khaos.run-id",
             "--format", "{{.Names}}\t{{.Labels}}",
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            env=_docker_cli_environment(),
         )
         stdout, _ = await process.communicate()
         results: list[dict[str, Any]] = []
@@ -927,6 +960,7 @@ class DockerVerificationSandboxBackend:
         process = await asyncio.create_subprocess_exec(
             str(self._docker), "image", "inspect", image_reference,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            env=_docker_cli_environment(),
         )
         stdout, stderr = await process.communicate()
         if process.returncode != 0:
@@ -1142,6 +1176,7 @@ class DockerVerificationSandboxBackend:
         args.extend((image_digest, *argv))
         create_proc = await asyncio.create_subprocess_exec(
             *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            env=_docker_cli_environment(),
         )
         create_stdout, create_stderr = await create_proc.communicate()
         if create_proc.returncode != 0:
@@ -1226,6 +1261,7 @@ class DockerVerificationSandboxBackend:
             str(self._docker), "start", "--attach", container_id,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            env=_docker_cli_environment(),
         )
         if use_persistent:
             import time as _t2

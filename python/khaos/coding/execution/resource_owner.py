@@ -1,7 +1,8 @@
 """Round-17 review §十四/§十七: unified lifecycle contract for security
 resource owners.
 
-The review identified that LSP, ProcessSupervisor, and BrowserEgressProxy
+The review identified that ExecutionService, ManagedProcessHandle, LSP,
+ProcessSupervisor, BrowserManager, and BrowserEgressProxy
 each had their own ad-hoc notion of "CLOSED" — with different state
 combinations, different cleanup semantics, and different (or missing)
 postcondition proofs.  This module defines a single :class:`ResourceOwner`
@@ -17,6 +18,10 @@ protocol that captures the unified lifecycle theorem:
          detached non-owned resources)
 
 Concretely:
+
+  ExecutionService:
+    state CLOSED       ❌
+    child owners empty + supervisor proof + external registry empty  ✅
 
   Process:
     signal sent       ❌
@@ -54,8 +59,10 @@ class ResourceOwner(Protocol):
     Implementations include :class:`~khaos.coding.execution.service.ExecutionService`,
     :class:`~khaos.coding.execution.managed.ManagedProcessHandle`,
     :class:`~khaos.coding.execution.supervisor.ProcessSupervisor`,
-    :class:`~khaos.coding.intelligence.lsp.client.LspClient`, and
-    :class:`~khaos.security.browser_egress_proxy.BrowserEgressProxy`.
+    :class:`~khaos.coding.intelligence.lsp.client.LspClient`,
+    :class:`~khaos.security.browser_egress_proxy.BrowserEgressProxy`,
+    :class:`~khaos.tools.browser_tools.BrowserManager`, and
+    :class:`~khaos.runtime.factory.RuntimeResult`.
 
     Admission is deliberately split into two independent fences:
 

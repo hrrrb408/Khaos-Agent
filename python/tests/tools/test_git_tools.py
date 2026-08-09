@@ -221,6 +221,7 @@ async def test_git_smart_commit_auto_message_for_new_file(tmp_path):
 
     result = json.loads(await git_smart_commit(str(repo), **_ctx(repo)))
 
+    assert "files_changed" in result, result
     assert result["files_changed"] == 1
     assert result["message"].startswith("feat")
     assert "feature.py" in result["message"]
@@ -241,6 +242,7 @@ async def test_git_smart_commit_custom_message(tmp_path):
         await git_smart_commit(str(repo), message="fix: custom msg", **_ctx(repo))
     )
 
+    assert "message" in result, result
     assert result["message"] == "fix: custom msg"
     assert result["files_changed"] == 1
 
@@ -253,6 +255,7 @@ async def test_git_smart_commit_test_file_type(tmp_path):
 
     result = json.loads(await git_smart_commit(str(repo), **_ctx(repo)))
 
+    assert "message" in result, result
     assert result["message"].startswith("test")
 
 
