@@ -1041,13 +1041,6 @@ class ApprovalBroker:
             return True
 
 
-def _canonical_digest(value: object) -> str:
-    encoded = json.dumps(
-        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
 def _normalize_operation_binding(binding: dict, expiry: float) -> dict:
     normalized = dict(binding)
     requester = str(normalized.get("requester") or normalized.get("session_id") or "")
