@@ -303,6 +303,7 @@ async def test_docker_backend_builds_hardened_fixed_argv(tmp_path):
     assert argv[argv.index("--network") + 1] == "none"
     assert argv[argv.index("--pull") + 1] == "never"
     assert "--init" in argv
+    assert "--sig-proxy=false" in argv
     assert argv[argv.index("--ipc") + 1] == "none"
     assert argv[argv.index("--pids-limit") + 1] == "256"
     assert argv[argv.index("--cpus") + 1] == "1.0"
