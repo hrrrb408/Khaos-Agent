@@ -179,6 +179,33 @@ def test_rename_identity_churn_is_fail_closed(tmp_path, monkeypatch):
     assert snapshot.complete is False
 
 
+def test_transient_incomplete_scan_retries_to_stable_view(tmp_path, monkeypatch):
+    import khaos.coding.workspace.storage as storage
+
+    root_identity = (1, 1)
+    stable = WorkspaceStorageSnapshot(
+        {(1, 2): 4096},
+        1,
+        True,
+        {"payload": (1, 2)},
+        root_identity,
+    )
+    transient = WorkspaceStorageSnapshot(
+        {(1, 2): 4096},
+        1,
+        False,
+        {"payload": (1, 2)},
+        root_identity,
+    )
+    scans = iter((transient, stable, stable))
+    monkeypatch.setattr(storage, "_capture_once", lambda _root: next(scans))
+
+    snapshot = storage.capture_workspace_snapshot(tmp_path)
+
+    assert snapshot.complete is True
+    assert snapshot.allocated_by_inode == stable.allocated_by_inode
+
+
 @pytest.mark.asyncio
 async def test_file_tool_and_process_write_share_authority(tmp_path):
     """File-tool writes and process (terminal) writes share the same
