@@ -32,12 +32,21 @@ jobs:
           go-version: "1.24.x"
           cache-dependency-path: go/go.mod
       - name: Build release subjects
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           release_commit="$(git rev-parse HEAD)"
           tag_commit="$(git rev-list -n 1 "refs/tags/${RELEASE_TAG}")"
           test "$release_commit" = "$tag_commit"
           mkdir -p dist
+          # A tag event proves only that a tag exists.  Require successful
+          # aggregate Security Closure and Product Integrity runs for this
+          # exact commit before producing any attestable subject.
+          python3 scripts/verify_release_gate_runs.py \
+            --repo "$GITHUB_REPOSITORY" \
+            --commit "$release_commit" \
+            --output dist/release-gate-evidence.json
           git archive --format=tar.gz --prefix="khaos-${RELEASE_TAG}/" \
             -o "dist/khaos-${RELEASE_TAG}-source.tar.gz" HEAD
           (cd go && go build -trimpath -o "../dist/khaos-gateway-linux-amd64" ./cmd/gateway)
@@ -48,7 +57,8 @@ jobs:
           python3 scripts/generate_release_evidence.py \
             --repo-root "$GITHUB_WORKSPACE" \
             --artifact-dir "$GITHUB_WORKSPACE/dist" \
-            --commit "$release_commit" --tag "$RELEASE_TAG"
+            --commit "$release_commit" --tag "$RELEASE_TAG" \
+            --gate-evidence "$GITHUB_WORKSPACE/dist/release-gate-evidence.json"
       - name: Generate signed SLSA provenance attestation
         id: provenance
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
@@ -67,4 +77,4 @@ jobs:
       - name: Upload immutable release evidence
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "$RELEASE_TAG" dist/* --clobber
+        run: gh release upload "$RELEASE_TAG" dist/*

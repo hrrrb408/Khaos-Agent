@@ -8,8 +8,8 @@ leaked a temp dir and a stale execution-id entry per process.
 
 All terminal paths (``wait`` / ``terminate`` / ``kill`` / ``aclose``) now go
 through a single lock-guarded ``_finalize_once()`` so the cleanup sequence
-(stderr → watchdog → supervisor unregister → ``on_terminal`` callback →
-remove temp home → ``_closed=True``) runs exactly once regardless of which
+(stderr → watchdog → supervisor unregister → remove temp home →
+``on_terminal`` callback → ``_closed=True``) runs exactly once regardless of which
 path observed process exit.  ``ExecutionService`` injects an ``on_terminal``
 callback that pops its own ``_active`` entry.
 """
@@ -56,7 +56,7 @@ class ManagedProcessHandle:
         supervisor=None,
         resource_watchdog: asyncio.Task[dict | None] | None = None,
         # P2-2: invoked exactly once when the process reaches a terminal
-        # state, before the temporary home is removed.  ExecutionService
+        # state, after the temporary home is removed.  ExecutionService
         # uses it to pop its own ``_active`` entry, so a process that
         # exits naturally (via ``wait()``) is no longer leaked there.
         on_terminal: Callable[[str], Awaitable[None]] | None = None,
@@ -312,21 +312,6 @@ class ManagedProcessHandle:
                 lambda: not _supervisor_owns(supervisor, self.execution_id),
             )
 
-        on_terminal = self._on_terminal
-        if on_terminal is not None:
-            callback_done = False
-
-            async def _notify_terminal() -> None:
-                nonlocal callback_done
-                await on_terminal(self.execution_id)
-                callback_done = True
-
-            await _run_step(
-                "on_terminal",
-                _notify_terminal,
-                lambda: callback_done,
-            )
-
         # temp-home removal: OBSERVABLE (round-13 P0-3). A real OSError
         # (permission, mount, open handle) must not be silently swallowed.
         if self._temporary_home is not None:
@@ -342,6 +327,25 @@ class ManagedProcessHandle:
                 "temp_home",
                 _remove_temp_home,
                 lambda: not temporary_home.exists(),
+            )
+
+        # Notify the parent owner only after the process-owned temporary HOME
+        # has been proven removed.  Removing the service registry entry before
+        # this point made the parent appear empty while this handle still
+        # retained filesystem ownership.
+        on_terminal = self._on_terminal
+        if on_terminal is not None:
+            callback_done = False
+
+            async def _notify_terminal() -> None:
+                nonlocal callback_done
+                await on_terminal(self.execution_id)
+                callback_done = True
+
+            await _run_step(
+                "on_terminal",
+                _notify_terminal,
+                lambda: callback_done,
             )
 
         errors = self._cleanup_ledger.errors

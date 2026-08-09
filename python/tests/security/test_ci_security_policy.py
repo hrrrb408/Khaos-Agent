@@ -53,6 +53,28 @@ def test_security_workflows_have_read_only_token_and_no_soft_failures():
         assert "persist-credentials: false" in text, workflow.name
 
 
+def test_release_provenance_binds_exact_required_gates_and_forbids_replacement():
+    """Release evidence must name exact successful gate runs, immutably."""
+    workflow = (WORKFLOWS / "release-provenance.yml").read_text(encoding="utf-8")
+    generator = (ROOT / "scripts" / "generate_release_evidence.py").read_text(
+        encoding="utf-8"
+    )
+    verifier = (ROOT / "scripts" / "verify_release_gate_runs.py").read_text(
+        encoding="utf-8"
+    )
+    assert "verify_release_gate_runs.py" in workflow
+    assert "--commit \"$release_commit\"" in workflow
+    assert "--gate-evidence" in workflow
+    assert "release-gate-evidence.json" in workflow
+    assert "--clobber" not in workflow
+    assert "security-closure-gate.yml" in verifier
+    assert "product-integrity-gate.yml" in verifier
+    assert 'run.get("conclusion") == "success"' in verifier
+    assert "required_gates" in generator
+    assert "run_id" in generator
+    assert "evidence_digest" in generator
+
+
 def test_platform_matrix_and_real_sandbox_jobs_are_mandatory():
     matrix = (WORKFLOWS / "security-contract-matrix.yml").read_text(encoding="utf-8")
     platform = (WORKFLOWS / "platform-sandbox-security.yml").read_text(encoding="utf-8")

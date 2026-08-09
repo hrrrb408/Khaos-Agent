@@ -1,9 +1,13 @@
 """Round-17 review §十五: Resource Ownership Closure E2E suite.
 
 This module applies a single behavior matrix to every ``ResourceOwner``
-implementation (:class:`~khaos.coding.execution.supervisor.ProcessSupervisor`,
+implementation (:class:`~khaos.coding.execution.service.ExecutionService`,
+:class:`~khaos.coding.execution.managed.ManagedProcessHandle`,
+:class:`~khaos.coding.execution.supervisor.ProcessSupervisor`,
 :class:`~khaos.coding.intelligence.lsp.client.LspClient`,
-:class:`~khaos.security.browser_egress_proxy.BrowserEgressProxy`).
+:class:`~khaos.security.browser_egress_proxy.BrowserEgressProxy`,
+:class:`~khaos.tools.browser_tools.BrowserManager`, and
+:class:`~khaos.runtime.factory.RuntimeResult`).
 
 The review identified that LSP, Supervisor, and BrowserEgressProxy each
 had their own ad-hoc notion of "CLOSED" — with different state
@@ -16,8 +20,11 @@ postcondition proofs.  This suite verifies the unified lifecycle theorem:
          postcondition
       3. no initializing/acquiring transaction remains
       4. no child owner remains non-terminal
-      5. all resource registries are empty (or contain only explicitly
-         detached non-owned resources)
+    5. all resource registries are empty (or contain only explicitly
+       detached non-owned resources)
+    6. independent external oracles (process returncode, temp paths,
+       supervisor registration, and child-owner inventories) agree with the
+       owner's terminal claim
 
 Concretely the behavior matrix is:
 
@@ -56,8 +63,15 @@ from khaos.coding.execution.supervisor import (
     SupervisorClosedError,
 )
 from khaos.coding.intelligence.lsp.client import LspClient, LspCloseError
-from khaos.security.browser_egress_proxy import BrowserEgressProxy, _ProxyState
+from khaos.security.browser_egress_proxy import (
+    BrowserEgressProxy,
+    _ProxyState,
+    _RelayLease,
+)
 from khaos.security.host_network import ValidatedTarget
+from khaos.tools.browser_tools import BrowserManager
+from khaos.runtime.factory import RuntimeResult
+from khaos.runtime.lifecycle import CloseState
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -251,6 +265,47 @@ async def test_supervisor_shutdown_settles_watchdog_before_unregister() -> None:
     assert supervisor.terminal_closed
     assert supervisor.terminal_postcondition()
     assert supervisor.owned_resources() == ()
+
+
+async def test_execution_service_closed_has_independent_owner_proof() -> None:
+    """ExecutionService CLOSED is backed by supervisor and registry oracles."""
+    service = ExecutionService(HostExecutionBackend())
+    await service.shutdown()
+    assert service.terminal_closed
+    assert service.terminal_postcondition()
+    assert service.owned_resources() == ()
+    assert service.process_supervisor.active_execution_ids == ()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process cleanup oracle")
+async def test_managed_handle_closed_proves_pid_and_temp_home_cleanup(
+    tmp_path: Path,
+) -> None:
+    """ManagedProcessHandle proves the real child and temporary HOME are gone."""
+    temporary_home = tmp_path / "managed-home"
+    temporary_home.mkdir()
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        "import time; time.sleep(30)",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    )
+    from khaos.coding.execution.managed import ManagedProcessHandle
+
+    handle = ManagedProcessHandle(
+        "matrix-managed-handle",
+        process,
+        temporary_home=temporary_home,
+    )
+    await handle.aclose()
+    assert process.returncode is not None
+    assert not temporary_home.exists()
+    assert handle.terminal_closed
+    assert handle.terminal_postcondition()
+    assert handle.owned_resources() == ()
 
 
 # ---------------------------------------------------------------------------
@@ -630,6 +685,92 @@ async def test_proxy_closed_implies_no_owned_resources() -> None:
     assert proxy.terminal_closed
     assert proxy.terminal_postcondition()
     assert proxy.owned_resources() == ()
+
+
+async def test_browser_manager_closed_has_empty_external_inventory() -> None:
+    """BrowserManager is a first-class owner even when no browser was launched."""
+    manager = BrowserManager()
+    result = await manager.close()
+    assert result["ok"] is True
+    assert manager.terminal_closed
+    assert manager.terminal_postcondition()
+    assert manager.owned_resources() == ()
+
+
+def test_runtime_result_terminal_proof_requires_child_owner_oracle() -> None:
+    """RuntimeResult cannot claim CLOSED while a child owner retains state."""
+
+    class ChildOwner:
+        terminal_closed = True
+
+        def __init__(self) -> None:
+            self.resources = ("child:live",)
+
+        def owned_resources(self) -> tuple[str, ...]:
+            return self.resources
+
+        def terminal_postcondition(self) -> bool:
+            return self.terminal_closed and not self.resources
+
+    child = ChildOwner()
+    runtime = RuntimeResult(
+        loop=SimpleNamespace(),
+        mode_manager=SimpleNamespace(),
+        task_manager=None,
+        skill_generator=None,
+        tool_scheduler=SimpleNamespace(),
+        memory_manager=SimpleNamespace(),
+        skill_manager=SimpleNamespace(),
+        new_verify_fix_loop=None,
+        execution_service=child,
+    )
+    runtime._close_state = CloseState.CLOSED
+    runtime._closed = True
+    assert not runtime.terminal_closed
+    assert runtime.owned_resources() == ("execution_service:child:live",)
+    child.resources = ()
+    assert runtime.terminal_closed
+    assert runtime.terminal_postcondition()
+    assert runtime.owned_resources() == ()
+
+
+class _RetryableRelayWriter:
+    """Writer oracle that fails once, then proves terminal on retry."""
+
+    def __init__(self) -> None:
+        self.close_calls = 0
+        self.wait_closed_calls = 0
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+    async def wait_closed(self) -> None:
+        self.wait_closed_calls += 1
+        if self.wait_closed_calls == 1:
+            raise OSError("upstream close transient failure")
+
+
+async def test_proxy_retries_retained_relay_lease_after_handler_failure() -> None:
+    """A failed handler lease remains owned and is retried by proxy.close()."""
+    guard = _PinnedGuard()
+    proxy = BrowserEgressProxy(guard)  # type: ignore[arg-type]
+    writer = _RetryableRelayWriter()
+    lease = _RelayLease(writer)  # type: ignore[arg-type]
+    proxy._relay_leases.add(lease)
+    proxy._upstream_writers.add(writer)  # type: ignore[arg-type]
+
+    with pytest.raises(RuntimeError, match="partially failed"):
+        await proxy.close()
+    assert proxy.is_quarantined
+    assert not proxy.terminal_closed
+    assert lease in proxy._relay_leases
+    assert proxy.owned_resources()
+
+    await proxy.close()
+    assert proxy.terminal_closed
+    assert proxy.terminal_postcondition()
+    assert proxy.owned_resources() == ()
+    assert writer.wait_closed_calls >= 2
 
 
 async def test_proxy_new_state_admission_open() -> None:

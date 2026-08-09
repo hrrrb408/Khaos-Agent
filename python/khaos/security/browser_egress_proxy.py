@@ -87,6 +87,8 @@ class _RelayLease:
     tasks: set[asyncio.Task] = field(default_factory=set)
     terminal: bool = False
     _close_error: BaseException | None = None
+    _close_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    _close_task: asyncio.Task[None] | None = field(default=None, repr=False)
 
     def create_task(self, coroutine) -> asyncio.Task:
         """Create and publish a child task before the next cancellable await."""
@@ -95,7 +97,23 @@ class _RelayLease:
         return task
 
     async def close(self) -> None:
-        """Cancel, settle, and close every resource in this lease."""
+        """Cancel, settle, and close every resource in this lease.
+
+        The close task is shared between the handler finally block and the
+        proxy owner.  A failed task is deliberately not reused: the lease
+        remains registered and the next owner-level close gets a fresh retry.
+        """
+        async with self._close_lock:
+            if self.terminal:
+                return
+            close_task = self._close_task
+            if close_task is None or close_task.done():
+                close_task = asyncio.ensure_future(self._run_close())
+                self._close_task = close_task
+        await asyncio.shield(close_task)
+
+    async def _run_close(self) -> None:
+        """Run the retryable lease cleanup sequence."""
         for task in tuple(self.tasks):
             if not task.done():
                 task.cancel()
@@ -298,8 +316,8 @@ class BrowserEgressProxy:
 
     @property
     def terminal_closed(self) -> bool:
-        """Round-17: True only when CLOSED (all resources proven terminated)."""
-        return self._state is _ProxyState.CLOSED
+        """True only when CLOSED and the independent resource proof is empty."""
+        return self._state is _ProxyState.CLOSED and self._terminal_resources_empty()
 
     @property
     def is_quarantined(self) -> bool:
@@ -335,6 +353,10 @@ class BrowserEgressProxy:
     def terminal_postcondition(self) -> bool:
         """Round-17 review §十四: True when listener is closed, all
         handler tasks are done, and all client writers are closed."""
+        return self._state is _ProxyState.CLOSED and self._terminal_resources_empty()
+
+    def _terminal_resources_empty(self) -> bool:
+        """Return the resource-level half of the terminal theorem."""
         return (
             self._server is None
             and not self._client_tasks
@@ -427,11 +449,10 @@ class BrowserEgressProxy:
             self._close_requested = True
             if self._state is not _ProxyState.QUARANTINED:
                 self._state = _ProxyState.CLOSING
-        if self._close_task is not None and not self._close_task.done():
-            await asyncio.shield(self._close_task)
-            return
-        self._close_task = asyncio.ensure_future(self._run_close())
-        await asyncio.shield(self._close_task)
+            if self._close_task is None or self._close_task.done():
+                self._close_task = asyncio.ensure_future(self._run_close())
+            close_task = self._close_task
+        await asyncio.shield(close_task)
 
     async def _run_close(self) -> None:
         """The actual cleanup sequence — may run multiple times via retry."""
@@ -479,11 +500,42 @@ class BrowserEgressProxy:
             await self._cleanup_ledger.run_step(
                 "handlers_drain",
                 action=_drain_handlers,
-                verify=lambda: (
-                    not self._client_tasks
-                    and not self._upstream_writers
-                    and not self._relay_leases
-                ),
+                # Relay leases are a separate transitive owner.  A handler
+                # may have been cancelled after it registered a lease and
+                # before its finally block could close it; the next cleanup
+                # step must own and retry that lease instead of making this
+                # step permanently fail on the same retained resource.
+                verify=lambda: not self._client_tasks,
+            )
+
+            async def _close_relay_leases() -> None:
+                errors: list[BaseException] = []
+                for lease in tuple(self._relay_leases):
+                    try:
+                        await lease.close()
+                    except asyncio.CancelledError:
+                        raise
+                    except BaseException as exc:  # noqa: BLE001 — retain lease
+                        errors.append(exc)
+                        continue
+                    if not lease.terminal:
+                        errors.append(
+                            RuntimeError(
+                                f"relay lease {id(lease)} lacks terminal proof"
+                            )
+                        )
+                        continue
+                    self._relay_leases.discard(lease)
+                    self._upstream_writers.discard(lease.upstream_writer)
+                if errors:
+                    raise RuntimeError(
+                        f"{len(errors)} browser relay lease(s) did not close"
+                    ) from errors[0]
+
+            await self._cleanup_ledger.run_step(
+                "relay_leases_close",
+                action=_close_relay_leases,
+                verify=lambda: not self._relay_leases,
             )
 
             # Step 3: wait for the stopped listener after accepted handlers
@@ -537,12 +589,17 @@ class BrowserEgressProxy:
                     "BrowserEgressProxy close() partially failed: "
                     + "; ".join(type(e).__name__ for e in errors)
                 ) from errors[0]
-            if not self.terminal_postcondition():
+            if not self._terminal_resources_empty():
                 self._state = _ProxyState.QUARANTINED
                 raise RuntimeError(
                     "BrowserEgressProxy cleanup completed without terminal proof"
                 )
             self._state = _ProxyState.CLOSED
+            if not self.terminal_closed or not self.terminal_postcondition():
+                self._state = _ProxyState.QUARANTINED
+                raise RuntimeError(
+                    "BrowserEgressProxy CLOSED state lacks terminal proof"
+                )
 
     async def _handle_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter,

@@ -20,6 +20,7 @@ from khaos.coding.execution.binding import (
     ExecutionDirectoryBinding,
     open_execution_directory_binding,
 )
+from khaos.coding.execution.environment import scrub_spawn_environment
 from khaos.coding.execution.models import ExecutionRequest, ExecutionResult
 from khaos.coding.execution.native_launcher import build_process_launch
 from khaos.coding.workspace.storage import (
@@ -263,6 +264,11 @@ class ProcessSupervisor:
                 f"ProcessSupervisor is {self._state.value}, "
                 f"not accepting new executions"
             )
+        # Final choke point: do not inherit the agent/desktop environment
+        # even if an upstream backend accidentally included a credential in
+        # its allowlist or overlay.  An explicit env mapping also prevents
+        # asyncio from implicitly inheriting the parent environment.
+        safe_environment = scrub_spawn_environment(env or {})
         try:
             process = await asyncio.create_subprocess_exec(
                 *(launch.argv if launch is not None else request.argv),
@@ -271,7 +277,7 @@ class ProcessSupervisor:
                     if launch is not None
                     else str(cwd or request.cwd)
                 ),
-                env=env,
+                env=safe_environment,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 start_new_session=(

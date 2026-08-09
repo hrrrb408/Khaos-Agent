@@ -13,6 +13,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, TypeVar
 
+from khaos.coding.execution.environment import scrub_spawn_environment
 from khaos.coding.workspace.boundary import PROTECTED_WORKSPACE_NAMES
 from khaos.coding.workspace.git_identity import (
     GitIdentityError,
@@ -256,7 +257,7 @@ class WorkspaceManager:
             require_root_owner=False,
             label="workspace authority root",
         )
-        environment = {
+        environment = scrub_spawn_environment({
             "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": os.devnull,
             "GIT_TERMINAL_PROMPT": "0",
@@ -265,7 +266,16 @@ class WorkspaceManager:
             "LANG": "C.UTF-8",
             "LC_ALL": "C.UTF-8",
             "HOME": str(self.root),
-        }
+        }, preserve={
+            # These values are deliberately pinned to local safe controls;
+            # removing them would re-enable Git's ambient user/system config
+            # or interactive credential helpers.
+            "GIT_CONFIG_NOSYSTEM",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_TERMINAL_PROMPT",
+            "GIT_ASKPASS",
+            "SSH_ASKPASS",
+        })
         process = await asyncio.create_subprocess_exec(
             str(self._git_executable), *args, cwd=str(repository), env=environment,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE

@@ -14,7 +14,8 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-from khaos.agent.approval import ApprovalBinding
+from khaos.agent.approval import ApprovalBinding, StepExecutionAuthority
+from khaos.coding.execution.environment import is_non_inheritable_secret_key
 from khaos.exceptions import PermissionDeniedError
 from khaos.permissions import (
     ApprovalMode,
@@ -268,6 +269,9 @@ class PermissionRequest:
     tool_schema_digest: str = ""
     tool_security_digest: str = ""
     approval_id: str = ""
+    # Final digest of the immutable authority consumed by execution.  The
+    # binding itself carries the pre-receipt scope digest.
+    step_execution_digest: str = ""
 
 
 @dataclass
@@ -812,14 +816,32 @@ class ToolScheduler:
                     )
                     continue
 
+            approval_target = decision.target
+            if destructive_context is not None:
+                binding = destructive_context["binding"]
+                approval_target = (
+                    f"{binding['operation']}:{binding['target']} "
+                    f"head={binding['head']} diff={binding['diff_hash']}"
+                )
+
+            # Freeze the authority after all pre-approval target/resource
+            # resolution has completed.  The same immutable object is carried
+            # through the approval request and into the invocation broker.
+            authorization_epoch = await self.permission_engine.authorization_snapshot()
+            step_authority = self._build_step_authority(
+                tool=tool,
+                call=normalized,
+                tool_context=tool_context,
+                resource=resource,
+                authorization_epoch=authorization_epoch,
+                approval_target=approval_target,
+            )
+            normalized["_step_authority"] = step_authority
+            normalized["_step_authority_required"] = True
+            normalized["_step_authority_scope_digest"] = step_authority.scope_digest()
+            normalized["_step_execution_digest"] = step_authority.digest()
+
             if decision.requires_user_confirm or destructive_context is not None:
-                approval_target = decision.target
-                if destructive_context is not None:
-                    binding = destructive_context["binding"]
-                    approval_target = (
-                        f"{binding['operation']}:{binding['target']} "
-                        f"head={binding['head']} diff={binding['diff_hash']}"
-                    )
                 principal_id = str(tool_context.get("principal_id") or "")
                 current_session = str(session_id or "")
                 if not principal_id or not current_session:
@@ -838,7 +860,6 @@ class ToolScheduler:
                     )
                     continue
                 expires_at = time.time() + 120.0
-                authorization_epoch = await self.permission_engine.authorization_snapshot()
                 project_id = str(tool_context.get("project_id") or "")
                 if resource is None and tool_context.get("coding_workspace_enforced"):
                     raise PermissionDeniedError("workspace authorization resource is missing")
@@ -886,6 +907,7 @@ class ToolScheduler:
                     policy_digest=self.permission_engine.policy_digest,
                     tool_schema_digest=tool.schema_digest,
                     tool_security_digest=tool.security_digest,
+                    step_authority_digest=step_authority.scope_digest(),
                 )
                 broker = tool_context.get("approval_broker")
                 if broker is None:
@@ -902,6 +924,12 @@ class ToolScheduler:
                     continue
                 approval_handle = await broker.register_tool_approval(binding)
                 binding_digest = str(approval_handle)
+                step_authority = replace(
+                    step_authority,
+                    approval_receipt_digest=binding_digest,
+                )
+                normalized["_step_authority"] = step_authority
+                normalized["_step_execution_digest"] = step_authority.digest()
                 normalized["_approval_id"] = getattr(
                     approval_handle, "approval_id", ""
                 )
@@ -940,6 +968,7 @@ class ToolScheduler:
                     policy_digest=binding.policy_digest,
                     tool_schema_digest=binding.tool_schema_digest,
                     tool_security_digest=binding.tool_security_digest,
+                    step_execution_digest=step_authority.digest(),
                 )
                 yield SchedulerEvent(event="permission_request", permission_request=request)
                 confirmation = await self._confirm(request, confirm_callback)
@@ -1156,7 +1185,15 @@ class ToolScheduler:
         effect_status = EFFECT_NOT_STARTED
         reconciliation_hint = str(getattr(tool, "reconciliation_hint", "") or "")
         operation_claim: _OperationClaim | None = None
+        step_authority = call.get("_step_authority")
         try:
+            self._verify_step_authority(
+                authority=step_authority,
+                call=call,
+                tool=tool,
+                tool_context=tool_context,
+                resource=resource,
+            )
             await self.permission_engine.validate_dispatch_epoch(
                 int(call.get("_authorization_epoch", 0))
             )
@@ -1309,6 +1346,12 @@ class ToolScheduler:
                 invocation_context["office_authority"] = office_authority
             if call.get("_approval_context") is not None:
                 invocation_context["approval_context"] = call["_approval_context"]
+            if isinstance(step_authority, StepExecutionAuthority):
+                invocation_context["step_execution_authority"] = step_authority
+                invocation_context["step_execution_digest"] = step_authority.digest()
+                invocation_context["step_authority_required"] = bool(
+                    call.get("_step_authority_required")
+                )
             invocation_context["effect_id"] = effect_id
             output = await asyncio.wait_for(
                 self.invocation_broker.invoke(tool.name, mode=mode, context=invocation_context, **call.get("arguments", {})),
@@ -2243,6 +2286,195 @@ class ToolScheduler:
             if not updated:
                 raise RuntimeError("durable tool operation lost ownership")
 
+    def _build_step_authority(
+        self,
+        *,
+        tool,
+        call: dict[str, Any],
+        tool_context: dict[str, Any],
+        resource: AuthorizationResource | None,
+        authorization_epoch: int,
+        approval_target: str,
+        approval_receipt_digest: str = "",
+    ) -> StepExecutionAuthority:
+        """Freeze the exact authority scope used by one scheduler step.
+
+        Production AgentLoop contexts provide every identity explicitly.  The
+        namespaced legacy fallbacks keep direct library/test schedulers
+        usable; ``build_runtime`` still rejects an empty production principal
+        before a scheduler can be exposed.
+        """
+        principal_id = str(tool_context.get("principal_id") or "legacy-principal")
+        project_id = str(tool_context.get("project_id") or "legacy-project")
+        session_id = str(tool_context.get("session_id") or "legacy-session")
+        task_id = str(tool_context.get("task_id") or f"session:{session_id}")
+        turn_id = str(tool_context.get("turn_id") or f"turn:{call['id']}")
+        step_id = str(tool_context.get("attempt_id") or f"step:{call['id']}")
+        workspace_id = str(
+            tool_context.get("workspace_id") or f"session:{session_id}"
+        )
+        workspace_generation = int(
+            resource.workspace_generation
+            if resource is not None
+            else tool_context.get("workspace_generation", 0) or 0
+        )
+        cwd_identity = _authority_identity(
+            tool_context.get(
+                "cwd_identity",
+                tool_context.get("workspace_cwd_identity", "cwd:unspecified"),
+            )
+        )
+        requested_cwd = call.get("arguments", {}).get("cwd")
+        if requested_cwd is not None:
+            # The model controls the relative cwd argument.  Bind it into
+            # the snapshot alongside the workspace identity; the execution
+            # backend performs the final dirfd/inode verification later.
+            cwd_identity = _authority_identity((cwd_identity, str(requested_cwd)))
+        target = self._resolve_target(tool.name, call.get("arguments", {}), resource)
+        effective_policy_digest = str(
+            tool_context.get("effective_policy_digest") or ""
+        )
+        permission_profile_digest = str(
+            tool_context.get("permission_profile_digest")
+            or _canonical_digest(
+                {
+                    "permission_level": tool.permission_level,
+                    "target": approval_target,
+                    "network_policy": tool_context.get("network_policy", "none"),
+                    "effective_policy_digest": effective_policy_digest,
+                }
+            )
+        )
+        environment_keys = tool_context.get("environment_keys")
+        if environment_keys is None:
+            environment_keys = tool_context.get("execution_environment_keys")
+        if environment_keys is None:
+            profile = tool_context.get("permission_profile")
+            environment_keys = getattr(profile, "environment_keys", None)
+        if isinstance(environment_keys, str):
+            environment_keys = (environment_keys,)
+        if environment_keys is None:
+            environment_keys = ("LANG", "LC_ALL", "PATH", "TMPDIR")
+        normalized_environment_keys = tuple(
+            sorted(
+                {
+                    str(key)
+                    for key in environment_keys
+                    if not is_non_inheritable_secret_key(str(key))
+                }
+            )
+        )
+        if not normalized_environment_keys:
+            normalized_environment_keys = ("LANG", "LC_ALL", "PATH", "TMPDIR")
+
+        execution_service = tool_context.get("execution_service")
+        backend = tool_context.get("sandbox_backend")
+        if backend is None:
+            backend = tool_context.get("execution_backend")
+        if backend is None and execution_service is not None:
+            backend = getattr(execution_service, "backend", None)
+            if backend is None:
+                backend = getattr(execution_service, "backend_selector", None)
+        sandbox_backend = _authority_identity(backend or "backend:unspecified")
+
+        network_guard = tool_context.get("network_guard")
+        network_authority = tool_context.get("network_authority")
+        if network_authority is None:
+            network_authority = tool_context.get("network_authority_digest")
+        if network_authority is None:
+            network_authority = _canonical_digest(
+                {
+                    "guard_type": (
+                        type(network_guard).__qualname__
+                        if network_guard is not None
+                        else "none"
+                    ),
+                    "network_enabled": getattr(
+                        network_guard, "network_enabled", False
+                    ),
+                    "allowed_domains": _authority_sequence(
+                        getattr(network_guard, "allowed_domains", None)
+                    ),
+                    "blocked_domains": _authority_sequence(
+                        getattr(network_guard, "blocked_domains", None)
+                    ),
+                    "network_policy": tool_context.get("network_policy", "none"),
+                    "effective_policy_digest": effective_policy_digest,
+                }
+            )
+        network_authority = _authority_identity(network_authority)
+        authorization_resource_digest = (
+            resource.digest() if resource is not None else "resource:none"
+        )
+        return StepExecutionAuthority(
+            principal_id=principal_id,
+            project_id=project_id,
+            session_id=session_id,
+            task_id=task_id,
+            turn_id=turn_id,
+            step_id=step_id,
+            tool_call_id=str(call["id"]),
+            tool_name=tool.name,
+            workspace_id=workspace_id,
+            workspace_generation=workspace_generation,
+            cwd_identity=cwd_identity,
+            permission_profile_digest=permission_profile_digest,
+            environment_keys=normalized_environment_keys,
+            sandbox_backend=sandbox_backend,
+            network_authority=network_authority,
+            target=target,
+            approval_target=str(approval_target),
+            arguments_digest=_canonical_digest(call.get("arguments", {})),
+            authorization_resource_digest=authorization_resource_digest,
+            authorization_epoch=int(authorization_epoch),
+            policy_digest=str(
+                self.permission_engine.policy_digest or "policy:unspecified"
+            ),
+            tool_schema_digest=tool.schema_digest,
+            tool_security_digest=tool.security_digest,
+            approval_receipt_digest=str(approval_receipt_digest or ""),
+        )
+
+    def _verify_step_authority(
+        self,
+        *,
+        authority: StepExecutionAuthority | None,
+        call: dict[str, Any],
+        tool,
+        tool_context: dict[str, Any],
+        resource: AuthorizationResource | None,
+    ) -> None:
+        """Refuse execution if the approved authority no longer matches."""
+        if call.get("_step_authority_required") and not isinstance(
+            authority, StepExecutionAuthority
+        ):
+            raise PermissionDeniedError(
+                "step execution authority is missing; re-authorization required"
+            )
+        if authority is None:
+            return
+        if call.get("_step_authority_scope_digest") != authority.scope_digest():
+            raise PermissionDeniedError(
+                "step execution authority scope was modified before dispatch"
+            )
+        if call.get("_step_execution_digest") != authority.digest():
+            raise PermissionDeniedError(
+                "step execution authority receipt was modified before dispatch"
+            )
+        current = self._build_step_authority(
+            tool=tool,
+            call=call,
+            tool_context=tool_context,
+            resource=resource,
+            authorization_epoch=authority.authorization_epoch,
+            approval_target=authority.approval_target,
+            approval_receipt_digest=authority.approval_receipt_digest,
+        )
+        if current.digest() != authority.digest():
+            raise PermissionDeniedError(
+                "step execution environment or authorization changed before dispatch"
+            )
+
     def _resolve_target(
         self,
         tool_name: str,
@@ -2499,6 +2731,28 @@ def _canonical_digest(value: object) -> str:
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _authority_identity(value: object) -> str:
+    """Serialize a backend/identity value without invoking arbitrary repr."""
+    if isinstance(value, str):
+        return value or "identity:unspecified"
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    if isinstance(value, (tuple, list)):
+        return json.dumps(list(value), separators=(",", ":"), ensure_ascii=False)
+    return f"{type(value).__module__}.{type(value).__qualname__}"
+
+
+def _authority_sequence(value: object) -> tuple[str, ...]:
+    """Normalize an optional domain/key collection for authority hashing."""
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        return (value,)
+    if isinstance(value, (tuple, list, set, frozenset)):
+        return tuple(sorted(str(item) for item in value))
+    return (_authority_identity(value),)
 
 
 def server_operation_key(

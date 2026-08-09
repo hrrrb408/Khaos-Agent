@@ -13,6 +13,7 @@ import tempfile
 from pathlib import Path
 
 from khaos.coding.execution.binding import open_execution_directory_binding
+from khaos.coding.execution.environment import scrub_spawn_environment
 from khaos.coding.execution.capability import (
     BackendAvailability,
     _cached_availability,
@@ -1008,4 +1009,4 @@ def _sandbox_environment(
     environment.setdefault("PATH", os.defpath)
     environment.setdefault("LANG", "C.UTF-8")
     environment.update({"HOME": home, "TMPDIR": tmpdir, "TMP": tmpdir, "TEMP": tmpdir})
-    return environment
+    return scrub_spawn_environment(environment)

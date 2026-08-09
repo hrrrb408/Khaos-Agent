@@ -34,6 +34,16 @@ class _FakeDockerBackend:
         self.contexts = []
         self.shutdown_called = False
 
+    @property
+    def terminal_closed(self):
+        return True
+
+    def owned_resources(self):
+        return ()
+
+    def terminal_postcondition(self):
+        return self.terminal_closed and not self.owned_resources()
+
     async def execute_resolved(self, context):
         self.contexts.append(context)
         return ExecutionResult(
@@ -370,7 +380,9 @@ async def test_docker_cleanup_refuses_foreign_container_name_collision(tmp_path)
 
     destructive = {"stop", "kill", "rm"}
     assert not any(call[0] in destructive for call in backend.cli_calls)
-    assert backend._active == {}
+    # The foreign collision is deliberately retained as an owned lease;
+    # silently dropping it would manufacture a false cleanup proof.
+    assert backend._active
 
 
 async def test_docker_backend_rejects_mount_option_injection_path(tmp_path):

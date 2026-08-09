@@ -141,6 +141,7 @@ class SubAgentRunner:
         )
 
         from khaos.runtime import (
+            ProductionRuntimeConfig,
             RuntimeConfig,
             build_runtime,
             close_runtime_or_register,
@@ -156,54 +157,50 @@ class SubAgentRunner:
         # the runtime construction raises ValueError.  No implicit
         # local-uid fallback in the build_runtime path.
         principal_id = task.principal_id or self.principal_id
-        runtime = await build_runtime(RuntimeConfig(
-            db=self.db,
+        # Production-safe subagents use the structural config that cannot
+        # carry a second scheduler, execution service, sandbox, network
+        # guard, memory owner, browser manager, or workspace manager.  The
+        # legacy config remains available for explicit test/development
+        # adapters that inject those components.
+        runtime_config_type = (
+            ProductionRuntimeConfig
+            if self.tool_scheduler is None
+            and not (self.inherit_memory and self.memory_manager is not None)
+            else RuntimeConfig
+        )
+        runtime_kwargs: dict[str, Any] = {
+            "db": self.db,
             # C-1-5b: pass ``mode_manager=None`` (production path) so
-            # ``build_runtime`` constructs a per-turn ``ModeManager`` from
-            # ``cfg.principal_id`` (= ``task.principal_id``).  Legacy / test
-            # callers may pass a mock, which ``build_runtime`` reuses as-is.
-            mode_manager=self.mode_manager,
-            router=self.router,
-            # B1: pass ``tool_scheduler=None`` (the default) so build_runtime
-            # constructs a fresh ToolScheduler with the full SecurityMiddleware
-            # stack (Sandbox / NetworkGuard / EffectivePolicy / AuditLogger).
-            # The previous path passed a bare scheduler without any security
-            # middleware, giving the subagent an unsupervised execution path.
-            tool_scheduler=self.tool_scheduler,
-            # B1: prune the runtime registry down to exactly the tools the
-            # task declared, so the subagent cannot invoke tools outside its
-            # scope even if they are registered globally.
-            tool_allowlist=(task.tools if self.tool_scheduler is None else None),
-            memory_manager=self.memory_manager if self.inherit_memory else None,
-            skill_manager=self.skill_manager, agent_config=config,
-            coding_context_builder=self.coding_context_builder,
-            office_authority=self.office_authority,
-            # B1: inherit the server-level approval broker / audit logger
-            # so approvals and audit events are bound to the same authority
-            # as the main AgentLoop.
-            approval_broker=self.approval_broker,
-            principal_id=principal_id,
-            source_transport="subagent",
-            foreground_session=False,
-            audit_logger=self.audit_logger,
-            # M4 batch 3.1.16A-5-1b (CRITICAL): inject the task's
-            # project_id so the subagent's AgentLoop._bound_project_id
-            # comes from the parent runtime's bound project identity
-            # (RPC-verified) instead of being recomputed from
-            # project_root.  This guarantees the subagent stamps the
-            # SAME project_id on its writes as the parent runtime.
-            project_id=effective_project_id,
-            # B1: inherit the server's project_root / config_path so the
-            # subagent loads the SAME ``khaos_policy.yaml`` and compiles the
-            # SAME EffectivePolicy as the main AgentLoop.  Without this, a
-            # server launched with ``--project-root /project/A`` from a
-            # different cwd would have the main runtime under
-            # ``/project/A/khaos_policy.yaml`` but the subagent under
-            # ``$CWD/khaos_policy.yaml`` — two security authorities.
-            project_root=project_root,
-            config_path=self.config_path,
-            cleanup_authority=self.cleanup_authority,
-        ))
+            # ``build_runtime`` constructs a per-turn manager from the task
+            # principal.  Legacy / test callers may pass a mock.
+            "mode_manager": self.mode_manager,
+            "router": self.router,
+            # B1: prune the registry down to the declared task tools.
+            "tool_allowlist": (task.tools if self.tool_scheduler is None else None),
+            "skill_manager": self.skill_manager,
+            "agent_config": config,
+            "coding_context_builder": self.coding_context_builder,
+            "office_authority": self.office_authority,
+            # B1: inherit the server-level approval broker / audit logger.
+            "approval_broker": self.approval_broker,
+            "principal_id": principal_id,
+            "source_transport": "subagent",
+            "foreground_session": False,
+            "audit_logger": self.audit_logger,
+            "project_id": effective_project_id,
+            # B1: inherit the same project policy/config root.
+            "project_root": project_root,
+            "config_path": self.config_path,
+            "cleanup_authority": self.cleanup_authority,
+        }
+        if runtime_config_type is RuntimeConfig:
+            # Explicit legacy/test adapters may inject these components; the
+            # production structural type has no fields for them.
+            runtime_kwargs["tool_scheduler"] = self.tool_scheduler
+            runtime_kwargs["memory_manager"] = (
+                self.memory_manager if self.inherit_memory else None
+            )
+        runtime = await build_runtime(runtime_config_type(**runtime_kwargs))
         try:
             logger.info(
                 "SubAgentRunner starting: task=%s session=%s goal=%r",

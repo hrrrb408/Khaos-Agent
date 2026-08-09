@@ -22,6 +22,7 @@ from typing import Any
 _GENERATED_NAMES = {
     "release-checksums.txt",
     "release-manifest.json",
+    "release-gate-evidence.json",
     "sbom.spdx.json",
 }
 
@@ -153,7 +154,55 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--artifact-dir", type=Path, required=True)
     parser.add_argument("--commit", required=True)
     parser.add_argument("--tag", required=True)
+    parser.add_argument("--gate-evidence", type=Path, required=True)
     return parser.parse_args()
+
+
+def _load_gate_evidence(path: Path, commit: str) -> dict[str, Any]:
+    """Validate the exact successful gate evidence selected for this release."""
+    try:
+        evidence = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"invalid release gate evidence: {exc}") from exc
+    if not isinstance(evidence, dict):
+        raise SystemExit("release gate evidence must be a JSON object")
+    if evidence.get("schema") != "khaos.release-gate-evidence.v1":
+        raise SystemExit("unsupported release gate evidence schema")
+    if evidence.get("commit") != commit:
+        raise SystemExit(
+            f"release gate evidence commit mismatch: {evidence.get('commit')} != {commit}"
+        )
+    supplied_digest = evidence.get("evidence_digest")
+    unsigned = dict(evidence)
+    unsigned.pop("evidence_digest", None)
+    if supplied_digest != _canonical_digest(unsigned):
+        raise SystemExit("release gate evidence digest mismatch")
+    gates = evidence.get("gates")
+    if not isinstance(gates, dict):
+        raise SystemExit("release gate evidence has no gate records")
+    required = {
+        "security_closure": "security-closure-gate.yml",
+        "product_integrity": "product-integrity-gate.yml",
+    }
+    for name, workflow in required.items():
+        record = gates.get(name)
+        if not isinstance(record, dict):
+            raise SystemExit(f"missing required release gate: {name}")
+        if (
+            record.get("workflow") != workflow
+            or record.get("head_sha") != commit
+            or record.get("status") != "completed"
+            or record.get("conclusion") != "success"
+        ):
+            raise SystemExit(f"required release gate is not successful: {name}")
+    return evidence
+
+
+def _canonical_digest(value: object) -> str:
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def main() -> int:
@@ -161,6 +210,8 @@ def main() -> int:
     repo_root = args.repo_root.resolve()
     artifact_dir = args.artifact_dir.resolve()
     artifact_dir.mkdir(parents=True, exist_ok=True)
+    gate_evidence_path = args.gate_evidence.resolve()
+    gate_evidence = _load_gate_evidence(gate_evidence_path, args.commit)
 
     actual_commit = subprocess.check_output(
         ["git", "-C", str(repo_root), "rev-parse", "HEAD"], text=True
@@ -209,6 +260,27 @@ def main() -> int:
         "checksums": {
             "name": checksums_path.name,
             "sha256": _sha256(checksums_path),
+        },
+        "required_gates": {
+            "evidence_file": gate_evidence_path.name,
+            "evidence_sha256": _sha256(gate_evidence_path),
+            "evidence_digest": gate_evidence["evidence_digest"],
+            "gates": {
+                name: {
+                    "workflow": record["workflow"],
+                    "run_id": record["run_id"],
+                    "run_attempt": record.get("run_attempt"),
+                    "url": record.get("url"),
+                    "head_sha": record["head_sha"],
+                    "run_evidence_digest": record["run_evidence_digest"],
+                    "artifact_digests": [
+                        artifact.get("digest", "")
+                        for artifact in record.get("artifacts", [])
+                        if artifact.get("digest")
+                    ],
+                }
+                for name, record in sorted(gate_evidence["gates"].items())
+            },
         },
     }
     (artifact_dir / "release-manifest.json").write_text(

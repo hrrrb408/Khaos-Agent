@@ -88,6 +88,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Self
 
+from khaos.coding.execution.environment import scrub_spawn_environment
 from khaos.security.kernel_helper_client import (
     KernelAuthorityClient,
     KernelIsolationEvidence,
@@ -1704,7 +1705,13 @@ class BrowserNetworkSandbox:
             env["KHAOS_BROWSER_CGROUP_PROCS"] = str(
                 self._cgroup_path / "cgroup.procs"
             )
-        return env
+        # The browser launcher is a trusted outer boundary: preserve only its
+        # explicitly constructed KHAOS_BROWSER_* control contract, while
+        # applying the same final secret scrub to the benign host allowlist.
+        return scrub_spawn_environment(
+            env,
+            preserve={key for key in env if key.startswith("KHAOS_BROWSER_")},
+        )
 
     def run_fs_probe(
         self, sentinel_paths: list[str], *, chromium_executable: str = "/bin/true",

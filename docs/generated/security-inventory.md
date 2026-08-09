@@ -51,10 +51,10 @@
 - `python/khaos/channels/webhook.py`: `653bc2281748abc42b7ad9e295e69586ab01bba3a1aedfc92c692c80a0253232`
 - `python/khaos/permissions/engine.py`: `4e6f03ed55584e11a240dca71be91d61556f11ce240a246627f75829a1af5939`
 - `python/khaos/permissions/rules.py`: `173df51bf720843e339e026c5219a0db7e2b69beaa45576b2e24ee17764dfe6f`
-- `python/khaos/coding/execution/service.py`: `a5a75afe57a5ff8064fea5188e29defc9aa355242d675251b7585aec7ee52af7`
+- `python/khaos/coding/execution/service.py`: `6601600980f33d2bffc84ab9b8487fd1fca91b7c5aedf6308b78f6e727c6c872`
 - `python/khaos/coding/execution/binding.py`: `99f3d8eb14d80a837ecf0f0d076d556ccdb366b8798c9e0fde6c69d0bb1a5501`
-- `python/khaos/coding/execution/supervisor.py`: `8543643b63f00cbb7b24e77c3e6a1eec6651280479509223314c04e27f2da5ef`
-- `python/khaos/grpc_server.py`: `a98ad97f729ad985edffeaf92d1392eca3352d806f554ea83718f2bac3aa7327`
+- `python/khaos/coding/execution/supervisor.py`: `ab2c7f867d742a5e3437e1fc68a73365b250a363e348a29285718dbe9688208a`
+- `python/khaos/grpc_server.py`: `a4f9c51f9516982a80a27675a0d7ad2b172ff382e03690473de418c8b23b8cff`
 - `go/internal/api/handler.go`: `119a049cdc45ea2c949f558a179752edaa30409a744f3f352e888e7e829343f3`
 - `go/cmd/gateway/main.go`: `75d14ad26917ddf15ddc38ce75f6bc0a1fcd214909c958849e7ae18054b81ed7`
 - `go/internal/platform/python_client.go`: `c4e68301ae6f54999636c9924bc832e57c46173f69ad852df7963af9d6de9df6`
