@@ -131,6 +131,18 @@ def test_linux_cgroup_v2_leaf_has_hard_limits(tmp_path: Path, monkeypatch):
     assert "rbps=" in (group / "io.max").read_text()
 
 
+def test_linux_cgroup_cleanup_failure_is_not_downgraded_to_warning(tmp_path: Path):
+    from khaos.coding.execution.platform import _remove_linux_cgroup
+
+    group = tmp_path / "retained-cgroup"
+    group.mkdir()
+    (group / "unreaped-process-marker").write_text("live", encoding="ascii")
+
+    with pytest.raises(OSError):
+        _remove_linux_cgroup(group)
+    assert group.exists()
+
+
 @pytest.mark.asyncio
 async def test_linux_execute_joins_cgroup_before_bwrap_and_seccomp_after(
     tmp_path: Path, monkeypatch,
@@ -161,6 +173,13 @@ async def test_linux_execute_joins_cgroup_before_bwrap_and_seccomp_after(
     monkeypatch.setattr(
         platform_module, "_linux_sandbox_launcher", lambda: launcher,
     )
+    # The test double is a plain directory, not a kernel cgroup.  Production
+    # cleanup is strict and requires the external cgroup disappearance proof.
+    def remove_fake_cgroup(path: Path) -> None:
+        (path / "cgroup.procs").unlink(missing_ok=True)
+        path.rmdir()
+
+    monkeypatch.setattr(platform_module, "_remove_linux_cgroup", remove_fake_cgroup)
     backend = LinuxBubblewrapBackend(supervisor=RecordingSupervisor())
 
     await backend.execute(ExecutionRequest(

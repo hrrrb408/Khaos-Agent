@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shlex
 import tempfile
 import uuid
 from collections.abc import Awaitable, Callable
@@ -14,7 +15,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 from khaos.coding.execution.binding import open_execution_directory_binding
-from khaos.coding.execution.capability import SandboxDecision
+from khaos.coding.execution.capability import DockerSandboxDecision, SandboxDecision
 from khaos.coding.execution.cleanup_ledger import CleanupInvariantError, CleanupLedger
 from khaos.coding.execution.environment import scrub_spawn_environment
 from khaos.coding.execution.identity import executable_identity
@@ -26,6 +27,8 @@ from khaos.coding.execution.models import (
     NetworkPolicy,
     PermissionProfile,
     ResolvedExecutionContext,
+    ResolvedSpawnPlan,
+    ResourceBudget,
 )
 from khaos.coding.execution.native_launcher import build_process_launch
 from khaos.coding.execution.supervisor import ProcessSupervisor
@@ -340,6 +343,7 @@ class ExecutionService:
                 workspace_cwd_identity=cwd_identity,
                 executable_identity=request.executable_identity,
                 sandbox_decision=request.sandbox_decision,
+                spawn_plan=request.spawn_plan,
             )
             assert request.task_id is not None
             assert request.workspace_id is not None
@@ -352,7 +356,10 @@ class ExecutionService:
                 storage_baseline, root_identity, cwd_identity,
                 request.executable_identity,
                 request.sandbox_decision,
+                request.spawn_plan,
+                int(getattr(workspace, "generation", 0) or 0),
             )
+            self._verify_spawn_plan(request, resolved_context)
         if self.backend_selector is not None:
             writable = profile.filesystem is FileSystemAccess.WORKSPACE_WRITE
             if request.sandbox_decision is not None:
@@ -421,6 +428,8 @@ class ExecutionService:
             and request.workspace_id
         ):
             await self.workspace_manager.verify_execution_root(request.workspace_id)
+        if resolved_context is not None:
+            self._verify_spawn_plan(request, resolved_context)
         # Round-15 review P0-A: final re-check before publishing to _active.
         # If shutdown began during any of the awaits above, abort now —
         # the backend's subprocess spawn is the irrevocable step.
@@ -455,7 +464,14 @@ class ExecutionService:
                     result = await backend.execute_resolved(resolved_context)
                 finally:
                     async with self._admission_lock:
-                        self._active.pop(execution_id, None)
+                        # Keep a failed external cleanup visible to the
+                        # service owner.  A false empty registry would make
+                        # shutdown skip the backend's retained lease.
+                        if (
+                            not _has_resource_owner(backend)
+                            or _resource_owner_released(backend, execution_id)
+                        ):
+                            self._active.pop(execution_id, None)
             else:
                 result = await backend.execute(request)
         except asyncio.CancelledError:
@@ -488,6 +504,134 @@ class ExecutionService:
             raise PermissionError(
                 "TaskWorkspace Git identity changed during execution"
             ) from exc
+
+    async def prepare_docker_decision(
+        self,
+        *,
+        tool_name: str,
+        arguments: dict[str, object],
+        tool_context: dict[str, object],
+    ) -> DockerSandboxDecision:
+        """Resolve Docker authority before an approval can be issued."""
+        if tool_name != "sandbox_exec":
+            raise PermissionError(f"unsupported Docker execution tool: {tool_name}")
+        if bool(arguments.get("network")):
+            raise PermissionError("sandbox_exec network access is disabled")
+        task_id = str(tool_context.get("task_id") or "")
+        workspace_id = str(tool_context.get("workspace_id") or "")
+        if self.workspace_manager is None or not task_id or not workspace_id:
+            raise PermissionError("Docker authority requires an active TaskWorkspace")
+        workspace = self.workspace_manager.require(
+            workspace_id,
+            task_id=task_id,
+            principal_id=self.principal_id,
+            project_id=self.project_id,
+            runtime_id=self.runtime_id,
+        )
+        root = workspace.worktree_path.expanduser().resolve()
+        project_dir = str(arguments.get("project_dir") or ".")
+        if project_dir not in {"", "."} and Path(project_dir).expanduser().resolve() != root:
+            raise PermissionError("project_dir must match the active TaskWorkspace")
+        command = str(arguments.get("command") or "")
+        try:
+            argv = tuple(shlex.split(command))
+        except ValueError as exc:
+            raise ValueError(f"invalid Docker command: {exc}") from exc
+        if not argv:
+            raise ValueError("Docker command must not be empty")
+        try:
+            cpus = float(str(arguments.get("cpus", 1.0)))
+            timeout = int(str(arguments.get("timeout", 30)))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invalid Docker resource budget") from exc
+        if not 0.1 <= cpus <= 8.0:
+            raise ValueError("cpus must be between 0.1 and 8.0")
+        if not 1 <= timeout <= 3600:
+            raise ValueError("timeout must be between 1 and 3600 seconds")
+        from khaos.tools.sandbox_tools import _parse_memory
+
+        budget = ResourceBudget(
+            timeout_seconds=float(timeout),
+            output_bytes=65536,
+            pids=256,
+            cpu_count=cpus,
+            memory_bytes=_parse_memory(str(arguments.get("memory", "512m"))),
+            tmpfs_bytes=256 * 1024 * 1024,
+        )
+        backend = self.docker_backend
+        if backend is None:
+            from khaos.coding.execution.docker import DockerBackend
+
+            backend = DockerBackend(supervisor=self.process_supervisor)
+            self.docker_backend = backend
+        prepare = getattr(backend, "prepare_decision", None)
+        if not callable(prepare):
+            raise PermissionError(
+                "configured Docker backend cannot produce a concrete authority"
+            )
+        prepare_authority = cast(
+            Callable[..., Awaitable[DockerSandboxDecision]], prepare
+        )
+        image = str(arguments.get("image") or "")
+        if not image:
+            from khaos.coding.execution.docker import DEFAULT_DOCKER_IMAGE
+
+            image = DEFAULT_DOCKER_IMAGE
+        return await prepare_authority(
+            image=image,
+            workspace=root,
+            budget=budget,
+            argv=argv,
+            filesystem_mode=FileSystemAccess.WORKSPACE_WRITE.value,
+        )
+
+    @staticmethod
+    def _verify_spawn_plan(
+        request: ExecutionRequest, context: ResolvedExecutionContext
+    ) -> None:
+        """Verify the immutable scheduler plan at the execution boundary.
+
+        The scheduler binds this plan before approval.  ExecutionService is
+        the last common boundary before a backend can acquire a process or a
+        container, so it refuses a plan whose command, identities, profile,
+        budget, or concrete sandbox no longer matches the resolved request.
+        """
+        plan = request.spawn_plan
+        if plan is None:
+            return
+        if not plan.is_valid():
+            raise PermissionError("resolved spawn plan digest is invalid")
+        if plan.argv != request.argv or plan.argv != context.argv:
+            raise PermissionError("resolved spawn plan argv changed before execution")
+        if plan.task_id != request.task_id or plan.task_id != context.task_id:
+            raise PermissionError("resolved spawn plan task binding changed")
+        if context.workspace_generation and (
+            plan.workspace_generation != context.workspace_generation
+        ):
+            raise PermissionError("resolved spawn plan workspace generation changed")
+        if plan.workspace_root_device is not None or plan.workspace_root_inode is not None:
+            if (plan.workspace_root_device, plan.workspace_root_inode) != (
+                request.workspace_root_identity or (None, None)
+            ):
+                raise PermissionError("resolved spawn plan workspace root changed")
+        if plan.workspace_cwd_device is not None or plan.workspace_cwd_inode is not None:
+            if (plan.workspace_cwd_device, plan.workspace_cwd_inode) != (
+                request.workspace_cwd_identity or (None, None)
+            ):
+                raise PermissionError("resolved spawn plan cwd changed")
+        if plan.executable_identity != request.executable_identity:
+            raise PermissionError("resolved spawn plan executable identity changed")
+        if plan.budget_digest != request.budget.digest():
+            raise PermissionError("resolved spawn plan resource budget changed")
+        profile = context.permission_profile
+        if profile is None:
+            raise PermissionError("resolved execution context has no permission profile")
+        if plan.permission_profile_digest != profile.digest():
+            raise PermissionError("resolved spawn plan permission profile changed")
+        if context.sandbox_decision is not None and (
+            plan.sandbox_decision_digest != context.sandbox_decision.digest()
+        ):
+            raise PermissionError("resolved spawn plan sandbox decision changed")
 
     async def _quarantine_cancelled_storage_violation(
         self, context: ResolvedExecutionContext

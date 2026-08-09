@@ -142,6 +142,71 @@ class SandboxDecision:
 
 
 @dataclass(frozen=True)
+class DockerSandboxDecision(SandboxDecision):
+    """Concrete Docker authority bound to the daemon and hardening policy."""
+
+    docker_binary_identity: str
+    daemon_identity_digest: str
+    image_reference: str
+    image_digest: str
+    uid: str
+    capabilities: tuple[str, ...]
+    no_new_privileges: bool
+    read_only_rootfs: bool
+    workspace_mount_policy_digest: str
+    budget_digest: str
+    hardening_generation: str
+    command_digest: str
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        required = (
+            self.docker_binary_identity,
+            self.daemon_identity_digest,
+            self.image_reference,
+            self.image_digest,
+            self.uid,
+            self.workspace_mount_policy_digest,
+            self.budget_digest,
+            self.hardening_generation,
+            self.command_digest,
+        )
+        if any(not isinstance(value, str) or not value for value in required):
+            raise ValueError("Docker sandbox decision identity fields must not be empty")
+        if self.backend_name != "docker":
+            raise ValueError("DockerSandboxDecision must select the Docker backend")
+        if self.network_mode != "none":
+            raise ValueError("Docker sandbox decision must disable networking")
+        if self.uid != "65534:65534":
+            raise ValueError("Docker sandbox decision must use the nobody uid")
+        if tuple(sorted(set(self.capabilities))) != self.capabilities:
+            raise ValueError("Docker capabilities must be sorted and unique")
+        if self.capabilities != ("ALL",):
+            raise ValueError("Docker sandbox decision must drop all capabilities")
+        if type(self.no_new_privileges) is not bool or not self.no_new_privileges:
+            raise ValueError("Docker sandbox decision requires no-new-privileges")
+        if type(self.read_only_rootfs) is not bool or not self.read_only_rootfs:
+            raise ValueError("Docker sandbox decision requires a read-only rootfs")
+
+    def _payload(self) -> dict[str, object]:
+        return {
+            **super()._payload(),
+            "docker_binary_identity": self.docker_binary_identity,
+            "daemon_identity_digest": self.daemon_identity_digest,
+            "image_reference": self.image_reference,
+            "image_digest": self.image_digest,
+            "uid": self.uid,
+            "capabilities": self.capabilities,
+            "no_new_privileges": self.no_new_privileges,
+            "read_only_rootfs": self.read_only_rootfs,
+            "workspace_mount_policy_digest": self.workspace_mount_policy_digest,
+            "budget_digest": self.budget_digest,
+            "hardening_generation": self.hardening_generation,
+            "command_digest": self.command_digest,
+        }
+
+
+@dataclass(frozen=True)
 class BackendAvailability:
     name: str
     available: bool

@@ -43,7 +43,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
-          go-version: "1.24.x"
+          go-version: "1.26.4"
           cache-dependency-path: go/go.mod
       - name: Build lockfile and module provenance
         run: |
@@ -51,6 +51,13 @@ jobs:
           mkdir -p provenance
           printf '%s\n' "$GITHUB_SHA" > provenance/commit.txt
           sha256sum uv.lock go/go.mod rust/khaos-core/Cargo.toml rust/khaos-core/Cargo.lock Dockerfile > provenance/lockfile-sha256.txt
+          sha256sum .go-version rust-toolchain.toml >> provenance/lockfile-sha256.txt
+          {
+            go version
+            rustc --version --verbose
+            cargo --version --verbose
+            python3 --version
+          } > provenance/toolchain.txt
           if [ -f go/go.sum ]; then sha256sum go/go.sum >> provenance/lockfile-sha256.txt; fi
           (cd go && go mod verify && go list -mod=readonly -m all) > provenance/go-modules.txt
           cargo metadata --locked --no-deps --format-version 1 --manifest-path rust/khaos-core/Cargo.toml > provenance/cargo-metadata.json

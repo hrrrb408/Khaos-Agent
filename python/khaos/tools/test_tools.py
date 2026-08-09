@@ -29,6 +29,7 @@ async def test_run(
     workspace_id: str | None = None,
     sandbox_decision=None,
     executable_identity: str | None = None,
+    spawn_plan=None,
 ) -> str:
     """Run a test command and return a structured JSON summary.
 
@@ -82,6 +83,7 @@ async def test_run(
                 access_mode="workspace-write",
                 sandbox_decision=sandbox_decision,
                 executable_identity=executable_identity or "",
+                spawn_plan=spawn_plan,
             )
         )
     except FileNotFoundError as exc:

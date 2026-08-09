@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
@@ -25,6 +26,7 @@ from khaos.coding.execution.capability import (
 from khaos.coding.execution.capability import (
     CapabilityEvidence as _CapabilityEvidence,
 )
+from khaos.coding.execution.identity import executable_identity
 from khaos.coding.execution.models import ResourceBudget
 from khaos.coding.execution.supervisor import ProcessSupervisor
 
@@ -33,6 +35,18 @@ logger = logging.getLogger(__name__)
 # Backwards-compatible public import for callers that historically imported
 # the evidence model from this module instead of ``capability``.
 CapabilityEvidence = _CapabilityEvidence
+
+
+@dataclass
+class KernelResourceLease:
+    """Owner record for one kernel cgroup until external removal is proven."""
+
+    execution_id: str
+    path: Path
+    quarantined: bool = False
+
+    def descriptor(self) -> str:
+        return f"cgroup:{self.execution_id}:{self.path}"
 
 
 class UnsupportedBackend:
@@ -400,16 +414,20 @@ class MacOSSandboxBackend:
                 synthetic_tmp=sandbox_tmp,
                 preserve_workspace_path=request.workspace_root_identity is not None,
             )
-            sandboxed = replace(
-                request,
-                argv=(
-                    "/usr/bin/sandbox-exec", "-p", sandbox_profile,
-                    *request.argv,
-                ),
+            sandboxed_argv = (
+                "/usr/bin/sandbox-exec", "-p", sandbox_profile,
+                *request.argv,
             )
             environment = _sandbox_environment(
                 profile, request.environment,
                 home=str(home), tmpdir=str(sandbox_tmp),
+            )
+            sandboxed = replace(
+                request,
+                argv=sandboxed_argv,
+                executable_identity=executable_identity(
+                    sandboxed_argv, environment
+                ),
             )
             supervisor = self.supervisor or ProcessSupervisor()
             self.supervisor = supervisor
@@ -438,6 +456,17 @@ class LinuxBubblewrapBackend:
     def __init__(self, supervisor=None) -> None:
         self.supervisor = supervisor
         self._capability_cache: _CapabilityCacheEntry | None = None
+        self._cgroup_leases: dict[str, KernelResourceLease] = {}
+
+    def owned_resources(self) -> tuple[str, ...]:
+        """Expose retained cgroups to the independent cleanup oracle."""
+        return tuple(
+            lease.descriptor()
+            for _, lease in sorted(self._cgroup_leases.items())
+        )
+
+    def owns_execution(self, execution_id: str) -> bool:
+        return execution_id in self._cgroup_leases
 
     async def probe(self) -> BackendAvailability:
         import asyncio
@@ -635,13 +664,17 @@ class LinuxBubblewrapBackend:
                 raise PermissionError(
                     f"execution refused: delegated cgroup v2 limits unavailable: {exc}"
                 ) from exc
-            directory_binding = open_execution_directory_binding(
-                worktree,
-                request.cwd,
-                expected_root_identity=request.workspace_root_identity,
-                expected_cwd_identity=request.workspace_cwd_identity,
-            )
+            execution_id = request.correlation_id
+            lease = KernelResourceLease(execution_id, cgroup)
+            self._cgroup_leases[execution_id] = lease
+            directory_binding = None
             try:
+                directory_binding = open_execution_directory_binding(
+                    worktree,
+                    request.cwd,
+                    expected_root_identity=request.workspace_root_identity,
+                    expected_cwd_identity=request.workspace_cwd_identity,
+                )
                 workspace_source = (
                     directory_binding.proc_path(directory_binding.root_fd)
                     if sys.platform.startswith("linux")
@@ -662,20 +695,26 @@ class LinuxBubblewrapBackend:
                     workspace_source=workspace_source,
                 )
             except Exception:
-                directory_binding.close()
+                if directory_binding is not None:
+                    directory_binding.close()
                 raise
             launcher = _linux_sandbox_launcher()
             if launcher is None:
-                directory_binding.close()
-                await asyncio.to_thread(_remove_linux_cgroup, cgroup)
+                if directory_binding is not None:
+                    directory_binding.close()
                 raise PermissionError(
                     "execution refused: no_new_privs/seccomp launcher unavailable"
                 )
-            sandboxed = replace(request, argv=(
+            sandboxed_argv = (
                 str(launcher), "--join-cgroup",
-                str(cgroup / "cgroup.procs"), "--", *prefix, "--",
+                str(lease.path / "cgroup.procs"), "--", *prefix, "--",
                 str(launcher), "--", *request.argv,
-            ))
+            )
+            sandboxed = replace(
+                request,
+                argv=sandboxed_argv,
+                executable_identity=executable_identity(sandboxed_argv, {}),
+            )
             supervisor = self.supervisor or ProcessSupervisor()
             self.supervisor = supervisor
             try:
@@ -696,12 +735,30 @@ class LinuxBubblewrapBackend:
             finally:
                 # ProcessSupervisor closes the binding after spawn; this is
                 # idempotent and also covers failures before supervisor.run.
-                directory_binding.close()
-                await asyncio.to_thread(_remove_linux_cgroup, cgroup)
+                if directory_binding is not None:
+                    directory_binding.close()
+                await self._release_cgroup_lease(execution_id)
 
     async def terminate(self, execution_id: str) -> None:
         if self.supervisor is not None:
             await self.supervisor.terminate(execution_id)
+        await self._release_cgroup_lease(execution_id)
+
+    async def _release_cgroup_lease(self, execution_id: str) -> None:
+        """Release only after the kernel path is absent; retain on failure."""
+        lease = self._cgroup_leases.get(execution_id)
+        if lease is None:
+            return
+        try:
+            await asyncio.to_thread(_remove_linux_cgroup, lease.path)
+            if lease.path.exists():
+                raise RuntimeError(
+                    f"cgroup disappearance was not proven: {lease.path}"
+                )
+        except BaseException:
+            lease.quarantined = True
+            raise
+        self._cgroup_leases.pop(execution_id, None)
 
 
 def _resolve_bwrap_path() -> str:
@@ -852,9 +909,9 @@ def _remove_linux_cgroup(group: Path) -> None:
     3. Remove descendant cgroups (if any) bottom-up.
     4. ``rmdir`` the leaf.
 
-    If any step fails, the cgroup is left in place and a warning is
-    logged — the caller (finally block) continues, and a startup
-    reaper can clean up the orphan later.
+    If any step fails, the cgroup is left in place and the error is raised.
+    The owning backend retains its kernel lease and enters quarantine; a
+    later explicit retry may only clear the lease after the path disappears.
     """
     import time
 
@@ -863,37 +920,39 @@ def _remove_linux_cgroup(group: Path) -> None:
     # Step 1: kill all processes in the cgroup.
     kill_file = group / "cgroup.kill"
     if kill_file.exists():
-        try:
-            kill_file.write_text("1", encoding="ascii")
-        except OSError as exc:
-            logger.warning("cgroup.kill failed for %s: %s", group, exc)
+        kill_file.write_text("1", encoding="ascii")
     # Step 2: wait for populated=0 (max 5 seconds).
     events_file = group / "cgroup.events"
     if events_file.exists():
         deadline = time.monotonic() + 5.0
+        observed_empty = False
         while time.monotonic() < deadline:
-            try:
-                content = events_file.read_text(encoding="ascii")
-                if "populated 0" in content or "populated=0" in content:
-                    break
-            except OSError:
+            content = events_file.read_text(encoding="ascii")
+            if "populated 0" in content or "populated=0" in content:
+                observed_empty = True
                 break
             time.sleep(0.1)
+        if not observed_empty:
+            raise TimeoutError(f"cgroup remained populated: {group}")
     # Step 3: remove descendant cgroups bottom-up (if any).
-    try:
-        for child in sorted(group.rglob("*"), reverse=True):
-            if child.is_dir():
-                try:
-                    child.rmdir()
-                except OSError:
-                    pass
-    except OSError:
-        pass
+    descendants: list[Path] = []
+    for child in group.rglob("*"):
+        if child.is_dir():
+            descendants.append(child)
+    failures: list[BaseException] = []
+    for child in sorted(descendants, reverse=True):
+        try:
+            child.rmdir()
+        except OSError as exc:
+            failures.append(exc)
+    if failures:
+        raise RuntimeError(
+            f"cgroup descendants could not be removed: {group}"
+        ) from failures[0]
     # Step 4: rmdir the leaf.
-    try:
-        group.rmdir()
-    except OSError as exc:
-        logger.warning("cgroup rmdir failed for %s (orphaned): %s", group, exc)
+    group.rmdir()
+    if group.exists():
+        raise RuntimeError(f"cgroup disappearance was not proven: {group}")
 
 
 def _validated_profile(request):

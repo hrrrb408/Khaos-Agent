@@ -1,5 +1,6 @@
 import asyncio
 import inspect
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -273,7 +274,14 @@ class _InspectableDockerBackend(DockerBackend):
         return 0, "", ""
 
 
-def _resolved(tmp_path, *, image=DEFAULT_DOCKER_IMAGE, budget=None, environment=None):
+def _resolved(
+    tmp_path,
+    *,
+    image=DEFAULT_DOCKER_IMAGE,
+    budget=None,
+    environment=None,
+    execution_id="exec-1",
+):
     worktree = tmp_path / "worktree"
     worktree.mkdir(exist_ok=True)
     (worktree / ".git").write_text("gitdir: ../repo/.git/worktrees/task\n", encoding="utf-8")
@@ -284,7 +292,7 @@ def _resolved(tmp_path, *, image=DEFAULT_DOCKER_IMAGE, budget=None, environment=
     return ResolvedExecutionContext(
         "task", "workspace", "running", repository, worktree, worktree, (worktree,),
         "workspace-write", NetworkPolicy.NONE, budget or ResourceBudget(), env,
-        frozenset(env), ("python", "-V"), "exec-1",
+        frozenset(env), ("python", "-V"), execution_id,
     )
 
 
@@ -334,6 +342,27 @@ async def test_docker_backend_builds_hardened_fixed_argv(tmp_path):
     assert "/var/run/docker.sock" not in " ".join(argv)
     assert argv[-3:] == ("--", "python", "-V")
     assert result.diagnostics["cleanup"] == "removed"
+
+
+async def test_docker_backend_prepares_concrete_daemon_and_hardening_decision(tmp_path):
+    backend = _InspectableDockerBackend()
+    decision = await backend.prepare_decision(
+        image=DEFAULT_DOCKER_IMAGE,
+        workspace=(tmp_path / "worktree"),
+        budget=ResourceBudget(),
+        argv=("python", "-V"),
+    )
+
+    assert decision.backend_name == "docker"
+    assert decision.image_reference == DEFAULT_DOCKER_IMAGE
+    assert decision.image_digest == DEFAULT_DOCKER_IMAGE.split("@sha256:", 1)[1]
+    assert decision.network_mode == "none"
+    assert decision.uid == "65534:65534"
+    assert decision.capabilities == ("ALL",)
+    assert decision.no_new_privileges is True
+    assert decision.read_only_rootfs is True
+    assert decision.budget_digest == ResourceBudget().digest()
+    assert decision.command_digest
 
 
 async def test_docker_deleted_open_file_watchdog_maps_to_resource_violation(tmp_path):
@@ -492,6 +521,43 @@ async def test_docker_backend_concurrent_shutdown_joins_shared_task():
     assert backend.terminal_closed
 
 
+async def test_docker_backend_shutdown_spawn_barrier_keeps_late_child_owned(tmp_path):
+    """Shutdown must wait for a Docker CLI spawn reserved after lease publish."""
+    backend = _InspectableDockerBackend()
+    spawn_entered = asyncio.Event()
+    release_spawn = asyncio.Event()
+    process = _FakeProcess()
+
+    async def delayed_spawn(*_args, **_kwargs):
+        spawn_entered.set()
+        await release_spawn.wait()
+        return process
+
+    context = _resolved(tmp_path)
+    with patch(
+        "khaos.coding.execution.docker.asyncio.create_subprocess_exec",
+        new=delayed_spawn,
+    ):
+        running = asyncio.create_task(backend.execute_resolved(context))
+        await spawn_entered.wait()
+        assert backend._active
+        shutdown = asyncio.create_task(backend.shutdown())
+        await asyncio.sleep(0)
+        assert backend.state == "CLOSING"
+        assert not backend.terminal_closed
+        assert any(
+            resource.startswith("container:exec-1:")
+            for resource in backend.owned_resources()
+        )
+        release_spawn.set()
+        result, _ = await asyncio.gather(running, shutdown)
+
+    assert result.status in {"passed", "cancelled"}
+    assert backend.terminal_closed
+    assert backend.owned_resources() == ()
+    assert "khaos-exec-1" in backend.removed
+
+
 async def test_docker_backend_shutdown_timeout_quarantines_and_retry_closes():
     backend = _InspectableDockerBackend(shutdown_timeout_seconds=0.01)
     await backend._begin_inflight("slow-finalizer")
@@ -581,6 +647,29 @@ def _docker_available():
     return subprocess.run(
         ["docker", "info"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False
     ).returncode == 0
+
+
+@pytest.mark.docker_lifecycle_soak
+@pytest.mark.docker_sandbox_real
+@pytest.mark.skipif(
+    os.environ.get("KHAOS_RUN_DOCKER_LIFECYCLE_SOAK") != "1",
+    reason="Docker lifecycle soak is enabled only by the nightly workflow",
+)
+@pytest.mark.skipif(not _docker_available(), reason="Docker daemon unavailable")
+async def test_real_docker_lifecycle_soak(tmp_path):
+    """Repeatedly prove container cleanup without an ownership-ledger leak."""
+    iterations = int(os.environ.get("KHAOS_DOCKER_SOAK_ITERATIONS", "100"))
+    if not 100 <= iterations <= 500:
+        raise AssertionError("KHAOS_DOCKER_SOAK_ITERATIONS must be between 100 and 500")
+    backend = DockerBackend(allowed_images={DEFAULT_DOCKER_IMAGE})
+    for index in range(iterations):
+        context = _resolved(tmp_path, execution_id=f"soak-{index:03d}")
+        result = await backend.execute_resolved(context)
+        assert result.status == "passed", result.diagnostics
+        assert result.diagnostics["cleanup"] == "removed"
+        assert backend.owned_resources() == ()
+    await backend.shutdown()
+    assert backend.terminal_closed
 
 
 @pytest.mark.skipif(not _docker_available(), reason="Docker daemon unavailable")

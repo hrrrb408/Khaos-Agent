@@ -21,6 +21,7 @@ from khaos.coding.execution.binding import (
     open_execution_directory_binding,
 )
 from khaos.coding.execution.environment import scrub_spawn_environment
+from khaos.coding.execution.identity import executable_identity
 from khaos.coding.execution.models import ExecutionRequest, ExecutionResult
 from khaos.coding.execution.native_launcher import build_process_launch
 from khaos.coding.workspace.storage import (
@@ -63,6 +64,18 @@ class _ActiveProcess:
     watchdog_task: asyncio.Task[dict | None] | None = None
 
 
+@dataclass
+class _PendingSpawn:
+    """Owner record for the interval between admission and child publish."""
+
+    ready: asyncio.Event = field(default_factory=asyncio.Event)
+    done: asyncio.Event = field(default_factory=asyncio.Event)
+    process: asyncio.subprocess.Process | None = None
+    active: _ActiveProcess | None = None
+    termination_requested: bool = False
+    error: BaseException | None = None
+
+
 class ProcessSupervisor:
     """Own process groups, bounded output, cancellation, and teardown.
 
@@ -85,6 +98,7 @@ class ProcessSupervisor:
         self.termination_grace_seconds = termination_grace_seconds
         self.storage_authority = storage_authority or WorkspaceStorageAuthority()
         self._active: dict[str, _ActiveProcess] = {}
+        self._pending_spawns: dict[str, _PendingSpawn] = {}
         self._registry_lock = asyncio.Lock()
         self._state = _SupervisorState.OPEN
         # Round-17 review §四: shared shutdown task so concurrent shutdown()
@@ -95,9 +109,14 @@ class ProcessSupervisor:
     def active_execution_ids(self) -> tuple[str, ...]:
         return tuple(sorted(self._active))
 
+    @property
+    def pending_execution_ids(self) -> tuple[str, ...]:
+        """Return spawn transactions not yet released by their owner."""
+        return tuple(sorted(self._pending_spawns))
+
     def owns_execution(self, execution_id: str) -> bool:
         """Return whether the supervisor still owns an execution id."""
-        return execution_id in self._active
+        return execution_id in self._active or execution_id in self._pending_spawns
 
     @property
     def is_closed(self) -> bool:
@@ -127,7 +146,11 @@ class ProcessSupervisor:
     @property
     def terminal_closed(self) -> bool:
         """Round-17: True only when CLOSED (all resources proven terminated)."""
-        return self._state is _SupervisorState.CLOSED
+        return (
+            self._state is _SupervisorState.CLOSED
+            and not self._active
+            and not self._pending_spawns
+        )
 
     @property
     def is_quarantined(self) -> bool:
@@ -148,6 +171,11 @@ class ProcessSupervisor:
             active = self._active.get(execution_id)
             if active is not None and active.watchdog_task is not None and not active.watchdog_task.done():
                 resources.append(f"watchdog:{execution_id}")
+        resources.extend(
+            f"spawn:{execution_id}"
+            for execution_id in self.pending_execution_ids
+            if execution_id not in self._active
+        )
         return tuple(resources)
 
     def terminal_postcondition(self) -> bool:
@@ -163,7 +191,7 @@ class ProcessSupervisor:
                 return False
             if active.watchdog_task is not None and not active.watchdog_task.done():
                 return False
-        return len(self._active) == 0
+        return len(self._active) == 0 and len(self._pending_spawns) == 0
 
     async def close(self) -> None:
         """Round-17 review §十四: ResourceOwner protocol — alias for
@@ -269,8 +297,13 @@ class ProcessSupervisor:
         # its allowlist or overlay.  An explicit env mapping also prevents
         # asyncio from implicitly inheriting the parent environment.
         safe_environment = scrub_spawn_environment(env or {})
-        try:
-            process = await asyncio.create_subprocess_exec(
+        observed_identity = executable_identity(request.argv, safe_environment)
+        if request.executable_identity != observed_identity:
+            raise PermissionError("executable identity changed before native spawn")
+        pending_spawn = await self._reserve_spawn(execution_id)
+        process: asyncio.subprocess.Process | None = None
+        spawn_task = asyncio.create_task(
+            asyncio.create_subprocess_exec(
                 *(launch.argv if launch is not None else request.argv),
                 cwd=(
                     launch.cwd
@@ -284,12 +317,51 @@ class ProcessSupervisor:
                     launch.start_new_session if launch is not None else True
                 ),
                 pass_fds=(launch.pass_fds if launch is not None else ()),
+            ),
+            name=f"khaos-spawn:{execution_id}",
+        )
+        try:
+            process = await asyncio.shield(spawn_task)
+            pending_spawn.process = process
+        except asyncio.CancelledError:
+            # Cancellation of the caller must not cancel the native spawn
+            # task and lose a child between the pending registry and process
+            # publication.  Finish the spawn transaction, kill the child if
+            # one was created, then retain the cancellation outcome.
+            try:
+                process = await asyncio.shield(spawn_task)
+                pending_spawn.process = process
+                if process is None:
+                    raise RuntimeError("subprocess spawn returned no process")
+                await _kill_orphaned_process(process)
+            except BaseException as spawn_error:
+                await self._finish_pending_spawn(
+                    execution_id, pending_spawn, error=spawn_error
+                )
+                raise
+            await self._finish_pending_spawn(
+                execution_id,
+                pending_spawn,
+                error=RuntimeError("subprocess spawn cancelled before registration"),
             )
+            raise
+        except BaseException as spawn_error:
+            await self._finish_pending_spawn(
+                execution_id, pending_spawn, error=spawn_error
+            )
+            raise
         finally:
             # ``finally`` (not ``except``) so ``CancelledError`` — a
             # ``BaseException`` — still closes the directory binding.
             if directory_binding is not None:
                 directory_binding.close()
+        if process is None:
+            await self._finish_pending_spawn(
+                execution_id,
+                pending_spawn,
+                error=RuntimeError("subprocess spawn did not produce a process"),
+            )
+            raise RuntimeError("subprocess spawn did not produce a process")
         active = _ActiveProcess(process)
         storage_roots = _storage_roots(
             process.pid, tmp_root, sandbox_storage_paths
@@ -311,7 +383,7 @@ class ProcessSupervisor:
         )
         active.watchdog_task = watchdog_task
         try:
-            await self._register(execution_id, active)
+            await self._register(execution_id, active, pending_spawn)
         except BaseException:
             # Round-15 review P0-2: spawn committed but registration
             # failed (supervisor closed during spawn, or duplicate id).
@@ -321,7 +393,14 @@ class ProcessSupervisor:
             finally:
                 watchdog_task.cancel()
                 await asyncio.gather(watchdog_task, return_exceptions=True)
+                await self._finish_pending_spawn(
+                    execution_id,
+                    pending_spawn,
+                    error=RuntimeError("spawn ownership registration failed"),
+                )
             raise
+        if process is None:
+            raise RuntimeError("subprocess spawn returned no process")
         total_limit = request.permission_profile.resources.output_bytes
         stdout_limit = (total_limit + 1) // 2
         stderr_limit = total_limit // 2
@@ -440,7 +519,10 @@ class ProcessSupervisor:
             if not watchdog_task.done():
                 watchdog_task.cancel()
                 await asyncio.gather(watchdog_task, return_exceptions=True)
-            await self._unregister(execution_id, active)
+            try:
+                await self._unregister(execution_id, active)
+            finally:
+                await self._finish_pending_spawn(execution_id, pending_spawn)
 
         diagnostics.update(
             {
@@ -538,10 +620,24 @@ class ProcessSupervisor:
         """Terminate one complete process group, returning whether it existed."""
         async with self._registry_lock:
             active = self._active.get(execution_id)
+            pending = self._pending_spawns.get(execution_id)
         if active is None:
-            return False
+            if pending is None:
+                return False
+            pending.termination_requested = True
+            await asyncio.shield(pending.ready.wait())
+            async with self._registry_lock:
+                active = self._active.get(execution_id)
+                still_pending = self._pending_spawns.get(execution_id)
+            if active is None:
+                if still_pending is not None:
+                    await asyncio.shield(still_pending.done.wait())
+                return True
         active.termination_requested = True
         await self._terminate_active(active)
+        current_pending = self._pending_spawns.get(execution_id)
+        if current_pending is not None:
+            await asyncio.shield(current_pending.done.wait())
         return True
 
     async def shutdown(self) -> None:
@@ -607,7 +703,10 @@ class ProcessSupervisor:
             self._state = _SupervisorState.CLOSING
         errors: list[Exception] = []
         cancel_requested = False
-        for execution_id in self.active_execution_ids:
+        execution_ids = tuple(
+            sorted(set(self.active_execution_ids) | set(self.pending_execution_ids))
+        )
+        for execution_id in execution_ids:
             try:
                 # Round-17: shield each terminate so an outer cancellation
                 # does not interrupt the process kill before returncode
@@ -617,22 +716,22 @@ class ProcessSupervisor:
                 await asyncio.shield(self.terminate(execution_id))
                 async with self._registry_lock:
                     active = self._active.get(execution_id)
-                if active is None:
-                    raise RuntimeError(
-                        f"execution {execution_id} disappeared before watchdog proof"
-                    )
-                await asyncio.shield(self._settle_watchdog(active))
-                if active.process.returncode is None:
-                    raise RuntimeError(
-                        f"process {execution_id} remains live after terminate"
-                    )
-                async with self._registry_lock:
-                    if self._active.get(execution_id) is active:
-                        self._active.pop(execution_id, None)
-                    else:
+                    pending = self._pending_spawns.get(execution_id)
+                if active is not None:
+                    await asyncio.shield(self._settle_watchdog(active))
+                    if active.process.returncode is None:
                         raise RuntimeError(
-                            f"execution {execution_id} ownership changed during shutdown"
+                            f"process {execution_id} remains live after terminate"
                         )
+                    async with self._registry_lock:
+                        if self._active.get(execution_id) is active:
+                            self._active.pop(execution_id, None)
+                        else:
+                            raise RuntimeError(
+                                f"execution {execution_id} ownership changed during shutdown"
+                            )
+                if pending is not None:
+                    await asyncio.shield(pending.done.wait())
             except asyncio.CancelledError:
                 cancel_requested = True
                 errors.append(RuntimeError(
@@ -658,7 +757,7 @@ class ProcessSupervisor:
         # Do not clear the registry to manufacture the CLOSED invariant.
         # Any surviving entry is a failed terminal proof and must remain
         # visible for quarantine/retry.
-        if self._active:
+        if self._active or self._pending_spawns:
             self._state = _SupervisorState.QUARANTINED
             raise SupervisorClosedError(
                 "ProcessSupervisor shutdown left owned resources after cleanup"
@@ -667,11 +766,29 @@ class ProcessSupervisor:
         if cancel_requested:
             raise asyncio.CancelledError()
 
-    async def _register(
-        self, execution_id: str, active: _ActiveProcess
-    ) -> None:
+    async def _reserve_spawn(self, execution_id: str) -> _PendingSpawn:
+        """Publish spawn ownership before the native create call."""
         async with self._registry_lock:
             if self._state is not _SupervisorState.OPEN:
+                raise SupervisorClosedError(
+                    f"ProcessSupervisor is {self._state.value}, "
+                    f"not accepting new executions"
+                )
+            if execution_id in self._active or execution_id in self._pending_spawns:
+                raise RuntimeError(f"execution id is already active: {execution_id}")
+            pending = _PendingSpawn()
+            self._pending_spawns[execution_id] = pending
+            return pending
+
+    async def _register(
+        self,
+        execution_id: str,
+        active: _ActiveProcess,
+        pending: _PendingSpawn | None = None,
+    ) -> None:
+        async with self._registry_lock:
+            current_pending = self._pending_spawns.get(execution_id)
+            if self._state is not _SupervisorState.OPEN and current_pending is not pending:
                 raise SupervisorClosedError(
                     f"ProcessSupervisor is {self._state.value}, "
                     f"cannot register execution {execution_id}"
@@ -679,6 +796,9 @@ class ProcessSupervisor:
             if execution_id in self._active:
                 raise RuntimeError(f"execution id is already active: {execution_id}")
             self._active[execution_id] = active
+            if current_pending is not None:
+                current_pending.active = active
+                current_pending.ready.set()
 
     async def _unregister(
         self, execution_id: str, active: _ActiveProcess
@@ -691,6 +811,23 @@ class ProcessSupervisor:
         async with self._registry_lock:
             if self._active.get(execution_id) is active:
                 self._active.pop(execution_id, None)
+
+    async def _finish_pending_spawn(
+        self,
+        execution_id: str,
+        pending: _PendingSpawn,
+        *,
+        error: BaseException | None = None,
+    ) -> None:
+        async with self._registry_lock:
+            current = self._pending_spawns.get(execution_id)
+            if current is not pending:
+                return
+            if error is not None:
+                pending.error = error
+            pending.ready.set()
+            pending.done.set()
+            self._pending_spawns.pop(execution_id, None)
 
     async def _settle_watchdog(self, active: _ActiveProcess) -> None:
         """Cancel and await a watchdog before releasing its owner entry."""

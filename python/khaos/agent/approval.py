@@ -62,6 +62,7 @@ class StepExecutionAuthority:
     policy_digest: str
     tool_schema_digest: str
     tool_security_digest: str
+    spawn_plan_digest: str = ""
     approval_receipt_digest: str = ""
 
     def __post_init__(self) -> None:
@@ -97,6 +98,8 @@ class StepExecutionAuthority:
             raise ValueError("step execution environment keys must be non-empty strings")
         if tuple(sorted(set(self.environment_keys))) != self.environment_keys:
             raise ValueError("step execution environment keys must be sorted and unique")
+        if self.spawn_plan_digest and not isinstance(self.spawn_plan_digest, str):
+            raise ValueError("step execution spawn plan digest must be a string")
 
     def _payload(self, *, include_receipt: bool) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -126,6 +129,7 @@ class StepExecutionAuthority:
             "policy_digest": self.policy_digest,
             "tool_schema_digest": self.tool_schema_digest,
             "tool_security_digest": self.tool_security_digest,
+            "spawn_plan_digest": self.spawn_plan_digest,
         }
         if include_receipt:
             payload["approval_receipt_digest"] = self.approval_receipt_digest
