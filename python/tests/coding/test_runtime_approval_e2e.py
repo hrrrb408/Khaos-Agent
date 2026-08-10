@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import subprocess
 import sys
 from dataclasses import replace
@@ -118,31 +117,7 @@ async def test_fake_agent_runtime_changes_only_worktree_then_approved_apply(tmp_
     assert (workspace.worktree_path / "README.txt").read_text(encoding="utf-8") == "after\n"
     assert (repository / "README.txt").read_text(encoding="utf-8") == "before\n"
     assert subprocess.run(["git", "status", "--porcelain"], cwd=repository, capture_output=True, text=True, check=True).stdout == ""
-    tool_result_details = [
-        {
-            "event": event.event,
-            "name": event.metadata.get("name"),
-            "success": event.metadata.get("success"),
-            "error": event.metadata.get("error"),
-            "error_code": event.metadata.get("error_code"),
-            "output": event.metadata.get("output"),
-        }
-        for event in events
-        if event.event == "tool_result"
-    ]
-    terminal_succeeded = any(
-        event.metadata.get("name") == "terminal_argv"
-        and event.metadata.get("success")
-        for event in events
-        if event.event == "tool_result"
-    )
-    if not terminal_succeeded:
-        print(
-            "RUNTIME_DIAGNOSTIC="
-            + json.dumps(tool_result_details, ensure_ascii=False, default=str),
-            flush=True,
-        )
-    assert terminal_succeeded, tool_result_details
+    assert any(event.metadata.get("name") == "terminal_argv" and event.metadata.get("success") for event in events if event.event == "tool_result")
 
     pipeline = VerificationPipeline(execution_service=execution)
     plan = VerificationPlan((VerificationStep("check", "unit-test", (sys.executable, "-c", "assert open('README.txt').read() == 'after\\n'"), workspace.worktree_path),))

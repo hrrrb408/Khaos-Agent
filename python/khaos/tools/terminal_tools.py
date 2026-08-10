@@ -202,15 +202,7 @@ async def terminal_argv(
         )
         return {"id": process_id, "status": "running", "argv": list(argv)}
     result = await execution_service.execute(request)
-    return {
-        "command": command,
-        "returncode": result.return_code,
-        "stdout": result.stdout,
-        "stderr": result.stderr,
-        "status": result.status,
-        "diagnostics": result.diagnostics,
-        "safety": safety,
-    }
+    return {"command": command, "returncode": result.return_code, "stdout": result.stdout, "stderr": result.stderr, "status": result.status, "safety": safety}
 
 
 async def terminal_shell(
