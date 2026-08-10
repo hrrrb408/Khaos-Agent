@@ -24,7 +24,10 @@ from khaos.coding.execution.models import (
 )
 from khaos.coding.execution.capability import DockerSandboxDecision
 from khaos.coding.execution.environment import scrub_spawn_environment
-from khaos.coding.execution.identity import executable_identity
+from khaos.coding.execution.identity import (
+    container_command_identity,
+    executable_identity,
+)
 from khaos.coding.execution.supervisor import ProcessSupervisor, SupervisorClosedError
 
 logger = logging.getLogger(__name__)
@@ -440,9 +443,9 @@ class DockerBackend:
                 # control process from starting before a container exists.
                 enforce_resource_limits=False,
                 enforce_resource_watchdog=True,
-                use_native_launcher=False,
                 workspace_root=context.worktree_path,
                 workspace_baseline=context.workspace_baseline,
+                use_native_launcher=True,
             )
             diagnostics.update(result.diagnostics)
             status = result.status
@@ -825,6 +828,17 @@ class DockerBackend:
             raise PermissionError("Docker mount is not an active Git Worktree")
         if not context.argv:
             raise ValueError("Docker argv must not be empty")
+        decision = context.sandbox_decision
+        if not isinstance(decision, DockerSandboxDecision):
+            raise PermissionError("Docker execution has no concrete command authority")
+        if context.executable_identity != container_command_identity(
+            decision.image_digest,
+            context.argv,
+            command_digest=decision.command_digest,
+        ):
+            raise PermissionError(
+                "Docker command identity is not bound to the image digest and argv"
+            )
         if _DENIED_ENV_KEYS & context.allowed_environment_keys:
             raise PermissionError("Docker environment allowlist contains sensitive keys")
 

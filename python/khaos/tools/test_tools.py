@@ -30,6 +30,7 @@ async def test_run(
     sandbox_decision=None,
     executable_identity: str | None = None,
     spawn_plan=None,
+    execution_authority=None,
 ) -> str:
     """Run a test command and return a structured JSON summary.
 
@@ -84,6 +85,7 @@ async def test_run(
                 sandbox_decision=sandbox_decision,
                 executable_identity=executable_identity or "",
                 spawn_plan=spawn_plan,
+                execution_authority=execution_authority,
             )
         )
     except FileNotFoundError as exc:

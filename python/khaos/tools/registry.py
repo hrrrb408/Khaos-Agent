@@ -829,6 +829,9 @@ class ToolInvocationBroker:
                 "executable_identity"
             )
             handler_params["spawn_plan"] = context.get("spawn_plan")
+            handler_params["execution_authority"] = context.get(
+                "execution_authority"
+            )
         if any(capability.name.startswith("vcs.") for capability in capabilities):
             handler_params["execution_service"] = context.get("execution_service")
             handler_params["task_id"] = context.get("task_id")

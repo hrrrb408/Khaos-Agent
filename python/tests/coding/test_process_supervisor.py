@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+import khaos.coding.execution.supervisor as supervisor_module
 from khaos.coding.execution import (
     ExecutionRequest,
     ExecutionResult,
@@ -139,9 +140,11 @@ async def test_signal_death_before_deadline_is_failed_not_timeout(tmp_path: Path
     proves the deadline had NOT elapsed, so the real status is preserved.
     """
     supervisor = ProcessSupervisor(termination_grace_seconds=0.1)
-    # The process sends itself SIGTERM after starting; the timeout is 2s,
-    # so the process exits on its own (returncode 143, shell convention)
-    # well before the deadline task fires.
+    # The process sends itself SIGTERM after starting; the timeout is generous
+    # enough to include the macOS native launcher's descriptor staging and
+    # ad-hoc signing before the target receives control.  Once started, the
+    # process exits on its own (returncode 143, shell convention) well before
+    # the deadline task fires.
     request = ExecutionRequest(
         (
             sys.executable, "-c",
@@ -149,7 +152,7 @@ async def test_signal_death_before_deadline_is_failed_not_timeout(tmp_path: Path
             "os.kill(os.getpid(), signal.SIGTERM); time.sleep(5)",
         ),
         tmp_path,
-        budget=ResourceBudget(timeout_seconds=2),
+        budget=ResourceBudget(timeout_seconds=10),
         correlation_id="signal-race",
     )
 
@@ -423,6 +426,116 @@ async def test_supervisor_accounts_deleted_but_open_workspace_file(tmp_path: Pat
     assert result.status == "resource-exhausted"
     assert result.diagnostics["resource_violation"]["kind"] == "workspace-bytes"
     assert not (workspace / "deleted.bin").exists()
+
+
+@pytest.mark.asyncio
+async def test_watchdog_retries_transient_linux_fd_observation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A racy /proc fd sample must not reject an otherwise clean process."""
+
+    class FakeProcess:
+        pid = 1234
+
+        def __init__(self) -> None:
+            self.done = False
+
+        @property
+        def returncode(self) -> int | None:
+            return 0 if self.done else None
+
+    class FakeActive:
+        termination_requested = False
+
+    class FakeStorageAuthority:
+        def assess(self, *_args, **_kwargs):
+            process.done = True
+            return None
+
+    process = FakeProcess()
+    calls = 0
+
+    def fd_observation(_process_group_id: int) -> tuple[int, bool]:
+        nonlocal calls
+        calls += 1
+        return (0, calls > 1)
+
+    monkeypatch.setattr(supervisor_module, "_process_group_usage", lambda _pid: (1, 0))
+    monkeypatch.setattr(
+        supervisor_module, "_deleted_open_file_usage", fd_observation
+    )
+
+    async def terminate(_active) -> None:
+        process.done = True
+
+    result = await supervisor_module._resource_watchdog(
+        process,
+        FakeActive(),
+        ResourceBudget(),
+        terminate,
+        workspace_root=tmp_path,
+        workspace_baseline=object(),
+        workspace_limits=object(),
+        storage_authority=FakeStorageAuthority(),
+    )
+
+    assert result is None
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_watchdog_fails_closed_after_persistent_fd_observation_gap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Persistent inability to inspect process FDs remains fail-closed."""
+
+    class FakeProcess:
+        pid = 1234
+
+        def __init__(self) -> None:
+            self.done = False
+
+        @property
+        def returncode(self) -> int | None:
+            return 0 if self.done else None
+
+    class FakeActive:
+        termination_requested = False
+
+    process = FakeProcess()
+    calls = 0
+
+    monkeypatch.setattr(supervisor_module, "_process_group_usage", lambda _pid: (1, 0))
+
+    def fd_observation(_process_group_id: int) -> tuple[int, bool]:
+        nonlocal calls
+        calls += 1
+        return (0, False)
+
+    monkeypatch.setattr(
+        supervisor_module, "_deleted_open_file_usage", fd_observation
+    )
+
+    async def terminate(_active) -> None:
+        process.done = True
+
+    result = await supervisor_module._resource_watchdog(
+        process,
+        FakeActive(),
+        ResourceBudget(),
+        terminate,
+        workspace_root=tmp_path,
+        workspace_baseline=object(),
+        workspace_limits=object(),
+        storage_authority=object(),
+    )
+
+    assert result == {
+        "kind": "workspace-observation",
+        "observed": "deleted-open-files-unobservable",
+        "limit": "complete-process-fd-accounting",
+    }
+    assert calls == 2
 
 
 @pytest.mark.asyncio

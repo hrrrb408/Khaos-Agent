@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+from khaos.coding.execution.identity import executable_identity, open_executable_authority
+
 ROOT = Path(__file__).resolve().parents[3]
 
 # macOS exposes open FDs via /dev/fd (same as Linux's /proc/self/fd).
@@ -38,6 +40,13 @@ def test_rust_launcher_has_stdio_only_fd_policy() -> None:
     assert "SYS_close_range" in source
     assert "for fd in 3..maximum" in source
     assert "explicit whitelist of 0/1/2" in source
+    assert "execveat_fd" in source
+    assert "verify_executable_fd" in source
+    assert "stage_fd" in source
+    assert "exec_digest" in source
+    assert "interpreter_argv0" in source
+    assert "mkdtemp" in source
+    assert "sign_staged_file" in source
 
 
 @pytest.mark.skipif(
@@ -215,3 +224,58 @@ def test_rust_launcher_closes_authority_fds_when_binary_is_provided(tmp_path) ->
     assert completed.returncode == 0, completed.stderr
     inherited = json.loads(completed.stdout.strip())
     assert inherited == []
+
+
+@pytest.mark.skipif(
+    not Path(_FD_DIR).is_dir(),
+    reason=f"descriptor-bound exec requires {_FD_DIR}",
+)
+def test_rust_launcher_executes_the_pinned_script_after_path_replacement(tmp_path) -> None:
+    launcher = os.environ.get("KHAOS_EXEC_LAUNCHER_FD_TEST", "")
+    if not launcher:
+        candidate = ROOT / "rust/khaos-core/target/release/khaos-exec-launcher"
+        if candidate.is_file():
+            launcher = str(candidate)
+        else:
+            pytest.skip("set KHAOS_EXEC_LAUNCHER_FD_TEST to a built Rust launcher")
+
+    script = tmp_path / "pinned-script"
+    script.write_text(f"#!{sys.executable}\nprint('original')\n", encoding="utf-8")
+    script.chmod(0o700)
+    argv = (str(script),)
+    environment = os.environ.copy()
+    authority = open_executable_authority(
+        argv,
+        environment,
+        expected_identity=executable_identity(argv, environment),
+    )
+    try:
+        script.unlink()
+        script.write_text(f"#!{sys.executable}\nprint('replaced')\n", encoding="utf-8")
+        script.chmod(0o700)
+        completed = subprocess.run(
+            [
+                launcher,
+                "--new-session",
+                "--exec-fd",
+                str(authority.executable_fd),
+                "--exec-digest",
+                authority.executable_digest,
+                "--interpreter-fd",
+                str(authority.interpreter_fd),
+                "--interpreter-digest",
+                str(authority.interpreter_digest),
+                "--",
+                *argv,
+            ],
+            pass_fds=authority.pass_fds,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=environment,
+        )
+    finally:
+        authority.close()
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "original"

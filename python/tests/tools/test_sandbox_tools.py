@@ -3,19 +3,28 @@ import inspect
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from khaos.coding.execution.capability import DockerSandboxDecision
 from khaos.coding.execution.docker import (
     DEFAULT_DOCKER_IMAGE,
     DockerBackend,
     DockerBackendClosedError,
     _ContainerLease,
+    _DOCKER_HARDENING_GENERATION,
+    _canonical_digest,
+    _workspace_mount_policy_digest,
 )
 from khaos.coding.execution.host import HostExecutionBackend
+from khaos.coding.execution.identity import (
+    container_command_identity,
+    executable_identity,
+)
 from khaos.coding.execution.models import (
     ExecutionResult,
     NetworkPolicy,
@@ -51,6 +60,35 @@ class _FakeDockerBackend:
         return ExecutionResult(
             context.correlation_id, "passed", 0, "ok\n", "", 1,
             {"container_id": "container-1", "cleanup": "removed"},
+        )
+
+    async def prepare_decision(
+        self, *, image, workspace, budget, argv, filesystem_mode="workspace-write"
+    ):
+        image_digest = image.split("@sha256:", 1)[-1]
+        command_digest = "fake-command-digest"
+        binary_identity = "fake-docker-binary"
+        daemon_identity = "fake-docker-daemon"
+        return DockerSandboxDecision(
+            backend_name="docker",
+            capability_evidence_digest="fake-capability-evidence",
+            filesystem_mode=filesystem_mode,
+            network_mode=NetworkPolicy.NONE.value,
+            kernel_enforced=True,
+            platform=sys.platform,
+            launcher_digest=binary_identity,
+            docker_binary_identity=binary_identity,
+            daemon_identity_digest=daemon_identity,
+            image_reference=image,
+            image_digest=image_digest,
+            uid="65534:65534",
+            capabilities=("ALL",),
+            no_new_privileges=True,
+            read_only_rootfs=True,
+            workspace_mount_policy_digest="fake-mount-policy",
+            budget_digest=budget.digest(),
+            hardening_generation="fake-hardening",
+            command_digest=command_digest,
         )
 
     async def terminate(self, execution_id):
@@ -246,6 +284,13 @@ class _InspectableDockerBackend(DockerBackend):
     def __init__(self, *, shutdown_timeout_seconds=15.0):
         super().__init__(
             allowed_images={DEFAULT_DOCKER_IMAGE},
+            # The fake CLI observations below do not need a Docker daemon,
+            # but DockerBackend still asks ProcessSupervisor to open the host
+            # command through its native executable authority.  GitHub's
+            # macOS runners do not ship the Docker CLI, so use the current
+            # Python executable as a portable authority for this test double.
+            # The fixed Docker argv remains fully asserted by the tests.
+            docker_binary=sys.executable,
             shutdown_timeout_seconds=shutdown_timeout_seconds,
         )
         self.cli_calls = []
@@ -280,7 +325,9 @@ def _resolved(
     image=DEFAULT_DOCKER_IMAGE,
     budget=None,
     environment=None,
+    argv=("python", "-V"),
     execution_id="exec-1",
+    docker_binary="docker",
 ):
     worktree = tmp_path / "worktree"
     worktree.mkdir(exist_ok=True)
@@ -289,10 +336,43 @@ def _resolved(
     repository = tmp_path / "repo"
     repository.mkdir(exist_ok=True)
     env = {"KHAOS_DOCKER_IMAGE": image, **(environment or {})}
+    budget_value = budget or ResourceBudget()
+    image_digest = image.split("@sha256:", 1)[-1]
+    docker_env = {"PATH": os.environ.get("PATH", os.defpath)}
+    binary_identity = executable_identity((docker_binary,), docker_env)
+    daemon_identity = _canonical_digest({"stdout": "", "stderr": ""})
+    command_digest = _canonical_digest(argv)
+    decision = DockerSandboxDecision(
+        backend_name="docker",
+        capability_evidence_digest=_canonical_digest(
+            {"binary": binary_identity, "daemon": daemon_identity}
+        ),
+        filesystem_mode="workspace-write",
+        network_mode=NetworkPolicy.NONE.value,
+        kernel_enforced=True,
+        platform=os.uname().sysname.lower() if hasattr(os, "uname") else "unknown",
+        launcher_digest=binary_identity,
+        docker_binary_identity=binary_identity,
+        daemon_identity_digest=daemon_identity,
+        image_reference=image,
+        image_digest=image_digest,
+        uid="65534:65534",
+        capabilities=("ALL",),
+        no_new_privileges=True,
+        read_only_rootfs=True,
+        workspace_mount_policy_digest=_workspace_mount_policy_digest(worktree),
+        budget_digest=budget_value.digest(),
+        hardening_generation=_DOCKER_HARDENING_GENERATION,
+        command_digest=command_digest,
+    )
     return ResolvedExecutionContext(
         "task", "workspace", "running", repository, worktree, worktree, (worktree,),
-        "workspace-write", NetworkPolicy.NONE, budget or ResourceBudget(), env,
-        frozenset(env), ("python", "-V"), execution_id,
+        "workspace-write", NetworkPolicy.NONE, budget_value, env,
+        frozenset(env), argv, execution_id,
+        executable_identity=container_command_identity(
+            image_digest, argv, command_digest=command_digest
+        ),
+        sandbox_decision=decision,
     )
 
 
@@ -300,9 +380,13 @@ async def test_docker_backend_builds_hardened_fixed_argv(tmp_path):
     backend = _InspectableDockerBackend()
     process = _FakeProcess()
     with patch("khaos.coding.execution.docker.asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)) as spawn:
-        result = await backend.execute_resolved(_resolved(tmp_path))
-    argv = spawn.await_args.args
-    assert argv[:2] == ("docker", "run")
+        result = await backend.execute_resolved(
+            _resolved(tmp_path, docker_binary=backend.docker_binary)
+        )
+    launch_argv = spawn.await_args.args
+    assert "--exec-fd" in launch_argv
+    argv = launch_argv[launch_argv.index("--") + 1:]
+    assert argv[:2] == (backend.docker_binary, "run")
     assert "--read-only" in argv
     assert "--tmpfs" in argv and any(str(item).startswith("/tmp:rw,noexec,nosuid,nodev") for item in argv)
     assert argv[argv.index("--user") + 1] == "65534:65534"
@@ -372,7 +456,9 @@ async def test_docker_deleted_open_file_watchdog_maps_to_resource_violation(tmp_
         "khaos.coding.execution.docker.asyncio.create_subprocess_exec",
         new=AsyncMock(return_value=process),
     ):
-        result = await backend.execute_resolved(_resolved(tmp_path))
+        result = await backend.execute_resolved(
+            _resolved(tmp_path, docker_binary=backend.docker_binary)
+        )
 
     assert result.status == "resource-exhausted"
     assert result.diagnostics["resource_violation"]["kind"] == "workspace-bytes"
@@ -381,7 +467,13 @@ async def test_docker_deleted_open_file_watchdog_maps_to_resource_violation(tmp_
 async def test_docker_backend_rejects_unavailable_or_unapproved_image_without_pull(tmp_path):
     backend = _InspectableDockerBackend()
     with pytest.raises(PermissionError, match="allowlist"):
-        await backend.execute_resolved(_resolved(tmp_path, image="evil/latest"))
+        await backend.execute_resolved(
+            _resolved(
+                tmp_path,
+                image="evil/latest",
+                docker_binary=backend.docker_binary,
+            )
+        )
     missing = "example.invalid/khaos@sha256:" + "1" * 64
     backend.allowed_images = frozenset({missing})
 
@@ -391,7 +483,9 @@ async def test_docker_backend_rejects_unavailable_or_unapproved_image_without_pu
 
     backend._run_cli = missing_cli
     with pytest.raises(PermissionError, match="automatic pull"):
-        await backend.execute_resolved(_resolved(tmp_path, image=missing))
+        await backend.execute_resolved(
+            _resolved(tmp_path, image=missing, docker_binary=backend.docker_binary)
+        )
     assert not any(call[:1] == ("pull",) for call in backend.cli_calls)
 
 
@@ -410,7 +504,9 @@ async def test_docker_cleanup_refuses_foreign_container_name_collision(tmp_path)
         new=AsyncMock(return_value=process),
     ):
         with pytest.raises(PermissionError, match="not owned"):
-            await backend.execute_resolved(_resolved(tmp_path))
+            await backend.execute_resolved(
+                _resolved(tmp_path, docker_binary=backend.docker_binary)
+            )
 
     destructive = {"stop", "kill", "rm"}
     assert not any(call[0] in destructive for call in backend.cli_calls)
@@ -421,7 +517,7 @@ async def test_docker_cleanup_refuses_foreign_container_name_collision(tmp_path)
 
 async def test_docker_backend_rejects_mount_option_injection_path(tmp_path):
     backend = _InspectableDockerBackend()
-    context = _resolved(tmp_path)
+    context = _resolved(tmp_path, docker_binary=backend.docker_binary)
     unsafe = tmp_path / "worktree,dst=host"
     context.worktree_path.rename(unsafe)
     context = ResolvedExecutionContext(
@@ -443,7 +539,7 @@ async def test_docker_backend_rejects_mount_option_injection_path(tmp_path):
 @pytest.mark.parametrize("violation", ["network", "writable-root", "sensitive-env", "main-repository"])
 async def test_docker_backend_rejects_untrusted_resolved_context(tmp_path, violation):
     backend = _InspectableDockerBackend()
-    context = _resolved(tmp_path)
+    context = _resolved(tmp_path, docker_binary=backend.docker_binary)
     if violation == "network":
         context = ResolvedExecutionContext(
             **{**context.__dict__, "network_policy": NetworkPolicy.UNRESTRICTED_WITH_APPROVAL}
@@ -473,7 +569,13 @@ async def test_docker_backend_timeout_cleanup_output_truncation_and_shutdown(tmp
     budget = ResourceBudget(timeout_seconds=0.01, output_bytes=4)
     process = _FakeProcess(stdout=b"0123456789", returncode=None, delay=0.05)
     with patch("khaos.coding.execution.docker.asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)):
-        result = await backend.execute_resolved(_resolved(tmp_path, budget=budget))
+        result = await backend.execute_resolved(
+            _resolved(
+                tmp_path,
+                budget=budget,
+                docker_binary=backend.docker_binary,
+            )
+        )
     assert result.status == "timed-out"
     assert process.returncode in {-15, -9}
     assert result.diagnostics["process_group_terminated"] is True
@@ -533,7 +635,7 @@ async def test_docker_backend_shutdown_spawn_barrier_keeps_late_child_owned(tmp_
         await release_spawn.wait()
         return process
 
-    context = _resolved(tmp_path)
+    context = _resolved(tmp_path, docker_binary=backend.docker_binary)
     with patch(
         "khaos.coding.execution.docker.asyncio.create_subprocess_exec",
         new=delayed_spawn,
@@ -602,8 +704,12 @@ async def test_docker_backend_truncates_output_without_unbounded_artifact(tmp_pa
     process = _FakeProcess(stdout=b"0123456789", stderr=b"abcdefghij")
     with patch("khaos.coding.execution.docker.asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)):
         result = await backend.execute_resolved(
-            _resolved(tmp_path, budget=ResourceBudget(output_bytes=8))
-    )
+            _resolved(
+                tmp_path,
+                budget=ResourceBudget(output_bytes=8),
+                docker_binary=backend.docker_binary,
+            )
+        )
     assert len(result.stdout.encode()) + len(result.stderr.encode()) <= 8
     assert result.diagnostics["output_truncated"] is True
     assert result.diagnostics["stdout_bytes_dropped"] == 6
@@ -732,6 +838,12 @@ async def test_real_docker_workspace_isolation_e2e(tmp_path):
 @pytest.mark.skipif(not _docker_available(), reason="Docker daemon unavailable")
 @pytest.mark.docker_sandbox_real
 async def test_real_docker_deleted_open_file_budget_is_enforced(tmp_path):
+    command = (
+        "import os,time; "
+        "fd=os.open('/workspace/deleted.bin', os.O_CREAT|os.O_RDWR, 0o600); "
+        "os.unlink('/workspace/deleted.bin'); os.write(fd, b'x'*16384); "
+        "os.fsync(fd); time.sleep(30)"
+    )
     context = _resolved(
         tmp_path,
         budget=ResourceBudget(
@@ -739,18 +851,19 @@ async def test_real_docker_deleted_open_file_budget_is_enforced(tmp_path):
             file_bytes=1024 * 1024,
             timeout_seconds=10,
         ),
+        argv=("python", "-c", command),
     )
     context.worktree_path.chmod(0o777)
-    command = (
-        "import os,time; "
-        "fd=os.open('/workspace/deleted.bin', os.O_CREAT|os.O_RDWR, 0o600); "
-        "os.unlink('/workspace/deleted.bin'); os.write(fd, b'x'*16384); "
-        "os.fsync(fd); time.sleep(30)"
+    backend = DockerBackend(allowed_images={DEFAULT_DOCKER_IMAGE})
+    decision = await backend.prepare_decision(
+        image=DEFAULT_DOCKER_IMAGE,
+        workspace=context.worktree_path,
+        budget=context.budget,
+        argv=context.argv,
     )
     context = ResolvedExecutionContext(
-        **{**context.__dict__, "argv": ("python", "-c", command)}
+        **{**context.__dict__, "sandbox_decision": decision}
     )
-    backend = DockerBackend(allowed_images={DEFAULT_DOCKER_IMAGE})
 
     result = await backend.execute_resolved(context)
 

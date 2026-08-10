@@ -18,6 +18,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from khaos.coding.execution.binding import ExecutionDirectoryBinding
+from khaos.coding.execution.identity import (
+    ExecutableAuthority,
+    open_executable_authority,
+)
 from khaos.coding.execution.models import ResourceBudget
 
 
@@ -29,6 +33,12 @@ class ProcessLaunch:
     cwd: str | None
     pass_fds: tuple[int, ...]
     start_new_session: bool
+    executable_authority: ExecutableAuthority | None = None
+
+    def close_owned_fds(self) -> None:
+        """Close parent-side executable authority descriptors after spawn."""
+        if self.executable_authority is not None:
+            self.executable_authority.close()
 
 
 def build_process_launch(
@@ -39,6 +49,9 @@ def build_process_launch(
     budget: ResourceBudget | None,
     enforce_resource_limits: bool,
     preserve_directory_fds: bool = False,
+    environment: dict[str, str] | None = None,
+    expected_identity: str | None = None,
+    executable_authority: ExecutableAuthority | None = None,
 ) -> ProcessLaunch:
     """Compile a safe launch into either the native or explicit dev boundary.
 
@@ -53,23 +66,21 @@ def build_process_launch(
         raise ValueError(
             "preserving directory descriptors requires a directory binding"
         )
-    needs_boundary = directory_binding is not None or (
-        enforce_resource_limits and budget is not None
-    )
-    if not needs_boundary:
-        return ProcessLaunch(
-            argv=command_tuple,
-            cwd=str(cwd),
-            pass_fds=(),
-            start_new_session=True,
-        )
     if os.name != "posix":
         raise PermissionError(
             "host execution resource and directory guarantees are unsupported on this platform"
         )
+    owned_authority = executable_authority
+    if owned_authority is None:
+        owned_authority = open_executable_authority(
+            command_tuple,
+            environment,
+            expected_identity=expected_identity,
+        )
     launcher = _find_launcher()
     development = launcher is None and os.environ.get("KHAOS_DEV_MODE") == "1"
     if launcher is None and not development:
+        owned_authority.close()
         raise PermissionError(
             "native execution launcher is required; build khaos-exec-launcher "
             "or set KHAOS_DEV_MODE=1 for an explicit development fallback"
@@ -113,12 +124,38 @@ def build_process_launch(
                     str(_positive_limit(budget.memory_bytes, "memory_bytes")),
                 )
             )
+    args.extend(
+        (
+            "--exec-fd",
+            str(owned_authority.executable_fd),
+            "--exec-digest",
+            owned_authority.executable_digest,
+        )
+    )
+    if owned_authority.interpreter_fd is not None:
+        assert owned_authority.interpreter_digest is not None
+        args.extend(
+            (
+                "--interpreter-fd",
+                str(owned_authority.interpreter_fd),
+                "--interpreter-digest",
+                owned_authority.interpreter_digest,
+            )
+        )
+        if owned_authority.interpreter_argv0 is not None:
+            args.extend(("--interpreter-argv0", owned_authority.interpreter_argv0))
+        for interpreter_arg in owned_authority.interpreter_args:
+            args.extend(("--interpreter-arg", interpreter_arg))
     args.extend(("--", *command_tuple))
     return ProcessLaunch(
         argv=tuple(args),
         cwd=(None if directory_binding is not None else str(cwd)),
-        pass_fds=(directory_binding.pass_fds if directory_binding is not None else ()),
+        pass_fds=(
+            (directory_binding.pass_fds if directory_binding is not None else ())
+            + owned_authority.pass_fds
+        ),
         start_new_session=False,
+        executable_authority=owned_authority,
     )
 
 

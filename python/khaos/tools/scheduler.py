@@ -18,8 +18,12 @@ from typing import Any, cast
 
 from khaos.agent.approval import ApprovalBinding, StepExecutionAuthority
 from khaos.coding.execution.capability import DockerSandboxDecision, SandboxDecision
+from khaos.coding.execution.authority import ExecutionAuthority
 from khaos.coding.execution.environment import is_non_inheritable_secret_key
-from khaos.coding.execution.identity import executable_identity
+from khaos.coding.execution.identity import (
+    container_command_identity,
+    executable_identity,
+)
 from khaos.coding.execution.models import (
     FileSystemAccess,
     NetworkPolicy,
@@ -1393,6 +1397,13 @@ class ToolScheduler:
                 ]
             if call.get("_spawn_plan") is not None:
                 invocation_context["spawn_plan"] = call["_spawn_plan"]
+            if isinstance(step_authority, StepExecutionAuthority) and isinstance(
+                call.get("_spawn_plan"), ResolvedSpawnPlan
+            ):
+                invocation_context["execution_authority"] = ExecutionAuthority(
+                    step_authority=step_authority,
+                    spawn_plan=call["_spawn_plan"],
+                )
             invocation_context["effect_id"] = effect_id
             output = await asyncio.wait_for(
                 self.invocation_broker.invoke(tool.name, mode=mode, context=invocation_context, **call.get("arguments", {})),
@@ -2474,6 +2485,21 @@ class ToolScheduler:
             "executable_identity"
         )
         argv = _execution_argv_for_authority(tool.name, call.get("arguments", {}))
+        execution_kind = str(getattr(tool, "execution_kind", "host-sandbox"))
+        if execution_kind == "docker" and argv and not executable_scope:
+            decision = call.get("_sandbox_decision") or tool_context.get(
+                "sandbox_decision"
+            )
+            image = str(call.get("arguments", {}).get("image") or "image:unspecified")
+            if isinstance(decision, DockerSandboxDecision):
+                image = decision.image_digest
+                executable_scope = container_command_identity(
+                    image,
+                    argv,
+                    command_digest=decision.command_digest,
+                )
+            else:
+                executable_scope = container_command_identity(image, argv)
         if not executable_scope:
             executable_scope = (
                 executable_identity(argv, environment_payload)
@@ -2572,10 +2598,6 @@ class ToolScheduler:
         if not _tool_has_capability(tool, "process.execute"):
             return
         argv = _execution_argv_for_authority(tool.name, call.get("arguments", {}))
-        if argv:
-            call["_executable_identity"] = executable_identity(
-                argv, tool_context.get("environment") or os.environ
-            )
         execution_kind = str(getattr(tool, "execution_kind", "host-sandbox"))
         if execution_kind == "process-control":
             return
@@ -2591,6 +2613,12 @@ class ToolScheduler:
                     )
                 call["_sandbox_decision"] = decision
                 call["_sandbox_backend"] = decision.backend_name
+                if argv:
+                    call["_executable_identity"] = container_command_identity(
+                        decision.image_digest,
+                        argv,
+                        command_digest=decision.command_digest,
+                    )
                 return
             resolver = getattr(service, "prepare_docker_decision", None)
             if not callable(resolver):
@@ -2615,7 +2643,17 @@ class ToolScheduler:
                 )
             call["_sandbox_decision"] = decision
             call["_sandbox_backend"] = decision.backend_name
+            if argv:
+                call["_executable_identity"] = container_command_identity(
+                    decision.image_digest,
+                    argv,
+                    command_digest=decision.command_digest,
+                )
             return
+        if argv:
+            call["_executable_identity"] = executable_identity(
+                argv, tool_context.get("environment") or os.environ
+            )
         selector = getattr(service, "backend_selector", None)
         selector_method = getattr(selector, "select_async_with_decision", None)
         if selector is None:
@@ -3129,6 +3167,7 @@ def _build_spawn_plan(
 ) -> ResolvedSpawnPlan:
     """Create one immutable, pre-approval spawn authority."""
     arguments = call.get("arguments", {})
+    session_id = str(tool_context.get("session_id") or "legacy-session")
     root_identity = _authority_identity_parts(
         tool_context.get("workspace_root_identity")
         or tool_context.get("cwd_identity")
@@ -3163,8 +3202,12 @@ def _build_spawn_plan(
     return ResolvedSpawnPlan(
         principal_id=str(tool_context.get("principal_id") or "legacy-principal"),
         project_id=str(tool_context.get("project_id") or "legacy-project"),
-        session_id=str(tool_context.get("session_id") or "legacy-session"),
-        task_id=str(tool_context.get("task_id") or "legacy-task"),
+        session_id=session_id,
+        # Keep the compatibility fallback identical to _build_step_authority.
+        # Direct library/test schedulers do not have a TaskWorkspace, but the
+        # step and spawn authorities must still bind to the same synthetic
+        # task identity.
+        task_id=str(tool_context.get("task_id") or f"session:{session_id}"),
         turn_id=str(tool_context.get("turn_id") or f"turn:{call['id']}"),
         step_id=str(tool_context.get("attempt_id") or f"step:{call['id']}"),
         workspace_generation=workspace_generation,

@@ -11,10 +11,14 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import cast
 
-from khaos.coding.execution.binding import open_execution_directory_binding
+from khaos.coding.execution.binding import (
+    ExecutionDirectoryBinding,
+    open_execution_directory_binding,
+)
 from khaos.coding.execution.environment import scrub_spawn_environment
 from khaos.coding.execution.capability import (
     BackendAvailability,
@@ -47,6 +51,15 @@ class KernelResourceLease:
 
     def descriptor(self) -> str:
         return f"cgroup:{self.execution_id}:{self.path}"
+
+
+class LinuxBubblewrapBackendState(str, Enum):
+    """Lifecycle states for the Linux kernel-resource owner."""
+
+    OPEN = "open"
+    CLOSING = "closing"
+    QUARANTINED = "quarantined"
+    CLOSED = "closed"
 
 
 class UnsupportedBackend:
@@ -457,16 +470,135 @@ class LinuxBubblewrapBackend:
         self.supervisor = supervisor
         self._capability_cache: _CapabilityCacheEntry | None = None
         self._cgroup_leases: dict[str, KernelResourceLease] = {}
+        self._release_tasks: dict[str, asyncio.Task[None]] = {}
+        self._lock = asyncio.Lock()
+        self._state = LinuxBubblewrapBackendState.OPEN
+        self._shutdown_task: asyncio.Task[None] | None = None
+        self._shutdown_error: BaseException | None = None
+
+    @property
+    def state(self) -> str:
+        """Return the ResourceOwner lifecycle state."""
+        return self._state.value
+
+    @property
+    def admission_closed(self) -> bool:
+        """Reject new cgroup generations after close or quarantine."""
+        return self._state is not LinuxBubblewrapBackendState.OPEN
+
+    @property
+    def generation_admission_closed(self) -> bool:
+        return self.admission_closed
+
+    @property
+    def child_admission_closed(self) -> bool:
+        return self.admission_closed
+
+    @property
+    def terminal_closed(self) -> bool:
+        """Close is proven only after every cgroup path is absent."""
+        return (
+            self._state is LinuxBubblewrapBackendState.CLOSED
+            and not self._cgroup_leases
+            and not self._release_tasks
+        )
+
+    @property
+    def is_quarantined(self) -> bool:
+        return self._state is LinuxBubblewrapBackendState.QUARANTINED
 
     def owned_resources(self) -> tuple[str, ...]:
-        """Expose retained cgroups to the independent cleanup oracle."""
-        return tuple(
+        """Expose cgroups and in-flight cleanup transactions to the oracle."""
+        resources = tuple(
             lease.descriptor()
             for _, lease in sorted(self._cgroup_leases.items())
         )
+        cleanup = tuple(
+            f"cgroup-cleanup:{execution_id}"
+            for execution_id, task in sorted(self._release_tasks.items())
+            if not task.done()
+        )
+        return resources + cleanup
 
     def owns_execution(self, execution_id: str) -> bool:
-        return execution_id in self._cgroup_leases
+        return (
+            execution_id in self._cgroup_leases
+            or execution_id in self._release_tasks
+        )
+
+    def terminal_postcondition(self) -> bool:
+        """Return an independent proof of kernel-resource termination."""
+        return self.terminal_closed and not self.owned_resources()
+
+    async def close(self) -> None:
+        """Retry cgroup cleanup until the external path oracle is empty."""
+        async with self._lock:
+            if self.terminal_closed:
+                return
+            if self._state is LinuxBubblewrapBackendState.OPEN:
+                self._state = LinuxBubblewrapBackendState.CLOSING
+            elif self._state is LinuxBubblewrapBackendState.QUARANTINED:
+                self._state = LinuxBubblewrapBackendState.CLOSING
+            if self._shutdown_task is None or self._shutdown_task.done():
+                self._shutdown_task = asyncio.create_task(
+                    self._shutdown_impl(),
+                    name="khaos-linux-cgroup-owner-shutdown",
+                )
+            shutdown_task = self._shutdown_task
+        await asyncio.shield(shutdown_task)
+
+    async def shutdown(self) -> None:
+        """ResourceOwner-compatible shutdown alias."""
+        await self.close()
+
+    async def _shutdown_impl(self) -> None:
+        errors: list[BaseException] = []
+        try:
+            execution_ids = tuple(sorted(self._cgroup_leases))
+            for execution_id in execution_ids:
+                try:
+                    await asyncio.shield(self._release_cgroup_lease(execution_id))
+                except asyncio.CancelledError as exc:
+                    errors.append(exc)
+                except BaseException as exc:  # noqa: BLE001 - retain lease for retry
+                    errors.append(exc)
+            if self._cgroup_leases or self._release_tasks:
+                errors.append(
+                    RuntimeError(
+                        "Linux cgroup owner shutdown left kernel resources owned"
+                    )
+                )
+            if errors:
+                self._shutdown_error = errors[0]
+                self._state = LinuxBubblewrapBackendState.QUARANTINED
+                raise RuntimeError(
+                    f"Linux cgroup owner shutdown completed with {len(errors)} error(s)"
+                ) from errors[0]
+            self._shutdown_error = None
+            self._state = LinuxBubblewrapBackendState.CLOSED
+        except asyncio.CancelledError as exc:
+            self._shutdown_error = exc
+            self._state = LinuxBubblewrapBackendState.QUARANTINED
+            raise
+
+    def _retain_lease_after_rejected_admission(
+        self, execution_id: str, cgroup: Path
+    ) -> KernelResourceLease:
+        lease = KernelResourceLease(execution_id, cgroup)
+        self._cgroup_leases[execution_id] = lease
+        return lease
+
+    async def _register_cgroup_lease(
+        self, execution_id: str, cgroup: Path
+    ) -> KernelResourceLease:
+        async with self._lock:
+            if execution_id in self._cgroup_leases:
+                raise RuntimeError(f"duplicate Linux cgroup execution: {execution_id}")
+            if self._state is not LinuxBubblewrapBackendState.OPEN:
+                return self._retain_lease_after_rejected_admission(execution_id, cgroup)
+            lease = KernelResourceLease(execution_id, cgroup)
+            self._cgroup_leases[execution_id] = lease
+            return lease
 
     async def probe(self) -> BackendAvailability:
         import asyncio
@@ -652,6 +784,10 @@ class LinuxBubblewrapBackend:
 
     async def execute(self, request):
         from dataclasses import replace
+        if self.admission_closed:
+            raise PermissionError(
+                f"Linux bubblewrap backend is {self._state.value}, not accepting executions"
+            )
         profile = _validated_profile(request)
         writable = profile.filesystem.value == "workspace-write"
         worktree = profile.workspace_roots[0]
@@ -665,9 +801,42 @@ class LinuxBubblewrapBackend:
                     f"execution refused: delegated cgroup v2 limits unavailable: {exc}"
                 ) from exc
             execution_id = request.correlation_id
-            lease = KernelResourceLease(execution_id, cgroup)
-            self._cgroup_leases[execution_id] = lease
-            directory_binding = None
+            try:
+                lease = await self._register_cgroup_lease(execution_id, cgroup)
+            except BaseException as registration_error:
+                # A duplicate execution id or a cancellation during
+                # registration must not orphan the just-created cgroup. If
+                # its external disappearance cannot be proven, retain it
+                # under a unique lease so the backend remains the owner.
+                try:
+                    await asyncio.shield(
+                        asyncio.to_thread(_remove_linux_cgroup, cgroup)
+                    )
+                except BaseException as cleanup_error:
+                    orphan_id = (
+                        f"{execution_id}:orphan:{secrets.token_hex(8)}"
+                    )
+                    async with self._lock:
+                        self._cgroup_leases[orphan_id] = KernelResourceLease(
+                            orphan_id, cgroup, quarantined=True
+                        )
+                        self._state = LinuxBubblewrapBackendState.QUARANTINED
+                    raise RuntimeError(
+                        "Linux cgroup registration failed and orphan cleanup "
+                        "was not proven"
+                    ) from cleanup_error
+                raise registration_error
+            if self.admission_closed:
+                try:
+                    await asyncio.shield(self._release_cgroup_lease(execution_id))
+                except BaseException as exc:
+                    raise PermissionError(
+                        "execution refused: Linux cgroup admission closed and cleanup is unproven"
+                    ) from exc
+                raise PermissionError(
+                    f"Linux bubblewrap backend is {self._state.value}, not accepting executions"
+                )
+            directory_binding: ExecutionDirectoryBinding | None = None
             try:
                 directory_binding = open_execution_directory_binding(
                     worktree,
@@ -694,44 +863,41 @@ class LinuxBubblewrapBackend:
                     # to the already-validated directory inode.
                     workspace_source=workspace_source,
                 )
-            except Exception:
-                if directory_binding is not None:
-                    directory_binding.close()
-                raise
-            launcher = _linux_sandbox_launcher()
-            if launcher is None:
-                if directory_binding is not None:
-                    directory_binding.close()
-                raise PermissionError(
-                    "execution refused: no_new_privs/seccomp launcher unavailable"
-                )
-            sandboxed_argv = (
-                str(launcher), "--join-cgroup",
-                str(lease.path / "cgroup.procs"), "--", *prefix, "--",
-                str(launcher), "--", *request.argv,
-            )
-            sandboxed = replace(
-                request,
-                argv=sandboxed_argv,
-                executable_identity=executable_identity(sandboxed_argv, {}),
-            )
-            supervisor = self.supervisor or ProcessSupervisor()
-            self.supervisor = supervisor
-            try:
-                try:
-                    return await supervisor.run(
-                        sandboxed,
-                        cwd=request.cwd.expanduser().absolute(),
-                        execution_root=worktree,
-                        sandbox_storage_paths=("/home/khaos", "/tmp"),
-                        workspace_root=worktree if writable else None,
-                        workspace_baseline=request.workspace_baseline,
-                        directory_binding=directory_binding,
-                        preserve_directory_fds=True,
+                launcher = _linux_sandbox_launcher()
+                if launcher is None:
+                    raise PermissionError(
+                        "execution refused: no_new_privs/seccomp launcher unavailable"
                     )
-                except (OSError, PermissionError):
-                    self._capability_cache = None
-                    raise
+                if self.admission_closed:
+                    raise PermissionError(
+                        f"Linux bubblewrap backend is {self._state.value}, "
+                        "not accepting executions"
+                    )
+                sandboxed_argv = (
+                    str(launcher), "--join-cgroup",
+                    str(lease.path / "cgroup.procs"), "--", *prefix, "--",
+                    str(launcher), "--", *request.argv,
+                )
+                sandboxed = replace(
+                    request,
+                    argv=sandboxed_argv,
+                    executable_identity=executable_identity(sandboxed_argv, {}),
+                )
+                supervisor = self.supervisor or ProcessSupervisor()
+                self.supervisor = supervisor
+                return await supervisor.run(
+                    sandboxed,
+                    cwd=request.cwd.expanduser().absolute(),
+                    execution_root=worktree,
+                    sandbox_storage_paths=("/home/khaos", "/tmp"),
+                    workspace_root=worktree if writable else None,
+                    workspace_baseline=request.workspace_baseline,
+                    directory_binding=directory_binding,
+                    preserve_directory_fds=True,
+                )
+            except (OSError, PermissionError):
+                self._capability_cache = None
+                raise
             finally:
                 # ProcessSupervisor closes the binding after spawn; this is
                 # idempotent and also covers failures before supervisor.run.
@@ -740,12 +906,38 @@ class LinuxBubblewrapBackend:
                 await self._release_cgroup_lease(execution_id)
 
     async def terminate(self, execution_id: str) -> None:
+        had_lease = execution_id in self._cgroup_leases
+        errors: list[BaseException] = []
         if self.supervisor is not None:
-            await self.supervisor.terminate(execution_id)
-        await self._release_cgroup_lease(execution_id)
+            try:
+                await self.supervisor.terminate(execution_id)
+            except BaseException as exc:  # noqa: BLE001 - cleanup must continue
+                errors.append(exc)
+        if had_lease:
+            try:
+                await asyncio.shield(self._release_cgroup_lease(execution_id))
+            except BaseException as exc:  # noqa: BLE001 - retain lease on failure
+                errors.append(exc)
+        if errors:
+            if had_lease:
+                self._state = LinuxBubblewrapBackendState.QUARANTINED
+            raise errors[0]
 
     async def _release_cgroup_lease(self, execution_id: str) -> None:
         """Release only after the kernel path is absent; retain on failure."""
+        async with self._lock:
+            if execution_id not in self._cgroup_leases:
+                return
+            cleanup_task = self._release_tasks.get(execution_id)
+            if cleanup_task is None or cleanup_task.done():
+                cleanup_task = asyncio.create_task(
+                    self._release_cgroup_lease_impl(execution_id),
+                    name=f"khaos-linux-cgroup-cleanup:{execution_id}",
+                )
+                self._release_tasks[execution_id] = cleanup_task
+        await asyncio.shield(cleanup_task)
+
+    async def _release_cgroup_lease_impl(self, execution_id: str) -> None:
         lease = self._cgroup_leases.get(execution_id)
         if lease is None:
             return
@@ -755,9 +947,15 @@ class LinuxBubblewrapBackend:
                 raise RuntimeError(
                     f"cgroup disappearance was not proven: {lease.path}"
                 )
-        except BaseException:
+        except BaseException as exc:  # noqa: BLE001 - lease remains owned
             lease.quarantined = True
+            self._shutdown_error = exc
+            self._state = LinuxBubblewrapBackendState.QUARANTINED
             raise
+        finally:
+            current = asyncio.current_task()
+            if current is not None and self._release_tasks.get(execution_id) is current:
+                self._release_tasks.pop(execution_id, None)
         self._cgroup_leases.pop(execution_id, None)
 
 

@@ -21,7 +21,10 @@ from khaos.coding.execution.binding import (
     open_execution_directory_binding,
 )
 from khaos.coding.execution.environment import scrub_spawn_environment
-from khaos.coding.execution.identity import executable_identity
+from khaos.coding.execution.identity import (
+    executable_identity,
+    open_executable_authority,
+)
 from khaos.coding.execution.models import ExecutionRequest, ExecutionResult
 from khaos.coding.execution.native_launcher import build_process_launch
 from khaos.coding.workspace.storage import (
@@ -265,21 +268,7 @@ class ProcessSupervisor:
                 expected_cwd_identity=request.workspace_cwd_identity,
             )
         started = time.monotonic()
-        if use_native_launcher:
-            launch = build_process_launch(
-                request.argv,
-                cwd=cwd or request.cwd,
-                directory_binding=directory_binding,
-                budget=(
-                    request.permission_profile.resources
-                    if enforce_resource_limits
-                    else None
-                ),
-                enforce_resource_limits=enforce_resource_limits,
-                preserve_directory_fds=preserve_directory_fds,
-            )
-        else:
-            launch = None
+        launch = None
         # Round-15 review P0-B: re-check the admission fence immediately
         # before spawn.  The check at the top guards against the common
         # case; this one closes the window between the top-of-method check
@@ -299,8 +288,46 @@ class ProcessSupervisor:
         safe_environment = scrub_spawn_environment(env or {})
         observed_identity = executable_identity(request.argv, safe_environment)
         if request.executable_identity != observed_identity:
+            if directory_binding is not None:
+                directory_binding.close()
             raise PermissionError("executable identity changed before native spawn")
-        pending_spawn = await self._reserve_spawn(execution_id)
+        if use_native_launcher:
+            authority = None
+            try:
+                authority = open_executable_authority(
+                    request.argv,
+                    safe_environment,
+                    expected_identity=request.executable_identity,
+                )
+                launch = build_process_launch(
+                    request.argv,
+                    cwd=cwd or request.cwd,
+                    directory_binding=directory_binding,
+                    budget=(
+                        request.permission_profile.resources
+                        if enforce_resource_limits
+                        else None
+                    ),
+                    enforce_resource_limits=enforce_resource_limits,
+                    preserve_directory_fds=preserve_directory_fds,
+                    environment=safe_environment,
+                    expected_identity=request.executable_identity,
+                    executable_authority=authority,
+                )
+            except BaseException:
+                if authority is not None:
+                    authority.close()
+                if directory_binding is not None:
+                    directory_binding.close()
+                raise
+        try:
+            pending_spawn = await self._reserve_spawn(execution_id)
+        except BaseException:
+            if directory_binding is not None:
+                directory_binding.close()
+            if launch is not None:
+                launch.close_owned_fds()
+            raise
         process: asyncio.subprocess.Process | None = None
         spawn_task = asyncio.create_task(
             asyncio.create_subprocess_exec(
@@ -355,6 +382,8 @@ class ProcessSupervisor:
             # ``BaseException`` — still closes the directory binding.
             if directory_binding is not None:
                 directory_binding.close()
+            if launch is not None:
+                launch.close_owned_fds()
         if process is None:
             await self._finish_pending_spawn(
                 execution_id,
@@ -445,7 +474,19 @@ class ProcessSupervisor:
                 done, _pending = await asyncio.wait(
                     wait_set, return_when=asyncio.FIRST_COMPLETED,
                 )
-                if deadline_task is not None and deadline_task in done:
+                if process_wait_task in done:
+                    # Process completion wins a same-loop tie with the
+                    # deadline task.  ``asyncio.wait`` may return both tasks
+                    # in ``done`` when a child exits at the deadline
+                    # boundary; terminal process evidence must not be
+                    # reclassified as a timeout merely because the deadline
+                    # sleeper was also ready.  Only a deadline task that is
+                    # done while the process wait is still pending proves a
+                    # genuine timeout.
+                    if deadline_task is not None:
+                        deadline_task.cancel()
+                    status = "passed" if process.returncode == 0 else "failed"
+                elif deadline_task is not None and deadline_task in done:
                     # Deadline elapsed first → genuine timeout.  Cancel
                     # the wait task, terminate the process group, mark
                     # timed-out.  The process may have already exited
@@ -462,12 +503,6 @@ class ProcessSupervisor:
                             "process_group_terminated": True,
                         }
                     )
-                else:
-                    # Process exited first (before the deadline).  Use the
-                    # real returncode — do NOT reclassify signal deaths.
-                    if deadline_task is not None:
-                        deadline_task.cancel()
-                    status = "passed" if process.returncode == 0 else "failed"
             except asyncio.CancelledError:
                 active.termination_requested = True
                 await asyncio.shield(self._terminate_active(active))
@@ -975,6 +1010,21 @@ async def _resource_watchdog(
             deleted_bytes, deleted_complete = await asyncio.to_thread(
                 _deleted_open_file_usage, process.pid
             )
+            if not deleted_complete:
+                # /proc is a live view: a process can exit between listing
+                # its fd directory and reading one of the entries.  Treat a
+                # single incomplete sample as an observation race, not as a
+                # workspace violation.  A second sample after one event-loop
+                # turn still fails closed when the accounting is genuinely
+                # unavailable while the process remains alive.
+                await asyncio.sleep(0.01)
+                deleted_bytes, deleted_complete = await asyncio.to_thread(
+                    _deleted_open_file_usage, process.pid
+                )
+                if not deleted_complete and process.returncode is not None:
+                    # The process reached terminal state during the retry;
+                    # there is no remaining live process tree to account.
+                    deleted_bytes, deleted_complete = 0, True
         else:
             process_count, resident_bytes = 0, 0
             deleted_bytes, deleted_complete = 0, True

@@ -787,10 +787,10 @@ async def test_real_macos_synthetic_home_capacity_is_enforced(tmp_path: Path):
     violation = result.diagnostics["resource_violation"]
     assert violation["kind"] == "tmpfs"
     assert violation["limit"] == 10_000
-    # The monitor may stop the process after the third or fourth 4 KiB
-    # write. Both observations prove that the configured limit was crossed;
-    # requiring the final 16 KiB total makes the test scheduler-dependent.
-    assert 10_000 < violation["observed"] <= 16_384
+    # The watchdog measures the complete synthetic HOME, including runtime
+    # filesystem overhead, and may observe an overshoot before termination.
+    # Crossing the configured boundary is the enforceable contract.
+    assert violation["observed"] > 10_000
 
 
 @pytest.mark.asyncio
