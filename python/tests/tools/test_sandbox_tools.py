@@ -318,6 +318,7 @@ def _resolved(
     image=DEFAULT_DOCKER_IMAGE,
     budget=None,
     environment=None,
+    argv=("python", "-V"),
     execution_id="exec-1",
 ):
     worktree = tmp_path / "worktree"
@@ -327,7 +328,6 @@ def _resolved(
     repository = tmp_path / "repo"
     repository.mkdir(exist_ok=True)
     env = {"KHAOS_DOCKER_IMAGE": image, **(environment or {})}
-    argv = ("python", "-V")
     budget_value = budget or ResourceBudget()
     image_digest = image.split("@sha256:", 1)[-1]
     docker_env = {"PATH": os.environ.get("PATH", os.defpath)}
@@ -806,6 +806,12 @@ async def test_real_docker_workspace_isolation_e2e(tmp_path):
 @pytest.mark.skipif(not _docker_available(), reason="Docker daemon unavailable")
 @pytest.mark.docker_sandbox_real
 async def test_real_docker_deleted_open_file_budget_is_enforced(tmp_path):
+    command = (
+        "import os,time; "
+        "fd=os.open('/workspace/deleted.bin', os.O_CREAT|os.O_RDWR, 0o600); "
+        "os.unlink('/workspace/deleted.bin'); os.write(fd, b'x'*16384); "
+        "os.fsync(fd); time.sleep(30)"
+    )
     context = _resolved(
         tmp_path,
         budget=ResourceBudget(
@@ -813,18 +819,19 @@ async def test_real_docker_deleted_open_file_budget_is_enforced(tmp_path):
             file_bytes=1024 * 1024,
             timeout_seconds=10,
         ),
+        argv=("python", "-c", command),
     )
     context.worktree_path.chmod(0o777)
-    command = (
-        "import os,time; "
-        "fd=os.open('/workspace/deleted.bin', os.O_CREAT|os.O_RDWR, 0o600); "
-        "os.unlink('/workspace/deleted.bin'); os.write(fd, b'x'*16384); "
-        "os.fsync(fd); time.sleep(30)"
+    backend = DockerBackend(allowed_images={DEFAULT_DOCKER_IMAGE})
+    decision = await backend.prepare_decision(
+        image=DEFAULT_DOCKER_IMAGE,
+        workspace=context.worktree_path,
+        budget=context.budget,
+        argv=context.argv,
     )
     context = ResolvedExecutionContext(
-        **{**context.__dict__, "argv": ("python", "-c", command)}
+        **{**context.__dict__, "sandbox_decision": decision}
     )
-    backend = DockerBackend(allowed_images={DEFAULT_DOCKER_IMAGE})
 
     result = await backend.execute_resolved(context)
 
