@@ -129,7 +129,21 @@ async def test_fake_agent_runtime_changes_only_worktree_then_approved_apply(tmp_
             "success": event.metadata.get("success"),
             "error": event.metadata.get("error"),
             "error_code": event.metadata.get("error_code"),
-            "output": event.metadata.get("output"),
+            "returncode": (
+                event.metadata.get("output", {}).get("returncode")
+                if isinstance(event.metadata.get("output"), dict)
+                else None
+            ),
+            "status": (
+                event.metadata.get("output", {}).get("status")
+                if isinstance(event.metadata.get("output"), dict)
+                else None
+            ),
+            "stderr": (
+                event.metadata.get("output", {}).get("stderr")
+                if isinstance(event.metadata.get("output"), dict)
+                else None
+            ),
         }
         for event in events
         if event.event == "tool_result"
