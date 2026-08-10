@@ -58,7 +58,7 @@
 - `python/khaos/coding/execution/platform.py`: `9def29b36a53436634de47d4a2ec2b9a95726057cb2a44c375fac04705cb3b0f`
 - `python/khaos/coding/execution/service.py`: `89b31b3234129890fff9508127fad6f73cc6eb40f2cd9504d4bfb0e8363f4d09`
 - `python/khaos/coding/execution/binding.py`: `99f3d8eb14d80a837ecf0f0d076d556ccdb366b8798c9e0fde6c69d0bb1a5501`
-- `python/khaos/coding/execution/supervisor.py`: `6b91dae34bd004594bd7b291a7bf01d4481c64f66bf40fc49eb997ec9d99997c`
+- `python/khaos/coding/execution/supervisor.py`: `36f2cd506e267e2c004927b6af3f13da9bd12d9451d83a63f7d60a7932799ca1`
 - `rust/khaos-core/src/bin/khaos-exec-launcher.rs`: `2f7a9a45783cab6dd14b0a96888552c9571936e93c45883957de70070f830e95`
 - `python/khaos/grpc_server.py`: `595a2f38072d0153c43d1e703be197156c82a38105c2a8340734becac505d8ec`
 - `go/internal/api/handler.go`: `119a049cdc45ea2c949f558a179752edaa30409a744f3f352e888e7e829343f3`

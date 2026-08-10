@@ -1010,6 +1010,21 @@ async def _resource_watchdog(
             deleted_bytes, deleted_complete = await asyncio.to_thread(
                 _deleted_open_file_usage, process.pid
             )
+            if not deleted_complete:
+                # /proc is a live view: a process can exit between listing
+                # its fd directory and reading one of the entries.  Treat a
+                # single incomplete sample as an observation race, not as a
+                # workspace violation.  A second sample after one event-loop
+                # turn still fails closed when the accounting is genuinely
+                # unavailable while the process remains alive.
+                await asyncio.sleep(0.01)
+                deleted_bytes, deleted_complete = await asyncio.to_thread(
+                    _deleted_open_file_usage, process.pid
+                )
+                if not deleted_complete and process.returncode is not None:
+                    # The process reached terminal state during the retry;
+                    # there is no remaining live process tree to account.
+                    deleted_bytes, deleted_complete = 0, True
         else:
             process_count, resident_bytes = 0, 0
             deleted_bytes, deleted_complete = 0, True
