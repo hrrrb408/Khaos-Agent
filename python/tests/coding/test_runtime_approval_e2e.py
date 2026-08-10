@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
-import json
 from dataclasses import replace
 from pathlib import Path
 
