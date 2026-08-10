@@ -441,11 +441,19 @@ mod unix {
 
     #[cfg(target_os = "macos")]
     fn sign_staged_file(path: &std::path::Path) -> io::Result<()> {
-        // macOS can terminate an unsigned copied Mach-O with SIGKILL before
-        // it reaches exec.  The source descriptor was already hashed and
-        // verified; ad-hoc signing only makes that private immutable staging
-        // generation admissible to the platform loader.  A signing failure
-        // is a hard failure rather than a pathname-based fallback.
+        // Preserve an embedded platform CodeDirectory when the source already
+        // has one.  Replacing the signature on a platform binary such as
+        // /bin/cat with an ad-hoc signature can make macOS AMFI terminate the
+        // staged process with SIGKILL even though its bytes and digest are
+        // unchanged.  Unsigned objects still receive an ad-hoc signature;
+        // failure remains hard failure rather than a pathname fallback.
+        let existing = Command::new("/usr/bin/codesign")
+            .args(["-d", "--verbose=4"])
+            .arg(path)
+            .output()?;
+        if existing.status.success() {
+            return Ok(());
+        }
         let status = Command::new("/usr/bin/codesign")
             .args(["--force", "--sign", "-", "--timestamp=none"])
             .arg(path)
