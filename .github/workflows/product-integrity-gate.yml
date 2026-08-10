@@ -31,12 +31,19 @@ on:
   push:
     branches: [main, "feature/**", "codex/**"]
   workflow_dispatch:
+    inputs:
+      diagnostic:
+        description: "Run only the macOS 3.11 suite and stop at the first failure"
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   # ─── Full Python product suite across the supported version matrix ──────
   python-product:
     name: Python Product Suite
     runs-on: ${{ matrix.os }}
+    if: ${{ !inputs.diagnostic || (matrix.os == 'macos-14' && matrix.python-version == '3.11') }}
     # The full 3800-test suite can take ~30-40 min on a slow shared runner;
     # macOS arm64 is materially slower when the native launcher stages and
     # signs executable authorities for process-backed tests.  Give the full
@@ -75,6 +82,7 @@ jobs:
           uv sync --frozen --extra test --extra tui --extra tree-sitter
           echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
       - name: Run FULL Python product suite
+        if: ${{ !inputs.diagnostic }}
         # Deselect tests that need real infrastructure only the dedicated
         # Security Closure Gate jobs provide: a real Docker daemon + pulled
         # images (docker_sandbox_real / production_sandbox_real), a real
@@ -88,6 +96,11 @@ jobs:
         #
         run: >-
           uv run pytest python/tests/ -vv
+          -m "not browser_real and not docker_sandbox_real and not production_sandbox_real and not kernel_real and not platform_sandbox_real"
+      - name: Run macOS diagnostic product suite
+        if: ${{ inputs.diagnostic }}
+        run: >-
+          uv run pytest python/tests/ -vv --tb=long --maxfail=1
           -m "not browser_real and not docker_sandbox_real and not production_sandbox_real and not kernel_real and not platform_sandbox_real"
 
   # ─── Full Go product suite with the race detector ──────────────────────
@@ -126,7 +139,7 @@ jobs:
   # ─── Aggregate gate ────────────────────────────────────────────────────
   product-integrity-gate:
     name: Product Integrity Gate
-    if: always()
+    if: ${{ always() && !inputs.diagnostic }}
     needs:
       - python-product
       - go-product
