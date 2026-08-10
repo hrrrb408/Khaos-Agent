@@ -3,19 +3,28 @@ import inspect
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from khaos.coding.execution.capability import DockerSandboxDecision
 from khaos.coding.execution.docker import (
     DEFAULT_DOCKER_IMAGE,
     DockerBackend,
     DockerBackendClosedError,
     _ContainerLease,
+    _DOCKER_HARDENING_GENERATION,
+    _canonical_digest,
+    _workspace_mount_policy_digest,
 )
 from khaos.coding.execution.host import HostExecutionBackend
+from khaos.coding.execution.identity import (
+    container_command_identity,
+    executable_identity,
+)
 from khaos.coding.execution.models import (
     ExecutionResult,
     NetworkPolicy,
@@ -51,6 +60,35 @@ class _FakeDockerBackend:
         return ExecutionResult(
             context.correlation_id, "passed", 0, "ok\n", "", 1,
             {"container_id": "container-1", "cleanup": "removed"},
+        )
+
+    async def prepare_decision(
+        self, *, image, workspace, budget, argv, filesystem_mode="workspace-write"
+    ):
+        image_digest = image.split("@sha256:", 1)[-1]
+        command_digest = "fake-command-digest"
+        binary_identity = "fake-docker-binary"
+        daemon_identity = "fake-docker-daemon"
+        return DockerSandboxDecision(
+            backend_name="docker",
+            capability_evidence_digest="fake-capability-evidence",
+            filesystem_mode=filesystem_mode,
+            network_mode=NetworkPolicy.NONE.value,
+            kernel_enforced=True,
+            platform=sys.platform,
+            launcher_digest=binary_identity,
+            docker_binary_identity=binary_identity,
+            daemon_identity_digest=daemon_identity,
+            image_reference=image,
+            image_digest=image_digest,
+            uid="65534:65534",
+            capabilities=("ALL",),
+            no_new_privileges=True,
+            read_only_rootfs=True,
+            workspace_mount_policy_digest="fake-mount-policy",
+            budget_digest=budget.digest(),
+            hardening_generation="fake-hardening",
+            command_digest=command_digest,
         )
 
     async def terminate(self, execution_id):
@@ -289,10 +327,44 @@ def _resolved(
     repository = tmp_path / "repo"
     repository.mkdir(exist_ok=True)
     env = {"KHAOS_DOCKER_IMAGE": image, **(environment or {})}
+    argv = ("python", "-V")
+    budget_value = budget or ResourceBudget()
+    image_digest = image.split("@sha256:", 1)[-1]
+    docker_env = {"PATH": os.environ.get("PATH", os.defpath)}
+    binary_identity = executable_identity(("docker",), docker_env)
+    daemon_identity = _canonical_digest({"stdout": "", "stderr": ""})
+    command_digest = _canonical_digest(argv)
+    decision = DockerSandboxDecision(
+        backend_name="docker",
+        capability_evidence_digest=_canonical_digest(
+            {"binary": binary_identity, "daemon": daemon_identity}
+        ),
+        filesystem_mode="workspace-write",
+        network_mode=NetworkPolicy.NONE.value,
+        kernel_enforced=True,
+        platform=os.uname().sysname.lower() if hasattr(os, "uname") else "unknown",
+        launcher_digest=binary_identity,
+        docker_binary_identity=binary_identity,
+        daemon_identity_digest=daemon_identity,
+        image_reference=image,
+        image_digest=image_digest,
+        uid="65534:65534",
+        capabilities=("ALL",),
+        no_new_privileges=True,
+        read_only_rootfs=True,
+        workspace_mount_policy_digest=_workspace_mount_policy_digest(worktree),
+        budget_digest=budget_value.digest(),
+        hardening_generation=_DOCKER_HARDENING_GENERATION,
+        command_digest=command_digest,
+    )
     return ResolvedExecutionContext(
         "task", "workspace", "running", repository, worktree, worktree, (worktree,),
-        "workspace-write", NetworkPolicy.NONE, budget or ResourceBudget(), env,
-        frozenset(env), ("python", "-V"), execution_id,
+        "workspace-write", NetworkPolicy.NONE, budget_value, env,
+        frozenset(env), argv, execution_id,
+        executable_identity=container_command_identity(
+            image_digest, argv, command_digest=command_digest
+        ),
+        sandbox_decision=decision,
     )
 
 
@@ -301,7 +373,9 @@ async def test_docker_backend_builds_hardened_fixed_argv(tmp_path):
     process = _FakeProcess()
     with patch("khaos.coding.execution.docker.asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)) as spawn:
         result = await backend.execute_resolved(_resolved(tmp_path))
-    argv = spawn.await_args.args
+    launch_argv = spawn.await_args.args
+    assert "--exec-fd" in launch_argv
+    argv = launch_argv[launch_argv.index("--") + 1:]
     assert argv[:2] == ("docker", "run")
     assert "--read-only" in argv
     assert "--tmpfs" in argv and any(str(item).startswith("/tmp:rw,noexec,nosuid,nodev") for item in argv)

@@ -7,7 +7,10 @@ import shlex
 from pathlib import Path
 from typing import Any
 
+from khaos.coding.execution.authority import ExecutionAuthority
+from khaos.coding.execution.capability import DockerSandboxDecision
 from khaos.coding.execution.docker import DEFAULT_DOCKER_IMAGE
+from khaos.coding.execution.identity import container_command_identity
 from khaos.coding.execution.models import (
     ExecutionRequest,
     NetworkPolicy,
@@ -33,6 +36,7 @@ async def sandbox_exec(
     sandbox_decision=None,
     executable_identity: str | None = None,
     spawn_plan=None,
+    execution_authority: ExecutionAuthority | None = None,
 ) -> dict[str, Any]:
     """Execute fixed argv inside the active TaskWorkspace Docker sandbox."""
     argv = tuple(shlex.split(command))
@@ -55,6 +59,37 @@ async def sandbox_exec(
     if not 1 <= timeout <= 3600:
         raise ValueError("timeout must be between 1 and 3600 seconds")
     memory_bytes = _parse_memory(memory)
+    if execution_authority is not None:
+        if not isinstance(execution_authority, ExecutionAuthority):
+            raise PermissionError("sandbox_exec received an invalid execution authority")
+        if not execution_authority.is_valid():
+            raise PermissionError("sandbox_exec execution authority is invalid")
+        if spawn_plan is not None and spawn_plan.digest() != execution_authority.spawn_plan.digest():
+            raise PermissionError("sandbox_exec spawn plan is not bound to its authority")
+        spawn_plan = execution_authority.spawn_plan
+    if sandbox_decision is None:
+        sandbox_decision = await execution_service.prepare_docker_decision(
+            tool_name="sandbox_exec",
+            arguments={
+                "image": image,
+                "command": command,
+                "project_dir": project_dir,
+                "network": network,
+                "cpus": cpus,
+                "memory": memory,
+                "timeout": timeout,
+            },
+            tool_context={"task_id": task_id, "workspace_id": workspace_id},
+        )
+    if not isinstance(sandbox_decision, DockerSandboxDecision):
+        raise PermissionError("sandbox_exec requires a concrete Docker authority")
+    expected_identity = container_command_identity(
+        sandbox_decision.image_digest,
+        argv,
+        command_digest=sandbox_decision.command_digest,
+    )
+    if executable_identity is not None and executable_identity != expected_identity:
+        raise PermissionError("sandbox command identity is not bound to its image")
     request = ExecutionRequest(
         argv=argv,
         cwd=root,
@@ -70,8 +105,9 @@ async def sandbox_exec(
         access_mode="workspace-write",
         backend_hint="docker",
         sandbox_decision=sandbox_decision,
-        executable_identity=executable_identity or "",
+        executable_identity=expected_identity,
         spawn_plan=spawn_plan,
+        execution_authority=execution_authority,
     )
     result = await execution_service.execute(request)
     timed_out = result.status == "timed-out"

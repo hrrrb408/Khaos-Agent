@@ -249,6 +249,7 @@ def test_execution_authority_modules_are_type_checked():
     workflow = (WORKFLOWS / "type-check.yml").read_text(encoding="utf-8")
     for module in (
         "python/khaos/coding/execution/capability.py",
+        "python/khaos/coding/execution/authority.py",
         "python/khaos/coding/execution/docker.py",
         "python/khaos/coding/execution/identity.py",
         "python/khaos/coding/execution/platform.py",

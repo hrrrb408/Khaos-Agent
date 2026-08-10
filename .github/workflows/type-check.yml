@@ -61,6 +61,7 @@ jobs:
             python/khaos/runtime/authority.py \
             python/khaos/runtime/lifecycle.py \
             python/khaos/coding/execution/capability.py \
+            python/khaos/coding/execution/authority.py \
             python/khaos/coding/execution/docker.py \
             python/khaos/coding/execution/identity.py \
             python/khaos/coding/execution/managed.py \

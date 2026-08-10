@@ -15,10 +15,15 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 from khaos.coding.execution.binding import open_execution_directory_binding
+from khaos.coding.execution.authority import ExecutionAuthority
 from khaos.coding.execution.capability import DockerSandboxDecision, SandboxDecision
 from khaos.coding.execution.cleanup_ledger import CleanupInvariantError, CleanupLedger
 from khaos.coding.execution.environment import scrub_spawn_environment
-from khaos.coding.execution.identity import executable_identity
+from khaos.coding.execution.identity import (
+    container_command_identity,
+    executable_identity,
+    open_executable_authority,
+)
 from khaos.coding.execution.managed import ManagedProcessHandle
 from khaos.coding.execution.models import (
     ExecutionRequest,
@@ -186,12 +191,42 @@ class ExecutionService:
             self.docker_backend
         ):
             return False
+        for backend in self._resource_owner_backends():
+            if backend is self.docker_backend:
+                continue
+            if not _resource_owner_terminal(backend):
+                return False
         return (
             not self._active
             and not self._initializing
             and not self._pending_managed_handles
             and _resource_owner_terminal(self.process_supervisor)
         )
+
+    def _resource_owner_backends(self) -> tuple[object, ...]:
+        """Return every execution backend still owned by this service.
+
+        A selector may create a backend per execution, so only inspecting
+        ``self.backend`` loses a retained kernel lease.  The active registry
+        is the service's authoritative transitive-owner edge; the configured
+        backend is included for the no-workspace/test path.
+        """
+        candidates: list[object] = []
+        if self.backend is not None:
+            candidates.append(self.backend)
+        candidates.extend(active[2] for active in self._active.values())
+        if self.docker_backend is not None:
+            candidates.append(self.docker_backend)
+        owners: list[object] = []
+        seen: set[int] = set()
+        for candidate in candidates:
+            identity = id(candidate)
+            if identity in seen or candidate is self.process_supervisor:
+                continue
+            seen.add(identity)
+            if _is_concrete_resource_owner(candidate):
+                owners.append(candidate)
+        return tuple(owners)
 
     async def close(self) -> None:
         """ResourceOwner alias for :meth:`shutdown`."""
@@ -344,6 +379,7 @@ class ExecutionService:
                 executable_identity=request.executable_identity,
                 sandbox_decision=request.sandbox_decision,
                 spawn_plan=request.spawn_plan,
+                execution_authority=request.execution_authority,
             )
             assert request.task_id is not None
             assert request.workspace_id is not None
@@ -358,6 +394,7 @@ class ExecutionService:
                 request.sandbox_decision,
                 request.spawn_plan,
                 int(getattr(workspace, "generation", 0) or 0),
+                request.execution_authority,
             )
             self._verify_spawn_plan(request, resolved_context)
         if self.backend_selector is not None:
@@ -398,12 +435,23 @@ class ExecutionService:
             backend = self.docker_backend
         if request.backend_hint == "docker" and resolved_context is None:
             raise PermissionError("Docker execution requires resolved TaskWorkspace context")
-        if request.executable_identity != executable_identity(
-            request.argv, request.environment
-        ):
-            raise PermissionError(
-                "executable identity changed before execution"
+        if request.backend_hint == "docker":
+            decision = request.sandbox_decision
+            if not isinstance(decision, DockerSandboxDecision):
+                raise PermissionError(
+                    "Docker execution requires a concrete container command authority"
+                )
+            observed_identity = container_command_identity(
+                decision.image_digest,
+                request.argv,
+                command_digest=decision.command_digest,
             )
+        else:
+            observed_identity = executable_identity(
+                request.argv, request.environment
+            )
+        if request.executable_identity != observed_identity:
+            raise PermissionError("execution command identity changed before execution")
         if request.sandbox_decision is not None:
             if (
                 request.sandbox_decision.filesystem_mode != profile.filesystem.value
@@ -596,6 +644,18 @@ class ExecutionService:
         container, so it refuses a plan whose command, identities, profile,
         budget, or concrete sandbox no longer matches the resolved request.
         """
+        authority = request.execution_authority
+        if authority is not None:
+            if not isinstance(authority, ExecutionAuthority) or not authority.is_valid():
+                raise PermissionError("execution authority is invalid")
+            if request.spawn_plan is None or (
+                request.spawn_plan.digest() != authority.spawn_plan.digest()
+            ):
+                raise PermissionError("execution authority is not bound to the spawn plan")
+            if context.execution_authority is not None and (
+                context.execution_authority.digest() != authority.digest()
+            ):
+                raise PermissionError("resolved execution authority changed")
         plan = request.spawn_plan
         if plan is None:
             return
@@ -915,23 +975,41 @@ class ExecutionService:
                 )
                 try:
                     argv = self._managed_argv(resolved, backend, temporary_home)
-                    launch = build_process_launch(
-                        argv,
-                        cwd=cwd,
-                        directory_binding=directory_binding,
-                        budget=request.budget,
-                        enforce_resource_limits=True,
-                    )
-                    process = await asyncio.create_subprocess_exec(
-                        *launch.argv,
-                        cwd=launch.cwd,
-                        env=scrub_spawn_environment(environment),
-                        stdin=asyncio.subprocess.PIPE,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
-                        start_new_session=launch.start_new_session,
-                        pass_fds=launch.pass_fds,
-                    )
+                    safe_environment = scrub_spawn_environment(environment)
+                    authority = None
+                    launch = None
+                    try:
+                        expected = executable_identity(argv, safe_environment)
+                        authority = open_executable_authority(
+                            argv,
+                            safe_environment,
+                            expected_identity=expected,
+                        )
+                        launch = build_process_launch(
+                            argv,
+                            cwd=cwd,
+                            directory_binding=directory_binding,
+                            budget=request.budget,
+                            enforce_resource_limits=True,
+                            environment=safe_environment,
+                            expected_identity=expected,
+                            executable_authority=authority,
+                        )
+                        process = await asyncio.create_subprocess_exec(
+                            *launch.argv,
+                            cwd=launch.cwd,
+                            env=safe_environment,
+                            stdin=asyncio.subprocess.PIPE,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                            start_new_session=launch.start_new_session,
+                            pass_fds=launch.pass_fds,
+                        )
+                    finally:
+                        if launch is not None:
+                            launch.close_owned_fds()
+                        elif authority is not None:
+                            authority.close()
                 finally:
                     directory_binding.close()
                 spawned_process = process
@@ -1216,6 +1294,58 @@ class ExecutionService:
                 generation=id(self.docker_backend),
             )
 
+        # Linux cgroups and any future execution backend are transitive
+        # ResourceOwners of the service.  They must be closed before the
+        # shared supervisor: a retained kernel lease may still be able to
+        # kill a process group, and a failed cleanup must remain retryable.
+        for backend in self._resource_owner_backends():
+            if backend is self.docker_backend:
+                continue
+            close = getattr(backend, "close", None)
+            if not callable(close):
+                close = getattr(backend, "shutdown", None)
+            if not callable(close):
+                continue
+            await _run_step(
+                f"backend:{id(backend)}:close",
+                close,
+                lambda backend=backend: _resource_owner_terminal(backend),
+                generation=id(backend),
+            )
+
+        async def _reconcile_released_backends() -> None:
+            # A backend close can release a retained cgroup after the earlier
+            # per-execution terminate step failed.  Remove only entries for
+            # which both the backend and supervisor independently prove that
+            # the execution is gone; never clear the registry speculatively.
+            async with self._admission_lock:
+                for execution_id, active in tuple(self._active.items()):
+                    backend = active[2]
+                    if not _has_resource_owner(backend):
+                        continue
+                    if not _resource_owner_released(backend, execution_id):
+                        continue
+                    if _supervisor_owns(self.process_supervisor, execution_id):
+                        continue
+                    if self._active.get(execution_id) is active:
+                        self._active.pop(execution_id, None)
+
+        await _run_step(
+            "backend:reconcile",
+            _reconcile_released_backends,
+            lambda: all(
+                not _has_resource_owner(active[2])
+                or (
+                    _resource_owner_released(active[2], execution_id)
+                    and not _supervisor_owns(
+                        self.process_supervisor, execution_id
+                    )
+                )
+                for execution_id, active in self._active.items()
+            ),
+            generation=id(self._active),
+        )
+
         await _run_step(
             "supervisor:shutdown",
             self.process_supervisor.shutdown,
@@ -1256,6 +1386,20 @@ def _has_resource_owner(component: object) -> bool:
         callable(getattr(component, name, None))
         for name in ("terminal_postcondition", "owned_resources")
     )
+
+
+def _is_concrete_resource_owner(component: object) -> bool:
+    """Recognize a real owner without treating permissive mocks as owners.
+
+    ``MagicMock`` manufactures every attribute requested by the legacy test
+    adapters and would otherwise look like a transitive backend owner.  A
+    concrete ResourceOwner exposes a boolean terminal property; requiring
+    that value keeps the generic owner traversal fail-closed without changing
+    the compatibility behavior of explicitly injected supervisor doubles.
+    """
+    if not _has_resource_owner(component):
+        return False
+    return isinstance(getattr(component, "terminal_closed", None), bool)
 
 
 def _resource_owner_terminal(component: object) -> bool:

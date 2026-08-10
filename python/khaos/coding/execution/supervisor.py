@@ -21,7 +21,10 @@ from khaos.coding.execution.binding import (
     open_execution_directory_binding,
 )
 from khaos.coding.execution.environment import scrub_spawn_environment
-from khaos.coding.execution.identity import executable_identity
+from khaos.coding.execution.identity import (
+    executable_identity,
+    open_executable_authority,
+)
 from khaos.coding.execution.models import ExecutionRequest, ExecutionResult
 from khaos.coding.execution.native_launcher import build_process_launch
 from khaos.coding.workspace.storage import (
@@ -265,21 +268,7 @@ class ProcessSupervisor:
                 expected_cwd_identity=request.workspace_cwd_identity,
             )
         started = time.monotonic()
-        if use_native_launcher:
-            launch = build_process_launch(
-                request.argv,
-                cwd=cwd or request.cwd,
-                directory_binding=directory_binding,
-                budget=(
-                    request.permission_profile.resources
-                    if enforce_resource_limits
-                    else None
-                ),
-                enforce_resource_limits=enforce_resource_limits,
-                preserve_directory_fds=preserve_directory_fds,
-            )
-        else:
-            launch = None
+        launch = None
         # Round-15 review P0-B: re-check the admission fence immediately
         # before spawn.  The check at the top guards against the common
         # case; this one closes the window between the top-of-method check
@@ -299,8 +288,46 @@ class ProcessSupervisor:
         safe_environment = scrub_spawn_environment(env or {})
         observed_identity = executable_identity(request.argv, safe_environment)
         if request.executable_identity != observed_identity:
+            if directory_binding is not None:
+                directory_binding.close()
             raise PermissionError("executable identity changed before native spawn")
-        pending_spawn = await self._reserve_spawn(execution_id)
+        if use_native_launcher:
+            authority = None
+            try:
+                authority = open_executable_authority(
+                    request.argv,
+                    safe_environment,
+                    expected_identity=request.executable_identity,
+                )
+                launch = build_process_launch(
+                    request.argv,
+                    cwd=cwd or request.cwd,
+                    directory_binding=directory_binding,
+                    budget=(
+                        request.permission_profile.resources
+                        if enforce_resource_limits
+                        else None
+                    ),
+                    enforce_resource_limits=enforce_resource_limits,
+                    preserve_directory_fds=preserve_directory_fds,
+                    environment=safe_environment,
+                    expected_identity=request.executable_identity,
+                    executable_authority=authority,
+                )
+            except BaseException:
+                if authority is not None:
+                    authority.close()
+                if directory_binding is not None:
+                    directory_binding.close()
+                raise
+        try:
+            pending_spawn = await self._reserve_spawn(execution_id)
+        except BaseException:
+            if directory_binding is not None:
+                directory_binding.close()
+            if launch is not None:
+                launch.close_owned_fds()
+            raise
         process: asyncio.subprocess.Process | None = None
         spawn_task = asyncio.create_task(
             asyncio.create_subprocess_exec(
@@ -355,6 +382,8 @@ class ProcessSupervisor:
             # ``BaseException`` — still closes the directory binding.
             if directory_binding is not None:
                 directory_binding.close()
+            if launch is not None:
+                launch.close_owned_fds()
         if process is None:
             await self._finish_pending_spawn(
                 execution_id,

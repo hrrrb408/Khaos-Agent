@@ -8,6 +8,7 @@ import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from khaos.coding.execution.capability import SandboxDecision
 from khaos.coding.execution.identity import executable_identity
@@ -16,6 +17,9 @@ from khaos.coding.workspace.storage import (
     DEFAULT_WORKSPACE_ENTRIES,
     WorkspaceStorageSnapshot,
 )
+
+if TYPE_CHECKING:
+    from khaos.coding.execution.authority import ExecutionAuthority
 
 
 class NetworkPolicy(str, Enum):
@@ -332,6 +336,7 @@ class ExecutionRequest:
     executable_identity: str = ""
     sandbox_decision: SandboxDecision | None = None
     spawn_plan: ResolvedSpawnPlan | None = None
+    execution_authority: ExecutionAuthority | None = None
 
     def __post_init__(self) -> None:
         profile = self.permission_profile or PermissionProfile.from_legacy(
@@ -386,6 +391,7 @@ class ResolvedExecutionContext:
     sandbox_decision: SandboxDecision | None = None
     spawn_plan: ResolvedSpawnPlan | None = None
     workspace_generation: int = 0
+    execution_authority: ExecutionAuthority | None = None
 
     def __post_init__(self) -> None:
         profile = self.permission_profile or PermissionProfile.from_legacy(

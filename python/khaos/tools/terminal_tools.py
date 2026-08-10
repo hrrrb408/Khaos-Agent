@@ -108,6 +108,7 @@ async def terminal(
     sandbox_decision=None,
     executable_identity: str | None = None,
     spawn_plan=None,
+    execution_authority=None,
 ) -> dict[str, Any]:
     """Compatibility wrapper for explicit shell execution.
 
@@ -126,6 +127,7 @@ async def terminal(
         sandbox_decision=sandbox_decision,
         executable_identity=executable_identity,
         spawn_plan=spawn_plan,
+        execution_authority=execution_authority,
     )
 
 
@@ -147,6 +149,7 @@ async def terminal_argv(
     sandbox_decision=None,
     executable_identity: str | None = None,
     spawn_plan=None,
+    execution_authority=None,
 ) -> dict[str, Any]:
     """Execute an argv vector without shell parsing or expansion."""
     if not argv or not all(isinstance(item, str) and item for item in argv):
@@ -185,6 +188,7 @@ async def terminal_argv(
         sandbox_decision=sandbox_decision,
         executable_identity=executable_identity or "",
         spawn_plan=spawn_plan,
+        execution_authority=execution_authority,
     )
     if background:
         if process_authority is None:
@@ -219,6 +223,7 @@ async def terminal_shell(
     sandbox_decision=None,
     executable_identity: str | None = None,
     spawn_plan=None,
+    execution_authority=None,
 ) -> dict[str, Any]:
     """Execute a script only through an explicitly selected absolute shell."""
     shell_path = Path(shell)
@@ -243,6 +248,7 @@ async def terminal_shell(
         sandbox_decision=sandbox_decision,
         executable_identity=executable_identity,
         spawn_plan=spawn_plan,
+        execution_authority=execution_authority,
     )
 
 
