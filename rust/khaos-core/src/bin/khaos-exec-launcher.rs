@@ -15,7 +15,9 @@ mod unix {
     use std::ffi::OsString;
     use std::fs::File;
     use std::io::{self, Read, Seek, SeekFrom};
-    use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+    #[cfg(not(target_os = "linux"))]
+    use std::os::fd::AsRawFd;
+    use std::os::fd::{FromRawFd, RawFd};
     use std::os::unix::ffi::OsStrExt;
     #[cfg(not(target_os = "linux"))]
     use std::os::unix::ffi::OsStringExt;
@@ -257,7 +259,7 @@ mod unix {
             } else {
                 interpreter_fd
             };
-            return execveat_fd(program_fd, &mut args);
+            execveat_fd(program_fd, &mut args)
         }
         #[cfg(not(target_os = "linux"))]
         {
