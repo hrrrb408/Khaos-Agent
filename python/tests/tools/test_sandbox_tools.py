@@ -284,6 +284,13 @@ class _InspectableDockerBackend(DockerBackend):
     def __init__(self, *, shutdown_timeout_seconds=15.0):
         super().__init__(
             allowed_images={DEFAULT_DOCKER_IMAGE},
+            # The fake CLI observations below do not need a Docker daemon,
+            # but DockerBackend still asks ProcessSupervisor to open the host
+            # command through its native executable authority.  GitHub's
+            # macOS runners do not ship the Docker CLI, so use the current
+            # Python executable as a portable authority for this test double.
+            # The fixed Docker argv remains fully asserted by the tests.
+            docker_binary=sys.executable,
             shutdown_timeout_seconds=shutdown_timeout_seconds,
         )
         self.cli_calls = []
@@ -320,6 +327,7 @@ def _resolved(
     environment=None,
     argv=("python", "-V"),
     execution_id="exec-1",
+    docker_binary="docker",
 ):
     worktree = tmp_path / "worktree"
     worktree.mkdir(exist_ok=True)
@@ -331,7 +339,7 @@ def _resolved(
     budget_value = budget or ResourceBudget()
     image_digest = image.split("@sha256:", 1)[-1]
     docker_env = {"PATH": os.environ.get("PATH", os.defpath)}
-    binary_identity = executable_identity(("docker",), docker_env)
+    binary_identity = executable_identity((docker_binary,), docker_env)
     daemon_identity = _canonical_digest({"stdout": "", "stderr": ""})
     command_digest = _canonical_digest(argv)
     decision = DockerSandboxDecision(
@@ -372,11 +380,13 @@ async def test_docker_backend_builds_hardened_fixed_argv(tmp_path):
     backend = _InspectableDockerBackend()
     process = _FakeProcess()
     with patch("khaos.coding.execution.docker.asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)) as spawn:
-        result = await backend.execute_resolved(_resolved(tmp_path))
+        result = await backend.execute_resolved(
+            _resolved(tmp_path, docker_binary=backend.docker_binary)
+        )
     launch_argv = spawn.await_args.args
     assert "--exec-fd" in launch_argv
     argv = launch_argv[launch_argv.index("--") + 1:]
-    assert argv[:2] == ("docker", "run")
+    assert argv[:2] == (backend.docker_binary, "run")
     assert "--read-only" in argv
     assert "--tmpfs" in argv and any(str(item).startswith("/tmp:rw,noexec,nosuid,nodev") for item in argv)
     assert argv[argv.index("--user") + 1] == "65534:65534"
@@ -446,7 +456,9 @@ async def test_docker_deleted_open_file_watchdog_maps_to_resource_violation(tmp_
         "khaos.coding.execution.docker.asyncio.create_subprocess_exec",
         new=AsyncMock(return_value=process),
     ):
-        result = await backend.execute_resolved(_resolved(tmp_path))
+        result = await backend.execute_resolved(
+            _resolved(tmp_path, docker_binary=backend.docker_binary)
+        )
 
     assert result.status == "resource-exhausted"
     assert result.diagnostics["resource_violation"]["kind"] == "workspace-bytes"
@@ -455,7 +467,13 @@ async def test_docker_deleted_open_file_watchdog_maps_to_resource_violation(tmp_
 async def test_docker_backend_rejects_unavailable_or_unapproved_image_without_pull(tmp_path):
     backend = _InspectableDockerBackend()
     with pytest.raises(PermissionError, match="allowlist"):
-        await backend.execute_resolved(_resolved(tmp_path, image="evil/latest"))
+        await backend.execute_resolved(
+            _resolved(
+                tmp_path,
+                image="evil/latest",
+                docker_binary=backend.docker_binary,
+            )
+        )
     missing = "example.invalid/khaos@sha256:" + "1" * 64
     backend.allowed_images = frozenset({missing})
 
@@ -465,7 +483,9 @@ async def test_docker_backend_rejects_unavailable_or_unapproved_image_without_pu
 
     backend._run_cli = missing_cli
     with pytest.raises(PermissionError, match="automatic pull"):
-        await backend.execute_resolved(_resolved(tmp_path, image=missing))
+        await backend.execute_resolved(
+            _resolved(tmp_path, image=missing, docker_binary=backend.docker_binary)
+        )
     assert not any(call[:1] == ("pull",) for call in backend.cli_calls)
 
 
@@ -484,7 +504,9 @@ async def test_docker_cleanup_refuses_foreign_container_name_collision(tmp_path)
         new=AsyncMock(return_value=process),
     ):
         with pytest.raises(PermissionError, match="not owned"):
-            await backend.execute_resolved(_resolved(tmp_path))
+            await backend.execute_resolved(
+                _resolved(tmp_path, docker_binary=backend.docker_binary)
+            )
 
     destructive = {"stop", "kill", "rm"}
     assert not any(call[0] in destructive for call in backend.cli_calls)
@@ -495,7 +517,7 @@ async def test_docker_cleanup_refuses_foreign_container_name_collision(tmp_path)
 
 async def test_docker_backend_rejects_mount_option_injection_path(tmp_path):
     backend = _InspectableDockerBackend()
-    context = _resolved(tmp_path)
+    context = _resolved(tmp_path, docker_binary=backend.docker_binary)
     unsafe = tmp_path / "worktree,dst=host"
     context.worktree_path.rename(unsafe)
     context = ResolvedExecutionContext(
@@ -517,7 +539,7 @@ async def test_docker_backend_rejects_mount_option_injection_path(tmp_path):
 @pytest.mark.parametrize("violation", ["network", "writable-root", "sensitive-env", "main-repository"])
 async def test_docker_backend_rejects_untrusted_resolved_context(tmp_path, violation):
     backend = _InspectableDockerBackend()
-    context = _resolved(tmp_path)
+    context = _resolved(tmp_path, docker_binary=backend.docker_binary)
     if violation == "network":
         context = ResolvedExecutionContext(
             **{**context.__dict__, "network_policy": NetworkPolicy.UNRESTRICTED_WITH_APPROVAL}
@@ -547,7 +569,13 @@ async def test_docker_backend_timeout_cleanup_output_truncation_and_shutdown(tmp
     budget = ResourceBudget(timeout_seconds=0.01, output_bytes=4)
     process = _FakeProcess(stdout=b"0123456789", returncode=None, delay=0.05)
     with patch("khaos.coding.execution.docker.asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)):
-        result = await backend.execute_resolved(_resolved(tmp_path, budget=budget))
+        result = await backend.execute_resolved(
+            _resolved(
+                tmp_path,
+                budget=budget,
+                docker_binary=backend.docker_binary,
+            )
+        )
     assert result.status == "timed-out"
     assert process.returncode in {-15, -9}
     assert result.diagnostics["process_group_terminated"] is True
@@ -607,7 +635,7 @@ async def test_docker_backend_shutdown_spawn_barrier_keeps_late_child_owned(tmp_
         await release_spawn.wait()
         return process
 
-    context = _resolved(tmp_path)
+    context = _resolved(tmp_path, docker_binary=backend.docker_binary)
     with patch(
         "khaos.coding.execution.docker.asyncio.create_subprocess_exec",
         new=delayed_spawn,
@@ -676,8 +704,12 @@ async def test_docker_backend_truncates_output_without_unbounded_artifact(tmp_pa
     process = _FakeProcess(stdout=b"0123456789", stderr=b"abcdefghij")
     with patch("khaos.coding.execution.docker.asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)):
         result = await backend.execute_resolved(
-            _resolved(tmp_path, budget=ResourceBudget(output_bytes=8))
-    )
+            _resolved(
+                tmp_path,
+                budget=ResourceBudget(output_bytes=8),
+                docker_binary=backend.docker_binary,
+            )
+        )
     assert len(result.stdout.encode()) + len(result.stderr.encode()) <= 8
     assert result.diagnostics["output_truncated"] is True
     assert result.diagnostics["stdout_bytes_dropped"] == 6
