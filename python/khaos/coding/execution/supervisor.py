@@ -474,7 +474,19 @@ class ProcessSupervisor:
                 done, _pending = await asyncio.wait(
                     wait_set, return_when=asyncio.FIRST_COMPLETED,
                 )
-                if deadline_task is not None and deadline_task in done:
+                if process_wait_task in done:
+                    # Process completion wins a same-loop tie with the
+                    # deadline task.  ``asyncio.wait`` may return both tasks
+                    # in ``done`` when a child exits at the deadline
+                    # boundary; terminal process evidence must not be
+                    # reclassified as a timeout merely because the deadline
+                    # sleeper was also ready.  Only a deadline task that is
+                    # done while the process wait is still pending proves a
+                    # genuine timeout.
+                    if deadline_task is not None:
+                        deadline_task.cancel()
+                    status = "passed" if process.returncode == 0 else "failed"
+                elif deadline_task is not None and deadline_task in done:
                     # Deadline elapsed first → genuine timeout.  Cancel
                     # the wait task, terminate the process group, mark
                     # timed-out.  The process may have already exited
@@ -491,12 +503,6 @@ class ProcessSupervisor:
                             "process_group_terminated": True,
                         }
                     )
-                else:
-                    # Process exited first (before the deadline).  Use the
-                    # real returncode — do NOT reclassify signal deaths.
-                    if deadline_task is not None:
-                        deadline_task.cancel()
-                    status = "passed" if process.returncode == 0 else "failed"
             except asyncio.CancelledError:
                 active.termination_requested = True
                 await asyncio.shield(self._terminate_active(active))

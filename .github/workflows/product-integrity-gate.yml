@@ -37,10 +37,12 @@ jobs:
   python-product:
     name: Python Product Suite
     runs-on: ${{ matrix.os }}
-    # The full 3800-test suite can take ~30-40 min on a slow shared runner
-    # (Ubuntu 3.11 was hitting the 45-min ceiling). Give it headroom so the
-    # cell completes rather than being force-cancelled mid-suite.
-    timeout-minutes: 60
+    # The full 3800-test suite can take ~30-40 min on a slow shared runner;
+    # macOS arm64 is materially slower when the native launcher stages and
+    # signs executable authorities for process-backed tests.  Give the full
+    # matrix enough headroom to finish rather than force-cancelling a healthy
+    # cell at the old 60-minute ceiling.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -85,7 +87,7 @@ jobs:
         # (installed above), not external infrastructure.
         #
         run: >-
-          uv run pytest python/tests/ -q
+          uv run pytest python/tests/ -vv
           -m "not browser_real and not docker_sandbox_real and not production_sandbox_real and not kernel_real and not platform_sandbox_real"
 
   # ─── Full Go product suite with the race detector ──────────────────────

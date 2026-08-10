@@ -139,9 +139,11 @@ async def test_signal_death_before_deadline_is_failed_not_timeout(tmp_path: Path
     proves the deadline had NOT elapsed, so the real status is preserved.
     """
     supervisor = ProcessSupervisor(termination_grace_seconds=0.1)
-    # The process sends itself SIGTERM after starting; the timeout is 2s,
-    # so the process exits on its own (returncode 143, shell convention)
-    # well before the deadline task fires.
+    # The process sends itself SIGTERM after starting; the timeout is generous
+    # enough to include the macOS native launcher's descriptor staging and
+    # ad-hoc signing before the target receives control.  Once started, the
+    # process exits on its own (returncode 143, shell convention) well before
+    # the deadline task fires.
     request = ExecutionRequest(
         (
             sys.executable, "-c",
@@ -149,7 +151,7 @@ async def test_signal_death_before_deadline_is_failed_not_timeout(tmp_path: Path
             "os.kill(os.getpid(), signal.SIGTERM); time.sleep(5)",
         ),
         tmp_path,
-        budget=ResourceBudget(timeout_seconds=2),
+        budget=ResourceBudget(timeout_seconds=10),
         correlation_id="signal-race",
     )
 
