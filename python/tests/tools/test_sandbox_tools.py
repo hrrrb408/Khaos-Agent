@@ -755,6 +755,23 @@ def _docker_available():
     ).returncode == 0
 
 
+async def _bind_real_docker_decision(
+    backend: DockerBackend,
+    context: ResolvedExecutionContext,
+) -> ResolvedExecutionContext:
+    """Bind a real Docker context to the backend's current observations."""
+    decision = await backend.prepare_decision(
+        image=context.environment["KHAOS_DOCKER_IMAGE"],
+        workspace=context.worktree_path,
+        budget=context.budget,
+        argv=context.argv,
+        filesystem_mode=context.access_mode,
+    )
+    return ResolvedExecutionContext(
+        **{**context.__dict__, "sandbox_decision": decision}
+    )
+
+
 @pytest.mark.docker_lifecycle_soak
 @pytest.mark.docker_sandbox_real
 @pytest.mark.skipif(
@@ -769,7 +786,10 @@ async def test_real_docker_lifecycle_soak(tmp_path):
         raise AssertionError("KHAOS_DOCKER_SOAK_ITERATIONS must be between 100 and 500")
     backend = DockerBackend(allowed_images={DEFAULT_DOCKER_IMAGE})
     for index in range(iterations):
-        context = _resolved(tmp_path, execution_id=f"soak-{index:03d}")
+        context = await _bind_real_docker_decision(
+            backend,
+            _resolved(tmp_path, execution_id=f"soak-{index:03d}"),
+        )
         result = await backend.execute_resolved(context)
         assert result.status == "passed", result.diagnostics
         assert result.diagnostics["cleanup"] == "removed"
