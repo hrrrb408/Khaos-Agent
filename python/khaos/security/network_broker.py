@@ -100,7 +100,7 @@ class NetworkLease:
         capability = self._capability
         authority_broker = self._authority_broker
         if capability is None or authority_broker is None:
-            raise NetworkBrokerError("network lease was not issued by NetworkBroker")
+            raise NetworkBrokerError("network lease was not broker-issued by NetworkBroker")
         if capability.digest != self.capability_digest:
             raise NetworkBrokerError("network lease capability digest does not match")
         try:
