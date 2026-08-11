@@ -60,8 +60,8 @@ mod windows_backend {
     };
     use windows_sys::Win32::System::SystemServices::SE_GROUP_LOGON_ID;
     use windows_sys::Win32::System::Threading::{
-        CreateProcessAsUserW, DeleteProcThreadAttributeList, GetCurrentProcess, GetExitCodeProcess,
-        InitializeProcThreadAttributeList, OpenProcessToken, ResumeThread,
+        CreateProcessAsUserW, CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess,
+        GetExitCodeProcess, InitializeProcThreadAttributeList, OpenProcessToken, ResumeThread,
         UpdateProcThreadAttribute, CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED,
         CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST,
         PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, STARTF_USESTDHANDLES,
@@ -1168,21 +1168,6 @@ mod windows_backend {
         Ok(Handle(restricted))
     }
 
-    fn current_process_token() -> Result<Handle, String> {
-        let mut current: HANDLE = null_mut();
-        if unsafe {
-            OpenProcessToken(
-                GetCurrentProcess(),
-                TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY,
-                &mut current,
-            )
-        } == 0
-        {
-            return Err(last_error("OpenProcessToken(AppContainer broker)"));
-        }
-        Ok(Handle(current))
-    }
-
     /// Preserve the interactive logon identity as a restricted SID so the
     /// normal Windows runtime can read user-scoped IPC and loader objects.
     fn token_logon_sid(token: HANDLE) -> Result<Vec<u8>, String> {
@@ -1406,15 +1391,13 @@ mod windows_backend {
         executable: &Path,
         appcontainer: Option<&AppContainerProfile>,
     ) -> Result<ExecutionOutcome, String> {
-        // Windows creates the AppContainer low-box token from the supplied
-        // ordinary primary token when PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES
-        // is present. Passing a separately CreateRestrictedToken-derived
-        // primary token at the same time is rejected by CreateProcessAsUserW
-        // with ERROR_INVALID_PARAMETER. The low-box token is itself the child
-        // authority for network-none; brokered executions retain the explicit
-        // restricted primary token path below.
+        // The AppContainer low-box is created by the normal CreateProcess
+        // current-identity path when PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES
+        // is present. Passing any hToken to that path is rejected by Windows
+        // with ERROR_INVALID_PARAMETER. Brokered executions retain the
+        // explicit restricted primary-token path below.
         let token = if appcontainer.is_some() {
-            Some(current_process_token()?)
+            None
         } else {
             Some(restricted_token()?)
         };
@@ -1455,20 +1438,37 @@ mod windows_backend {
             } else {
                 0
             };
-        let created = unsafe {
-            CreateProcessAsUserW(
-                token.as_ref().map_or(null_mut(), |token| token.0),
-                application.as_mut_ptr(),
-                command.as_mut_ptr(),
-                null_mut(),
-                null_mut(),
-                1,
-                creation_flags,
-                null_mut(),
-                current_directory.as_mut_ptr(),
-                &startup.StartupInfo,
-                &mut information,
-            )
+        let created = if appcontainer.is_some() {
+            unsafe {
+                CreateProcessW(
+                    application.as_mut_ptr(),
+                    command.as_mut_ptr(),
+                    null_mut(),
+                    null_mut(),
+                    1,
+                    creation_flags,
+                    null_mut(),
+                    current_directory.as_mut_ptr(),
+                    &startup.StartupInfo,
+                    &mut information,
+                )
+            }
+        } else {
+            unsafe {
+                CreateProcessAsUserW(
+                    token.as_ref().map_or(null_mut(), |token| token.0),
+                    application.as_mut_ptr(),
+                    command.as_mut_ptr(),
+                    null_mut(),
+                    null_mut(),
+                    1,
+                    creation_flags,
+                    null_mut(),
+                    current_directory.as_mut_ptr(),
+                    &startup.StartupInfo,
+                    &mut information,
+                )
+            }
         };
         if created == 0 {
             return Err(last_error("CreateProcessAsUserW"));
