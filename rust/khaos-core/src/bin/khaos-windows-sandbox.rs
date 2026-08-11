@@ -651,6 +651,7 @@ mod windows_backend {
             &executable,
             appcontainer.as_ref().map(AppContainerProfile::sid_string),
             &options.runtime_roots,
+            &options.runtime_files,
         ) {
             Ok(acl) => acl,
             Err(error) => {
@@ -762,6 +763,7 @@ mod windows_backend {
             cpu_seconds: 120,
             timeout_seconds: 10,
             runtime_roots: Vec::new(),
+            runtime_files: Vec::new(),
             command,
         };
         let appcontainer = match AppContainerProfile::create() {
@@ -786,6 +788,7 @@ mod windows_backend {
         let runtime_acl = match RuntimeAcl::apply(
             &helper,
             appcontainer.as_ref().map(AppContainerProfile::sid_string),
+            &[],
             &[],
         ) {
             Ok(acl) => acl,
@@ -991,6 +994,7 @@ mod windows_backend {
         cpu_seconds: u64,
         timeout_seconds: u64,
         runtime_roots: Vec<PathBuf>,
+        runtime_files: Vec<PathBuf>,
         command: Vec<OsString>,
     }
 
@@ -1005,6 +1009,7 @@ mod windows_backend {
             let mut cpu_seconds = 120;
             let mut timeout_seconds = 120;
             let mut runtime_roots = Vec::new();
+            let mut runtime_files = Vec::new();
             let mut index = 0;
             while index < args.len() {
                 let value = args[index].to_string_lossy();
@@ -1052,6 +1057,7 @@ mod windows_backend {
                             .map_err(|_| "invalid timeout".to_string())?
                     }
                     "--runtime-root" => runtime_roots.push(PathBuf::from(next(&mut index)?)),
+                    "--runtime-file" => runtime_files.push(PathBuf::from(next(&mut index)?)),
                     _ => return Err(format!("unknown Windows sandbox option: {value}")),
                 }
                 index += 1;
@@ -1086,6 +1092,7 @@ mod windows_backend {
                 cpu_seconds,
                 timeout_seconds,
                 runtime_roots,
+                runtime_files,
                 command,
             })
         }
@@ -1111,6 +1118,18 @@ mod windows_backend {
             if canonical == workspace || canonical.starts_with(&workspace) {
                 return Err(
                     "Windows sandbox runtime root cannot be inside the task workspace".to_string(),
+                );
+            }
+        }
+        for runtime_file in &options.runtime_files {
+            let canonical = std::fs::canonicalize(runtime_file)
+                .map_err(|e| format!("Windows sandbox runtime file unavailable: {e}"))?;
+            if !canonical.is_file() {
+                return Err("Windows sandbox runtime file must be a file".to_string());
+            }
+            if canonical == workspace || canonical.starts_with(&workspace) {
+                return Err(
+                    "Windows sandbox runtime file cannot be inside the task workspace".to_string(),
                 );
             }
         }
@@ -1736,6 +1755,7 @@ mod windows_backend {
             executable: &Path,
             appcontainer_sid: Option<&str>,
             additional_roots: &[PathBuf],
+            additional_files: &[PathBuf],
         ) -> Result<Self, String> {
             let runtime_root = executable
                 .parent()
@@ -1796,6 +1816,52 @@ mod windows_backend {
                         "*S-1-5-12:(OI)(CI)RX",
                         appcontainer_sid,
                         true,
+                    ) {
+                        return Err(join_runtime_acl_error(error, entries));
+                    }
+                    seen_ancestors.insert(root);
+                }
+            }
+            let mut seen_files = HashSet::new();
+            for file in additional_files {
+                let file = std::fs::canonicalize(file)
+                    .map_err(|e| format!("canonicalize Windows runtime file: {e}"))?;
+                if !file.is_file() {
+                    return Err(format!(
+                        "Windows sandbox runtime file is not a file: {}",
+                        file.display()
+                    ));
+                }
+                let parent = file.parent().ok_or_else(|| {
+                    "Windows sandbox runtime file has no parent directory".to_string()
+                })?;
+                if directory_ancestors(parent).is_empty() {
+                    return Err("Windows sandbox refuses a volume-root runtime file".to_string());
+                }
+                for ancestor in directory_ancestors(parent)
+                    .into_iter()
+                    .chain(std::iter::once(parent.to_path_buf()))
+                {
+                    if !seen_ancestors.insert(ancestor.clone()) {
+                        continue;
+                    }
+                    if let Err(error) = apply_runtime_acl(
+                        &ancestor,
+                        &mut entries,
+                        "*S-1-5-12:(X)",
+                        appcontainer_sid,
+                        false,
+                    ) {
+                        return Err(join_runtime_acl_error(error, entries));
+                    }
+                }
+                if seen_files.insert(file.clone()) {
+                    if let Err(error) = apply_runtime_acl(
+                        &file,
+                        &mut entries,
+                        "*S-1-5-12:(R)",
+                        appcontainer_sid,
+                        false,
                     ) {
                         return Err(join_runtime_acl_error(error, entries));
                     }

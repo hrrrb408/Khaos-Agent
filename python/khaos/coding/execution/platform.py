@@ -249,9 +249,10 @@ class WindowsSandboxBackend:
             str(max(1, math.ceil(profile.resources.timeout_seconds))),
         ]
         # A venv executable needs its lexical ``pyvenv.cfg`` and the base
-        # interpreter tree.  These roots come from the trusted Khaos Python
-        # runtime, not from model-controlled request fields, and the native
-        # helper grants them read/execute access only for this execution.
+        # interpreter runtime.  These paths come from the trusted Khaos
+        # Python runtime, not from model-controlled request fields.  Pass
+        # only the runtime's Lib/DLL trees and exact launcher files so ACL
+        # setup does not recursively rewrite unrelated tool-cache paths.
         try:
             requested_executable = request.argv[0]
             if not Path(requested_executable).is_absolute():
@@ -265,12 +266,24 @@ class WindowsSandboxBackend:
         except (OSError, RuntimeError):
             same_as_khaos_python = False
         if same_as_khaos_python:
-            seen_runtime_roots: set[Path] = set()
+            seen_runtime_paths: set[Path] = set()
             for prefix in (sys.prefix, sys.base_prefix):
                 runtime_root = Path(prefix).expanduser().resolve()
-                if runtime_root.is_dir() and runtime_root not in seen_runtime_roots:
-                    helper_args.extend(("--runtime-root", str(runtime_root)))
-                    seen_runtime_roots.add(runtime_root)
+                for relative_root in ("Lib", "DLLs"):
+                    path = runtime_root / relative_root
+                    if path.is_dir() and path not in seen_runtime_paths:
+                        helper_args.extend(("--runtime-root", str(path)))
+                        seen_runtime_paths.add(path)
+                exact_files = (
+                    runtime_root / "pyvenv.cfg",
+                    runtime_root / "python.exe",
+                    runtime_root
+                    / f"python{sys.version_info.major}{sys.version_info.minor}.dll",
+                )
+                for path in exact_files:
+                    if path.is_file() and path not in seen_runtime_paths:
+                        helper_args.extend(("--runtime-file", str(path)))
+                        seen_runtime_paths.add(path)
         if lease is not None:
             environment.update(lease.proxy_environment())
             helper_args.extend(("--proxy-host", lease.host, "--proxy-port", str(lease.port)))
