@@ -557,8 +557,12 @@ mod windows_backend {
     struct AppContainerAttributes {
         storage: Vec<u8>,
         list: LPPROC_THREAD_ATTRIBUTE_LIST,
-        capabilities: SECURITY_CAPABILITIES,
-        child_process_policy: u32,
+        // UpdateProcThreadAttribute retains pointers to both values until
+        // DeleteProcThreadAttributeList.  Keep the pointees on the heap so
+        // moving this owner into an Option cannot invalidate the attribute
+        // list before CreateProcess consumes it.
+        capabilities: Box<SECURITY_CAPABILITIES>,
+        child_process_policy: Box<u32>,
     }
 
     impl AppContainerAttributes {
@@ -573,18 +577,18 @@ mod windows_backend {
             if unsafe { InitializeProcThreadAttributeList(list, 2, 0, &mut size) } == 0 {
                 return Err(last_error("InitializeProcThreadAttributeList"));
             }
-            let capabilities = SECURITY_CAPABILITIES {
+            let capabilities = Box::new(SECURITY_CAPABILITIES {
                 AppContainerSid: profile.sid(),
                 Capabilities: null_mut(),
                 CapabilityCount: 0,
                 Reserved: 0,
-            };
+            });
             let updated = unsafe {
                 UpdateProcThreadAttribute(
                     list,
                     0,
                     PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
-                    &capabilities as *const SECURITY_CAPABILITIES as *const c_void,
+                    capabilities.as_ref() as *const SECURITY_CAPABILITIES as *const c_void,
                     size_of::<SECURITY_CAPABILITIES>(),
                     null_mut(),
                     null(),
@@ -596,13 +600,13 @@ mod windows_backend {
                     "UpdateProcThreadAttribute(security capabilities)",
                 ));
             }
-            let child_process_policy = PROCESS_CREATION_CHILD_PROCESS_RESTRICTED;
+            let child_process_policy = Box::new(PROCESS_CREATION_CHILD_PROCESS_RESTRICTED);
             let updated = unsafe {
                 UpdateProcThreadAttribute(
                     list,
                     0,
                     PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY as usize,
-                    &child_process_policy as *const u32 as *const c_void,
+                    child_process_policy.as_ref() as *const u32 as *const c_void,
                     size_of::<u32>(),
                     null_mut(),
                     null(),
