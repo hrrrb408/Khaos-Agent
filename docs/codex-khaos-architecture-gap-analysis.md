@@ -1,5 +1,11 @@
 # Codex × Khaos 系统架构与安全差距报告
 
+> **SUPERSEDED / HISTORICAL** — 本文是 2026-07-15 的只读架构快照，不能作为
+> 当前实现、发布安全保证或 review closure 的事实来源。当前 RPC、Trusted Git、
+> bootstrap 限额、spawn inventory 与 release gate 以 `AGENTS.md`、
+> `docs/adr/ADR-011-gateway-rpc-boundary.md`、生成的 inventories、源代码和
+> 当前 CI evidence 为准；修改前请先重新做 live review。
+
 > Codex 基线：`3f74f00295dcb1346340686bb09c5bfd4f0237c4`
 > Khaos 基线：`17f90ba0e63f7a43b7b062c9ae3e9b810b1f051d`
 > 审查日期：2026-07-15

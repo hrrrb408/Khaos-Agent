@@ -29,6 +29,33 @@ DECLARATION = re.compile(
     r"boundary=(?P<boundary>[A-Za-z0-9_.-]+)"
 )
 RUST_CALL = re.compile(r"\b(?:Command::new|execvp|execveat|execve|execvpe)\b")
+GO_CALLS = {
+    "os/exec": ("Command", "CommandContext", "Cmd"),
+    "os": ("StartProcess", "StartProcessAsUser", "FindProcess", "ForkExec"),
+    "syscall": ("Exec", "Execve", "Execveat", "ForkExec"),
+    "golang.org/x/sys/unix": ("Exec", "Execve", "Execveat", "ForkExec"),
+}
+PYTHON_EXACT_CALLS = frozenset(
+    {
+        "subprocess.run",
+        "subprocess.Popen",
+        "subprocess.check_call",
+        "subprocess.check_output",
+        "subprocess.check_returncode",
+        "subprocess.call",
+        "subprocess.getoutput",
+        "subprocess.getstatusoutput",
+        "asyncio.create_subprocess_exec",
+        "asyncio.create_subprocess_shell",
+        "os.system",
+        "os.popen",
+        "os.posix_spawn",
+        "os.posix_spawnp",
+        "os.fork",
+        "os.forkpty",
+        "pty.spawn",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -63,16 +90,47 @@ def _python_sites(path: Path) -> list[tuple[int, str, str]]:
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     sites: list[tuple[int, str, str]] = []
     stack: list[str] = ["<module>"]
-    target_prefixes = (
-        "subprocess.run",
-        "subprocess.Popen",
-        "subprocess.check_call",
-        "subprocess.check_output",
-        "subprocess.call",
-        "asyncio.create_subprocess_exec",
-        "asyncio.create_subprocess_shell",
-        "os.exec",
-    )
+    module_aliases: dict[str, str] = {}
+    symbol_aliases: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                module = alias.name
+                local = alias.asname or module.split(".", 1)[0]
+                if module in {"subprocess", "asyncio", "os", "pty"}:
+                    module_aliases[local] = module
+        elif isinstance(node, ast.ImportFrom) and node.module in {
+            "subprocess",
+            "asyncio",
+            "os",
+            "pty",
+        }:
+            for alias in node.names:
+                local = alias.asname or alias.name
+                symbol_aliases[local] = f"{node.module}.{alias.name}"
+
+    def resolve(node: ast.AST) -> str:
+        if isinstance(node, ast.Name):
+            return symbol_aliases.get(node.id, module_aliases.get(node.id, node.id))
+        if isinstance(node, ast.Attribute):
+            left = resolve(node.value)
+            return f"{left}.{node.attr}" if left else node.attr
+        return _dotted(node)
+
+    def is_spawn_call(name: str) -> bool:
+        if name in PYTHON_EXACT_CALLS:
+            return True
+        if name.startswith("subprocess.") and name.split(".", 1)[1] in {
+            "run",
+            "Popen",
+            "call",
+            "check_call",
+            "check_output",
+            "getoutput",
+            "getstatusoutput",
+        }:
+            return True
+        return name.startswith(("os.exec", "os.spawn"))
 
     class Visitor(ast.NodeVisitor):
         def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
@@ -83,8 +141,8 @@ def _python_sites(path: Path) -> list[tuple[int, str, str]]:
         visit_AsyncFunctionDef = visit_FunctionDef
 
         def visit_Call(self, node: ast.Call) -> None:
-            name = _dotted(node.func)
-            if name.startswith(target_prefixes):
+            name = resolve(node.func)
+            if is_spawn_call(name):
                 sites.append((node.lineno, name, ".".join(stack)))
             self.generic_visit(node)
 
@@ -93,13 +151,120 @@ def _python_sites(path: Path) -> list[tuple[int, str, str]]:
 
 
 def _rust_sites(path: Path) -> list[tuple[int, str, str]]:
+    source = path.read_text(encoding="utf-8")
+    aliases = {"Command"}
+    for match in re.finditer(
+        r"use\s+std::process::Command\s+as\s+(?P<alias>[A-Za-z_][A-Za-z0-9_]*)",
+        source,
+    ):
+        aliases.add(match.group("alias"))
     sites: list[tuple[int, str, str]] = []
-    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+    call = re.compile(
+        rf"\b(?:{'|'.join(re.escape(alias) for alias in sorted(aliases))})::new\b"
+        r"|\b(?:execvp|execveat|execve|execvpe)\b"
+    )
+    for line_number, line in enumerate(source.splitlines(), 1):
         code = line.split("//", 1)[0]
-        match = RUST_CALL.search(code)
+        match = call.search(code) or RUST_CALL.search(code)
         if match:
             sites.append((line_number, match.group(0), "rust::entrypoint"))
     return sites
+
+
+def _strip_go_comments_and_strings(source: str) -> str:
+    """Blank Go comments/strings while preserving line and column positions."""
+    output: list[str] = []
+    index = 0
+    quote: str | None = None
+    while index < len(source):
+        char = source[index]
+        next_char = source[index + 1] if index + 1 < len(source) else ""
+        if quote is None:
+            if char == "/" and next_char == "/":
+                output.extend((" ", " "))
+                index += 2
+                while index < len(source) and source[index] != "\n":
+                    output.append(" ")
+                    index += 1
+                continue
+            if char == "/" and next_char == "*":
+                output.extend((" ", " "))
+                index += 2
+                while index < len(source):
+                    if source[index] == "*" and index + 1 < len(source) and source[index + 1] == "/":
+                        output.extend((" ", " "))
+                        index += 2
+                        break
+                    output.append("\n" if source[index] == "\n" else " ")
+                    index += 1
+                continue
+            if char in {'"', "'", "`"}:
+                quote = char
+                output.append(" ")
+                index += 1
+                continue
+            output.append(char)
+            index += 1
+            continue
+        if char == "\\" and quote != "`" and index + 1 < len(source):
+            output.extend((" ", " "))
+            index += 2
+            continue
+        if char == quote:
+            quote = None
+        output.append("\n" if char == "\n" else " ")
+        index += 1
+    return "".join(output)
+
+
+def _go_import_aliases(source: str) -> dict[str, str]:
+    aliases: dict[str, str] = {}
+    import_re = re.compile(
+        r"(?:import\s*\(\s*(?P<block>.*?)\s*\)|import\s+(?P<single>[^\n]+))",
+        re.DOTALL,
+    )
+    for match in import_re.finditer(source):
+        block = match.group("block") or match.group("single") or ""
+        for line in block.splitlines():
+            item = line.strip().split("//", 1)[0].strip()
+            imported = re.search(
+                r'(?:(?P<alias>[A-Za-z_][A-Za-z0-9_]*|\.)\s+)?"(?P<path>[^"]+)"',
+                item,
+            )
+            if imported is None:
+                continue
+            package = imported.group("path")
+            if package not in GO_CALLS:
+                continue
+            alias = imported.group("alias")
+            if alias is None:
+                alias = package.rsplit("/", 1)[-1]
+            aliases[alias] = package
+    return aliases
+
+
+def _go_sites(path: Path) -> list[tuple[int, str, str]]:
+    source = path.read_text(encoding="utf-8")
+    code = _strip_go_comments_and_strings(source)
+    aliases = _go_import_aliases(source)
+    sites: list[tuple[int, str, str]] = []
+    for alias, package in aliases.items():
+        functions = GO_CALLS[package]
+        for function in functions:
+            pattern = re.compile(
+                rf"\b{re.escape(alias)}\.{re.escape(function)}\s*(?:\(|\{{)"
+            )
+            for match in pattern.finditer(code):
+                line = code.count("\n", 0, match.start()) + 1
+                sites.append((line, f"{package.rsplit('/', 1)[-1]}.{function}", "go::function"))
+    if "." in aliases:
+        for package in {value for key, value in aliases.items() if key == "."}:
+            for function in GO_CALLS[package]:
+                pattern = re.compile(rf"\b{re.escape(function)}\s*(?:\(|\{{)")
+                for match in pattern.finditer(code):
+                    line = code.count("\n", 0, match.start()) + 1
+                    sites.append((line, f"{package.rsplit('/', 1)[-1]}.{function}", "go::function"))
+    return sorted(set(sites))
 
 
 def discover() -> list[SpawnSite]:
@@ -119,7 +284,7 @@ def discover() -> list[SpawnSite]:
                 if path.suffix == ".py"
                 else _rust_sites(path)
                 if path.suffix == ".rs"
-                else []
+                else _go_sites(path)
             )
         except (OSError, SyntaxError) as exc:
             errors.append(f"{relative}: cannot parse source: {exc}")

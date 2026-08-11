@@ -16,17 +16,34 @@ class OutputMode(str, Enum):
 
 async def output_changeset(manager: WorkspaceManager, workspace_id: str, changeset: ChangeSet, mode: OutputMode, *, message: str = "Khaos coding task") -> str:
     if mode is OutputMode.PATCH_ONLY:
-        return changeset.patch
+        if changeset.artifact is None:
+            return changeset.patch
+        return await manager.read_changeset_patch(workspace_id, changeset)
     if mode is OutputMode.COMMIT_IN_WORKTREE:
         return await manager.commit_in_worktree(workspace_id, changeset, message)
     workspace = manager._workspaces.get(workspace_id)
     if workspace is None:
         raise WorkspaceError("workspace not found")
-    clean = await manager._git(workspace.repository_root, "status", "--porcelain")
-    head = await manager._git(workspace.repository_root, "rev-parse", "HEAD")
+    authority = workspace.authority_envelope
+    git_kwargs = {"authority": authority} if authority is not None else {}
+    clean = await manager._git(
+        workspace.repository_root, "status", "--porcelain", **git_kwargs
+    )
+    head = await manager._git(
+        workspace.repository_root, "rev-parse", "HEAD", **git_kwargs
+    )
     if clean or head != changeset.base_sha:
         raise WorkspaceError("主工作树不干净或 base SHA 已漂移")
     patch_file = workspace.worktree_path.parent / f"{changeset.id}.apply.patch"
-    patch_file.write_text(changeset.patch, encoding="utf-8")
-    await manager._git(workspace.repository_root, "apply", "--index", str(patch_file))
+    await manager.export_changeset_artifact(workspace_id, changeset, patch_file)
+    try:
+        await manager._git(
+            workspace.repository_root,
+            "apply",
+            "--index",
+            str(patch_file),
+            **git_kwargs,
+        )
+    finally:
+        patch_file.unlink(missing_ok=True)
     return "applied"

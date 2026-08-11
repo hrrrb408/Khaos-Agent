@@ -1,8 +1,8 @@
 """Execution backends for Coding Tasks."""
 
-from khaos.coding.execution.docker import DockerBackend
 from khaos.coding.execution.authority import ExecutionAuthority
 from khaos.coding.execution.capability import DockerSandboxDecision, SandboxDecision
+from khaos.coding.execution.docker import DockerBackend
 from khaos.coding.execution.host import HostExecutionBackend
 from khaos.coding.execution.managed import ManagedProcessHandle
 from khaos.coding.execution.models import (

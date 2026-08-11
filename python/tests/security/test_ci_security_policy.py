@@ -7,7 +7,6 @@ from pathlib import Path
 
 import yaml
 
-
 ROOT = Path(__file__).resolve().parents[3]
 WORKFLOWS = ROOT / ".github" / "workflows"
 PINNED_ACTION = re.compile(
@@ -64,12 +63,20 @@ def test_release_provenance_binds_exact_required_gates_and_forbids_replacement()
     )
     assert "verify_release_gate_runs.py" in workflow
     assert "--commit \"$release_commit\"" in workflow
+    assert "git fetch --no-tags origin main" in workflow
+    assert 'git merge-base --is-ancestor "$release_commit" FETCH_HEAD' in workflow
     assert "--gate-evidence" in workflow
     assert "release-gate-evidence.json" in workflow
     assert "--clobber" not in workflow
     assert "security-closure-gate.yml" in verifier
     assert "product-integrity-gate.yml" in verifier
     assert 'run.get("conclusion") == "success"' in verifier
+    assert 'run.get("event") == "push"' in verifier
+    assert 'run.get("head_branch") == "main"' in verifier
+    assert "main ancestry" in verifier
+    assert 'evidence.get("main_ancestry")' in generator
+    assert 'record.get("event") != "push"' in generator
+    assert 'record.get("head_branch") != "main"' in generator
     assert 'run.get("run_attempt") or 0' in verifier
     assert 'security-evidence-{commit}' in verifier
     assert 'artifact.get("expired") is not False' in verifier

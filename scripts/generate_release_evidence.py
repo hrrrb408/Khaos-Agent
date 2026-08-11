@@ -15,10 +15,9 @@ import os
 import re
 import subprocess
 import tomllib
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-
 
 _GENERATED_NAMES = {
     "release-checksums.txt",
@@ -41,7 +40,7 @@ def _git_timestamp(repo_root: Path, commit: str) -> str:
         ["git", "-C", str(repo_root), "show", "-s", "--format=%ct", commit],
         text=True,
     ).strip()
-    return datetime.fromtimestamp(int(timestamp), tz=timezone.utc).isoformat().replace(
+    return datetime.fromtimestamp(int(timestamp), tz=UTC).isoformat().replace(
         "+00:00", "Z"
     )
 
@@ -215,6 +214,15 @@ def _load_gate_evidence(path: Path, commit: str) -> dict[str, Any]:
     unsigned.pop("evidence_digest", None)
     if supplied_digest != _canonical_digest(unsigned):
         raise SystemExit("release gate evidence digest mismatch")
+    ancestry = evidence.get("main_ancestry")
+    if (
+        not isinstance(ancestry, dict)
+        or ancestry.get("base") != commit
+        or ancestry.get("head") != "main"
+        or ancestry.get("behind_by") != 0
+        or ancestry.get("status") not in {"ahead", "identical"}
+    ):
+        raise SystemExit("release gate evidence does not prove protected main ancestry")
     gates = evidence.get("gates")
     if not isinstance(gates, dict):
         raise SystemExit("release gate evidence has no gate records")
@@ -232,6 +240,8 @@ def _load_gate_evidence(path: Path, commit: str) -> dict[str, Any]:
             or record.get("status") != "completed"
             or record.get("conclusion") != "success"
             or record.get("run_attempt") != 1
+            or record.get("event") != "push"
+            or record.get("head_branch") != "main"
         ):
             raise SystemExit(f"required release gate is not successful: {name}")
         if name == "security_closure":

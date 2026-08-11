@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import time
-from hashlib import sha256
 
 from khaos.coding.workspace.apply import OutputMode, output_changeset
 from khaos.coding.workspace.manager import WorkspaceError, WorkspaceManager
@@ -73,10 +72,10 @@ class ChangeSetApplicationService:
 
     async def _binding(self, workspace, task_id: str, changeset: ChangeSet, operation: OutputMode, requester: str, principal_id: str) -> dict:
         """Recompute mutable Git facts, invalidating approvals after drift."""
-        current_head = await self.manager._git(workspace.worktree_path, "rev-parse", "HEAD")
-        patch = await self.manager._git(
-            workspace.worktree_path, "diff", "--binary", workspace.base_sha, preserve_output=True
+        current_head = await self.manager._workspace_git(
+            workspace, "rev-parse", "HEAD"
         )
+        diff_hash = await self.manager._workspace_diff_digest(workspace)
         return {
             "principal_id": principal_id,
             "session_id": requester,
@@ -88,5 +87,5 @@ class ChangeSetApplicationService:
             "operation": operation.value,
             "base_sha": changeset.base_sha,
             "head": current_head,
-            "diff_hash": sha256(patch.encode("utf-8")).hexdigest(),
+            "diff_hash": diff_hash,
         }

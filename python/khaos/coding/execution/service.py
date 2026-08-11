@@ -16,8 +16,8 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
-from khaos.coding.execution.binding import open_execution_directory_binding
 from khaos.coding.execution.authority import ExecutionAuthority
+from khaos.coding.execution.binding import open_execution_directory_binding
 from khaos.coding.execution.capability import DockerSandboxDecision, SandboxDecision
 from khaos.coding.execution.cleanup_ledger import CleanupInvariantError, CleanupLedger
 from khaos.coding.execution.environment import scrub_spawn_environment
@@ -34,7 +34,6 @@ from khaos.coding.execution.models import (
     NetworkPolicy,
     PermissionProfile,
     ResolvedExecutionContext,
-    ResolvedSpawnPlan,
     ResourceBudget,
 )
 from khaos.coding.execution.native_launcher import build_process_launch
@@ -454,14 +453,13 @@ class ExecutionService:
             )
         if request.executable_identity != observed_identity:
             raise PermissionError("execution command identity changed before execution")
-        if request.sandbox_decision is not None:
-            if (
-                request.sandbox_decision.filesystem_mode != profile.filesystem.value
-                or request.sandbox_decision.network_mode != profile.network.value
-            ):
-                raise PermissionError(
-                    "sandbox decision does not match the resolved permission profile"
-                )
+        if request.sandbox_decision is not None and (
+            request.sandbox_decision.filesystem_mode != profile.filesystem.value
+            or request.sandbox_decision.network_mode != profile.network.value
+        ):
+            raise PermissionError(
+                "sandbox decision does not match the resolved permission profile"
+            )
         # Round-14 §1: revalidate the worktree root inode AND Git identity as
         # the last step before the backend launches the subprocess.  ``require``
         # (above) and ``verify_git_identity`` both ran earlier in this method,
@@ -671,16 +669,18 @@ class ExecutionService:
             plan.workspace_generation != context.workspace_generation
         ):
             raise PermissionError("resolved spawn plan workspace generation changed")
-        if plan.workspace_root_device is not None or plan.workspace_root_inode is not None:
-            if (plan.workspace_root_device, plan.workspace_root_inode) != (
-                request.workspace_root_identity or (None, None)
-            ):
-                raise PermissionError("resolved spawn plan workspace root changed")
-        if plan.workspace_cwd_device is not None or plan.workspace_cwd_inode is not None:
-            if (plan.workspace_cwd_device, plan.workspace_cwd_inode) != (
-                request.workspace_cwd_identity or (None, None)
-            ):
-                raise PermissionError("resolved spawn plan cwd changed")
+        if (
+            (plan.workspace_root_device is not None or plan.workspace_root_inode is not None)
+            and (plan.workspace_root_device, plan.workspace_root_inode)
+            != (request.workspace_root_identity or (None, None))
+        ):
+            raise PermissionError("resolved spawn plan workspace root changed")
+        if (
+            (plan.workspace_cwd_device is not None or plan.workspace_cwd_inode is not None)
+            and (plan.workspace_cwd_device, plan.workspace_cwd_inode)
+            != (request.workspace_cwd_identity or (None, None))
+        ):
+            raise PermissionError("resolved spawn plan cwd changed")
         if plan.executable_identity != request.executable_identity:
             raise PermissionError("resolved spawn plan executable identity changed")
         if plan.budget_digest != request.budget.digest():
@@ -760,7 +760,7 @@ class ExecutionService:
             result.diagnostics["workspace_cleanup"] = "failed"
             result.diagnostics["workspace_cleanup_error"] = type(exc).__name__
 
-    def _make_managed_on_terminal(self) -> "Callable[[str], Awaitable[None]]":
+    def _make_managed_on_terminal(self) -> Callable[[str], Awaitable[None]]:
         """Build the ``on_terminal`` callback injected into ManagedProcessHandle.
 
         P2-2: when a managed process reaches a terminal state via ANY path
@@ -1088,7 +1088,7 @@ class ExecutionService:
                     raise CleanupInvariantError(
                         f"managed process {execution_id} lacks terminal proof"
                     )
-            except Exception:  # noqa: BLE001 — retain failure for caller
+            except Exception:
                 logger.debug(
                     "managed process %s aclose failed during late shutdown detection",
                     execution_id, exc_info=True,
@@ -1211,7 +1211,7 @@ class ExecutionService:
                 # continue independent cleanup, but never allow CLOSED.
                 cancel_requested = True
                 logger.debug("ExecutionService shutdown step %s cancelled", label)
-            except Exception:  # noqa: BLE001 — run_step records the failure
+            except Exception:
                 logger.debug(
                     "ExecutionService shutdown step %s failed",
                     label,
@@ -1410,7 +1410,7 @@ def _resource_owner_terminal(component: object) -> bool:
         return False
     owner = cast("Any", component)
     try:
-        terminal_closed = bool(getattr(owner, "terminal_closed"))
+        terminal_closed = bool(owner.terminal_closed)
         terminal_proof = bool(owner.terminal_postcondition())
         resources = tuple(owner.owned_resources())
     except Exception:  # noqa: BLE001 — an unknown owner is not terminal

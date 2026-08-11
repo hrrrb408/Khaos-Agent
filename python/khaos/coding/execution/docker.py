@@ -15,18 +15,18 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
+from khaos.coding.execution.capability import DockerSandboxDecision
+from khaos.coding.execution.environment import scrub_spawn_environment
+from khaos.coding.execution.identity import (
+    container_command_identity,
+    executable_identity,
+)
 from khaos.coding.execution.models import (
     ExecutionRequest,
     ExecutionResult,
     NetworkPolicy,
     ResolvedExecutionContext,
     ResourceBudget,
-)
-from khaos.coding.execution.capability import DockerSandboxDecision
-from khaos.coding.execution.environment import scrub_spawn_environment
-from khaos.coding.execution.identity import (
-    container_command_identity,
-    executable_identity,
 )
 from khaos.coding.execution.supervisor import ProcessSupervisor, SupervisorClosedError
 
@@ -475,7 +475,6 @@ class DockerBackend:
     async def _before_supervisor_run(self, execution_id: str) -> None:
         """Test seam kept before the supervisor's monotonic spawn reserve."""
         _ = execution_id
-        return None
 
     async def prepare_decision(
         self,
@@ -747,7 +746,7 @@ class DockerBackend:
                 asyncio.shield(lease.finalizer_task),
                 timeout=self.shutdown_timeout_seconds,
             )
-        except asyncio.TimeoutError as exc:
+        except TimeoutError:
             await self._enter_quarantine(
                 TimeoutError(f"Docker execution finalizer did not settle: {execution_id}")
             )

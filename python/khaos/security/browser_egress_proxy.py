@@ -674,7 +674,7 @@ class BrowserEgressProxy:
             writer.close()
             try:
                 await writer.wait_closed()
-            except BaseException:  # noqa: BLE001 — retain writer for close/retry
+            except BaseException:
                 logger.debug("browser client writer did not reach terminal state", exc_info=True)
             else:
                 self._client_writers.discard(writer)
@@ -761,7 +761,7 @@ class BrowserEgressProxy:
         try:
             writer.close()
             await writer.wait_closed()
-        except BaseException:  # noqa: BLE001 — retain ownership on failure
+        except BaseException:
             logger.debug(
                 "browser upstream writer did not reach terminal state",
                 exc_info=True,

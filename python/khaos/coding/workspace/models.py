@@ -15,6 +15,8 @@ from khaos.coding.workspace.storage import (
 )
 from khaos.security.authority import AuthorityEnvelope
 
+MAX_CHANGESET_INLINE_BYTES = 1024 * 1024
+
 
 class WorkspaceState(str, Enum):
     CREATING = "creating"
@@ -67,6 +69,9 @@ class TaskWorkspace:
     root_device: int | None = None
     root_inode: int | None = None
     authority_envelope: AuthorityEnvelope | None = None
+    change_artifacts: set[Path] = field(default_factory=set, repr=False)
+    change_artifact_bytes: int = field(default=0, repr=False)
+    change_artifact_reservations: int = field(default=0, repr=False)
     _authority_sealed: bool = field(default=False, init=False, repr=False)
 
     _IMMUTABLE_AUTHORITY_FIELDS = frozenset(
@@ -98,6 +103,20 @@ class TaskWorkspace:
 
 
 @dataclass(frozen=True)
+class ChangeSetArtifact:
+    """Authority-owned streamed diff with bounded disclosure metadata."""
+
+    path: Path
+    byte_length: int
+    sha256: str
+    preview: str
+
+    def __post_init__(self) -> None:
+        if self.byte_length < 0 or len(self.sha256) != 64:
+            raise ValueError("invalid ChangeSet artifact metadata")
+
+
+@dataclass(frozen=True)
 class ChangeSet:
     id: str
     workspace_id: str
@@ -109,11 +128,39 @@ class ChangeSet:
     risk_level: str
     content_hash: str
     created_at: datetime
+    artifact: ChangeSetArtifact | None = None
 
     @classmethod
-    def create(cls, *, id: str, workspace_id: str, base_sha: str, head_sha: str | None, patch: str, diff_stat: str, changed_files: tuple[str, ...], risk_level: str = "low") -> ChangeSet:
-        digest = hashlib.sha256(patch.encode("utf-8")).hexdigest()
-        return cls(id, workspace_id, base_sha, head_sha, patch, diff_stat, changed_files, risk_level, digest, datetime.now(UTC))
+    def create(
+        cls,
+        *,
+        id: str,
+        workspace_id: str,
+        base_sha: str,
+        head_sha: str | None,
+        patch: str,
+        diff_stat: str,
+        changed_files: tuple[str, ...],
+        risk_level: str = "low",
+        artifact: ChangeSetArtifact | None = None,
+    ) -> ChangeSet:
+        patch_bytes = patch.encode("utf-8")
+        if len(patch_bytes) > MAX_CHANGESET_INLINE_BYTES:
+            raise ValueError("inline ChangeSet patch exceeds the configured bound")
+        digest = artifact.sha256 if artifact is not None else hashlib.sha256(patch_bytes).hexdigest()
+        return cls(
+            id,
+            workspace_id,
+            base_sha,
+            head_sha,
+            patch,
+            diff_stat,
+            changed_files,
+            risk_level,
+            digest,
+            datetime.now(UTC),
+            artifact,
+        )
 
     def approval_key(self, operation: str) -> str:
         """Return an approval binding that cannot be reused for another diff."""

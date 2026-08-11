@@ -6,7 +6,6 @@ import os
 import re
 from collections.abc import Iterable, Mapping
 
-
 _PINNED_GIT_CONFIG_SUPPRESSIONS = frozenset(
     {"GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"}
 )

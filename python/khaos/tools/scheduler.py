@@ -17,8 +17,8 @@ from pathlib import Path
 from typing import Any, cast
 
 from khaos.agent.approval import ApprovalBinding, StepExecutionAuthority
-from khaos.coding.execution.capability import DockerSandboxDecision, SandboxDecision
 from khaos.coding.execution.authority import ExecutionAuthority
+from khaos.coding.execution.capability import DockerSandboxDecision, SandboxDecision
 from khaos.coding.execution.environment import is_non_inheritable_secret_key
 from khaos.coding.execution.identity import (
     container_command_identity,
@@ -2754,7 +2754,6 @@ class ToolScheduler:
         """Reject coding execution before approval when no safe backend exists."""
         if mode != "coding" or not _tool_has_capability(tool, "process.execute"):
             return ""
-        tool_name = tool.name
         # Small library/test schedulers may intentionally provide a recording
         # handler without an AgentLoop execution authority.  Enforce this
         # preflight only when the runtime has supplied the authority slot;

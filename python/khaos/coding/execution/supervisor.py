@@ -778,7 +778,7 @@ class ProcessSupervisor:
                     "ProcessSupervisor shutdown: terminate(%s) cancelled",
                     execution_id,
                 )
-            except Exception as exc:  # noqa: BLE001 — collect, don't abort
+            except Exception as exc:
                 errors.append(exc)
                 logger.debug(
                     "ProcessSupervisor shutdown: terminate(%s) failed",
@@ -957,12 +957,12 @@ async def _kill_orphaned_process(process: asyncio.subprocess.Process) -> None:
         return
     try:
         _signal_process_group(process, signal.SIGKILL, force=True)
-    except BaseException:  # noqa: BLE001 — best-effort
+    except BaseException:  # noqa: BLE001 — best-effort orphan cleanup
         return
     try:
         await asyncio.wait_for(process.wait(), timeout=2.0)
-    except BaseException:  # noqa: BLE001 — best-effort
-        pass
+    except BaseException:
+        logger.debug("orphaned process did not settle after SIGKILL", exc_info=True)
 
 
 def _resource_limit_diagnostics(budget) -> dict[str, object]:
