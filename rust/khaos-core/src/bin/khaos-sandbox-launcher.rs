@@ -50,7 +50,9 @@ mod linux {
     const LANDLOCK_ACCESS_FS_MAKE_SYM: u64 = 1 << 12;
     const LANDLOCK_ACCESS_FS_REFER: u64 = 1 << 13;
     const LANDLOCK_ACCESS_FS_TRUNCATE: u64 = 1 << 14;
-    const LANDLOCK_ACCESS_FS_MAKE_WATCH: u64 = 1 << 15;
+    // ABI 5 introduced device ioctl mediation at bit 15.  Keep the name
+    // aligned with the kernel UAPI: there is no MAKE_WATCH filesystem right.
+    const LANDLOCK_ACCESS_FS_IOCTL_DEV: u64 = 1 << 15;
     const LANDLOCK_CREATE_RULESET_VERSION_FLAG: libc::c_uint = 1;
     const O_PATH_FLAG: libc::c_int = 0o10000000;
 
@@ -129,9 +131,23 @@ mod linux {
             write |= LANDLOCK_ACCESS_FS_TRUNCATE;
         }
         if abi >= 5 {
-            write |= LANDLOCK_ACCESS_FS_MAKE_WATCH;
+            write |= LANDLOCK_ACCESS_FS_IOCTL_DEV;
         }
         Ok((read, read | write))
+    }
+
+    fn landlock_ruleset_attr_size(abi: i32) -> usize {
+        // landlock_ruleset_attr grew as new classes of restrictions were
+        // added.  Passing a newer struct size to an older kernel can return
+        // EINVAL/E2BIG even when all newer fields are zero, so only expose
+        // the prefix supported by the runtime ABI.
+        if abi >= 6 {
+            std::mem::size_of::<LandlockRulesetAttr>()
+        } else if abi >= 4 {
+            std::mem::size_of::<u64>() * 2
+        } else {
+            std::mem::size_of::<u64>()
+        }
     }
 
     fn landlock_paths(variable: &str) -> io::Result<Vec<String>> {
@@ -193,10 +209,20 @@ mod linux {
         };
         let close_result = unsafe { libc::close(descriptor) };
         if close_result != 0 && result >= 0 {
-            return Err(io::Error::last_os_error());
+            return Err(io::Error::new(
+                io::Error::last_os_error().kind(),
+                format!(
+                    "close Landlock allow path {path}: {}",
+                    io::Error::last_os_error()
+                ),
+            ));
         }
         if result < 0 {
-            return Err(io::Error::last_os_error());
+            let error = io::Error::last_os_error();
+            return Err(io::Error::new(
+                error.kind(),
+                format!("add Landlock rule for {path}: {error}"),
+            ));
         }
         Ok(())
     }
@@ -221,14 +247,15 @@ mod linux {
             libc::syscall(
                 SYS_LANDLOCK_CREATE_RULESET,
                 &attr as *const LandlockRulesetAttr,
-                std::mem::size_of::<LandlockRulesetAttr>(),
+                landlock_ruleset_attr_size(abi),
                 0u32,
             )
         };
         if ruleset_fd < 0 {
+            let error = io::Error::last_os_error();
             return Err(io::Error::new(
-                io::Error::last_os_error().kind(),
-                format!("create Landlock ruleset: {}", io::Error::last_os_error()),
+                error.kind(),
+                format!("create Landlock ruleset (ABI {abi}): {error}"),
             ));
         }
         let ruleset_fd = ruleset_fd as RawFd;
@@ -244,7 +271,11 @@ mod linux {
             }
             let restricted = unsafe { libc::syscall(SYS_LANDLOCK_RESTRICT_SELF, ruleset_fd, 0u32) };
             if restricted < 0 {
-                return Err(io::Error::last_os_error());
+                let error = io::Error::last_os_error();
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("restrict self with Landlock (ABI {abi}): {error}"),
+                ));
             }
             Ok(())
         })();

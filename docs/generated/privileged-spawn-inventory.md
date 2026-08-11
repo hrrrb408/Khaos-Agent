@@ -54,4 +54,4 @@
 - `rust/khaos-core/src/bin/khaos-exec-launcher.rs:452` `Command::new` in `rust::entrypoint` owner=`NativeExecLauncher` threat-model=`fd-bound-executable-authority` boundary=`native-launcher`
 - `rust/khaos-core/src/bin/khaos-exec-launcher.rs:459` `Command::new` in `rust::entrypoint` owner=`NativeExecLauncher` threat-model=`fd-bound-executable-authority` boundary=`native-launcher`
 - `rust/khaos-core/src/bin/khaos-exec-launcher.rs:512` `execveat` in `rust::entrypoint` owner=`NativeExecLauncher` threat-model=`fd-bound-executable-authority` boundary=`native-launcher`
-- `rust/khaos-core/src/bin/khaos-sandbox-launcher.rs:353` `execvp` in `rust::entrypoint` owner=`LinuxSandboxLauncher` threat-model=`seccomp-landlock-bwrap-boundary` boundary=`linux-sandbox`
+- `rust/khaos-core/src/bin/khaos-sandbox-launcher.rs:384` `execvp` in `rust::entrypoint` owner=`LinuxSandboxLauncher` threat-model=`seccomp-landlock-bwrap-boundary` boundary=`linux-sandbox`
