@@ -25,8 +25,9 @@ DEFAULT_POLICY_PATHS = [
     Path("~/.khaos/policy.yaml"),
 ]
 
-# Defaults mirror the template in khaos_policy.yaml so that a missing file and
-# an empty file behave identically.
+# Defaults mirror the explicit null/absent allowlist values in the template so
+# that a missing file and an empty file behave identically.  An explicit empty
+# list remains a deliberate deny-all policy and is never treated as unset.
 _DEFAULT_DENIED_PATHS = [
     "~/.ssh",
     "~/.aws",

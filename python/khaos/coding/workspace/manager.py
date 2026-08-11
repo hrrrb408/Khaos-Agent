@@ -13,7 +13,6 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, TypeVar
 
-from khaos.coding.execution.environment import scrub_spawn_environment
 from khaos.coding.workspace.boundary import PROTECTED_WORKSPACE_NAMES
 from khaos.coding.workspace.git_identity import (
     GitIdentityError,
@@ -34,6 +33,11 @@ from khaos.coding.workspace.storage import (
     WorkspaceStorageViolation,
     capture_workspace_snapshot,
 )
+from khaos.coding.workspace.trusted_git import (
+    TrustedGitError,
+    TrustedGitRunner,
+)
+from khaos.security.authority import AuthorityEnvelope
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -108,78 +112,6 @@ def _open_private_authority_root(configured: Path) -> tuple[Path, FileIdentity]:
     return canonical, _identity(info)
 
 
-def _file_digest(path: Path) -> str:
-    digest = hashlib.sha256()
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    try:
-        while chunk := os.read(descriptor, 1024 * 1024):
-            digest.update(chunk)
-    finally:
-        os.close(descriptor)
-    return digest.hexdigest()
-
-
-def _resolve_trusted_git() -> tuple[Path, FileIdentity, str]:
-    """Pin the platform system Git without consulting caller-controlled PATH."""
-    system_git = (
-        Path("C:/Program Files/Git/cmd/git.exe")
-        if os.name == "nt"
-        else Path("/usr/bin/git")
-    )
-    try:
-        executable = system_git.resolve(strict=True)
-    except OSError as error:
-        raise WorkspaceError("trusted system Git executable is unavailable") from error
-    info = executable.stat()
-    if (
-        not executable.is_absolute()
-        or not stat.S_ISREG(info.st_mode)
-        or info.st_uid != 0
-        or info.st_mode & 0o022
-    ):
-        raise WorkspaceError(
-            "Git executable must be absolute, root-owned, regular, and immutable"
-        )
-    for parent in executable.parents:
-        parent_info = parent.stat()
-        if parent_info.st_uid != 0 or parent_info.st_mode & 0o022:
-            raise WorkspaceError("Git executable parent chain is not trusted")
-    return executable, _identity(info), _file_digest(executable)
-
-
-def _verify_identity(
-    path: Path,
-    expected: FileIdentity,
-    *,
-    require_root_owner: bool,
-    label: str,
-    expected_digest: str | None = None,
-) -> None:
-    """Open with no-follow and compare the live device/inode/mode authority."""
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    if path.is_dir():
-        flags |= getattr(os, "O_DIRECTORY", 0)
-    try:
-        descriptor = os.open(path, flags)
-        try:
-            current = os.fstat(descriptor)
-            if expected_digest is not None:
-                digest = hashlib.sha256()
-                while chunk := os.read(descriptor, 1024 * 1024):
-                    digest.update(chunk)
-                if digest.hexdigest() != expected_digest:
-                    raise WorkspaceError(f"{label} content digest drifted")
-        finally:
-            os.close(descriptor)
-    except OSError as exc:
-        raise WorkspaceError(f"{label} is unavailable") from exc
-    if _identity(current) != expected:
-        raise WorkspaceError(f"{label} identity drifted")
-    required_uid = 0 if require_root_owner else os.getuid()
-    if current.st_uid != required_uid or current.st_mode & 0o022:
-        raise WorkspaceError(f"{label} trust policy failed")
-
-
 ALLOWED: dict[WorkspaceState, frozenset[WorkspaceState]] = {
     WorkspaceState.CREATING: frozenset({WorkspaceState.READY, WorkspaceState.FAILED}),
     WorkspaceState.READY: frozenset({WorkspaceState.INDEXING, WorkspaceState.RUNNING, WorkspaceState.FAILED, WorkspaceState.CANCELLED}),
@@ -206,6 +138,7 @@ class WorkspaceManager:
         *,
         storage_limits: WorkspaceStorageLimits | None = None,
         storage_authority: WorkspaceStorageAuthority | None = None,
+        policy_digest: str = "legacy-unbound",
     ) -> None:
         configured_root = (
             root or Path(tempfile.gettempdir()) / "khaos" / "worktrees"
@@ -213,11 +146,16 @@ class WorkspaceManager:
         self.root, self._root_identity = _open_private_authority_root(
             configured_root
         )
-        (
-            self._git_executable,
-            self._git_identity,
-            self._git_digest,
-        ) = _resolve_trusted_git()
+        try:
+            self._git_runner = TrustedGitRunner.for_authority_root(
+                self.root, self._root_identity
+            )
+        except TrustedGitError as exc:
+            raise WorkspaceError(str(exc)) from exc
+        self._git_executable = self._git_runner.executable
+        self._git_identity = self._git_runner.git_identity
+        self._git_digest = self._git_runner.git_digest
+        self.policy_digest = policy_digest
         self.storage_limits = storage_limits or WorkspaceStorageLimits()
         self.storage_authority = storage_authority or WorkspaceStorageAuthority()
         self._workspaces: dict[str, TaskWorkspace] = {}
@@ -243,48 +181,69 @@ class WorkspaceManager:
         """Batch 2.6 §5: register the shared per-workspace mutation fence."""
         self._mutation_fence = fence
 
-    async def _git(self, repository: Path, *args: str, preserve_output: bool = False) -> str:
-        _verify_identity(
-            self._git_executable,
-            self._git_identity,
-            require_root_owner=True,
-            label="Git executable",
-            expected_digest=self._git_digest,
+    def _default_git_authority(self, repository: Path) -> AuthorityEnvelope:
+        return AuthorityEnvelope(
+            principal_id="legacy",
+            project_id="local",
+            runtime_id="workspace-manager",
+            task_id="host-git",
+            workspace_id=repository.name or "repository",
+            workspace_generation=1,
+            policy_digest=self.policy_digest,
+            operation_class="git.host",
+            resource_digest=hashlib.sha256(
+                str(repository.resolve()).encode("utf-8")
+            ).hexdigest(),
         )
-        _verify_identity(
-            self.root,
-            self._root_identity,
-            require_root_owner=False,
-            label="workspace authority root",
-        )
-        environment = scrub_spawn_environment({
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_CONFIG_GLOBAL": os.devnull,
-            "GIT_TERMINAL_PROMPT": "0",
-            "GIT_ASKPASS": os.devnull,
-            "SSH_ASKPASS": os.devnull,
-            "LANG": "C.UTF-8",
-            "LC_ALL": "C.UTF-8",
-            "HOME": str(self.root),
-        }, preserve={
-            # These values are deliberately pinned to local safe controls;
-            # removing them would re-enable Git's ambient user/system config
-            # or interactive credential helpers.
-            "GIT_CONFIG_NOSYSTEM",
-            "GIT_CONFIG_GLOBAL",
-            "GIT_TERMINAL_PROMPT",
-            "GIT_ASKPASS",
-            "SSH_ASKPASS",
-        })
-        process = await asyncio.create_subprocess_exec(
-            str(self._git_executable), *args, cwd=str(repository), env=environment,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await process.communicate()
-        if process.returncode != 0:
-            raise WorkspaceError(stderr.decode("utf-8", errors="replace").strip() or "git command failed")
-        output = stdout.decode("utf-8", errors="replace")
-        return output if preserve_output else output.strip()
+
+    async def _git(
+        self,
+        repository: Path,
+        *args: str,
+        authority: AuthorityEnvelope | None = None,
+        preserve_output: bool = False,
+    ) -> str:
+        try:
+            runner = TrustedGitRunner(
+                self._git_executable,
+                self._git_identity,
+                self._git_digest,
+                self.root,
+                self._root_identity,
+            )
+            return await runner.run(
+                repository,
+                *args,
+                authority=authority or self._default_git_authority(repository),
+                preserve_output=preserve_output,
+            )
+        except TrustedGitError as exc:
+            raise WorkspaceError(str(exc)) from exc
+
+    async def _materialize_git_tree(
+        self,
+        repository: Path,
+        base_sha: str,
+        worktree: Path,
+        *,
+        authority: AuthorityEnvelope,
+    ) -> None:
+        try:
+            runner = TrustedGitRunner(
+                self._git_executable,
+                self._git_identity,
+                self._git_digest,
+                self.root,
+                self._root_identity,
+            )
+            await runner.materialize_tree(
+                repository,
+                base_sha,
+                worktree,
+                authority=authority.derive(operation_class="git.materialize"),
+            )
+        except TrustedGitError as exc:
+            raise WorkspaceError(str(exc)) from exc
 
     async def _workspace_git(
         self,
@@ -300,16 +259,20 @@ class WorkspaceManager:
             await asyncio.to_thread(verify_git_worktree_identity, identity)
         except GitIdentityError as exc:
             raise WorkspaceError(str(exc)) from exc
-        return await self._git(
-            workspace.worktree_path,
-            f"--git-dir={identity.admin_dir}",
-            f"--work-tree={workspace.worktree_path}",
-            "-c", f"core.hooksPath={os.devnull}",
-            "-c", "core.fsmonitor=false",
-            "-c", "core.untrackedCache=false",
-            *args,
-            preserve_output=preserve_output,
-        )
+        authority = workspace.authority_envelope
+        if authority is None:
+            raise WorkspaceError("TaskWorkspace authority envelope is missing")
+        try:
+            return await self._git_runner.run(
+                workspace.worktree_path,
+                f"--git-dir={identity.admin_dir}",
+                f"--work-tree={workspace.worktree_path}",
+                *args,
+                authority=authority.derive(operation_class="git.workspace"),
+                preserve_output=preserve_output,
+            )
+        except TrustedGitError as exc:
+            raise WorkspaceError(str(exc)) from exc
 
     async def create(
         self,
@@ -327,25 +290,92 @@ class WorkspaceManager:
                 raise WorkspaceError(f"task already has an active workspace: {task_id}")
             if not (repository / ".git").exists():
                 raise WorkspaceError(f"not a git repository: {repository}")
-            dirty = await self._git(repository, "status", "--porcelain")
+            workspace_id = uuid.uuid4().hex[:12]
+            authority_context = AuthorityEnvelope(
+                principal_id=principal_id or "legacy",
+                project_id=project_id or "local",
+                runtime_id=creator_runtime_id or "legacy-runtime",
+                task_id=task_id,
+                workspace_id=workspace_id,
+                workspace_generation=1,
+                policy_digest=self.policy_digest,
+                operation_class="git.bootstrap",
+                resource_digest=hashlib.sha256(
+                    str(repository).encode("utf-8")
+                ).hexdigest(),
+            )
+            dirty = await self._git(
+                repository,
+                "status",
+                "--porcelain",
+                authority=authority_context,
+            )
             if dirty:
                 raise WorkspaceError("主工作树存在未提交修改，拒绝创建可写 Worktree")
-            base_sha = await self._git(repository, "rev-parse", base_ref)
-            workspace_id = uuid.uuid4().hex[:12]
+            base_sha = await self._git(
+                repository,
+                "rev-parse",
+                base_ref,
+                authority=authority_context,
+            )
             branch = f"khaos/task/{task_id}"
             path = (self.root / workspace_id).resolve()
             path.parent.mkdir(parents=True, exist_ok=True)
-            await self._git(repository, "worktree", "add", "-b", branch, str(path), base_sha)
+            await self._git(
+                repository,
+                "worktree",
+                "add",
+                "--no-checkout",
+                "-b",
+                branch,
+                str(path),
+                base_sha,
+                authority=authority_context,
+            )
             try:
                 git_identity = await asyncio.to_thread(
                     capture_git_worktree_identity, repository, path
                 )
             except GitIdentityError:
                 await self._git(
-                    repository, "worktree", "remove", "--force", str(path)
+                    repository,
+                    "worktree",
+                    "remove",
+                    "--force",
+                    str(path),
+                    authority=authority_context,
                 )
                 raise
+            # ``--no-checkout`` deliberately leaves the worktree empty.  Set
+            # the linked index to the approved tree without ``-u`` so Git
+            # does not invoke any smudge/filter driver; tracked bytes are
+            # materialized separately from raw tree/blob objects below.
+            await self._git(
+                path,
+                f"--git-dir={git_identity.admin_dir}",
+                f"--work-tree={path}",
+                "read-tree",
+                base_sha,
+                authority=authority_context.derive(operation_class="git.index"),
+            )
             recovery_root = (self.root.parent / ".khaos-recovery").resolve()
+            try:
+                await self._materialize_git_tree(
+                    repository,
+                    base_sha,
+                    path,
+                    authority=authority_context,
+                )
+            except Exception:
+                await self._git(
+                    repository,
+                    "worktree",
+                    "remove",
+                    "--force",
+                    str(path),
+                    authority=authority_context,
+                )
+                raise
             root_stat = path.stat()
             workspace = TaskWorkspace(
                 id=workspace_id,
@@ -366,18 +396,29 @@ class WorkspaceManager:
                 authority_generation=1,
                 root_device=int(root_stat.st_dev),
                 root_inode=int(root_stat.st_ino),
+                authority_envelope=authority_context,
             )
             try:
                 await asyncio.to_thread(_install_protected_metadata_guards, path)
             except Exception:
                 await self._git(
-                    repository, "worktree", "remove", "--force", str(path)
+                    repository,
+                    "worktree",
+                    "remove",
+                    "--force",
+                    str(path),
+                    authority=authority_context,
                 )
                 raise
             baseline = await asyncio.to_thread(capture_workspace_snapshot, path)
             if not baseline.complete:
                 await self._git(
-                    repository, "worktree", "remove", "--force", str(path)
+                    repository,
+                    "worktree",
+                    "remove",
+                    "--force",
+                    str(path),
+                    authority=authority_context,
                 )
                 raise WorkspaceError("TaskWorkspace storage baseline is incomplete")
             workspace.storage_baseline = baseline
@@ -671,10 +712,26 @@ class WorkspaceManager:
                         restore_git_pointer_for_cleanup,
                         workspace.git_identity,
                     )
+                authority = workspace.authority_envelope
+                if authority is None:
+                    raise WorkspaceError("TaskWorkspace authority envelope is missing")
                 if force:
-                    await self._git(workspace.repository_root, "worktree", "remove", "--force", str(workspace.worktree_path))
+                    await self._git(
+                        workspace.repository_root,
+                        "worktree",
+                        "remove",
+                        "--force",
+                        str(workspace.worktree_path),
+                        authority=authority.derive(operation_class="git.cleanup"),
+                    )
                 else:
-                    await self._git(workspace.repository_root, "worktree", "remove", str(workspace.worktree_path))
+                    await self._git(
+                        workspace.repository_root,
+                        "worktree",
+                        "remove",
+                        str(workspace.worktree_path),
+                        authority=authority.derive(operation_class="git.cleanup"),
+                    )
             except Exception:  # noqa: BLE001 - worktree cleanup failure is persisted
                 workspace.state = WorkspaceState.FAILED
                 return WorkspaceTransition.FAILED

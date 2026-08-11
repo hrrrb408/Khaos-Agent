@@ -10,7 +10,9 @@ sandbox:
 
   # 网络访问（默认关闭）
   network: false
-  allowed_domains: []
+  # absent/null = this layer does not configure a domain allowlist;
+  # [] = explicitly deny every domain; a non-empty list is a whitelist.
+  allowed_domains: null
   blocked_domains: []
 
   # 文件系统路径
@@ -25,7 +27,8 @@ sandbox:
     - "/etc/passwd"
 
 commands:
-  allow: []
+  # absent/null = no command allowlist at this layer; [] = deny all commands.
+  allow: null
   require_approval:
     - git push
     - rm

@@ -1,5 +1,7 @@
 //! Fail-closed inner launcher for the Linux execution sandbox.
 
+// KHAOS-PRIVILEGED-SPAWN owner=LinuxSandboxLauncher threat-model=seccomp-landlock-bwrap-boundary boundary=linux-sandbox
+
 #[cfg(target_os = "linux")]
 mod linux {
     use _khaos_core::browser_kernel_protocol_generated::{
@@ -26,6 +28,45 @@ mod linux {
     const SECCOMP_MODE_FILTER: libc::c_ulong = 2;
     const DEFAULT_HELPER_SOCKET: &str = "/run/khaos/browser-kernel-helper.sock";
 
+    // Landlock syscall numbers are stable across the supported Linux
+    // architectures.  Keep them local instead of depending on the libc crate
+    // exposing a kernel-header version newer than the runner's headers.
+    const SYS_LANDLOCK_CREATE_RULESET: libc::c_long = 444;
+    const SYS_LANDLOCK_ADD_RULE: libc::c_long = 445;
+    const SYS_LANDLOCK_RESTRICT_SELF: libc::c_long = 446;
+    const LANDLOCK_RULE_TYPE_PATH_BENEATH: libc::c_uint = 1;
+    const LANDLOCK_ACCESS_FS_EXECUTE: u64 = 1 << 0;
+    const LANDLOCK_ACCESS_FS_WRITE_FILE: u64 = 1 << 1;
+    const LANDLOCK_ACCESS_FS_READ_FILE: u64 = 1 << 2;
+    const LANDLOCK_ACCESS_FS_READ_DIR: u64 = 1 << 3;
+    const LANDLOCK_ACCESS_FS_REMOVE_DIR: u64 = 1 << 4;
+    const LANDLOCK_ACCESS_FS_REMOVE_FILE: u64 = 1 << 5;
+    const LANDLOCK_ACCESS_FS_MAKE_CHAR: u64 = 1 << 6;
+    const LANDLOCK_ACCESS_FS_MAKE_DIR: u64 = 1 << 7;
+    const LANDLOCK_ACCESS_FS_MAKE_REG: u64 = 1 << 8;
+    const LANDLOCK_ACCESS_FS_MAKE_SOCK: u64 = 1 << 9;
+    const LANDLOCK_ACCESS_FS_MAKE_FIFO: u64 = 1 << 10;
+    const LANDLOCK_ACCESS_FS_MAKE_BLOCK: u64 = 1 << 11;
+    const LANDLOCK_ACCESS_FS_MAKE_SYM: u64 = 1 << 12;
+    const LANDLOCK_ACCESS_FS_REFER: u64 = 1 << 13;
+    const LANDLOCK_ACCESS_FS_TRUNCATE: u64 = 1 << 14;
+    const LANDLOCK_ACCESS_FS_MAKE_WATCH: u64 = 1 << 15;
+    const LANDLOCK_CREATE_RULESET_VERSION_FLAG: libc::c_uint = 1;
+    const O_PATH_FLAG: libc::c_int = 0o10000000;
+
+    #[repr(C)]
+    struct LandlockRulesetAttr {
+        handled_access_fs: u64,
+        handled_access_net: u64,
+        scoped: u64,
+    }
+
+    #[repr(C)]
+    struct LandlockPathBeneathAttr {
+        allowed_access: u64,
+        parent_fd: libc::c_int,
+    }
+
     const BPF_LD: u16 = 0x00;
     const BPF_W: u16 = 0x00;
     const BPF_ABS: u16 = 0x20;
@@ -45,6 +86,170 @@ mod linux {
 
     fn jump(code: u16, k: u32, jt: u8, jf: u8) -> libc::sock_filter {
         libc::sock_filter { code, jt, jf, k }
+    }
+
+    fn landlock_abi() -> io::Result<i32> {
+        let result = unsafe {
+            libc::syscall(
+                SYS_LANDLOCK_CREATE_RULESET,
+                std::ptr::null::<LandlockRulesetAttr>(),
+                0usize,
+                LANDLOCK_CREATE_RULESET_VERSION_FLAG,
+            )
+        };
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(result as i32)
+    }
+
+    fn landlock_access_masks(abi: i32) -> io::Result<(u64, u64)> {
+        if abi < 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Landlock filesystem ABI is unavailable",
+            ));
+        }
+        let read =
+            LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR;
+        let mut write = LANDLOCK_ACCESS_FS_WRITE_FILE
+            | LANDLOCK_ACCESS_FS_REMOVE_DIR
+            | LANDLOCK_ACCESS_FS_REMOVE_FILE
+            | LANDLOCK_ACCESS_FS_MAKE_CHAR
+            | LANDLOCK_ACCESS_FS_MAKE_DIR
+            | LANDLOCK_ACCESS_FS_MAKE_REG
+            | LANDLOCK_ACCESS_FS_MAKE_SOCK
+            | LANDLOCK_ACCESS_FS_MAKE_FIFO
+            | LANDLOCK_ACCESS_FS_MAKE_BLOCK
+            | LANDLOCK_ACCESS_FS_MAKE_SYM;
+        if abi >= 2 {
+            write |= LANDLOCK_ACCESS_FS_REFER;
+        }
+        if abi >= 3 {
+            write |= LANDLOCK_ACCESS_FS_TRUNCATE;
+        }
+        if abi >= 5 {
+            write |= LANDLOCK_ACCESS_FS_MAKE_WATCH;
+        }
+        Ok((read, read | write))
+    }
+
+    fn landlock_paths(variable: &str) -> io::Result<Vec<String>> {
+        let raw = env::var(variable).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{variable} is missing from the sandbox environment"),
+            )
+        })?;
+        let paths: Vec<String> = serde_json::from_str(&raw).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{variable} is not a JSON path list: {error}"),
+            )
+        })?;
+        if paths
+            .iter()
+            .any(|path| path.is_empty() || !path.starts_with('/') || path.as_bytes().contains(&0))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{variable} contains an invalid absolute path"),
+            ));
+        }
+        Ok(paths)
+    }
+
+    fn add_landlock_path(ruleset_fd: RawFd, path: &str, access: u64) -> io::Result<()> {
+        let c_path = CString::new(path).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "Landlock path contained NUL")
+        })?;
+        let descriptor = unsafe {
+            libc::open(
+                c_path.as_ptr(),
+                O_PATH_FLAG | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if descriptor < 0 {
+            return Err(io::Error::new(
+                io::Error::last_os_error().kind(),
+                format!(
+                    "open Landlock allow path {path}: {}",
+                    io::Error::last_os_error()
+                ),
+            ));
+        }
+        let rule = LandlockPathBeneathAttr {
+            allowed_access: access,
+            parent_fd: descriptor,
+        };
+        let result = unsafe {
+            libc::syscall(
+                SYS_LANDLOCK_ADD_RULE,
+                ruleset_fd,
+                LANDLOCK_RULE_TYPE_PATH_BENEATH,
+                &rule as *const LandlockPathBeneathAttr,
+                0u32,
+            )
+        };
+        let close_result = unsafe { libc::close(descriptor) };
+        if close_result != 0 && result >= 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn install_landlock_if_required() -> io::Result<()> {
+        if env::var("KHAOS_LANDLOCK_REQUIRED").as_deref() != Ok("1") {
+            return Ok(());
+        }
+        let abi = landlock_abi().map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("Landlock is required but unavailable: {error}"),
+            )
+        })?;
+        let (read_access, write_access) = landlock_access_masks(abi)?;
+        let attr = LandlockRulesetAttr {
+            handled_access_fs: write_access,
+            handled_access_net: 0,
+            scoped: 0,
+        };
+        let ruleset_fd = unsafe {
+            libc::syscall(
+                SYS_LANDLOCK_CREATE_RULESET,
+                &attr as *const LandlockRulesetAttr,
+                std::mem::size_of::<LandlockRulesetAttr>(),
+                0u32,
+            )
+        };
+        if ruleset_fd < 0 {
+            return Err(io::Error::new(
+                io::Error::last_os_error().kind(),
+                format!("create Landlock ruleset: {}", io::Error::last_os_error()),
+            ));
+        }
+        let ruleset_fd = ruleset_fd as RawFd;
+        let result = (|| {
+            for path in landlock_paths("KHAOS_LANDLOCK_READ_ROOTS")? {
+                add_landlock_path(ruleset_fd, &path, read_access)?;
+            }
+            for path in landlock_paths("KHAOS_LANDLOCK_WRITE_ROOTS")? {
+                add_landlock_path(ruleset_fd, &path, write_access)?;
+            }
+            if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let restricted = unsafe { libc::syscall(SYS_LANDLOCK_RESTRICT_SELF, ruleset_fd, 0u32) };
+            if restricted < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        })();
+        unsafe { libc::close(ruleset_fd) };
+        result
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -1356,6 +1561,7 @@ mod linux {
         if args.first().is_some_and(|arg| arg == "--") {
             args.remove(0);
         }
+        install_landlock_if_required()?;
         install_seccomp()?;
         exec(&args)
     }

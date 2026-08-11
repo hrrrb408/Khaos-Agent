@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+"""Require an owner and threat model for every runtime host-spawn site.
+
+The gate intentionally scans source syntax rather than grep text, so comments
+and documentation cannot hide a new privileged spawn.  Each production source
+file containing a spawn must carry a file-level declaration:
+
+``KHAOS-PRIVILEGED-SPAWN owner=... threat-model=... boundary=...```
+
+The generated inventory is an auditable snapshot of all discovered call sites;
+adding a new site or moving one changes the generated artifact and therefore
+requires an explicit security review in the same change.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import re
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+OUTPUT = ROOT / "docs" / "generated" / "privileged-spawn-inventory.md"
+DECLARATION = re.compile(
+    r"KHAOS-PRIVILEGED-SPAWN\s+owner=(?P<owner>[A-Za-z0-9_.-]+)\s+"
+    r"threat-model=(?P<threat>[A-Za-z0-9_.-]+)\s+"
+    r"boundary=(?P<boundary>[A-Za-z0-9_.-]+)"
+)
+RUST_CALL = re.compile(r"\b(?:Command::new|execvp|execveat|execve|execvpe)\b")
+
+
+@dataclass(frozen=True)
+class SpawnSite:
+    path: str
+    line: int
+    symbol: str
+    function: str
+    owner: str
+    threat_model: str
+    boundary: str
+
+
+def _declaration(path: Path) -> tuple[str, str, str] | None:
+    for line in path.read_text(encoding="utf-8").splitlines()[:100]:
+        match = DECLARATION.search(line)
+        if match:
+            return match.group("owner"), match.group("threat"), match.group("boundary")
+    return None
+
+
+def _dotted(node: ast.AST) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        left = _dotted(node.value)
+        return f"{left}.{node.attr}" if left else node.attr
+    return ""
+
+
+def _python_sites(path: Path) -> list[tuple[int, str, str]]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    sites: list[tuple[int, str, str]] = []
+    stack: list[str] = ["<module>"]
+    target_prefixes = (
+        "subprocess.run",
+        "subprocess.Popen",
+        "subprocess.check_call",
+        "subprocess.check_output",
+        "subprocess.call",
+        "asyncio.create_subprocess_exec",
+        "asyncio.create_subprocess_shell",
+        "os.exec",
+    )
+
+    class Visitor(ast.NodeVisitor):
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            stack.append(node.name)
+            self.generic_visit(node)
+            stack.pop()
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_Call(self, node: ast.Call) -> None:
+            name = _dotted(node.func)
+            if name.startswith(target_prefixes):
+                sites.append((node.lineno, name, ".".join(stack)))
+            self.generic_visit(node)
+
+    Visitor().visit(tree)
+    return sites
+
+
+def _rust_sites(path: Path) -> list[tuple[int, str, str]]:
+    sites: list[tuple[int, str, str]] = []
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        code = line.split("//", 1)[0]
+        match = RUST_CALL.search(code)
+        if match:
+            sites.append((line_number, match.group(0), "rust::entrypoint"))
+    return sites
+
+
+def discover() -> list[SpawnSite]:
+    files: list[Path] = []
+    files.extend(sorted((ROOT / "python" / "khaos").rglob("*.py")))
+    files.extend(sorted((ROOT / "rust" / "khaos-core" / "src").rglob("*.rs")))
+    files.extend(sorted((ROOT / "go").rglob("*.go")))
+    discovered: list[SpawnSite] = []
+    errors: list[str] = []
+    for path in files:
+        if any(part in {"tests", "__pycache__", "target"} for part in path.parts):
+            continue
+        relative = path.relative_to(ROOT).as_posix()
+        try:
+            raw_sites = (
+                _python_sites(path)
+                if path.suffix == ".py"
+                else _rust_sites(path)
+                if path.suffix == ".rs"
+                else []
+            )
+        except (OSError, SyntaxError) as exc:
+            errors.append(f"{relative}: cannot parse source: {exc}")
+            continue
+        if not raw_sites:
+            continue
+        declaration = _declaration(path)
+        if declaration is None:
+            errors.append(
+                f"{relative}: missing KHAOS-PRIVILEGED-SPAWN owner/threat-model/boundary declaration"
+            )
+            continue
+        owner, threat, boundary = declaration
+        discovered.extend(
+            SpawnSite(relative, line, symbol, function, owner, threat, boundary)
+            for line, symbol, function in raw_sites
+        )
+    if errors:
+        raise SystemExit("\n".join(errors))
+    return discovered
+
+
+def render() -> str:
+    sites = discover()
+    lines = [
+        "# Generated Privileged Spawn Inventory",
+        "",
+        "> Generated by `scripts/check_privileged_spawn_sites.py`; do not edit manually.",
+        "> Every runtime host process start must have an owner, threat model, and enforcement boundary.",
+        "",
+    ]
+    for site in sites:
+        lines.append(
+            f"- `{site.path}:{site.line}` `{site.symbol}` in `{site.function}` "
+            f"owner=`{site.owner}` threat-model=`{site.threat_model}` boundary=`{site.boundary}`"
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--check", action="store_true")
+    parser.add_argument("--output", type=Path, default=OUTPUT)
+    args = parser.parse_args(argv)
+    output = args.output if args.output.is_absolute() else ROOT / args.output
+    rendered = render()
+    if args.check:
+        if not output.is_file() or output.read_text(encoding="utf-8") != rendered:
+            print(f"stale privileged spawn inventory: {output}", file=sys.stderr)
+            return 1
+        return 0
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(rendered, encoding="utf-8")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

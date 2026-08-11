@@ -1,5 +1,7 @@
 """Clipboard tools for macOS/Linux."""
 
+# KHAOS-PRIVILEGED-SPAWN owner=HostClipboard threat-model=foreground-user-host-integration boundary=host-integration
+
 from __future__ import annotations
 
 import asyncio

@@ -972,7 +972,20 @@ async def build_runtime(
             project_id=project_id,
         )
         await task_manager.load()
-    workspace_manager = cfg.workspace_manager or WorkspaceManager()
+    workspace_manager = cfg.workspace_manager or WorkspaceManager(
+        policy_digest=effective_policy.digest
+    )
+    injected_workspace_policy = getattr(workspace_manager, "policy_digest", None)
+    if (
+        production_mode
+        and injected_workspace_policy is not None
+        and injected_workspace_policy != effective_policy.digest
+    ):
+        raise PermissionError(
+            "WorkspaceManager authority policy digest does not match the "
+            "runtime effective policy; host Git control-plane effects cannot "
+            "borrow a different policy authority."
+        )
     execution_service = cfg.execution_service or ExecutionService(
         workspace_manager=workspace_manager,
         backend_selector=BackendSelector(),

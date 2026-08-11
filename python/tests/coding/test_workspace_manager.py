@@ -159,6 +159,57 @@ async def test_workspace_commit_disables_repository_hooks(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_workspace_bootstrap_never_executes_repository_git_extensions(
+    tmp_path: Path,
+):
+    """Host bootstrap must not run hooks, fsmonitor, or checkout filters."""
+    repository = _repo(tmp_path / "repo")
+    marker = tmp_path / "host-extension-ran"
+    extension = tmp_path / "extension.sh"
+    extension.write_text(
+        f"#!/bin/sh\ntouch {marker}\nexit 0\n",
+        encoding="utf-8",
+    )
+    extension.chmod(0o755)
+    hooks = tmp_path / "hooks"
+    hooks.mkdir()
+    (hooks / "post-checkout").write_text(
+        f"#!/bin/sh\ntouch {marker}\n",
+        encoding="utf-8",
+    )
+    (hooks / "post-checkout").chmod(0o755)
+    (repository / ".gitattributes").write_text(
+        "README.md filter=sentinel\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", ".gitattributes"], cwd=repository, check=True)
+    subprocess.run(["git", "commit", "-qm", "attributes"], cwd=repository, check=True)
+    subprocess.run(
+        ["git", "config", "core.hooksPath", str(hooks)],
+        cwd=repository,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "core.fsmonitor", str(extension)],
+        cwd=repository,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "filter.sentinel.process", str(extension)],
+        cwd=repository,
+        check=True,
+    )
+
+    workspace = await WorkspaceManager(tmp_path / "worktrees").create(
+        repository,
+        "task-untrusted-git-extensions",
+    )
+
+    assert (workspace.worktree_path / "README.md").read_text() == "base\n"
+    assert not marker.exists()
+
+
+@pytest.mark.asyncio
 async def test_host_git_does_not_inherit_git_configuration_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):

@@ -1,8 +1,11 @@
 """Platform sandbox capability probes and command builders."""
 
+# KHAOS-PRIVILEGED-SPAWN owner=ExecutionBackend threat-model=kernel-sandbox-and-resource-control boundary=execution-service
+
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import secrets
@@ -766,8 +769,36 @@ class LinuxBubblewrapBackend:
         launcher = _linux_sandbox_launcher()
         if launcher is not None:
             prefix.extend(("--ro-bind", str(launcher), str(launcher)))
+        landlock_read_roots = {
+            "/usr",
+            "/etc",
+            "/dev",
+            "/proc",
+            "/home",
+            *(str(path) for path in runtime_roots),
+            *(str(path) for path in _linux_literal_read_files()),
+        }
+        landlock_write_roots = {"/home/khaos", "/tmp"}
+        if writable:
+            landlock_write_roots.add(self.SANDBOX_WORKDIR)
+        else:
+            landlock_read_roots.add(self.SANDBOX_WORKDIR)
         safe_environment = _sandbox_environment(
             None, environment or {}, home="/home/khaos", tmpdir="/tmp"
+        )
+        # The inner Rust launcher consumes these values only after bwrap has
+        # created the final mount namespace.  JSON avoids ambiguous ':' path
+        # splitting and makes the allowlist part of the exact spawn plan.
+        safe_environment.update(
+            {
+                "KHAOS_LANDLOCK_REQUIRED": "1",
+                "KHAOS_LANDLOCK_READ_ROOTS": json.dumps(
+                    sorted(landlock_read_roots), separators=(",", ":")
+                ),
+                "KHAOS_LANDLOCK_WRITE_ROOTS": json.dumps(
+                    sorted(landlock_write_roots), separators=(",", ":")
+                ),
+            }
         )
         prefix.append("--clearenv")
         for key, value in sorted(safe_environment.items()):

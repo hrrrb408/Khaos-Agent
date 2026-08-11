@@ -1,5 +1,7 @@
 """Evidence-bound platform sandbox capability cache."""
 
+# KHAOS-PRIVILEGED-SPAWN owner=SandboxCapabilityProbe threat-model=trusted-tcb-probe boundary=execution-capability
+
 from __future__ import annotations
 
 import hashlib

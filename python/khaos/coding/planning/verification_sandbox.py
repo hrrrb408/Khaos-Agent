@@ -10,6 +10,8 @@ Batch 3.1.2 §1: refactored to an explicit container lifecycle:
 ``remove_instance``.  The container ID is persisted BEFORE project code
 executes, using ``docker create --pull=never`` instead of ``docker run --rm``.
 """
+# KHAOS-PRIVILEGED-SPAWN owner=VerificationSandbox threat-model=trusted-docker-verification boundary=verification-authority
+
 from __future__ import annotations
 
 import asyncio

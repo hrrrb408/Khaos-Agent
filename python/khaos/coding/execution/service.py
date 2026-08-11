@@ -1,5 +1,7 @@
 """Single execution entry point for terminal, tests, sandbox and LSP."""
 
+# KHAOS-PRIVILEGED-SPAWN owner=ExecutionService threat-model=authority-bound-child-spawn boundary=execution-service
+
 from __future__ import annotations
 
 import asyncio
