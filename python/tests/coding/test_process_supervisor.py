@@ -3,9 +3,8 @@ import os
 import sys
 from pathlib import Path
 
-import pytest
-
 import khaos.coding.execution.supervisor as supervisor_module
+import pytest
 from khaos.coding.execution import (
     ExecutionRequest,
     ExecutionResult,
@@ -14,9 +13,8 @@ from khaos.coding.execution import (
     ResourceBudget,
 )
 from khaos.coding.execution.supervisor import ProcessSupervisor
-from khaos.coding.workspace.storage import capture_workspace_snapshot
 from khaos.coding.workspace.models import WorkspaceTransition
-
+from khaos.coding.workspace.storage import capture_workspace_snapshot
 
 POSIX_ONLY = pytest.mark.skipif(
     os.name != "posix",
@@ -74,18 +72,21 @@ async def test_supervisor_terminate_kills_complete_process_group(tmp_path: Path)
     )
     running = asyncio.create_task(supervisor.run(request))
     await _wait_until_active(supervisor, "tree-termination")
+    child_pid: int | None = None
     for _ in range(100):
-        if pid_file.exists():
+        try:
+            child_pid = int(pid_file.read_text())
+        except (FileNotFoundError, ValueError):
+            await asyncio.sleep(0.01)
+        else:
             break
-        await asyncio.sleep(0.01)
-    else:
-        pytest.fail("child process did not start")
+    if child_pid is None:
+        pytest.fail("child process did not publish a valid PID")
 
     assert await supervisor.terminate("tree-termination") is True
     result = await asyncio.wait_for(running, timeout=5)
 
     assert result.status == "cancelled"
-    child_pid = int(pid_file.read_text())
     await _wait_until_process_gone(child_pid)
     assert supervisor.active_execution_ids == ()
 
@@ -148,8 +149,10 @@ async def test_signal_death_before_deadline_is_failed_not_timeout(tmp_path: Path
     request = ExecutionRequest(
         (
             sys.executable, "-c",
-            "import os, signal, time; "
-            "os.kill(os.getpid(), signal.SIGTERM); time.sleep(5)",
+            (
+                "import os, signal, time; "
+                "os.kill(os.getpid(), signal.SIGTERM); time.sleep(5)"
+            ),
         ),
         tmp_path,
         budget=ResourceBudget(timeout_seconds=10),
@@ -309,8 +312,10 @@ async def test_supervisor_enforces_synthetic_tmp_capacity(tmp_path: Path):
         (
             sys.executable,
             "-c",
-            "from pathlib import Path; import sys,time; "
-            "Path(sys.argv[1]).write_bytes(b'x' * 8192); time.sleep(30)",
+            (
+                "from pathlib import Path; import sys,time; "
+                "Path(sys.argv[1]).write_bytes(b'x' * 8192); time.sleep(30)"
+            ),
             str(sandbox_tmp / "payload"),
         ),
         tmp_path,
@@ -335,9 +340,11 @@ async def test_supervisor_enforces_synthetic_home_entry_budget(tmp_path: Path):
         (
             sys.executable,
             "-c",
-            "from pathlib import Path; import sys,time; "
-            "root=Path(sys.argv[1]); "
-            "[(root / f'entry-{i}').touch() for i in range(12)]; time.sleep(30)",
+            (
+                "from pathlib import Path; import sys,time; "
+                "root=Path(sys.argv[1]); "
+                "[(root / f'entry-{i}').touch() for i in range(12)]; time.sleep(30)"
+            ),
             str(synthetic_home),
         ),
         tmp_path,
@@ -450,7 +457,6 @@ async def test_watchdog_retries_transient_linux_fd_observation(
     class FakeStorageAuthority:
         def assess(self, *_args, **_kwargs):
             process.done = True
-            return None
 
     process = FakeProcess()
     calls = 0
