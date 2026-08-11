@@ -565,7 +565,10 @@ mod windows_backend {
                     format!("name={allow_name}"),
                     "dir=out".to_string(),
                     "action=allow".to_string(),
-                    format!("program=\"{program}\""),
+                    // ``Command`` passes this as one already-isolated argv
+                    // element; embedding shell quotes would make the quotes
+                    // part of the program path when netsh parses it.
+                    format!("program={program}"),
                     "remoteip=127.0.0.1".to_string(),
                     "protocol=TCP".to_string(),
                     format!("remoteport={port}"),
@@ -583,7 +586,7 @@ mod windows_backend {
                     format!("name={non_loopback_v4}"),
                     "dir=out".to_string(),
                     "action=block".to_string(),
-                    format!("program=\"{program}\""),
+                    format!("program={program}"),
                     "remoteip=0.0.0.0-126.255.255.255,128.0.0.0-255.255.255.255".to_string(),
                     "profile=any".to_string(),
                 ];
@@ -602,7 +605,7 @@ mod windows_backend {
                     format!("name={v6_name}"),
                     "dir=out".to_string(),
                     "action=block".to_string(),
-                    format!("program=\"{program}\""),
+                    format!("program={program}"),
                     "remoteip=::/0".to_string(),
                     "profile=any".to_string(),
                 ];
@@ -623,7 +626,7 @@ mod windows_backend {
                             format!("name={name}"),
                             "dir=out".to_string(),
                             "action=block".to_string(),
-                            format!("program=\"{program}\""),
+                            format!("program={program}"),
                             // Block every IPv4 loopback address except the
                             // exact proxy endpoint covered by the allow rule.
                             "remoteip=127.0.0.0-127.255.255.255".to_string(),
@@ -649,7 +652,7 @@ mod windows_backend {
                     format!("name={name}"),
                     "dir=out".to_string(),
                     "action=block".to_string(),
-                    format!("program=\"{program}\""),
+                    format!("program={program}"),
                     "profile=any".to_string(),
                 ];
                 run_netsh_dynamic(&args).map(|()| names.push(name))
