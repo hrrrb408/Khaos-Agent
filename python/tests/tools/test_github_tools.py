@@ -1,4 +1,3 @@
-import hashlib
 import inspect
 import json
 import os
@@ -7,10 +6,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-
 from khaos.agent.approval import ApprovalBroker
 from khaos.coding.execution.models import ExecutionResult, NetworkPolicy
 from khaos.coding.workspace.models import WorkspaceState
+from khaos.security.network_broker import NetworkLease
 from khaos.tools.github_tools import (
     GITHUB_TOOL_SPECS,
     github_comment_issue,
@@ -53,8 +52,28 @@ class _FakeGitHubExecutionService:
         raise AssertionError(f"unexpected argv: {request.argv}")
 
 
+def _test_network_lease() -> NetworkLease:
+    """Provide an explicit lease for the fake execution-service adapter.
+
+    These tests stop at ``ExecutionService.execute`` and never launch a
+    platform backend. Production scheduler calls receive a broker-issued
+    lease; the platform backends still reject this deliberately unattested
+    test lease if it is ever allowed past the fake adapter.
+    """
+    return NetworkLease(
+        endpoint="http://127.0.0.1:49152",
+        username="khaos-test",
+        password="test-secret",
+        capability_digest="test-capability",
+        allowed_domains=frozenset({"github.com"}),
+        blocked_domains=frozenset(),
+        allowed_ports=frozenset({443}),
+        protocols=frozenset({"https"}),
+    )
+
+
 def _context(service, *, operations, network_policy="unrestricted-with-approval"):
-    return {
+    context = {
         "task_id": "task",
         "workspace_id": "workspace",
         "execution_service": service,
@@ -67,6 +86,9 @@ def _context(service, *, operations, network_policy="unrestricted-with-approval"
             "environment": {"GH_TOKEN": "test-token"},
         },
     }
+    if network_policy == "unrestricted-with-approval":
+        context["network_lease"] = _test_network_lease()
+    return context
 
 
 async def _approved_context(service, tool_name, arguments, *, requester="session", approval_id="approval"):
@@ -91,8 +113,9 @@ async def test_github_read_issue_uses_execution_service_without_write_approval(t
     result = json.loads(await github_read_issue(7, **_context(service, operations=["github_read_issue"])))
 
     assert result == {"number": 7}
-    request = [request for request in service.requests if request.argv[0] == "gh"][0]
-    assert request.network_policy is NetworkPolicy.UNRESTRICTED_WITH_APPROVAL
+    request = next(request for request in service.requests if request.argv[0] == "gh")
+    assert request.network_policy is NetworkPolicy.BROKERED
+    assert request.network_broker is not None
     assert request.argv == ("gh", "issue", "view", "7", "--json", "number,title,body,state,labels", "--repo", "owner/repo")
 
 
@@ -112,7 +135,8 @@ async def test_github_write_tools_use_execution_service_and_one_shot_approval(tm
     await handler(context)
 
     request = [request for request in service.requests if request.argv[0] == "gh"][-1]
-    assert request.network_policy is NetworkPolicy.UNRESTRICTED_WITH_APPROVAL
+    assert request.network_policy is NetworkPolicy.BROKERED
+    assert request.network_broker is not None
     assert request.environment["GH_TOKEN"] == "test-token"
     assert "GITHUB_TOKEN" not in request.allowed_environment_keys
     assert not os.path.exists(request.environment["HOME"])

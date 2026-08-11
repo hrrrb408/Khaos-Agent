@@ -24,8 +24,10 @@ async def output_changeset(manager: WorkspaceManager, workspace_id: str, changes
     workspace = manager._workspaces.get(workspace_id)
     if workspace is None:
         raise WorkspaceError("workspace not found")
-    authority = workspace.authority_envelope
-    git_kwargs = {"authority": authority} if authority is not None else {}
+    authority = workspace.authority_capability
+    if authority is None:
+        raise WorkspaceError("TaskWorkspace authority capability is missing")
+    git_kwargs = {"authority": authority.derive(operation_class="git.apply")}
     clean = await manager._git(
         workspace.repository_root, "status", "--porcelain", **git_kwargs
     )

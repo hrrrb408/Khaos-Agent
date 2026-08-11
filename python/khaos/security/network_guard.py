@@ -209,6 +209,18 @@ class NetworkGuard:
         # production authority's public-address-only policy.
         self._host_authority = host_authority or HostNetworkAuthority()
 
+    @property
+    def allowed_domains(self) -> frozenset[str] | None:
+        """Return the compiled allowlist without exposing mutable state."""
+        if self._allowed is None:
+            return None
+        return frozenset(self._allowed)
+
+    @property
+    def blocked_domains(self) -> frozenset[str]:
+        """Return the compiled blocklist without exposing mutable state."""
+        return frozenset(self._blocked)
+
     async def check_resolved_url(self, url: str) -> NetworkCheckResult:
         """Apply domain policy and reject URLs resolving to special-use IPs."""
         try:

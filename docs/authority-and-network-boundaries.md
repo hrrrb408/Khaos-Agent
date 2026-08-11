@@ -56,7 +56,8 @@ execution:
    logon SID and Everyone restricted groups, plus an explicit default DACL for
    child-created IPC objects;
 2. a kill-on-close Job Object with resource limits and an active-process limit
-   of two (the launcher plus one native runtime process);
+   of one native runtime process; the outer helper remains outside the Job and
+   owns the wait/cleanup transaction;
 3. transactionally granted/restored restricted-code ACLs: full access for the
    task workspace and read/execute plus ancestor traverse for the resolved
    native runtime tree;
@@ -65,8 +66,8 @@ execution:
 
 The active-process limit is deliberate: Windows program firewall rules cannot
 reliably authorize unknown descendants during a process-discovery race. The
-helper therefore permits only the launcher plus one native runtime process;
-anything beyond that is refused rather than being allowed an ungoverned
+native runtime therefore cannot create an ungoverned descendant; anything
+beyond the one Job member is refused rather than being allowed an ungoverned
 network tree. Windows brokered egress is limited
 to IPv4 loopback and the exact broker port; all other IPv4/IPv6 paths are
 blocked.

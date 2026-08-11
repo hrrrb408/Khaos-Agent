@@ -25,6 +25,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from urllib.parse import quote, urlsplit, urlunsplit
 
+from khaos.security.authority import AuthorityEnvelope
 from khaos.security.authority_broker import (
     AuthorityBroker,
     AuthorityBrokerError,
@@ -216,7 +217,10 @@ class NetworkBroker:
             raise NetworkBrokerError("network broker requires a non-empty domain allowlist")
         if not allowed_ports or any(type(port) is not int or not 1 <= port <= 65535 for port in allowed_ports):
             raise NetworkBrokerError("network broker port allowlist is invalid")
-        normalized_allowed = frozenset(_normalize_domain(domain) for domain in allowed_domains)
+        normalized_allowed = frozenset(
+            "*" if str(domain).strip() == "*" else _normalize_domain(str(domain))
+            for domain in allowed_domains
+        )
         normalized_blocked = frozenset(_normalize_domain(domain) for domain in blocked_domains)
         self._capability = capability
         self._authority_broker = authority_broker or AuthorityBroker.default()
@@ -381,13 +385,10 @@ class NetworkBroker:
                 "namespace_environment": namespace_environment,
             }
             candidate = NetworkLease(**lease_fields)
-            network_authority = self._capability.authority.derive(
+            lease_capability = self._authority_broker.reissue(
+                self._capability,
                 operation_class="network.connect",
                 resource_digest=candidate.configuration_digest,
-            )
-            lease_capability = self._authority_broker.issue(
-                network_authority,
-                allowed_operation="network.connect",
             )
             lease_fields["capability_digest"] = lease_capability.digest
             self._lease = NetworkLease._from_broker(
@@ -709,6 +710,133 @@ class NetworkBroker:
             logger.info("network broker event: %s", event)
 
 
+class NetworkBrokerFactory:
+    """Create a managed broker and lease for one execution authority.
+
+    The factory is the production bridge between the scheduler's approved
+    network policy and the transport consumed by an execution backend. It
+    starts the broker before the step authority is frozen, so the lease
+    identity is part of the approval-bound permission profile rather than an
+    untracked environment mutation at spawn time.
+    """
+
+    def __init__(
+        self,
+        *,
+        authority_broker: AuthorityBroker | None = None,
+        linux_namespace: bool | None = None,
+        audit: Callable[[dict[str, object]], None] | None = None,
+    ) -> None:
+        self.authority_broker = authority_broker or AuthorityBroker.default()
+        self.linux_namespace = (
+            sys.platform.startswith("linux")
+            if linux_namespace is None
+            else linux_namespace
+        )
+        self.audit = audit
+        self._quarantined: set[NetworkBroker] = set()
+
+    async def start(
+        self,
+        *,
+        principal_id: str,
+        project_id: str,
+        runtime_id: str,
+        task_id: str,
+        workspace_id: str,
+        workspace_generation: int,
+        policy_digest: str,
+        authorization_epoch: int,
+        allowed_domains: frozenset[str] | None,
+        blocked_domains: frozenset[str],
+    ) -> tuple[NetworkBroker, NetworkLease]:
+        """Start one capability-bound broker for an execution step."""
+        if allowed_domains is not None and not allowed_domains:
+            raise NetworkBrokerError(
+                "network policy has an explicit empty allowlist; broker denied"
+            )
+        broker_domains = (
+            frozenset({"*"}) if allowed_domains is None else frozenset(allowed_domains)
+        )
+        policy_resource = hashlib.sha256(
+            repr(
+                (
+                    tuple(sorted(broker_domains)),
+                    tuple(sorted(blocked_domains)),
+                    (80, 443),
+                    ("http", "https"),
+                )
+            ).encode("utf-8")
+        ).hexdigest()
+        authority = AuthorityEnvelope(
+            principal_id=principal_id,
+            project_id=project_id,
+            runtime_id=runtime_id,
+            task_id=task_id,
+            workspace_id=workspace_id,
+            workspace_generation=workspace_generation,
+            policy_digest=policy_digest or "policy:unspecified",
+            operation_class="network.connect",
+            resource_digest=policy_resource,
+            authorization_epoch=authorization_epoch,
+        )
+        capability = self.authority_broker.issue(
+            authority,
+            allowed_operation="network.connect",
+            resource_digest=policy_resource,
+        )
+        broker = NetworkBroker(
+            capability,
+            authority_broker=self.authority_broker,
+            allowed_domains=broker_domains,
+            blocked_domains=frozenset(blocked_domains),
+            audit=self.audit,
+            linux_namespace=self.linux_namespace,
+        )
+        try:
+            lease = await broker.start()
+        except BaseException:
+            # A failed start may retain a namespace or listener transaction;
+            # close is the broker's proof-producing cleanup path.  Retain the
+            # broker when that proof cannot be completed so the runtime can
+            # retry cleanup during its final close instead of losing ownership
+            # at the factory boundary.
+            cleanup = asyncio.create_task(broker.close())
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                try:
+                    await cleanup
+                except BaseException as cleanup_error:
+                    self._quarantined.add(broker)
+                    raise NetworkBrokerError(
+                        "network broker start was cancelled and cleanup is unproven"
+                    ) from cleanup_error
+                raise
+            except BaseException as cleanup_error:
+                self._quarantined.add(broker)
+                raise NetworkBrokerError(
+                    "network broker start failed and cleanup is unproven"
+                ) from cleanup_error
+            raise
+        return broker, lease
+
+    async def close(self) -> None:
+        """Retry cleanup for brokers whose start transaction was unproven."""
+        errors: list[BaseException] = []
+        for broker in tuple(self._quarantined):
+            try:
+                await broker.close()
+            except BaseException as exc:  # noqa: BLE001 - cleanup must survive cancellation
+                errors.append(exc)
+            else:
+                self._quarantined.discard(broker)
+        if errors:
+            raise NetworkBrokerError(
+                "network broker factory cleanup was not proven"
+            ) from errors[0]
+
+
 def _is_loopback(value: str) -> bool:
     try:
         return ipaddress.ip_address(value).is_loopback
@@ -732,7 +860,12 @@ def _normalize_domain(value: str) -> str:
 
 
 def _domain_matches(host: str, rule: str) -> bool:
-    return host == rule or host.endswith(f".{rule}")
+    return rule == "*" or host == rule or host.endswith(f".{rule}")
 
 
-__all__ = ["NetworkBroker", "NetworkBrokerError", "NetworkLease"]
+__all__ = [
+    "NetworkBroker",
+    "NetworkBrokerError",
+    "NetworkBrokerFactory",
+    "NetworkLease",
+]

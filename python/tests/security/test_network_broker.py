@@ -7,7 +7,11 @@ import contextlib
 import pytest
 from khaos.security.authority import AuthorityEnvelope
 from khaos.security.authority_broker import AuthorityBroker
-from khaos.security.network_broker import NetworkBroker, NetworkBrokerError
+from khaos.security.network_broker import (
+    NetworkBroker,
+    NetworkBrokerError,
+    NetworkBrokerFactory,
+)
 
 
 def _authority() -> AuthorityEnvelope:
@@ -170,6 +174,42 @@ async def test_broker_revalidates_lease_after_revocation() -> None:
         with contextlib.suppress(ConnectionResetError):
             await writer.wait_closed()
         assert b"200 OK" not in response
+    finally:
+        if broker is not None:
+            await broker.close()
+        authority_broker.close()
+
+
+@pytest.mark.asyncio
+async def test_factory_binds_policy_to_lease_and_revokes_on_close() -> None:
+    authority_broker = AuthorityBroker()
+    broker: NetworkBroker | None = None
+    try:
+        factory = NetworkBrokerFactory(
+            authority_broker=authority_broker,
+            linux_namespace=False,
+        )
+        broker, lease = await factory.start(
+            principal_id="principal",
+            project_id="project",
+            runtime_id="runtime",
+            task_id="task",
+            workspace_id="workspace",
+            workspace_generation=1,
+            policy_digest="policy",
+            authorization_epoch=7,
+            allowed_domains=frozenset({"allowed.example"}),
+            blocked_domains=frozenset({"blocked.example"}),
+        )
+        assert lease.allowed_domains == frozenset({"allowed.example"})
+        assert lease.blocked_domains == frozenset({"blocked.example"})
+        lease.validate()
+
+        await broker.close()
+        assert broker.terminal_closed
+        with pytest.raises(NetworkBrokerError, match="attestation"):
+            lease.validate()
+        broker = None
     finally:
         if broker is not None:
             await broker.close()

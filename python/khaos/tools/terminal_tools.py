@@ -109,6 +109,7 @@ async def terminal(
     executable_identity: str | None = None,
     spawn_plan=None,
     execution_authority=None,
+    network_lease=None,
 ) -> dict[str, Any]:
     """Compatibility wrapper for explicit shell execution.
 
@@ -128,6 +129,7 @@ async def terminal(
         executable_identity=executable_identity,
         spawn_plan=spawn_plan,
         execution_authority=execution_authority,
+        network_lease=network_lease,
     )
 
 
@@ -150,6 +152,7 @@ async def terminal_argv(
     executable_identity: str | None = None,
     spawn_plan=None,
     execution_authority=None,
+    network_lease=None,
 ) -> dict[str, Any]:
     """Execute an argv vector without shell parsing or expansion."""
     if not argv or not all(isinstance(item, str) and item for item in argv):
@@ -177,7 +180,7 @@ async def terminal_argv(
             "risk_level": "blocked",
         }
     workdir = _workspace_cwd(cwd, workspace_manager, workspace_id, task_id)
-    from khaos.coding.execution import ExecutionRequest, ResourceBudget
+    from khaos.coding.execution import ExecutionRequest, NetworkPolicy, ResourceBudget
     request = ExecutionRequest(
         tuple(argv),
         workdir,
@@ -185,6 +188,10 @@ async def terminal_argv(
         task_id=task_id,
         workspace_id=workspace_id,
         access_mode="read-only" if safety["read_only"] else "workspace-write",
+        network_policy=(
+            NetworkPolicy.BROKERED if network_lease is not None else NetworkPolicy.NONE
+        ),
+        network_broker=network_lease,
         sandbox_decision=sandbox_decision,
         executable_identity=executable_identity or "",
         spawn_plan=spawn_plan,
@@ -224,6 +231,7 @@ async def terminal_shell(
     executable_identity: str | None = None,
     spawn_plan=None,
     execution_authority=None,
+    network_lease=None,
 ) -> dict[str, Any]:
     """Execute a script only through an explicitly selected absolute shell."""
     shell_path = Path(shell)
@@ -249,6 +257,7 @@ async def terminal_shell(
         executable_identity=executable_identity,
         spawn_plan=spawn_plan,
         execution_authority=execution_authority,
+        network_lease=network_lease,
     )
 
 

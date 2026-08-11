@@ -15,9 +15,10 @@
 mod windows_backend {
     use std::env;
     use std::ffi::{c_void, OsStr, OsString};
-    use std::io::Read;
+    use std::io::{ErrorKind, Read};
     use std::iter::once;
     use std::mem::{size_of, zeroed};
+    use std::net::{TcpListener, TcpStream};
     use std::os::windows::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -56,11 +57,13 @@ mod windows_backend {
     };
 
     const FIREWALL_PREFIX: &str = "KhaosWindowsSandbox";
-    // Windows-hosted Python can be a launcher that creates the actual
-    // interpreter as one child process. Keep the process tree deliberately
-    // tiny so the program-scoped WFP rules remain attributable while still
-    // allowing that legitimate launcher boundary.
-    const MAX_ACTIVE_PROCESSES: u32 = 2;
+    // Windows Firewall application rules are image-scoped. A descendant can
+    // otherwise switch to another executable and bypass the parent's rule.
+    // Until a job-wide WFP/AppContainer policy is available, the only
+    // deterministic fail-closed containment is one process per sandbox.
+    // Commands that need to spawn children therefore fail inside the native
+    // boundary instead of silently escaping the network policy.
+    const MAX_ACTIVE_PROCESSES: u32 = 1;
 
     pub enum ExecutionOutcome {
         Completed,
@@ -87,6 +90,10 @@ mod windows_backend {
         let args: Vec<OsString> = env::args_os().skip(1).collect();
         if args.first().is_some_and(|arg| arg == "--probe") {
             probe()?;
+            return Ok(ExecutionOutcome::Completed);
+        }
+        if args.first().is_some_and(|arg| arg == "--probe-child") {
+            probe_child(&args[1..])?;
             return Ok(ExecutionOutcome::Completed);
         }
         let options = Options::parse(&args)?;
@@ -170,29 +177,205 @@ mod windows_backend {
 
     fn probe() -> Result<(), String> {
         let token = restricted_token()?;
-        let job = unsafe { CreateJobObjectW(null(), null()) };
-        if job == null_mut() {
-            return Err(last_error("CreateJobObjectW"));
-        }
-        let job = Handle(job);
-        configure_job(job.0, 128 * 1024 * 1024, 120)?;
-        let firewall = FirewallRule::probe()?;
-        firewall.remove()?;
-        let probe_root = env::temp_dir().join(unique_rule_name("acl-probe"));
-        std::fs::create_dir(&probe_root).map_err(|e| format!("create ACL probe directory: {e}"))?;
-        let acl = WorkspaceAcl::apply(&probe_root)?;
-        acl.restore()?;
-        std::fs::remove_dir(&probe_root).map_err(|e| format!("remove ACL probe directory: {e}"))?;
-        let helper = env::current_exe().map_err(|e| format!("resolve Windows helper: {e}"))?;
-        let runtime_acl = RuntimeAcl::apply(&helper)?;
-        runtime_acl.restore()?;
         if unsafe { IsTokenRestricted(token.0) } == 0 {
             return Err("CreateRestrictedToken did not create a restricted token".to_string());
         }
         drop(token);
+
+        let helper = env::current_exe().map_err(|e| format!("resolve Windows helper: {e}"))?;
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .map_err(|e| format!("create Windows firewall probe listener: {e}"))?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|e| format!("configure Windows firewall probe listener: {e}"))?;
+        let port = listener
+            .local_addr()
+            .map_err(|e| format!("read Windows firewall probe port: {e}"))?
+            .port();
+        let probe_root = env::temp_dir().join(unique_rule_name("sandbox-probe"));
+        let outside = env::temp_dir().join(unique_rule_name("sandbox-outside"));
+        std::fs::create_dir(&probe_root)
+            .map_err(|e| format!("create sandbox probe directory: {e}"))?;
+        let result_path = probe_root.join("probe-result.txt");
+        let command = vec![
+            helper.as_os_str().to_os_string(),
+            OsString::from("--probe-child"),
+            OsString::from("--workspace"),
+            probe_root.as_os_str().to_os_string(),
+            OsString::from("--outside"),
+            outside.as_os_str().to_os_string(),
+            OsString::from("--port"),
+            OsString::from(port.to_string()),
+        ];
+        let options = Options {
+            workspace: probe_root.clone(),
+            cwd: probe_root.clone(),
+            network: "none".to_string(),
+            proxy_port: None,
+            memory_bytes: 128 * 1024 * 1024,
+            cpu_seconds: 120,
+            timeout_seconds: 10,
+            command,
+        };
+        let acl = match WorkspaceAcl::apply(&probe_root) {
+            Ok(acl) => acl,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&probe_root);
+                return Err(error);
+            }
+        };
+        let runtime_acl = match RuntimeAcl::apply(&helper) {
+            Ok(acl) => acl,
+            Err(error) => {
+                let _ = acl.restore();
+                let _ = std::fs::remove_dir_all(&probe_root);
+                return Err(error);
+            }
+        };
+        let rule = match FirewallRule::install(&options, &helper) {
+            Ok(rule) => rule,
+            Err(error) => {
+                let _ = runtime_acl.restore();
+                let _ = acl.restore();
+                let _ = std::fs::remove_dir_all(&probe_root);
+                return Err(error);
+            }
+        };
+        let result = spawn_restricted(&options, &helper);
+        let network_connected = listener_observed_connection(&listener);
+        let remove_result = rule.remove();
+        let runtime_acl_result = runtime_acl.restore();
+        let acl_result = acl.restore();
+        let child_report = match result {
+            Ok(ExecutionOutcome::Completed) => std::fs::read_to_string(&result_path)
+                .map_err(|e| format!("read Windows sandbox capability probe: {e}")),
+            Ok(_) => Err("Windows sandbox capability probe child did not complete".to_string()),
+            Err(error) => Err(error),
+        };
+        let mut errors = Vec::new();
+        if network_connected {
+            errors.push("Windows firewall probe observed a direct network path".to_string());
+        }
+        match child_report {
+            Ok(report) => {
+                if !report.contains("network_blocked=true") {
+                    errors.push(
+                        "Windows firewall probe did not block the child network path".to_string(),
+                    );
+                }
+                if !report.contains("descendant_blocked=true") {
+                    errors.push("Windows Job Object allowed an untracked descendant".to_string());
+                }
+                if !report.contains("outside_denied=true")
+                    || !report.contains("inside_written=true")
+                {
+                    errors.push(
+                        "Windows restricted-token ACL probe did not enforce workspace scope"
+                            .to_string(),
+                    );
+                }
+            }
+            Err(error) => errors.push(error),
+        }
+        if let Err(error) = remove_result {
+            errors.push(error);
+        }
+        if let Err(error) = runtime_acl_result {
+            errors.push(error);
+        }
+        if let Err(error) = acl_result {
+            errors.push(error);
+        }
+        if let Err(error) = remove_probe_path(&outside) {
+            errors.push(error);
+        }
+        if let Err(error) = std::fs::remove_dir_all(&probe_root) {
+            errors.push(format!("remove Windows sandbox capability probe: {error}"));
+        }
+        if !errors.is_empty() {
+            return Err(errors.join("; "));
+        }
         println!(
             "{{\"restricted_token\":true,\"job_object\":true,\"process_tree\":true,\"acl\":true,\"wfp\":true}}"
         );
+        Ok(())
+    }
+
+    fn listener_observed_connection(listener: &TcpListener) -> bool {
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            match listener.accept() {
+                Ok((_stream, _address)) => return true,
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return false;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => return false,
+            }
+        }
+    }
+
+    fn remove_probe_path(path: &Path) -> Result<(), String> {
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!("remove Windows sandbox probe path: {error}")),
+        }
+    }
+
+    fn probe_child(args: &[OsString]) -> Result<(), String> {
+        let mut workspace = None;
+        let mut outside = None;
+        let mut port = None;
+        let mut index = 0;
+        while index < args.len() {
+            let value = args[index].to_string_lossy();
+            let next = |index: &mut usize| -> Result<OsString, String> {
+                *index += 1;
+                args.get(*index)
+                    .cloned()
+                    .ok_or_else(|| "Windows probe child option is missing a value".to_string())
+            };
+            match value.as_ref() {
+                "--workspace" => workspace = Some(PathBuf::from(next(&mut index)?)),
+                "--outside" => outside = Some(PathBuf::from(next(&mut index)?)),
+                "--port" => {
+                    port = Some(
+                        next(&mut index)?
+                            .to_string_lossy()
+                            .parse::<u16>()
+                            .map_err(|_| "invalid Windows probe port".to_string())?,
+                    )
+                }
+                _ => return Err(format!("unknown Windows probe child option: {value}")),
+            }
+            index += 1;
+        }
+        let workspace =
+            workspace.ok_or_else(|| "Windows probe workspace is missing".to_string())?;
+        let outside = outside.ok_or_else(|| "Windows probe outside path is missing".to_string())?;
+        let port = port.ok_or_else(|| "Windows probe port is missing".to_string())?;
+        let address: std::net::SocketAddr = format!("127.0.0.1:{port}")
+            .parse()
+            .map_err(|e| format!("invalid probe address: {e}"))?;
+        let network_blocked =
+            TcpStream::connect_timeout(&address, Duration::from_millis(250)).is_err();
+        let cmd = env::var_os("SystemRoot")
+            .map(|root| PathBuf::from(root).join("System32").join("cmd.exe"))
+            .ok_or_else(|| "SystemRoot is missing for Windows process probe".to_string())?;
+        let descendant_blocked = Command::new(cmd)
+            .args(["/c", "exit", "0"])
+            .status()
+            .is_err();
+        let inside_written = std::fs::write(workspace.join("inside-probe.txt"), b"ok").is_ok();
+        let outside_denied = std::fs::write(outside, b"must-not-write").is_err();
+        let report = format!(
+            "network_blocked={network_blocked}\ndescendant_blocked={descendant_blocked}\ninside_written={inside_written}\noutside_denied={outside_denied}\n"
+        );
+        std::fs::write(workspace.join("probe-result.txt"), report)
+            .map_err(|e| format!("write Windows sandbox capability probe: {e}"))?;
         Ok(())
     }
 
@@ -580,11 +763,12 @@ mod windows_backend {
             | JOB_OBJECT_LIMIT_PROCESS_MEMORY
             | JOB_OBJECT_LIMIT_JOB_TIME
             | JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
-        // A coding execution is intentionally limited to a launcher and one
-        // native runtime process on Windows. Job Objects do not provide an
-        // egress policy for unknown descendants; keeping this bound at two is
-        // the deterministic containment primitive that closes that WFP
-        // discovery race while allowing Python's launcher boundary.
+        // A coding execution is intentionally limited to one native process
+        // on Windows. Job Objects do not provide an egress policy for unknown
+        // descendants; keeping this bound at one is the deterministic
+        // containment primitive that closes that WFP discovery race. Commands
+        // that need a launcher/child must use a future job-wide network
+        // authority instead of silently bypassing the current policy.
         limits.BasicLimitInformation.ActiveProcessLimit = MAX_ACTIVE_PROCESSES;
         limits.ProcessMemoryLimit = memory_bytes as usize;
         limits.BasicLimitInformation.PerJobUserTimeLimit = (cpu_seconds as i64) * 10_000_000;
@@ -940,21 +1124,6 @@ mod windows_backend {
     }
 
     impl FirewallRule {
-        fn probe() -> Result<Self, String> {
-            let name = unique_rule_name("probe");
-            run_netsh(&[
-                "advfirewall",
-                "firewall",
-                "add",
-                "rule",
-                &format!("name={name}"),
-                "dir=out",
-                "action=block",
-                "remoteip=203.0.113.1",
-            ])?;
-            Ok(Self { names: vec![name] })
-        }
-
         fn install(options: &Options, executable: &Path) -> Result<Self, String> {
             let program = executable.to_string_lossy().to_string();
             let mut names = Vec::new();

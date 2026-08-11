@@ -403,6 +403,42 @@ class AuthorityBroker:
         except (KeyError, TypeError, ValueError) as exc:
             raise AuthorityBrokerError("authority broker returned malformed capability") from exc
 
+    def reissue(
+        self,
+        capability: EffectCapability,
+        *,
+        operation_class: str,
+        resource_digest: str,
+        ttl_seconds: float = _DEFAULT_TTL_SECONDS,
+    ) -> EffectCapability:
+        """Mint a narrower capability from an already-live capability.
+
+        A resource transition is a new authorization decision.  It must not
+        be implemented by copying the original token into a derived
+        ``EffectCapability``: the broker registry would still attest the old
+        resource.  Requiring a live source capability keeps the transition
+        inside the capability chain and prevents a caller that only has a
+        constructible ``AuthorityEnvelope`` from manufacturing a lease for a
+        different resource.
+        """
+        if not isinstance(capability, EffectCapability):
+            raise AuthorityBrokerError("capability reissue requires a broker capability")
+        if not _valid_operation(operation_class):
+            raise AuthorityBrokerError("invalid capability operation authority")
+        if not isinstance(resource_digest, str) or not resource_digest:
+            raise AuthorityBrokerError("capability reissue resource is invalid")
+        self.validate(capability, expected_operation=operation_class)
+        authority = capability.authority.derive(
+            operation_class=operation_class,
+            resource_digest=resource_digest,
+        )
+        return self.issue(
+            authority,
+            allowed_operation=operation_class,
+            resource_digest=resource_digest,
+            ttl_seconds=ttl_seconds,
+        )
+
     def validate(
         self,
         capability: EffectCapability,

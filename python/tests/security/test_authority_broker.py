@@ -83,3 +83,38 @@ def test_capability_expiry_is_enforced_by_broker() -> None:
             broker.validate(capability)
     finally:
         broker.close()
+
+
+def test_reissue_mints_a_new_live_resource_capability() -> None:
+    broker = AuthorityBroker()
+    try:
+        source_authority = replace(
+            _authority(),
+            operation_class="network.connect",
+            resource_digest="initial-network-resource",
+        )
+        source = broker.issue(source_authority, allowed_operation="network.*")
+        network = broker.reissue(
+            source,
+            operation_class="network.connect",
+            resource_digest="network-policy-resource",
+        )
+
+        broker.validate(
+            network,
+            expected_operation="network.connect",
+            expected_resource_digest="network-policy-resource",
+        )
+        with pytest.raises(AuthorityBrokerError, match="resource"):
+            broker.validate(
+                network,
+                expected_operation="network.connect",
+                expected_resource_digest="different-resource",
+            )
+        with pytest.raises(ValueError, match="reissue"):
+            source.derive(
+                operation_class="network.connect",
+                resource_digest="another-resource",
+            )
+    finally:
+        broker.close()
