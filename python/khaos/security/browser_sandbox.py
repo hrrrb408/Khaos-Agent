@@ -725,6 +725,40 @@ class BrowserNetworkSandbox:
         """The proxy host as seen from inside the browser netns."""
         return self._host_ip if self._active else "127.0.0.1"
 
+    @property
+    def sandbox_token(self) -> str:
+        """Return the opaque token used by the authenticated kernel helper."""
+        return self._token
+
+    @property
+    def network_namespace_active(self) -> bool:
+        """Return whether this owner currently holds a real network namespace."""
+        return self._active and self._enforcement.network_namespace
+
+    def authority_environment(self, *, prefix: str = "KHAOS_NETWORK") -> dict[str, str]:
+        """Return only the outer-launcher namespace join contract.
+
+        The values are consumed by the trusted Rust launcher and must never
+        be included in the final model-controlled child environment.
+        """
+        if not self.network_namespace_active:
+            raise BrowserSandboxError("network namespace is not active")
+        if self._production_authority:
+            values = {
+                f"{prefix}_PRINCIPAL": self._principal_id,
+                f"{prefix}_PROJECT": self._project_id,
+                f"{prefix}_RUNTIME": self._runtime_id,
+                f"{prefix}_TASK": self._task_id,
+                f"{prefix}_SANDBOX": self._token,
+            }
+            helper_socket = os.environ.get("KHAOS_BROWSER_KERNEL_HELPER_SOCKET")
+            if helper_socket:
+                values[f"{prefix}_HELPER_SOCKET"] = helper_socket
+            return values
+        if not self._netns_name:
+            raise BrowserSandboxError("development network namespace identity missing")
+        return {f"{prefix}_NETNS": self._netns_name}
+
     def setup(self) -> None:
         """Create the netns, veth pair, and cgroup.
 

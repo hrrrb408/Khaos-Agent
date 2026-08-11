@@ -517,11 +517,20 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install test dependencies
+        shell: pwsh
         run: |
           python -m pip install --require-hashes -r python/bootstrap-requirements.txt
           uv sync --frozen --extra test
-          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
-      - name: Prove Windows has no Host fallback
+      - name: Build native Windows sandbox helper
+        shell: pwsh
+        run: cargo build --locked --release --no-default-features --bin khaos-windows-sandbox --manifest-path rust/khaos-core/Cargo.toml
+      - name: Require native Windows sandbox evidence
+        shell: pwsh
+        run: |
+          "KHAOS_WINDOWS_SANDBOX_HELPER=$env:GITHUB_WORKSPACE\rust\khaos-core\target\release\khaos-windows-sandbox.exe" >> $env:GITHUB_ENV
+          "KHAOS_REQUIRE_WINDOWS_NATIVE=1" >> $env:GITHUB_ENV
+      - name: Prove Windows native sandbox has no Host fallback
+        shell: pwsh
         run: uv run python -m pytest python/tests/coding/test_windows_fail_closed.py python/tests/coding/test_backend_selector.py -q -m windows_fail_closed -v
       - name: Capture Windows diagnostics
         if: always()

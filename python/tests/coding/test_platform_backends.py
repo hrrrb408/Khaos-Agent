@@ -22,7 +22,9 @@ from khaos.coding.execution.platform import (
     UnsupportedBackend,
     _create_linux_cgroup,
     _runtime_read_roots,
+    _validated_profile,
 )
+from khaos.security.network_broker import NetworkLease
 
 
 @pytest.mark.asyncio
@@ -34,6 +36,49 @@ async def test_unsupported_backend_refuses_writable_execution():
 def test_platform_profiles_are_network_denying(tmp_path: Path):
     assert "deny network" in MacOSSandboxBackend().profile(tmp_path)
     assert "--unshare-net" in LinuxBubblewrapBackend().argv_prefix(tmp_path)
+
+
+def test_linux_brokered_profile_requires_a_real_namespace_lease(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setattr("khaos.coding.execution.platform.sys.platform", "linux")
+    namespace_lease = NetworkLease(
+        endpoint="http://10.88.0.1:49152",
+        username="khaos",
+        password="secret",
+        capability_digest="broker-capability",
+        allowed_domains=frozenset({"example.com"}),
+        blocked_domains=frozenset(),
+        allowed_ports=frozenset({443}),
+        protocols=frozenset({"https"}),
+        namespace_environment=(("KHAOS_NETWORK_NETNS", "khaos-net-1234abcd"),),
+    )
+    argv = LinuxBubblewrapBackend().argv_prefix(
+        tmp_path,
+        network_broker=namespace_lease,
+        include_network_authority=False,
+    )
+    assert "--share-net" in argv
+    assert "--unshare-net" not in argv
+    assert not any(value.startswith("KHAOS_NETWORK_") for value in argv)
+
+    loopback_lease = NetworkLease(
+        endpoint="http://127.0.0.1:49152",
+        username="khaos",
+        password="secret",
+        capability_digest="broker-capability",
+        allowed_domains=frozenset({"example.com"}),
+        blocked_domains=frozenset(),
+        allowed_ports=frozenset({443}),
+        protocols=frozenset({"https"}),
+    )
+    profile = PermissionProfile(
+        network="brokered",
+        network_broker=loopback_lease,
+    ).bind_workspace(tmp_path)
+    request = ExecutionRequest(("true",), tmp_path, permission_profile=profile)
+    with pytest.raises(PermissionError, match="broker-issued"):
+        _validated_profile(request)
 
 
 def test_writable_platform_profiles_protect_git_pointer(tmp_path: Path):

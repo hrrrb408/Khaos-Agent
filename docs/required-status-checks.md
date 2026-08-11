@@ -60,7 +60,7 @@ PR checks UI), grouped by workflow.
 | `browser-kernel-isolation` | **real** nft parser + netns/veth/cgroup creation + egress isolation + teardown (Batch 6.6) |
 | `fullstack-browser-kernel` | **real** Chromium + BrowserManager + production sandbox + nft + proxy + cgroup PID, full-stack E2E (Batch 7.5) |
 | `macos-sandbox-security` | real `sandbox-exec` on macOS |
-| `windows-fail-closed-security` | Windows refuses execution (no backend) |
+| `windows-fail-closed-security` | Windows native helper probe and execution pass; missing evidence still fails closed |
 
 ### `Browser Security E2E` (`.github/workflows/browser-e2e.yml`)
 

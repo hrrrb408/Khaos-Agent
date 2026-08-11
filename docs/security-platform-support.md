@@ -1,14 +1,14 @@
 # Security Platform Support Boundary
 
-Khaos currently claims sandboxed Coding execution only on Linux and macOS,
-subject to the platform-specific capability probes and the corresponding
-real-kernel CI gates.
+Khaos claims sandboxed Coding execution on Linux, macOS, and Windows only after
+the platform-specific capability probe and corresponding real-platform CI gate
+pass for the current commit.
 
 | Platform | Coding execution | Product boundary |
 | --- | --- | --- |
 | Linux | Supported when the launcher, bubblewrap, Landlock, cgroup and browser helper checks pass | Python runs non-root; missing isolation fails closed |
 | macOS | Supported through the Seatbelt backend when its probe passes | No Linux namespace/browser-kernel claim |
-| Windows | Not supported | `UnsupportedBackend` rejects execution; there is no Host fallback or false `isolated` result |
+| Windows | Supported when the native helper probe passes | restricted token + Job Object single-process tree + transactional workspace ACL + WFP-backed Firewall; missing evidence fails closed |
 
 Host execution on supported POSIX systems requires a trusted
 `khaos-exec-launcher`. The loader accepts a root-owned or current-EUID-owned
@@ -20,10 +20,13 @@ interpreter, then replaces itself with the requested command. A missing or
 untrusted launcher fails closed; the standalone Python boundary is available
 only with the explicit `KHAOS_DEV_MODE=1` development switch.
 
-The Windows contract is intentionally explicit: Windows can run non-execution
-parts of the application, but it must not be presented as Codex-equivalent
-Coding support until an AppContainer/Job Object backend and its hosted security
-tests exist.
+The Windows backend is intentionally narrow: it runs native executables under a
+restricted primary token, a kill-on-close Job Object with an active-process
+limit of one, a transactional ACL grant for the workspace, and a WFP-backed
+Firewall transaction. Brokered network access is limited to the exact IPv4
+loopback proxy endpoint. The helper probe and the hosted Windows security job
+are mandatory; a missing helper, failed probe, non-native command, or cleanup
+failure is an infrastructure refusal rather than a Host fallback.
 
 The current Gateway API key is a single-instance authentication boundary. It
 does not provide multi-tenant identity, per-user credentials, or tenant

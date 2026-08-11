@@ -42,6 +42,10 @@ from khaos.coding.workspace.trusted_git import (
     _parse_index_listing,
 )
 from khaos.security.authority import AuthorityEnvelope
+from khaos.security.authority_broker import (
+    AuthorityBroker,
+    EffectCapability,
+)
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -298,9 +302,12 @@ class WorkspaceManager:
         self.root, self._root_identity = _open_private_authority_root(
             configured_root
         )
+        self._authority_broker = AuthorityBroker.default()
         try:
             self._git_runner = TrustedGitRunner.for_authority_root(
-                self.root, self._root_identity
+                self.root,
+                self._root_identity,
+                authority_broker=self._authority_broker,
             )
         except TrustedGitError as exc:
             raise WorkspaceError(str(exc)) from exc
@@ -349,25 +356,43 @@ class WorkspaceManager:
             ).hexdigest(),
         )
 
+    def _git_capability(
+        self,
+        authority: AuthorityEnvelope | EffectCapability,
+    ) -> EffectCapability:
+        if isinstance(authority, EffectCapability):
+            return authority
+        return self._authority_broker.issue(
+            authority,
+            allowed_operation="git.*",
+        )
+
     async def _git(
         self,
         repository: Path,
         *args: str,
-        authority: AuthorityEnvelope | None = None,
+        authority: AuthorityEnvelope | EffectCapability | None = None,
         preserve_output: bool = False,
     ) -> str:
         try:
+            # Reconstruct from the manager-owned identity on every call.  The
+            # explicit fields are intentionally mutable only through the
+            # manager's startup/revalidation contract; this preserves the
+            # digest-drift test and prevents a stale cached runner from
+            # becoming an authority bypass.
             runner = TrustedGitRunner(
                 self._git_executable,
                 self._git_identity,
                 self._git_digest,
                 self.root,
                 self._root_identity,
+                self._authority_broker,
             )
+            context = authority or self._default_git_authority(repository)
             return await runner.run(
                 repository,
                 *args,
-                authority=authority or self._default_git_authority(repository),
+                authority=self._git_capability(context),
                 preserve_output=preserve_output,
             )
         except TrustedGitError as exc:
@@ -379,7 +404,7 @@ class WorkspaceManager:
         base_sha: str,
         worktree: Path,
         *,
-        authority: AuthorityEnvelope,
+        authority: AuthorityEnvelope | EffectCapability,
     ) -> None:
         try:
             runner = TrustedGitRunner(
@@ -388,12 +413,14 @@ class WorkspaceManager:
                 self._git_digest,
                 self.root,
                 self._root_identity,
+                self._authority_broker,
             )
+            capability = self._git_capability(authority)
             await runner.materialize_tree(
                 repository,
                 base_sha,
                 worktree,
-                authority=authority.derive(operation_class="git.materialize"),
+                authority=capability.derive(operation_class="git.materialize"),
                 limits=self.bootstrap_limits,
             )
         except TrustedGitError as exc:
@@ -414,9 +441,9 @@ class WorkspaceManager:
             await asyncio.to_thread(verify_git_worktree_identity, identity)
         except GitIdentityError as exc:
             raise WorkspaceError(str(exc)) from exc
-        authority = workspace.authority_envelope
+        authority = workspace.authority_capability
         if authority is None:
-            raise WorkspaceError("TaskWorkspace authority envelope is missing")
+            raise WorkspaceError("TaskWorkspace authority capability is missing")
         try:
             return await self._git_runner.run(
                 workspace.worktree_path,
@@ -440,9 +467,9 @@ class WorkspaceManager:
     ) -> str:
         """Run one audited Git plumbing operation with bounded stdin."""
         identity = workspace.git_identity
-        authority = workspace.authority_envelope
+        authority = workspace.authority_capability
         if identity is None or authority is None:
-            raise WorkspaceError("TaskWorkspace Git authority is missing")
+            raise WorkspaceError("TaskWorkspace Git capability is missing")
         try:
             await asyncio.to_thread(verify_git_worktree_identity, identity)
             return await self._git_runner.run_with_input(
@@ -467,9 +494,9 @@ class WorkspaceManager:
     ) -> bytes:
         """Run one workspace Git read with an explicit output cap."""
         identity = workspace.git_identity
-        authority = workspace.authority_envelope
+        authority = workspace.authority_capability
         if identity is None or authority is None:
-            raise WorkspaceError("TaskWorkspace Git authority is missing")
+            raise WorkspaceError("TaskWorkspace Git capability is missing")
         try:
             await asyncio.to_thread(verify_git_worktree_identity, identity)
             return await self._git_runner.run_bytes_limited(
@@ -494,9 +521,9 @@ class WorkspaceManager:
     ):
         """Stream workspace Git output into a private artifact."""
         identity = workspace.git_identity
-        authority = workspace.authority_envelope
+        authority = workspace.authority_capability
         if identity is None or authority is None:
-            raise WorkspaceError("TaskWorkspace Git authority is missing")
+            raise WorkspaceError("TaskWorkspace Git capability is missing")
         try:
             await asyncio.to_thread(verify_git_worktree_identity, identity)
             return await self._git_runner.stream_to_file(
@@ -657,11 +684,15 @@ class WorkspaceManager:
                     str(repository).encode("utf-8")
                 ).hexdigest(),
             )
+            authority_capability = self._authority_broker.issue(
+                authority_context,
+                allowed_operation="git.*",
+            )
             dirty = await self._git(
                 repository,
                 "status",
                 "--porcelain",
-                authority=authority_context,
+                authority=authority_capability,
             )
             if dirty:
                 raise WorkspaceError("主工作树存在未提交修改，拒绝创建可写 Worktree")
@@ -669,7 +700,7 @@ class WorkspaceManager:
                 repository,
                 "rev-parse",
                 base_ref,
-                authority=authority_context,
+                authority=authority_capability,
             )
             branch = f"khaos/task/{task_id}"
             path = (self.root / workspace_id).resolve()
@@ -688,7 +719,7 @@ class WorkspaceManager:
                     branch,
                     str(pending_path),
                     base_sha,
-                    authority=authority_context,
+                    authority=authority_capability,
                 )
                 git_identity = await asyncio.to_thread(
                     capture_git_worktree_identity, repository, pending_path
@@ -703,13 +734,13 @@ class WorkspaceManager:
                     f"--work-tree={pending_path}",
                     "read-tree",
                     base_sha,
-                    authority=authority_context.derive(operation_class="git.index"),
+                    authority=authority_capability.derive(operation_class="git.index"),
                 )
                 await self._materialize_git_tree(
                     repository,
                     base_sha,
                     pending_path,
-                    authority=authority_context,
+                    authority=authority_capability,
                 )
                 recovery_root = (self.root.parent / ".khaos-recovery").resolve()
                 await asyncio.to_thread(
@@ -726,7 +757,7 @@ class WorkspaceManager:
                     "move",
                     str(pending_path),
                     str(path),
-                    authority=authority_context,
+                    authority=authority_capability,
                 )
                 active_path = path
                 git_identity = await asyncio.to_thread(
@@ -753,6 +784,7 @@ class WorkspaceManager:
                     root_device=int(root_stat.st_dev),
                     root_inode=int(root_stat.st_ino),
                     authority_envelope=authority_context,
+                    authority_capability=authority_capability,
                 )
                 workspace.storage_baseline = baseline
                 self._workspaces[workspace_id] = workspace

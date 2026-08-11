@@ -59,11 +59,32 @@ local browser UI. It is **not** multi-tenant, does not provide per-user
 independent authorization, per-device revocation, or per-client least
 privilege.
 
+## Effect capabilities and managed egress
+
+`AuthorityEnvelope` is an immutable context record, not an effect grant. Git
+and network effect boundaries require a broker-issued `EffectCapability`. The
+`AuthorityBroker` keeps the signing secret and live revocation registry in a
+separate spawned process; the capability handle is opaque to its public
+constructor, and every boundary validates operation, resource, generation,
+expiry and revocation against that broker. This is a same-user control-plane
+boundary, not a claim that Python can defeat a hostile process with the same
+OS identity.
+
+`NetworkBroker` is the generic terminal/tool egress authority. It accepts only
+brokered capabilities, authenticates each proxy connection, resolves DNS
+itself, pins the selected address, enforces domain/port/protocol allowlists,
+rejects unsafe address classes, bounds concurrency/bytes/idle time, and emits
+allow/deny audit events. A `NetworkLease` is itself attested to the exact
+endpoint and policy digest and is revalidated at every connection. Linux
+execution requires the lease's real kernel-network-namespace join contract;
+the tempting loopback lease plus `--unshare-net` combination is rejected
+because it would not actually reach the broker.
+
 | Platform | Production guarantee | Unsupported behavior |
 |---|---|---|
 | Linux | non-root, zero-capability Python; bwrap filesystem isolation; cgroup v2 budgets; root Rust helper as the sole netns/veth/nft/cgroup authority; default-deny browser egress | missing launcher/helper/cgroup delegation rejects execution; no Host, `ip`, `nft`, or proxy-only fallback |
 | macOS | `sandbox-exec` Seatbelt profile restricts content, metadata, directory listing, credential roots, Mach services, network and writable workspace boundaries | no browser kernel namespace claim; a failed probe or invalid launcher rejects execution |
-| Windows | explicit fail-closed `UnsupportedBackend` | no AppContainer/Job Object sandbox is claimed; unsupported never falls back to Host and never reports isolated |
+| Windows | native helper after a passing probe: restricted primary token, Job Object with kill-on-close/resource limits and a single-process tree, transactional workspace ACL, and WFP-backed Windows Firewall policy | missing helper/probe evidence, non-native command, ACL/firewall failure, or unsupported network endpoint rejects execution; never falls back to Host |
 
 `KHAOS_DEV_MODE=1` is an explicit development-only mode. It is not a weaker
 production profile and must never generate production security evidence.

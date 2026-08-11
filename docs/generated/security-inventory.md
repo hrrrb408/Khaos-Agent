@@ -42,7 +42,7 @@
 | --- | --- | --- |
 | Linux namespace/cgroup/nftables and Compose isolation | Uses a helper-only netns root, but must pass real Linux CI with kernel capabilities | CI-only |
 | macOS Seatbelt | Fail-closed/native contract tests and hosted macOS security job | Local/CI |
-| Windows | Unsupported for execution; refuses Host fallback and emits fail-closed result | CI fail-closed |
+| Windows | Native restricted-token/Job/ACL/WFP helper; missing probe evidence refuses Host fallback | Windows native CI gate |
 | Remote audit/WORM and independent human review | Not implemented by this repository | Unknown/external gate |
 
 ## Source fingerprints

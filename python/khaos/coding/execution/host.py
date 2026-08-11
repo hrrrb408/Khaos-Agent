@@ -54,7 +54,10 @@ class HostExecutionBackend:
         if roots and not _under(cwd, roots):
             raise ExecutionDenied("cwd is outside permission profile workspace roots")
         if profile.network is not NetworkPolicy.NONE:
-            raise ExecutionDenied("host backend only permits network_policy=none")
+            raise ExecutionDenied(
+                "host backend only permits network policy none; it cannot prove "
+                "network isolation; use an OS sandbox"
+            )
         env = {
             key: value
             for key, value in os.environ.items()

@@ -10,6 +10,7 @@ from pathlib import Path
 
 from khaos.coding.workspace.trusted_git import TrustedGitError, TrustedGitRunner
 from khaos.security.authority import AuthorityEnvelope
+from khaos.security.authority_broker import AuthorityBroker
 
 
 @dataclass(frozen=True)
@@ -52,6 +53,7 @@ def discover_orphans(root: Path) -> tuple[OrphanWorkspace, ...]:
                     )
                 )
         return tuple(found)
+    broker = AuthorityBroker.default()
     for path in root.iterdir():
         if not path.is_dir() or path.is_symlink():
             continue
@@ -61,8 +63,14 @@ def discover_orphans(root: Path) -> tuple[OrphanWorkspace, ...]:
             task_id=path.name,
             workspace_id=path.name,
         )
+        capability = broker.issue(authority, allowed_operation="git.*")
         try:
-            status = runner.run_sync(path, "status", "--porcelain", authority=authority)
+            status = runner.run_sync(
+                path,
+                "status",
+                "--porcelain",
+                authority=capability,
+            )
         except TrustedGitError as exc:
             found.append(
                 OrphanWorkspace(path, True, f"trusted Git status unavailable: {exc}")

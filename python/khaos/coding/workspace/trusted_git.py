@@ -19,7 +19,11 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from khaos.coding.execution.environment import scrub_spawn_environment
-from khaos.security.authority import AuthorityEnvelope
+from khaos.security.authority_broker import (
+    AuthorityBroker,
+    AuthorityBrokerError,
+    EffectCapability,
+)
 
 FileIdentity = tuple[int, int, int, int]
 _PROTECTED_GIT_NAME = ".git"
@@ -176,18 +180,32 @@ def _verify_identity(
 
 @dataclass(frozen=True)
 class TrustedGitRunner:
-    """Run a bounded set of Git operations under one authority envelope."""
+    """Run bounded Git operations under a broker-issued capability."""
 
     executable: Path
     git_identity: FileIdentity
     git_digest: str
     authority_root: Path
     authority_root_identity: FileIdentity
+    authority_broker: AuthorityBroker | None = None
 
     @classmethod
-    def for_authority_root(cls, root: Path, root_identity: FileIdentity) -> TrustedGitRunner:
+    def for_authority_root(
+        cls,
+        root: Path,
+        root_identity: FileIdentity,
+        *,
+        authority_broker: AuthorityBroker | None = None,
+    ) -> TrustedGitRunner:
         executable, identity, digest = resolve_trusted_git()
-        return cls(executable, identity, digest, root, root_identity)
+        return cls(
+            executable,
+            identity,
+            digest,
+            root,
+            root_identity,
+            authority_broker or AuthorityBroker.default(),
+        )
 
     def _verify(self) -> None:
         _verify_identity(
@@ -312,19 +330,33 @@ class TrustedGitRunner:
         )
         return ("--no-optional-locks", *safe_config, *self._validate_args(args))
 
-    @staticmethod
-    def _authority_or_fail(authority: AuthorityEnvelope | None) -> AuthorityEnvelope:
-        if not isinstance(authority, AuthorityEnvelope):
-            raise TrustedGitError("TrustedGitRunner requires an immutable authority envelope")
-        if not authority.operation_class.startswith("git."):
+    def _authority_or_fail(
+        self, authority: EffectCapability | None
+    ) -> EffectCapability:
+        if not isinstance(authority, EffectCapability):
+            raise TrustedGitError(
+                "TrustedGitRunner requires a broker-issued effect capability"
+            )
+        if not authority.authority.operation_class.startswith("git."):
             raise TrustedGitError("Git operation authority class is invalid")
+        broker = self.authority_broker
+        if broker is None:
+            raise TrustedGitError("TrustedGitRunner has no authority broker")
+        try:
+            broker.validate(
+                authority,
+                expected_operation=authority.authority.operation_class,
+                expected_resource_digest=authority.resource_digest,
+            )
+        except AuthorityBrokerError as exc:
+            raise TrustedGitError(f"Git effect capability rejected: {exc}") from exc
         return authority
 
     async def run(
         self,
         repository: Path,
         *args: str,
-        authority: AuthorityEnvelope,
+        authority: EffectCapability,
         preserve_output: bool = False,
         index_file: Path | None = None,
     ) -> str:
@@ -356,7 +388,7 @@ class TrustedGitRunner:
         self,
         repository: Path,
         *args: str,
-        authority: AuthorityEnvelope,
+        authority: EffectCapability,
         index_file: Path | None = None,
     ) -> bytes:
         """Run one binary-producing Git command with the same authority gate."""
@@ -384,7 +416,7 @@ class TrustedGitRunner:
         repository: Path,
         *args: str,
         input_bytes: bytes,
-        authority: AuthorityEnvelope,
+        authority: EffectCapability,
         max_input_bytes: int = 64 * 1024,
         max_output_bytes: int = 64 * 1024,
         index_file: Path | None = None,
@@ -419,7 +451,7 @@ class TrustedGitRunner:
         repository: Path,
         *args: str,
         destination: Path,
-        authority: AuthorityEnvelope,
+        authority: EffectCapability,
         max_bytes: int,
         preview_bytes: int = 64 * 1024,
         index_file: Path | None = None,
@@ -511,7 +543,7 @@ class TrustedGitRunner:
         self,
         repository: Path,
         *args: str,
-        authority: AuthorityEnvelope,
+        authority: EffectCapability,
         max_bytes: int,
         index_file: Path | None = None,
     ) -> bytes:
@@ -575,7 +607,7 @@ class TrustedGitRunner:
         treeish: str,
         worktree: Path,
         *,
-        authority: AuthorityEnvelope,
+        authority: EffectCapability,
         limits: WorkspaceBootstrapLimits | None = None,
     ) -> None:
         """Materialize a commit's blobs without checkout filters or archives.
@@ -623,7 +655,7 @@ class TrustedGitRunner:
         entries: list[tuple[str, str, str]],
         worktree: Path,
         *,
-        authority: AuthorityEnvelope,
+        authority: EffectCapability,
         limits: WorkspaceBootstrapLimits,
         object_id_length: int,
     ) -> None:
@@ -750,7 +782,7 @@ class TrustedGitRunner:
                 await process.wait()
 
     async def _object_id_length(
-        self, repository: Path, *, authority: AuthorityEnvelope
+        self, repository: Path, *, authority: EffectCapability
     ) -> int:
         object_format = await self.run(
             repository,
@@ -764,7 +796,7 @@ class TrustedGitRunner:
         self,
         repository: Path,
         *,
-        authority: AuthorityEnvelope,
+        authority: EffectCapability,
     ) -> bool:
         """Detect changes without invoking status/filter extensions."""
         object_id_length = await self._object_id_length(repository, authority=authority)
@@ -802,7 +834,7 @@ class TrustedGitRunner:
         self,
         repository: Path,
         *args: str,
-        authority: AuthorityEnvelope,
+        authority: EffectCapability,
     ) -> str:
         """Synchronous variant used only by startup/recovery discovery."""
         if args and args[0] == "status":
@@ -831,7 +863,7 @@ class TrustedGitRunner:
         self,
         repository: Path,
         *,
-        authority: AuthorityEnvelope,
+        authority: EffectCapability,
     ) -> bool:
         """Synchronous filter-free dirty-state check for recovery."""
         object_id_length = self._object_id_length_sync(repository, authority=authority)
@@ -866,7 +898,7 @@ class TrustedGitRunner:
         return not _working_tree_matches_index(listing, repository, object_id_length)
 
     def _object_id_length_sync(
-        self, repository: Path, *, authority: AuthorityEnvelope
+        self, repository: Path, *, authority: EffectCapability
     ) -> int:
         object_format = self.run_sync(
             repository,
@@ -880,7 +912,7 @@ class TrustedGitRunner:
         self,
         repository: Path,
         *args: str,
-        authority: AuthorityEnvelope,
+        authority: EffectCapability,
     ) -> bytes:
         """Synchronous binary variant used by recovery dirty checks."""
         self._verify()

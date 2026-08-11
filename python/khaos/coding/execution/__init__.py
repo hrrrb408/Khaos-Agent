@@ -20,8 +20,9 @@ from khaos.coding.execution.platform import (
     LinuxBubblewrapBackend,
     MacOSSandboxBackend,
     UnsupportedBackend,
+    WindowsSandboxBackend,
 )
 from khaos.coding.execution.service import ExecutionService
 from khaos.coding.execution.supervisor import ProcessSupervisor, SupervisorClosedError
 
-__all__ = ["BackendSelector", "DockerBackend", "DockerSandboxDecision", "ExecutionAuthority", "ExecutionRequest", "ExecutionResult", "ExecutionService", "FileSystemAccess", "HostExecutionBackend", "LinuxBubblewrapBackend", "MacOSSandboxBackend", "ManagedProcessHandle", "NetworkPolicy", "PermissionProfile", "ProcessSupervisor", "ResolvedExecutionContext", "ResolvedSpawnPlan", "ResourceBudget", "SandboxDecision", "SupervisorClosedError", "UnsupportedBackend"]
+__all__ = ["BackendSelector", "DockerBackend", "DockerSandboxDecision", "ExecutionAuthority", "ExecutionRequest", "ExecutionResult", "ExecutionService", "FileSystemAccess", "HostExecutionBackend", "LinuxBubblewrapBackend", "MacOSSandboxBackend", "ManagedProcessHandle", "NetworkPolicy", "PermissionProfile", "ProcessSupervisor", "ResolvedExecutionContext", "ResolvedSpawnPlan", "ResourceBudget", "SandboxDecision", "SupervisorClosedError", "UnsupportedBackend", "WindowsSandboxBackend"]

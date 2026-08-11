@@ -602,6 +602,7 @@ mod linux {
         runtime_id: &str,
         task_id: &str,
         token: &str,
+        helper_socket_override: Option<&str>,
     ) -> io::Result<()> {
         validate_authority_identifier(principal_id, "principal_id")?;
         validate_authority_identifier(project_id, "project_id")?;
@@ -616,8 +617,10 @@ mod linux {
                 "invalid sandbox token",
             ));
         }
-        let socket_path = env::var("KHAOS_BROWSER_KERNEL_HELPER_SOCKET")
-            .unwrap_or_else(|_| DEFAULT_HELPER_SOCKET.to_owned());
+        let socket_path = helper_socket_override
+            .map(ToOwned::to_owned)
+            .or_else(|| env::var("KHAOS_BROWSER_KERNEL_HELPER_SOCKET").ok())
+            .unwrap_or_else(|| DEFAULT_HELPER_SOCKET.to_owned());
         validate_helper_socket(&socket_path)?;
         let client_pid = std::process::id();
         let client_start_time = process_start_time(client_pid)?;
@@ -1117,7 +1120,14 @@ mod linux {
                     .map_err(|_| io::Error::other("browser task identity missing"))?;
                 let token = env::var("KHAOS_BROWSER_SANDBOX_TOKEN")
                     .map_err(|_| io::Error::other("browser sandbox token missing"))?;
-                join_browser_authority(&principal_id, &project_id, &runtime_id, &task_id, &token)?;
+                join_browser_authority(
+                    &principal_id,
+                    &project_id,
+                    &runtime_id,
+                    &task_id,
+                    &token,
+                    None,
+                )?;
             } else {
                 if env::var_os("KHAOS_DEV_MODE").as_deref() != Some(std::ffi::OsStr::new("1")) {
                     return Err(io::Error::new(
@@ -1514,7 +1524,14 @@ mod linux {
             env::remove_var("KHAOS_BROWSER_RUNTIME_ID");
             env::remove_var("KHAOS_BROWSER_TASK_ID");
             env::remove_var("KHAOS_BROWSER_SANDBOX_TOKEN");
-            join_browser_authority(&principal_id, &project_id, &runtime_id, &task_id, &token)?;
+            join_browser_authority(
+                &principal_id,
+                &project_id,
+                &runtime_id,
+                &task_id,
+                &token,
+                None,
+            )?;
             let remote_debugging_pipe = args
                 .iter()
                 .any(|arg| arg.to_string_lossy() == "--remote-debugging-pipe");
@@ -1601,6 +1618,87 @@ mod linux {
             // seccomp: no_new_privs + deny-list.  setns is in the deny
             // list, so Chromium cannot change namespaces after this point.
             install_seccomp()?;
+            return exec(&args);
+        }
+
+        // Generic terminal/tool network authority mode.  The authenticated
+        // browser kernel helper is reused as the root-owned netns/veth/nft
+        // owner, but the command is not treated as a browser: it is joined to
+        // the namespace, moved into the execution cgroup, and then execs the
+        // normal bubblewrap plan.  The inner launcher remains responsible for
+        // Landlock/seccomp after bubblewrap has created its mount namespace.
+        if args.first().is_some_and(|arg| arg == "--network-authority") {
+            args.remove(0);
+            let mut cgroup: Option<PathBuf> = None;
+            loop {
+                match args
+                    .first()
+                    .map(|value| value.to_string_lossy().to_string())
+                {
+                    Some(value) if value == "--cgroup" => {
+                        args.remove(0);
+                        let path = args.first().cloned().ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::InvalidInput, "missing network cgroup")
+                        })?;
+                        args.remove(0);
+                        cgroup = Some(PathBuf::from(path));
+                    }
+                    Some(value) if value == "--" => {
+                        args.remove(0);
+                        break;
+                    }
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "expected --network-authority [--cgroup PATH] -- COMMAND",
+                        ));
+                    }
+                }
+            }
+            if args.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "network authority command is empty",
+                ));
+            }
+            if let Ok(netns) = env::var("KHAOS_NETWORK_NETNS") {
+                join_netns(&netns)?;
+            } else {
+                let principal_id = env::var("KHAOS_NETWORK_PRINCIPAL")
+                    .map_err(|_| io::Error::other("network principal identity missing"))?;
+                let project_id = env::var("KHAOS_NETWORK_PROJECT")
+                    .map_err(|_| io::Error::other("network project identity missing"))?;
+                let runtime_id = env::var("KHAOS_NETWORK_RUNTIME")
+                    .map_err(|_| io::Error::other("network runtime identity missing"))?;
+                let task_id = env::var("KHAOS_NETWORK_TASK")
+                    .map_err(|_| io::Error::other("network task identity missing"))?;
+                let token = env::var("KHAOS_NETWORK_SANDBOX")
+                    .map_err(|_| io::Error::other("network sandbox token missing"))?;
+                let helper_socket = env::var("KHAOS_NETWORK_HELPER_SOCKET").ok();
+                join_browser_authority(
+                    &principal_id,
+                    &project_id,
+                    &runtime_id,
+                    &task_id,
+                    &token,
+                    helper_socket.as_deref(),
+                )?;
+            }
+            for key in [
+                "KHAOS_NETWORK_NETNS",
+                "KHAOS_NETWORK_PRINCIPAL",
+                "KHAOS_NETWORK_PROJECT",
+                "KHAOS_NETWORK_RUNTIME",
+                "KHAOS_NETWORK_TASK",
+                "KHAOS_NETWORK_SANDBOX",
+                "KHAOS_NETWORK_HELPER_SOCKET",
+            ] {
+                env::remove_var(key);
+            }
+            if let Some(path) = cgroup {
+                join_cgroup(path.as_os_str())?;
+            }
+            sanitize_fds_except(&[])?;
             return exec(&args);
         }
 

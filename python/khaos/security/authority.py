@@ -1,11 +1,11 @@
-"""Immutable authority envelopes for privileged local effects.
+"""Immutable authority contexts for privileged local effects.
 
-An :class:`AuthorityEnvelope` is the common, typed binding carried by local
-control-plane operations.  It is deliberately an in-process proof object,
-not a cryptographic boundary: the operating-system sandbox and the runtime
-authority seal remain the cross-process trust boundaries.  The envelope makes
-the principal/project/runtime/workspace/resource tuple explicit and gives
-static and runtime checks one contract to enforce across subsystems.
+An :class:`AuthorityEnvelope` is the common, typed context carried by local
+control-plane operations.  It is not itself an effect authority: callers must
+obtain an ``EffectCapability`` from ``AuthorityBroker`` before a privileged
+runner accepts it.  Keeping the context separate from the broker-issued
+capability makes audit identity explicit without treating a constructible
+dataclass as an authorization proof.
 """
 
 from __future__ import annotations
@@ -79,6 +79,25 @@ class AuthorityEnvelope:
         """Return the stable digest used by audit and child-owner bindings."""
         encoded = json.dumps(
             self.payload(), sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def context_digest(self) -> str:
+        """Return the stable owner digest excluding operation/resource labels."""
+        encoded = json.dumps(
+            {
+                "schema_version": self.schema_version,
+                "principal_id": self.principal_id,
+                "project_id": self.project_id,
+                "runtime_id": self.runtime_id,
+                "task_id": self.task_id,
+                "workspace_id": self.workspace_id,
+                "workspace_generation": self.workspace_generation,
+                "policy_digest": self.policy_digest,
+                "authorization_epoch": self.authorization_epoch,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
         ).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 

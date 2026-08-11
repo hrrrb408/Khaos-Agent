@@ -17,6 +17,7 @@ from khaos.coding.workspace.storage import (
     DEFAULT_WORKSPACE_ENTRIES,
     WorkspaceStorageSnapshot,
 )
+from khaos.security.network_broker import NetworkLease
 
 if TYPE_CHECKING:
     from khaos.coding.execution.authority import ExecutionAuthority
@@ -25,6 +26,7 @@ if TYPE_CHECKING:
 class NetworkPolicy(str, Enum):
     NONE = "none"
     LOOPBACK_ONLY = "loopback-only"
+    BROKERED = "brokered"
     UNRESTRICTED_WITH_APPROVAL = "unrestricted-with-approval"
 
 
@@ -85,6 +87,7 @@ class PermissionProfile:
     schema_version: int = 1
     filesystem: FileSystemAccess = FileSystemAccess.READ_ONLY
     network: NetworkPolicy = NetworkPolicy.NONE
+    network_broker: NetworkLease | None = None
     workspace_roots: tuple[Path, ...] = ()
     writable_roots: tuple[Path, ...] = ()
     unreadable_roots: tuple[Path, ...] = field(
@@ -112,6 +115,10 @@ class PermissionProfile:
         )
         if filesystem is FileSystemAccess.READ_ONLY and writable_roots:
             raise ValueError("read-only permission profile cannot contain writable roots")
+        if network is NetworkPolicy.BROKERED and self.network_broker is None:
+            raise ValueError("brokered network profile requires a NetworkLease")
+        if network is not NetworkPolicy.BROKERED and self.network_broker is not None:
+            raise ValueError("NetworkLease is only valid for a brokered profile")
         if any(root not in workspace_roots for root in writable_roots):
             raise ValueError("writable roots must be contained in workspace roots")
         if any(not isinstance(key, str) or not key for key in self.environment_keys):
@@ -157,6 +164,7 @@ class PermissionProfile:
             schema_version=self.schema_version,
             filesystem=self.filesystem,
             network=self.network,
+            network_broker=self.network_broker,
             workspace_roots=(canonical,),
             writable_roots=(
                 (canonical,)
@@ -192,6 +200,11 @@ class PermissionProfile:
             "schema_version": self.schema_version,
             "filesystem": self.filesystem.value,
             "network": self.network.value,
+            "network_broker": (
+                self.network_broker.identity_digest
+                if self.network_broker is not None
+                else None
+            ),
             "workspace_roots": [str(path) for path in self.workspace_roots],
             "writable_roots": [str(path) for path in self.writable_roots],
             "unreadable_roots": [str(path) for path in self.unreadable_roots],
