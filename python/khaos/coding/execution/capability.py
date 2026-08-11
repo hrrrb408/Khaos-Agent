@@ -103,7 +103,7 @@ class SandboxDecision:
         writable: bool,
         network_mode: str = "none",
         platform: str | None = None,
-    ) -> "SandboxDecision":
+    ) -> SandboxDecision:
         """Build a decision only from a successful capability probe."""
         evidence = availability.evidence
         if (

@@ -7,7 +7,8 @@ import logging
 import os
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass, field, fields as dataclass_fields
+from dataclasses import dataclass, field
+from dataclasses import fields as dataclass_fields
 from pathlib import Path
 from typing import Any
 
@@ -27,11 +28,11 @@ from khaos.coding.workspace.office_authority import OfficeMutationAuthority
 from khaos.db.state_root import project_id as compute_project_id
 from khaos.exceptions import RuntimeCloseError
 from khaos.memory import MemoryBudget, MemoryManager, MemoryStore
-from khaos.runtime.authority import RuntimeAuthoritySeal, is_production_mode
-from khaos.runtime.lifecycle import CloseState
 from khaos.modes import ModeManager
 from khaos.permissions import PermissionEngine
 from khaos.routing.router import create_default_router
+from khaos.runtime.authority import RuntimeAuthoritySeal, is_production_mode
+from khaos.runtime.lifecycle import CloseState
 from khaos.rust_bridge import get_token_engine
 from khaos.security.middleware import SecurityMiddleware
 from khaos.security.network_guard import NetworkGuard
@@ -450,7 +451,7 @@ class RuntimeResult:
                 return False
         return True
 
-    def _with_seal(self, seal: "RuntimeAuthoritySeal") -> "RuntimeResult":
+    def _with_seal(self, seal: RuntimeAuthoritySeal) -> RuntimeResult:
         """Stamp the authority seal minted by ``build_runtime`` and return self.
 
         The field is ``init=False`` so positional construction can never bind

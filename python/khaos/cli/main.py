@@ -67,7 +67,11 @@ async def run_once(args: argparse.Namespace) -> int:
         project_id=cli_project_id,
     )
 
-    from khaos.runtime import ProductionRuntimeConfig, build_production_runtime, close_runtime_or_register
+    from khaos.runtime import (
+        ProductionRuntimeConfig,
+        build_production_runtime,
+        close_runtime_or_register,
+    )
     runtime = None
     try:
         runtime = await build_production_runtime(ProductionRuntimeConfig(db=db, mode_manager=mode_manager, confirm_callback=_confirm_from_args(args), principal_id=f"local-uid:{os.getuid()}", source_transport="cli", foreground_session=True, project_id=cli_project_id))
@@ -104,7 +108,11 @@ async def run_repl(args: argparse.Namespace) -> int:
         principal_id=f"local-uid:{os.getuid()}",
         project_id=cli_project_id,
     )
-    from khaos.runtime import ProductionRuntimeConfig, build_production_runtime, close_runtime_or_register
+    from khaos.runtime import (
+        ProductionRuntimeConfig,
+        build_production_runtime,
+        close_runtime_or_register,
+    )
     runtime = None
     try:
         runtime = await build_production_runtime(ProductionRuntimeConfig(db=db, mode_manager=mode_manager, confirm_callback=_interactive_confirm(args), principal_id=f"local-uid:{os.getuid()}", source_transport="cli", foreground_session=True, project_id=cli_project_id))

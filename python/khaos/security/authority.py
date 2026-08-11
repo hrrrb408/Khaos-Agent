@@ -87,7 +87,7 @@ class AuthorityEnvelope:
         *,
         operation_class: str,
         resource_digest: str | None = None,
-    ) -> "AuthorityEnvelope":
+    ) -> AuthorityEnvelope:
         """Derive a narrower operation without changing its owner binding."""
         return replace(
             self,
@@ -125,7 +125,7 @@ class AuthorityEnvelope:
         resource_digest: str,
         task_id: str = "recovery",
         workspace_id: str = "system",
-    ) -> "AuthorityEnvelope":
+    ) -> AuthorityEnvelope:
         """Create the explicit envelope used by local recovery control paths."""
         return cls(
             principal_id="system",

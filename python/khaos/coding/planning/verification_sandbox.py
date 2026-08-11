@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar, Protocol
 
+from khaos.coding.execution.environment import scrub_spawn_environment
 from khaos.coding.planning.trusted_verification import (
     DisposableVerificationWorkspace,
     SandboxProfile,
@@ -36,7 +37,6 @@ from khaos.coding.planning.trusted_verification import (
 from khaos.coding.planning.verification_execution_models import (
     TrustedVerificationCommand,
 )
-from khaos.coding.execution.environment import scrub_spawn_environment
 
 logger = logging.getLogger(__name__)
 

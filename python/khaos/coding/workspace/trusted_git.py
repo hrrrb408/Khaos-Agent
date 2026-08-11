@@ -120,7 +120,7 @@ class TrustedGitRunner:
     authority_root_identity: FileIdentity
 
     @classmethod
-    def for_authority_root(cls, root: Path, root_identity: FileIdentity) -> "TrustedGitRunner":
+    def for_authority_root(cls, root: Path, root_identity: FileIdentity) -> TrustedGitRunner:
         executable, identity, digest = resolve_trusted_git()
         return cls(executable, identity, digest, root, root_identity)
 
@@ -144,8 +144,7 @@ class TrustedGitRunner:
         """Reject caller-supplied config/cwd switches and disable checkout."""
         if any(
             arg in {"-c", "--config-env"}
-            or arg.startswith("--config=")
-            or arg.startswith("--config-env=")
+            or arg.startswith(("--config=", "--config-env="))
             for arg in args
         ):
             raise TrustedGitError("TrustedGitRunner rejects caller Git configuration switches")
@@ -597,7 +596,7 @@ def _parse_index_listing(listing: bytes) -> list[tuple[str, str, str]]:
     return entries
 
 
-def _blob_hasher(object_id: str, size: int) -> "hashlib._Hash":
+def _blob_hasher(object_id: str, size: int) -> hashlib._Hash:
     algorithm = "sha256" if len(object_id) == 64 else "sha1"
     digest = hashlib.new(algorithm)
     digest.update(f"blob {size}\0".encode("ascii"))

@@ -288,7 +288,7 @@ class ManagedProcessHandle:
             except asyncio.CancelledError:
                 cancel_requested = True
                 logger.debug("managed process finalize step %s cancelled (incomplete)", label)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.debug("managed process finalize step %s failed", label, exc_info=True)
 
         await _run_step(

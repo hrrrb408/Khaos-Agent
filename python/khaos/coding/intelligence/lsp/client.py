@@ -418,8 +418,10 @@ class LspClient:
         ):
             try:
                 await asyncio.shield(start_task)
-            except (Exception, asyncio.CancelledError):
-                pass  # start() handles its own rollback
+            except asyncio.CancelledError:
+                logger.debug("LSP start task cancelled while close was waiting", exc_info=True)
+            except Exception:
+                logger.debug("LSP start task failed while close was waiting", exc_info=True)
 
         # Phase 3: cleanup with lock held.
         cancel_requested = False

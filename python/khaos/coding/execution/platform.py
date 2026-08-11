@@ -22,7 +22,6 @@ from khaos.coding.execution.binding import (
     ExecutionDirectoryBinding,
     open_execution_directory_binding,
 )
-from khaos.coding.execution.environment import scrub_spawn_environment
 from khaos.coding.execution.capability import (
     BackendAvailability,
     SandboxDecision,
@@ -33,6 +32,7 @@ from khaos.coding.execution.capability import (
 from khaos.coding.execution.capability import (
     CapabilityEvidence as _CapabilityEvidence,
 )
+from khaos.coding.execution.environment import scrub_spawn_environment
 from khaos.coding.execution.identity import executable_identity
 from khaos.coding.execution.models import ResourceBudget
 from khaos.coding.execution.supervisor import ProcessSupervisor
@@ -538,9 +538,7 @@ class LinuxBubblewrapBackend:
         async with self._lock:
             if self.terminal_closed:
                 return
-            if self._state is LinuxBubblewrapBackendState.OPEN:
-                self._state = LinuxBubblewrapBackendState.CLOSING
-            elif self._state is LinuxBubblewrapBackendState.QUARANTINED:
+            if self._state is LinuxBubblewrapBackendState.OPEN or self._state is LinuxBubblewrapBackendState.QUARANTINED:
                 self._state = LinuxBubblewrapBackendState.CLOSING
             if self._shutdown_task is None or self._shutdown_task.done():
                 self._shutdown_task = asyncio.create_task(
@@ -834,7 +832,7 @@ class LinuxBubblewrapBackend:
             execution_id = request.correlation_id
             try:
                 lease = await self._register_cgroup_lease(execution_id, cgroup)
-            except BaseException as registration_error:
+            except BaseException:
                 # A duplicate execution id or a cancellation during
                 # registration must not orphan the just-created cgroup. If
                 # its external disappearance cannot be proven, retain it
@@ -856,7 +854,7 @@ class LinuxBubblewrapBackend:
                         "Linux cgroup registration failed and orphan cleanup "
                         "was not proven"
                     ) from cleanup_error
-                raise registration_error
+                raise
             if self.admission_closed:
                 try:
                     await asyncio.shield(self._release_cgroup_lease(execution_id))
@@ -978,7 +976,7 @@ class LinuxBubblewrapBackend:
                 raise RuntimeError(
                     f"cgroup disappearance was not proven: {lease.path}"
                 )
-        except BaseException as exc:  # noqa: BLE001 - lease remains owned
+        except BaseException as exc:
             lease.quarantined = True
             self._shutdown_error = exc
             self._state = LinuxBubblewrapBackendState.QUARANTINED

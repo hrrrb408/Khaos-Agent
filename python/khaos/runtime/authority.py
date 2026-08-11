@@ -64,7 +64,7 @@ class RuntimeAuthoritySeal:
         project_id: str,
         policy_digest: str,
         runtime_id: str,
-    ) -> "RuntimeAuthoritySeal":
+    ) -> RuntimeAuthoritySeal:
         """Mint a seal bound to the given authority tuple.
 
         The MAC key is fresh per process (read from ``urandom`` once and held
@@ -117,7 +117,7 @@ _MAC_KEY = os.urandom(32)
 def _compute_mac(
     principal_id: str, project_id: str, policy_digest: str, runtime_id: str
 ) -> str:
-    payload = "|".join((principal_id, project_id, policy_digest, runtime_id)).encode()
+    payload = f"{principal_id}|{project_id}|{policy_digest}|{runtime_id}".encode()
     return hmac.new(_MAC_KEY, payload, hashlib.sha256).hexdigest()
 
 
