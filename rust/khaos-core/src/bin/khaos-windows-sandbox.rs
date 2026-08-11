@@ -33,7 +33,8 @@ mod windows_backend {
         AdjustTokenPrivileges, CreateRestrictedToken, CreateWellKnownSid, IsTokenRestricted,
         LookupPrivilegeValueW, WinRestrictedCodeSid, DISABLE_MAX_PRIVILEGE, LUA_TOKEN,
         LUID_AND_ATTRIBUTES, PSID, SE_CHANGE_NOTIFY_NAME, SE_PRIVILEGE_ENABLED, SID_AND_ATTRIBUTES,
-        TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_PRIVILEGES, TOKEN_QUERY, WRITE_RESTRICTED,
+        TOKEN_ADJUST_PRIVILEGES, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_PRIVILEGES,
+        TOKEN_QUERY, WRITE_RESTRICTED,
     };
     use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE};
     use windows_sys::Win32::System::JobObjects::{
@@ -308,7 +309,7 @@ mod windows_backend {
         let opened = unsafe {
             OpenProcessToken(
                 GetCurrentProcess(),
-                TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY,
+                TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY | TOKEN_ADJUST_PRIVILEGES,
                 &mut current as *mut HANDLE,
             )
         };
