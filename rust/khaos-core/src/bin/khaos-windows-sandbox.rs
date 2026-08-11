@@ -29,8 +29,10 @@ mod windows_backend {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use windows_sys::Win32::Foundation::{
-        CloseHandle, GetLastError, LocalFree, ERROR_INSUFFICIENT_BUFFER, ERROR_NOT_ALL_ASSIGNED,
-        ERROR_SUCCESS, HANDLE, HLOCAL, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        CloseHandle, GetHandleInformation, GetLastError, LocalFree, SetHandleInformation,
+        ERROR_INSUFFICIENT_BUFFER, ERROR_NOT_ALL_ASSIGNED, ERROR_SUCCESS, HANDLE,
+        HANDLE_FLAG_INHERIT, HLOCAL, INVALID_HANDLE_VALUE, WAIT_FAILED, WAIT_OBJECT_0,
+        WAIT_TIMEOUT,
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW,
@@ -65,8 +67,8 @@ mod windows_backend {
         UpdateProcThreadAttribute, CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED,
         CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST,
         PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY,
-        PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, STARTF_USESTDHANDLES, STARTUPINFOEXW,
-        STARTUPINFOW,
+        PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+        STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
     };
     use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_CHILD_PROCESS_RESTRICTED;
 
@@ -563,18 +565,22 @@ mod windows_backend {
         // list before CreateProcess consumes it.
         capabilities: Box<SECURITY_CAPABILITIES>,
         child_process_policy: Box<u32>,
+        handle_list: Box<[HANDLE; 2]>,
     }
 
     impl AppContainerAttributes {
-        fn create(profile: &AppContainerProfile) -> Result<Self, String> {
+        fn create(
+            profile: &AppContainerProfile,
+            standard_handles: &InheritedStandardHandles,
+        ) -> Result<Self, String> {
             let mut size = 0usize;
-            let first = unsafe { InitializeProcThreadAttributeList(null_mut(), 2, 0, &mut size) };
+            let first = unsafe { InitializeProcThreadAttributeList(null_mut(), 3, 0, &mut size) };
             if first != 0 || unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER {
                 return Err(last_error("InitializeProcThreadAttributeList(size)"));
             }
             let mut storage = vec![0u8; size];
             let list = storage.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
-            if unsafe { InitializeProcThreadAttributeList(list, 2, 0, &mut size) } == 0 {
+            if unsafe { InitializeProcThreadAttributeList(list, 3, 0, &mut size) } == 0 {
                 return Err(last_error("InitializeProcThreadAttributeList"));
             }
             let capabilities = Box::new(SECURITY_CAPABILITIES {
@@ -618,11 +624,28 @@ mod windows_backend {
                     "UpdateProcThreadAttribute(child process policy)",
                 ));
             }
+            let handle_list = Box::new(standard_handles.handles);
+            let updated = unsafe {
+                UpdateProcThreadAttribute(
+                    list,
+                    0,
+                    PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                    handle_list.as_ptr() as *const c_void,
+                    size_of::<[HANDLE; 2]>(),
+                    null_mut(),
+                    null(),
+                )
+            };
+            if updated == 0 {
+                unsafe { DeleteProcThreadAttributeList(list) };
+                return Err(last_error("UpdateProcThreadAttribute(handle list)"));
+            }
             Ok(Self {
                 storage,
                 list,
                 capabilities,
                 child_process_policy,
+                handle_list,
             })
         }
     }
@@ -638,7 +661,75 @@ mod windows_backend {
                 &self.storage,
                 &self.capabilities,
                 &self.child_process_policy,
+                &self.handle_list,
             );
+        }
+    }
+
+    /// Temporarily marks only the two output handles as inheritable for an
+    /// AppContainer launch.  The explicit HANDLE_LIST attribute then prevents
+    /// unrelated broker handles from entering the low-box process.
+    struct InheritedStandardHandles {
+        handles: [HANDLE; 2],
+        previous_flags: [u32; 2],
+        restored: bool,
+    }
+
+    impl InheritedStandardHandles {
+        fn prepare() -> Result<Self, String> {
+            let handles = [unsafe { GetStdHandle(STD_OUTPUT_HANDLE) }, unsafe {
+                GetStdHandle(STD_ERROR_HANDLE)
+            }];
+            let mut guard = Self {
+                handles,
+                previous_flags: [0u32; 2],
+                restored: false,
+            };
+            for (index, handle) in guard.handles.into_iter().enumerate() {
+                if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+                    return Err("Windows sandbox standard output handle is unavailable".to_string());
+                }
+                if unsafe { GetHandleInformation(handle, &mut guard.previous_flags[index]) } == 0 {
+                    return Err(last_error("GetHandleInformation(standard output)"));
+                }
+                if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) }
+                    == 0
+                {
+                    return Err(last_error("SetHandleInformation(standard output)"));
+                }
+            }
+            Ok(guard)
+        }
+
+        fn restore(&mut self) -> Result<(), String> {
+            if self.restored {
+                return Ok(());
+            }
+            let mut errors = Vec::new();
+            for (index, handle) in self.handles.into_iter().enumerate() {
+                if unsafe {
+                    SetHandleInformation(
+                        handle,
+                        HANDLE_FLAG_INHERIT,
+                        self.previous_flags[index] & HANDLE_FLAG_INHERIT,
+                    )
+                } == 0
+                {
+                    errors.push(last_error("SetHandleInformation(restore)"));
+                }
+            }
+            self.restored = true;
+            if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(errors.join("; "))
+            }
+        }
+    }
+
+    impl Drop for InheritedStandardHandles {
+        fn drop(&mut self) {
+            let _ = self.restore();
         }
     }
 
@@ -1479,8 +1570,18 @@ mod windows_backend {
         let mut command = quote_command_line(&options.command);
         let mut application = wide_null(executable.as_os_str());
         let mut current_directory = wide_null(options.cwd.as_os_str());
+        let mut standard_handles = appcontainer
+            .map(|_| InheritedStandardHandles::prepare())
+            .transpose()?;
         let appcontainer_attributes = appcontainer
-            .map(AppContainerAttributes::create)
+            .map(|profile| {
+                AppContainerAttributes::create(
+                    profile,
+                    standard_handles
+                        .as_ref()
+                        .ok_or_else(|| "AppContainer standard handles are missing".to_string())?,
+                )
+            })
             .transpose()?;
         let mut startup: STARTUPINFOEXW = unsafe { zeroed() };
         startup.StartupInfo.cb = if appcontainer_attributes.is_some() {
@@ -1493,8 +1594,14 @@ mod windows_backend {
         // stdin handle to the restricted child would let the command consume
         // the cancellation byte before the helper sees it.
         startup.StartupInfo.hStdInput = null_mut();
-        startup.StartupInfo.hStdOutput = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
-        startup.StartupInfo.hStdError = unsafe { GetStdHandle(STD_ERROR_HANDLE) };
+        startup.StartupInfo.hStdOutput = standard_handles.as_ref().map_or_else(
+            || unsafe { GetStdHandle(STD_OUTPUT_HANDLE) },
+            |handles| handles.handles[0],
+        );
+        startup.StartupInfo.hStdError = standard_handles.as_ref().map_or_else(
+            || unsafe { GetStdHandle(STD_ERROR_HANDLE) },
+            |handles| handles.handles[1],
+        );
         startup.lpAttributeList = appcontainer_attributes
             .as_ref()
             .map_or(null_mut(), |attributes| attributes.list);
@@ -1539,15 +1646,26 @@ mod windows_backend {
                 )
             }
         };
+        let process = Handle(information.hProcess);
+        let thread = Handle(information.hThread);
+        let handle_restore = standard_handles
+            .as_mut()
+            .map(InheritedStandardHandles::restore);
         if created == 0 {
-            return Err(last_error(if appcontainer.is_some() {
+            let mut errors = vec![last_error(if appcontainer.is_some() {
                 "CreateProcessW"
             } else {
                 "CreateProcessAsUserW"
-            }));
+            })];
+            if let Some(Err(error)) = handle_restore {
+                errors.push(format!("restore inherited standard handles: {error}"));
+            }
+            return Err(errors.join("; "));
         }
-        let process = Handle(information.hProcess);
-        let thread = Handle(information.hThread);
+        if let Some(Err(error)) = handle_restore {
+            unsafe { windows_sys::Win32::System::Threading::TerminateProcess(process.0, 1) };
+            return Err(format!("restore inherited standard handles: {error}"));
+        }
         if unsafe { AssignProcessToJobObject(job.0, process.0) } == 0 {
             unsafe { windows_sys::Win32::System::Threading::TerminateProcess(process.0, 1) };
             return Err(last_error("AssignProcessToJobObject"));
