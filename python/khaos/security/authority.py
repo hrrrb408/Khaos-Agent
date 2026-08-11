@@ -1,0 +1,143 @@
+"""Immutable authority envelopes for privileged local effects.
+
+An :class:`AuthorityEnvelope` is the common, typed binding carried by local
+control-plane operations.  It is deliberately an in-process proof object,
+not a cryptographic boundary: the operating-system sandbox and the runtime
+authority seal remain the cross-process trust boundaries.  The envelope makes
+the principal/project/runtime/workspace/resource tuple explicit and gives
+static and runtime checks one contract to enforce across subsystems.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+from dataclasses import dataclass, replace
+
+_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$")
+_DIGEST = re.compile(r"^[A-Za-z0-9_.:-]{1,256}$")
+
+
+@dataclass(frozen=True, slots=True)
+class AuthorityEnvelope:
+    """Bind one privileged effect to one immutable security context."""
+
+    principal_id: str
+    project_id: str
+    runtime_id: str
+    task_id: str
+    workspace_id: str
+    workspace_generation: int
+    policy_digest: str
+    operation_class: str
+    resource_digest: str
+    authorization_epoch: int = 0
+    schema_version: int = 1
+
+    def __post_init__(self) -> None:
+        if self.schema_version != 1:
+            raise ValueError(f"unsupported authority envelope schema: {self.schema_version}")
+        for label, value in (
+            ("principal_id", self.principal_id),
+            ("project_id", self.project_id),
+            ("runtime_id", self.runtime_id),
+            ("task_id", self.task_id),
+            ("workspace_id", self.workspace_id),
+            ("operation_class", self.operation_class),
+        ):
+            if not isinstance(value, str) or _IDENTIFIER.fullmatch(value) is None:
+                raise ValueError(f"invalid authority envelope {label}")
+        for label, value in (
+            ("policy_digest", self.policy_digest),
+            ("resource_digest", self.resource_digest),
+        ):
+            if not isinstance(value, str) or _DIGEST.fullmatch(value) is None:
+                raise ValueError(f"invalid authority envelope {label}")
+        if self.workspace_generation <= 0:
+            raise ValueError("authority envelope workspace generation must be positive")
+        if self.authorization_epoch < 0:
+            raise ValueError("authority envelope authorization epoch cannot be negative")
+
+    def payload(self) -> dict[str, object]:
+        """Return the canonical, non-secret binding payload."""
+        return {
+            "schema_version": self.schema_version,
+            "principal_id": self.principal_id,
+            "project_id": self.project_id,
+            "runtime_id": self.runtime_id,
+            "task_id": self.task_id,
+            "workspace_id": self.workspace_id,
+            "workspace_generation": self.workspace_generation,
+            "policy_digest": self.policy_digest,
+            "operation_class": self.operation_class,
+            "resource_digest": self.resource_digest,
+            "authorization_epoch": self.authorization_epoch,
+        }
+
+    def digest(self) -> str:
+        """Return the stable digest used by audit and child-owner bindings."""
+        encoded = json.dumps(
+            self.payload(), sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def derive(
+        self,
+        *,
+        operation_class: str,
+        resource_digest: str | None = None,
+    ) -> "AuthorityEnvelope":
+        """Derive a narrower operation without changing its owner binding."""
+        return replace(
+            self,
+            operation_class=operation_class,
+            resource_digest=resource_digest or self.resource_digest,
+        )
+
+    def matches_context(
+        self,
+        *,
+        principal_id: str,
+        project_id: str,
+        runtime_id: str,
+        task_id: str,
+        workspace_id: str,
+        workspace_generation: int,
+        policy_digest: str,
+    ) -> bool:
+        """Check the immutable owner/generation/policy portion of the envelope."""
+        return (
+            self.principal_id == principal_id
+            and self.project_id == project_id
+            and self.runtime_id == runtime_id
+            and self.task_id == task_id
+            and self.workspace_id == workspace_id
+            and self.workspace_generation == workspace_generation
+            and self.policy_digest == policy_digest
+        )
+
+    @classmethod
+    def system(
+        cls,
+        *,
+        operation_class: str,
+        resource_digest: str,
+        task_id: str = "recovery",
+        workspace_id: str = "system",
+    ) -> "AuthorityEnvelope":
+        """Create the explicit envelope used by local recovery control paths."""
+        return cls(
+            principal_id="system",
+            project_id="local",
+            runtime_id="recovery",
+            task_id=task_id,
+            workspace_id=workspace_id,
+            workspace_generation=1,
+            policy_digest="system-recovery",
+            operation_class=operation_class,
+            resource_digest=resource_digest,
+        )
+
+
+__all__ = ["AuthorityEnvelope"]

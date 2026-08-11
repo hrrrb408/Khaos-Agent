@@ -1,5 +1,7 @@
 """Command line interface for the P0-A Khaos loop."""
 
+# KHAOS-PRIVILEGED-SPAWN owner=CliGatewayProcess threat-model=user-authorized-local-gateway boundary=cli-runtime
+
 from __future__ import annotations
 
 import argparse

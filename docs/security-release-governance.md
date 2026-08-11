@@ -13,7 +13,8 @@ release-ready merely because the maintainer can approve it.
    covered by `.github/CODEOWNERS`. Until then, record the independent-review
    control as an explicit release prerequisite rather than claiming that the
    single-maintainer ruleset provides it.
-4. Require signed, non-retargetable release tags, successful `Security Closure
+4. Require GitHub-verified signed, annotated, non-retargetable release tags,
+   successful `Security Closure
    Gate` and `Product Integrity Gate` runs for the exact tagged commit, a
    commit-bound SBOM/provenance attestation, and retain the gate evidence with
    the release record.
@@ -58,6 +59,7 @@ Export/archive evidence before reducing any window.
   manifest.
 - Release SBOM, checksum manifest, and GitHub artifact provenance attestation
   are attached to the release; the release workflow must fail on digest drift.
-- Gate evidence artifact, reviewer identity, signed non-retargetable tag, and
+- Gate evidence artifact, reviewer identity, GitHub-verified signed annotated
+  non-retargetable tag, and
   any CI-only skips are recorded together. Existing release assets are never
   overwritten.

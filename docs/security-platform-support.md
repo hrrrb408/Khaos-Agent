@@ -6,7 +6,7 @@ real-kernel CI gates.
 
 | Platform | Coding execution | Product boundary |
 | --- | --- | --- |
-| Linux | Supported when the launcher, bubblewrap, cgroup and browser helper checks pass | Python runs non-root; missing isolation fails closed |
+| Linux | Supported when the launcher, bubblewrap, Landlock, cgroup and browser helper checks pass | Python runs non-root; missing isolation fails closed |
 | macOS | Supported through the Seatbelt backend when its probe passes | No Linux namespace/browser-kernel claim |
 | Windows | Not supported | `UnsupportedBackend` rejects execution; there is no Host fallback or false `isolated` result |
 

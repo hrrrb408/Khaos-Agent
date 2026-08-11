@@ -62,9 +62,12 @@ are opened from the pinned root FD); the supervisor passes those descriptors to
 the child, rechecks their identities, and uses `fchdir` immediately before
 `exec`.  Linux bubblewrap uses the inherited root FD as its bind source through
 `/proc/self/fd`.  A path swap or symlinked cwd component therefore fails closed
-before the payload runs.  macOS Seatbelt still uses its platform path-based
-profile for allowlisted read/write rules, so real Linux/macOS sandbox
-acceptance remains a platform capability and CI gate.
+before the payload runs.  After bubblewrap has created the final Linux mount
+namespace, the Rust launcher installs a required Landlock filesystem allowlist
+and then the seccomp deny-list; missing Landlock support or any malformed
+allowlist rejects the payload. macOS Seatbelt still uses its platform
+path-based profile for allowlisted read/write rules, so real Linux/macOS
+sandbox acceptance remains a platform capability and CI gate.
 
 Gateway `/api/config` is operator-level state.  Authentication alone does not
 grant access: GET and PUT require a principal in the explicit

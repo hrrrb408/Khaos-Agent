@@ -4,6 +4,8 @@
 //! only project/runtime identity plus an opaque sandbox token; every kernel
 //! resource name is derived inside this helper with a protected HMAC key.
 
+// KHAOS-PRIVILEGED-SPAWN owner=BrowserKernelHelper threat-model=root-owned-browser-kernel boundary=browser-kernel
+
 #[cfg(target_os = "linux")]
 mod linux {
     use _khaos_core::browser_kernel_protocol_generated::{

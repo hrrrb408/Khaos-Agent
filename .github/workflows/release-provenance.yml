@@ -26,6 +26,7 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           ref: ${{ github.event.release.tag_name || inputs.tag }}
+          fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
@@ -40,6 +41,10 @@ jobs:
           tag_commit="$(git rev-list -n 1 "refs/tags/${RELEASE_TAG}")"
           test "$release_commit" = "$tag_commit"
           mkdir -p dist
+          python3 scripts/verify_release_tag.py \
+            --repo "$GITHUB_REPOSITORY" \
+            --tag "$RELEASE_TAG" \
+            --token "$GH_TOKEN"
           # A tag event proves only that a tag exists.  Require successful
           # aggregate Security Closure and Product Integrity runs for this
           # exact commit before producing any attestable subject.

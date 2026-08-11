@@ -13,6 +13,7 @@ from khaos.coding.workspace.storage import (
     WorkspaceStorageLimits,
     WorkspaceStorageSnapshot,
 )
+from khaos.security.authority import AuthorityEnvelope
 
 
 class WorkspaceState(str, Enum):
@@ -65,6 +66,7 @@ class TaskWorkspace:
     authority_generation: int = 1
     root_device: int | None = None
     root_inode: int | None = None
+    authority_envelope: AuthorityEnvelope | None = None
     _authority_sealed: bool = field(default=False, init=False, repr=False)
 
     _IMMUTABLE_AUTHORITY_FIELDS = frozenset(
@@ -77,6 +79,7 @@ class TaskWorkspace:
             "authority_generation",
             "root_device",
             "root_inode",
+            "authority_envelope",
         }
     )
 

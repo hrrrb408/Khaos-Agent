@@ -1,5 +1,7 @@
 """Explicit-development process boundary matching the Rust launcher."""
 
+# KHAOS-PRIVILEGED-SPAWN owner=NativeLauncherTCB threat-model=fd-bound-exec-and-codesign boundary=native-launcher
+
 from __future__ import annotations
 
 import hashlib

@@ -6,6 +6,8 @@
 //! with the requested command.  Keeping this sequence outside the Python
 //! interpreter removes ``preexec_fn`` from the security boundary.
 
+// KHAOS-PRIVILEGED-SPAWN owner=NativeExecLauncher threat-model=fd-bound-executable-authority boundary=native-launcher
+
 #[cfg(unix)]
 mod unix {
     use sha2::{Digest, Sha256};

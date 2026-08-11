@@ -1,5 +1,7 @@
 """Unified lifecycle supervision for Agent-owned subprocess trees."""
 
+# KHAOS-PRIVILEGED-SPAWN owner=ProcessSupervisor threat-model=child-tree-lifecycle boundary=execution-service
+
 from __future__ import annotations
 
 import asyncio

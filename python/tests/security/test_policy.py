@@ -129,6 +129,32 @@ commands:
     assert policy.commands_blocked == []
 
 
+def test_official_template_preserves_unset_allowlists() -> None:
+    """The checked-in template must not accidentally deny all commands/domains."""
+    repository_root = Path(__file__).resolve().parents[3]
+    policy = load_policy(repository_root / "khaos_policy.yaml")
+
+    assert policy.commands_allowed is None
+    assert policy.network_allowed_domains is None
+
+
+def test_explicit_empty_allowlists_remain_deny_all(tmp_path: Path) -> None:
+    """An operator can still opt into a strict deny-all list explicitly."""
+    policy_file = _write_policy(
+        tmp_path / "khaos_policy.yaml",
+        """
+sandbox:
+  allowed_domains: []
+commands:
+  allow: []
+""",
+    )
+    policy = load_policy(policy_file)
+
+    assert policy.network_allowed_domains == []
+    assert policy.commands_allowed == []
+
+
 def test_invalid_yaml_fails_closed(tmp_path: Path) -> None:
     """H3: malformed YAML raises rather than degrading to workspace-write.
 

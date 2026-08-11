@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import shutil
 import subprocess
@@ -109,6 +110,29 @@ def test_linux_profile_isolates_proc_ipc_uts_and_parent_lifetime(tmp_path: Path)
         argv[index:index + 3] for index in range(len(argv) - 2)
     )
     assert "--clearenv" in argv
+
+
+def test_linux_profile_requires_landlock_allowlists_after_mount_setup(tmp_path: Path):
+    """The inner launcher receives an explicit fail-closed filesystem plan."""
+    argv = LinuxBubblewrapBackend().argv_prefix(tmp_path)
+
+    def setenv_value(name: str) -> str:
+        for index, value in enumerate(argv[:-2]):
+            if value == "--setenv" and argv[index + 1] == name:
+                return argv[index + 2]
+        raise AssertionError(f"missing sandbox environment key: {name}")
+
+    assert setenv_value("KHAOS_LANDLOCK_REQUIRED") == "1"
+    read_roots = json.loads(setenv_value("KHAOS_LANDLOCK_READ_ROOTS"))
+    write_roots = json.loads(setenv_value("KHAOS_LANDLOCK_WRITE_ROOTS"))
+    assert "/usr" in read_roots
+    assert "/etc" in read_roots
+    assert "/proc" in read_roots
+    assert "/workspace" in write_roots
+    assert "/home/khaos" in write_roots
+    assert "/tmp" in write_roots
+    assert read_roots == sorted(set(read_roots))
+    assert write_roots == sorted(set(write_roots))
 
 
 def test_linux_cgroup_v2_leaf_has_hard_limits(tmp_path: Path, monkeypatch):

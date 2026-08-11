@@ -70,6 +70,8 @@ Round-6 review Batch 6.2 fixes (C-02 round-6 + §四 + §五 + §六):
   a detectable failure instead of a silent kernel-policy gap.
 """
 
+# KHAOS-PRIVILEGED-SPAWN owner=BrowserKernel threat-model=privileged-netns-and-nft boundary=browser-kernel
+
 from __future__ import annotations
 
 import hashlib
