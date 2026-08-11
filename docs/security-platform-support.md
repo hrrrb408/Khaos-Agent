@@ -24,11 +24,14 @@ The Windows backend is intentionally narrow: `network=none` runs native
 executables under an OS-issued AppContainer with no declared network
 capability, a restricted primary token, a kill-on-close Job Object with an
 active-process limit of one, a transactional ACL grant for the workspace, and
-a WFP-backed Firewall transaction. Brokered network access is limited to the
-exact IPv4 loopback proxy endpoint and is not implemented by granting a child
-general network capability. The helper probe and the hosted Windows security
-job are mandatory; a missing helper, failed probe, non-native command, or
-cleanup failure is an infrastructure refusal rather than a Host fallback.
+a WFP-backed Firewall transaction. The TCB may temporarily enable
+`SeSecurityPrivilege` only to snapshot/restore integrity SACLs and restores
+its prior state before returning; the restricted child receives no such
+privilege. Brokered network access is limited to the exact IPv4 loopback proxy
+endpoint and is not implemented by granting a child general network
+capability. The helper probe and the hosted Windows security job are
+mandatory; a missing helper, failed probe, non-native command, or cleanup
+failure is an infrastructure refusal rather than a Host fallback.
 
 The current Gateway API key is a single-instance authentication boundary. It
 does not provide multi-tenant identity, per-user credentials, or tenant

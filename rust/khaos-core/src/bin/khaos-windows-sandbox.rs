@@ -47,8 +47,8 @@ mod windows_backend {
         TokenGroups, TokenIsAppContainer, WinRestrictedCodeSid, WinWorldSid, ACL,
         DISABLE_MAX_PRIVILEGE, LUA_TOKEN, LUID_AND_ATTRIBUTES, PROTECTED_SACL_SECURITY_INFORMATION,
         PSECURITY_DESCRIPTOR, PSID, SACL_SECURITY_INFORMATION, SECURITY_CAPABILITIES,
-        SE_CHANGE_NOTIFY_NAME, SE_PRIVILEGE_ENABLED, SE_SACL_PROTECTED, SID_AND_ATTRIBUTES,
-        TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_PRIVILEGES, TOKEN_ADJUST_SESSIONID,
+        SE_CHANGE_NOTIFY_NAME, SE_PRIVILEGE_ENABLED, SE_SACL_PROTECTED, SE_SECURITY_NAME,
+        SID_AND_ATTRIBUTES, TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_PRIVILEGES, TOKEN_ADJUST_SESSIONID,
         TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_PRIVILEGES, TOKEN_QUERY, WRITE_RESTRICTED,
     };
     use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE};
@@ -87,6 +87,128 @@ mod windows_backend {
 
     struct Handle(HANDLE);
 
+    /// Temporarily enables the TCB's SACL privilege for the integrity-label
+    /// transaction.  The child never receives this token: it is created later
+    /// from a `DISABLE_MAX_PRIVILEGE` restricted token.  Keeping the privilege
+    /// in a small RAII guard prevents the cleanup path from accidentally
+    /// leaving the helper process elevated after the ACL transaction.
+    struct SecurityPrivilegeGuard {
+        token: Handle,
+        previous: TOKEN_PRIVILEGES,
+        active: bool,
+    }
+
+    impl SecurityPrivilegeGuard {
+        fn enable() -> Result<Self, String> {
+            let mut token: HANDLE = null_mut();
+            if unsafe {
+                OpenProcessToken(
+                    GetCurrentProcess(),
+                    TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+                    &mut token,
+                )
+            } == 0
+            {
+                return Err(last_error("OpenProcessToken(SeSecurityPrivilege)"));
+            }
+            let token = Handle(token);
+            let mut luid = unsafe { zeroed() };
+            if unsafe { LookupPrivilegeValueW(null(), SE_SECURITY_NAME, &mut luid) } == 0 {
+                return Err(last_error("LookupPrivilegeValueW(SeSecurityPrivilege)"));
+            }
+            let requested = TOKEN_PRIVILEGES {
+                PrivilegeCount: 1,
+                Privileges: [LUID_AND_ATTRIBUTES {
+                    Luid: luid,
+                    Attributes: SE_PRIVILEGE_ENABLED,
+                }],
+            };
+            let mut previous = TOKEN_PRIVILEGES::default();
+            let mut returned_length = 0_u32;
+            let adjusted = unsafe {
+                AdjustTokenPrivileges(
+                    token.0,
+                    0,
+                    &requested,
+                    size_of::<TOKEN_PRIVILEGES>() as u32,
+                    &mut previous,
+                    &mut returned_length,
+                )
+            };
+            let adjust_error = unsafe { GetLastError() };
+            if adjusted == 0 || adjust_error == ERROR_NOT_ALL_ASSIGNED {
+                if adjusted != 0 {
+                    let _ = unsafe {
+                        AdjustTokenPrivileges(
+                            token.0,
+                            0,
+                            &previous,
+                            size_of::<TOKEN_PRIVILEGES>() as u32,
+                            null_mut(),
+                            null_mut(),
+                        )
+                    };
+                }
+                if adjusted == 0 {
+                    return Err(last_error("AdjustTokenPrivileges(SeSecurityPrivilege)"));
+                }
+                return Err(
+                    "SeSecurityPrivilege is unavailable on the Windows TCB token".to_string(),
+                );
+            }
+            Ok(Self {
+                token,
+                previous,
+                active: true,
+            })
+        }
+
+        fn restore(mut self) -> Result<(), String> {
+            if !self.active {
+                return Ok(());
+            }
+            let restored = unsafe {
+                AdjustTokenPrivileges(
+                    self.token.0,
+                    0,
+                    &self.previous,
+                    size_of::<TOKEN_PRIVILEGES>() as u32,
+                    null_mut(),
+                    null_mut(),
+                )
+            };
+            let restore_error = unsafe { GetLastError() };
+            self.active = false;
+            if restored == 0 {
+                return Err(last_error("restore SeSecurityPrivilege"));
+            }
+            if restore_error == ERROR_NOT_ALL_ASSIGNED {
+                return Err(
+                    "restore SeSecurityPrivilege reported ERROR_NOT_ALL_ASSIGNED".to_string(),
+                );
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for SecurityPrivilegeGuard {
+        fn drop(&mut self) {
+            if self.active {
+                let _ = unsafe {
+                    AdjustTokenPrivileges(
+                        self.token.0,
+                        0,
+                        &self.previous,
+                        size_of::<TOKEN_PRIVILEGES>() as u32,
+                        null_mut(),
+                        null_mut(),
+                    )
+                };
+                self.active = false;
+            }
+        }
+    }
+
     #[repr(C)]
     struct TokenDefaultDaclInfo {
         default_dacl: *mut windows_sys::Win32::Security::ACL,
@@ -105,29 +227,52 @@ mod windows_backend {
     struct IntegrityTransaction {
         root: PathBuf,
         snapshots: Vec<IntegritySnapshot>,
+        security_privilege: SecurityPrivilegeGuard,
     }
 
     impl IntegrityTransaction {
         fn capture(root: &Path) -> Result<Self, String> {
-            let mut snapshots = Vec::new();
-            for path in filesystem_paths(root)? {
-                snapshots.push(IntegritySnapshot::capture(path)?);
-            }
+            let security_privilege = SecurityPrivilegeGuard::enable().map_err(|error| {
+                format!("enable SeSecurityPrivilege for SACL transaction: {error}")
+            })?;
+            let capture_result = (|| -> Result<Vec<IntegritySnapshot>, String> {
+                let mut snapshots = Vec::new();
+                for path in filesystem_paths(root)? {
+                    snapshots.push(IntegritySnapshot::capture(path)?);
+                }
+                Ok(snapshots)
+            })();
+            let snapshots = match capture_result {
+                Ok(snapshots) => snapshots,
+                Err(error) => {
+                    if let Err(restore_error) = security_privilege.restore() {
+                        return Err(format!(
+                            "{error}; restore SeSecurityPrivilege after failed capture: {restore_error}"
+                        ));
+                    }
+                    return Err(error);
+                }
+            };
             Ok(Self {
                 root: root.to_path_buf(),
                 snapshots,
+                security_privilege,
             })
         }
 
         fn restore(self) -> Result<(), String> {
+            let Self {
+                root,
+                snapshots,
+                security_privilege,
+            } = self;
             let mut errors = Vec::new();
-            let known: HashSet<PathBuf> = self
-                .snapshots
+            let known: HashSet<PathBuf> = snapshots
                 .iter()
                 .map(|snapshot| snapshot.path.clone())
                 .collect();
-            if let Some(root_snapshot) = self.snapshots.first() {
-                match filesystem_paths(&self.root) {
+            if let Some(root_snapshot) = snapshots.first() {
+                match filesystem_paths(&root) {
                     Ok(paths) => {
                         for path in paths {
                             if !known.contains(&path) {
@@ -140,10 +285,13 @@ mod windows_backend {
                     Err(error) => errors.push(error),
                 }
             }
-            for snapshot in self.snapshots.into_iter().rev() {
+            for snapshot in snapshots.into_iter().rev() {
                 if let Err(error) = snapshot.restore_to(&snapshot.path) {
                     errors.push(error);
                 }
+            }
+            if let Err(error) = security_privilege.restore() {
+                errors.push(error);
             }
             if errors.is_empty() {
                 Ok(())

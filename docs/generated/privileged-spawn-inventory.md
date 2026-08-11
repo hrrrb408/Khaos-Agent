@@ -60,6 +60,6 @@
 - `rust/khaos-core/src/bin/khaos-exec-launcher.rs:459` `Command::new` in `rust::entrypoint` owner=`NativeExecLauncher` threat-model=`fd-bound-executable-authority` boundary=`native-launcher`
 - `rust/khaos-core/src/bin/khaos-exec-launcher.rs:512` `execveat` in `rust::entrypoint` owner=`NativeExecLauncher` threat-model=`fd-bound-executable-authority` boundary=`native-launcher`
 - `rust/khaos-core/src/bin/khaos-sandbox-launcher.rs:418` `execvp` in `rust::entrypoint` owner=`LinuxSandboxLauncher` threat-model=`seccomp-landlock-bwrap-boundary` boundary=`linux-sandbox`
-- `rust/khaos-core/src/bin/khaos-windows-sandbox.rs:797` `Command::new` in `rust::entrypoint` owner=`WindowsSandboxTCB` threat-model=`restricted-token-job-acl-appcontainer-wfp` boundary=`windows-sandbox`
-- `rust/khaos-core/src/bin/khaos-windows-sandbox.rs:1674` `Command::new` in `rust::entrypoint` owner=`WindowsSandboxTCB` threat-model=`restricted-token-job-acl-appcontainer-wfp` boundary=`windows-sandbox`
-- `rust/khaos-core/src/bin/khaos-windows-sandbox.rs:1864` `Command::new` in `rust::entrypoint` owner=`WindowsSandboxTCB` threat-model=`restricted-token-job-acl-appcontainer-wfp` boundary=`windows-sandbox`
+- `rust/khaos-core/src/bin/khaos-windows-sandbox.rs:945` `Command::new` in `rust::entrypoint` owner=`WindowsSandboxTCB` threat-model=`restricted-token-job-acl-appcontainer-wfp` boundary=`windows-sandbox`
+- `rust/khaos-core/src/bin/khaos-windows-sandbox.rs:1822` `Command::new` in `rust::entrypoint` owner=`WindowsSandboxTCB` threat-model=`restricted-token-job-acl-appcontainer-wfp` boundary=`windows-sandbox`
+- `rust/khaos-core/src/bin/khaos-windows-sandbox.rs:2012` `Command::new` in `rust::entrypoint` owner=`WindowsSandboxTCB` threat-model=`restricted-token-job-acl-appcontainer-wfp` boundary=`windows-sandbox`

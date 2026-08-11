@@ -19,7 +19,9 @@ Windows 的安全承诺是 **native-or-fail-closed**：只有当前 job 构建�
 `khaos-windows-sandbox.exe` 输出六项完整 probe 证据，Coding command execution 才会
 被允许；否则执行拒绝，绝不切换到 Host subprocess。该 backend 已在
 `network=none` 路径验证 AppContainer/no-network contract，但不宣称 Windows
-private desktop 或浏览器专用 Linux netns parity。
+private desktop 或浏览器专用 Linux netns parity。TCB 仅为完整性 SACL
+事务临时启用 `SeSecurityPrivilege`，恢复原 privilege state，且 probe
+验证的 restricted child 不继承该 privilege；不可用时保持 fail-closed。
 
 ## Supply-chain 规则
 

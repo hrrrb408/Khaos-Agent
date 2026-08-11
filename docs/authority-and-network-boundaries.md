@@ -64,7 +64,9 @@ execution:
    loopback NetworkBroker endpoint;
 4. transactionally granted/restored restricted-code ACLs: full access for the
    task workspace and read/execute plus ancestor traverse for the resolved
-   native runtime tree;
+   native runtime tree. The TCB temporarily enables `SeSecurityPrivilege` on
+   its own token to snapshot/restore integrity SACLs, restores the prior
+   privilege state, and never passes that privilege to the restricted child;
 5. a WFP-backed Windows Firewall transaction; and
 6. exact resolution to a native `.exe`/`.com`, never a shell script.
 
