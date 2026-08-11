@@ -650,6 +650,7 @@ mod windows_backend {
         let runtime_acl = match RuntimeAcl::apply(
             &executable,
             appcontainer.as_ref().map(AppContainerProfile::sid_string),
+            &options.runtime_roots,
         ) {
             Ok(acl) => acl,
             Err(error) => {
@@ -760,6 +761,7 @@ mod windows_backend {
             memory_bytes: 128 * 1024 * 1024,
             cpu_seconds: 120,
             timeout_seconds: 10,
+            runtime_roots: Vec::new(),
             command,
         };
         let appcontainer = match AppContainerProfile::create() {
@@ -784,6 +786,7 @@ mod windows_backend {
         let runtime_acl = match RuntimeAcl::apply(
             &helper,
             appcontainer.as_ref().map(AppContainerProfile::sid_string),
+            &[],
         ) {
             Ok(acl) => acl,
             Err(error) => {
@@ -987,6 +990,7 @@ mod windows_backend {
         memory_bytes: u64,
         cpu_seconds: u64,
         timeout_seconds: u64,
+        runtime_roots: Vec<PathBuf>,
         command: Vec<OsString>,
     }
 
@@ -1000,6 +1004,7 @@ mod windows_backend {
             let mut memory_bytes = 512 * 1024 * 1024;
             let mut cpu_seconds = 120;
             let mut timeout_seconds = 120;
+            let mut runtime_roots = Vec::new();
             let mut index = 0;
             while index < args.len() {
                 let value = args[index].to_string_lossy();
@@ -1046,6 +1051,7 @@ mod windows_backend {
                             .parse()
                             .map_err(|_| "invalid timeout".to_string())?
                     }
+                    "--runtime-root" => runtime_roots.push(PathBuf::from(next(&mut index)?)),
                     _ => return Err(format!("unknown Windows sandbox option: {value}")),
                 }
                 index += 1;
@@ -1079,6 +1085,7 @@ mod windows_backend {
                 memory_bytes,
                 cpu_seconds,
                 timeout_seconds,
+                runtime_roots,
                 command,
             })
         }
@@ -1094,6 +1101,18 @@ mod windows_backend {
         }
         if !workspace.is_dir() || !cwd.is_dir() {
             return Err("Windows sandbox workspace/cwd must be directories".to_string());
+        }
+        for runtime_root in &options.runtime_roots {
+            let canonical = std::fs::canonicalize(runtime_root)
+                .map_err(|e| format!("Windows sandbox runtime root unavailable: {e}"))?;
+            if !canonical.is_dir() {
+                return Err("Windows sandbox runtime root must be a directory".to_string());
+            }
+            if canonical == workspace || canonical.starts_with(&workspace) {
+                return Err(
+                    "Windows sandbox runtime root cannot be inside the task workspace".to_string(),
+                );
+            }
         }
         Ok(())
     }
@@ -1694,9 +1713,10 @@ mod windows_backend {
     /// resolved native runtime tree.  WRITE_RESTRICTED makes this SID the
     /// authority for writes, so a user-owned runtime that is writable by the
     /// interactive user must still be made explicitly read/execute-only for
-    /// the child.  The grant is scoped to the interpreter's parent directory;
-    /// only execute/traverse is added to its ancestors.  Every ACL is saved
-    /// before mutation and restored before the helper reports success.
+    /// the child.  The executable directory and explicitly trusted runtime
+    /// roots receive read/execute access; only execute/traverse is added to
+    /// their ancestors. Every ACL is saved before mutation and restored
+    /// before the helper reports success.
     ///
     /// This is deliberately separate from ``WorkspaceAcl``: the child gets
     /// full access only to the task workspace, while the runtime is strictly
@@ -1712,7 +1732,11 @@ mod windows_backend {
     }
 
     impl RuntimeAcl {
-        fn apply(executable: &Path, appcontainer_sid: Option<&str>) -> Result<Self, String> {
+        fn apply(
+            executable: &Path,
+            appcontainer_sid: Option<&str>,
+            additional_roots: &[PathBuf],
+        ) -> Result<Self, String> {
             let runtime_root = executable
                 .parent()
                 .ok_or_else(|| "Windows sandbox executable has no parent directory".to_string())?
@@ -1728,26 +1752,54 @@ mod windows_backend {
                     "Windows sandbox refuses to mutate a volume-root runtime directory".to_string(),
                 );
             }
+            let mut roots = vec![runtime_root];
+            roots.extend(additional_roots.iter().cloned());
             let mut entries = Vec::new();
-            for ancestor in directory_ancestors(&runtime_root) {
-                if let Err(error) = apply_runtime_acl(
-                    &ancestor,
-                    &mut entries,
-                    "*S-1-5-12:(X)",
-                    appcontainer_sid,
-                    false,
-                ) {
-                    return Err(join_runtime_acl_error(error, entries));
+            let mut seen_ancestors = HashSet::new();
+            let mut seen_recursive = HashSet::new();
+            for root in roots {
+                let root = std::fs::canonicalize(&root)
+                    .map_err(|e| format!("canonicalize Windows runtime root: {e}"))?;
+                if !root.is_dir() {
+                    return Err(format!(
+                        "Windows sandbox runtime root is not a directory: {}",
+                        root.display()
+                    ));
                 }
-            }
-            if let Err(error) = apply_runtime_acl(
-                &runtime_root,
-                &mut entries,
-                "*S-1-5-12:(OI)(CI)RX",
-                appcontainer_sid,
-                true,
-            ) {
-                return Err(join_runtime_acl_error(error, entries));
+                if directory_ancestors(&root).is_empty() {
+                    return Err(
+                        "Windows sandbox refuses a volume-root runtime directory".to_string()
+                    );
+                }
+                for ancestor in directory_ancestors(&root) {
+                    if !seen_ancestors.insert(ancestor.clone()) {
+                        continue;
+                    }
+                    if let Err(error) = apply_runtime_acl(
+                        &ancestor,
+                        &mut entries,
+                        "*S-1-5-12:(X)",
+                        appcontainer_sid,
+                        false,
+                    ) {
+                        return Err(join_runtime_acl_error(error, entries));
+                    }
+                }
+                // A root may first appear as another root's traversal
+                // ancestor (for example venv\Scripts before venv).  That
+                // must not suppress the recursive read/execute grant for
+                // the root itself.
+                if seen_recursive.insert(root.clone()) {
+                    if let Err(error) = apply_runtime_acl(
+                        &root,
+                        &mut entries,
+                        "*S-1-5-12:(OI)(CI)RX",
+                        appcontainer_sid,
+                        true,
+                    ) {
+                        return Err(join_runtime_acl_error(error, entries));
+                    }
+                }
             }
             Ok(Self { entries })
         }

@@ -23,8 +23,9 @@ only with the explicit `KHAOS_DEV_MODE=1` development switch.
 The Windows backend is intentionally narrow: `network=none` runs native
 executables under an OS-issued AppContainer with no declared network
 capability, a restricted primary token, a kill-on-close Job Object with an
-active-process limit of one, a transactional ACL grant for the workspace, and
-a WFP-backed Firewall transaction. The TCB may temporarily enable
+active-process limit of one, a transactional ACL grant for the workspace and
+trusted venv/base-runtime read/execute roots, and a WFP-backed Firewall
+transaction. The TCB may temporarily enable
 `SeSecurityPrivilege` only to snapshot/restore integrity SACLs and restores
 its prior state before returning; the restricted child receives no such
 privilege. Brokered network access is limited to the exact IPv4 loopback proxy

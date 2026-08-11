@@ -248,6 +248,29 @@ class WindowsSandboxBackend:
             "--timeout-seconds",
             str(max(1, math.ceil(profile.resources.timeout_seconds))),
         ]
+        # A venv executable needs its lexical ``pyvenv.cfg`` and the base
+        # interpreter tree.  These roots come from the trusted Khaos Python
+        # runtime, not from model-controlled request fields, and the native
+        # helper grants them read/execute access only for this execution.
+        try:
+            requested_executable = request.argv[0]
+            if not Path(requested_executable).is_absolute():
+                requested_executable = shutil.which(
+                    requested_executable, path=environment.get("PATH")
+                ) or requested_executable
+            same_as_khaos_python = (
+                Path(requested_executable).resolve()
+                == Path(sys.executable).resolve()
+            )
+        except (OSError, RuntimeError):
+            same_as_khaos_python = False
+        if same_as_khaos_python:
+            seen_runtime_roots: set[Path] = set()
+            for prefix in (sys.prefix, sys.base_prefix):
+                runtime_root = Path(prefix).expanduser().resolve()
+                if runtime_root.is_dir() and runtime_root not in seen_runtime_roots:
+                    helper_args.extend(("--runtime-root", str(runtime_root)))
+                    seen_runtime_roots.add(runtime_root)
         if lease is not None:
             environment.update(lease.proxy_environment())
             helper_args.extend(("--proxy-host", lease.host, "--proxy-port", str(lease.port)))
