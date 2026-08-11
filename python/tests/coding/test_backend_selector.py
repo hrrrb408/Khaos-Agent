@@ -2,7 +2,6 @@ import asyncio
 import time
 
 import pytest
-
 from khaos.coding.execution import BackendSelector, UnsupportedBackend
 
 
@@ -37,15 +36,21 @@ def test_selector_never_uses_host_for_read_without_platform_sandbox(monkeypatch)
 
 @pytest.mark.asyncio
 @pytest.mark.windows_fail_closed
-async def test_windows_is_explicitly_unsupported_and_fails_closed(monkeypatch):
+async def test_windows_never_falls_back_to_host(monkeypatch):
     monkeypatch.setattr("khaos.coding.execution.platform.sys.platform", "win32")
 
     backend = BackendSelector().select(writable=True)
     availability = await backend.probe()
 
-    assert isinstance(backend, UnsupportedBackend)
-    assert "Windows" in availability.reason
-    assert availability.available is False
-    assert availability.network_enforced is False
-    with pytest.raises(PermissionError, match="Windows"):
-        await backend.execute(object())
+    if isinstance(backend, UnsupportedBackend):
+        assert "Windows" in availability.reason
+        assert availability.available is False
+        assert availability.network_enforced is False
+        with pytest.raises(PermissionError, match="Windows"):
+            await backend.execute(object())
+    else:
+        from khaos.coding.execution import WindowsSandboxBackend
+
+        assert isinstance(backend, WindowsSandboxBackend)
+        assert availability.available is True
+        assert availability.network_enforced is True

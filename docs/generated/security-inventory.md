@@ -42,7 +42,7 @@
 | --- | --- | --- |
 | Linux namespace/cgroup/nftables and Compose isolation | Uses a helper-only netns root, but must pass real Linux CI with kernel capabilities | CI-only |
 | macOS Seatbelt | Fail-closed/native contract tests and hosted macOS security job | Local/CI |
-| Windows | Unsupported for execution; refuses Host fallback and emits fail-closed result | CI fail-closed |
+| Windows | Native restricted-token/Job/ACL/WFP helper; missing probe evidence refuses Host fallback | Windows native CI gate |
 | Remote audit/WORM and independent human review | Not implemented by this repository | Unknown/external gate |
 
 ## Source fingerprints
@@ -53,17 +53,17 @@
 - `python/khaos/permissions/rules.py`: `173df51bf720843e339e026c5219a0db7e2b69beaa45576b2e24ee17764dfe6f`
 - `python/khaos/coding/execution/authority.py`: `abce06886df49008a109a1a89391ea0ca0f8b029f79e764c8ae29aeec5d82ae5`
 - `python/khaos/coding/execution/identity.py`: `5f159cf59788242902e0010bd59a05a2f7c14dd2f8251f62cafa2a1c3cc5e265`
-- `python/khaos/coding/execution/models.py`: `258b92953ea4a697f78d373d3f9806dba5806870ffe0bae33c6a8315854a9d4a`
+- `python/khaos/coding/execution/models.py`: `8350bd70efd33c77b6b7bfbfc4489ade2b4460f4431ae30c0b214843d4dad6f2`
 - `python/khaos/coding/execution/native_launcher.py`: `4c27b61db7c7c0be2319a55c909b4d17658b563c74d70d8217f00387a5b2cf07`
-- `python/khaos/coding/execution/platform.py`: `f164620f98e3ebda8ccfee7577d7e80db12a5033ae23a6f1747b42056d38172f`
+- `python/khaos/coding/execution/platform.py`: `0289055b96fea27de8f91ea604ac670431410d27dc30dbf157aec45eb58032b0`
 - `python/khaos/coding/execution/service.py`: `2f0ac90a3ee9955d911e53b63e3a8e4f8725315a483e8419439a2abf290b9736`
 - `python/khaos/coding/execution/binding.py`: `99f3d8eb14d80a837ecf0f0d076d556ccdb366b8798c9e0fde6c69d0bb1a5501`
 - `python/khaos/coding/execution/supervisor.py`: `6fbe58da27a6d6d2d4f3094e3dc1025fe93fc39c7523fcef167d4a59dfb50096`
-- `python/khaos/coding/workspace/manager.py`: `dcbd0122bcd90cb5e8e215bac0ec0894b0646f2c42aa820f753e334bfdfe3e2f`
-- `python/khaos/coding/workspace/trusted_git.py`: `d0f69a6f844d184351fbdf63ec3b20756b3ec770548a4c0f9c4e990fd309336e`
-- `python/khaos/security/authority.py`: `df842505a5ec46ff8422566565de77c6b0082138bbe414021c83ed60a0bff9b9`
+- `python/khaos/coding/workspace/manager.py`: `a7dd7ab41a9e4d32435bac407eed96ad59f3e362cabd8de8fb6d801b13630c70`
+- `python/khaos/coding/workspace/trusted_git.py`: `ea9a2eac346357d86c316df7f3749342bde5ea2ad129d5f646d3661aa2462831`
+- `python/khaos/security/authority.py`: `fd998bb3cf073a5abf4c1c278245c38df49716a4a83c54735fae00959789a6cf`
 - `rust/khaos-core/src/bin/khaos-exec-launcher.rs`: `d1d61d338a35d863e127284eccfe0ed5ef32f7e2b51f17bad7b8e7b737ab29da`
-- `rust/khaos-core/src/bin/khaos-sandbox-launcher.rs`: `c3e2fd935448c22f7cc344f8b691af0ef25ab3122de83f845ee7a2f1f51d85e6`
+- `rust/khaos-core/src/bin/khaos-sandbox-launcher.rs`: `523e5dafa9037093d624bda6ebc2c56a5b4b7ab4d8c4cfd353834928b34ad6cb`
 - `python/khaos/grpc_server.py`: `595a2f38072d0153c43d1e703be197156c82a38105c2a8340734becac505d8ec`
 - `go/internal/api/handler.go`: `119a049cdc45ea2c949f558a179752edaa30409a744f3f352e888e7e829343f3`
 - `go/cmd/gateway/main.go`: `75d14ad26917ddf15ddc38ce75f6bc0a1fcd214909c958849e7ae18054b81ed7`

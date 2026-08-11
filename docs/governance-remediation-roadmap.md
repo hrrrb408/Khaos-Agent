@@ -85,28 +85,31 @@ trade-off.
 
 ## G3 — Windows sandbox (P1, feature/platform)
 
-**Current state.** Windows execution returns an explicit `UnsupportedBackend`
-and fails closed (`docs/platform-security-guarantees.md` table,
-`python/khaos/coding/execution/platform.py`). No AppContainer / Job Object /
-WSL-based sandbox is claimed. CI proves the fail-closed contract
-(`windows-fail-closed-security` job, `contract (windows-2025)` matrix). Codex
-already ships a Windows sandbox path, so Khaos is behind on platform coverage.
+**Current state.** This head implements a native Windows execution backend.
+`WindowsSandboxBackend` admits execution only after the Rust helper proves a
+restricted primary token, Job Object limits with a two-process launcher/runtime tree,
+transactional workspace ACL, and WFP-backed Firewall policy. The hosted
+`windows-fail-closed-security` and `contract (windows-2025)` jobs build the
+helper and set `KHAOS_REQUIRE_WINDOWS_NATIVE=1`; the merge claim remains
+pending until those jobs pass on this head. AppContainer/private desktop and
+browser-specific Linux netns parity are not claimed.
 
-**Risk.** Windows users get no execution capability (functionality 2/10 per
-the review), though the security posture is correctly fail-closed (9/10). No
-silent Host fallback exists, so there is no bypass risk — only a capability
-gap.
+**Risk.** A failed native probe must continue to produce no execution
+capability; the remaining risk is platform-specific CI/runtime compatibility,
+not a silent Host bypass. The helper deliberately limits each execution to a
+launcher plus one native runtime process because Windows Firewall program
+rules cannot safely authorize unknown descendants during a discovery race.
 
-**Proposed resolution.** Either (a) implement a real Windows sandbox
-(AppContainer + Job Object + restricted token, mirroring Codex's
-`WindowsSandboxPolicy` / workspace roots / private desktop), or (b) formally
-declare Windows out of scope for execution and keep only the fail-closed
-contract. Option (b) is the honest short-term position and is already what the
-docs describe; option (a) is a multi-quarter platform project.
+**Resolution in this head.** Use the native helper as the only Windows Coding
+backend: restricted token, Job Object kill-on-close/resource limits and active
+process limit two, transactional ACL grant/restore, exact native executable
+resolution, and WFP-backed Firewall rules. Brokered egress accepts only the
+loopback NetworkBroker endpoint. Any missing primitive, cleanup proof, or
+unsupported command fails closed.
 
-**Prerequisite.** Sustained Windows demand + a maintainer able to own the
-Windows TCB. Until then, the fail-closed contract must remain the only
-Windows claim.
+**Prerequisite.** A passing current-head Windows runner is required before
+release; future work may add AppContainer/private-desktop support, but it is
+outside this closure.
 
 ---
 

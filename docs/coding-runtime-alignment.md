@@ -40,7 +40,8 @@ Coding runtime 的安全默认值是：
 - 非 Python 语言当前为 Legacy/正则级解析，尚未达到完整语义精度。
 - LSP 查询 enrichment、完整引用/调用边和 FTS5 尚未完成。
 - VerificationPipeline 尚未提供完整 flaky/baseline 报告。
-- Windows 安全后端策略尚未建立实机矩阵。
+- Windows native helper 已实现 restricted token、Job Object 两进程上限树、workspace ACL 与 WFP
+  Firewall contract；真实执行能力仍以当前 commit 的 Windows hosted probe/执行 job 为准。
 
 ## 离线验证
 

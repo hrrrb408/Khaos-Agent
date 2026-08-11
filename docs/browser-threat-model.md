@@ -81,4 +81,5 @@ kernel-default-deny egress, filesystem hiding, cgroup limits, descriptor
 sanitization and retryable fail-closed teardown on supported Linux hosts.
 
 Not a safe claim: absolute containment, or support on an OS without a passing
-real-kernel gate. Windows remains explicitly unsupported and fail-closed.
+real-kernel gate. Windows Coding execution has a separate native helper gate;
+this browser-specific Linux netns claim does not extend to Windows.

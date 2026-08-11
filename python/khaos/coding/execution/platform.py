@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import secrets
 import shutil
@@ -34,7 +35,7 @@ from khaos.coding.execution.capability import (
 )
 from khaos.coding.execution.environment import scrub_spawn_environment
 from khaos.coding.execution.identity import executable_identity
-from khaos.coding.execution.models import ResourceBudget
+from khaos.coding.execution.models import ExecutionResult, ResourceBudget
 from khaos.coding.execution.supervisor import ProcessSupervisor
 
 logger = logging.getLogger(__name__)
@@ -86,6 +87,275 @@ class UnsupportedBackend:
         return None
 
 
+class WindowsSandboxBackend:
+    """Native Windows backend: restricted token, Job Object, ACL/WFP helper.
+
+    The Python process is only the lifecycle owner.  The native helper owns
+    the irreversible Windows operations and refuses to start a child unless
+    its capability probe has proved the restricted-token, Job Object, private
+    workspace ACL, and Windows Firewall (WFP-backed) layers.  There is no
+    subprocess/Host fallback when the helper is missing or its probe is
+    incomplete.
+    """
+
+    name = "windows-native"
+
+    def __init__(self, supervisor=None) -> None:
+        self.supervisor = supervisor
+        self._capability_cache: _CapabilityCacheEntry | None = None
+        self._active: dict[str, asyncio.subprocess.Process] = {}
+        self._quarantined = False
+
+    async def probe(self) -> BackendAvailability:
+        return await asyncio.to_thread(self.probe_capability)
+
+    def probe_capability(self) -> BackendAvailability:
+        if self._quarantined:
+            return BackendAvailability(
+                self.name,
+                False,
+                False,
+                "Windows sandbox cleanup is unproven; backend quarantined",
+            )
+        if sys.platform != "win32":
+            return BackendAvailability(self.name, False, False, "Windows backend used on a non-Windows platform")
+        helper = _windows_sandbox_helper()
+        if helper is None:
+            return BackendAvailability(
+                self.name,
+                False,
+                False,
+                "Windows khaos-windows-sandbox helper unavailable; Host fallback is forbidden",
+            )
+        try:
+            evidence = _capability_evidence((helper,))
+            cached = _cached_availability(self._capability_cache, evidence)
+            if cached is not None:
+                return cached
+            completed = subprocess.run(
+                (str(helper), "--probe"),
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            payload = json.loads(completed.stdout or "{}")
+            required = (
+                "restricted_token",
+                "job_object",
+                "process_tree",
+                "acl",
+                "wfp",
+            )
+            passed = (
+                completed.returncode == 0
+                and isinstance(payload, dict)
+                and set(payload) == set(required)
+                and all(payload[key] is True for key in required)
+            )
+            availability = BackendAvailability(
+                self.name,
+                passed,
+                passed,
+                "" if passed else (
+                    "Windows native sandbox probe failed: "
+                    f"rc={completed.returncode} stdout={completed.stdout!r} "
+                    f"stderr={completed.stderr[-500:]!r}"
+                ),
+                evidence,
+            )
+        except (OSError, subprocess.SubprocessError, ValueError, TypeError) as exc:
+            availability = BackendAvailability(
+                self.name,
+                False,
+                False,
+                f"Windows native sandbox probe unavailable: {type(exc).__name__}: {exc}",
+                evidence if "evidence" in locals() else None,
+            )
+        self._capability_cache = (
+            _CapabilityCacheEntry(availability, evidence)
+            if "evidence" in locals()
+            else None
+        )
+        return availability
+
+    async def execute(self, request):
+        profile = _validated_profile(request)
+        if self._quarantined:
+            raise PermissionError(
+                "execution refused: Windows sandbox cleanup is unproven; backend quarantined"
+            )
+        if sys.platform != "win32":
+            raise PermissionError("Windows native backend cannot execute on this platform")
+        availability = self.probe_capability()
+        if not availability.available:
+            raise PermissionError(
+                "execution refused: Windows native sandbox is unavailable: "
+                f"{availability.reason}"
+            )
+        helper = _windows_sandbox_helper()
+        if helper is None:
+            raise PermissionError("execution refused: Windows sandbox helper disappeared")
+        worktree = profile.workspace_roots[0]
+        environment = {
+            key: value
+            for key, value in request.environment.items()
+            if key in profile.environment_keys
+        }
+        environment.setdefault("PATH", os.defpath)
+        environment = scrub_spawn_environment(environment)
+        # The native helper resolves icacls/netsh from the Windows system
+        # root. These values are trusted host metadata, not model-controlled
+        # environment input, and are required on installations whose Windows
+        # directory is not the default fallback path.
+        for key in ("SystemRoot", "SystemDrive", "WINDIR"):
+            value = os.environ.get(key)
+            if value:
+                environment[key] = value
+        lease = profile.network_broker
+        if lease is not None and (
+            lease.uses_network_namespace or lease.host != "127.0.0.1"
+        ):
+            raise PermissionError(
+                "Windows brokered execution requires a loopback NetworkBroker lease"
+            )
+        helper_args = [
+            str(helper),
+            "--workspace", str(worktree),
+            "--cwd", str(request.cwd),
+            "--network", profile.network.value,
+            "--memory-bytes", str(profile.resources.memory_bytes),
+            "--cpu-seconds", str(max(1, int(profile.resources.cpu_time_seconds))),
+            "--timeout-seconds",
+            str(max(1, math.ceil(profile.resources.timeout_seconds))),
+        ]
+        if lease is not None:
+            environment.update(lease.proxy_environment())
+            helper_args.extend(("--proxy-host", lease.host, "--proxy-port", str(lease.port)))
+        helper_args.extend(("--", *request.argv))
+        flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *helper_args,
+                cwd=str(request.cwd),
+                env=environment,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                creationflags=flags,
+            )
+        except OSError as exc:
+            raise PermissionError("Windows sandbox helper could not start") from exc
+        self._active[request.correlation_id] = process
+        started = asyncio.get_running_loop().time()
+        stdout_task = asyncio.create_task(_read_windows_output(process.stdout, profile.resources.output_bytes // 2))
+        stderr_task = asyncio.create_task(_read_windows_output(process.stderr, profile.resources.output_bytes - profile.resources.output_bytes // 2))
+        status = "failed"
+        timed_out = False
+        try:
+            try:
+                await asyncio.wait_for(
+                    process.wait(), timeout=profile.resources.timeout_seconds + 10
+                )
+            except TimeoutError:
+                timed_out = True
+                await self._terminate_process(request.correlation_id)
+            stdout, stdout_truncated = await stdout_task
+            stderr, stderr_truncated = await stderr_task
+            status = (
+                "timed-out"
+                if timed_out or process.returncode == 124
+                else ("passed" if process.returncode == 0 else "failed")
+            )
+            diagnostics = {
+                "backend": self.name,
+                "restricted_token": True,
+                "job_object": True,
+                "process_tree": True,
+                "workspace_acl": True,
+                "wfp_network_policy": profile.network.value,
+                "stdout_truncated": stdout_truncated,
+                "stderr_truncated": stderr_truncated,
+            }
+            return ExecutionResult(
+                execution_id=request.correlation_id,
+                status=status,
+                return_code=process.returncode,
+                stdout=stdout,
+                stderr=stderr,
+                duration_ms=int((asyncio.get_running_loop().time() - started) * 1000),
+                diagnostics=diagnostics,
+            )
+        finally:
+            self._active.pop(request.correlation_id, None)
+
+    async def terminate(self, execution_id: str) -> None:
+        await self._terminate_process(execution_id)
+
+    async def _terminate_process(self, execution_id: str) -> None:
+        process = self._active.get(execution_id)
+        if process is None or process.returncode is not None:
+            return
+        if process.stdin is not None:
+            try:
+                process.stdin.write(b"\x01")
+                await process.stdin.drain()
+                process.stdin.close()
+            except (BrokenPipeError, ConnectionError, OSError):
+                self._quarantined = True
+        try:
+            await asyncio.wait_for(process.wait(), timeout=5)
+        except TimeoutError:
+            self._quarantined = True
+            process.kill()
+            await process.wait()
+
+    def owned_resources(self) -> tuple[str, ...]:
+        return tuple(f"windows-helper:{key}" for key in sorted(self._active))
+
+    @property
+    def terminal_closed(self) -> bool:
+        return not self._active and not self._quarantined
+
+    def terminal_postcondition(self) -> bool:
+        return self.terminal_closed
+
+
+async def _read_windows_output(
+    stream: asyncio.StreamReader | None, limit: int
+) -> tuple[str, bool]:
+    if stream is None:
+        return "", False
+    data = await stream.read(max(1, limit) + 1)
+    return data[:limit].decode("utf-8", errors="replace"), len(data) > limit
+
+
+def _windows_sandbox_helper() -> Path | None:
+    if sys.platform != "win32":
+        return None
+    repository_root = Path(__file__).resolve().parents[4]
+    configured = os.environ.get("KHAOS_WINDOWS_SANDBOX_HELPER", "").strip()
+    candidates = [Path(configured)] if configured else []
+    candidates.extend(
+        (
+            repository_root / "rust" / "khaos-core" / "target" / "release" / "khaos-windows-sandbox.exe",
+            repository_root / "rust" / "khaos-core" / "target" / "debug" / "khaos-windows-sandbox.exe",
+        )
+    )
+    located = shutil.which("khaos-windows-sandbox.exe")
+    if located:
+        candidates.append(Path(located))
+    for candidate in candidates:
+        try:
+            resolved = candidate.expanduser().resolve(strict=True)
+            info = resolved.stat()
+        except OSError:
+            continue
+        if resolved.is_file() and info.st_size > 0:
+            return resolved
+    return None
+
+
 class BackendSelector:
     """Select an OS-enforced backend; Agent execution never falls back to host."""
 
@@ -129,8 +399,21 @@ class BackendSelector:
             if writable:
                 return UnsupportedBackend()
         if sys.platform.startswith("win"):
+            backend = WindowsSandboxBackend(self.supervisor)
+            try:
+                availability = backend.probe_capability()
+            except Exception as exc:  # noqa: BLE001 - Windows probes fail closed
+                availability = BackendAvailability(
+                    backend.name,
+                    False,
+                    False,
+                    f"Windows native sandbox probe raised {type(exc).__name__}: {exc}",
+                )
+            if availability.available and availability.network_enforced:
+                return backend
             return UnsupportedBackend(
-                "Windows sandbox backend is not implemented; Host fallback is forbidden"
+                availability.reason
+                or "Windows native sandbox unavailable; Host fallback is forbidden"
             )
         return UnsupportedBackend()
 
@@ -310,6 +593,7 @@ class MacOSSandboxBackend:
         synthetic_home: Path | None = None,
         synthetic_tmp: Path | None = None,
         preserve_workspace_path: bool = False,
+        network_broker=None,
     ) -> str:
         workspace = (
             worktree.expanduser().absolute()
@@ -384,6 +668,15 @@ class MacOSSandboxBackend:
         # deny-default plus the positive allowlist makes all non-runtime host
         # paths invisible, including credential roots not known in advance.
         _ = unreadable_roots
+        network_rules = "(deny network*)"
+        if network_broker is not None:
+            if network_broker.host != "127.0.0.1":
+                raise PermissionError("macOS broker endpoint must be loopback")
+            network_rules = (
+                '(allow network-outbound (remote ip "127.0.0.1") '
+                f'(remote tcp "{network_broker.port}"))'
+                "(deny network*)"
+            )
         return (
             "(version 1)(deny default)(allow process-exec process-fork)"
             "(allow signal (target same-sandbox))"
@@ -405,7 +698,7 @@ class MacOSSandboxBackend:
             f"{metadata_rules}{read_rules}{literal_reads}"
             f"{executable_map_rules}{write_rules}"
             f"{protected_write_rules}{protected_read_rules}{mach_lookup_rules}"
-            "(deny network*)"
+            f"{network_rules}"
         )
 
     async def execute(self, request):
@@ -429,6 +722,7 @@ class MacOSSandboxBackend:
                 synthetic_home=home,
                 synthetic_tmp=sandbox_tmp,
                 preserve_workspace_path=request.workspace_root_identity is not None,
+                network_broker=profile.network_broker,
             )
             sandboxed_argv = (
                 "/usr/bin/sandbox-exec", "-p", sandbox_profile,
@@ -711,6 +1005,8 @@ class LinuxBubblewrapBackend:
         command: tuple[str, ...] = (),
         environment: dict[str, str] | None = None,
         workspace_source: str | None = None,
+        network_broker=None,
+        include_network_authority: bool = True,
     ) -> tuple[str, ...]:
         canonical_worktree = worktree.expanduser().absolute()
         canonical_cwd = (cwd or canonical_worktree).expanduser().absolute()
@@ -782,7 +1078,12 @@ class LinuxBubblewrapBackend:
         else:
             landlock_read_roots.add(self.SANDBOX_WORKDIR)
         safe_environment = _sandbox_environment(
-            None, environment or {}, home="/home/khaos", tmpdir="/tmp"
+            None,
+            environment or {},
+            home="/home/khaos",
+            tmpdir="/tmp",
+            network_broker=network_broker,
+            include_network_authority=include_network_authority,
         )
         # The inner Rust launcher consumes these values only after bwrap has
         # created the final mount namespace.  JSON avoids ambiguous ':' path
@@ -804,8 +1105,13 @@ class LinuxBubblewrapBackend:
         # deny-default mount construction makes unreadable roots absent.  They
         # must never be mounted merely to cover them with another mount.
         _ = unreadable_roots
+        network_namespace = bool(
+            network_broker is not None
+            and getattr(network_broker, "uses_network_namespace", False)
+        )
+        network_option = "--share-net" if network_namespace else "--unshare-net"
         prefix.extend((
-            "--unshare-net", "--unshare-pid", "--unshare-ipc", "--unshare-uts",
+            network_option, "--unshare-pid", "--unshare-ipc", "--unshare-uts",
             "--new-session", "--die-with-parent",
             "--chdir", str(sandbox_cwd),
         ))
@@ -887,6 +1193,8 @@ class LinuxBubblewrapBackend:
                     resources=profile.resources,
                     command=request.argv,
                     environment=request.environment,
+                    network_broker=profile.network_broker,
+                    include_network_authority=False,
                     # bwrap resolves bind sources in the launching mount
                     # namespace.  An inherited proc-fd keeps that source tied
                     # to the already-validated directory inode.
@@ -902,15 +1210,33 @@ class LinuxBubblewrapBackend:
                         f"Linux bubblewrap backend is {self._state.value}, "
                         "not accepting executions"
                     )
-                sandboxed_argv = (
-                    str(launcher), "--join-cgroup",
-                    str(lease.path / "cgroup.procs"), "--", *prefix, "--",
-                    str(launcher), "--", *request.argv,
-                )
+                if profile.network_broker is not None and profile.network_broker.uses_network_namespace:
+                    sandboxed_argv = (
+                        str(launcher), "--network-authority", "--cgroup",
+                        str(lease.path / "cgroup.procs"), "--", *prefix, "--",
+                        str(launcher), "--", *request.argv,
+                    )
+                    outer_environment = _linux_network_outer_environment(
+                        profile, request.environment
+                    )
+                else:
+                    sandboxed_argv = (
+                        str(launcher), "--join-cgroup",
+                        str(lease.path / "cgroup.procs"), "--", *prefix, "--",
+                        str(launcher), "--", *request.argv,
+                    )
+                    # The bwrap prefix already carries the model-approved
+                    # child environment via --clearenv/--setenv.  Keep the
+                    # host-side launcher environment empty in the normal
+                    # path; only the namespace join contract is allowed in
+                    # the network-authority path above.
+                    outer_environment = {}
                 sandboxed = replace(
                     request,
                     argv=sandboxed_argv,
-                    executable_identity=executable_identity(sandboxed_argv, {}),
+                    executable_identity=executable_identity(
+                        sandboxed_argv, outer_environment
+                    ),
                 )
                 supervisor = self.supervisor or ProcessSupervisor()
                 self.supervisor = supervisor
@@ -923,6 +1249,7 @@ class LinuxBubblewrapBackend:
                     workspace_baseline=request.workspace_baseline,
                     directory_binding=directory_binding,
                     preserve_directory_fds=True,
+                    env=outer_environment,
                 )
             except (OSError, PermissionError):
                 self._capability_cache = None
@@ -1187,7 +1514,33 @@ def _validated_profile(request):
     if profile is None:
         raise PermissionError("execution request has no permission profile")
     profile.validate_resolved()
-    if profile.network.value != "none":
+    if profile.network.value == "brokered":
+        lease = profile.network_broker
+        if lease is not None:
+            lease.validate()
+        valid_endpoint = (
+            lease is not None
+            and 1 <= lease.port <= 65535
+            and (
+                lease.host == "127.0.0.1"
+                or (
+                    lease.uses_network_namespace
+                    and _is_private_ipv4(lease.host)
+                )
+            )
+        )
+        if not valid_endpoint:
+            raise PermissionError(
+                "brokered network policy requires a loopback or kernel-namespace NetworkLease"
+            )
+        # ``valid_endpoint`` proves this value is present, but Pyright cannot
+        # retain that narrowing across the boolean expression above.
+        assert lease is not None
+        if sys.platform.startswith("linux") and not lease.uses_network_namespace:
+            raise PermissionError(
+                "Linux brokered execution requires a kernel-network-namespace NetworkLease"
+            )
+    elif profile.network.value != "none":
         raise PermissionError(
             f"platform backend cannot enforce requested network policy: {profile.network.value}"
         )
@@ -1325,6 +1678,8 @@ def _sandbox_environment(
     *,
     home: str,
     tmpdir: str,
+    network_broker=None,
+    include_network_authority: bool = True,
 ) -> dict[str, str]:
     allowed_keys = (
         profile.environment_keys if profile is not None
@@ -1336,4 +1691,38 @@ def _sandbox_environment(
     environment.setdefault("PATH", os.defpath)
     environment.setdefault("LANG", "C.UTF-8")
     environment.update({"HOME": home, "TMPDIR": tmpdir, "TMP": tmpdir, "TEMP": tmpdir})
-    return scrub_spawn_environment(environment)
+    environment = scrub_spawn_environment(environment)
+    lease = network_broker
+    if lease is None and profile is not None:
+        lease = getattr(profile, "network_broker", None)
+    if lease is not None:
+        environment.update(lease.proxy_environment())
+        if include_network_authority and lease.namespace_environment:
+            environment.update(dict(lease.namespace_environment))
+    return environment
+
+
+def _linux_network_outer_environment(profile, requested: dict[str, str]) -> dict[str, str]:
+    """Build the scrubbed environment consumed only by the outer TCB launcher."""
+    allowed = {
+        key: value
+        for key, value in requested.items()
+        if key in profile.environment_keys
+    }
+    allowed.setdefault("PATH", os.defpath)
+    environment = scrub_spawn_environment(allowed)
+    lease = profile.network_broker
+    if lease is None or not lease.namespace_environment:
+        raise PermissionError("Linux network authority lease is missing its join contract")
+    environment.update(dict(lease.namespace_environment))
+    return environment
+
+
+def _is_private_ipv4(value: str) -> bool:
+    import ipaddress
+
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return address.version == 4 and address.is_private and not address.is_loopback

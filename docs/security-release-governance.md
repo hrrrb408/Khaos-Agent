@@ -31,10 +31,10 @@ release-ready merely because the maintainer can approve it.
 
 ## Evidence boundary
 
-Local Python/Go/Rust tests prove source-level contracts only.  Linux namespace,
-cgroup, nftables, Docker Compose, and native helper acceptance remain CI-only
-on this macOS workstation.  Windows is a fail-closed unsupported platform,
-not a parity claim.  The local audit chain anchor detects database rollback or
+Local Python/Go/Rust tests prove source-level contracts only. Linux namespace,
+cgroup, nftables, Docker Compose, and Windows native helper acceptance remain
+CI-only on this macOS workstation. Windows is native-or-fail-closed, not a
+claim of browser-specific Linux netns parity. The local audit chain anchor detects database rollback or
 history edits, but a remote WORM audit sink and independent human review are
 external release controls and are not implemented by this repository.
 

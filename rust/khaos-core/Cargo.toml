@@ -25,6 +25,20 @@ default = ["pyo3"]
 #   cargo test --no-default-features
 pyo3 = ["dep:pyo3"]
 
+[target.'cfg(windows)'.dependencies]
+# The Windows launcher is a native TCB: restricted token + Job Object are
+# intentionally kept out of the Python process.  The dependency is target
+# gated so POSIX builds do not pull Windows APIs into the Linux/macOS core.
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Console",
+    "Win32_System_JobObjects",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+] }
+
 [profile.release]
 lto = true
 codegen-units = 1

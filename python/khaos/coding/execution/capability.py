@@ -86,7 +86,7 @@ class SandboxDecision:
         if self.filesystem_mode not in {"read-only", "workspace-write"}:
             raise ValueError("sandbox decision filesystem mode is invalid")
         if self.network_mode not in {
-            "none", "loopback-only", "unrestricted-with-approval"
+            "none", "loopback-only", "brokered", "unrestricted-with-approval"
         }:
             raise ValueError("sandbox decision network mode is invalid")
         if type(self.kernel_enforced) is not bool:

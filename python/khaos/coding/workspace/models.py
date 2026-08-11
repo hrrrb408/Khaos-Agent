@@ -14,6 +14,7 @@ from khaos.coding.workspace.storage import (
     WorkspaceStorageSnapshot,
 )
 from khaos.security.authority import AuthorityEnvelope
+from khaos.security.authority_broker import EffectCapability
 
 MAX_CHANGESET_INLINE_BYTES = 1024 * 1024
 
@@ -69,6 +70,7 @@ class TaskWorkspace:
     root_device: int | None = None
     root_inode: int | None = None
     authority_envelope: AuthorityEnvelope | None = None
+    authority_capability: EffectCapability | None = None
     change_artifacts: set[Path] = field(default_factory=set, repr=False)
     change_artifact_bytes: int = field(default=0, repr=False)
     change_artifact_reservations: int = field(default=0, repr=False)
@@ -85,6 +87,7 @@ class TaskWorkspace:
             "root_device",
             "root_inode",
             "authority_envelope",
+            "authority_capability",
         }
     )
 

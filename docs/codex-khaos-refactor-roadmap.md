@@ -42,7 +42,7 @@ stream 作为 adapter 保留，done/error metadata 携带 turn/attempt/sequence�
 ## 3. Batch B：Execution 与 Sandbox
 
 实施进度（2026-07-15）：B1–B7 已完成首轮收敛。B1 `PermissionProfile`、B2
-`ProcessSupervisor`、B3 Linux、B4 macOS、B5 Docker、B6 Windows/unsupported 与 B7
+`ProcessSupervisor`、B3 Linux、B4 macOS、B5 Docker、B6 Windows native 与 B7
 Host fallback 删除已验证。profile 已覆盖 filesystem、network、workspace roots、
 unreadable host-secret roots、environment allowlist、resources 和稳定 digest；显式
 profile 无法被旧字段 `replace()` 降权。macOS 真实 sandbox gate 已验证工作区写、
@@ -53,7 +53,8 @@ Docker foreground process 现由共享 supervisor 负责 process-group TERM→gr
 die-with-parent 和相对 cwd 映射；异常 probe fail closed，并由 Linux CI 真实 gate 强制。
 macOS capability 使用真实 Seatbelt probe，本机真实 gate 已通过。Docker 使用 digest、
 pull-never、owner-nonce cleanup、mount delimiter rejection 与共享 supervisor；真实 Docker
-destructive E2E 仅在干净 CI runner gate。Windows 在实现 OS 强制 backend 前显式拒绝。
+destructive E2E 仅在干净 CI runner gate。Windows native helper 已接入 restricted token、
+Job Object 两进程上限树、workspace ACL、WFP Firewall 与 native-or-fail-closed CI gate。
 
 | 项 | 内容 |
 | --- | --- |
@@ -61,13 +62,13 @@ destructive E2E 仅在干净 CI runner gate。Windows 在实现 OS 强制 backen
 | 不变量 | restricted profile 无 Host fallback；cwd/roots/profile 每请求绑定；network none 由 OS 证明；所有进程可取消和清理 |
 | 威胁模型 | probe 伪阳性、backend 消失、宿主文件/secret/网络访问、fork 后逃逸、输出 DoS、容器 socket/代理泄漏 |
 | 设计 | versioned `PermissionProfile`（FS entries + network + resources + env）；`BackendPlan` 在执行前验证；统一 `ProcessSupervisor`；full access 必须显式 approval capability |
-| 代码修改 | 删除 AgentLoop 默认 Host；selector 对 read-only 也 fail closed；平台 profile 只读挂载+protected metadata；最小 env；流式 bounded stdout/stderr；Windows backend 明确 unsupported 前拒绝 |
+| 代码修改 | 删除 AgentLoop 默认 Host；selector 对 read-only 也 fail closed；平台 profile 只读挂载+protected metadata；最小 env；流式 bounded stdout/stderr；Windows native helper 缺失或 probe 不完整时拒绝 |
 | 迁移 | `access_mode/network_policy/writable_roots` 转换为 v1 profile；无法无损转换的配置启动失败并给出迁移提示 |
 | 负向测试 | backend unavailable、probe failure、invalid config、outside cwd、network/DNS/UDS、HOME/SSH/cloud/Docker secret、fork/grandchild、timeout/cancel/crash |
 | 回归测试 | test_run、terminal、LSP、Docker、macOS/Linux E2E、artifact 截断 |
 | 回滚方案 | 保留旧字段 parser，不保留旧 executor；安全 backend 故障时停用执行，不转 Host |
 | 文档 | threat model、各平台保证/限制、运维 probe、profile schema |
-| 原子提交 | B1 profile；B2 supervisor/output；B3 Linux；B4 macOS；B5 Docker；B6 Windows/unsupported；B7 删除 Host fallback |
+| 原子提交 | B1 profile；B2 supervisor/output；B3 Linux；B4 macOS；B5 Docker；B6 Windows native；B7 删除 Host fallback |
 
 ## 4. Batch C：Approval 与 Principal
 
