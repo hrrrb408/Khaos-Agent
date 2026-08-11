@@ -35,7 +35,7 @@ from khaos.coding.execution.capability import (
 )
 from khaos.coding.execution.environment import scrub_spawn_environment
 from khaos.coding.execution.identity import executable_identity
-from khaos.coding.execution.models import ExecutionResult, ResourceBudget
+from khaos.coding.execution.models import ExecutionResult, NetworkPolicy, ResourceBudget
 from khaos.coding.execution.supervisor import ProcessSupervisor
 
 logger = logging.getLogger(__name__)
@@ -88,12 +88,13 @@ class UnsupportedBackend:
 
 
 class WindowsSandboxBackend:
-    """Native Windows backend: restricted token, Job Object, ACL/WFP helper.
+    """Native Windows backend: AppContainer, token, Job, ACL/WFP helper.
 
     The Python process is only the lifecycle owner.  The native helper owns
     the irreversible Windows operations and refuses to start a child unless
-    its capability probe has proved the restricted-token, Job Object, private
-    workspace ACL, and Windows Firewall (WFP-backed) layers.  There is no
+    its capability probe has proved the restricted-token, AppContainer/no-
+    network, Job Object, private workspace ACL, and Windows Firewall
+    (WFP-backed) layers.  There is no
     subprocess/Host fallback when the helper is missing or its probe is
     incomplete.
     """
@@ -146,6 +147,7 @@ class WindowsSandboxBackend:
                 "process_tree",
                 "acl",
                 "wfp",
+                "appcontainer",
             )
             passed = (
                 completed.returncode == 0
@@ -270,6 +272,7 @@ class WindowsSandboxBackend:
             diagnostics = {
                 "backend": self.name,
                 "restricted_token": True,
+                "appcontainer": profile.network is NetworkPolicy.NONE,
                 "job_object": True,
                 "process_tree": True,
                 "workspace_acl": True,

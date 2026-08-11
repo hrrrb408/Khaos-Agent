@@ -42,7 +42,7 @@
 | --- | --- | --- |
 | Linux namespace/cgroup/nftables and Compose isolation | Uses a helper-only netns root, but must pass real Linux CI with kernel capabilities | CI-only |
 | macOS Seatbelt | Fail-closed/native contract tests and hosted macOS security job | Local/CI |
-| Windows | Native restricted-token/Job/ACL/WFP helper; missing probe evidence refuses Host fallback | Windows native CI gate |
+| Windows | Native restricted-token/AppContainer/Job/ACL/WFP helper; missing probe evidence refuses Host fallback | Windows native CI gate |
 | Remote audit/WORM and independent human review | Not implemented by this repository | Unknown/external gate |
 
 ## Source fingerprints
@@ -55,7 +55,7 @@
 - `python/khaos/coding/execution/identity.py`: `5f159cf59788242902e0010bd59a05a2f7c14dd2f8251f62cafa2a1c3cc5e265`
 - `python/khaos/coding/execution/models.py`: `8f165d586928c0cd95823b9008777b4b35281c4202c9847c9994c3d2258f6579`
 - `python/khaos/coding/execution/native_launcher.py`: `4c27b61db7c7c0be2319a55c909b4d17658b563c74d70d8217f00387a5b2cf07`
-- `python/khaos/coding/execution/platform.py`: `0289055b96fea27de8f91ea604ac670431410d27dc30dbf157aec45eb58032b0`
+- `python/khaos/coding/execution/platform.py`: `a2b06b11ac2ce0a053a430848e3aca04653e3db352d90833f2f7261955b51167`
 - `python/khaos/coding/execution/service.py`: `2f0ac90a3ee9955d911e53b63e3a8e4f8725315a483e8419439a2abf290b9736`
 - `python/khaos/coding/execution/binding.py`: `99f3d8eb14d80a837ecf0f0d076d556ccdb366b8798c9e0fde6c69d0bb1a5501`
 - `python/khaos/coding/execution/supervisor.py`: `6fbe58da27a6d6d2d4f3094e3dc1025fe93fc39c7523fcef167d4a59dfb50096`

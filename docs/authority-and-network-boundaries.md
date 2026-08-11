@@ -58,11 +58,15 @@ execution:
 2. a kill-on-close Job Object with resource limits and an active-process limit
    of one native runtime process; the outer helper remains outside the Job and
    owns the wait/cleanup transaction;
-3. transactionally granted/restored restricted-code ACLs: full access for the
+3. for `network=none`, an OS-issued per-execution AppContainer with no
+   declared network capabilities, verified from the child token; brokered
+   execution remains a restricted-token/WFP path and is limited to the exact
+   loopback NetworkBroker endpoint;
+4. transactionally granted/restored restricted-code ACLs: full access for the
    task workspace and read/execute plus ancestor traverse for the resolved
    native runtime tree;
-4. a WFP-backed Windows Firewall transaction; and
-5. exact resolution to a native `.exe`/`.com`, never a shell script.
+5. a WFP-backed Windows Firewall transaction; and
+6. exact resolution to a native `.exe`/`.com`, never a shell script.
 
 The active-process limit is deliberate: Windows program firewall rules cannot
 reliably authorize unknown descendants during a process-discovery race. The
@@ -72,6 +76,8 @@ network tree. Windows brokered egress is limited
 to IPv4 loopback and the exact broker port; all other IPv4/IPv6 paths are
 blocked.
 
-The helper probe and native execution job run on Windows hosted CI. A missing
-helper or any incomplete probe returns infrastructure-unsupported and keeps
-the fail-closed behavior.
+The helper probe and native execution job run on Windows hosted CI. The probe
+must observe the AppContainer token, denied loopback connection, denied
+descendant, workspace-only ACL, and complete cleanup. A missing helper or any
+incomplete probe returns infrastructure-unsupported and keeps the fail-closed
+behavior.

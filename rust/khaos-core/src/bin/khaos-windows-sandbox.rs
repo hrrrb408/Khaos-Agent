@@ -1,25 +1,27 @@
 //! Windows execution TCB for Khaos.
 //!
 //! The Python layer never creates the child directly on Windows.  This
-//! launcher creates a restricted primary token, places the child in a
-//! kill-on-close Job Object, and keeps the job alive until the child exits.
+//! launcher creates a restricted primary token, places network-none children
+//! in an OS-issued AppContainer, adds a kill-on-close Job Object, and keeps
+//! the job alive until the child exits.
 //! The surrounding Python backend only reports the backend as available after
-//! this binary proves its native primitives and its WFP-backed firewall
-//! transaction can be created and removed.
+//! this binary proves its native primitives, AppContainer network isolation,
+//! and WFP-backed firewall transaction can be created and removed.
 
 #![cfg_attr(not(windows), allow(dead_code))]
 
-// KHAOS-PRIVILEGED-SPAWN owner=WindowsSandboxTCB threat-model=restricted-token-job-acl-wfp boundary=windows-sandbox
+// KHAOS-PRIVILEGED-SPAWN owner=WindowsSandboxTCB threat-model=restricted-token-job-acl-appcontainer-wfp boundary=windows-sandbox
 
 #[cfg(windows)]
 mod windows_backend {
+    use std::collections::HashSet;
     use std::env;
     use std::ffi::{c_void, OsStr, OsString};
     use std::io::{ErrorKind, Read};
     use std::iter::once;
     use std::mem::{size_of, zeroed};
     use std::net::{TcpListener, TcpStream};
-    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::ptr::{null, null_mut};
@@ -27,19 +29,26 @@ mod windows_backend {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use windows_sys::Win32::Foundation::{
-        CloseHandle, GetLastError, LocalFree, ERROR_NOT_ALL_ASSIGNED, ERROR_SUCCESS, HANDLE,
-        HLOCAL, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        CloseHandle, GetLastError, LocalFree, ERROR_INSUFFICIENT_BUFFER, ERROR_NOT_ALL_ASSIGNED,
+        ERROR_SUCCESS, HANDLE, HLOCAL, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
     use windows_sys::Win32::Security::Authorization::{
-        SetEntriesInAclW, EXPLICIT_ACCESS_W, GRANT_ACCESS, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN,
+        ConvertSidToStringSidW, GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW,
+        EXPLICIT_ACCESS_W, GRANT_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN,
         TRUSTEE_W,
     };
+    use windows_sys::Win32::Security::Isolation::{
+        CreateAppContainerProfile, DeleteAppContainerProfile,
+    };
     use windows_sys::Win32::Security::{
-        AdjustTokenPrivileges, CopySid, CreateRestrictedToken, CreateWellKnownSid, GetLengthSid,
-        GetTokenInformation, IsTokenRestricted, LookupPrivilegeValueW, SetTokenInformation,
-        TokenDefaultDacl, TokenGroups, WinRestrictedCodeSid, WinWorldSid, DISABLE_MAX_PRIVILEGE,
-        LUA_TOKEN, LUID_AND_ATTRIBUTES, PSID, SE_CHANGE_NOTIFY_NAME, SE_PRIVILEGE_ENABLED,
-        SID_AND_ATTRIBUTES, TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_PRIVILEGES, TOKEN_ADJUST_SESSIONID,
+        AdjustTokenPrivileges, CopySid, CreateRestrictedToken, CreateWellKnownSid, FreeSid,
+        GetLengthSid, GetSecurityDescriptorControl, GetSecurityDescriptorSacl, GetTokenInformation,
+        IsTokenRestricted, LookupPrivilegeValueW, SetTokenInformation, TokenDefaultDacl,
+        TokenGroups, TokenIsAppContainer, WinRestrictedCodeSid, WinWorldSid, ACL,
+        DISABLE_MAX_PRIVILEGE, LUA_TOKEN, LUID_AND_ATTRIBUTES, PROTECTED_SACL_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR, PSID, SACL_SECURITY_INFORMATION, SECURITY_CAPABILITIES,
+        SE_CHANGE_NOTIFY_NAME, SE_PRIVILEGE_ENABLED, SE_SACL_PROTECTED, SID_AND_ATTRIBUTES,
+        TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_PRIVILEGES, TOKEN_ADJUST_SESSIONID,
         TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_PRIVILEGES, TOKEN_QUERY, WRITE_RESTRICTED,
     };
     use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE};
@@ -51,16 +60,21 @@ mod windows_backend {
     };
     use windows_sys::Win32::System::SystemServices::SE_GROUP_LOGON_ID;
     use windows_sys::Win32::System::Threading::{
-        CreateProcessAsUserW, GetCurrentProcess, GetExitCodeProcess, OpenProcessToken,
-        ResumeThread, CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
-        PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
+        CreateProcessAsUserW, DeleteProcThreadAttributeList, GetCurrentProcess, GetExitCodeProcess,
+        InitializeProcThreadAttributeList, OpenProcessToken, ResumeThread,
+        UpdateProcThreadAttribute, CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED,
+        CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST,
+        PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, STARTF_USESTDHANDLES,
+        STARTUPINFOEXW, STARTUPINFOW,
     };
 
     const FIREWALL_PREFIX: &str = "KhaosWindowsSandbox";
     // Windows Firewall application rules are image-scoped. A descendant can
     // otherwise switch to another executable and bypass the parent's rule.
-    // Until a job-wide WFP/AppContainer policy is available, the only
-    // deterministic fail-closed containment is one process per sandbox.
+    // Windows Firewall application rules are image-scoped, while the
+    // AppContainer is the network boundary for network-none executions.
+    // The one-process limit still prevents a descendant from switching to an
+    // untracked executable before a job-wide policy is available.
     // Commands that need to spawn children therefore fail inside the native
     // boundary instead of silently escaping the network policy.
     const MAX_ACTIVE_PROCESSES: u32 = 1;
@@ -78,11 +92,374 @@ mod windows_backend {
         default_dacl: *mut windows_sys::Win32::Security::ACL,
     }
 
+    /// Snapshot the complete SACL before lowering a workspace's integrity
+    /// label for an AppContainer.  ``icacls /save`` only stores DACLs; without
+    /// this separate transaction a failed execution could leave the user's
+    /// workspace at low integrity after the helper exits.
+    struct IntegritySnapshot {
+        path: PathBuf,
+        sacl: Option<Vec<u8>>,
+        protected: bool,
+    }
+
+    struct IntegrityTransaction {
+        root: PathBuf,
+        snapshots: Vec<IntegritySnapshot>,
+    }
+
+    impl IntegrityTransaction {
+        fn capture(root: &Path) -> Result<Self, String> {
+            let mut snapshots = Vec::new();
+            for path in filesystem_paths(root)? {
+                snapshots.push(IntegritySnapshot::capture(path)?);
+            }
+            Ok(Self {
+                root: root.to_path_buf(),
+                snapshots,
+            })
+        }
+
+        fn restore(self) -> Result<(), String> {
+            let mut errors = Vec::new();
+            let known: HashSet<PathBuf> = self
+                .snapshots
+                .iter()
+                .map(|snapshot| snapshot.path.clone())
+                .collect();
+            if let Some(root_snapshot) = self.snapshots.first() {
+                match filesystem_paths(&self.root) {
+                    Ok(paths) => {
+                        for path in paths {
+                            if !known.contains(&path) {
+                                if let Err(error) = root_snapshot.restore_to(&path) {
+                                    errors.push(error);
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => errors.push(error),
+                }
+            }
+            for snapshot in self.snapshots.into_iter().rev() {
+                if let Err(error) = snapshot.restore_to(&snapshot.path) {
+                    errors.push(error);
+                }
+            }
+            if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(errors.join("; "))
+            }
+        }
+    }
+
+    impl IntegritySnapshot {
+        fn capture(path: PathBuf) -> Result<Self, String> {
+            let path_wide = wide_null(path.as_os_str());
+            let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
+            let mut sacl: *mut ACL = null_mut();
+            let result = unsafe {
+                GetNamedSecurityInfoW(
+                    path_wide.as_ptr(),
+                    SE_FILE_OBJECT,
+                    SACL_SECURITY_INFORMATION,
+                    null_mut(),
+                    null_mut(),
+                    null_mut(),
+                    &mut sacl,
+                    &mut descriptor,
+                )
+            };
+            if result != ERROR_SUCCESS {
+                return Err(format!(
+                    "capture Windows integrity SACL for {} failed with Win32 error {result}",
+                    path.display()
+                ));
+            }
+            let mut present = 0;
+            let mut _defaulted = 0;
+            let sacl_read = unsafe {
+                GetSecurityDescriptorSacl(descriptor, &mut present, &mut sacl, &mut _defaulted)
+            };
+            if sacl_read == 0 {
+                unsafe { LocalFree(descriptor as HLOCAL) };
+                return Err(format!(
+                    "read Windows integrity SACL for {} failed: {}",
+                    path.display(),
+                    last_error("GetSecurityDescriptorSacl")
+                ));
+            }
+            let mut control = 0_u16;
+            let mut _revision = 0_u32;
+            if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut _revision) }
+                == 0
+            {
+                unsafe { LocalFree(descriptor as HLOCAL) };
+                return Err(format!(
+                    "read Windows integrity SACL control for {} failed: {}",
+                    path.display(),
+                    last_error("GetSecurityDescriptorControl")
+                ));
+            }
+            let sacl_bytes = if present != 0 && !sacl.is_null() {
+                let size = unsafe { (*sacl).AclSize as usize };
+                if size < size_of::<ACL>() {
+                    unsafe { LocalFree(descriptor as HLOCAL) };
+                    return Err(format!(
+                        "Windows integrity SACL for {} has an invalid size",
+                        path.display()
+                    ));
+                }
+                Some(unsafe { std::slice::from_raw_parts(sacl as *const u8, size) }.to_vec())
+            } else {
+                None
+            };
+            let free_result = unsafe { LocalFree(descriptor as HLOCAL) };
+            if !free_result.is_null() {
+                return Err(format!(
+                    "free Windows integrity SACL for {} failed",
+                    path.display()
+                ));
+            }
+            Ok(Self {
+                path,
+                sacl: sacl_bytes,
+                protected: control & SE_SACL_PROTECTED != 0,
+            })
+        }
+
+        fn restore_to(&self, path: &Path) -> Result<(), String> {
+            let path_wide = wide_null(path.as_os_str());
+            let security_info = SACL_SECURITY_INFORMATION
+                | if self.protected {
+                    PROTECTED_SACL_SECURITY_INFORMATION
+                } else {
+                    0
+                };
+            let sacl = self
+                .sacl
+                .as_ref()
+                .map_or(null(), |bytes| bytes.as_ptr() as *const ACL);
+            let result = unsafe {
+                SetNamedSecurityInfoW(
+                    path_wide.as_ptr(),
+                    SE_FILE_OBJECT,
+                    security_info,
+                    null_mut(),
+                    null_mut(),
+                    null(),
+                    sacl,
+                )
+            };
+            if result == ERROR_SUCCESS {
+                Ok(())
+            } else {
+                Err(format!(
+                    "restore Windows integrity SACL for {} failed with Win32 error {result}",
+                    path.display()
+                ))
+            }
+        }
+    }
+
+    fn filesystem_paths(root: &Path) -> Result<Vec<PathBuf>, String> {
+        let mut paths = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(path) = pending.pop() {
+            let metadata = std::fs::symlink_metadata(&path)
+                .map_err(|e| format!("inspect Windows integrity path {}: {e}", path.display()))?;
+            paths.push(path.clone());
+            if metadata.is_dir() {
+                for entry in std::fs::read_dir(&path).map_err(|e| {
+                    format!("enumerate Windows integrity path {}: {e}", path.display())
+                })? {
+                    let entry = entry.map_err(|e| {
+                        format!(
+                            "read Windows integrity directory entry {}: {e}",
+                            path.display()
+                        )
+                    })?;
+                    pending.push(entry.path());
+                }
+            }
+        }
+        Ok(paths)
+    }
+
     impl Drop for Handle {
         fn drop(&mut self) {
-            if self.0 != null_mut() {
+            if !self.0.is_null() {
                 unsafe { CloseHandle(self.0) };
             }
+        }
+    }
+
+    /// Owns the per-execution AppContainer identity used by network-none
+    /// executions.  The profile SID is an OS-issued authority; it is never
+    /// accepted from the Python caller or reconstructed from user input.
+    struct AppContainerProfile {
+        name: Vec<u16>,
+        sid: PSID,
+        sid_string: String,
+        deleted: bool,
+    }
+
+    impl AppContainerProfile {
+        fn create() -> Result<Self, String> {
+            let name = unique_rule_name("appcontainer");
+            let name_wide = wide_null(OsStr::new(&name));
+            let display = wide_null(OsStr::new("Khaos network-none sandbox"));
+            let description = wide_null(OsStr::new(
+                "Per-execution Khaos AppContainer with no network capability",
+            ));
+            let mut sid = null_mut();
+            let result = unsafe {
+                CreateAppContainerProfile(
+                    name_wide.as_ptr(),
+                    display.as_ptr(),
+                    description.as_ptr(),
+                    null(),
+                    0,
+                    &mut sid,
+                )
+            };
+            if result != 0 {
+                return Err(format!(
+                    "CreateAppContainerProfile failed with HRESULT 0x{:08x}",
+                    result as u32
+                ));
+            }
+            if sid.is_null() {
+                let _ = unsafe { DeleteAppContainerProfile(name_wide.as_ptr()) };
+                return Err("CreateAppContainerProfile returned a null package SID".to_string());
+            }
+            let sid_string = match sid_to_string(sid) {
+                Ok(value) => value,
+                Err(error) => {
+                    unsafe { FreeSid(sid) };
+                    let _ = unsafe { DeleteAppContainerProfile(name_wide.as_ptr()) };
+                    return Err(error);
+                }
+            };
+            Ok(Self {
+                name: name_wide,
+                sid,
+                sid_string,
+                deleted: false,
+            })
+        }
+
+        fn sid(&self) -> PSID {
+            self.sid
+        }
+
+        fn sid_string(&self) -> &str {
+            &self.sid_string
+        }
+
+        fn close(mut self) -> Result<(), String> {
+            let delete_result = unsafe { DeleteAppContainerProfile(self.name.as_ptr()) };
+            if delete_result == 0 {
+                self.deleted = true;
+            }
+            let free_result = if self.sid.is_null() {
+                null_mut()
+            } else {
+                let sid = self.sid;
+                self.sid = null_mut();
+                unsafe { FreeSid(sid) }
+            };
+            let mut errors = Vec::new();
+            if delete_result != 0 {
+                errors.push(format!(
+                    "DeleteAppContainerProfile failed with HRESULT 0x{:08x}",
+                    delete_result as u32
+                ));
+            }
+            if !free_result.is_null() {
+                errors.push("FreeSid failed for AppContainer package SID".to_string());
+            }
+            if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(errors.join("; "))
+            }
+        }
+    }
+
+    impl Drop for AppContainerProfile {
+        fn drop(&mut self) {
+            if !self.deleted {
+                let _ = unsafe { DeleteAppContainerProfile(self.name.as_ptr()) };
+                self.deleted = true;
+            }
+            if !self.sid.is_null() {
+                unsafe { FreeSid(self.sid) };
+                self.sid = null_mut();
+            }
+        }
+    }
+
+    /// Owns the extended startup attribute list that marks a process as an
+    /// AppContainer.  The package SID remains owned by AppContainerProfile
+    /// for the full lifetime of the created process.
+    struct AppContainerAttributes {
+        storage: Vec<u8>,
+        list: LPPROC_THREAD_ATTRIBUTE_LIST,
+        capabilities: SECURITY_CAPABILITIES,
+    }
+
+    impl AppContainerAttributes {
+        fn create(profile: &AppContainerProfile) -> Result<Self, String> {
+            let mut size = 0usize;
+            let first = unsafe { InitializeProcThreadAttributeList(null_mut(), 1, 0, &mut size) };
+            if first != 0 || unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER {
+                return Err(last_error("InitializeProcThreadAttributeList(size)"));
+            }
+            let mut storage = vec![0u8; size];
+            let list = storage.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
+            if unsafe { InitializeProcThreadAttributeList(list, 1, 0, &mut size) } == 0 {
+                return Err(last_error("InitializeProcThreadAttributeList"));
+            }
+            let capabilities = SECURITY_CAPABILITIES {
+                AppContainerSid: profile.sid(),
+                Capabilities: null_mut(),
+                CapabilityCount: 0,
+                Reserved: 0,
+            };
+            let updated = unsafe {
+                UpdateProcThreadAttribute(
+                    list,
+                    0,
+                    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
+                    &capabilities as *const SECURITY_CAPABILITIES as *const c_void,
+                    size_of::<SECURITY_CAPABILITIES>(),
+                    null_mut(),
+                    null(),
+                )
+            };
+            if updated == 0 {
+                unsafe { DeleteProcThreadAttributeList(list) };
+                return Err(last_error(
+                    "UpdateProcThreadAttribute(security capabilities)",
+                ));
+            }
+            Ok(Self {
+                storage,
+                list,
+                capabilities,
+            })
+        }
+    }
+
+    impl Drop for AppContainerAttributes {
+        fn drop(&mut self) {
+            if !self.list.is_null() {
+                unsafe { DeleteProcThreadAttributeList(self.list) };
+                self.list = null_mut();
+            }
+            // Keep both fields live until the attribute list is destroyed.
+            let _ = (&self.storage, &self.capabilities);
         }
     }
 
@@ -106,15 +483,35 @@ mod windows_backend {
         )?;
         let workspace = std::fs::canonicalize(&options.workspace)
             .map_err(|e| format!("workspace unavailable: {e}"))?;
-        let acl = WorkspaceAcl::apply(&workspace)?;
-        let runtime_acl = match RuntimeAcl::apply(&executable) {
+        let appcontainer = if options.network == "none" {
+            Some(AppContainerProfile::create()?)
+        } else {
+            None
+        };
+        let acl = match WorkspaceAcl::apply(
+            &workspace,
+            appcontainer.as_ref().map(AppContainerProfile::sid_string),
+        ) {
+            Ok(acl) => acl,
+            Err(error) => {
+                let mut errors = vec![error];
+                close_appcontainer(appcontainer, &mut errors);
+                return Err(errors.join("; "));
+            }
+        };
+        let runtime_acl = match RuntimeAcl::apply(
+            &executable,
+            appcontainer.as_ref().map(AppContainerProfile::sid_string),
+        ) {
             Ok(acl) => acl,
             Err(error) => {
                 let restore = acl.restore();
-                return Err(match restore {
-                    Ok(()) => error,
-                    Err(restore_error) => format!("{error}; {restore_error}"),
-                });
+                let mut errors = vec![error];
+                if let Err(restore_error) = restore {
+                    errors.push(restore_error);
+                }
+                close_appcontainer(appcontainer, &mut errors);
+                return Err(errors.join("; "));
             }
         };
         let rule = match FirewallRule::install(&options, &executable) {
@@ -122,14 +519,18 @@ mod windows_backend {
             Err(error) => {
                 let runtime_restore = runtime_acl.restore();
                 let workspace_restore = acl.restore();
-                return Err(join_cleanup_errors(
-                    error,
-                    runtime_restore,
-                    workspace_restore,
-                ));
+                let mut errors = vec![error];
+                if let Err(restore_error) = runtime_restore {
+                    errors.push(restore_error);
+                }
+                if let Err(restore_error) = workspace_restore {
+                    errors.push(restore_error);
+                }
+                close_appcontainer(appcontainer, &mut errors);
+                return Err(errors.join("; "));
             }
         };
-        let result = spawn_restricted(&options, &executable);
+        let result = spawn_restricted(&options, &executable, appcontainer.as_ref());
         let remove_result = rule.remove();
         let runtime_acl_result = runtime_acl.restore();
         let acl_result = acl.restore();
@@ -150,6 +551,7 @@ mod windows_backend {
         if let Err(error) = acl_result {
             errors.push(error);
         }
+        close_appcontainer(appcontainer, &mut errors);
         if errors.is_empty() {
             match outcome {
                 Some(outcome) => Ok(outcome),
@@ -160,19 +562,12 @@ mod windows_backend {
         }
     }
 
-    fn join_cleanup_errors(
-        primary: String,
-        runtime_restore: Result<(), String>,
-        workspace_restore: Result<(), String>,
-    ) -> String {
-        let mut errors = vec![primary];
-        if let Err(error) = runtime_restore {
-            errors.push(error);
+    fn close_appcontainer(profile: Option<AppContainerProfile>, errors: &mut Vec<String>) {
+        if let Some(profile) = profile {
+            if let Err(error) = profile.close() {
+                errors.push(format!("close Windows AppContainer: {error}"));
+            }
         }
-        if let Err(error) = workspace_restore {
-            errors.push(error);
-        }
-        errors.join("; ")
     }
 
     fn probe() -> Result<(), String> {
@@ -219,31 +614,56 @@ mod windows_backend {
             timeout_seconds: 10,
             command,
         };
-        let acl = match WorkspaceAcl::apply(&probe_root) {
-            Ok(acl) => acl,
+        let appcontainer = match AppContainerProfile::create() {
+            Ok(profile) => Some(profile),
             Err(error) => {
                 let _ = std::fs::remove_dir_all(&probe_root);
                 return Err(error);
             }
         };
-        let runtime_acl = match RuntimeAcl::apply(&helper) {
+        let acl = match WorkspaceAcl::apply(
+            &probe_root,
+            appcontainer.as_ref().map(AppContainerProfile::sid_string),
+        ) {
             Ok(acl) => acl,
             Err(error) => {
-                let _ = acl.restore();
+                let mut errors = vec![error];
+                close_appcontainer(appcontainer, &mut errors);
                 let _ = std::fs::remove_dir_all(&probe_root);
-                return Err(error);
+                return Err(errors.join("; "));
+            }
+        };
+        let runtime_acl = match RuntimeAcl::apply(
+            &helper,
+            appcontainer.as_ref().map(AppContainerProfile::sid_string),
+        ) {
+            Ok(acl) => acl,
+            Err(error) => {
+                let mut errors = vec![error];
+                if let Err(restore_error) = acl.restore() {
+                    errors.push(restore_error);
+                }
+                close_appcontainer(appcontainer, &mut errors);
+                let _ = std::fs::remove_dir_all(&probe_root);
+                return Err(errors.join("; "));
             }
         };
         let rule = match FirewallRule::install(&options, &helper) {
             Ok(rule) => rule,
             Err(error) => {
-                let _ = runtime_acl.restore();
-                let _ = acl.restore();
+                let mut errors = vec![error];
+                if let Err(restore_error) = runtime_acl.restore() {
+                    errors.push(restore_error);
+                }
+                if let Err(restore_error) = acl.restore() {
+                    errors.push(restore_error);
+                }
+                close_appcontainer(appcontainer, &mut errors);
                 let _ = std::fs::remove_dir_all(&probe_root);
-                return Err(error);
+                return Err(errors.join("; "));
             }
         };
-        let result = spawn_restricted(&options, &helper);
+        let result = spawn_restricted(&options, &helper, appcontainer.as_ref());
         let network_connected = listener_observed_connection(&listener);
         let remove_result = rule.remove();
         let runtime_acl_result = runtime_acl.restore();
@@ -268,6 +688,11 @@ mod windows_backend {
                 if !report.contains("descendant_blocked=true") {
                     errors.push("Windows Job Object allowed an untracked descendant".to_string());
                 }
+                if !report.contains("appcontainer=true") {
+                    errors.push(
+                        "Windows network-none probe did not enter an AppContainer".to_string(),
+                    );
+                }
                 if !report.contains("outside_denied=true")
                     || !report.contains("inside_written=true")
                 {
@@ -288,6 +713,7 @@ mod windows_backend {
         if let Err(error) = acl_result {
             errors.push(error);
         }
+        close_appcontainer(appcontainer, &mut errors);
         if let Err(error) = remove_probe_path(&outside) {
             errors.push(error);
         }
@@ -298,7 +724,7 @@ mod windows_backend {
             return Err(errors.join("; "));
         }
         println!(
-            "{{\"restricted_token\":true,\"job_object\":true,\"process_tree\":true,\"acl\":true,\"wfp\":true}}"
+            "{{\"restricted_token\":true,\"job_object\":true,\"process_tree\":true,\"acl\":true,\"wfp\":true,\"appcontainer\":true}}"
         );
         Ok(())
     }
@@ -359,6 +785,7 @@ mod windows_backend {
             workspace.ok_or_else(|| "Windows probe workspace is missing".to_string())?;
         let outside = outside.ok_or_else(|| "Windows probe outside path is missing".to_string())?;
         let port = port.ok_or_else(|| "Windows probe port is missing".to_string())?;
+        let appcontainer = running_in_appcontainer()?;
         let address: std::net::SocketAddr = format!("127.0.0.1:{port}")
             .parse()
             .map_err(|e| format!("invalid probe address: {e}"))?;
@@ -374,11 +801,34 @@ mod windows_backend {
         let inside_written = std::fs::write(workspace.join("inside-probe.txt"), b"ok").is_ok();
         let outside_denied = std::fs::write(outside, b"must-not-write").is_err();
         let report = format!(
-            "network_blocked={network_blocked}\ndescendant_blocked={descendant_blocked}\ninside_written={inside_written}\noutside_denied={outside_denied}\n"
+            "network_blocked={network_blocked}\ndescendant_blocked={descendant_blocked}\nappcontainer={appcontainer}\ninside_written={inside_written}\noutside_denied={outside_denied}\n"
         );
         std::fs::write(workspace.join("probe-result.txt"), report)
             .map_err(|e| format!("write Windows sandbox capability probe: {e}"))?;
         Ok(())
+    }
+
+    fn running_in_appcontainer() -> Result<bool, String> {
+        let mut token = null_mut();
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            return Err(last_error("OpenProcessToken(probe child)"));
+        }
+        let token = Handle(token);
+        let mut value = 0u32;
+        let mut returned = 0u32;
+        if unsafe {
+            GetTokenInformation(
+                token.0,
+                TokenIsAppContainer,
+                &mut value as *mut u32 as *mut c_void,
+                size_of::<u32>() as u32,
+                &mut returned,
+            )
+        } == 0
+        {
+            return Err(last_error("GetTokenInformation(TokenIsAppContainer)"));
+        }
+        Ok(value != 0)
     }
 
     struct Options {
@@ -788,10 +1238,14 @@ mod windows_backend {
         Ok(())
     }
 
-    fn spawn_restricted(options: &Options, executable: &Path) -> Result<ExecutionOutcome, String> {
+    fn spawn_restricted(
+        options: &Options,
+        executable: &Path,
+        appcontainer: Option<&AppContainerProfile>,
+    ) -> Result<ExecutionOutcome, String> {
         let token = restricted_token()?;
         let job = unsafe { CreateJobObjectW(null(), null()) };
-        if job == null_mut() {
+        if job.is_null() {
             return Err(last_error("CreateJobObjectW"));
         }
         let job = Handle(job);
@@ -799,16 +1253,34 @@ mod windows_backend {
         let mut command = quote_command_line(&options.command);
         let mut application = wide_null(executable.as_os_str());
         let mut current_directory = wide_null(options.cwd.as_os_str());
-        let mut startup: STARTUPINFOW = unsafe { zeroed() };
-        startup.cb = size_of::<STARTUPINFOW>() as u32;
-        startup.dwFlags = STARTF_USESTDHANDLES;
+        let appcontainer_attributes = appcontainer
+            .map(AppContainerAttributes::create)
+            .transpose()?;
+        let mut startup: STARTUPINFOEXW = unsafe { zeroed() };
+        startup.StartupInfo.cb = if appcontainer_attributes.is_some() {
+            size_of::<STARTUPINFOEXW>() as u32
+        } else {
+            size_of::<STARTUPINFOW>() as u32
+        };
+        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
         // Keep the helper's cancellation pipe private.  Passing the same
         // stdin handle to the restricted child would let the command consume
         // the cancellation byte before the helper sees it.
-        startup.hStdInput = null_mut();
-        startup.hStdOutput = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
-        startup.hStdError = unsafe { GetStdHandle(STD_ERROR_HANDLE) };
+        startup.StartupInfo.hStdInput = null_mut();
+        startup.StartupInfo.hStdOutput = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+        startup.StartupInfo.hStdError = unsafe { GetStdHandle(STD_ERROR_HANDLE) };
+        startup.lpAttributeList = appcontainer_attributes
+            .as_ref()
+            .map_or(null_mut(), |attributes| attributes.list);
         let mut information: PROCESS_INFORMATION = unsafe { zeroed() };
+        let creation_flags = CREATE_NEW_PROCESS_GROUP
+            | CREATE_SUSPENDED
+            | CREATE_UNICODE_ENVIRONMENT
+            | if appcontainer_attributes.is_some() {
+                EXTENDED_STARTUPINFO_PRESENT
+            } else {
+                0
+            };
         let created = unsafe {
             CreateProcessAsUserW(
                 token.0,
@@ -817,10 +1289,10 @@ mod windows_backend {
                 null_mut(),
                 null_mut(),
                 1,
-                CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
+                creation_flags,
                 null_mut(),
                 current_directory.as_mut_ptr(),
-                &startup,
+                &startup.StartupInfo,
                 &mut information,
             )
         };
@@ -913,10 +1385,19 @@ mod windows_backend {
     struct WorkspaceAcl {
         workspace: PathBuf,
         backup: PathBuf,
+        integrity: Option<IntegrityTransaction>,
+        appcontainer_sid: Option<String>,
     }
 
     impl WorkspaceAcl {
-        fn apply(workspace: &Path) -> Result<Self, String> {
+        fn apply(workspace: &Path, appcontainer_sid: Option<&str>) -> Result<Self, String> {
+            let integrity = if appcontainer_sid.is_some() {
+                Some(IntegrityTransaction::capture(workspace).map_err(|error| {
+                    format!("capture AppContainer workspace integrity: {error}")
+                })?)
+            } else {
+                None
+            };
             let backup = env::temp_dir().join(unique_rule_name("acl"));
             let save = vec![
                 workspace.as_os_str().to_os_string(),
@@ -926,13 +1407,40 @@ mod windows_backend {
                 OsString::from("/c"),
             ];
             run_icacls(&save).map_err(|error| format!("save workspace ACL: {error}"))?;
-            let grant = vec![
+            let mut grant = vec![
                 workspace.as_os_str().to_os_string(),
                 OsString::from("/grant:r"),
                 OsString::from("*S-1-5-12:(OI)(CI)F"),
-                OsString::from("/t"),
-                OsString::from("/c"),
             ];
+            if let Some(sid) = appcontainer_sid {
+                grant.extend([
+                    OsString::from("/grant"),
+                    OsString::from(format!("*{sid}:(OI)(CI)F")),
+                ]);
+                let integrity_args = vec![
+                    workspace.as_os_str().to_os_string(),
+                    OsString::from("/setintegritylevel"),
+                    OsString::from("(OI)(CI)L"),
+                    OsString::from("/t"),
+                    OsString::from("/c"),
+                ];
+                if let Err(error) = run_icacls(&integrity_args) {
+                    let restore = vec![
+                        workspace.as_os_str().to_os_string(),
+                        OsString::from("/restore"),
+                        backup.as_os_str().to_os_string(),
+                        OsString::from("/c"),
+                    ];
+                    let _ = run_icacls(&restore);
+                    let _ = remove_workspace_grants(workspace, appcontainer_sid);
+                    if let Some(integrity) = integrity {
+                        let _ = integrity.restore();
+                    }
+                    let _ = std::fs::remove_file(&backup);
+                    return Err(format!("set AppContainer workspace integrity: {error}"));
+                }
+            }
+            grant.extend([OsString::from("/t"), OsString::from("/c")]);
             if let Err(error) = run_icacls(&grant) {
                 let restore = vec![
                     workspace.as_os_str().to_os_string(),
@@ -941,12 +1449,18 @@ mod windows_backend {
                     OsString::from("/c"),
                 ];
                 let _ = run_icacls(&restore);
+                let _ = remove_workspace_grants(workspace, appcontainer_sid);
+                if let Some(integrity) = integrity {
+                    let _ = integrity.restore();
+                }
                 let _ = std::fs::remove_file(&backup);
                 return Err(format!("grant restricted workspace ACL: {error}"));
             }
             Ok(Self {
                 workspace: workspace.to_path_buf(),
                 backup,
+                integrity,
+                appcontainer_sid: appcontainer_sid.map(str::to_owned),
             })
         }
 
@@ -957,12 +1471,45 @@ mod windows_backend {
                 self.backup.as_os_str().to_os_string(),
                 OsString::from("/c"),
             ];
-            let result =
-                run_icacls(&restore).map_err(|error| format!("restore workspace ACL: {error}"));
-            let remove = std::fs::remove_file(&self.backup)
-                .map_err(|error| format!("remove workspace ACL backup: {error}"));
-            result.and(remove)
+            let mut errors = Vec::new();
+            if let Err(error) =
+                remove_workspace_grants(&self.workspace, self.appcontainer_sid.as_deref())
+            {
+                errors.push(format!("remove temporary workspace ACL grants: {error}"));
+            }
+            if let Err(error) = run_icacls(&restore) {
+                errors.push(format!("restore workspace ACL: {error}"));
+            }
+            if let Some(integrity) = self.integrity {
+                if let Err(error) = integrity.restore() {
+                    errors.push(format!("restore workspace integrity: {error}"));
+                }
+            }
+            if let Err(error) = std::fs::remove_file(&self.backup) {
+                errors.push(format!("remove workspace ACL backup: {error}"));
+            }
+            if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(errors.join("; "))
+            }
         }
+    }
+
+    fn remove_workspace_grants(
+        workspace: &Path,
+        appcontainer_sid: Option<&str>,
+    ) -> Result<(), String> {
+        let mut arguments = vec![
+            workspace.as_os_str().to_os_string(),
+            OsString::from("/remove:g"),
+            OsString::from("*S-1-5-12"),
+        ];
+        if let Some(sid) = appcontainer_sid {
+            arguments.push(OsString::from(format!("*{sid}")));
+        }
+        arguments.extend([OsString::from("/t"), OsString::from("/c")]);
+        run_icacls(&arguments)
     }
 
     /// Temporarily grants the restricted-code SID read/execute access to the
@@ -987,7 +1534,7 @@ mod windows_backend {
     }
 
     impl RuntimeAcl {
-        fn apply(executable: &Path) -> Result<Self, String> {
+        fn apply(executable: &Path, appcontainer_sid: Option<&str>) -> Result<Self, String> {
             let runtime_root = executable
                 .parent()
                 .ok_or_else(|| "Windows sandbox executable has no parent directory".to_string())?
@@ -1005,15 +1552,23 @@ mod windows_backend {
             }
             let mut entries = Vec::new();
             for ancestor in directory_ancestors(&runtime_root) {
-                if let Err(error) =
-                    apply_runtime_acl(&ancestor, &mut entries, "*S-1-5-12:(X)", false)
-                {
+                if let Err(error) = apply_runtime_acl(
+                    &ancestor,
+                    &mut entries,
+                    "*S-1-5-12:(X)",
+                    appcontainer_sid,
+                    false,
+                ) {
                     return Err(join_runtime_acl_error(error, entries));
                 }
             }
-            if let Err(error) =
-                apply_runtime_acl(&runtime_root, &mut entries, "*S-1-5-12:(OI)(CI)RX", true)
-            {
+            if let Err(error) = apply_runtime_acl(
+                &runtime_root,
+                &mut entries,
+                "*S-1-5-12:(OI)(CI)RX",
+                appcontainer_sid,
+                true,
+            ) {
                 return Err(join_runtime_acl_error(error, entries));
             }
             Ok(Self { entries })
@@ -1028,6 +1583,7 @@ mod windows_backend {
         root: &Path,
         entries: &mut Vec<RuntimeAclEntry>,
         permission: &str,
+        appcontainer_sid: Option<&str>,
         recursive: bool,
     ) -> Result<(), String> {
         let backup = env::temp_dir().join(unique_rule_name("runtime-acl"));
@@ -1051,6 +1607,13 @@ mod windows_backend {
             OsString::from("/grant"),
             OsString::from(permission),
         ];
+        if let Some(sid) = appcontainer_sid {
+            let app_permission = permission.strip_prefix("*S-1-5-12:").unwrap_or(permission);
+            grant.extend([
+                OsString::from("/grant"),
+                OsString::from(format!("*{sid}:{app_permission}")),
+            ]);
+        }
         if recursive {
             grant.extend([OsString::from("/t"), OsString::from("/c")]);
         }
@@ -1410,6 +1973,27 @@ mod windows_backend {
 
     fn wide_null(value: &OsStr) -> Vec<u16> {
         value.encode_wide().chain(once(0)).collect()
+    }
+
+    fn sid_to_string(sid: PSID) -> Result<String, String> {
+        let mut raw = null_mut();
+        if unsafe { ConvertSidToStringSidW(sid, &mut raw) } == 0 {
+            return Err(last_error("ConvertSidToStringSidW"));
+        }
+        let value = unsafe {
+            let mut length = 0usize;
+            while *raw.add(length) != 0 {
+                length += 1;
+            }
+            OsString::from_wide(std::slice::from_raw_parts(raw, length))
+        };
+        let free_result = unsafe { LocalFree(raw as HLOCAL) };
+        if !free_result.is_null() {
+            return Err("LocalFree failed for converted SID".to_string());
+        }
+        value
+            .into_string()
+            .map_err(|_| "converted AppContainer SID is not valid UTF-16".to_string())
     }
 
     fn last_error(operation: &str) -> String {

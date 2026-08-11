@@ -10,14 +10,15 @@
 | `Security Contract Matrix / contract` | Ubuntu 24.04、Windows 2025、macOS 14 | Approval、turn、permission profile、Office read/write Sandbox path、durable webhook replay/限流隔离、workspace mutation-wide storage authority、mutation cancel fence、deleted fd accounting、Git identity、快速退出最终核算、遍历错误/churn fail-closed、Gateway/RPC、managed resource、TUI、Go/Rust；POSIX 额外验证 Verification Authority、Office nested-object rejection 与 dirfd workspace boundary | 真实 OS 隔离 |
 | `Platform Sandbox Security E2E / linux-bwrap-security` | Ubuntu hosted runner | bwrap workspace-write/read-only、Landlock filesystem allowlist（缺失即拒绝）、`.git` pointer read-only、禁网、secret root、PID/process tree、HOME/TMP size 与 entry budget、TaskWorkspace 相对 entry budget、无 Host fallback | Windows sandbox |
 | `Platform Sandbox Security E2E / macos-sandbox-security` | macOS hosted runner | sandbox-exec workspace-write、`.git`/case alias write denial、外部写拒绝、禁网、secret root、pasteboard/Keychain IPC、whole-HOME 与 TaskWorkspace 相对 byte budget 拒绝 | Linux namespace |
-| `Platform Sandbox Security E2E / windows-fail-closed-security` | Windows hosted runner | 构建并 probe native helper；restricted token、Job Object 单 native runtime 上限、workspace ACL、runtime read/execute ACL、WFP Firewall；native execution 与 no-Host-fallback contract | Windows AppContainer/private-desktop parity、Linux namespace/browser kernel isolation |
+| `Platform Sandbox Security E2E / windows-fail-closed-security` | Windows hosted runner | 构建并 probe native helper；`network=none` 的 AppContainer token/no-network、restricted token、Job Object 单 native runtime 上限、workspace ACL、runtime read/execute ACL、WFP Firewall；native execution 与 no-Host-fallback contract | Windows private-desktop parity、Linux namespace/browser kernel isolation |
 | `Docker Security E2E / docker-isolation` | Ubuntu + Docker | digest-pinned image、network none、read-only root、非 root、`.git` readonly mount、deleted-open-file PID namespace watchdog、资源限制、timeout/cancel/shutdown cleanup、Trusted Verification secret/output 边界 | 非容器宿主策略 |
 | `Docker Security E2E / compose-deployment` | Ubuntu + Docker | clean-checkout Compose startup、loopback-only development HTTP、production TLS/API-key/Host allowlist、secret-file wiring、authenticated health smoke | 非 Docker 宿主策略、长期证书轮换 |
 | `Security Closure Gate` | reusable workflow 聚合 | 上述真实平台矩阵、Python security、Go race、Rust test/clippy、供应链、schema fuzz、authorization drift、process lifecycle、event-loop starvation 全部成功，并生成 commit-bound Security Evidence Artifact | 绝对安全；未支持平台的功能可用性 |
 
 Windows 的安全承诺是 **native-or-fail-closed**：只有当前 job 构建的
-`khaos-windows-sandbox.exe` 输出五项完整 probe 证据，Coding command execution 才会
-被允许；否则执行拒绝，绝不切换到 Host subprocess。该 backend 不宣称 AppContainer、
+`khaos-windows-sandbox.exe` 输出六项完整 probe 证据，Coding command execution 才会
+被允许；否则执行拒绝，绝不切换到 Host subprocess。该 backend 已在
+`network=none` 路径验证 AppContainer/no-network contract，但不宣称 Windows
 private desktop 或浏览器专用 Linux netns parity。
 
 ## Supply-chain 规则
