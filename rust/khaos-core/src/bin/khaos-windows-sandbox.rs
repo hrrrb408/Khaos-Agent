@@ -41,9 +41,9 @@ mod windows_backend {
         JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
     };
     use windows_sys::Win32::System::Threading::{
-        CreateProcessAsUserW, GetCurrentProcess, OpenProcessToken, ResumeThread,
-        CREATE_NEW_PROCESS_GROUP, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION,
-        STARTF_USESTDHANDLES, STARTUPINFOW,
+        CreateProcessAsUserW, GetCurrentProcess, GetExitCodeProcess, OpenProcessToken,
+        ResumeThread, CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
+        PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
     };
 
     const FIREWALL_PREFIX: &str = "KhaosWindowsSandbox";
@@ -374,7 +374,7 @@ mod windows_backend {
                 null_mut(),
                 null_mut(),
                 1,
-                CREATE_NEW_PROCESS_GROUP | CREATE_UNICODE_ENVIRONMENT,
+                CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
                 null_mut(),
                 current_directory.as_mut_ptr(),
                 &startup,
@@ -437,6 +437,17 @@ mod windows_backend {
         };
         if wait != WAIT_OBJECT_0 {
             return Err(last_error("WaitForSingleObject after job termination"));
+        }
+        if matches!(outcome, ExecutionOutcome::Completed) {
+            let mut exit_code = 0_u32;
+            if unsafe { GetExitCodeProcess(process.0, &mut exit_code) } == 0 {
+                return Err(last_error("GetExitCodeProcess"));
+            }
+            if exit_code != 0 {
+                return Err(format!(
+                    "Windows sandbox child exited with status {exit_code}"
+                ));
+            }
         }
         Ok(outcome)
     }
