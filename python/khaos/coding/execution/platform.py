@@ -267,13 +267,19 @@ class WindowsSandboxBackend:
             same_as_khaos_python = False
         if same_as_khaos_python:
             seen_runtime_paths: set[Path] = set()
-            for prefix in (sys.prefix, sys.base_prefix):
+            # The venv owns third-party imports under its Lib tree.  The
+            # base install is handled below by exact launcher/DLL files;
+            # recursively ACL-ing the hosted base standard-library tree is
+            # both unnecessary for the native probe and too slow on CI.
+            for prefix in (sys.prefix,):
                 runtime_root = Path(prefix).expanduser().resolve()
                 for relative_root in ("Lib", "DLLs"):
                     path = runtime_root / relative_root
                     if path.is_dir() and path not in seen_runtime_paths:
                         helper_args.extend(("--runtime-root", str(path)))
                         seen_runtime_paths.add(path)
+            for prefix in (sys.prefix, sys.base_prefix):
+                runtime_root = Path(prefix).expanduser().resolve()
                 exact_files = (
                     runtime_root / "pyvenv.cfg",
                     runtime_root / "python.exe",
