@@ -52,7 +52,9 @@ contract; model-controlled environment values never authorize the join.
 `WindowsSandboxBackend` has no Host fallback. The Rust helper must prove before
 execution:
 
-1. a restricted primary token with the restricted-code SID;
+1. a restricted primary token with the restricted-code capability, current
+   logon SID and Everyone restricted groups, plus an explicit default DACL for
+   child-created IPC objects;
 2. a kill-on-close Job Object with resource limits and an active-process limit
    of two (the launcher plus one native runtime process);
 3. transactionally granted/restored restricted-code ACLs: full access for the

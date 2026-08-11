@@ -26,15 +26,20 @@ mod windows_backend {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use windows_sys::Win32::Foundation::{
-        CloseHandle, GetLastError, ERROR_NOT_ALL_ASSIGNED, HANDLE, WAIT_FAILED, WAIT_OBJECT_0,
-        WAIT_TIMEOUT,
+        CloseHandle, GetLastError, LocalFree, ERROR_NOT_ALL_ASSIGNED, ERROR_SUCCESS, HANDLE,
+        HLOCAL, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    };
+    use windows_sys::Win32::Security::Authorization::{
+        SetEntriesInAclW, EXPLICIT_ACCESS_W, GRANT_ACCESS, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN,
+        TRUSTEE_W,
     };
     use windows_sys::Win32::Security::{
-        AdjustTokenPrivileges, CreateRestrictedToken, CreateWellKnownSid, IsTokenRestricted,
-        LookupPrivilegeValueW, WinRestrictedCodeSid, DISABLE_MAX_PRIVILEGE, LUA_TOKEN,
-        LUID_AND_ATTRIBUTES, PSID, SE_CHANGE_NOTIFY_NAME, SE_PRIVILEGE_ENABLED, SID_AND_ATTRIBUTES,
-        TOKEN_ADJUST_PRIVILEGES, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_PRIVILEGES,
-        TOKEN_QUERY, WRITE_RESTRICTED,
+        AdjustTokenPrivileges, CopySid, CreateRestrictedToken, CreateWellKnownSid, GetLengthSid,
+        GetTokenInformation, IsTokenRestricted, LookupPrivilegeValueW, SetTokenInformation,
+        TokenDefaultDacl, TokenGroups, WinRestrictedCodeSid, WinWorldSid, DISABLE_MAX_PRIVILEGE,
+        LUA_TOKEN, LUID_AND_ATTRIBUTES, PSID, SE_CHANGE_NOTIFY_NAME, SE_PRIVILEGE_ENABLED,
+        SID_AND_ATTRIBUTES, TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_PRIVILEGES, TOKEN_ADJUST_SESSIONID,
+        TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_PRIVILEGES, TOKEN_QUERY, WRITE_RESTRICTED,
     };
     use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE};
     use windows_sys::Win32::System::JobObjects::{
@@ -43,6 +48,7 @@ mod windows_backend {
         JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_JOB_TIME,
         JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
     };
+    use windows_sys::Win32::System::SystemServices::SE_GROUP_LOGON_ID;
     use windows_sys::Win32::System::Threading::{
         CreateProcessAsUserW, GetCurrentProcess, GetExitCodeProcess, OpenProcessToken,
         ResumeThread, CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
@@ -63,6 +69,11 @@ mod windows_backend {
     }
 
     struct Handle(HANDLE);
+
+    #[repr(C)]
+    struct TokenDefaultDaclInfo {
+        default_dacl: *mut windows_sys::Win32::Security::ACL,
+    }
 
     impl Drop for Handle {
         fn drop(&mut self) {
@@ -306,15 +317,16 @@ mod windows_backend {
 
     fn restricted_token() -> Result<Handle, String> {
         let restricted_sid = restricted_code_sid()?;
-        let restricted_sid_attribute = SID_AND_ATTRIBUTES {
-            Sid: restricted_sid.as_ptr() as PSID,
-            Attributes: 0,
-        };
         let mut current: HANDLE = null_mut();
         let opened = unsafe {
             OpenProcessToken(
                 GetCurrentProcess(),
-                TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY | TOKEN_ADJUST_PRIVILEGES,
+                TOKEN_DUPLICATE
+                    | TOKEN_QUERY
+                    | TOKEN_ASSIGN_PRIMARY
+                    | TOKEN_ADJUST_DEFAULT
+                    | TOKEN_ADJUST_SESSIONID
+                    | TOKEN_ADJUST_PRIVILEGES,
                 &mut current as *mut HANDLE,
             )
         };
@@ -322,6 +334,22 @@ mod windows_backend {
             return Err(last_error("OpenProcessToken"));
         }
         let current = Handle(current);
+        let logon_sid = token_logon_sid(current.0)?;
+        let everyone_sid = world_sid()?;
+        let restricted_sid_attributes = [
+            SID_AND_ATTRIBUTES {
+                Sid: restricted_sid.as_ptr() as PSID,
+                Attributes: 0,
+            },
+            SID_AND_ATTRIBUTES {
+                Sid: logon_sid.as_ptr() as PSID,
+                Attributes: 0,
+            },
+            SID_AND_ATTRIBUTES {
+                Sid: everyone_sid.as_ptr() as PSID,
+                Attributes: 0,
+            },
+        ];
         let mut restricted: HANDLE = null_mut();
         let created = unsafe {
             CreateRestrictedToken(
@@ -331,16 +359,156 @@ mod windows_backend {
                 null(),
                 0,
                 null(),
-                1,
-                &restricted_sid_attribute,
+                restricted_sid_attributes.len() as u32,
+                restricted_sid_attributes.as_ptr(),
                 &mut restricted as *mut HANDLE,
             )
         };
         if created == 0 {
             return Err(last_error("CreateRestrictedToken"));
         }
-        enable_change_notify_privilege(restricted)?;
+        if let Err(error) = set_default_dacl(
+            restricted,
+            &[
+                logon_sid.as_ptr() as PSID,
+                everyone_sid.as_ptr() as PSID,
+                restricted_sid.as_ptr() as PSID,
+            ],
+        ) {
+            unsafe { CloseHandle(restricted) };
+            return Err(error);
+        }
+        if let Err(error) = enable_change_notify_privilege(restricted) {
+            unsafe { CloseHandle(restricted) };
+            return Err(error);
+        }
         Ok(Handle(restricted))
+    }
+
+    /// Preserve the interactive logon identity as a restricted SID so the
+    /// normal Windows runtime can read user-scoped IPC and loader objects.
+    fn token_logon_sid(token: HANDLE) -> Result<Vec<u8>, String> {
+        let mut required = 0_u32;
+        unsafe {
+            GetTokenInformation(token, TokenGroups, null_mut(), 0, &mut required as *mut u32);
+        }
+        if required == 0 {
+            return Err(last_error("GetTokenInformation(TokenGroups size)"));
+        }
+        let mut buffer = vec![0_u8; required as usize];
+        if unsafe {
+            GetTokenInformation(
+                token,
+                TokenGroups,
+                buffer.as_mut_ptr() as *mut c_void,
+                required,
+                &mut required as *mut u32,
+            )
+        } == 0
+        {
+            return Err(last_error("GetTokenInformation(TokenGroups)"));
+        }
+        if buffer.len() < size_of::<u32>() {
+            return Err("TokenGroups response is truncated".to_string());
+        }
+        let group_count = unsafe { std::ptr::read_unaligned(buffer.as_ptr() as *const u32) };
+        let after_count = buffer.as_ptr() as usize + size_of::<u32>();
+        let alignment = std::mem::align_of::<SID_AND_ATTRIBUTES>();
+        let groups_address = (after_count + alignment - 1) & !(alignment - 1);
+        let groups_offset = groups_address - buffer.as_ptr() as usize;
+        let group_size = size_of::<SID_AND_ATTRIBUTES>();
+        let group_bytes = (group_count as usize)
+            .checked_mul(group_size)
+            .ok_or_else(|| "TokenGroups count overflow".to_string())?;
+        if groups_offset > buffer.len() || group_bytes > buffer.len() - groups_offset {
+            return Err("TokenGroups response has invalid group bounds".to_string());
+        }
+        let groups = groups_address as *const SID_AND_ATTRIBUTES;
+        for index in 0..group_count as usize {
+            let entry = unsafe { std::ptr::read_unaligned(groups.add(index)) };
+            if entry.Attributes & SE_GROUP_LOGON_ID as u32 == 0 {
+                continue;
+            }
+            if entry.Sid.is_null() {
+                return Err("TokenGroups contains a null logon SID".to_string());
+            }
+            let length = unsafe { GetLengthSid(entry.Sid) };
+            if length == 0 {
+                return Err(last_error("GetLengthSid(logon SID)"));
+            }
+            let mut sid = vec![0_u8; length as usize];
+            if unsafe { CopySid(length, sid.as_mut_ptr() as PSID, entry.Sid) } == 0 {
+                return Err(last_error("CopySid(logon SID)"));
+            }
+            return Ok(sid);
+        }
+        Err("interactive logon SID is absent from the current token".to_string())
+    }
+
+    /// Give child-created pipes and runtime IPC a narrow, explicit default
+    /// DACL.  This does not grant filesystem access; the workspace/runtime
+    /// ACL transactions remain the filesystem authority.
+    fn set_default_dacl(token: HANDLE, sids: &[PSID]) -> Result<(), String> {
+        if sids.is_empty() {
+            return Ok(());
+        }
+        const GENERIC_ALL: u32 = 0x1000_0000;
+        let entries: Vec<EXPLICIT_ACCESS_W> = sids
+            .iter()
+            .map(|sid| EXPLICIT_ACCESS_W {
+                grfAccessPermissions: GENERIC_ALL,
+                grfAccessMode: GRANT_ACCESS,
+                grfInheritance: 0,
+                Trustee: TRUSTEE_W {
+                    pMultipleTrustee: null_mut(),
+                    MultipleTrusteeOperation: 0,
+                    TrusteeForm: TRUSTEE_IS_SID,
+                    TrusteeType: TRUSTEE_IS_UNKNOWN,
+                    ptstrName: *sid as *mut u16,
+                },
+            })
+            .collect();
+        let mut new_acl: *mut windows_sys::Win32::Security::ACL = null_mut();
+        let result = unsafe {
+            SetEntriesInAclW(
+                entries.len() as u32,
+                entries.as_ptr(),
+                null(),
+                &mut new_acl as *mut *mut windows_sys::Win32::Security::ACL,
+            )
+        };
+        if result != ERROR_SUCCESS {
+            return Err(format!("SetEntriesInAclW failed with Win32 error {result}"));
+        }
+        let mut info = TokenDefaultDaclInfo {
+            default_dacl: new_acl,
+        };
+        let updated = unsafe {
+            SetTokenInformation(
+                token,
+                TokenDefaultDacl,
+                &mut info as *mut TokenDefaultDaclInfo as *mut c_void,
+                size_of::<TokenDefaultDaclInfo>() as u32,
+            )
+        };
+        let free_result = if new_acl.is_null() {
+            None
+        } else {
+            Some(unsafe { LocalFree(new_acl as HLOCAL) })
+        };
+        if updated == 0 {
+            let mut error = last_error("SetTokenInformation(TokenDefaultDacl)");
+            if let Some(free_result) = free_result {
+                if !free_result.is_null() {
+                    error.push_str("; LocalFree(default DACL) failed");
+                }
+            }
+            return Err(error);
+        }
+        if free_result.is_some_and(|result| !result.is_null()) {
+            return Err("LocalFree(default DACL) failed".to_string());
+        }
+        Ok(())
     }
 
     /// Re-enable only directory traversal after creating the restricted token.
@@ -380,18 +548,27 @@ mod windows_backend {
     }
 
     fn restricted_code_sid() -> Result<Vec<u8>, String> {
+        well_known_sid(WinRestrictedCodeSid, "restricted-code SID")
+    }
+
+    fn world_sid() -> Result<Vec<u8>, String> {
+        well_known_sid(WinWorldSid, "Everyone SID")
+    }
+
+    fn well_known_sid(
+        sid_type: windows_sys::Win32::Security::WELL_KNOWN_SID_TYPE,
+        label: &str,
+    ) -> Result<Vec<u8>, String> {
         let mut sid = vec![0u8; 68];
         let mut size = sid.len() as u32;
         let created = unsafe {
-            CreateWellKnownSid(
-                WinRestrictedCodeSid,
-                null_mut(),
-                sid.as_mut_ptr() as PSID,
-                &mut size,
-            )
+            CreateWellKnownSid(sid_type, null_mut(), sid.as_mut_ptr() as PSID, &mut size)
         };
         if created == 0 {
-            return Err(last_error("CreateWellKnownSid"));
+            return Err(format!(
+                "CreateWellKnownSid({label}): {}",
+                last_error("Win32")
+            ));
         }
         sid.truncate(size as usize);
         Ok(sid)
