@@ -773,12 +773,27 @@ mod windows_backend {
                     resolved.display()
                 ));
             }
-            return Ok(resolved);
+            // ``canonicalize`` may return a Win32 extended path such as
+            // ``\\?\\C:\\...``.  CreateProcess and icacls accept that form,
+            // but the Windows Firewall application filter rejects the
+            // ``\\?\\`` prefix as invalid application-path characters.
+            return Ok(strip_windows_verbatim_prefix(resolved));
         }
         Err(format!(
             "Windows sandbox executable could not be resolved: {}",
             command.to_string_lossy()
         ))
+    }
+
+    fn strip_windows_verbatim_prefix(path: PathBuf) -> PathBuf {
+        let value = path.to_string_lossy();
+        if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = value.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+        path
     }
 
     fn unique_rule_name(kind: &str) -> String {
