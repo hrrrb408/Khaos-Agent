@@ -1144,10 +1144,7 @@ mod windows_backend {
                     format!("name={allow_name}"),
                     "dir=out".to_string(),
                     "action=allow".to_string(),
-                    // ``Command`` passes this as one already-isolated argv
-                    // element; embedding shell quotes would make the quotes
-                    // part of the program path when netsh parses it.
-                    format!("program={program}"),
+                    program_rule_argument(&program),
                     "remoteip=127.0.0.1".to_string(),
                     "protocol=TCP".to_string(),
                     format!("remoteport={port}"),
@@ -1165,7 +1162,7 @@ mod windows_backend {
                     format!("name={non_loopback_v4}"),
                     "dir=out".to_string(),
                     "action=block".to_string(),
-                    format!("program={program}"),
+                    program_rule_argument(&program),
                     "remoteip=0.0.0.0-126.255.255.255,128.0.0.0-255.255.255.255".to_string(),
                     "profile=any".to_string(),
                 ];
@@ -1184,7 +1181,7 @@ mod windows_backend {
                     format!("name={v6_name}"),
                     "dir=out".to_string(),
                     "action=block".to_string(),
-                    format!("program={program}"),
+                    program_rule_argument(&program),
                     "remoteip=::/0".to_string(),
                     "profile=any".to_string(),
                 ];
@@ -1205,7 +1202,7 @@ mod windows_backend {
                             format!("name={name}"),
                             "dir=out".to_string(),
                             "action=block".to_string(),
-                            format!("program={program}"),
+                            program_rule_argument(&program),
                             // Block every IPv4 loopback address except the
                             // exact proxy endpoint covered by the allow rule.
                             "remoteip=127.0.0.0-127.255.255.255".to_string(),
@@ -1222,30 +1219,20 @@ mod windows_backend {
                 }
                 Ok(())
             } else {
-                let mut result = Ok(());
-                for (kind, remote_ip) in
-                    [("exec-v4", "0.0.0.0-255.255.255.255"), ("exec-v6", "::/0")]
-                {
-                    let name = unique_rule_name(kind);
-                    let args = vec![
-                        "advfirewall".to_string(),
-                        "firewall".to_string(),
-                        "add".to_string(),
-                        "rule".to_string(),
-                        format!("name={name}"),
-                        "dir=out".to_string(),
-                        "action=block".to_string(),
-                        format!("program={program}"),
-                        format!("remoteip={remote_ip}"),
-                        "profile=any".to_string(),
-                    ];
-                    if let Err(error) = run_netsh_dynamic(&args) {
-                        result = Err(error);
-                        break;
-                    }
-                    names.push(name);
-                }
-                result
+                let name = unique_rule_name("exec-all");
+                let args = vec![
+                    "advfirewall".to_string(),
+                    "firewall".to_string(),
+                    "add".to_string(),
+                    "rule".to_string(),
+                    format!("name={name}"),
+                    "dir=out".to_string(),
+                    "action=block".to_string(),
+                    program_rule_argument(&program),
+                    "profile=any".to_string(),
+                    "enable=yes".to_string(),
+                ];
+                run_netsh_dynamic(&args).map(|()| names.push(name))
             };
             if let Err(error) = result {
                 remove_firewall_rules(&names);
@@ -1301,6 +1288,13 @@ mod windows_backend {
         ranges
     }
 
+    fn program_rule_argument(program: &str) -> String {
+        // netsh's firewall grammar accepts a quoted program value.  Keep the
+        // quotes in the single argv element so paths containing spaces are
+        // still matched by the normalized application identity.
+        format!(r#"program="{program}""#)
+    }
+
     fn run_netsh(arguments: &[&str]) -> Result<(), String> {
         let root = env::var_os("SystemRoot").unwrap_or_else(|| OsString::from(r"C:\Windows"));
         let path = Path::new(&root).join("System32").join("netsh.exe");
@@ -1310,8 +1304,9 @@ mod windows_backend {
             .map_err(|e| format!("WFP firewall command unavailable: {e}"))?;
         if !result.status.success() {
             return Err(format!(
-                "WFP firewall command failed (status={}): stdout={} stderr={}",
+                "WFP firewall command failed (status={}): args={} stdout={} stderr={}",
                 result.status,
+                arguments.join(" "),
                 String::from_utf8_lossy(&result.stdout).trim(),
                 String::from_utf8_lossy(&result.stderr).trim(),
             ));
