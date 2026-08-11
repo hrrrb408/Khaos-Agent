@@ -1878,13 +1878,14 @@ mod windows_backend {
     }
 
     /// Temporarily grants the restricted-code SID read/execute access to the
-    /// resolved native runtime tree.  WRITE_RESTRICTED makes this SID the
+    /// resolved native runtime.  WRITE_RESTRICTED makes this SID the
     /// authority for writes, so a user-owned runtime that is writable by the
     /// interactive user must still be made explicitly read/execute-only for
-    /// the child.  The executable directory and explicitly trusted runtime
-    /// roots receive read/execute access; only execute/traverse is added to
-    /// their ancestors. Every ACL is saved before mutation and restored
-    /// before the helper reports success.
+    /// the child.  The native executable itself receives exact RX access and
+    /// only its parent directory receives execute/traverse access. Explicitly
+    /// trusted runtime roots (for example Python's Lib/DLL trees) may receive
+    /// recursive read/execute access. Every ACL is saved before mutation and
+    /// restored before the helper reports success.
     ///
     /// This is deliberately separate from ``WorkspaceAcl``: the child gets
     /// full access only to the task workspace, while the runtime is strictly
@@ -1906,6 +1907,14 @@ mod windows_backend {
             additional_roots: &[PathBuf],
             additional_files: &[PathBuf],
         ) -> Result<Self, String> {
+            let executable = std::fs::canonicalize(executable)
+                .map_err(|e| format!("canonicalize Windows sandbox executable: {e}"))?;
+            if !executable.is_file() {
+                return Err(format!(
+                    "Windows sandbox executable is not a file: {}",
+                    executable.display()
+                ));
+            }
             let runtime_root = executable
                 .parent()
                 .ok_or_else(|| "Windows sandbox executable has no parent directory".to_string())?
@@ -1921,13 +1930,37 @@ mod windows_backend {
                     "Windows sandbox refuses to mutate a volume-root runtime directory".to_string(),
                 );
             }
-            let mut roots = vec![runtime_root];
-            roots.extend(additional_roots.iter().cloned());
             let mut entries = Vec::new();
             let mut seen_ancestors = HashSet::new();
             let mut seen_recursive = HashSet::new();
-            for root in roots {
-                let root = std::fs::canonicalize(&root)
+            for ancestor in directory_ancestors(&runtime_root)
+                .into_iter()
+                .chain(std::iter::once(runtime_root.clone()))
+            {
+                if !seen_ancestors.insert(ancestor.clone()) {
+                    continue;
+                }
+                if let Err(error) = apply_runtime_acl(
+                    &ancestor,
+                    &mut entries,
+                    "*S-1-5-12:(X)",
+                    appcontainer_sid,
+                    false,
+                ) {
+                    return Err(join_runtime_acl_error(error, entries));
+                }
+            }
+            if let Err(error) = apply_runtime_acl(
+                &executable,
+                &mut entries,
+                "*S-1-5-12:(RX)",
+                appcontainer_sid,
+                false,
+            ) {
+                return Err(join_runtime_acl_error(error, entries));
+            }
+            for root in additional_roots {
+                let root = std::fs::canonicalize(root)
                     .map_err(|e| format!("canonicalize Windows runtime root: {e}"))?;
                 if !root.is_dir() {
                     return Err(format!(
