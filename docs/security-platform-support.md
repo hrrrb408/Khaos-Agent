@@ -8,7 +8,7 @@ pass for the current commit.
 | --- | --- | --- |
 | Linux | Supported when the launcher, bubblewrap, Landlock, cgroup and browser helper checks pass | Python runs non-root; missing isolation fails closed |
 | macOS | Supported through the Seatbelt backend when its probe passes | No Linux namespace/browser-kernel claim |
-| Windows | Supported when the native helper probe passes | restricted token + Job Object single-process tree + transactional workspace ACL + WFP-backed Firewall; missing evidence fails closed |
+| Windows | Supported when the native helper probe passes | restricted token + Job Object two-process launcher/runtime tree + transactional workspace ACL + WFP-backed Firewall; missing evidence fails closed |
 
 Host execution on supported POSIX systems requires a trusted
 `khaos-exec-launcher`. The loader accepts a root-owned or current-EUID-owned

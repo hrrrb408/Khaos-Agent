@@ -50,6 +50,11 @@ mod windows_backend {
     };
 
     const FIREWALL_PREFIX: &str = "KhaosWindowsSandbox";
+    // Windows-hosted Python can be a launcher that creates the actual
+    // interpreter as one child process. Keep the process tree deliberately
+    // tiny so the program-scoped WFP rules remain attributable while still
+    // allowing that legitimate launcher boundary.
+    const MAX_ACTIVE_PROCESSES: u32 = 2;
 
     pub enum ExecutionOutcome {
         Completed,
@@ -398,11 +403,12 @@ mod windows_backend {
             | JOB_OBJECT_LIMIT_PROCESS_MEMORY
             | JOB_OBJECT_LIMIT_JOB_TIME
             | JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
-        // A coding execution is intentionally a single-process tree on
-        // Windows.  Job Objects do not provide an egress policy for unknown
-        // descendants; denying descendants is the deterministic containment
-        // primitive that closes that WFP discovery race.
-        limits.BasicLimitInformation.ActiveProcessLimit = 1;
+        // A coding execution is intentionally limited to a launcher and one
+        // native runtime process on Windows. Job Objects do not provide an
+        // egress policy for unknown descendants; keeping this bound at two is
+        // the deterministic containment primitive that closes that WFP
+        // discovery race while allowing Python's launcher boundary.
+        limits.BasicLimitInformation.ActiveProcessLimit = MAX_ACTIVE_PROCESSES;
         limits.ProcessMemoryLimit = memory_bytes as usize;
         limits.BasicLimitInformation.PerJobUserTimeLimit = (cpu_seconds as i64) * 10_000_000;
         let updated = unsafe {

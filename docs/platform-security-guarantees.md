@@ -84,7 +84,7 @@ because it would not actually reach the broker.
 |---|---|---|
 | Linux | non-root, zero-capability Python; bwrap filesystem isolation; cgroup v2 budgets; root Rust helper as the sole netns/veth/nft/cgroup authority; default-deny browser egress | missing launcher/helper/cgroup delegation rejects execution; no Host, `ip`, `nft`, or proxy-only fallback |
 | macOS | `sandbox-exec` Seatbelt profile restricts content, metadata, directory listing, credential roots, Mach services, network and writable workspace boundaries | no browser kernel namespace claim; a failed probe or invalid launcher rejects execution |
-| Windows | native helper after a passing probe: restricted primary token, Job Object with kill-on-close/resource limits and a single-process tree, transactional workspace ACL, and WFP-backed Windows Firewall policy | missing helper/probe evidence, non-native command, ACL/firewall failure, or unsupported network endpoint rejects execution; never falls back to Host |
+| Windows | native helper after a passing probe: restricted primary token, Job Object with kill-on-close/resource limits and a two-process launcher/runtime tree, transactional workspace ACL, and WFP-backed Windows Firewall policy | missing helper/probe evidence, non-native command, ACL/firewall failure, or unsupported network endpoint rejects execution; never falls back to Host |
 
 `KHAOS_DEV_MODE=1` is an explicit development-only mode. It is not a weaker
 production profile and must never generate production security evidence.

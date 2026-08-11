@@ -87,7 +87,7 @@ trade-off.
 
 **Current state.** This head implements a native Windows execution backend.
 `WindowsSandboxBackend` admits execution only after the Rust helper proves a
-restricted primary token, Job Object limits with a single-process tree,
+restricted primary token, Job Object limits with a two-process launcher/runtime tree,
 transactional workspace ACL, and WFP-backed Firewall policy. The hosted
 `windows-fail-closed-security` and `contract (windows-2025)` jobs build the
 helper and set `KHAOS_REQUIRE_WINDOWS_NATIVE=1`; the merge claim remains
@@ -97,12 +97,12 @@ browser-specific Linux netns parity are not claimed.
 **Risk.** A failed native probe must continue to produce no execution
 capability; the remaining risk is platform-specific CI/runtime compatibility,
 not a silent Host bypass. The helper deliberately limits each execution to a
-single process because Windows Firewall program rules cannot safely authorize
-unknown descendants during a discovery race.
+launcher plus one native runtime process because Windows Firewall program
+rules cannot safely authorize unknown descendants during a discovery race.
 
 **Resolution in this head.** Use the native helper as the only Windows Coding
 backend: restricted token, Job Object kill-on-close/resource limits and active
-process limit one, transactional ACL grant/restore, exact native executable
+process limit two, transactional ACL grant/restore, exact native executable
 resolution, and WFP-backed Firewall rules. Brokered egress accepts only the
 loopback NetworkBroker endpoint. Any missing primitive, cleanup proof, or
 unsupported command fails closed.

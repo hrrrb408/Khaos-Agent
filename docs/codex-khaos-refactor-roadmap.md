@@ -54,7 +54,7 @@ die-with-parent 和相对 cwd 映射；异常 probe fail closed，并由 Linux C
 macOS capability 使用真实 Seatbelt probe，本机真实 gate 已通过。Docker 使用 digest、
 pull-never、owner-nonce cleanup、mount delimiter rejection 与共享 supervisor；真实 Docker
 destructive E2E 仅在干净 CI runner gate。Windows native helper 已接入 restricted token、
-Job Object 单进程树、workspace ACL、WFP Firewall 与 native-or-fail-closed CI gate。
+Job Object 两进程上限树、workspace ACL、WFP Firewall 与 native-or-fail-closed CI gate。
 
 | 项 | 内容 |
 | --- | --- |
