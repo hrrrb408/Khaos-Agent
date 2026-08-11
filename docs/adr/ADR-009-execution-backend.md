@@ -67,8 +67,8 @@ macOS selector 同样必须实际启动 `/usr/bin/sandbox-exec`，证明 workspa
 workspace 外 write、network、pasteboard 与 Keychain IPC 失败后才返回 backend。
 Seatbelt 不得使用全局 `allow mach-lookup`，只允许显式的最小运行时 service
 allowlist；只检查可执行文件存在不构成
-capability。Windows selector 只有在 native helper probe 同时证明 restricted token、
-`network=none` AppContainer/no-network、Job Object 单 native runtime 上限、workspace
+capability。Windows selector 只有在 native helper probe 同时证明 brokered restricted
+token、`network=none` AppContainer/no-network、Job Object 单 native runtime 上限、workspace
 ACL 与 WFP Firewall 后才返回 backend；helper 缺失或
 任一证据失败均带平台原因 fail closed，不能走 Host。未知平台同样拒绝。
 

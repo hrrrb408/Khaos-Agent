@@ -1391,7 +1391,18 @@ mod windows_backend {
         executable: &Path,
         appcontainer: Option<&AppContainerProfile>,
     ) -> Result<ExecutionOutcome, String> {
-        let token = restricted_token()?;
+        // Windows creates the AppContainer low-box token from the caller's
+        // token when PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES is present.
+        // Passing a separately CreateRestrictedToken-derived primary token at
+        // the same time is rejected by CreateProcessAsUserW with
+        // ERROR_INVALID_PARAMETER.  The low-box token is itself the child
+        // authority for network-none; brokered executions retain the explicit
+        // restricted primary token path below.
+        let token = if appcontainer.is_some() {
+            None
+        } else {
+            Some(restricted_token()?)
+        };
         let job = unsafe { CreateJobObjectW(null(), null()) };
         if job.is_null() {
             return Err(last_error("CreateJobObjectW"));
@@ -1431,7 +1442,7 @@ mod windows_backend {
             };
         let created = unsafe {
             CreateProcessAsUserW(
-                token.0,
+                token.as_ref().map_or(null_mut(), |token| token.0),
                 application.as_mut_ptr(),
                 command.as_mut_ptr(),
                 null_mut(),

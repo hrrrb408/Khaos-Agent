@@ -8,7 +8,7 @@ pass for the current commit.
 | --- | --- | --- |
 | Linux | Supported when the launcher, bubblewrap, Landlock, cgroup and browser helper checks pass | Python runs non-root; missing isolation fails closed |
 | macOS | Supported through the Seatbelt backend when its probe passes | No Linux namespace/browser-kernel claim |
-| Windows | Supported when the native helper probe passes | `network=none`: OS-issued AppContainer with no network capability + restricted token + one-process Job Object (outer helper owns cleanup) + transactional workspace ACL + WFP-backed Firewall; brokered mode is exact loopback-only; missing evidence fails closed |
+| Windows | Supported when the native helper probe passes | `network=none`: OS-issued AppContainer low-box with no network capability + one-process Job Object (outer helper owns cleanup) + transactional workspace ACL + WFP-backed Firewall; brokered mode separately uses the restricted token and is exact loopback-only; missing evidence fails closed |
 
 Host execution on supported POSIX systems requires a trusted
 `khaos-exec-launcher`. The loader accepts a root-owned or current-EUID-owned
