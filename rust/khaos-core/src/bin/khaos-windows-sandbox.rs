@@ -26,13 +26,14 @@ mod windows_backend {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use windows_sys::Win32::Foundation::{
-        CloseHandle, GetLastError, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        CloseHandle, GetLastError, ERROR_NOT_ALL_ASSIGNED, HANDLE, WAIT_FAILED, WAIT_OBJECT_0,
+        WAIT_TIMEOUT,
     };
     use windows_sys::Win32::Security::{
-        CreateRestrictedToken, CreateWellKnownSid, GetTokenInformation, IsTokenRestricted,
-        LookupPrivilegeValueW, TokenPrivileges, WinRestrictedCodeSid, LUID_AND_ATTRIBUTES, PSID,
-        SE_CHANGE_NOTIFY_NAME, SID_AND_ATTRIBUTES, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE,
-        TOKEN_PRIVILEGES, TOKEN_QUERY,
+        AdjustTokenPrivileges, CreateRestrictedToken, CreateWellKnownSid, IsTokenRestricted,
+        LookupPrivilegeValueW, WinRestrictedCodeSid, DISABLE_MAX_PRIVILEGE, LUA_TOKEN,
+        LUID_AND_ATTRIBUTES, PSID, SE_CHANGE_NOTIFY_NAME, SE_PRIVILEGE_ENABLED, SID_AND_ATTRIBUTES,
+        TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_PRIVILEGES, TOKEN_QUERY, WRITE_RESTRICTED,
     };
     use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE};
     use windows_sys::Win32::System::JobObjects::{
@@ -315,16 +316,15 @@ mod windows_backend {
             return Err(last_error("OpenProcessToken"));
         }
         let current = Handle(current);
-        let privileges_to_delete = privileges_except_change_notify(current.0)?;
         let mut restricted: HANDLE = null_mut();
         let created = unsafe {
             CreateRestrictedToken(
                 current.0,
-                0,
+                DISABLE_MAX_PRIVILEGE | LUA_TOKEN | WRITE_RESTRICTED,
                 0,
                 null(),
-                privileges_to_delete.len() as u32,
-                privileges_to_delete.as_ptr(),
+                0,
+                null(),
                 1,
                 &restricted_sid_attribute,
                 &mut restricted as *mut HANDLE,
@@ -333,66 +333,44 @@ mod windows_backend {
         if created == 0 {
             return Err(last_error("CreateRestrictedToken"));
         }
+        enable_change_notify_privilege(restricted)?;
         Ok(Handle(restricted))
     }
 
-    /// Keep only directory traversal while deleting every other privilege.
-    /// ``DISABLE_MAX_PRIVILEGE`` also removes SeChangeNotifyPrivilege, which
-    /// makes an otherwise usable restricted process fail while traversing the
-    /// interpreter and system runtime path.  The privilege does not grant
-    /// read/write access; the separate restricted-SID ACL checks remain the
-    /// authority for files and directories.
-    fn privileges_except_change_notify(token: HANDLE) -> Result<Vec<LUID_AND_ATTRIBUTES>, String> {
-        let mut required = 0_u32;
-        unsafe {
-            GetTokenInformation(
-                token,
-                TokenPrivileges,
-                null_mut(),
-                0,
-                &mut required as *mut u32,
-            );
-        }
-        if required == 0 {
-            return Err(last_error("GetTokenInformation(TokenPrivileges size)"));
-        }
-        let mut buffer = vec![0_u8; required as usize];
-        let queried = unsafe {
-            GetTokenInformation(
-                token,
-                TokenPrivileges,
-                buffer.as_mut_ptr() as *mut c_void,
-                required,
-                &mut required as *mut u32,
-            )
-        };
-        if queried == 0 {
-            return Err(last_error("GetTokenInformation(TokenPrivileges)"));
-        }
-        let mut change_notify: windows_sys::Win32::Foundation::LUID = unsafe { zeroed() };
-        if unsafe { LookupPrivilegeValueW(null(), SE_CHANGE_NOTIFY_NAME, &mut change_notify) } == 0
-        {
+    /// Re-enable only directory traversal after creating the restricted token.
+    /// WRITE_RESTRICTED keeps the restricted-code SID in the write-access
+    /// check while ordinary runtime reads use the normal user SIDs.  This is
+    /// the Windows restricted-token shape needed to load public system and
+    /// interpreter DLLs without granting the restricted SID broad read access.
+    fn enable_change_notify_privilege(token: HANDLE) -> Result<(), String> {
+        let mut luid: windows_sys::Win32::Foundation::LUID = unsafe { zeroed() };
+        if unsafe { LookupPrivilegeValueW(null(), SE_CHANGE_NOTIFY_NAME, &mut luid) } == 0 {
             return Err(last_error("LookupPrivilegeValueW(SeChangeNotifyPrivilege)"));
         }
-        let privileges = unsafe { &*(buffer.as_ptr() as *const TOKEN_PRIVILEGES) };
-        let entries = unsafe {
-            std::slice::from_raw_parts(
-                privileges.Privileges.as_ptr(),
-                privileges.PrivilegeCount as usize,
-            )
+        let privileges = TOKEN_PRIVILEGES {
+            PrivilegeCount: 1,
+            Privileges: [LUID_AND_ATTRIBUTES {
+                Luid: luid,
+                Attributes: SE_PRIVILEGE_ENABLED,
+            }],
         };
-        Ok(entries
-            .iter()
-            .copied()
-            .filter(|entry| !same_luid(entry.Luid, change_notify))
-            .collect())
-    }
-
-    fn same_luid(
-        left: windows_sys::Win32::Foundation::LUID,
-        right: windows_sys::Win32::Foundation::LUID,
-    ) -> bool {
-        left.LowPart == right.LowPart && left.HighPart == right.HighPart
+        if unsafe {
+            AdjustTokenPrivileges(
+                token,
+                0,
+                &privileges,
+                std::mem::size_of::<TOKEN_PRIVILEGES>() as u32,
+                null_mut(),
+                null_mut(),
+            )
+        } == 0
+        {
+            return Err(last_error("AdjustTokenPrivileges(SeChangeNotifyPrivilege)"));
+        }
+        if unsafe { GetLastError() } == ERROR_NOT_ALL_ASSIGNED {
+            return Err("SeChangeNotifyPrivilege is unavailable on restricted token".to_string());
+        }
+        Ok(())
     }
 
     fn restricted_code_sid() -> Result<Vec<u8>, String> {
@@ -618,13 +596,12 @@ mod windows_backend {
     }
 
     /// Temporarily grants the restricted-code SID read/execute access to the
-    /// resolved native runtime tree.  Restricted tokens perform a second
-    /// access check using their restricting SIDs, so a normal user-owned
-    /// interpreter can otherwise fail before its first instruction with
-    /// ``STATUS_DLL_NOT_FOUND`` even though the interactive user can execute
-    /// it.  The grant is scoped to the interpreter's parent directory; only
-    /// execute/traverse is added to its ancestors.  Every ACL is saved before
-    /// mutation and restored before the helper reports success.
+    /// resolved native runtime tree.  WRITE_RESTRICTED makes this SID the
+    /// authority for writes, so a user-owned runtime that is writable by the
+    /// interactive user must still be made explicitly read/execute-only for
+    /// the child.  The grant is scoped to the interpreter's parent directory;
+    /// only execute/traverse is added to its ancestors.  Every ACL is saved
+    /// before mutation and restored before the helper reports success.
     ///
     /// This is deliberately separate from ``WorkspaceAcl``: the child gets
     /// full access only to the task workspace, while the runtime is strictly
