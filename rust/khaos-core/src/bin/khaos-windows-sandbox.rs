@@ -81,8 +81,8 @@ mod windows_backend {
         let workspace = std::fs::canonicalize(&options.workspace)
             .map_err(|e| format!("workspace unavailable: {e}"))?;
         let acl = WorkspaceAcl::apply(&workspace)?;
-        let rule = match FirewallRule::install(&options, &executable) {
-            Ok(rule) => rule,
+        let runtime_acl = match RuntimeAcl::apply(&executable) {
+            Ok(acl) => acl,
             Err(error) => {
                 let restore = acl.restore();
                 return Err(match restore {
@@ -91,8 +91,21 @@ mod windows_backend {
                 });
             }
         };
+        let rule = match FirewallRule::install(&options, &executable) {
+            Ok(rule) => rule,
+            Err(error) => {
+                let runtime_restore = runtime_acl.restore();
+                let workspace_restore = acl.restore();
+                return Err(join_cleanup_errors(
+                    error,
+                    runtime_restore,
+                    workspace_restore,
+                ));
+            }
+        };
         let result = spawn_restricted(&options, &executable);
         let remove_result = rule.remove();
+        let runtime_acl_result = runtime_acl.restore();
         let acl_result = acl.restore();
         let mut errors = Vec::new();
         let outcome = match result {
@@ -103,6 +116,9 @@ mod windows_backend {
             }
         };
         if let Err(error) = remove_result {
+            errors.push(error);
+        }
+        if let Err(error) = runtime_acl_result {
             errors.push(error);
         }
         if let Err(error) = acl_result {
@@ -116,6 +132,21 @@ mod windows_backend {
         } else {
             Err(errors.join("; "))
         }
+    }
+
+    fn join_cleanup_errors(
+        primary: String,
+        runtime_restore: Result<(), String>,
+        workspace_restore: Result<(), String>,
+    ) -> String {
+        let mut errors = vec![primary];
+        if let Err(error) = runtime_restore {
+            errors.push(error);
+        }
+        if let Err(error) = workspace_restore {
+            errors.push(error);
+        }
+        errors.join("; ")
     }
 
     fn probe() -> Result<(), String> {
@@ -133,6 +164,9 @@ mod windows_backend {
         let acl = WorkspaceAcl::apply(&probe_root)?;
         acl.restore()?;
         std::fs::remove_dir(&probe_root).map_err(|e| format!("remove ACL probe directory: {e}"))?;
+        let helper = env::current_exe().map_err(|e| format!("resolve Windows helper: {e}"))?;
+        let runtime_acl = RuntimeAcl::apply(&helper)?;
+        runtime_acl.restore()?;
         if unsafe { IsTokenRestricted(token.0) } == 0 {
             return Err("CreateRestrictedToken did not create a restricted token".to_string());
         }
@@ -520,6 +554,147 @@ mod windows_backend {
                 .map_err(|error| format!("remove workspace ACL backup: {error}"));
             result.and(remove)
         }
+    }
+
+    /// Temporarily grants the restricted-code SID read/execute access to the
+    /// resolved native runtime tree.  Restricted tokens perform a second
+    /// access check using their restricting SIDs, so a normal user-owned
+    /// interpreter can otherwise fail before its first instruction with
+    /// ``STATUS_DLL_NOT_FOUND`` even though the interactive user can execute
+    /// it.  The grant is scoped to the interpreter's parent directory; only
+    /// execute/traverse is added to its ancestors.  Every ACL is saved before
+    /// mutation and restored before the helper reports success.
+    ///
+    /// This is deliberately separate from ``WorkspaceAcl``: the child gets
+    /// full access only to the task workspace, while the runtime is strictly
+    /// read/execute.  Any grant or restore failure aborts the execution and
+    /// leaves the helper fail-closed.
+    struct RuntimeAcl {
+        entries: Vec<RuntimeAclEntry>,
+    }
+
+    struct RuntimeAclEntry {
+        root: PathBuf,
+        backup: PathBuf,
+    }
+
+    impl RuntimeAcl {
+        fn apply(executable: &Path) -> Result<Self, String> {
+            let runtime_root = executable
+                .parent()
+                .ok_or_else(|| "Windows sandbox executable has no parent directory".to_string())?
+                .to_path_buf();
+            if !runtime_root.is_dir() {
+                return Err(format!(
+                    "Windows sandbox runtime directory is unavailable: {}",
+                    runtime_root.display()
+                ));
+            }
+            if directory_ancestors(&runtime_root).is_empty() {
+                return Err(
+                    "Windows sandbox refuses to mutate a volume-root runtime directory".to_string(),
+                );
+            }
+            let mut entries = Vec::new();
+            for ancestor in directory_ancestors(&runtime_root) {
+                if let Err(error) =
+                    apply_runtime_acl(&ancestor, &mut entries, "*S-1-5-12:(X)", false)
+                {
+                    return Err(join_runtime_acl_error(error, entries));
+                }
+            }
+            if let Err(error) =
+                apply_runtime_acl(&runtime_root, &mut entries, "*S-1-5-12:(OI)(CI)RX", true)
+            {
+                return Err(join_runtime_acl_error(error, entries));
+            }
+            Ok(Self { entries })
+        }
+
+        fn restore(self) -> Result<(), String> {
+            restore_runtime_acl_entries(self.entries)
+        }
+    }
+
+    fn apply_runtime_acl(
+        root: &Path,
+        entries: &mut Vec<RuntimeAclEntry>,
+        permission: &str,
+        recursive: bool,
+    ) -> Result<(), String> {
+        let backup = env::temp_dir().join(unique_rule_name("runtime-acl"));
+        let save = vec![
+            root.as_os_str().to_os_string(),
+            OsString::from("/save"),
+            backup.as_os_str().to_os_string(),
+            OsString::from("/c"),
+        ];
+        let mut save = save;
+        if recursive {
+            save.push(OsString::from("/t"));
+        }
+        run_icacls(&save).map_err(|error| format!("save runtime ACL: {error}"))?;
+        entries.push(RuntimeAclEntry {
+            root: root.to_path_buf(),
+            backup: backup.clone(),
+        });
+        let mut grant = vec![
+            root.as_os_str().to_os_string(),
+            OsString::from("/grant"),
+            OsString::from(permission),
+        ];
+        if recursive {
+            grant.extend([OsString::from("/t"), OsString::from("/c")]);
+        }
+        if let Err(error) = run_icacls(&grant) {
+            return Err(format!("grant restricted runtime ACL: {error}"));
+        }
+        Ok(())
+    }
+
+    fn join_runtime_acl_error(primary: String, entries: Vec<RuntimeAclEntry>) -> String {
+        let mut errors = vec![primary];
+        if let Err(error) = restore_runtime_acl_entries(entries) {
+            errors.push(error);
+        }
+        errors.join("; ")
+    }
+
+    fn restore_runtime_acl_entries(mut entries: Vec<RuntimeAclEntry>) -> Result<(), String> {
+        let mut errors = Vec::new();
+        while let Some(entry) = entries.pop() {
+            let restore = vec![
+                entry.root.as_os_str().to_os_string(),
+                OsString::from("/restore"),
+                entry.backup.as_os_str().to_os_string(),
+                OsString::from("/c"),
+            ];
+            if let Err(error) = run_icacls(&restore) {
+                errors.push(format!("restore runtime ACL: {error}"));
+            }
+            if let Err(error) = std::fs::remove_file(&entry.backup) {
+                errors.push(format!("remove runtime ACL backup: {error}"));
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+
+    fn directory_ancestors(path: &Path) -> Vec<PathBuf> {
+        let mut ancestors = Vec::new();
+        let mut current = path.to_path_buf();
+        while let Some(parent) = current.parent() {
+            let parent = parent.to_path_buf();
+            if parent == current {
+                break;
+            }
+            ancestors.push(parent.clone());
+            current = parent;
+        }
+        ancestors
     }
 
     fn run_icacls(arguments: &[OsString]) -> Result<(), String> {

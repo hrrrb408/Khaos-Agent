@@ -54,7 +54,9 @@ execution:
 
 1. a restricted primary token with the restricted-code SID;
 2. a kill-on-close Job Object with resource limits and active-process limit one;
-3. a transactionally granted/restored restricted-code workspace ACL;
+3. transactionally granted/restored restricted-code ACLs: full access for the
+   task workspace and read/execute plus ancestor traverse for the resolved
+   native runtime tree;
 4. a WFP-backed Windows Firewall transaction; and
 5. exact resolution to a native `.exe`/`.com`, never a shell script.
 
