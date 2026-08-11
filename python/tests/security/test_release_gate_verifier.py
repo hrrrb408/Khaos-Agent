@@ -7,7 +7,6 @@ from pathlib import Path
 
 import pytest
 
-
 ROOT = Path(__file__).resolve().parents[3]
 SPEC = importlib.util.spec_from_file_location(
     "verify_release_gate_runs",
@@ -29,6 +28,8 @@ def _run(*, run_id: int, attempt: int) -> dict[str, object]:
         "status": "completed",
         "conclusion": "success",
         "run_attempt": attempt,
+        "event": "push",
+        "head_branch": "main",
         "run_started_at": f"2026-08-09T00:00:{run_id:02d}Z",
     }
 
@@ -55,6 +56,24 @@ def test_release_selector_never_replaces_attempt_one_with_rerun():
     with pytest.raises(RuntimeError, match="attempt-1"):
         MODULE._select_successful_run(
             [_run(run_id=2, attempt=2)],
+            commit=COMMIT,
+            workflow="security-closure-gate.yml",
+        )
+
+
+def test_release_selector_rejects_non_main_or_non_push_runs():
+    branch_run = _run(run_id=3, attempt=1) | {"event": "pull_request"}
+    with pytest.raises(RuntimeError, match="attempt-1"):
+        MODULE._select_successful_run(
+            [branch_run],
+            commit=COMMIT,
+            workflow="security-closure-gate.yml",
+        )
+
+    non_main_run = _run(run_id=4, attempt=1) | {"head_branch": "feature"}
+    with pytest.raises(RuntimeError, match="attempt-1"):
+        MODULE._select_successful_run(
+            [non_main_run],
             commit=COMMIT,
             workflow="security-closure-gate.yml",
         )
@@ -93,3 +112,30 @@ def test_security_gate_records_exact_artifact_and_attempt(monkeypatch: pytest.Mo
     record = MODULE._gate_record("owner/repo", "security-closure-gate.yml", COMMIT)
     assert record["run_attempt"] == 1
     assert record["artifacts"][0]["name"] == f"security-evidence-{COMMIT}"
+
+
+def test_release_evidence_requires_main_ancestry(monkeypatch: pytest.MonkeyPatch):
+    def fake_api(_repo: str, endpoint: str) -> dict[str, object]:
+        if endpoint.startswith("compare/"):
+            return {
+                "status": "ahead",
+                "ahead_by": 3,
+                "behind_by": 0,
+                "html_url": "https://github.com/compare",
+            }
+        if endpoint.startswith("actions/workflows/"):
+            return {"workflow_runs": [_run(run_id=1, attempt=1)]}
+        return {"artifacts": [_security_artifact()]}
+
+    monkeypatch.setattr(MODULE, "_run_gh_api", fake_api)
+    evidence = MODULE.verify_release_gates("owner/repo", COMMIT)
+    assert evidence["main_ancestry"]["behind_by"] == 0
+
+    def diverged_api(_repo: str, endpoint: str) -> dict[str, object]:
+        if endpoint.startswith("compare/"):
+            return {"status": "diverged", "ahead_by": 1, "behind_by": 1}
+        return fake_api(_repo, endpoint)
+
+    monkeypatch.setattr(MODULE, "_run_gh_api", diverged_api)
+    with pytest.raises(RuntimeError, match="main ancestry"):
+        MODULE.verify_release_gates("owner/repo", COMMIT)

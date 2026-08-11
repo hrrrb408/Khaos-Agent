@@ -152,10 +152,11 @@ def run(self, user_input, session_id):
 
 **异步：**
 - 所有涉及 I/O 的函数必须是 `async`
-- 使用 `asyncio`，不用 `threading`
+- 使用 `asyncio`；安全边界中允许使用 `os.open`/dirfd、`os.read`、`fsync`、
+  `asyncio.to_thread` 和 `threading.RLock`，因为它们承载 no-follow、原子提交、
+  取消屏蔽和 mutation fence。不得为了形式上的异步移除这些保护。
 - 数据库操作用 `aiosqlite`（异步 SQLite）
 - HTTP 调用用 `httpx`（异步 HTTP client）
-- 文件操作用 `aiofiles`（异步文件 IO）
 
 **错误处理：**
 - 自定义异常放在模块的 `exceptions.py` 中
@@ -227,7 +228,8 @@ async def run(self, ...):
 - fixture 放在 `conftest.py`
 - Mock 外部依赖（模型 API、Docker、文件系统）
 - Coding 模式新增模块必须在 `python/tests/coding/` 下有对应测试。
-- VerifyFixLoop 是核心策略层，其测试覆盖率应达到 100%。
+- VerifyFixLoop 是核心策略层，必须保留策略分支的回归测试；覆盖率由 CI
+  报告，未配置的百分比不作为机器闸门。
 
 ```python
 # tests/conftest.py
@@ -376,11 +378,14 @@ mod tests {
 ### 分支策略
 
 ```
-main          ← 稳定分支，每次 Phase 完成合并
-dev           ← 开发分支，日常开发合并到这里
-feature/xxx   ← 功能分支，从 dev 创建
-fix/xxx       ← 修复分支，从 dev 创建
+main          ← 受保护稳定分支，所有变更通过 PR 和 required checks 合并
+codex/xxx     ← Codex 实现/修复分支，从最新 main 创建
+feature/xxx   ← 功能分支；必须以 PR 合并到 main
+fix/xxx       ← 修复分支；必须以 PR 合并到 main
 ```
+
+`dev` 不属于当前发布权威路径；未经过 main required checks 的分支绿跑不能
+作为发布或安全闭环证据。
 
 ### 提交信息
 
@@ -467,7 +472,9 @@ scope:
 - Go：高并发低延迟，适合 API 网关、SSE 长连接、多平台接入
 - Rust：Token 解析和并行执行是 CPU 密集型高频操作，需要零开销抽象和内存安全
 
-**约束**：Python 和 Rust 通过 PyO3 FFI 通信，Python 和 Go 通过 gRPC 通信。
+**约束**：Python 和 Rust 通过 PyO3 FFI 通信；Go Gateway 与 Python Agent 使用
+受认证的 UDS JSON-lines RPC v2。envelope、HMAC、peer UID/PID 和 frame 限制
+以 `docs/adr/ADR-011-gateway-rpc-boundary.md` 为准。
 
 ### ADR-002: 单层子代理，不嵌套
 
@@ -510,10 +517,11 @@ scope:
 3. **所有写操作必须记录审计日志**：audit_log 表记录所有写操作
 4. **环境变量中不出现明文 API Key**：日志脱敏，配置文件支持 `${ENV_VAR}` 引用
 5. **错误可恢复优先**：工具执行失败不算致命错误，返回模型重决策；模型超时自动 fallback
-6. **测试先行**：新代码必须有对应测试，覆盖率不低于 60%
+6. **测试先行**：新代码必须有对应测试；CI 必须报告相关覆盖率与安全 gate 结果，任何未配置的覆盖率百分比不作为已存在的硬闸门
 7. **Office 变更必须经过 Mutation Authority**：Office `copy_file`/`move_file` 通过 `OfficeMutationAuthority`（复用 `WorkspaceStorageAuthority` + mutation fence + `asyncio.shield`），取消/超时不会在"调用失败"后继续提交副作用。Office Workspace 拥有 baseline + 总量限制 + quarantine。
 8. **file_search_content 使用线性时间正则**：用户提供的 pattern 通过 google-re2 编译（线性时间、拒绝灾难性回溯），绝不使用 Python `re`；pattern 长度 ≤ 256，单行 ≤ 64 KiB。
 9. **khaos_policy.yaml 是唯一安全权威**：启动时编译为不可变 `EffectiveSecurityPolicy`（user ∩ project ∩ platform，只能收紧）。`allowed_paths` 编译为 root capabilities；`commands_require_approval` 是 PermissionEngine 的前置闸门，覆盖持久 auto-approve rule；未知 mode / malformed YAML / 未知字段 → **fail closed**（启动失败或 read-only，绝不静默回退到 workspace-write）。审批绑定包含 effective policy digest。
+10. **Trusted Git、workspace bootstrap 与 ChangeSet artifact 必须独立限额并 fail closed**：Git 只允许审计过的 plumbing 操作；禁止 checkout/filter/textconv/external diff、porcelain add/commit 和 signing helper。bootstrap 在 pending worktree 中按 blob、条目、深度、symlink、时长和总字节限额 materialize，完整校验并 controlled publish 后才注册正式 workspace。每个 workspace 的 ChangeSet artifact 最多 64 个、总计 256 MiB，并在 workspace cleanup 或失败时回收。Git submodule/gitlink（mode `160000`）当前不 materialize，也不自动执行 `git submodule update`。
 
 ---
 
@@ -568,5 +576,5 @@ khaos test --all
 
 ---
 
-*最后更新：2026-07-09*
+*最后更新：2026-08-11*
 *维护者：瑞邦 + Hermes Agent*

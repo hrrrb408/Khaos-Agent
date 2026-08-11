@@ -4,6 +4,29 @@ These guarantees are deliberately narrower than “absolute security”. A claim
 is valid only for a commit whose required `Security Closure Gate` passed with
 complete provenance-backed evidence.
 
+## Trusted Git workspace bootstrap
+
+Host Git is a control-plane dependency, not a trust boundary. Khaos pins the
+Git executable and authority root, rejects Git checkout/filter/textconv and
+external-diff extensions, and uses a bounded allowlist of plumbing operations.
+Tracked content is materialized from raw tree/blob objects into a pending
+worktree. Publication occurs only after bounded entry/byte/path-depth/symlink/
+duration accounting, object-id verification, protected-metadata validation and
+stable storage observation. Any cancellation, malformed object, hash mismatch,
+quota violation, disk error or child failure removes the pending worktree and
+does not register a usable `TaskWorkspace`.
+
+Git submodules are an explicit current limitation: tree entries with mode
+`160000` are rejected with a fail-closed diagnostic. Khaos does not run
+`git submodule update` during bootstrap and therefore does not claim submodule
+materialization support.
+
+ChangeSet artifacts are also bounded resources: each workspace may register at
+most 64 artifacts and 256 MiB total. Each artifact is exclusive-created,
+length/digest checked, owned by the workspace registry, exportable only below
+the private authority root, and removed during workspace cleanup or a failed
+build.
+
 ## Trust Boundary Axiom
 
 The guarantees below defend the host against **untrusted repository content**,

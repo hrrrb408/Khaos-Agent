@@ -13,10 +13,9 @@ import argparse
 import hashlib
 import json
 import subprocess
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-
 
 REQUIRED_GATES = {
     "security_closure": "security-closure-gate.yml",
@@ -37,7 +36,7 @@ def _run_gh_api(repo: str, endpoint: str) -> dict[str, Any]:
     )
     value = json.loads(raw)
     if not isinstance(value, dict):
-        raise ValueError(f"GitHub API returned a non-object for {endpoint}")
+        raise TypeError(f"GitHub API returned a non-object for {endpoint}")
     return value
 
 
@@ -53,6 +52,8 @@ def _select_successful_run(
         run
         for run in runs
         if run.get("head_sha") == commit
+        and run.get("event") == "push"
+        and run.get("head_branch") == "main"
         and run.get("status") == "completed"
         and run.get("conclusion") == "success"
         # A rerun can be green after an earlier attempt failed.  Release
@@ -133,8 +134,34 @@ def _gate_record(repo: str, workflow: str, commit: str) -> dict[str, Any]:
     return record
 
 
+def _verify_main_ancestry(repo: str, commit: str) -> dict[str, Any]:
+    """Prove the release commit is an ancestor of protected ``main``."""
+    payload = _run_gh_api(repo, f"compare/{commit}...main")
+    try:
+        behind_by = int(payload.get("behind_by"))
+        ahead_by = int(payload.get("ahead_by"))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("GitHub main ancestry comparison is incomplete") from exc
+    # The comparison uses the release commit as BASE and main as HEAD.  A
+    # valid release commit has no commits that are present only on the base;
+    # identical is the zero/zero special case.
+    if behind_by != 0 or str(payload.get("status")) not in {"ahead", "identical"}:
+        raise RuntimeError(
+            f"release commit {commit} is not in protected main ancestry"
+        )
+    return {
+        "base": commit,
+        "head": "main",
+        "status": payload.get("status"),
+        "ahead_by": ahead_by,
+        "behind_by": behind_by,
+        "url": payload.get("html_url"),
+    }
+
+
 def verify_release_gates(repo: str, commit: str) -> dict[str, Any]:
     """Return commit-bound evidence for every required aggregate gate."""
+    main_ancestry = _verify_main_ancestry(repo, commit)
     gates = {
         name: _gate_record(repo, workflow, commit)
         for name, workflow in REQUIRED_GATES.items()
@@ -142,9 +169,10 @@ def verify_release_gates(repo: str, commit: str) -> dict[str, Any]:
     evidence = {
         "schema": "khaos.release-gate-evidence.v1",
         "commit": commit,
-        "verified_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace(
+        "verified_at": datetime.now(UTC).isoformat(timespec="seconds").replace(
             "+00:00", "Z"
         ),
+        "main_ancestry": main_ancestry,
         "gates": gates,
     }
     evidence["evidence_digest"] = _canonical_digest(evidence)

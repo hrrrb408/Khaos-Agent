@@ -10,7 +10,7 @@ import stat
 import tempfile
 import uuid
 from collections.abc import Callable
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, TypeVar
 
 from khaos.coding.workspace.boundary import PROTECTED_WORKSPACE_NAMES
@@ -21,7 +21,9 @@ from khaos.coding.workspace.git_identity import (
     verify_git_worktree_identity,
 )
 from khaos.coding.workspace.models import (
+    MAX_CHANGESET_INLINE_BYTES,
     ChangeSet,
+    ChangeSetArtifact,
     TaskWorkspace,
     WorkspaceState,
     WorkspaceTransition,
@@ -36,12 +38,21 @@ from khaos.coding.workspace.storage import (
 from khaos.coding.workspace.trusted_git import (
     TrustedGitError,
     TrustedGitRunner,
+    WorkspaceBootstrapLimits,
+    _parse_index_listing,
 )
 from khaos.security.authority import AuthorityEnvelope
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
 FileIdentity = tuple[int, int, int, int]
+MAX_CHANGESET_BYTES = 64 * 1024 * 1024
+MAX_CHANGESET_PREVIEW_BYTES = 64 * 1024
+MAX_CHANGESET_FILES = 10_000
+MAX_CHANGESET_NAMES_BYTES = 8 * 1024 * 1024
+MAX_CHANGESET_STAT_BYTES = 1024 * 1024
+MAX_CHANGESET_ARTIFACTS = 64
+MAX_CHANGESET_ARTIFACT_BYTES = 256 * 1024 * 1024
 
 
 class WorkspaceError(RuntimeError):
@@ -72,6 +83,146 @@ def _install_protected_metadata_guards(worktree: Path) -> None:
 
 def _identity(info: os.stat_result) -> FileIdentity:
     return (int(info.st_dev), int(info.st_ino), int(info.st_uid), int(info.st_mode))
+
+
+def _safe_workspace_target(
+    workspace: TaskWorkspace, relative: str
+) -> tuple[Path, str]:
+    """Resolve a Git pathname without following attacker-controlled parents."""
+    if not isinstance(relative, str) or "\0" in relative:
+        raise WorkspaceError("workspace path is invalid")
+    path = PurePosixPath(relative)
+    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+        raise WorkspaceError("workspace path is not relative and normalized")
+    if any(part.casefold() in PROTECTED_WORKSPACE_NAMES for part in path.parts):
+        raise WorkspaceError("workspace path reaches protected metadata")
+    root = workspace.worktree_path.resolve(strict=True)
+    target = workspace.worktree_path.joinpath(*path.parts)
+    try:
+        parent = target.parent.resolve(strict=True)
+        parent.relative_to(root)
+    except (OSError, ValueError) as exc:
+        raise WorkspaceError("workspace path parent escapes the worktree") from exc
+    return target, path.as_posix()
+
+
+def _safe_branch_ref(branch_name: str) -> str:
+    """Return a validated local ref name for CAS branch publication."""
+    forbidden = set("~^:?*[\\")
+    if (
+        not branch_name
+        or branch_name.startswith("/")
+        or branch_name.endswith("/")
+        or ".." in branch_name
+        or "@{" in branch_name
+        or any(ord(char) < 32 or char in forbidden for char in branch_name)
+    ):
+        raise WorkspaceError("workspace branch ref is invalid")
+    return f"refs/heads/{branch_name}"
+
+
+def _verified_changeset_artifact_path(
+    workspace: TaskWorkspace, changeset: ChangeSet
+) -> Path:
+    artifact = changeset.artifact
+    if artifact is None:
+        raise WorkspaceError("changeset has no artifact")
+    expected = workspace.worktree_path.parent / f"{changeset.id}.patch"
+    if artifact.path != expected or artifact.path.parent != workspace.worktree_path.parent:
+        raise WorkspaceError("changeset artifact is outside its authority root")
+    if artifact.path not in workspace.change_artifacts:
+        raise WorkspaceError("changeset artifact is not owned by the workspace")
+    try:
+        info = artifact.path.lstat()
+    except OSError as exc:
+        raise WorkspaceError("changeset artifact is unavailable") from exc
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise WorkspaceError("changeset artifact has an unsafe file type")
+    if int(info.st_size) != artifact.byte_length:
+        raise WorkspaceError("changeset artifact length drifted")
+    return artifact.path
+
+
+def _read_verified_artifact(
+    path: Path,
+    expected_length: int,
+    expected_digest: str,
+    max_bytes: int,
+) -> bytes:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    digest = hashlib.sha256()
+    data = bytearray()
+    try:
+        while chunk := os.read(descriptor, 1024 * 1024):
+            data.extend(chunk)
+            digest.update(chunk)
+            if len(data) > max_bytes:
+                raise WorkspaceError("changeset patch exceeds inline output bound")
+    finally:
+        os.close(descriptor)
+    if len(data) != expected_length or digest.hexdigest() != expected_digest:
+        raise WorkspaceError("changeset artifact digest or length drifted")
+    return bytes(data)
+
+
+def _write_exclusive_artifact(path: Path, payload: bytes) -> None:
+    descriptor = os.open(
+        path,
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        offset = 0
+        while offset < len(payload):
+            offset += os.write(descriptor, payload[offset:])
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _copy_verified_artifact(
+    source: Path,
+    destination: Path,
+    expected_length: int,
+    expected_digest: str,
+) -> None:
+    source_descriptor = os.open(
+        source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    )
+    destination_descriptor: int | None = None
+    digest = hashlib.sha256()
+    total = 0
+    try:
+        destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        destination_descriptor = os.open(
+            destination,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        while chunk := os.read(source_descriptor, 1024 * 1024):
+            total += len(chunk)
+            if total > MAX_CHANGESET_BYTES:
+                raise WorkspaceError("changeset artifact exceeds the configured bound")
+            digest.update(chunk)
+            offset = 0
+            while offset < len(chunk):
+                offset += os.write(destination_descriptor, chunk[offset:])
+        if total != expected_length or digest.hexdigest() != expected_digest:
+            raise WorkspaceError("changeset artifact digest or length drifted")
+        os.fsync(destination_descriptor)
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
+    finally:
+        os.close(source_descriptor)
+        if destination_descriptor is not None:
+            os.close(destination_descriptor)
 
 
 def _open_private_authority_root(configured: Path) -> tuple[Path, FileIdentity]:
@@ -138,6 +289,7 @@ class WorkspaceManager:
         *,
         storage_limits: WorkspaceStorageLimits | None = None,
         storage_authority: WorkspaceStorageAuthority | None = None,
+        bootstrap_limits: WorkspaceBootstrapLimits | None = None,
         policy_digest: str = "legacy-unbound",
     ) -> None:
         configured_root = (
@@ -158,6 +310,7 @@ class WorkspaceManager:
         self.policy_digest = policy_digest
         self.storage_limits = storage_limits or WorkspaceStorageLimits()
         self.storage_authority = storage_authority or WorkspaceStorageAuthority()
+        self.bootstrap_limits = bootstrap_limits or WorkspaceBootstrapLimits()
         self._workspaces: dict[str, TaskWorkspace] = {}
         self._task_ids: set[str] = set()
         self._lock = asyncio.Lock()
@@ -241,6 +394,7 @@ class WorkspaceManager:
                 base_sha,
                 worktree,
                 authority=authority.derive(operation_class="git.materialize"),
+                limits=self.bootstrap_limits,
             )
         except TrustedGitError as exc:
             raise WorkspaceError(str(exc)) from exc
@@ -250,6 +404,7 @@ class WorkspaceManager:
         workspace: TaskWorkspace,
         *args: str,
         preserve_output: bool = False,
+        index_file: Path | None = None,
     ) -> str:
         """Run Git only against the pinned admin dir and worktree."""
         identity = workspace.git_identity
@@ -270,9 +425,207 @@ class WorkspaceManager:
                 *args,
                 authority=authority.derive(operation_class="git.workspace"),
                 preserve_output=preserve_output,
+                index_file=index_file,
             )
         except TrustedGitError as exc:
             raise WorkspaceError(str(exc)) from exc
+
+    async def _workspace_git_input(
+        self,
+        workspace: TaskWorkspace,
+        *args: str,
+        input_bytes: bytes,
+        max_input_bytes: int = 64 * 1024,
+        index_file: Path | None = None,
+    ) -> str:
+        """Run one audited Git plumbing operation with bounded stdin."""
+        identity = workspace.git_identity
+        authority = workspace.authority_envelope
+        if identity is None or authority is None:
+            raise WorkspaceError("TaskWorkspace Git authority is missing")
+        try:
+            await asyncio.to_thread(verify_git_worktree_identity, identity)
+            return await self._git_runner.run_with_input(
+                workspace.worktree_path,
+                f"--git-dir={identity.admin_dir}",
+                f"--work-tree={workspace.worktree_path}",
+                *args,
+                input_bytes=input_bytes,
+                max_input_bytes=max_input_bytes,
+                authority=authority.derive(operation_class="git.workspace"),
+                index_file=index_file,
+            )
+        except (GitIdentityError, TrustedGitError) as exc:
+            raise WorkspaceError(str(exc)) from exc
+
+    async def _workspace_git_bytes_limited(
+        self,
+        workspace: TaskWorkspace,
+        *args: str,
+        max_bytes: int,
+        index_file: Path | None = None,
+    ) -> bytes:
+        """Run one workspace Git read with an explicit output cap."""
+        identity = workspace.git_identity
+        authority = workspace.authority_envelope
+        if identity is None or authority is None:
+            raise WorkspaceError("TaskWorkspace Git authority is missing")
+        try:
+            await asyncio.to_thread(verify_git_worktree_identity, identity)
+            return await self._git_runner.run_bytes_limited(
+                workspace.worktree_path,
+                f"--git-dir={identity.admin_dir}",
+                f"--work-tree={workspace.worktree_path}",
+                *args,
+                authority=authority.derive(operation_class="git.workspace"),
+                max_bytes=max_bytes,
+                index_file=index_file,
+            )
+        except (GitIdentityError, TrustedGitError) as exc:
+            raise WorkspaceError(str(exc)) from exc
+
+    async def _workspace_git_stream(
+        self,
+        workspace: TaskWorkspace,
+        *args: str,
+        destination: Path,
+        max_bytes: int,
+        index_file: Path | None = None,
+    ):
+        """Stream workspace Git output into a private artifact."""
+        identity = workspace.git_identity
+        authority = workspace.authority_envelope
+        if identity is None or authority is None:
+            raise WorkspaceError("TaskWorkspace Git authority is missing")
+        try:
+            await asyncio.to_thread(verify_git_worktree_identity, identity)
+            return await self._git_runner.stream_to_file(
+                workspace.worktree_path,
+                f"--git-dir={identity.admin_dir}",
+                f"--work-tree={workspace.worktree_path}",
+                *args,
+                destination=destination,
+                authority=authority.derive(operation_class="git.workspace"),
+                max_bytes=max_bytes,
+                preview_bytes=MAX_CHANGESET_PREVIEW_BYTES,
+                index_file=index_file,
+            )
+        except (GitIdentityError, TrustedGitError) as exc:
+            raise WorkspaceError(str(exc)) from exc
+
+    async def _workspace_diff_digest(self, workspace: TaskWorkspace) -> str:
+        """Hash the current raw diff without materializing it in Python memory."""
+        index_file = workspace.worktree_path.parent / f".binding-index-{uuid.uuid4().hex}"
+        temporary = workspace.worktree_path.parent / f".binding-{uuid.uuid4().hex}.patch"
+        try:
+            await self._prepare_raw_changeset_index(workspace, index_file)
+            result = await self._workspace_git_stream(
+                workspace,
+                "diff",
+                "--cached",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--binary",
+                workspace.base_sha,
+                destination=temporary,
+                max_bytes=MAX_CHANGESET_BYTES,
+                index_file=index_file,
+            )
+            return result.sha256
+        finally:
+            temporary.unlink(missing_ok=True)
+            index_file.unlink(missing_ok=True)
+            index_file.with_name(f"{index_file.name}.lock").unlink(missing_ok=True)
+
+    async def _hash_workspace_entry(
+        self, workspace: TaskWorkspace, target: Path, info: os.stat_result
+    ) -> tuple[str, str]:
+        """Hash one raw worktree entry without invoking clean filters."""
+        if stat.S_ISLNK(info.st_mode):
+            raw_target = os.fsencode(os.readlink(target))
+            if len(raw_target) > 4096 or b"\0" in raw_target:
+                raise WorkspaceError("workspace symlink target is invalid")
+            object_id = await self._workspace_git_input(
+                workspace,
+                "hash-object",
+                "--stdin",
+                "--no-filters",
+                "-w",
+                input_bytes=raw_target,
+                max_input_bytes=4096,
+            )
+            return object_id, "120000"
+        if stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+            object_id = await self._workspace_git(
+                workspace,
+                "hash-object",
+                "-w",
+                "--no-filters",
+                "--",
+                str(target),
+            )
+            return object_id, "100755" if info.st_mode & 0o111 else "100644"
+        raise WorkspaceError(f"workspace change has an unsupported file type: {target}")
+
+    async def _prepare_raw_changeset_index(
+        self, workspace: TaskWorkspace, index_file: Path
+    ) -> None:
+        """Build a temporary raw-byte index, bypassing all clean filters."""
+        tracked_listing = await self._workspace_git_bytes_limited(
+            workspace, "ls-files", "--stage", "-z", max_bytes=MAX_CHANGESET_NAMES_BYTES
+        )
+        tracked = _parse_index_listing(
+            tracked_listing, object_id_length=len(workspace.base_sha)
+        )
+        untracked_listing = await self._workspace_git_bytes_limited(
+            workspace,
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "-z",
+            max_bytes=MAX_CHANGESET_NAMES_BYTES,
+        )
+        untracked = tuple(
+            os.fsdecode(raw) for raw in untracked_listing.split(b"\0") if raw
+        )
+        if len(tracked) + len(untracked) > MAX_CHANGESET_FILES:
+            raise WorkspaceError("changeset contains too many files")
+        index_file.unlink(missing_ok=True)
+        await self._workspace_git(
+            workspace,
+            "read-tree",
+            workspace.base_sha,
+            index_file=index_file,
+        )
+        paths = {path for _, _, path in tracked}
+        paths.update(untracked)
+        for relative in sorted(paths):
+            target, safe_relative = _safe_workspace_target(workspace, relative)
+            try:
+                info = target.lstat()
+            except FileNotFoundError:
+                await self._workspace_git(
+                    workspace,
+                    "update-index",
+                    "--remove",
+                    "--",
+                    safe_relative,
+                    index_file=index_file,
+                )
+                continue
+            object_id, mode = await self._hash_workspace_entry(workspace, target, info)
+            if len(object_id) != len(workspace.base_sha) or any(
+                character not in "0123456789abcdef" for character in object_id
+            ):
+                raise WorkspaceError("Git returned an object id for the wrong repository format")
+            await self._workspace_git(
+                workspace,
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                f"{mode},{object_id},{safe_relative}",
+                index_file=index_file,
+            )
 
     async def create(
         self,
@@ -320,111 +673,116 @@ class WorkspaceManager:
             )
             branch = f"khaos/task/{task_id}"
             path = (self.root / workspace_id).resolve()
+            pending_path = (self.root / f".pending-{workspace_id}").resolve()
             path.parent.mkdir(parents=True, exist_ok=True)
-            await self._git(
-                repository,
-                "worktree",
-                "add",
-                "--no-checkout",
-                "-b",
-                branch,
-                str(path),
-                base_sha,
-                authority=authority_context,
-            )
+            if path.exists() or path.is_symlink() or pending_path.exists() or pending_path.is_symlink():
+                raise WorkspaceError("workspace bootstrap path already exists")
+            active_path: Path | None = pending_path
             try:
-                git_identity = await asyncio.to_thread(
-                    capture_git_worktree_identity, repository, path
-                )
-            except GitIdentityError:
                 await self._git(
                     repository,
                     "worktree",
-                    "remove",
-                    "--force",
-                    str(path),
+                    "add",
+                    "--no-checkout",
+                    "-b",
+                    branch,
+                    str(pending_path),
+                    base_sha,
                     authority=authority_context,
                 )
-                raise
-            # ``--no-checkout`` deliberately leaves the worktree empty.  Set
-            # the linked index to the approved tree without ``-u`` so Git
-            # does not invoke any smudge/filter driver; tracked bytes are
-            # materialized separately from raw tree/blob objects below.
-            await self._git(
-                path,
-                f"--git-dir={git_identity.admin_dir}",
-                f"--work-tree={path}",
-                "read-tree",
-                base_sha,
-                authority=authority_context.derive(operation_class="git.index"),
-            )
-            recovery_root = (self.root.parent / ".khaos-recovery").resolve()
-            try:
+                git_identity = await asyncio.to_thread(
+                    capture_git_worktree_identity, repository, pending_path
+                )
+                # ``--no-checkout`` deliberately leaves the worktree empty.
+                # Set the linked index to the approved tree without ``-u`` so
+                # Git does not invoke any smudge/filter driver; tracked bytes
+                # are materialized separately from raw tree/blob objects.
+                await self._git(
+                    pending_path,
+                    f"--git-dir={git_identity.admin_dir}",
+                    f"--work-tree={pending_path}",
+                    "read-tree",
+                    base_sha,
+                    authority=authority_context.derive(operation_class="git.index"),
+                )
                 await self._materialize_git_tree(
                     repository,
                     base_sha,
-                    path,
+                    pending_path,
                     authority=authority_context,
                 )
+                recovery_root = (self.root.parent / ".khaos-recovery").resolve()
+                await asyncio.to_thread(
+                    _install_protected_metadata_guards, pending_path
+                )
+                baseline = await asyncio.to_thread(
+                    capture_workspace_snapshot, pending_path
+                )
+                if not baseline.complete:
+                    raise WorkspaceError("TaskWorkspace storage baseline is incomplete")
+                await self._git(
+                    repository,
+                    "worktree",
+                    "move",
+                    str(pending_path),
+                    str(path),
+                    authority=authority_context,
+                )
+                active_path = path
+                git_identity = await asyncio.to_thread(
+                    capture_git_worktree_identity, repository, path
+                )
+                root_stat = path.stat()
+                workspace = TaskWorkspace(
+                    id=workspace_id,
+                    task_id=task_id,
+                    repository_root=repository,
+                    worktree_path=path,
+                    base_ref=base_ref,
+                    base_sha=base_sha,
+                    branch_name=branch,
+                    state=WorkspaceState.READY,
+                    writable_roots=(path,),
+                    recovery_root=recovery_root,
+                    storage_limits=self.storage_limits,
+                    git_identity=git_identity,
+                    principal_id=principal_id,
+                    project_id=project_id,
+                    creator_runtime_id=creator_runtime_id,
+                    authority_generation=1,
+                    root_device=int(root_stat.st_dev),
+                    root_inode=int(root_stat.st_ino),
+                    authority_envelope=authority_context,
+                )
+                workspace.storage_baseline = baseline
+                self._workspaces[workspace_id] = workspace
+                self._task_ids.add(task_id)
+                active_path = None
+                return workspace
             except Exception:
-                await self._git(
-                    repository,
-                    "worktree",
-                    "remove",
-                    "--force",
-                    str(path),
-                    authority=authority_context,
-                )
+                # A bootstrap failure must not leave a directory that looks
+                # usable but is absent from the in-memory lifecycle registry.
+                # Git owns the administrative metadata, so cleanup stays on
+                # the trusted worktree path rather than using host ``rmtree``.
+                if active_path is not None:
+                    try:
+                        await self._git(
+                            repository,
+                            "worktree",
+                            "remove",
+                            "--force",
+                            str(active_path),
+                            authority=authority_context,
+                        )
+                    except Exception as cleanup_error:  # noqa: BLE001 - preserve original failure
+                        logger.error(
+                            "bootstrap cleanup failed for %s: %s",
+                            active_path,
+                            cleanup_error,
+                        )
+                self._workspaces.pop(workspace_id, None)
+                self._task_ids.discard(task_id)
                 raise
-            root_stat = path.stat()
-            workspace = TaskWorkspace(
-                id=workspace_id,
-                task_id=task_id,
-                repository_root=repository,
-                worktree_path=path,
-                base_ref=base_ref,
-                base_sha=base_sha,
-                branch_name=branch,
-                state=WorkspaceState.READY,
-                writable_roots=(path,),
-                recovery_root=recovery_root,
-                storage_limits=self.storage_limits,
-                git_identity=git_identity,
-                principal_id=principal_id,
-                project_id=project_id,
-                creator_runtime_id=creator_runtime_id,
-                authority_generation=1,
-                root_device=int(root_stat.st_dev),
-                root_inode=int(root_stat.st_ino),
-                authority_envelope=authority_context,
-            )
-            try:
-                await asyncio.to_thread(_install_protected_metadata_guards, path)
-            except Exception:
-                await self._git(
-                    repository,
-                    "worktree",
-                    "remove",
-                    "--force",
-                    str(path),
-                    authority=authority_context,
-                )
-                raise
-            baseline = await asyncio.to_thread(capture_workspace_snapshot, path)
-            if not baseline.complete:
-                await self._git(
-                    repository,
-                    "worktree",
-                    "remove",
-                    "--force",
-                    str(path),
-                    authority=authority_context,
-                )
-                raise WorkspaceError("TaskWorkspace storage baseline is incomplete")
-            workspace.storage_baseline = baseline
-            self._workspaces[workspace_id] = workspace
-            self._task_ids.add(task_id)
-            return workspace
 
     async def transition(self, workspace_id: str, target: WorkspaceState) -> WorkspaceTransition:
         async with self._lock:
@@ -616,30 +974,249 @@ class WorkspaceManager:
         return transition
 
     async def build_changeset(self, workspace_id: str) -> ChangeSet:
+        async with self._lock:
+            workspace = self._workspaces.get(workspace_id)
+            if workspace is None:
+                raise WorkspaceError("workspace not found")
+            if workspace.state in {
+                WorkspaceState.CANCELLED,
+                WorkspaceState.CLEANING,
+                WorkspaceState.CLEANED,
+            }:
+                raise WorkspaceError("workspace is not available for ChangeSet creation")
+            if (
+                len(workspace.change_artifacts)
+                + workspace.change_artifact_reservations
+                >= MAX_CHANGESET_ARTIFACTS
+                or workspace.change_artifact_bytes
+                + (
+                    workspace.change_artifact_reservations + 1
+                ) * MAX_CHANGESET_BYTES
+                > MAX_CHANGESET_ARTIFACT_BYTES
+            ):
+                raise WorkspaceError("workspace ChangeSet artifact quota is exhausted")
+            workspace.change_artifact_reservations += 1
+        index_file = workspace.worktree_path.parent / f".changeset-index-{uuid.uuid4().hex}"
+        artifact_path: Path | None = None
+        artifact_registered = False
+        artifact_length = 0
+        try:
+            await self._prepare_raw_changeset_index(workspace, index_file)
+            names_raw = await self._workspace_git_bytes_limited(
+                workspace,
+                "diff",
+                "--cached",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--name-only",
+                "-z",
+                workspace.base_sha,
+                max_bytes=MAX_CHANGESET_NAMES_BYTES,
+                index_file=index_file,
+            )
+            changed_files = tuple(
+                os.fsdecode(raw)
+                for raw in names_raw.split(b"\0")
+                if raw
+            )
+            if len(changed_files) > MAX_CHANGESET_FILES:
+                raise WorkspaceError("changeset contains too many files")
+            protected = {name.casefold() for name in PROTECTED_WORKSPACE_NAMES}
+            for changed in changed_files:
+                if any(part.casefold() in protected for part in Path(changed).parts):
+                    raise WorkspaceError("changeset contains protected workspace metadata")
+                _safe_workspace_target(workspace, changed)
+            stat_raw = await self._workspace_git_bytes_limited(
+                workspace,
+                "diff",
+                "--cached",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--stat",
+                workspace.base_sha,
+                max_bytes=MAX_CHANGESET_STAT_BYTES,
+                index_file=index_file,
+            )
+            artifact_path = workspace.worktree_path.parent / f"{uuid.uuid4().hex[:12]}.patch"
+            stream = await self._workspace_git_stream(
+                workspace,
+                "diff",
+                "--cached",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--binary",
+                workspace.base_sha,
+                destination=artifact_path,
+                max_bytes=MAX_CHANGESET_BYTES,
+                index_file=index_file,
+            )
+            artifact_length = stream.byte_length
+            async with self._lock:
+                if (
+                    workspace.change_artifact_bytes + stream.byte_length
+                    > MAX_CHANGESET_ARTIFACT_BYTES
+                ):
+                    raise WorkspaceError(
+                        "workspace ChangeSet artifact byte quota is exhausted"
+                    )
+                workspace.change_artifacts.add(artifact_path)
+                workspace.change_artifact_bytes += stream.byte_length
+                artifact_registered = True
+            if stream.byte_length <= MAX_CHANGESET_INLINE_BYTES:
+                patch = artifact_path.read_bytes().decode("utf-8", errors="replace")
+            else:
+                patch = stream.preview
+            artifact = ChangeSetArtifact(
+                path=artifact_path,
+                byte_length=stream.byte_length,
+                sha256=stream.sha256,
+                preview=stream.preview,
+            )
+            changeset = ChangeSet.create(
+                id=artifact_path.stem,
+                workspace_id=workspace_id,
+                base_sha=workspace.base_sha,
+                head_sha=None,
+                patch=patch,
+                diff_stat=stat_raw.decode("utf-8", errors="replace"),
+                changed_files=changed_files,
+                artifact=artifact,
+            )
+            return changeset
+        except Exception:
+            if artifact_path is not None:
+                if artifact_registered:
+                    async with self._lock:
+                        workspace.change_artifacts.discard(artifact_path)
+                        workspace.change_artifact_bytes -= artifact_length
+                    artifact_registered = False
+                artifact_path.unlink(missing_ok=True)
+            raise
+        finally:
+            async with self._lock:
+                workspace.change_artifact_reservations -= 1
+            index_file.unlink(missing_ok=True)
+            index_file.with_name(f"{index_file.name}.lock").unlink(missing_ok=True)
+
+    async def read_changeset_patch(
+        self, workspace_id: str, changeset: ChangeSet
+    ) -> str:
+        """Read only a small patch inline; large artifacts require paging."""
         workspace = self._workspaces.get(workspace_id)
-        if workspace is None:
-            raise WorkspaceError("workspace not found")
-        patch = await self._workspace_git(workspace, "diff", "--no-ext-diff", "--binary", workspace.base_sha, preserve_output=True)
-        stat = await self._workspace_git(workspace, "diff", "--no-ext-diff", "--stat", workspace.base_sha)
-        names = await self._workspace_git(workspace, "diff", "--no-ext-diff", "--name-only", workspace.base_sha)
-        protected = {name.casefold() for name in PROTECTED_WORKSPACE_NAMES}
-        for changed in names.splitlines():
-            if any(part.casefold() in protected for part in Path(changed).parts):
-                raise WorkspaceError("changeset contains protected workspace metadata")
-        changeset = ChangeSet.create(id=uuid.uuid4().hex[:12], workspace_id=workspace_id, base_sha=workspace.base_sha, head_sha=None, patch=patch, diff_stat=stat, changed_files=tuple(line for line in names.splitlines() if line))
-        artifact = workspace.worktree_path.parent / f"{changeset.id}.patch"
-        artifact.write_text(patch, encoding="utf-8")
-        return changeset
+        if workspace is None or changeset.workspace_id != workspace_id:
+            raise WorkspaceError("workspace or changeset not found")
+        if changeset.artifact is None:
+            if len(changeset.patch.encode("utf-8")) > MAX_CHANGESET_INLINE_BYTES:
+                raise WorkspaceError("large changesets must be consumed as artifacts")
+            return changeset.patch
+        path = _verified_changeset_artifact_path(workspace, changeset)
+        data = await asyncio.to_thread(
+            _read_verified_artifact,
+            path,
+            changeset.artifact.byte_length,
+            changeset.artifact.sha256,
+            MAX_CHANGESET_INLINE_BYTES,
+        )
+        return data.decode("utf-8", errors="replace")
+
+    async def export_changeset_artifact(
+        self, workspace_id: str, changeset: ChangeSet, destination: Path
+    ) -> None:
+        """Copy a verified artifact with a bounded, digest-checked stream."""
+        workspace = self._workspaces.get(workspace_id)
+        if workspace is None or changeset.workspace_id != workspace_id:
+            raise WorkspaceError("workspace or changeset not found")
+        destination = destination.absolute()
+        try:
+            destination.parent.resolve(strict=True).relative_to(self.root)
+        except (OSError, ValueError) as exc:
+            raise WorkspaceError("changeset export destination is outside the private root") from exc
+        if changeset.artifact is None:
+            payload = changeset.patch.encode("utf-8")
+            if len(payload) > MAX_CHANGESET_BYTES:
+                raise WorkspaceError("changeset exceeds the artifact limit")
+            await asyncio.to_thread(_write_exclusive_artifact, destination, payload)
+            return
+        path = _verified_changeset_artifact_path(workspace, changeset)
+        await asyncio.to_thread(
+            _copy_verified_artifact,
+            path,
+            destination,
+            changeset.artifact.byte_length,
+            changeset.artifact.sha256,
+        )
 
     async def commit_in_worktree(self, workspace_id: str, changeset: ChangeSet, message: str) -> str:
         workspace = self._workspaces.get(workspace_id)
         if workspace is None or changeset.workspace_id != workspace_id:
             raise WorkspaceError("workspace or changeset not found")
-        current = await self._workspace_git(workspace, "diff", "--no-ext-diff", "--binary", workspace.base_sha, preserve_output=True)
-        if current.encode("utf-8") != changeset.patch.encode("utf-8"):
+        current_head = await self._workspace_git(workspace, "rev-parse", "HEAD")
+        current_digest = await self._workspace_diff_digest(workspace)
+        if current_head != changeset.base_sha or current_digest != changeset.content_hash:
             raise WorkspaceError("changeset content changed; approval is stale")
-        await self._workspace_git(workspace, "add", "--", *changeset.changed_files)
-        await self._workspace_git(workspace, "commit", "-m", message)
+
+        await self._workspace_git(workspace, "read-tree", workspace.base_sha)
+        for relative in changeset.changed_files:
+            target, safe_relative = _safe_workspace_target(workspace, relative)
+            try:
+                info = target.lstat()
+            except FileNotFoundError:
+                await self._workspace_git(
+                    workspace, "update-index", "--remove", "--", safe_relative
+                )
+                continue
+            if stat.S_ISLNK(info.st_mode):
+                raw_target = os.fsencode(os.readlink(target))
+                if len(raw_target) > 4096 or b"\0" in raw_target:
+                    raise WorkspaceError("workspace symlink target is invalid")
+                object_id = await self._workspace_git_input(
+                    workspace,
+                    "hash-object",
+                    "--stdin",
+                    "--no-filters",
+                    "-w",
+                    input_bytes=raw_target,
+                    max_input_bytes=4096,
+                )
+                mode = "120000"
+            elif stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+                object_id = await self._workspace_git(
+                    workspace,
+                    "hash-object",
+                    "-w",
+                    "--no-filters",
+                    "--",
+                    str(target),
+                )
+                mode = "100755" if info.st_mode & 0o111 else "100644"
+            else:
+                raise WorkspaceError(f"workspace change has an unsupported file type: {relative}")
+            if len(object_id) != len(workspace.base_sha) or any(
+                character not in "0123456789abcdef" for character in object_id
+            ):
+                raise WorkspaceError("Git returned an object id for the wrong repository format")
+            await self._workspace_git(
+                workspace,
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                f"{mode},{object_id},{safe_relative}",
+            )
+
+        tree = await self._workspace_git(workspace, "write-tree")
+        message_bytes = message.encode("utf-8")
+        if not message_bytes or len(message_bytes) > 64 * 1024 or b"\0" in message_bytes:
+            raise WorkspaceError("commit message is empty, too large, or contains NUL")
+        commit_id = await self._workspace_git_input(
+            workspace,
+            "commit-tree",
+            tree,
+            "-p",
+            current_head,
+            input_bytes=message_bytes,
+        )
+        ref = _safe_branch_ref(workspace.branch_name)
+        await self._workspace_git(workspace, "update-ref", ref, commit_id, current_head)
         return await self._workspace_git(workspace, "rev-parse", "HEAD")
 
     async def cleanup(self, workspace_id: str, *, force: bool = False) -> WorkspaceTransition:
@@ -690,6 +1267,12 @@ class WorkspaceManager:
                 return WorkspaceTransition.NOT_FOUND
             if workspace.state not in {WorkspaceState.APPLIED, WorkspaceState.FAILED, WorkspaceState.CANCELLED} and not force:
                 return WorkspaceTransition.INVALID
+            if workspace.change_artifact_reservations:
+                logger.warning(
+                    "cleanup refused while ChangeSet artifact build is active: %s",
+                    workspace_id,
+                )
+                return WorkspaceTransition.FAILED
             # Release any ACTIVE execution lease for this workspace.
             # Batch 2.6 §4: fail closed on lease invalidation error — do
             # NOT continue to CLEANING/CLEANED. The workspace stays in its
@@ -733,6 +1316,16 @@ class WorkspaceManager:
                         authority=authority.derive(operation_class="git.cleanup"),
                     )
             except Exception:  # noqa: BLE001 - worktree cleanup failure is persisted
+                workspace.state = WorkspaceState.FAILED
+                return WorkspaceTransition.FAILED
+            try:
+                for artifact in tuple(workspace.change_artifacts):
+                    if artifact.parent != workspace.worktree_path.parent:
+                        raise WorkspaceError("changeset artifact escaped its authority root")
+                    artifact.unlink(missing_ok=True)
+                workspace.change_artifacts.clear()
+                workspace.change_artifact_bytes = 0
+            except (OSError, WorkspaceError):
                 workspace.state = WorkspaceState.FAILED
                 return WorkspaceTransition.FAILED
             workspace.state = WorkspaceState.CLEANED

@@ -1,5 +1,4 @@
 import pytest
-
 from khaos.agent.approval import ApprovalBroker
 from khaos.coding.workspace.application import ChangeSetApplicationService
 from khaos.coding.workspace.apply import OutputMode
@@ -15,7 +14,8 @@ async def test_changeset_application_rejects_replay():
     workspace.worktree_path = MagicMock()
     workspace.base_sha = "b"
     manager.get.return_value = workspace
-    manager._git = AsyncMock(side_effect=lambda _root, *args, **_kwargs: "patch" if args[0] == "diff" else "head")
+    manager._workspace_git = AsyncMock(return_value="head")
+    manager._workspace_diff_digest = AsyncMock(return_value="digest")
     change = ChangeSet.create(id="c", workspace_id="w", base_sha="b", head_sha=None, patch="patch", diff_stat="", changed_files=())
     service = ChangeSetApplicationService(manager, ApprovalBroker())
     key = await service.request_approval(task_id="task", workspace_id="w", changeset=change, operation=OutputMode.PATCH_ONLY, requester="session", expiry=10**12)

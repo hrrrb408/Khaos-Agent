@@ -3,10 +3,12 @@ import subprocess
 from pathlib import Path
 
 import pytest
-
+from khaos.coding.workspace import manager as workspace_manager_module
+from khaos.coding.workspace.boundary import PROTECTED_WORKSPACE_NAMES
+from khaos.coding.workspace.git_identity import GitIdentityError
 from khaos.coding.workspace.manager import WorkspaceError, WorkspaceManager
 from khaos.coding.workspace.models import WorkspaceState, WorkspaceTransition
-from khaos.coding.workspace.boundary import PROTECTED_WORKSPACE_NAMES
+from khaos.coding.workspace.trusted_git import WorkspaceBootstrapLimits
 
 
 def _repo(path: Path) -> Path:
@@ -39,6 +41,7 @@ async def test_worktree_lifecycle_and_changeset_binding(tmp_path: Path):
     assert await manager.transition(workspace.id, WorkspaceState.CLEANED) is WorkspaceTransition.INVALID
     assert await manager.transition(workspace.id, WorkspaceState.FAILED) is WorkspaceTransition.UPDATED
     assert await manager.cleanup(workspace.id, force=True) is WorkspaceTransition.UPDATED
+    assert not (workspace.worktree_path.parent / f"{changeset.id}.patch").exists()
 
 
 @pytest.mark.asyncio
@@ -207,6 +210,218 @@ async def test_workspace_bootstrap_never_executes_repository_git_extensions(
 
     assert (workspace.worktree_path / "README.md").read_text() == "base\n"
     assert not marker.exists()
+
+
+@pytest.mark.asyncio
+async def test_workspace_bootstrap_enforces_independent_blob_quota_and_cleans_pending(
+    tmp_path: Path,
+):
+    repository = _repo(tmp_path / "repo")
+    (repository / "large.bin").write_bytes(b"x" * 128)
+    subprocess.run(["git", "add", "large.bin"], cwd=repository, check=True)
+    subprocess.run(["git", "commit", "-qm", "large"], cwd=repository, check=True)
+    manager = WorkspaceManager(
+        tmp_path / "worktrees",
+        bootstrap_limits=WorkspaceBootstrapLimits(
+            max_materialized_bytes=64,
+            max_single_blob_bytes=64,
+            max_tree_entries=100,
+            max_path_depth=8,
+            max_symlinks=4,
+            max_duration_seconds=30,
+        ),
+    )
+
+    with pytest.raises(WorkspaceError, match="single-blob|materialized-byte"):
+        await manager.create(repository, "task-bootstrap-quota")
+
+    assert manager._workspaces == {}
+    assert list(manager.root.iterdir()) == []
+    assert subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        cwd=repository,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.count("worktree ") == 1
+
+
+@pytest.mark.asyncio
+async def test_workspace_bootstrap_publish_failure_cleans_final_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A post-publish identity failure cannot leave an unregistered worktree."""
+    repository = _repo(tmp_path / "repo")
+    manager = WorkspaceManager(tmp_path / "worktrees")
+    original_capture = workspace_manager_module.capture_git_worktree_identity
+    calls = 0
+
+    def fail_after_publish(repository_root: Path, worktree_path: Path):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise GitIdentityError("simulated final identity failure")
+        return original_capture(repository_root, worktree_path)
+
+    monkeypatch.setattr(
+        workspace_manager_module,
+        "capture_git_worktree_identity",
+        fail_after_publish,
+    )
+
+    with pytest.raises(GitIdentityError, match="simulated final identity failure"):
+        await manager.create(repository, "task-publish-failure")
+
+    assert manager._workspaces == {}
+    assert list(manager.root.iterdir()) == []
+    assert subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        cwd=repository,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.count("worktree ") == 1
+
+
+@pytest.mark.asyncio
+async def test_workspace_bootstrap_rejects_gitlinks_without_submodule_update(
+    tmp_path: Path,
+):
+    repository = _repo(tmp_path / "repo")
+    base_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repository,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "update-index", "--add", "--cacheinfo", f"160000,{base_sha},submodule"],
+        cwd=repository,
+        check=True,
+    )
+    subprocess.run(["git", "commit", "-qm", "gitlink"], cwd=repository, check=True)
+    manager = WorkspaceManager(tmp_path / "worktrees")
+
+    with pytest.raises(WorkspaceError, match="submodules/gitlinks"):
+        await manager.create(repository, "task-gitlink")
+
+    assert manager._workspaces == {}
+    assert list(manager.root.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_trusted_diff_and_plumbing_commit_disable_textconv_filters_and_signing(
+    tmp_path: Path,
+):
+    repository = _repo(tmp_path / "repo")
+    marker = tmp_path / "extension-ran"
+    extension = tmp_path / "extension.sh"
+    extension.write_text(
+        f"#!/bin/sh\ntouch {marker}\ncat\n",
+        encoding="utf-8",
+    )
+    extension.chmod(0o755)
+    (repository / ".gitattributes").write_text(
+        "README.md diff=sentinel filter=sentinel\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", ".gitattributes"], cwd=repository, check=True)
+    subprocess.run(["git", "commit", "-qm", "attributes"], cwd=repository, check=True)
+    subprocess.run(
+        ["git", "config", "diff.sentinel.textconv", str(extension)],
+        cwd=repository,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "filter.sentinel.clean", str(extension)],
+        cwd=repository,
+        check=True,
+    )
+    subprocess.run(["git", "config", "commit.gpgSign", "true"], cwd=repository, check=True)
+    subprocess.run(["git", "config", "gpg.program", str(extension)], cwd=repository, check=True)
+
+    manager = WorkspaceManager(tmp_path / "worktrees")
+    workspace = await manager.create(repository, "task-git-extensions")
+    assert not marker.exists()
+    (workspace.worktree_path / "README.md").write_text("changed\n", encoding="utf-8")
+    changeset = await manager.build_changeset(workspace.id)
+    assert changeset.artifact is not None
+    assert not marker.exists()
+
+    await manager.commit_in_worktree(workspace.id, changeset, "safe plumbing commit")
+    assert not marker.exists()
+    assert subprocess.run(
+        ["git", "show", "HEAD:README.md"],
+        cwd=workspace.worktree_path,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout == "changed\n"
+
+
+@pytest.mark.asyncio
+async def test_large_changeset_is_streamed_and_inline_read_is_bounded(tmp_path: Path):
+    repository = _repo(tmp_path / "repo")
+    manager = WorkspaceManager(tmp_path / "worktrees")
+    workspace = await manager.create(repository, "task-large-diff")
+    (workspace.worktree_path / "README.md").write_text("x" * (1024 * 1024 + 32), encoding="utf-8")
+
+    changeset = await manager.build_changeset(workspace.id)
+    assert changeset.artifact is not None
+    assert changeset.artifact.byte_length > 1024 * 1024
+    assert len(changeset.patch.encode("utf-8")) <= 64 * 1024
+    with pytest.raises(WorkspaceError, match="large changesets|inline output"):
+        await manager.read_changeset_patch(workspace.id, changeset)
+
+
+@pytest.mark.asyncio
+async def test_changeset_artifact_workspace_quota_is_enforced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repository = _repo(tmp_path / "repo")
+    manager = WorkspaceManager(tmp_path / "worktrees")
+    workspace = await manager.create(repository, "task-artifact-quota")
+    monkeypatch.setattr(workspace_manager_module, "MAX_CHANGESET_ARTIFACTS", 1)
+
+    await manager.build_changeset(workspace.id)
+    with pytest.raises(WorkspaceError, match="artifact quota"):
+        await manager.build_changeset(workspace.id)
+
+
+@pytest.mark.asyncio
+async def test_plumbing_changeset_covers_untracked_and_deleted_files(tmp_path: Path):
+    repository = _repo(tmp_path / "repo")
+    manager = WorkspaceManager(tmp_path / "worktrees")
+    workspace = await manager.create(repository, "task-file-set")
+    (workspace.worktree_path / "README.md").unlink()
+    (workspace.worktree_path / "new.txt").write_text("new\n", encoding="utf-8")
+
+    changeset = await manager.build_changeset(workspace.id)
+    assert set(changeset.changed_files) == {"README.md", "new.txt"}
+    await manager.commit_in_worktree(workspace.id, changeset, "raw file set")
+    assert not (workspace.worktree_path / "README.md").exists()
+    assert (workspace.worktree_path / "new.txt").read_text(encoding="utf-8") == "new\n"
+
+
+@pytest.mark.asyncio
+async def test_sha256_repository_uses_64_character_object_ids(tmp_path: Path):
+    repository = tmp_path / "sha256-repo"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-q", "--object-format=sha256"], cwd=repository, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repository, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repository, check=True)
+    (repository / "README.md").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repository, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=repository, check=True)
+
+    manager = WorkspaceManager(tmp_path / "worktrees")
+    workspace = await manager.create(repository, "task-sha256")
+    assert len(workspace.base_sha) == 64
+    (workspace.worktree_path / "README.md").write_text("sha256\n", encoding="utf-8")
+    changeset = await manager.build_changeset(workspace.id)
+    assert len(changeset.base_sha) == 64
+    await manager.commit_in_worktree(workspace.id, changeset, "sha256 plumbing")
 
 
 @pytest.mark.asyncio
