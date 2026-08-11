@@ -29,9 +29,10 @@ mod windows_backend {
         CloseHandle, GetLastError, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
     use windows_sys::Win32::Security::{
-        CreateRestrictedToken, CreateWellKnownSid, IsTokenRestricted, WinRestrictedCodeSid,
-        DISABLE_MAX_PRIVILEGE, PSID, SID_AND_ATTRIBUTES, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE,
-        TOKEN_QUERY,
+        CreateRestrictedToken, CreateWellKnownSid, GetTokenInformation, IsTokenRestricted,
+        LookupPrivilegeValueW, TokenPrivileges, WinRestrictedCodeSid, LUID_AND_ATTRIBUTES, PSID,
+        SE_CHANGE_NOTIFY_NAME, SID_AND_ATTRIBUTES, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE,
+        TOKEN_PRIVILEGES, TOKEN_QUERY,
     };
     use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE};
     use windows_sys::Win32::System::JobObjects::{
@@ -314,15 +315,16 @@ mod windows_backend {
             return Err(last_error("OpenProcessToken"));
         }
         let current = Handle(current);
+        let privileges_to_delete = privileges_except_change_notify(current.0)?;
         let mut restricted: HANDLE = null_mut();
         let created = unsafe {
             CreateRestrictedToken(
                 current.0,
-                DISABLE_MAX_PRIVILEGE,
+                0,
                 0,
                 null(),
-                0,
-                null(),
+                privileges_to_delete.len() as u32,
+                privileges_to_delete.as_ptr(),
                 1,
                 &restricted_sid_attribute,
                 &mut restricted as *mut HANDLE,
@@ -332,6 +334,65 @@ mod windows_backend {
             return Err(last_error("CreateRestrictedToken"));
         }
         Ok(Handle(restricted))
+    }
+
+    /// Keep only directory traversal while deleting every other privilege.
+    /// ``DISABLE_MAX_PRIVILEGE`` also removes SeChangeNotifyPrivilege, which
+    /// makes an otherwise usable restricted process fail while traversing the
+    /// interpreter and system runtime path.  The privilege does not grant
+    /// read/write access; the separate restricted-SID ACL checks remain the
+    /// authority for files and directories.
+    fn privileges_except_change_notify(token: HANDLE) -> Result<Vec<LUID_AND_ATTRIBUTES>, String> {
+        let mut required = 0_u32;
+        unsafe {
+            GetTokenInformation(
+                token,
+                TokenPrivileges,
+                null_mut(),
+                0,
+                &mut required as *mut u32,
+            );
+        }
+        if required == 0 {
+            return Err(last_error("GetTokenInformation(TokenPrivileges size)"));
+        }
+        let mut buffer = vec![0_u8; required as usize];
+        let queried = unsafe {
+            GetTokenInformation(
+                token,
+                TokenPrivileges,
+                buffer.as_mut_ptr() as *mut c_void,
+                required,
+                &mut required as *mut u32,
+            )
+        };
+        if queried == 0 {
+            return Err(last_error("GetTokenInformation(TokenPrivileges)"));
+        }
+        let mut change_notify: windows_sys::Win32::Foundation::LUID = unsafe { zeroed() };
+        if unsafe { LookupPrivilegeValueW(null(), SE_CHANGE_NOTIFY_NAME, &mut change_notify) } == 0
+        {
+            return Err(last_error("LookupPrivilegeValueW(SeChangeNotifyPrivilege)"));
+        }
+        let privileges = unsafe { &*(buffer.as_ptr() as *const TOKEN_PRIVILEGES) };
+        let entries = unsafe {
+            std::slice::from_raw_parts(
+                privileges.Privileges.as_ptr(),
+                privileges.PrivilegeCount as usize,
+            )
+        };
+        Ok(entries
+            .iter()
+            .copied()
+            .filter(|entry| !same_luid(entry.Luid, change_notify))
+            .collect())
+    }
+
+    fn same_luid(
+        left: windows_sys::Win32::Foundation::LUID,
+        right: windows_sys::Win32::Foundation::LUID,
+    ) -> bool {
+        left.LowPart == right.LowPart && left.HighPart == right.HighPart
     }
 
     fn restricted_code_sid() -> Result<Vec<u8>, String> {
