@@ -150,6 +150,35 @@ mod linux {
         }
     }
 
+    fn landlock_rule_access(descriptor: RawFd, requested: u64) -> io::Result<u64> {
+        let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(descriptor, &mut metadata) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let file_type = metadata.st_mode & libc::S_IFMT;
+        if file_type == libc::S_IFDIR {
+            return Ok(requested);
+        }
+        // READ_DIR and the MAKE_*/REMOVE_* rights describe directory
+        // hierarchies.  Passing them for a literal file (for example
+        // /etc/group) is rejected by Landlock with EINVAL.
+        let mut file_access = LANDLOCK_ACCESS_FS_EXECUTE
+            | LANDLOCK_ACCESS_FS_WRITE_FILE
+            | LANDLOCK_ACCESS_FS_READ_FILE
+            | LANDLOCK_ACCESS_FS_TRUNCATE;
+        if file_type == libc::S_IFCHR || file_type == libc::S_IFBLK {
+            file_access |= LANDLOCK_ACCESS_FS_IOCTL_DEV;
+        }
+        let filtered = requested & file_access;
+        if filtered == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Landlock rule has no access applicable to a non-directory",
+            ));
+        }
+        Ok(filtered)
+    }
+
     fn landlock_paths(variable: &str) -> io::Result<Vec<String>> {
         let raw = env::var(variable).map_err(|_| {
             io::Error::new(
@@ -195,7 +224,12 @@ mod linux {
             ));
         }
         let rule = LandlockPathBeneathAttr {
-            allowed_access: access,
+            allowed_access: landlock_rule_access(descriptor, access).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("inspect Landlock allow path {path}: {error}"),
+                )
+            })?,
             parent_fd: descriptor,
         };
         let result = unsafe {
