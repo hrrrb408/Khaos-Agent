@@ -9,6 +9,8 @@
 
 #![cfg_attr(not(windows), allow(dead_code))]
 
+// KHAOS-PRIVILEGED-SPAWN owner=WindowsSandboxTCB threat-model=restricted-token-job-acl-wfp boundary=windows-sandbox
+
 #[cfg(windows)]
 mod windows_backend {
     use std::env;
@@ -563,10 +565,11 @@ mod windows_backend {
                     format!("name={allow_name}"),
                     "dir=out".to_string(),
                     "action=allow".to_string(),
-                    format!("program={program}"),
+                    format!("program=\"{program}\""),
                     "remoteip=127.0.0.1".to_string(),
                     "protocol=TCP".to_string(),
                     format!("remoteport={port}"),
+                    "profile=any".to_string(),
                 ];
                 run_netsh_dynamic(&allow_args)?;
                 names.push(allow_name);
@@ -580,8 +583,9 @@ mod windows_backend {
                     format!("name={non_loopback_v4}"),
                     "dir=out".to_string(),
                     "action=block".to_string(),
-                    format!("program={program}"),
+                    format!("program=\"{program}\""),
                     "remoteip=0.0.0.0-126.255.255.255,128.0.0.0-255.255.255.255".to_string(),
+                    "profile=any".to_string(),
                 ];
                 if let Err(error) = run_netsh_dynamic(&v4_args) {
                     remove_firewall_rules(&names);
@@ -598,8 +602,9 @@ mod windows_backend {
                     format!("name={v6_name}"),
                     "dir=out".to_string(),
                     "action=block".to_string(),
-                    format!("program={program}"),
+                    format!("program=\"{program}\""),
                     "remoteip=::/0".to_string(),
+                    "profile=any".to_string(),
                 ];
                 if let Err(error) = run_netsh_dynamic(&v6_args) {
                     remove_firewall_rules(&names);
@@ -618,12 +623,13 @@ mod windows_backend {
                             format!("name={name}"),
                             "dir=out".to_string(),
                             "action=block".to_string(),
-                            format!("program={program}"),
+                            format!("program=\"{program}\""),
                             // Block every IPv4 loopback address except the
                             // exact proxy endpoint covered by the allow rule.
                             "remoteip=127.0.0.0-127.255.255.255".to_string(),
                             format!("protocol={protocol}"),
                             format!("remoteport={remote_port}"),
+                            "profile=any".to_string(),
                         ];
                         if let Err(error) = run_netsh_dynamic(&args) {
                             remove_firewall_rules(&names);
@@ -643,7 +649,8 @@ mod windows_backend {
                     format!("name={name}"),
                     "dir=out".to_string(),
                     "action=block".to_string(),
-                    format!("program={program}"),
+                    format!("program=\"{program}\""),
+                    "profile=any".to_string(),
                 ];
                 run_netsh_dynamic(&args).map(|()| names.push(name))
             };
@@ -705,8 +712,10 @@ mod windows_backend {
             .map_err(|e| format!("WFP firewall command unavailable: {e}"))?;
         if !result.status.success() {
             return Err(format!(
-                "WFP firewall command failed: {}",
-                String::from_utf8_lossy(&result.stderr).trim()
+                "WFP firewall command failed (status={}): stdout={} stderr={}",
+                result.status,
+                String::from_utf8_lossy(&result.stdout).trim(),
+                String::from_utf8_lossy(&result.stderr).trim(),
             ));
         }
         Ok(())

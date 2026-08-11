@@ -125,7 +125,7 @@ class WindowsSandboxBackend:
                 self.name,
                 False,
                 False,
-                "khaos-windows-sandbox helper unavailable; Host fallback is forbidden",
+                "Windows khaos-windows-sandbox helper unavailable; Host fallback is forbidden",
             )
         try:
             evidence = _capability_evidence((helper,))
@@ -1533,6 +1533,9 @@ def _validated_profile(request):
             raise PermissionError(
                 "brokered network policy requires a loopback or kernel-namespace NetworkLease"
             )
+        # ``valid_endpoint`` proves this value is present, but Pyright cannot
+        # retain that narrowing across the boolean expression above.
+        assert lease is not None
         if sys.platform.startswith("linux") and not lease.uses_network_namespace:
             raise PermissionError(
                 "Linux brokered execution requires a kernel-network-namespace NetworkLease"
