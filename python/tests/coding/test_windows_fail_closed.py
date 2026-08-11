@@ -80,7 +80,10 @@ async def test_windows_agent_execution_has_no_host_fallback(tmp_path):
             permission_profile=profile,
         )
         result = await backend.execute(request)
-        assert result.status == "passed", result.stderr
+        assert result.status == "passed", (
+            f"{result.stderr}; duration_ms={result.duration_ms}; "
+            f"diagnostics={result.diagnostics}"
+        )
         assert (workspace / "inside.txt").read_text() == "ok"
         evidence = json.loads((workspace / "probe.json").read_text())
         assert evidence == {
