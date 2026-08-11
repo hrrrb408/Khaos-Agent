@@ -1168,6 +1168,21 @@ mod windows_backend {
         Ok(Handle(restricted))
     }
 
+    fn current_process_token() -> Result<Handle, String> {
+        let mut current: HANDLE = null_mut();
+        if unsafe {
+            OpenProcessToken(
+                GetCurrentProcess(),
+                TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY,
+                &mut current,
+            )
+        } == 0
+        {
+            return Err(last_error("OpenProcessToken(AppContainer broker)"));
+        }
+        Ok(Handle(current))
+    }
+
     /// Preserve the interactive logon identity as a restricted SID so the
     /// normal Windows runtime can read user-scoped IPC and loader objects.
     fn token_logon_sid(token: HANDLE) -> Result<Vec<u8>, String> {
@@ -1391,15 +1406,15 @@ mod windows_backend {
         executable: &Path,
         appcontainer: Option<&AppContainerProfile>,
     ) -> Result<ExecutionOutcome, String> {
-        // Windows creates the AppContainer low-box token from the caller's
-        // token when PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES is present.
-        // Passing a separately CreateRestrictedToken-derived primary token at
-        // the same time is rejected by CreateProcessAsUserW with
-        // ERROR_INVALID_PARAMETER.  The low-box token is itself the child
+        // Windows creates the AppContainer low-box token from the supplied
+        // ordinary primary token when PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES
+        // is present. Passing a separately CreateRestrictedToken-derived
+        // primary token at the same time is rejected by CreateProcessAsUserW
+        // with ERROR_INVALID_PARAMETER. The low-box token is itself the child
         // authority for network-none; brokered executions retain the explicit
         // restricted primary token path below.
         let token = if appcontainer.is_some() {
-            None
+            Some(current_process_token()?)
         } else {
             Some(restricted_token()?)
         };
