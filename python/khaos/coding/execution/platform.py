@@ -208,7 +208,10 @@ class WindowsSandboxBackend:
         environment = scrub_spawn_environment(environment)
         # The native helper resolves icacls/netsh from the Windows system
         # root. AppContainer process creation also needs the host's temporary
-        # and user-profile metadata to construct its low-box environment.
+        # and user-profile metadata to construct its low-box environment.  In
+        # particular, LOCALAPPDATA is the parent of the per-execution
+        # AppContainer profile; omitting it makes CreateProcessW fail on some
+        # hosted Windows runners with ERROR_ENVVAR_NOT_FOUND.
         # These values are trusted host metadata, not model-controlled
         # environment input, and are never allowed to widen the requested
         # executable environment with secrets.
@@ -218,6 +221,7 @@ class WindowsSandboxBackend:
             "WINDIR",
             "TEMP",
             "TMP",
+            "LOCALAPPDATA",
             "USERPROFILE",
             "HOMEDRIVE",
             "HOMEPATH",

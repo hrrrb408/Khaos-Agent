@@ -1471,7 +1471,11 @@ mod windows_backend {
             }
         };
         if created == 0 {
-            return Err(last_error("CreateProcessAsUserW"));
+            return Err(last_error(if appcontainer.is_some() {
+                "CreateProcessW"
+            } else {
+                "CreateProcessAsUserW"
+            }));
         }
         let process = Handle(information.hProcess);
         let thread = Handle(information.hThread);
@@ -2138,9 +2142,29 @@ mod windows_backend {
                 result.push(" ");
             }
             let value = argument.to_string_lossy();
-            result.push("\"");
-            result.push(value.replace('"', "\\\""));
-            result.push("\"");
+            let mut escaped = String::with_capacity(value.len() + 2);
+            escaped.push('"');
+            let mut backslashes = 0usize;
+            for character in value.chars() {
+                match character {
+                    '\\' => backslashes += 1,
+                    '"' => {
+                        escaped.push_str(&"\\".repeat(backslashes * 2 + 1));
+                        escaped.push('"');
+                        backslashes = 0;
+                    }
+                    _ => {
+                        escaped.push_str(&"\\".repeat(backslashes));
+                        escaped.push(character);
+                        backslashes = 0;
+                    }
+                }
+            }
+            // Backslashes immediately before the closing quote must also be
+            // doubled, otherwise Windows removes them while parsing argv.
+            escaped.push_str(&"\\".repeat(backslashes * 2));
+            escaped.push('"');
+            result.push(escaped);
         }
         wide_null(&result)
     }
