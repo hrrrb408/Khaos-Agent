@@ -1884,8 +1884,10 @@ mod windows_backend {
     /// the child.  The native executable itself receives exact RX access and
     /// only its parent directory receives execute/traverse access. Explicitly
     /// trusted runtime roots (for example Python's Lib/DLL trees) may receive
-    /// recursive read/execute access. Every ACL is saved before mutation and
-    /// restored before the helper reports success.
+    /// read/execute access through an inheritable root ACE. Windows propagates
+    /// that ACE to existing descendants, so the transaction does not need to
+    /// walk the whole runtime tree in the helper process. Every ACL root is
+    /// saved before mutation and restored before the helper reports success.
     ///
     /// This is deliberately separate from ``WorkspaceAcl``: the child gets
     /// full access only to the task workspace, while the runtime is strictly
@@ -1932,7 +1934,7 @@ mod windows_backend {
             }
             let mut entries = Vec::new();
             let mut seen_ancestors = HashSet::new();
-            let mut seen_recursive = HashSet::new();
+            let mut seen_root_grants = HashSet::new();
             for ancestor in directory_ancestors(&runtime_root)
                 .into_iter()
                 .chain(std::iter::once(runtime_root.clone()))
@@ -1989,15 +1991,17 @@ mod windows_backend {
                 }
                 // A root may first appear as another root's traversal
                 // ancestor (for example venv\Scripts before venv).  That
-                // must not suppress the recursive read/execute grant for
-                // the root itself.
-                if seen_recursive.insert(root.clone()) {
+                // must not suppress the inheritable read/execute grant for
+                // the root itself.  ``icacls /grant`` uses SetNamedSecurityInfo
+                // semantics here; Windows automatically propagates the
+                // inheritable ACE to existing descendants.
+                if seen_root_grants.insert(root.clone()) {
                     if let Err(error) = apply_runtime_acl(
                         &root,
                         &mut entries,
                         "*S-1-5-12:(OI)(CI)RX",
                         appcontainer_sid,
-                        true,
+                        false,
                     ) {
                         return Err(join_runtime_acl_error(error, entries));
                     }
