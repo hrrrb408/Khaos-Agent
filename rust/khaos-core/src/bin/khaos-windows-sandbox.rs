@@ -64,9 +64,11 @@ mod windows_backend {
         GetExitCodeProcess, InitializeProcThreadAttributeList, OpenProcessToken, ResumeThread,
         UpdateProcThreadAttribute, CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED,
         CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST,
-        PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, STARTF_USESTDHANDLES,
-        STARTUPINFOEXW, STARTUPINFOW,
+        PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY,
+        PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+        STARTUPINFOW,
     };
+    use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_CHILD_PROCESS_RESTRICTED;
 
     const FIREWALL_PREFIX: &str = "KhaosWindowsSandbox";
     // Windows Firewall application rules are image-scoped. A descendant can
@@ -549,24 +551,26 @@ mod windows_backend {
     }
 
     /// Owns the extended startup attribute list that marks a process as an
-    /// AppContainer.  The package SID remains owned by AppContainerProfile
-    /// for the full lifetime of the created process.
+    /// AppContainer and prevents that child from creating descendants.  The
+    /// package SID and policy value remain owned for the full lifetime of the
+    /// created process.
     struct AppContainerAttributes {
         storage: Vec<u8>,
         list: LPPROC_THREAD_ATTRIBUTE_LIST,
         capabilities: SECURITY_CAPABILITIES,
+        child_process_policy: u32,
     }
 
     impl AppContainerAttributes {
         fn create(profile: &AppContainerProfile) -> Result<Self, String> {
             let mut size = 0usize;
-            let first = unsafe { InitializeProcThreadAttributeList(null_mut(), 1, 0, &mut size) };
+            let first = unsafe { InitializeProcThreadAttributeList(null_mut(), 2, 0, &mut size) };
             if first != 0 || unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER {
                 return Err(last_error("InitializeProcThreadAttributeList(size)"));
             }
             let mut storage = vec![0u8; size];
             let list = storage.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
-            if unsafe { InitializeProcThreadAttributeList(list, 1, 0, &mut size) } == 0 {
+            if unsafe { InitializeProcThreadAttributeList(list, 2, 0, &mut size) } == 0 {
                 return Err(last_error("InitializeProcThreadAttributeList"));
             }
             let capabilities = SECURITY_CAPABILITIES {
@@ -592,10 +596,29 @@ mod windows_backend {
                     "UpdateProcThreadAttribute(security capabilities)",
                 ));
             }
+            let child_process_policy = PROCESS_CREATION_CHILD_PROCESS_RESTRICTED;
+            let updated = unsafe {
+                UpdateProcThreadAttribute(
+                    list,
+                    0,
+                    PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY as usize,
+                    &child_process_policy as *const u32 as *const c_void,
+                    size_of::<u32>(),
+                    null_mut(),
+                    null(),
+                )
+            };
+            if updated == 0 {
+                unsafe { DeleteProcThreadAttributeList(list) };
+                return Err(last_error(
+                    "UpdateProcThreadAttribute(child process policy)",
+                ));
+            }
             Ok(Self {
                 storage,
                 list,
                 capabilities,
+                child_process_policy,
             })
         }
     }
@@ -607,7 +630,11 @@ mod windows_backend {
                 self.list = null_mut();
             }
             // Keep both fields live until the attribute list is destroyed.
-            let _ = (&self.storage, &self.capabilities);
+            let _ = (
+                &self.storage,
+                &self.capabilities,
+                &self.child_process_policy,
+            );
         }
     }
 
