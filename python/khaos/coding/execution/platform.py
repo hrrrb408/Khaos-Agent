@@ -207,10 +207,23 @@ class WindowsSandboxBackend:
         environment.setdefault("PATH", os.defpath)
         environment = scrub_spawn_environment(environment)
         # The native helper resolves icacls/netsh from the Windows system
-        # root. These values are trusted host metadata, not model-controlled
-        # environment input, and are required on installations whose Windows
-        # directory is not the default fallback path.
-        for key in ("SystemRoot", "SystemDrive", "WINDIR"):
+        # root. AppContainer process creation also needs the host's temporary
+        # and user-profile metadata to construct its low-box environment.
+        # These values are trusted host metadata, not model-controlled
+        # environment input, and are never allowed to widen the requested
+        # executable environment with secrets.
+        for key in (
+            "SystemRoot",
+            "SystemDrive",
+            "WINDIR",
+            "TEMP",
+            "TMP",
+            "USERPROFILE",
+            "HOMEDRIVE",
+            "HOMEPATH",
+            "COMSPEC",
+            "PATHEXT",
+        ):
             value = os.environ.get(key)
             if value:
                 environment[key] = value
