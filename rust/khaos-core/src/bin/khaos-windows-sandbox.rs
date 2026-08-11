@@ -182,7 +182,9 @@ mod windows_backend {
         }
         drop(token);
 
-        let helper = env::current_exe().map_err(|e| format!("resolve Windows helper: {e}"))?;
+        let helper = env::current_exe()
+            .map_err(|e| format!("resolve Windows helper: {e}"))
+            .and_then(|path| resolve_executable(path.as_os_str()))?;
         let listener = TcpListener::bind("127.0.0.1:0")
             .map_err(|e| format!("create Windows firewall probe listener: {e}"))?;
         listener
@@ -1220,24 +1222,40 @@ mod windows_backend {
                 }
                 Ok(())
             } else {
-                let name = unique_rule_name("exec-all");
-                let args = vec![
-                    "advfirewall".to_string(),
-                    "firewall".to_string(),
-                    "add".to_string(),
-                    "rule".to_string(),
-                    format!("name={name}"),
-                    "dir=out".to_string(),
-                    "action=block".to_string(),
-                    format!("program={program}"),
-                    "profile=any".to_string(),
-                ];
-                run_netsh_dynamic(&args).map(|()| names.push(name))
+                let mut result = Ok(());
+                for (kind, remote_ip) in
+                    [("exec-v4", "0.0.0.0-255.255.255.255"), ("exec-v6", "::/0")]
+                {
+                    let name = unique_rule_name(kind);
+                    let args = vec![
+                        "advfirewall".to_string(),
+                        "firewall".to_string(),
+                        "add".to_string(),
+                        "rule".to_string(),
+                        format!("name={name}"),
+                        "dir=out".to_string(),
+                        "action=block".to_string(),
+                        format!("program={program}"),
+                        format!("remoteip={remote_ip}"),
+                        "profile=any".to_string(),
+                    ];
+                    if let Err(error) = run_netsh_dynamic(&args) {
+                        result = Err(error);
+                        break;
+                    }
+                    names.push(name);
+                }
+                result
             };
             if let Err(error) = result {
                 remove_firewall_rules(&names);
                 return Err(error);
             }
+            // netsh returns after the policy transaction is accepted, while
+            // the WFP provider may still be publishing the filter to the
+            // active profile.  Do not spawn the restricted runtime during
+            // that small propagation window.
+            std::thread::sleep(Duration::from_millis(100));
             Ok(Self { names })
         }
 
