@@ -61,17 +61,27 @@ async def test_windows_agent_execution_has_no_host_fallback(tmp_path):
             resources=ResourceBudget(timeout_seconds=20),
         ).bind_workspace(workspace)
         probe = (
-            "import json, os, socket, subprocess, sys; "
-            "from pathlib import Path; "
-            "inside = Path('inside.txt'); inside.write_text('ok'); "
-            "outside = Path(sys.argv[1]); "
-            "try: outside.write_text('must-not-write'); outside_denied = False\n"
-            "except OSError: outside_denied = True\n"
-            "try: socket.create_connection(('127.0.0.1', int(sys.argv[2])), 0.5); network_blocked = False\n"
-            "except OSError: network_blocked = True\n"
-            "try: subprocess.run([os.path.join(os.environ['SystemRoot'], 'System32', 'cmd.exe'), '/c', 'exit', '0'], check=False); descendant_blocked = False\n"
-            "except OSError: descendant_blocked = True\n"
-            "Path('probe.json').write_text(json.dumps({'inside_written': inside.exists(), 'outside_denied': outside_denied, 'network_blocked': network_blocked, 'descendant_blocked': descendant_blocked}))"
+            "import json, os, socket, subprocess, sys\n"
+            "from pathlib import Path\n"
+            "inside = Path('inside.txt')\n"
+            "inside.write_text('ok')\n"
+            "outside = Path(sys.argv[1])\n"
+            "try:\n"
+            "    outside.write_text('must-not-write')\n"
+            "    outside_denied = False\n"
+            "except OSError:\n"
+            "    outside_denied = True\n"
+            "try:\n"
+            "    socket.create_connection(('127.0.0.1', int(sys.argv[2])), 0.5)\n"
+            "    network_blocked = False\n"
+            "except OSError:\n"
+            "    network_blocked = True\n"
+            "try:\n"
+            "    subprocess.run([os.path.join(os.environ['SystemRoot'], 'System32', 'cmd.exe'), '/c', 'exit', '0'], check=False)\n"
+            "    descendant_blocked = False\n"
+            "except OSError:\n"
+            "    descendant_blocked = True\n"
+            "Path('probe.json').write_text(json.dumps({'inside_written': inside.exists(), 'outside_denied': outside_denied, 'network_blocked': network_blocked, 'descendant_blocked': descendant_blocked}))\n"
         )
         request = ExecutionRequest(
             (sys.executable, "-c", probe, str(outside), str(port)),
