@@ -82,7 +82,11 @@ mod windows_backend {
     // Commands that need to spawn children therefore fail inside the native
     // boundary instead of silently escaping the network policy.
     const MAX_ACTIVE_PROCESSES: u32 = 1;
-    const ADMIN_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
+    // AppContainer runtime ACLs may trigger Windows' synchronous propagation
+    // across an existing venv tree. Keep the operation bounded, but allow a
+    // hosted Windows runner enough time to complete that kernel-managed
+    // transaction before reclaiming the child.
+    const ADMIN_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 
     pub enum ExecutionOutcome {
         Completed,

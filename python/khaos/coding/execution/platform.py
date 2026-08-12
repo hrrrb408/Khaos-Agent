@@ -40,6 +40,12 @@ from khaos.coding.execution.supervisor import ProcessSupervisor
 
 logger = logging.getLogger(__name__)
 
+# The Windows helper performs a bounded native ACL/firewall startup
+# transaction before it creates the Job Object child.  Existing venv trees can
+# take longer than the command's own execution budget because Windows
+# propagates inheritable AppContainer ACEs synchronously.
+WINDOWS_HELPER_STARTUP_GRACE_SECONDS = 75
+
 # Backwards-compatible public import for callers that historically imported
 # the evidence model from this module instead of ``capability``.
 CapabilityEvidence = _CapabilityEvidence
@@ -365,7 +371,11 @@ class WindowsSandboxBackend:
         try:
             try:
                 await asyncio.wait_for(
-                    process.wait(), timeout=profile.resources.timeout_seconds + 10
+                    process.wait(),
+                    timeout=(
+                        profile.resources.timeout_seconds
+                        + WINDOWS_HELPER_STARTUP_GRACE_SECONDS
+                    ),
                 )
             except TimeoutError:
                 timed_out = True
