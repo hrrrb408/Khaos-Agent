@@ -1917,7 +1917,9 @@ mod windows_backend {
     /// resolved native runtime.  WRITE_RESTRICTED makes this SID the
     /// authority for writes, so a user-owned runtime that is writable by the
     /// interactive user must still be made explicitly read/execute-only for
-    /// the child.  The native executable itself receives exact RX access.
+    /// the child.  The restricted-token path receives exact RX access on the
+    /// native executable; AppContainer maps its image before the low-box
+    /// token is applied, so that image is deliberately not mutated there.
     /// AppContainer launches additionally grant the package SID
     /// execute/traverse access on parent directories; the restricted-token
     /// trusted-interpreter path uses the existing interactive-user traverse
@@ -1994,14 +1996,23 @@ mod windows_backend {
                     }
                 }
             }
-            if let Err(error) = apply_runtime_acl(
-                &executable,
-                &mut entries,
-                "*S-1-5-12:(RX)",
-                appcontainer_sid,
-                false,
-            ) {
-                return Err(join_runtime_acl_error(error, entries));
+            if appcontainer_sid.is_none() {
+                // CreateProcessW maps the image using the launching
+                // identity before the AppContainer low-box is applied. Do
+                // not mutate the exact interpreter image here: trusted
+                // Python is commonly the active executable of the parent
+                // venv, and Windows can block an ACL transaction on that
+                // open image. All post-launch runtime directories and files
+                // still receive the restricted-token read/execute grant.
+                if let Err(error) = apply_runtime_acl(
+                    &executable,
+                    &mut entries,
+                    "*S-1-5-12:(RX)",
+                    appcontainer_sid,
+                    false,
+                ) {
+                    return Err(join_runtime_acl_error(error, entries));
+                }
             }
             for root in additional_roots {
                 let root = std::fs::canonicalize(root)

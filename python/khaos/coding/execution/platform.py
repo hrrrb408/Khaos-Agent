@@ -353,11 +353,16 @@ class WindowsSandboxBackend:
                 if standard_library.is_dir() and standard_library not in seen_runtime_paths:
                     helper_args.extend(("--runtime-root", str(standard_library)))
                     seen_runtime_paths.add(standard_library)
-            base_runtime_files = (
-                base_executable,
+            base_runtime_files = [
                 base_root / f"python{sys.version_info.major}{sys.version_info.minor}.dll",
                 standard_library_zip,
-            )
+            ]
+            if profile.network is not NetworkPolicy.NONE:
+                # The AppContainer image is mapped by CreateProcessW before
+                # the low-box token is applied. Do not submit the active base
+                # executable for an additional ACL mutation; brokered
+                # restricted-token launches still need its exact file grant.
+                base_runtime_files.insert(0, base_executable)
             for path in base_runtime_files:
                 if path.is_file() and path not in seen_runtime_paths:
                     helper_args.extend(("--runtime-file", str(path)))
