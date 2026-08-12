@@ -734,6 +734,7 @@ mod windows_backend {
     }
 
     pub fn run() -> Result<ExecutionOutcome, String> {
+        trace("run:start");
         let args: Vec<OsString> = env::args_os().skip(1).collect();
         if args.first().is_some_and(|arg| arg == "--probe") {
             probe()?;
@@ -745,6 +746,7 @@ mod windows_backend {
         }
         let options = Options::parse(&args)?;
         validate_paths(&options)?;
+        trace("paths:validated");
         let executable = resolve_executable(
             options
                 .command
@@ -754,7 +756,9 @@ mod windows_backend {
         let workspace = std::fs::canonicalize(&options.workspace)
             .map_err(|e| format!("workspace unavailable: {e}"))?;
         let appcontainer = if options.network == "none" {
-            Some(AppContainerProfile::create()?)
+            let profile = AppContainerProfile::create()?;
+            trace("appcontainer:created");
+            Some(profile)
         } else {
             None
         };
@@ -769,6 +773,7 @@ mod windows_backend {
                 return Err(errors.join("; "));
             }
         };
+        trace("workspace-acl:applied");
         let runtime_acl = match RuntimeAcl::apply(
             &executable,
             appcontainer.as_ref().map(AppContainerProfile::sid_string),
@@ -786,6 +791,7 @@ mod windows_backend {
                 return Err(errors.join("; "));
             }
         };
+        trace("runtime-acl:applied");
         let rule = match FirewallRule::install(&options, &executable) {
             Ok(rule) => rule,
             Err(error) => {
@@ -802,10 +808,15 @@ mod windows_backend {
                 return Err(errors.join("; "));
             }
         };
+        trace("firewall:installed");
         let result = spawn_restricted(&options, &executable, appcontainer.as_ref());
+        trace("spawn:return");
         let remove_result = rule.remove();
+        trace("firewall:removed");
         let runtime_acl_result = runtime_acl.restore();
+        trace("runtime-acl:restored");
         let acl_result = acl.restore();
+        trace("workspace-acl:restored");
         let mut errors = Vec::new();
         let outcome = match result {
             Ok(outcome) => Some(outcome),
@@ -824,6 +835,7 @@ mod windows_backend {
             errors.push(error);
         }
         close_appcontainer(appcontainer, &mut errors);
+        trace("appcontainer:closed");
         if errors.is_empty() {
             match outcome {
                 Some(outcome) => Ok(outcome),
@@ -832,6 +844,17 @@ mod windows_backend {
         } else {
             Err(errors.join("; "))
         }
+    }
+
+    fn trace(label: &str) {
+        if env::var_os("KHAOS_WINDOWS_SANDBOX_TRACE") != Some(OsString::from("1")) {
+            return;
+        }
+        let millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        eprintln!("khaos-windows-sandbox: trace {millis} {label}");
     }
 
     fn close_appcontainer(profile: Option<AppContainerProfile>, errors: &mut Vec<String>) {
@@ -1551,6 +1574,7 @@ mod windows_backend {
         executable: &Path,
         appcontainer: Option<&AppContainerProfile>,
     ) -> Result<ExecutionOutcome, String> {
+        trace("spawn:start");
         // The AppContainer low-box is created by the normal CreateProcess
         // current-identity path when PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES
         // is present. Passing any hToken to that path is rejected by Windows
@@ -1662,6 +1686,7 @@ mod windows_backend {
             }
             return Err(errors.join("; "));
         }
+        trace("spawn:created");
         if let Some(Err(error)) = handle_restore {
             unsafe { windows_sys::Win32::System::Threading::TerminateProcess(process.0, 1) };
             return Err(format!("restore inherited standard handles: {error}"));
@@ -1729,6 +1754,7 @@ mod windows_backend {
                 ));
             }
         }
+        trace("spawn:finished");
         Ok(outcome)
     }
 
@@ -2151,6 +2177,12 @@ mod windows_backend {
     }
 
     fn run_icacls(arguments: &[OsString]) -> Result<(), String> {
+        let recursive = arguments.iter().any(|argument| argument == "/t");
+        trace(if recursive {
+            "icacls:start:recursive"
+        } else {
+            "icacls:start:single"
+        });
         let root = env::var_os("SystemRoot").unwrap_or_else(|| OsString::from(r"C:\Windows"));
         let path = Path::new(&root).join("System32").join("icacls.exe");
         let result = Command::new(path)
@@ -2163,6 +2195,11 @@ mod windows_backend {
                 String::from_utf8_lossy(&result.stderr).trim()
             ));
         }
+        trace(if recursive {
+            "icacls:done:recursive"
+        } else {
+            "icacls:done:single"
+        });
         Ok(())
     }
 

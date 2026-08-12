@@ -231,6 +231,11 @@ class WindowsSandboxBackend:
             value = os.environ.get(key)
             if value:
                 environment[key] = value
+        # Keep native-helper phase tracing opt-in and CI-only. It is useful
+        # for diagnosing platform TCB latency, but must never become an
+        # ambient production setting or expose host metadata by default.
+        if os.environ.get("KHAOS_WINDOWS_SANDBOX_TRACE") == "1":
+            environment["KHAOS_WINDOWS_SANDBOX_TRACE"] = "1"
         lease = profile.network_broker
         if lease is not None and (
             lease.uses_network_namespace or lease.host != "127.0.0.1"
