@@ -671,15 +671,18 @@ async def _git_remote_via_execution_service(
     workspace, cwd = _resolve_git_workspace(repo, context, require_writable=True)
     remote, branch, refspec = _validate_push_argv(args)
     await _consume_remote_approval(workspace, cwd, context, remote, branch, refspec)
+    approval = context.approval_context
+    if not isinstance(approval, dict):
+        raise PermissionError("git_push requires approval")
     credential_scope, credential_environment = _credential_material(
-        context.approval_context.get("binding", {}).get("remote_url", ""),
+        approval.get("binding", {}).get("remote_url", ""),
         context.credential_context,
     )
     if context.network_lease is None:
         raise PermissionError(
             "git_push requires a managed NetworkBroker lease"
         )
-    if credential_scope != context.approval_context["binding"].get("credential_scope"):
+    if credential_scope != approval.get("binding", {}).get("credential_scope"):
         raise PermissionError("credential scope changed after approval")
     with tempfile.TemporaryDirectory(prefix="khaos-git-remote-home-") as temporary_home:
         environment = _git_environment(temporary_home)
