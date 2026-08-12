@@ -45,7 +45,11 @@ from khaos.permissions.resource import (
 )
 from khaos.permissions.rules import typed_rule_from_authorization_resource
 from khaos.security.middleware import SecurityMiddleware
-from khaos.security.network_broker import NetworkBrokerFactory, NetworkLease
+from khaos.security.network_broker import (
+    NetworkBroker,
+    NetworkBrokerFactory,
+    NetworkLease,
+)
 from khaos.tools.registry import ToolInvocationBroker, ToolRegistry
 from khaos.tools.terminal_tools import (
     BackgroundProcessAuthority,
@@ -504,8 +508,10 @@ class ToolScheduler:
         # H5: per-runtime identifier propagated to the broker so browser
         # tools can key their BrowserContext by (principal, session, runtime).
         self.runtime_id = runtime_id
-        self.network_broker_factory = network_broker_factory or NetworkBrokerFactory()
-        self._network_brokers: set[object] = set()
+        self.network_broker_factory: NetworkBrokerFactory = (
+            network_broker_factory or NetworkBrokerFactory()
+        )
+        self._network_brokers: set[NetworkBroker] = set()
         # When True and the Rust bridge is importable, read-only file reads in
         # the parallel group are offloaded to the Rust executor for the bulk
         # I/O; the result still flows through the normal Python handler so
@@ -2848,12 +2854,10 @@ class ToolScheduler:
                 errors.append(exc)
             else:
                 self._network_brokers.discard(broker)
-        factory_close = getattr(self.network_broker_factory, "close", None)
-        if callable(factory_close):
-            try:
-                await factory_close()
-            except BaseException as exc:  # noqa: BLE001 - cleanup must survive cancellation
-                errors.append(exc)
+        try:
+            await self.network_broker_factory.close()
+        except BaseException as exc:  # noqa: BLE001 - cleanup must survive cancellation
+            errors.append(exc)
         if errors:
             raise RuntimeError("managed network broker cleanup was not proven") from errors[0]
 
