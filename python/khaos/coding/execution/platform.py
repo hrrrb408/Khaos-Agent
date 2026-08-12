@@ -260,7 +260,6 @@ class WindowsSandboxBackend:
         # Python runtime, not from model-controlled request fields.  Pass
         # only the runtime's Lib/DLL trees and exact launcher files so ACL
         # setup does not recursively rewrite unrelated tool-cache paths.
-        use_restricted_runtime = False
         try:
             requested_executable = request.argv[0]
             if not Path(requested_executable).is_absolute():
@@ -298,25 +297,21 @@ class WindowsSandboxBackend:
                 if import_roots:
                     environment["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(import_roots))
                 environment["PYTHONNOUSERSITE"] = "1"
-            # The restricted-token path keeps the normal trusted interpreter
-            # identity for reads and uses WRITE_RESTRICTED plus the exact
-            # runtime-file ACLs for writes.  Avoiding a per-execution
-            # AppContainer SID means the venv's large Lib tree never needs an
-            # ACL transaction; network=none remains denied by the exact WFP
-            # image rule and the native child-process policy.
-            use_restricted_runtime = profile.network is NetworkPolicy.NONE
-            if use_restricted_runtime:
-                helper_args.append("--no-appcontainer")
-            else:
-                # Brokered execution is already restricted-token based. The
-                # venv owns third-party imports under its Lib/DLL trees.
-                for prefix in (sys.prefix,):
-                    runtime_root = Path(prefix).expanduser().resolve()
-                    for relative_root in ("Lib", "DLLs"):
-                        path = runtime_root / relative_root
-                        if path.is_dir() and path not in seen_runtime_paths:
-                            helper_args.extend(("--runtime-root", str(path)))
-                            seen_runtime_paths.add(path)
+            # Network-none trusted Python uses the per-execution AppContainer
+            # as its network authority.  This is required because Windows
+            # Firewall image rules do not provide a dependable loopback
+            # boundary on every supported runner.  Brokered execution keeps
+            # the restricted-token path and its loopback-only WFP rules.
+            # Both the venv and base interpreter trees are trusted runtime
+            # inputs and therefore receive only temporary read/execute ACLs.
+            runtime_prefixes = (sys.prefix, sys.base_prefix)
+            for prefix in runtime_prefixes:
+                runtime_root = Path(prefix).expanduser().resolve()
+                for relative_root in ("Lib", "DLLs"):
+                    path = runtime_root / relative_root
+                    if path.is_dir() and path not in seen_runtime_paths:
+                        helper_args.extend(("--runtime-root", str(path)))
+                        seen_runtime_paths.add(path)
             for prefix in (sys.prefix, sys.base_prefix):
                 runtime_root = Path(prefix).expanduser().resolve()
                 exact_files = (
@@ -371,16 +366,14 @@ class WindowsSandboxBackend:
                 "backend": self.name,
                 "restricted_token": True,
                 "appcontainer": (
-                    profile.network is NetworkPolicy.NONE and not use_restricted_runtime
+                    profile.network is NetworkPolicy.NONE
                 ),
                 "job_object": True,
                 "process_tree": True,
                 "workspace_acl": True,
                 "wfp_network_policy": profile.network.value,
                 "network_authority": (
-                    "wfp-image-block"
-                    if use_restricted_runtime
-                    else "appcontainer"
+                    "appcontainer" if profile.network is NetworkPolicy.NONE else "wfp-loopback"
                 ),
                 "python_launcher": python_launcher,
                 "stdout_truncated": stdout_truncated,

@@ -89,10 +89,11 @@ trade-off.
 `WindowsSandboxBackend` admits execution only after the Rust helper proves a
 restricted primary token, Job Object limits with one native runtime process
 (the outer helper owns the wait/cleanup transaction),
-transactional workspace ACL, an OS-issued no-network AppContainer for
-native commands, and WFP-backed Firewall policy. The trusted Python
-interpreter uses the restricted-token/WFP path with exact runtime-file ACLs so
-a large venv is not recursively rewritten per execution. The hosted
+transactional workspace ACL, an OS-issued no-network AppContainer for native
+commands and the trusted Python interpreter, and WFP-backed Firewall policy.
+Trusted Python launches the resolved base executable directly and receives
+temporary RX access to the venv/base runtime roots, so the venv redirector
+cannot escape the child policy. The hosted
 `windows-fail-closed-security` and `contract (windows-2025)` jobs build the
 helper and set `KHAOS_REQUIRE_WINDOWS_NATIVE=1`; the merge claim remains
 pending until those jobs pass on this head. Windows private-desktop parity and
@@ -107,9 +108,10 @@ outside the Job and does not execute the model command.
 
 **Resolution in this head.** Use the native helper as the only Windows Coding
 backend: restricted token, child-process policy, inherited-handle allowlist,
-per-execution no-network AppContainer for native `network=none` commands,
-the restricted-token/WFP path with exact runtime-file ACLs for the trusted
-Python interpreter, Job Object kill-on-close/resource limits and active
+per-execution no-network AppContainer for native `network=none` commands and
+trusted Python, direct base-executable launch for trusted Python, the
+restricted-token/WFP path with exact runtime-file ACLs for brokered execution,
+Job Object kill-on-close/resource limits and active
 process limit one, transactional ACL grant/restore, exact native executable
 resolution, and WFP-backed Firewall rules. Brokered egress accepts only the
 loopback NetworkBroker endpoint. Any missing primitive, cleanup proof, or
