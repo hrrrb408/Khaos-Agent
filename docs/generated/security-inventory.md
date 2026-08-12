@@ -55,10 +55,10 @@
 - `python/khaos/coding/execution/identity.py`: `5f159cf59788242902e0010bd59a05a2f7c14dd2f8251f62cafa2a1c3cc5e265`
 - `python/khaos/coding/execution/models.py`: `8f165d586928c0cd95823b9008777b4b35281c4202c9847c9994c3d2258f6579`
 - `python/khaos/coding/execution/native_launcher.py`: `4c27b61db7c7c0be2319a55c909b4d17658b563c74d70d8217f00387a5b2cf07`
-- `python/khaos/coding/execution/platform.py`: `2772edf27212c666072b112c83250caddc8dfe82ac96be0c2be2cc515d03e4bf`
+- `python/khaos/coding/execution/platform.py`: `f163c54e8dc14b97ad16961775dae248ee4bc4276a4b3adda7d59f83a7ba722e`
 - `python/khaos/coding/execution/service.py`: `2f0ac90a3ee9955d911e53b63e3a8e4f8725315a483e8419439a2abf290b9736`
 - `python/khaos/coding/execution/binding.py`: `99f3d8eb14d80a837ecf0f0d076d556ccdb366b8798c9e0fde6c69d0bb1a5501`
-- `python/khaos/coding/execution/supervisor.py`: `6fbe58da27a6d6d2d4f3094e3dc1025fe93fc39c7523fcef167d4a59dfb50096`
+- `python/khaos/coding/execution/supervisor.py`: `a61a360e4bef61e5c70cf0000fb2cdb6a561ddf27e85c7885358d46b5b11bddc`
 - `python/khaos/coding/workspace/manager.py`: `b72c4c76b533049e5c158c7bd09ae84df20768c58cb5e5e5514283004caa4378`
 - `python/khaos/coding/workspace/trusted_git.py`: `ea9a2eac346357d86c316df7f3749342bde5ea2ad129d5f646d3661aa2462831`
 - `python/khaos/security/authority.py`: `fd998bb3cf073a5abf4c1c278245c38df49716a4a83c54735fae00959789a6cf`
