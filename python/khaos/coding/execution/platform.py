@@ -279,6 +279,7 @@ class WindowsSandboxBackend:
             base_executable = Path(
                 getattr(sys, "_base_executable", sys.executable)
             ).expanduser().resolve()
+            import_root_paths: list[Path] = []
             if base_executable.is_file():
                 # On Windows a venv's Scripts/python.exe is a redirector that
                 # starts the base interpreter as a second process.  The
@@ -288,42 +289,56 @@ class WindowsSandboxBackend:
                 # import root into the restricted environment.
                 command_argv[0] = str(base_executable)
                 python_launcher = "base-executable"
-                site_packages = Path(sys.prefix).expanduser().resolve() / "Lib" / "site-packages"
-                import_roots = [
-                    str(path)
-                    for path in (site_packages, Path(__file__).resolve().parents[3])
-                    if path.is_dir() and (path / "khaos").is_dir()
-                ]
+                venv_root = Path(sys.prefix).expanduser().resolve()
+                site_packages = venv_root / "Lib" / "site-packages"
+                source_root = Path(__file__).resolve().parents[3]
+                if (site_packages / "khaos").is_dir():
+                    import_root_paths.append(site_packages)
+                elif (source_root / "khaos").is_dir():
+                    import_root_paths.append(source_root)
+                import_roots = [str(path) for path in import_root_paths]
                 if import_roots:
                     environment["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(import_roots))
                 environment["PYTHONNOUSERSITE"] = "1"
+                environment["PYTHONDONTWRITEBYTECODE"] = "1"
             # Network-none trusted Python uses the per-execution AppContainer
             # as its network authority.  This is required because Windows
             # Firewall image rules do not provide a dependable loopback
             # boundary on every supported runner.  Brokered execution keeps
             # the restricted-token path and its loopback-only WFP rules.
-            # Both the venv and base interpreter trees are trusted runtime
-            # inputs and therefore receive only temporary read/execute ACLs.
-            runtime_prefixes = (sys.prefix, sys.base_prefix)
-            for prefix in runtime_prefixes:
-                runtime_root = Path(prefix).expanduser().resolve()
-                for relative_root in ("Lib", "DLLs"):
-                    path = runtime_root / relative_root
-                    if path.is_dir() and path not in seen_runtime_paths:
-                        helper_args.extend(("--runtime-root", str(path)))
-                        seen_runtime_paths.add(path)
-            for prefix in (sys.prefix, sys.base_prefix):
-                runtime_root = Path(prefix).expanduser().resolve()
-                exact_files = (
-                    runtime_root / "pyvenv.cfg",
-                    runtime_root / "python.exe",
-                    runtime_root
-                    / f"python{sys.version_info.major}{sys.version_info.minor}.dll",
-                )
-                for path in exact_files:
-                    if path.is_file() and path not in seen_runtime_paths:
-                        helper_args.extend(("--runtime-file", str(path)))
-                        seen_runtime_paths.add(path)
+            # The direct base interpreter uses the vendor standard-library
+            # zip when present, plus extension modules from DLLs.  The venv
+            # contributes only its installed packages.  Avoid granting the
+            # full base Lib tree when the zip is available: propagating an
+            # inheritable ACL through that tree is slow on hosted Windows
+            # images and is unnecessary for the interpreter's actual import
+            # path.
+            base_root = Path(sys.base_prefix).expanduser().resolve()
+            runtime_roots = [
+                *import_root_paths,
+                base_root / "DLLs",
+            ]
+            for path in runtime_roots:
+                if path.is_dir() and path not in seen_runtime_paths:
+                    helper_args.extend(("--runtime-root", str(path)))
+                    seen_runtime_paths.add(path)
+            standard_library_zip = base_root / (
+                f"python{sys.version_info.major}{sys.version_info.minor}.zip"
+            )
+            if not standard_library_zip.is_file():
+                standard_library = base_root / "Lib"
+                if standard_library.is_dir() and standard_library not in seen_runtime_paths:
+                    helper_args.extend(("--runtime-root", str(standard_library)))
+                    seen_runtime_paths.add(standard_library)
+            base_runtime_files = (
+                base_executable,
+                base_root / f"python{sys.version_info.major}{sys.version_info.minor}.dll",
+                standard_library_zip,
+            )
+            for path in base_runtime_files:
+                if path.is_file() and path not in seen_runtime_paths:
+                    helper_args.extend(("--runtime-file", str(path)))
+                    seen_runtime_paths.add(path)
         if lease is not None:
             environment.update(lease.proxy_environment())
             helper_args.extend(("--proxy-host", lease.host, "--proxy-port", str(lease.port)))
