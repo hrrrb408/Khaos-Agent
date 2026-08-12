@@ -18,8 +18,8 @@
 - `python/khaos/coding/execution/platform.py:834` `subprocess.run` in `<module>.probe_capability` owner=`ExecutionBackend` threat-model=`kernel-sandbox-and-resource-control` boundary=`execution-service`
 - `python/khaos/coding/execution/platform.py:1247` `subprocess.run` in `<module>.probe_capability` owner=`ExecutionBackend` threat-model=`kernel-sandbox-and-resource-control` boundary=`execution-service`
 - `python/khaos/coding/execution/service.py:1000` `asyncio.create_subprocess_exec` in `<module>._start_managed_after_admission` owner=`ExecutionService` threat-model=`authority-bound-child-spawn` boundary=`execution-service`
-- `python/khaos/coding/execution/supervisor.py:344` `asyncio.create_subprocess_exec` in `<module>.run` owner=`ProcessSupervisor` threat-model=`child-tree-lifecycle` boundary=`execution-service`
-- `python/khaos/coding/execution/supervisor.py:1238` `subprocess.run` in `<module>._darwin_deleted_open_file_usage` owner=`ProcessSupervisor` threat-model=`child-tree-lifecycle` boundary=`execution-service`
+- `python/khaos/coding/execution/supervisor.py:349` `asyncio.create_subprocess_exec` in `<module>.run` owner=`ProcessSupervisor` threat-model=`child-tree-lifecycle` boundary=`execution-service`
+- `python/khaos/coding/execution/supervisor.py:1297` `subprocess.run` in `<module>._darwin_deleted_open_file_usage` owner=`ProcessSupervisor` threat-model=`child-tree-lifecycle` boundary=`execution-service`
 - `python/khaos/coding/planning/verification_sandbox.py:411` `asyncio.create_subprocess_exec` in `<module>.create_instance` owner=`VerificationSandbox` threat-model=`trusted-docker-verification` boundary=`verification-authority`
 - `python/khaos/coding/planning/verification_sandbox.py:597` `asyncio.create_subprocess_exec` in `<module>.start_instance` owner=`VerificationSandbox` threat-model=`trusted-docker-verification` boundary=`verification-authority`
 - `python/khaos/coding/planning/verification_sandbox.py:621` `asyncio.create_subprocess_exec` in `<module>.attach_instance` owner=`VerificationSandbox` threat-model=`trusted-docker-verification` boundary=`verification-authority`
