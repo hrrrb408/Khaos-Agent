@@ -66,6 +66,7 @@ class SupervisorClosedError(RuntimeError):
 class _ActiveProcess:
     process: asyncio.subprocess.Process
     termination_callback: Callable[[], Awaitable[None]] | None = None
+    process_wait_task: asyncio.Task[int] | None = None
     termination_requested: bool = False
     termination_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     watchdog_task: asyncio.Task[dict | None] | None = None
@@ -476,7 +477,10 @@ class ProcessSupervisor:
                 timeout_seconds = (
                     request.permission_profile.resources.timeout_seconds
                 )
-                process_wait_task = asyncio.create_task(process.wait())
+                process_wait_task = active.process_wait_task
+                if process_wait_task is None:
+                    process_wait_task = asyncio.create_task(process.wait())
+                    active.process_wait_task = process_wait_task
                 if timeout_seconds is not None:
                     deadline_task = asyncio.create_task(
                         asyncio.sleep(timeout_seconds)
@@ -500,15 +504,17 @@ class ProcessSupervisor:
                         deadline_task.cancel()
                     status = "passed" if process.returncode == 0 else "failed"
                 elif deadline_task is not None and deadline_task in done:
-                    # Deadline elapsed first → genuine timeout.  Cancel
-                    # the wait task, terminate the process group, mark
-                    # timed-out.  The process may have already exited
+                    # Deadline elapsed first → genuine timeout.  Terminate
+                    # the process group while preserving the shared wait
+                    # task, then mark the result timed-out.  The process may
+                    # have already exited
                     # (Docker daemon race) — _terminate_active is a no-op
                     # when returncode is set, but the deadline proof
                     # stands: the configured budget elapsed.
-                    process_wait_task.cancel()
                     active.termination_requested = True
-                    await self._terminate_active(active)
+                    await self._terminate_active(
+                        active, process_wait_task=process_wait_task
+                    )
                     status = "timed-out"
                     diagnostics.update(
                         {
@@ -518,7 +524,11 @@ class ProcessSupervisor:
                     )
             except asyncio.CancelledError:
                 active.termination_requested = True
-                await asyncio.shield(self._terminate_active(active))
+                await asyncio.shield(
+                    self._terminate_active(
+                        active, process_wait_task=process_wait_task
+                    )
+                )
                 await asyncio.shield(
                     asyncio.gather(stdout_task, stderr_task)
                 )
@@ -899,19 +909,28 @@ class ProcessSupervisor:
         if watchdog_error is not None and not isinstance(watchdog_error, asyncio.CancelledError):
             raise RuntimeError("process watchdog failed before terminal proof") from watchdog_error
 
-    async def _terminate_active(self, active: _ActiveProcess) -> None:
+    async def _terminate_active(
+        self,
+        active: _ActiveProcess,
+        *,
+        process_wait_task: asyncio.Task[int] | None = None,
+    ) -> None:
         async with active.termination_lock:
             process = active.process
             if process.returncode is None:
                 _signal_process_group(process, signal.SIGTERM)
-                # Keep the subprocess transport's wait task alive across the
-                # grace-period timeout.  ``asyncio.wait_for(process.wait(),
-                # ...)`` cancels the wait coroutine on timeout; on Python
-                # 3.13 that can leave a reaped subprocess with a closed
-                # transport whose later ``process.wait()`` never resolves.
-                # Shielding one owned wait task lets us signal the group and
-                # then await the same terminal proof reliably.
-                process_wait_task = asyncio.create_task(process.wait())
+                # Keep exactly one subprocess wait task alive across the
+                # grace-period timeout.  Cancelling the deadline race's wait
+                # and creating a second ``process.wait()`` can race the
+                # asyncio subprocess transport on macOS, leaving the second
+                # wait unresolved after the child has been reaped.  Reusing
+                # the active process's task gives every termination path the
+                # same terminal proof.
+                if process_wait_task is None:
+                    process_wait_task = active.process_wait_task
+                if process_wait_task is None:
+                    process_wait_task = asyncio.create_task(process.wait())
+                    active.process_wait_task = process_wait_task
                 try:
                     await asyncio.wait_for(
                         asyncio.shield(process_wait_task),
