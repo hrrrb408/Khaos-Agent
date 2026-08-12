@@ -409,8 +409,21 @@ async def _read_windows_output(
 ) -> tuple[str, bool]:
     if stream is None:
         return "", False
-    data = await stream.read(max(1, limit) + 1)
-    return data[:limit].decode("utf-8", errors="replace"), len(data) > limit
+    chunks: list[bytes] = []
+    retained = 0
+    truncated = False
+    while True:
+        chunk = await stream.read(64 * 1024)
+        if not chunk:
+            break
+        if retained < limit:
+            keep = min(limit - retained, len(chunk))
+            chunks.append(chunk[:keep])
+            retained += keep
+            truncated = truncated or keep < len(chunk)
+        else:
+            truncated = True
+    return b"".join(chunks).decode("utf-8", errors="replace"), truncated
 
 
 def _windows_sandbox_helper() -> Path | None:

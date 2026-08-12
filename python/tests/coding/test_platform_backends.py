@@ -21,6 +21,7 @@ from khaos.coding.execution.platform import (
     MacOSSandboxBackend,
     UnsupportedBackend,
     _create_linux_cgroup,
+    _read_windows_output,
     _runtime_read_roots,
     _validated_profile,
 )
@@ -36,6 +37,21 @@ async def test_unsupported_backend_refuses_writable_execution():
 def test_platform_profiles_are_network_denying(tmp_path: Path):
     assert "deny network" in MacOSSandboxBackend().profile(tmp_path)
     assert "--unshare-net" in LinuxBubblewrapBackend().argv_prefix(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_windows_output_reader_drains_after_first_chunk():
+    class ChunkedStream:
+        def __init__(self) -> None:
+            self.chunks = iter((b"first", b" second", b""))
+
+        async def read(self, _size: int) -> bytes:
+            return next(self.chunks)
+
+    output, truncated = await _read_windows_output(ChunkedStream(), 64)
+
+    assert output == "first second"
+    assert truncated is False
 
 
 def test_linux_brokered_profile_requires_a_real_namespace_lease(
