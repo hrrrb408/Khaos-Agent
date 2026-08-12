@@ -1536,6 +1536,9 @@ class PlanApprovalStore:
     ) -> tuple[bool, PlanExecutionAuthorization | None]:
         """Serialize minting with invalidation on a shared connection.
 
+        A ``CONSUMED`` request is never mintable; the locked implementation
+        performs that authoritative check before any authorization insert.
+
         SQLite serializes ``BEGIN IMMEDIATE`` across connections, but a
         single ``sqlite3.Connection`` has one transaction state shared by all
         threads using it. The runtime and test harness may intentionally share
