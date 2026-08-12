@@ -9,6 +9,7 @@ from khaos.coding.workspace.git_identity import GitIdentityError
 from khaos.coding.workspace.manager import WorkspaceError, WorkspaceManager
 from khaos.coding.workspace.models import WorkspaceState, WorkspaceTransition
 from khaos.coding.workspace.trusted_git import WorkspaceBootstrapLimits
+from khaos.security.authority import AuthorityEnvelope
 
 
 def _repo(path: Path) -> Path:
@@ -437,6 +438,28 @@ async def test_host_git_does_not_inherit_git_configuration_environment(
 
     assert await manager._git(repository, "status", "--porcelain") == ""
     assert not marker.exists()
+
+
+@pytest.mark.asyncio
+async def test_host_git_rejects_constructed_authority_envelope(
+    tmp_path: Path,
+):
+    repository = _repo(tmp_path / "repo")
+    manager = WorkspaceManager(tmp_path / "worktrees")
+    authority = AuthorityEnvelope(
+        principal_id="principal",
+        project_id="project",
+        runtime_id="runtime",
+        task_id="task",
+        workspace_id="workspace",
+        workspace_generation=1,
+        policy_digest="policy",
+        operation_class="git.status",
+        resource_digest="resource",
+    )
+
+    with pytest.raises(WorkspaceError, match="AuthorityEnvelope is context only"):
+        await manager._git(repository, "status", "--porcelain", authority=authority)  # type: ignore[arg-type]
 
 
 @pytest.mark.asyncio

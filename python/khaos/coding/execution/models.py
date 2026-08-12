@@ -137,6 +137,7 @@ class PermissionProfile:
         *,
         access_mode: str,
         network_policy: NetworkPolicy,
+        network_broker: NetworkLease | None = None,
         roots: tuple[Path, ...],
         environment_keys: frozenset[str],
         resources: ResourceBudget,
@@ -146,6 +147,7 @@ class PermissionProfile:
         return cls(
             filesystem=filesystem,
             network=NetworkPolicy(network_policy),
+            network_broker=network_broker,
             workspace_roots=canonical_roots,
             writable_roots=(
                 canonical_roots
@@ -333,6 +335,7 @@ class ExecutionRequest:
     environment: dict[str, str] = field(default_factory=dict)
     allowed_environment_keys: frozenset[str] = frozenset({"PATH", "LANG", "LC_ALL", "TMPDIR"})
     network_policy: NetworkPolicy = NetworkPolicy.NONE
+    network_broker: NetworkLease | None = None
     budget: ResourceBudget = field(default_factory=ResourceBudget)
     task_id: str | None = None
     workspace_id: str | None = None
@@ -355,6 +358,7 @@ class ExecutionRequest:
         profile = self.permission_profile or PermissionProfile.from_legacy(
             access_mode=self.access_mode,
             network_policy=self.network_policy,
+            network_broker=self.network_broker,
             roots=self.writable_roots,
             environment_keys=self.allowed_environment_keys,
             resources=self.budget,

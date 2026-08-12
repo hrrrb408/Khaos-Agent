@@ -52,25 +52,38 @@ contract; model-controlled environment values never authorize the join.
 `WindowsSandboxBackend` has no Host fallback. The Rust helper must prove before
 execution:
 
-1. a restricted primary token with the restricted-code capability, current
-   logon SID and Everyone restricted groups, plus an explicit default DACL for
-   child-created IPC objects;
+1. for brokered/restricted executions, a restricted primary token with the
+   restricted-code capability, current logon SID and Everyone restricted
+   groups, plus an explicit default DACL for child-created IPC objects;
 2. a kill-on-close Job Object with resource limits and an active-process limit
-   of two (the launcher plus one native runtime process);
-3. transactionally granted/restored restricted-code ACLs: full access for the
+   of one native runtime process; the outer helper remains outside the Job and
+   owns the wait/cleanup transaction;
+3. for `network=none`, native commands and the trusted Python interpreter use
+   an OS-issued per-execution AppContainer low-box with no declared network
+   capabilities, verified from the child token. Trusted Python launches the
+   staged copy of the resolved base executable (avoiding a venv redirector outside the
+   child policy) and grants temporary RX access only to a disposable staged
+   runtime tree; brokered execution uses the restricted-token/WFP path and remains
+   limited to the exact loopback NetworkBroker endpoint;
+4. transactionally granted/restored restricted-code ACLs: full access for the
    task workspace and read/execute plus ancestor traverse for the resolved
-   native runtime tree;
-4. a WFP-backed Windows Firewall transaction; and
-5. exact resolution to a native `.exe`/`.com`, never a shell script.
+   native runtime tree and an explicitly staged trusted Python runtime. The
+   TCB temporarily enables `SeSecurityPrivilege` on its own token to
+   snapshot/restore integrity SACLs, restores the prior privilege state, and
+   never passes that privilege to the restricted child;
+5. a WFP-backed Windows Firewall transaction; and
+6. exact resolution to a native `.exe`/`.com`, never a shell script.
 
 The active-process limit is deliberate: Windows program firewall rules cannot
 reliably authorize unknown descendants during a process-discovery race. The
-helper therefore permits only the launcher plus one native runtime process;
-anything beyond that is refused rather than being allowed an ungoverned
+native runtime therefore cannot create an ungoverned descendant; anything
+beyond the one Job member is refused rather than being allowed an ungoverned
 network tree. Windows brokered egress is limited
 to IPv4 loopback and the exact broker port; all other IPv4/IPv6 paths are
 blocked.
 
-The helper probe and native execution job run on Windows hosted CI. A missing
-helper or any incomplete probe returns infrastructure-unsupported and keeps
-the fail-closed behavior.
+The helper probe and native execution job run on Windows hosted CI. The probe
+must observe the AppContainer token, denied loopback connection, denied
+descendant, workspace-only ACL, and complete cleanup. A missing helper or any
+incomplete probe returns infrastructure-unsupported and keeps the fail-closed
+behavior.

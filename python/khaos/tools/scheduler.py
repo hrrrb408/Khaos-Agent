@@ -45,6 +45,11 @@ from khaos.permissions.resource import (
 )
 from khaos.permissions.rules import typed_rule_from_authorization_resource
 from khaos.security.middleware import SecurityMiddleware
+from khaos.security.network_broker import (
+    NetworkBroker,
+    NetworkBrokerFactory,
+    NetworkLease,
+)
 from khaos.tools.registry import ToolInvocationBroker, ToolRegistry
 from khaos.tools.terminal_tools import (
     BackgroundProcessAuthority,
@@ -494,6 +499,7 @@ class ToolScheduler:
         # two concurrent local sessions under the same UID get independent
         # BrowserContexts (keyed by principal_id + session_id + runtime_id).
         runtime_id: str = "",
+        network_broker_factory: NetworkBrokerFactory | None = None,
     ):
         self.registry = registry
         self.permission_engine = permission_engine
@@ -502,6 +508,10 @@ class ToolScheduler:
         # H5: per-runtime identifier propagated to the broker so browser
         # tools can key their BrowserContext by (principal, session, runtime).
         self.runtime_id = runtime_id
+        self.network_broker_factory: NetworkBrokerFactory = (
+            network_broker_factory or NetworkBrokerFactory()
+        )
+        self._network_brokers: set[NetworkBroker] = set()
         # When True and the Rust bridge is importable, read-only file reads in
         # the parallel group are offloaded to the Rust executor for the bulk
         # I/O; the result still flows through the normal Python handler so
@@ -587,6 +597,27 @@ class ToolScheduler:
         return results
 
     async def stream_batch(
+        self,
+        tool_calls: list[dict],
+        mode: str,
+        session_id: str | None = None,
+        confirm_callback: ConfirmCallback | None = None,
+        tool_context: dict[str, Any] | None = None,
+    ):
+        """Execute a batch and always reclaim any managed egress lease."""
+        try:
+            async for event in self._stream_batch_impl(
+                tool_calls,
+                mode,
+                session_id,
+                confirm_callback,
+                tool_context,
+            ):
+                yield event
+        finally:
+            await self._close_all_network_brokers()
+
+    async def _stream_batch_impl(
         self,
         tool_calls: list[dict],
         mode: str,
@@ -843,19 +874,26 @@ class ToolScheduler:
                 )
 
             try:
+                await self._prepare_network_authority_inputs(
+                    tool=tool,
+                    call=normalized,
+                    tool_context=tool_context,
+                    resource=resource,
+                )
                 await self._prepare_sandbox_authority_inputs(
                     tool=tool,
                     call=normalized,
                     tool_context=tool_context,
                 )
             except (PermissionError, ValueError) as exc:
+                await self._close_network_broker(normalized)
                 yield SchedulerEvent(
                     event="tool_result",
                     result=ToolResult(
                         tool_call_id=normalized["id"],
                         name=tool.name,
                         success=False,
-                        error=f"Sandbox authority rejected: {exc}",
+                        error=f"Execution authority rejected: {exc}",
                         arguments=normalized["arguments"],
                     ),
                 )
@@ -882,6 +920,7 @@ class ToolScheduler:
                 principal_id = str(tool_context.get("principal_id") or "")
                 current_session = str(session_id or "")
                 if not principal_id or not current_session:
+                    await self._close_network_broker(normalized)
                     yield SchedulerEvent(
                         event="tool_result",
                         result=ToolResult(
@@ -948,6 +987,7 @@ class ToolScheduler:
                 )
                 broker = tool_context.get("approval_broker")
                 if broker is None:
+                    await self._close_network_broker(normalized)
                     yield SchedulerEvent(
                         event="tool_result",
                         result=ToolResult(
@@ -1018,6 +1058,7 @@ class ToolScheduler:
                     binding_digest=binding_digest,
                 )
                 if not confirmation.get("approved", False):
+                    await self._close_network_broker(normalized)
                     if destructive_context is not None:
                         await destructive_context["approval_broker"].cancel_operation(normalized["id"])
                     await self._audit_best_effort(
@@ -1044,6 +1085,7 @@ class ToolScheduler:
                         principal_id=principal_id,
                     )
                     if not approved:
+                        await self._close_network_broker(normalized)
                         yield SchedulerEvent(
                             event="tool_result",
                             result=ToolResult(
@@ -1106,6 +1148,7 @@ class ToolScheduler:
                 dispatch_epoch = await self.permission_engine.authorization_snapshot()
             except PermissionDeniedError as exc:
                 for call in approved_calls:
+                    await self._close_network_broker(call)
                     yield SchedulerEvent(
                         event="tool_result",
                         result=ToolResult(
@@ -1127,6 +1170,7 @@ class ToolScheduler:
             for call in parallel_calls:
                 reservation = await self.budget.reserve(parallel=True)
                 if reservation is None:
+                    await self._close_network_broker(call)
                     yield SchedulerEvent(
                         event="tool_result",
                         result=ToolResult(
@@ -1173,6 +1217,7 @@ class ToolScheduler:
         for call in serial_calls:
             reservation = await self.budget.reserve(parallel=False)
             if reservation is None:
+                await self._close_network_broker(call)
                 yield SchedulerEvent(
                     event="tool_result",
                     result=ToolResult(
@@ -1192,6 +1237,21 @@ class ToolScheduler:
             )
 
     async def _execute_one(
+        self,
+        call: dict,
+        session_id: str | None,
+        mode: str,
+        tool_context: dict[str, Any],
+        reservation: ToolBudgetReservation,
+    ) -> ToolResult:
+        try:
+            return await self._execute_one_impl(
+                call, session_id, mode, tool_context, reservation
+            )
+        finally:
+            await self._close_network_broker(call)
+
+    async def _execute_one_impl(
         self,
         call: dict,
         session_id: str | None,
@@ -1404,6 +1464,8 @@ class ToolScheduler:
                     step_authority=step_authority,
                     spawn_plan=call["_spawn_plan"],
                 )
+            if call.get("_network_lease") is not None:
+                invocation_context["network_lease"] = call["_network_lease"]
             invocation_context["effect_id"] = effect_id
             output = await asyncio.wait_for(
                 self.invocation_broker.invoke(tool.name, mode=mode, context=invocation_context, **call.get("arguments", {})),
@@ -2508,6 +2570,7 @@ class ToolScheduler:
             )
 
         network_guard = tool_context.get("network_guard")
+        network_lease = call.get("_network_lease")
         network_authority = tool_context.get("network_authority")
         if network_authority is None:
             network_authority = tool_context.get("network_authority_digest")
@@ -2532,6 +2595,10 @@ class ToolScheduler:
                     "effective_policy_digest": effective_policy_digest,
                 }
             )
+        if network_lease is not None:
+            network_authority = getattr(network_lease, "identity_digest", "")
+            if not network_authority:
+                raise PermissionDeniedError("managed network lease has no identity")
         network_authority = _authority_identity(network_authority)
         authorization_resource_digest = (
             resource.digest() if resource is not None else "resource:none"
@@ -2549,6 +2616,7 @@ class ToolScheduler:
                 environment_payload=environment_payload,
                 executable_scope=str(executable_scope),
                 argv=argv,
+                network_lease=network_lease,
             )
             call["_spawn_plan"] = spawn_plan
         elif not isinstance(spawn_plan, ResolvedSpawnPlan):
@@ -2693,6 +2761,105 @@ class ToolScheduler:
         )
         call["_sandbox_decision"] = decision
         call["_sandbox_backend"] = backend
+
+    async def _prepare_network_authority_inputs(
+        self,
+        *,
+        tool,
+        call: dict[str, Any],
+        tool_context: dict[str, Any],
+        resource: AuthorizationResource | None = None,
+    ) -> None:
+        """Start the managed egress broker before freezing step authority.
+
+        NetworkGuard remains the policy/approval layer for tool calls.  Every
+        process-capable coding tool additionally receives a concrete
+        NetworkLease whenever the effective policy enables network access;
+        there is no direct-host process path hidden behind the legacy
+        ``unrestricted-with-approval`` label.
+        """
+        if not _tool_has_capability(tool, "process.execute"):
+            return
+        if str(getattr(tool, "execution_kind", "host-sandbox")) in {
+            "process-control",
+            "docker",
+        }:
+            return
+        network_guard = tool_context.get("network_guard")
+        if network_guard is None or not bool(
+            getattr(network_guard, "network_enabled", False)
+        ):
+            return
+        if call.get("_network_broker") is not None:
+            return
+        factory = self.network_broker_factory
+        if factory is None:
+            raise PermissionError(
+                "network-enabled process execution requires NetworkBrokerFactory"
+            )
+        authorization_epoch = await self.permission_engine.authorization_snapshot()
+        workspace_generation = int(
+            resource.workspace_generation
+            if resource is not None
+            else tool_context.get("workspace_generation") or 0
+        )
+        if workspace_generation <= 0:
+            raise PermissionError(
+                "network-enabled process execution requires a live workspace generation"
+            )
+        allowed_domains = getattr(network_guard, "allowed_domains", None)
+        blocked_domains = getattr(network_guard, "blocked_domains", frozenset())
+        broker, lease = await factory.start(
+            principal_id=str(tool_context.get("principal_id") or "legacy-principal"),
+            project_id=str(tool_context.get("project_id") or "legacy-project"),
+            runtime_id=str(tool_context.get("runtime_id") or self.runtime_id or "legacy-runtime"),
+            task_id=str(tool_context.get("task_id") or "legacy-task"),
+            workspace_id=str(tool_context.get("workspace_id") or "legacy-workspace"),
+            workspace_generation=workspace_generation,
+            policy_digest=str(
+                tool_context.get("effective_policy_digest") or "policy:unspecified"
+            ),
+            authorization_epoch=authorization_epoch,
+            allowed_domains=(
+                frozenset(str(domain) for domain in allowed_domains)
+                if allowed_domains is not None
+                else None
+            ),
+            blocked_domains=frozenset(str(domain) for domain in blocked_domains),
+        )
+        call["_network_broker"] = broker
+        call["_network_lease"] = lease
+        call["_network_authorization_epoch"] = authorization_epoch
+        self._network_brokers.add(broker)
+
+    async def _close_network_broker(self, call: dict[str, Any]) -> None:
+        """Close one step broker and retain failures as a hard boundary."""
+        broker = call.pop("_network_broker", None)
+        if broker is None:
+            return
+        try:
+            await broker.close()
+        except Exception:
+            logger.exception("managed network broker cleanup failed")
+            raise
+        self._network_brokers.discard(broker)
+
+    async def _close_all_network_brokers(self) -> None:
+        """Close every tracked broker and retain failed cleanup ownership."""
+        errors: list[BaseException] = []
+        for broker in tuple(self._network_brokers):
+            try:
+                await broker.close()
+            except BaseException as exc:  # noqa: BLE001 - cleanup must survive cancellation
+                errors.append(exc)
+            else:
+                self._network_brokers.discard(broker)
+        try:
+            await self.network_broker_factory.close()
+        except BaseException as exc:  # noqa: BLE001 - cleanup must survive cancellation
+            errors.append(exc)
+        if errors:
+            raise RuntimeError("managed network broker cleanup was not proven") from errors[0]
 
     def _verify_step_authority(
         self,
@@ -2959,7 +3126,8 @@ class ToolScheduler:
         return normalized
 
     async def aclose(self) -> None:
-        """Close every runtime-owned background process handle."""
+        """Close every runtime-owned network and background-process handle."""
+        await self._close_all_network_brokers()
         await self.process_authority.shutdown()
 
     @staticmethod
@@ -3123,6 +3291,7 @@ def _authority_profile(
     arguments: dict[str, Any],
     tool_context: dict[str, Any],
     environment_keys: tuple[str, ...],
+    network_lease: NetworkLease | None = None,
 ) -> PermissionProfile | None:
     """Build the same profile projection consumed by ExecutionService."""
     root_value = tool_context.get("workspace_root")
@@ -3137,16 +3306,24 @@ def _authority_profile(
             if writable
             else FileSystemAccess.READ_ONLY
         )
-        network = NetworkPolicy(
+        requested_network = NetworkPolicy(
             str(tool_context.get("network_policy") or NetworkPolicy.NONE.value)
         )
-        return PermissionProfile.from_legacy(
+        network = (
+            NetworkPolicy.BROKERED
+            if network_lease is not None
+            and requested_network is NetworkPolicy.UNRESTRICTED_WITH_APPROVAL
+            else requested_network
+        )
+        profile = PermissionProfile.from_legacy(
             access_mode=access_mode.value,
             network_policy=network,
+            network_broker=network_lease,
             roots=(root,),
             environment_keys=frozenset(environment_keys),
             resources=_authority_budget(tool.name, arguments, int(getattr(tool, "timeout", 120))),
-        ).bind_workspace(root)
+        )
+        return profile.bind_workspace(root)
     except (OSError, TypeError, ValueError, PermissionError):
         return None
 
@@ -3163,6 +3340,7 @@ def _build_spawn_plan(
     environment_payload: dict[str, str],
     executable_scope: str,
     argv: tuple[str, ...],
+    network_lease: NetworkLease | None = None,
 ) -> ResolvedSpawnPlan:
     """Create one immutable, pre-approval spawn authority."""
     arguments = call.get("arguments", {})
@@ -3193,6 +3371,7 @@ def _build_spawn_plan(
         arguments=arguments,
         tool_context=tool_context,
         environment_keys=tuple(sorted(environment_payload)),
+        network_lease=network_lease,
     )
     if profile is not None:
         permission_profile_digest = profile.digest()

@@ -56,10 +56,11 @@ class _GitExecutionContext:
     credential_context: dict[str, Any] | None = None
     principal_id: str | None = None
     requester: str | None = None
+    network_lease: Any = None
 
 
-def _context(task_id: str | None, workspace_id: str | None, access_mode: str, execution_service: Any, approval_context: dict[str, Any] | None, network_policy: str, credential_context: dict[str, Any] | None = None, principal_id: str | None = None, requester: str | None = None) -> _GitExecutionContext:
-    return _GitExecutionContext(task_id, workspace_id, access_mode, execution_service, approval_context, network_policy, credential_context, principal_id, requester)
+def _context(task_id: str | None, workspace_id: str | None, access_mode: str, execution_service: Any, approval_context: dict[str, Any] | None, network_policy: str, credential_context: dict[str, Any] | None = None, principal_id: str | None = None, requester: str | None = None, network_lease: Any = None) -> _GitExecutionContext:
+    return _GitExecutionContext(task_id, workspace_id, access_mode, execution_service, approval_context, network_policy, credential_context, principal_id, requester, network_lease)
 
 
 async def git_diff(repo: str = ".", staged: bool = False, *, task_id: str | None = None, workspace_id: str | None = None, access_mode: str = "read-only", execution_service: Any = None, approval_context: dict[str, Any] | None = None, network_policy: str = "none") -> dict[str, Any]:
@@ -332,7 +333,7 @@ async def git_create_branch(
 
 
 async def git_push(
-    cwd: str = ".", remote: str = "origin", branch: str = "", *, task_id: str | None = None, workspace_id: str | None = None, access_mode: str = "vcs.remote-write", execution_service: Any = None, approval_context: dict[str, Any] | None = None, network_policy: str = "none", credential_context: dict[str, Any] | None = None, principal_id: str | None = None, requester: str | None = None
+    cwd: str = ".", remote: str = "origin", branch: str = "", *, task_id: str | None = None, workspace_id: str | None = None, access_mode: str = "vcs.remote-write", execution_service: Any = None, approval_context: dict[str, Any] | None = None, network_policy: str = "none", credential_context: dict[str, Any] | None = None, principal_id: str | None = None, requester: str | None = None, network_lease: Any = None
 ) -> str:
     """Push the current (or named) branch to ``remote``.
 
@@ -345,7 +346,7 @@ async def git_push(
     """
     remote = remote or "origin"
     _validate_remote_name(remote)
-    ctx = _context(task_id, workspace_id, "vcs.remote-write", execution_service, approval_context, network_policy, credential_context, principal_id, requester)
+    ctx = _context(task_id, workspace_id, "vcs.remote-write", execution_service, approval_context, network_policy, credential_context, principal_id, requester, network_lease)
     read_ctx = _context(task_id, workspace_id, "read-only", execution_service, approval_context, "none")
     branch_result = await _git(["git", *_GIT_SAFE_CONFIG, "branch", "--show-current"], cwd, read_ctx)
     current_branch = branch_result["stdout"].strip()
@@ -670,11 +671,18 @@ async def _git_remote_via_execution_service(
     workspace, cwd = _resolve_git_workspace(repo, context, require_writable=True)
     remote, branch, refspec = _validate_push_argv(args)
     await _consume_remote_approval(workspace, cwd, context, remote, branch, refspec)
+    approval = context.approval_context
+    if not isinstance(approval, dict):
+        raise PermissionError("git_push requires approval")
     credential_scope, credential_environment = _credential_material(
-        context.approval_context.get("binding", {}).get("remote_url", ""),
+        approval.get("binding", {}).get("remote_url", ""),
         context.credential_context,
     )
-    if credential_scope != context.approval_context["binding"].get("credential_scope"):
+    if context.network_lease is None:
+        raise PermissionError(
+            "git_push requires a managed NetworkBroker lease"
+        )
+    if credential_scope != approval.get("binding", {}).get("credential_scope"):
         raise PermissionError("credential scope changed after approval")
     with tempfile.TemporaryDirectory(prefix="khaos-git-remote-home-") as temporary_home:
         environment = _git_environment(temporary_home)
@@ -685,7 +693,8 @@ async def _git_remote_via_execution_service(
             writable_roots=(cwd,),
             environment=environment,
             allowed_environment_keys=frozenset(environment),
-            network_policy=NetworkPolicy.UNRESTRICTED_WITH_APPROVAL,
+            network_policy=NetworkPolicy.BROKERED,
+            network_broker=context.network_lease,
             task_id=context.task_id,
             workspace_id=context.workspace_id,
             access_mode="workspace-write",

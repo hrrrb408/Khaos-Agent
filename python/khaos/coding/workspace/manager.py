@@ -356,22 +356,11 @@ class WorkspaceManager:
             ).hexdigest(),
         )
 
-    def _git_capability(
-        self,
-        authority: AuthorityEnvelope | EffectCapability,
-    ) -> EffectCapability:
-        if isinstance(authority, EffectCapability):
-            return authority
-        return self._authority_broker.issue(
-            authority,
-            allowed_operation="git.*",
-        )
-
     async def _git(
         self,
         repository: Path,
         *args: str,
-        authority: AuthorityEnvelope | EffectCapability | None = None,
+        authority: EffectCapability | None = None,
         preserve_output: bool = False,
     ) -> str:
         try:
@@ -388,11 +377,23 @@ class WorkspaceManager:
                 self._root_identity,
                 self._authority_broker,
             )
-            context = authority or self._default_git_authority(repository)
+            if authority is None:
+                context = self._default_git_authority(repository)
+                capability = self._authority_broker.issue(
+                    context,
+                    allowed_operation="git.*",
+                )
+            elif isinstance(authority, EffectCapability):
+                capability = authority
+            else:
+                raise WorkspaceError(
+                    "trusted Git requires a broker-issued capability; "
+                    "AuthorityEnvelope is context only"
+                )
             return await runner.run(
                 repository,
                 *args,
-                authority=self._git_capability(context),
+                authority=capability,
                 preserve_output=preserve_output,
             )
         except TrustedGitError as exc:
@@ -404,7 +405,7 @@ class WorkspaceManager:
         base_sha: str,
         worktree: Path,
         *,
-        authority: AuthorityEnvelope | EffectCapability,
+        authority: EffectCapability,
     ) -> None:
         try:
             runner = TrustedGitRunner(
@@ -415,12 +416,15 @@ class WorkspaceManager:
                 self._root_identity,
                 self._authority_broker,
             )
-            capability = self._git_capability(authority)
+            if not isinstance(authority, EffectCapability):
+                raise WorkspaceError(
+                    "trusted Git materialization requires a broker capability"
+                )
             await runner.materialize_tree(
                 repository,
                 base_sha,
                 worktree,
-                authority=capability.derive(operation_class="git.materialize"),
+                authority=authority.derive(operation_class="git.materialize"),
                 limits=self.bootstrap_limits,
             )
         except TrustedGitError as exc:
@@ -804,7 +808,7 @@ class WorkspaceManager:
                             "remove",
                             "--force",
                             str(active_path),
-                            authority=authority_context,
+                            authority=authority_capability,
                         )
                     except Exception as cleanup_error:  # noqa: BLE001 - preserve original failure
                         logger.error(
@@ -1327,9 +1331,9 @@ class WorkspaceManager:
                         restore_git_pointer_for_cleanup,
                         workspace.git_identity,
                     )
-                authority = workspace.authority_envelope
+                authority = workspace.authority_capability
                 if authority is None:
-                    raise WorkspaceError("TaskWorkspace authority envelope is missing")
+                    raise WorkspaceError("TaskWorkspace authority capability is missing")
                 if force:
                     await self._git(
                         workspace.repository_root,

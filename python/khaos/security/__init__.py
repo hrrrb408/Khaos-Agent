@@ -11,6 +11,7 @@ from khaos.security.middleware import SecurityCheckResult, SecurityMiddleware
 from khaos.security.network_broker import (
     NetworkBroker,
     NetworkBrokerError,
+    NetworkBrokerFactory,
     NetworkLease,
 )
 from khaos.security.path_guard import PathCheckResult, PathGuard
@@ -25,6 +26,7 @@ __all__ = [
     "EffectCapability",
     "NetworkBroker",
     "NetworkBrokerError",
+    "NetworkBrokerFactory",
     "NetworkLease",
     "PathCheckResult",
     "PathGuard",

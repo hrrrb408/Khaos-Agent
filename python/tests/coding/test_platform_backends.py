@@ -21,7 +21,10 @@ from khaos.coding.execution.platform import (
     MacOSSandboxBackend,
     UnsupportedBackend,
     _create_linux_cgroup,
+    _read_windows_output,
+    _remove_windows_python_runtime,
     _runtime_read_roots,
+    _stage_windows_python_runtime,
     _validated_profile,
 )
 from khaos.security.network_broker import NetworkLease
@@ -36,6 +39,21 @@ async def test_unsupported_backend_refuses_writable_execution():
 def test_platform_profiles_are_network_denying(tmp_path: Path):
     assert "deny network" in MacOSSandboxBackend().profile(tmp_path)
     assert "--unshare-net" in LinuxBubblewrapBackend().argv_prefix(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_windows_output_reader_drains_after_first_chunk():
+    class ChunkedStream:
+        def __init__(self) -> None:
+            self.chunks = iter((b"first", b" second", b""))
+
+        async def read(self, _size: int) -> bytes:
+            return next(self.chunks)
+
+    output, truncated = await _read_windows_output(ChunkedStream(), 64)
+
+    assert output == "first second"
+    assert truncated is False
 
 
 def test_linux_brokered_profile_requires_a_real_namespace_lease(
@@ -310,6 +328,69 @@ def test_runtime_roots_include_lexical_virtualenv(tmp_path: Path):
     roots = _runtime_read_roots((str(executable),), tmp_path / "workspace")
 
     assert virtualenv.resolve() in roots
+
+
+def test_windows_python_runtime_staging_is_private_and_reversible(tmp_path: Path):
+    base_root = tmp_path / "base"
+    base_root.mkdir()
+    executable = base_root / "python.exe"
+    executable.write_bytes(b"exe")
+    version = f"python{sys.version_info.major}{sys.version_info.minor}"
+    (base_root / f"{version}.dll").write_bytes(b"dll")
+    (base_root / "vcruntime140.dll").write_bytes(b"runtime")
+    (base_root / f"{version}.zip").write_bytes(b"zip")
+    (base_root / "DLLs").mkdir()
+    (base_root / "DLLs" / "_ssl.pyd").write_bytes(b"pyd")
+    site_packages = tmp_path / "site-packages"
+    (site_packages / "khaos").mkdir(parents=True)
+    (site_packages / "khaos" / "__init__.py").write_text("ok\n", encoding="utf-8")
+    source_root = tmp_path / "source"
+    (source_root / "khaos").mkdir(parents=True)
+    (source_root / "khaos" / "module.py").write_text("ok\n", encoding="utf-8")
+
+    staged = _stage_windows_python_runtime(
+        executable,
+        base_root=base_root,
+        site_packages=site_packages,
+        source_root=source_root,
+    )
+    try:
+        assert (staged / "python.exe").read_bytes() == b"exe"
+        assert (staged / f"{version}.dll").read_bytes() == b"dll"
+        assert (staged / "vcruntime140.dll").read_bytes() == b"runtime"
+        assert (staged / f"{version}.zip").read_bytes() == b"zip"
+        assert (staged / "DLLs" / "_ssl.pyd").read_bytes() == b"pyd"
+        assert (staged / "site-packages" / "khaos" / "__init__.py").is_file()
+        assert (staged / "source" / "khaos" / "module.py").is_file()
+        assert staged != base_root
+        assert staged != site_packages
+    finally:
+        _remove_windows_python_runtime(staged)
+
+    assert not staged.exists()
+
+
+def test_windows_runtime_reparse_alias_is_not_staged(tmp_path: Path):
+    base_root = tmp_path / "base"
+    base_root.mkdir()
+    executable = base_root / "python.exe"
+    executable.write_bytes(b"exe")
+    (base_root / "python3.exe").symlink_to(executable)
+    version = f"python{sys.version_info.major}{sys.version_info.minor}"
+    (base_root / f"{version}.dll").write_bytes(b"dll")
+    (base_root / f"{version}.zip").write_bytes(b"zip")
+
+    staged = _stage_windows_python_runtime(
+        executable,
+        base_root=base_root,
+        site_packages=tmp_path / "missing-site-packages",
+        source_root=tmp_path / "missing-source",
+    )
+    try:
+        assert (staged / "python.exe").is_file()
+        assert not (staged / "python3.exe").exists()
+    finally:
+        _remove_windows_python_runtime(staged)
 
 
 def test_linux_profile_preserves_cwd_relative_to_workspace(tmp_path: Path):

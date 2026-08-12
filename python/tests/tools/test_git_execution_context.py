@@ -1,4 +1,3 @@
-from types import SimpleNamespace
 import asyncio
 import hashlib
 import inspect
@@ -6,19 +5,20 @@ import json
 import os
 import time
 from dataclasses import replace
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-
-from khaos.coding.execution.models import ExecutionResult, NetworkPolicy
+from khaos.agent.approval import ApprovalBroker
 from khaos.coding.execution.host import HostExecutionBackend
+from khaos.coding.execution.models import ExecutionResult, NetworkPolicy
 from khaos.coding.execution.service import ExecutionService
 from khaos.coding.workspace.models import WorkspaceState
-from khaos.agent.approval import ApprovalBroker
-from khaos.tools.registry import create_runtime_registry
+from khaos.security.network_broker import NetworkLease
 from khaos.tools.git_tools import (
     git_branch,
     git_commit,
+    git_create_branch,
     git_diff,
     git_log,
     git_pr_body,
@@ -26,10 +26,10 @@ from khaos.tools.git_tools import (
     git_smart_commit,
     git_status,
     git_undo,
-    git_create_branch,
     prepare_destructive_git_approval,
     prepare_remote_git_approval,
 )
+from khaos.tools.registry import create_runtime_registry
 
 
 class _RecordingLocalRemoteBackend(HostExecutionBackend):
@@ -42,7 +42,9 @@ class _RecordingLocalRemoteBackend(HostExecutionBackend):
         # local bare remote. Mutating the legacy network field alone must not
         # downgrade an approved production request.
         local_profile = replace(
-            request.permission_profile, network=NetworkPolicy.NONE
+            request.permission_profile,
+            network=NetworkPolicy.NONE,
+            network_broker=None,
         )
         return await super().execute(
             replace(request, permission_profile=local_profile)
@@ -62,6 +64,20 @@ class _RecordingExecutionService:
     async def execute(self, request):
         self.requests.append(request)
         return ExecutionResult("exec", "passed", 0, next(self.outputs, ""), "", 1)
+
+
+def _test_network_lease() -> NetworkLease:
+    """Explicit network authority for fake execution-service tests only."""
+    return NetworkLease(
+        endpoint="http://127.0.0.1:49152",
+        username="khaos-test",
+        password="test-secret",
+        capability_digest="test-capability",
+        allowed_domains=frozenset({"example.com", "github.com"}),
+        blocked_domains=frozenset(),
+        allowed_ports=frozenset({443}),
+        protocols=frozenset({"https"}),
+    )
 
 
 def _read_context(tmp_path, *, task_id="task-a", state=WorkspaceState.RUNNING, outputs=None):
@@ -165,7 +181,7 @@ async def test_git_read_rejects_cross_task_workspace(tmp_path):
 
 
 async def test_access_mode_cannot_downgrade_branch_write(tmp_path):
-    service, context = _read_context(tmp_path)
+    _service, context = _read_context(tmp_path)
     context.pop("task_id")
     context.pop("workspace_id")
     context["access_mode"] = "read-only"
@@ -259,6 +275,7 @@ async def _approve_remote(service, task, *, requester="session", approval_id="pu
         "approval_broker": broker,
         "network_policy": "unrestricted-with-approval",
         "credential_context": credential_context,
+        "network_lease": _test_network_lease(),
     }
     approval = await prepare_remote_git_approval(
         "git_push",
@@ -276,6 +293,7 @@ async def _approve_remote(service, task, *, requester="session", approval_id="pu
         "approval_context": approval,
         "network_policy": "unrestricted-with-approval",
         "credential_context": credential_context,
+        "network_lease": _test_network_lease(),
     }, broker
 
 
@@ -605,7 +623,8 @@ async def test_git_push_uses_execution_service_and_approval_is_one_shot(tmp_path
     assert result["branch"] == "task/test"
     assert result["remote_host"] == "local"
     push_request = backend.requests[-1]
-    assert push_request.network_policy is NetworkPolicy.UNRESTRICTED_WITH_APPROVAL
+    assert push_request.network_policy is NetworkPolicy.BROKERED
+    assert push_request.permission_profile.network_broker is not None
     assert push_request.argv[-4:] == (
         "push", "--set-upstream", "origin", "task/test:task/test"
     )
@@ -743,6 +762,7 @@ async def test_git_push_injects_only_single_use_authorized_credential_scope(tmp_
         },
         network_policy="unrestricted-with-approval",
         credential_context=credential_context,
+        network_lease=_test_network_lease(),
     ))
     assert result["pushed"] is True
     request = service.requests[-1]

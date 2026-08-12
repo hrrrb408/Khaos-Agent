@@ -31,6 +31,7 @@ async def test_run(
     executable_identity: str | None = None,
     spawn_plan=None,
     execution_authority=None,
+    network_lease=None,
 ) -> str:
     """Run a test command and return a structured JSON summary.
 
@@ -66,7 +67,7 @@ async def test_run(
             ensure_ascii=False,
         )
 
-    from khaos.coding.execution import ExecutionRequest, ResourceBudget
+    from khaos.coding.execution import ExecutionRequest, NetworkPolicy, ResourceBudget
 
     try:
         result = await execution_service.execute(
@@ -82,6 +83,12 @@ async def test_run(
                 task_id=task_id,
                 workspace_id=workspace_id,
                 access_mode="workspace-write",
+                network_policy=(
+                    NetworkPolicy.BROKERED
+                    if network_lease is not None
+                    else NetworkPolicy.NONE
+                ),
+                network_broker=network_lease,
                 sandbox_decision=sandbox_decision,
                 executable_identity=executable_identity or "",
                 spawn_plan=spawn_plan,

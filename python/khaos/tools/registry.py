@@ -43,6 +43,7 @@ _OFFICE_WORKSPACE_FILE_TOOLS = frozenset({
 _INJECTED_CAPABILITY_FIELDS = frozenset({
     "execution_service", "workspace_manager", "approval_context",
     "principal_id", "project_id", "runtime_id", "network_guard",
+    "network_lease",
     "credential_context", "process_supervisor", "process_authority",
     "browser_manager", "cron_engine",
 })
@@ -832,6 +833,7 @@ class ToolInvocationBroker:
             handler_params["execution_authority"] = context.get(
                 "execution_authority"
             )
+            handler_params["network_lease"] = context.get("network_lease")
         if any(capability.name.startswith("vcs.") for capability in capabilities):
             handler_params["execution_service"] = context.get("execution_service")
             handler_params["task_id"] = context.get("task_id")
@@ -840,6 +842,7 @@ class ToolInvocationBroker:
             handler_params["network_policy"] = context.get("network_policy", "none")
             handler_params["principal_id"] = context.get("principal_id")
             handler_params["requester"] = context.get("requester")
+            handler_params["network_lease"] = context.get("network_lease")
             if name == "git_push":
                 handler_params["credential_context"] = context.get("credential_context")
         if any(capability.name == "network.access" for capability in capabilities):

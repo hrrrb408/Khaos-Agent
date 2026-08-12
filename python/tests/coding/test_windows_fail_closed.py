@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
+import socket
 import sys
 
 import pytest
@@ -47,21 +49,63 @@ async def test_windows_agent_execution_has_no_host_fallback(tmp_path):
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
+    outside = tmp_path / "outside.txt"
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    listener.settimeout(0.2)
+    port = listener.getsockname()[1]
     try:
         profile = PermissionProfile(
             filesystem=FileSystemAccess.WORKSPACE_WRITE,
             resources=ResourceBudget(timeout_seconds=20),
         ).bind_workspace(workspace)
+        probe = (
+            "import json, os, socket, subprocess, sys\n"
+            "from pathlib import Path\n"
+            "inside = Path('inside.txt')\n"
+            "inside.write_text('ok')\n"
+            "outside = Path(sys.argv[1])\n"
+            "try:\n"
+            "    outside.write_text('must-not-write')\n"
+            "    outside_denied = False\n"
+            "except OSError:\n"
+            "    outside_denied = True\n"
+            "try:\n"
+            "    socket.create_connection(('127.0.0.1', int(sys.argv[2])), 0.5)\n"
+            "    network_blocked = False\n"
+            "except OSError:\n"
+            "    network_blocked = True\n"
+            "try:\n"
+            "    subprocess.run([os.path.join(os.environ['SystemRoot'], 'System32', 'cmd.exe'), '/c', 'exit', '0'], check=False)\n"
+            "    descendant_blocked = False\n"
+            "except OSError:\n"
+            "    descendant_blocked = True\n"
+            "Path('probe.json').write_text(json.dumps({'inside_written': inside.exists(), 'outside_denied': outside_denied, 'network_blocked': network_blocked, 'descendant_blocked': descendant_blocked}))\n"
+        )
         request = ExecutionRequest(
-            (sys.executable, "-c", "from pathlib import Path; Path('inside.txt').write_text('ok')"),
+            (sys.executable, "-c", probe, str(outside), str(port)),
             workspace,
             environment={"PATH": os.environ.get("PATH", "")},
             permission_profile=profile,
         )
         result = await backend.execute(request)
-        assert result.status == "passed", result.stderr
+        assert result.status == "passed", (
+            f"{result.stderr}; duration_ms={result.duration_ms}; "
+            f"diagnostics={result.diagnostics}"
+        )
         assert (workspace / "inside.txt").read_text() == "ok"
+        evidence = json.loads((workspace / "probe.json").read_text())
+        assert evidence == {
+            "inside_written": True,
+            "outside_denied": True,
+            "network_blocked": True,
+            "descendant_blocked": True,
+        }
+        with pytest.raises(socket.timeout):
+            listener.accept()
     finally:
+        listener.close()
         shutil.rmtree(workspace, ignore_errors=True)
 
 

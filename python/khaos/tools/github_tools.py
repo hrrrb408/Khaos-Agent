@@ -42,12 +42,18 @@ async def _gh(args: list[str], *, context: dict[str, Any], tool_name: str, paylo
                 "NO_COLOR": "1",
                 **credential_environment,
             }
+            network_lease = context.get("network_lease")
+            if network_lease is None:
+                raise PermissionError(
+                    "GitHub operation requires a managed NetworkBroker lease"
+                )
             request = ExecutionRequest(
                 argv=("gh", *args),
                 cwd=cwd,
                 environment=environment,
                 allowed_environment_keys=frozenset(environment),
-                network_policy=NetworkPolicy.UNRESTRICTED_WITH_APPROVAL,
+                network_policy=NetworkPolicy.BROKERED,
+                network_broker=network_lease,
                 task_id=context.get("task_id"),
                 workspace_id=context.get("workspace_id"),
                 access_mode="read-only",

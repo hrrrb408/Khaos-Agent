@@ -87,29 +87,39 @@ trade-off.
 
 **Current state.** This head implements a native Windows execution backend.
 `WindowsSandboxBackend` admits execution only after the Rust helper proves a
-restricted primary token, Job Object limits with a two-process launcher/runtime tree,
-transactional workspace ACL, and WFP-backed Firewall policy. The hosted
+restricted primary token, Job Object limits with one native runtime process
+(the outer helper owns the wait/cleanup transaction),
+transactional workspace ACL, an OS-issued no-network AppContainer for native
+commands and the trusted Python interpreter, and WFP-backed Firewall policy.
+Trusted Python stages a copy of the resolved base executable and receives
+temporary RX access only to that disposable runtime tree, so the venv
+redirector cannot escape the child policy or force ACL mutation on an active
+host runtime. The hosted
 `windows-fail-closed-security` and `contract (windows-2025)` jobs build the
 helper and set `KHAOS_REQUIRE_WINDOWS_NATIVE=1`; the merge claim remains
-pending until those jobs pass on this head. AppContainer/private desktop and
+pending until those jobs pass on this head. Windows private-desktop parity and
 browser-specific Linux netns parity are not claimed.
 
 **Risk.** A failed native probe must continue to produce no execution
 capability; the remaining risk is platform-specific CI/runtime compatibility,
 not a silent Host bypass. The helper deliberately limits each execution to a
-launcher plus one native runtime process because Windows Firewall program
-rules cannot safely authorize unknown descendants during a discovery race.
+one native runtime process because Windows Firewall program rules cannot safely
+authorize unknown descendants during a discovery race; the outer helper is
+outside the Job and does not execute the model command.
 
 **Resolution in this head.** Use the native helper as the only Windows Coding
-backend: restricted token, Job Object kill-on-close/resource limits and active
-process limit two, transactional ACL grant/restore, exact native executable
+backend: restricted token, child-process policy, inherited-handle allowlist,
+per-execution no-network AppContainer for native `network=none` commands and
+trusted Python, disposable staged base-executable launch for trusted Python, the
+restricted-token/WFP path with exact runtime-file ACLs for brokered execution,
+Job Object kill-on-close/resource limits and active
+process limit one, transactional ACL grant/restore, exact native executable
 resolution, and WFP-backed Firewall rules. Brokered egress accepts only the
 loopback NetworkBroker endpoint. Any missing primitive, cleanup proof, or
 unsupported command fails closed.
 
 **Prerequisite.** A passing current-head Windows runner is required before
-release; future work may add AppContainer/private-desktop support, but it is
-outside this closure.
+release; private-desktop support remains outside this closure.
 
 ---
 
