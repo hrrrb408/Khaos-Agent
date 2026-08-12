@@ -23,6 +23,18 @@ POSIX_ONLY = pytest.mark.skipif(
 
 
 @pytest.mark.asyncio
+async def test_completed_wait_result_is_terminal_process_proof():
+    """A completed wait task remains authoritative before transport sync."""
+    process = type("ProcessStub", (), {"returncode": None})()
+    active = supervisor_module._ActiveProcess(process)
+    wait_task = asyncio.create_task(asyncio.sleep(0, result=-15))
+    await wait_task
+
+    assert ProcessSupervisor._record_process_exit(active, wait_task) == -15
+    assert supervisor_module._has_terminal_process_proof(active)
+
+
+@pytest.mark.asyncio
 async def test_supervisor_bounds_stdout_and_stderr_fairly(tmp_path: Path):
     supervisor = ProcessSupervisor()
     command = (
