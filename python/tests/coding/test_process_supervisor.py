@@ -1,5 +1,6 @@
 import asyncio
 import os
+import signal
 import sys
 from pathlib import Path
 
@@ -20,6 +21,30 @@ POSIX_ONLY = pytest.mark.skipif(
     os.name != "posix",
     reason="process-group and rlimit enforcement is POSIX-specific",
 )
+
+
+@POSIX_ONLY
+def test_force_group_signal_also_kills_direct_child(monkeypatch):
+    """A successful group signal must not suppress the direct kill fallback."""
+    process = type(
+        "ProcessStub",
+        (),
+        {
+            "pid": 424242,
+            "returncode": None,
+            "killed": False,
+            "kill": lambda self: setattr(self, "killed", True),
+        },
+    )()
+    monkeypatch.setattr(supervisor_module.os, "killpg", lambda *_args: None)
+
+    supervisor_module._signal_process_group(
+        process,
+        signal.SIGKILL,
+        force=True,
+    )
+
+    assert process.killed is True
 
 
 @pytest.mark.asyncio

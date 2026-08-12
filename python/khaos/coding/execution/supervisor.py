@@ -1041,17 +1041,26 @@ def _signal_process_group(
 ) -> None:
     if process.returncode is not None:
         return
+    group_signal_sent = False
     if os.name == "posix" and process.pid is not None:
         try:
             os.killpg(process.pid, sig)
-            return
+            group_signal_sent = True
         except ProcessLookupError:
-            return
+            if not force:
+                return
         except OSError:
             pass
     if force:
-        process.kill()
-    else:
+        # A successful group signal is not, by itself, proof that the direct
+        # child is still attached to that group.  The launcher/native backend
+        # must also receive SIGKILL so its asyncio wait task can settle and
+        # ownership can be closed deterministically.
+        try:
+            process.kill()
+        except ProcessLookupError:
+            return
+    elif not group_signal_sent:
         process.terminate()
 
 
