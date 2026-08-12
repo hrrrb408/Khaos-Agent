@@ -370,6 +370,29 @@ def test_windows_python_runtime_staging_is_private_and_reversible(tmp_path: Path
     assert not staged.exists()
 
 
+def test_windows_runtime_reparse_alias_is_not_staged(tmp_path: Path):
+    base_root = tmp_path / "base"
+    base_root.mkdir()
+    executable = base_root / "python.exe"
+    executable.write_bytes(b"exe")
+    (base_root / "python3.exe").symlink_to(executable)
+    version = f"python{sys.version_info.major}{sys.version_info.minor}"
+    (base_root / f"{version}.dll").write_bytes(b"dll")
+    (base_root / f"{version}.zip").write_bytes(b"zip")
+
+    staged = _stage_windows_python_runtime(
+        executable,
+        base_root=base_root,
+        site_packages=tmp_path / "missing-site-packages",
+        source_root=tmp_path / "missing-source",
+    )
+    try:
+        assert (staged / "python.exe").is_file()
+        assert not (staged / "python3.exe").exists()
+    finally:
+        _remove_windows_python_runtime(staged)
+
+
 def test_linux_profile_preserves_cwd_relative_to_workspace(tmp_path: Path):
     workspace = tmp_path / "workspace"
     cwd = workspace / "src" / "pkg"

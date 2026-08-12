@@ -571,9 +571,11 @@ def _stage_windows_python_runtime(
             if not runtime_file.is_file():
                 continue
             if _windows_runtime_path_is_reparse(runtime_file):
-                raise PermissionError(
-                    f"trusted Windows runtime contains a reparse point: {runtime_file}"
-                )
+                # Hosted Python installations commonly expose python3.exe as
+                # a reparse/alias next to the resolved python.exe. It is not
+                # part of the staged interpreter contract and must not cause
+                # the required resolved runtime to fail closed.
+                continue
             if runtime_file.suffix.lower() == ".dll" or runtime_file.name.endswith("._pth"):
                 shutil.copy2(runtime_file, staging_root / runtime_file.name)
         standard_library_zip = base_root / (
