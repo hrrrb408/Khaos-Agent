@@ -1967,7 +1967,7 @@ mod windows_backend {
                 ));
             }
             let needs_restricted_traverse = appcontainer_sid.is_some();
-            if needs_restricted_traverse && directory_ancestors(&runtime_root).is_empty() {
+            if needs_restricted_traverse && is_volume_root(&runtime_root) {
                 return Err(
                     "Windows sandbox refuses to mutate a volume-root runtime directory".to_string(),
                 );
@@ -2012,7 +2012,7 @@ mod windows_backend {
                         root.display()
                     ));
                 }
-                if needs_restricted_traverse && directory_ancestors(&root).is_empty() {
+                if needs_restricted_traverse && is_volume_root(&root) {
                     return Err(
                         "Windows sandbox refuses a volume-root runtime directory".to_string()
                     );
@@ -2065,7 +2065,7 @@ mod windows_backend {
                 let parent = file.parent().ok_or_else(|| {
                     "Windows sandbox runtime file has no parent directory".to_string()
                 })?;
-                if needs_restricted_traverse && directory_ancestors(parent).is_empty() {
+                if needs_restricted_traverse && is_volume_root(parent) {
                     return Err("Windows sandbox refuses a volume-root runtime file".to_string());
                 }
                 if needs_restricted_traverse {
@@ -2187,13 +2187,30 @@ mod windows_backend {
         let mut current = path.to_path_buf();
         while let Some(parent) = current.parent() {
             let parent = parent.to_path_buf();
-            if parent == current {
+            // A volume root is not a useful traverse capability and an
+            // icacls grant on C:\ can block while Windows enumerates the
+            // entire volume. Stop before including it; callers still reject
+            // a runtime rooted directly at the volume root through the empty
+            // ancestor check above.
+            if parent == current
+                || parent.parent().is_none()
+                || parent
+                    .parent()
+                    .is_some_and(|grandparent| grandparent == parent)
+            {
                 break;
             }
             ancestors.push(parent.clone());
             current = parent;
         }
         ancestors
+    }
+
+    fn is_volume_root(path: &Path) -> bool {
+        match path.parent() {
+            None => true,
+            Some(parent) => parent == path,
+        }
     }
 
     fn run_icacls(arguments: &[OsString]) -> Result<(), String> {
