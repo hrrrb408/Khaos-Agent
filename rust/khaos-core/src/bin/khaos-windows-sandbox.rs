@@ -1913,8 +1913,11 @@ mod windows_backend {
     /// resolved native runtime.  WRITE_RESTRICTED makes this SID the
     /// authority for writes, so a user-owned runtime that is writable by the
     /// interactive user must still be made explicitly read/execute-only for
-    /// the child.  The native executable itself receives exact RX access and
-    /// only its parent directory receives execute/traverse access. Explicitly
+    /// the child.  The native executable itself receives exact RX access.
+    /// AppContainer launches additionally grant the package SID
+    /// execute/traverse access on parent directories; the restricted-token
+    /// trusted-interpreter path uses the existing interactive-user traverse
+    /// rights and therefore does not rewrite those ancestors. Explicitly
     /// trusted runtime roots (for example Python's Lib/DLL trees) may receive
     /// read/execute access through an inheritable root ACE. Windows propagates
     /// that ACE to existing descendants, so the transaction does not need to
@@ -1959,7 +1962,8 @@ mod windows_backend {
                     runtime_root.display()
                 ));
             }
-            if directory_ancestors(&runtime_root).is_empty() {
+            let needs_restricted_traverse = appcontainer_sid.is_some();
+            if needs_restricted_traverse && directory_ancestors(&runtime_root).is_empty() {
                 return Err(
                     "Windows sandbox refuses to mutate a volume-root runtime directory".to_string(),
                 );
@@ -1967,21 +1971,23 @@ mod windows_backend {
             let mut entries = Vec::new();
             let mut seen_ancestors = HashSet::new();
             let mut seen_root_grants = HashSet::new();
-            for ancestor in directory_ancestors(&runtime_root)
-                .into_iter()
-                .chain(std::iter::once(runtime_root.clone()))
-            {
-                if !seen_ancestors.insert(ancestor.clone()) {
-                    continue;
-                }
-                if let Err(error) = apply_runtime_acl(
-                    &ancestor,
-                    &mut entries,
-                    "*S-1-5-12:(X)",
-                    appcontainer_sid,
-                    false,
-                ) {
-                    return Err(join_runtime_acl_error(error, entries));
+            if needs_restricted_traverse {
+                for ancestor in directory_ancestors(&runtime_root)
+                    .into_iter()
+                    .chain(std::iter::once(runtime_root.clone()))
+                {
+                    if !seen_ancestors.insert(ancestor.clone()) {
+                        continue;
+                    }
+                    if let Err(error) = apply_runtime_acl(
+                        &ancestor,
+                        &mut entries,
+                        "*S-1-5-12:(X)",
+                        appcontainer_sid,
+                        false,
+                    ) {
+                        return Err(join_runtime_acl_error(error, entries));
+                    }
                 }
             }
             if let Err(error) = apply_runtime_acl(
@@ -2002,23 +2008,25 @@ mod windows_backend {
                         root.display()
                     ));
                 }
-                if directory_ancestors(&root).is_empty() {
+                if needs_restricted_traverse && directory_ancestors(&root).is_empty() {
                     return Err(
                         "Windows sandbox refuses a volume-root runtime directory".to_string()
                     );
                 }
-                for ancestor in directory_ancestors(&root) {
-                    if !seen_ancestors.insert(ancestor.clone()) {
-                        continue;
-                    }
-                    if let Err(error) = apply_runtime_acl(
-                        &ancestor,
-                        &mut entries,
-                        "*S-1-5-12:(X)",
-                        appcontainer_sid,
-                        false,
-                    ) {
-                        return Err(join_runtime_acl_error(error, entries));
+                if needs_restricted_traverse {
+                    for ancestor in directory_ancestors(&root) {
+                        if !seen_ancestors.insert(ancestor.clone()) {
+                            continue;
+                        }
+                        if let Err(error) = apply_runtime_acl(
+                            &ancestor,
+                            &mut entries,
+                            "*S-1-5-12:(X)",
+                            appcontainer_sid,
+                            false,
+                        ) {
+                            return Err(join_runtime_acl_error(error, entries));
+                        }
                     }
                 }
                 // A root may first appear as another root's traversal
@@ -2053,24 +2061,26 @@ mod windows_backend {
                 let parent = file.parent().ok_or_else(|| {
                     "Windows sandbox runtime file has no parent directory".to_string()
                 })?;
-                if directory_ancestors(parent).is_empty() {
+                if needs_restricted_traverse && directory_ancestors(parent).is_empty() {
                     return Err("Windows sandbox refuses a volume-root runtime file".to_string());
                 }
-                for ancestor in directory_ancestors(parent)
-                    .into_iter()
-                    .chain(std::iter::once(parent.to_path_buf()))
-                {
-                    if !seen_ancestors.insert(ancestor.clone()) {
-                        continue;
-                    }
-                    if let Err(error) = apply_runtime_acl(
-                        &ancestor,
-                        &mut entries,
-                        "*S-1-5-12:(X)",
-                        appcontainer_sid,
-                        false,
-                    ) {
-                        return Err(join_runtime_acl_error(error, entries));
+                if needs_restricted_traverse {
+                    for ancestor in directory_ancestors(parent)
+                        .into_iter()
+                        .chain(std::iter::once(parent.to_path_buf()))
+                    {
+                        if !seen_ancestors.insert(ancestor.clone()) {
+                            continue;
+                        }
+                        if let Err(error) = apply_runtime_acl(
+                            &ancestor,
+                            &mut entries,
+                            "*S-1-5-12:(X)",
+                            appcontainer_sid,
+                            false,
+                        ) {
+                            return Err(join_runtime_acl_error(error, entries));
+                        }
                     }
                 }
                 if seen_files.insert(file.clone()) {
