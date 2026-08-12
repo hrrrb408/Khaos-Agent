@@ -1,5 +1,6 @@
 import asyncio
 import os
+import signal
 import sys
 from pathlib import Path
 
@@ -20,6 +21,42 @@ POSIX_ONLY = pytest.mark.skipif(
     os.name != "posix",
     reason="process-group and rlimit enforcement is POSIX-specific",
 )
+
+
+@POSIX_ONLY
+def test_force_group_signal_also_kills_direct_child(monkeypatch):
+    """A successful group signal must not suppress the direct kill fallback."""
+    process = type(
+        "ProcessStub",
+        (),
+        {
+            "pid": 424242,
+            "returncode": None,
+            "killed": False,
+            "kill": lambda self: setattr(self, "killed", True),
+        },
+    )()
+    monkeypatch.setattr(supervisor_module.os, "killpg", lambda *_args: None)
+
+    supervisor_module._signal_process_group(
+        process,
+        signal.SIGKILL,
+        force=True,
+    )
+
+    assert process.killed is True
+
+
+@pytest.mark.asyncio
+async def test_completed_wait_result_is_terminal_process_proof():
+    """A completed wait task remains authoritative before transport sync."""
+    process = type("ProcessStub", (), {"returncode": None})()
+    active = supervisor_module._ActiveProcess(process)
+    wait_task = asyncio.create_task(asyncio.sleep(0, result=-15))
+    await wait_task
+
+    assert ProcessSupervisor._record_process_exit(active, wait_task) == -15
+    assert supervisor_module._has_terminal_process_proof(active)
 
 
 @pytest.mark.asyncio
@@ -88,6 +125,40 @@ async def test_supervisor_terminate_kills_complete_process_group(tmp_path: Path)
 
     assert result.status == "cancelled"
     await _wait_until_process_gone(child_pid)
+    assert supervisor.active_execution_ids == ()
+
+
+@pytest.mark.asyncio
+async def test_supervisor_runs_backend_termination_callback_before_draining_output(
+    tmp_path: Path,
+):
+    """A backend may need a kernel tree kill after the launcher exits.
+
+    The callback is intentionally exercised through the public supervisor
+    lifecycle so a native sandbox cannot leave descendants holding captured
+    output pipes open after the direct process has been reaped.
+    """
+    supervisor = ProcessSupervisor(termination_grace_seconds=0.1)
+    callback_called = asyncio.Event()
+    request = ExecutionRequest(
+        (sys.executable, "-c", "import time; time.sleep(30)"),
+        tmp_path,
+        budget=ResourceBudget(timeout_seconds=0.05),
+        correlation_id="backend-termination-callback",
+    )
+
+    async def terminate_backend_tree() -> None:
+        callback_called.set()
+
+    running = asyncio.create_task(
+        supervisor.run(request, termination_callback=terminate_backend_tree)
+    )
+    await _wait_until_active(supervisor, "backend-termination-callback")
+
+    result = await asyncio.wait_for(running, timeout=5)
+
+    assert result.status == "timed-out"
+    assert callback_called.is_set()
     assert supervisor.active_execution_ids == ()
 
 

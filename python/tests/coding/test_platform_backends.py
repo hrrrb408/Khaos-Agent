@@ -230,6 +230,29 @@ def test_linux_cgroup_cleanup_failure_is_not_downgraded_to_warning(tmp_path: Pat
     assert group.exists()
 
 
+def test_linux_cgroup_process_kill_requires_kernel_cgroup_controls(tmp_path: Path):
+    from khaos.coding.execution.platform import _kill_linux_cgroup_processes
+
+    group = tmp_path / "incomplete-cgroup"
+    group.mkdir()
+
+    with pytest.raises(OSError, match="cgroup.kill"):
+        _kill_linux_cgroup_processes(group)
+
+
+def test_linux_cgroup_process_kill_proves_empty_before_return(tmp_path: Path):
+    from khaos.coding.execution.platform import _kill_linux_cgroup_processes
+
+    group = tmp_path / "empty-cgroup"
+    group.mkdir()
+    (group / "cgroup.kill").write_text("", encoding="ascii")
+    (group / "cgroup.events").write_text("populated 0\n", encoding="ascii")
+
+    _kill_linux_cgroup_processes(group)
+
+    assert (group / "cgroup.kill").read_text(encoding="ascii") == "1"
+
+
 @pytest.mark.asyncio
 async def test_linux_execute_joins_cgroup_before_bwrap_and_seccomp_after(
     tmp_path: Path, monkeypatch,
@@ -243,11 +266,12 @@ async def test_linux_execute_joins_cgroup_before_bwrap_and_seccomp_after(
     cgroup.mkdir()
     (cgroup / "cgroup.procs").write_text("", encoding="ascii")
     launcher = Path("/trusted/khaos-sandbox-launcher")
-    captured: dict[str, tuple[str, ...]] = {}
+    captured: dict[str, object] = {}
 
     class RecordingSupervisor:
         async def run(self, request, **_kwargs):
             captured["argv"] = request.argv
+            captured["termination_callback"] = _kwargs.get("termination_callback")
             return object()
 
         async def terminate(self, _execution_id):
@@ -277,6 +301,8 @@ async def test_linux_execute_joins_cgroup_before_bwrap_and_seccomp_after(
     ))
 
     argv = captured["argv"]
+    assert isinstance(argv, tuple)
+    assert callable(captured["termination_callback"])
     assert argv[:4] == (
         str(launcher), "--join-cgroup", str(cgroup / "cgroup.procs"), "--",
     )

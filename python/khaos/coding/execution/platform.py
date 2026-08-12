@@ -1552,6 +1552,11 @@ class LinuxBubblewrapBackend:
                     directory_binding=directory_binding,
                     preserve_directory_fds=True,
                     env=outer_environment,
+                    termination_callback=(
+                        lambda: asyncio.to_thread(
+                            _kill_linux_cgroup_processes, lease.path
+                        )
+                    ),
                 )
             except (OSError, PermissionError):
                 self._capability_cache = None
@@ -1769,27 +1774,11 @@ def _remove_linux_cgroup(group: Path) -> None:
     The owning backend retains its kernel lease and enters quarantine; a
     later explicit retry may only clear the lease after the path disappears.
     """
-    import time
-
     if not group.is_dir():
         return
-    # Step 1: kill all processes in the cgroup.
-    kill_file = group / "cgroup.kill"
-    if kill_file.exists():
-        kill_file.write_text("1", encoding="ascii")
-    # Step 2: wait for populated=0 (max 5 seconds).
-    events_file = group / "cgroup.events"
-    if events_file.exists():
-        deadline = time.monotonic() + 5.0
-        observed_empty = False
-        while time.monotonic() < deadline:
-            content = events_file.read_text(encoding="ascii")
-            if "populated 0" in content or "populated=0" in content:
-                observed_empty = True
-                break
-            time.sleep(0.1)
-        if not observed_empty:
-            raise TimeoutError(f"cgroup remained populated: {group}")
+    # Step 1-2: kill all processes in the cgroup and prove that the kernel
+    # has reaped them before attempting to remove the leaf.
+    _kill_linux_cgroup_processes(group)
     # Step 3: remove descendant cgroups bottom-up (if any).
     descendants: list[Path] = []
     for child in group.rglob("*"):
@@ -1809,6 +1798,35 @@ def _remove_linux_cgroup(group: Path) -> None:
     group.rmdir()
     if group.exists():
         raise RuntimeError(f"cgroup disappearance was not proven: {group}")
+
+
+def _kill_linux_cgroup_processes(group: Path) -> None:
+    """Kill every process in a cgroup and prove that it became empty.
+
+    This is deliberately separate from ``_remove_linux_cgroup`` because the
+    process supervisor must perform kernel-level tree termination *before*
+    it drains captured output.  Removing the cgroup belongs to the backend's
+    final lease release and must happen only after the supervisor has reached
+    a terminal process result.
+    """
+    import time
+
+    if not group.is_dir():
+        return
+    kill_file = group / "cgroup.kill"
+    if not kill_file.is_file():
+        raise OSError(f"cgroup.kill is unavailable: {group}")
+    kill_file.write_text("1", encoding="ascii")
+    events_file = group / "cgroup.events"
+    if not events_file.is_file():
+        raise OSError(f"cgroup.events is unavailable: {group}")
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        content = events_file.read_text(encoding="ascii")
+        if "populated 0" in content or "populated=0" in content:
+            return
+        time.sleep(0.1)
+    raise TimeoutError(f"cgroup remained populated: {group}")
 
 
 def _validated_profile(request):

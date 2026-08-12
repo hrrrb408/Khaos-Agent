@@ -13,6 +13,7 @@ import stat
 import subprocess
 import sys
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -64,6 +65,13 @@ class SupervisorClosedError(RuntimeError):
 @dataclass
 class _ActiveProcess:
     process: asyncio.subprocess.Process
+    termination_callback: Callable[[], Awaitable[None]] | None = None
+    process_wait_task: asyncio.Task[int] | None = None
+    # The native launcher/transport can expose the wait result one event-loop
+    # turn before ``Process.returncode`` is updated.  Retain the wait result as
+    # independent terminal proof so cleanup does not wait on an already-done
+    # task merely because the transport property has not caught up.
+    reaped_return_code: int | None = None
     termination_requested: bool = False
     termination_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     watchdog_task: asyncio.Task[dict | None] | None = None
@@ -192,7 +200,7 @@ class ProcessSupervisor:
         remove an entry only after these proofs succeed.
         """
         for active in self._active.values():
-            if active.process.returncode is None:
+            if not _has_terminal_process_proof(active):
                 return False
             if active.watchdog_task is not None and not active.watchdog_task.done():
                 return False
@@ -221,6 +229,7 @@ class ProcessSupervisor:
         directory_binding: ExecutionDirectoryBinding | None = None,
         use_native_launcher: bool = True,
         preserve_directory_fds: bool = False,
+        termination_callback: Callable[[], Awaitable[None]] | None = None,
     ) -> ExecutionResult:
         """Run one foreground process with bounded, fairly split output.
 
@@ -229,6 +238,11 @@ class ProcessSupervisor:
         its own backend validates the request and applies the container
         boundary.  It still receives a new session, but it must not inherit
         the payload's host directory/rlimit launcher arguments.
+
+        ``termination_callback`` is an optional backend-owned kernel cleanup
+        hook.  It runs after the direct child is reaped and before captured
+        output is drained, which lets a namespace backend terminate
+        descendants that are not in the supervisor's process group.
         """
         execution_id = request.correlation_id
         if not execution_id:
@@ -393,7 +407,10 @@ class ProcessSupervisor:
                 error=RuntimeError("subprocess spawn did not produce a process"),
             )
             raise RuntimeError("subprocess spawn did not produce a process")
-        active = _ActiveProcess(process)
+        active = _ActiveProcess(
+            process,
+            termination_callback=termination_callback,
+        )
         storage_roots = _storage_roots(
             process.pid, tmp_root, sandbox_storage_paths
         )
@@ -465,7 +482,10 @@ class ProcessSupervisor:
                 timeout_seconds = (
                     request.permission_profile.resources.timeout_seconds
                 )
-                process_wait_task = asyncio.create_task(process.wait())
+                process_wait_task = active.process_wait_task
+                if process_wait_task is None:
+                    process_wait_task = asyncio.create_task(process.wait())
+                    active.process_wait_task = process_wait_task
                 if timeout_seconds is not None:
                     deadline_task = asyncio.create_task(
                         asyncio.sleep(timeout_seconds)
@@ -487,17 +507,31 @@ class ProcessSupervisor:
                     # genuine timeout.
                     if deadline_task is not None:
                         deadline_task.cancel()
-                    status = "passed" if process.returncode == 0 else "failed"
+                    return_code = self._record_process_exit(
+                        active, process_wait_task
+                    )
+                    status = "passed" if return_code == 0 else "failed"
                 elif deadline_task is not None and deadline_task in done:
-                    # Deadline elapsed first → genuine timeout.  Cancel
-                    # the wait task, terminate the process group, mark
-                    # timed-out.  The process may have already exited
+                    # Deadline elapsed first → genuine timeout.  Terminate
+                    # the process group while preserving the shared wait
+                    # task, then mark the result timed-out.  The process may
+                    # have already exited
                     # (Docker daemon race) — _terminate_active is a no-op
                     # when returncode is set, but the deadline proof
                     # stands: the configured budget elapsed.
-                    process_wait_task.cancel()
                     active.termination_requested = True
-                    await self._terminate_active(active)
+                    # Deadline cleanup is a terminal proof, just like the
+                    # explicit cancellation path below.  Keep the process
+                    # wait and backend-owned tree cleanup running if the
+                    # caller is cancelled while the grace period is in
+                    # flight; otherwise a short caller timeout can interrupt
+                    # termination after the child has been signalled and
+                    # leave the supervisor task without a terminal result.
+                    await asyncio.shield(
+                        self._terminate_active(
+                            active, process_wait_task=process_wait_task
+                        )
+                    )
                     status = "timed-out"
                     diagnostics.update(
                         {
@@ -507,7 +541,11 @@ class ProcessSupervisor:
                     )
             except asyncio.CancelledError:
                 active.termination_requested = True
-                await asyncio.shield(self._terminate_active(active))
+                await asyncio.shield(
+                    self._terminate_active(
+                        active, process_wait_task=process_wait_task
+                    )
+                )
                 await asyncio.shield(
                     asyncio.gather(stdout_task, stderr_task)
                 )
@@ -584,7 +622,7 @@ class ProcessSupervisor:
         return ExecutionResult(
             execution_id=execution_id,
             status=status,
-            return_code=process.returncode,
+            return_code=_process_return_code(active),
             stdout=stdout.decode("utf-8", errors="replace"),
             stderr=stderr.decode("utf-8", errors="replace"),
             duration_ms=int((time.monotonic() - started) * 1000),
@@ -644,7 +682,7 @@ class ProcessSupervisor:
             active = self._active.get(execution_id)
         if active is None:
             return
-        if active.process.returncode is None:
+        if not _has_terminal_process_proof(active):
             raise RuntimeError(
                 f"cannot unregister live process {execution_id}; terminal proof is missing"
             )
@@ -756,7 +794,7 @@ class ProcessSupervisor:
                     pending = self._pending_spawns.get(execution_id)
                 if active is not None:
                     await asyncio.shield(self._settle_watchdog(active))
-                    if active.process.returncode is None:
+                    if not _has_terminal_process_proof(active):
                         raise RuntimeError(
                             f"process {execution_id} remains live after terminate"
                         )
@@ -840,7 +878,7 @@ class ProcessSupervisor:
     async def _unregister(
         self, execution_id: str, active: _ActiveProcess
     ) -> None:
-        if active.process.returncode is None:
+        if not _has_terminal_process_proof(active):
             raise RuntimeError(
                 f"cannot unregister live process {execution_id}; terminal proof is missing"
             )
@@ -888,25 +926,93 @@ class ProcessSupervisor:
         if watchdog_error is not None and not isinstance(watchdog_error, asyncio.CancelledError):
             raise RuntimeError("process watchdog failed before terminal proof") from watchdog_error
 
-    async def _terminate_active(self, active: _ActiveProcess) -> None:
+    @staticmethod
+    def _record_process_exit(
+        active: _ActiveProcess,
+        process_wait_task: asyncio.Task[int] | None = None,
+    ) -> int | None:
+        """Record the subprocess wait result as an explicit terminal proof."""
+        wait_task = process_wait_task or active.process_wait_task
+        if wait_task is not None:
+            active.process_wait_task = wait_task
+            if wait_task.done() and not wait_task.cancelled():
+                active.reaped_return_code = wait_task.result()
+        if active.reaped_return_code is None and active.process.returncode is not None:
+            active.reaped_return_code = active.process.returncode
+        return active.reaped_return_code
+
+    async def _terminate_active(
+        self,
+        active: _ActiveProcess,
+        *,
+        process_wait_task: asyncio.Task[int] | None = None,
+    ) -> None:
         async with active.termination_lock:
             process = active.process
-            if process.returncode is not None:
-                return
-            _signal_process_group(process, signal.SIGTERM)
-            try:
-                await asyncio.wait_for(
-                    process.wait(), timeout=self.termination_grace_seconds
-                )
-                return
-            except TimeoutError:
-                force_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
-                _signal_process_group(process, force_signal, force=True)
-                await process.wait()
+            # Keep exactly one subprocess wait task alive across every
+            # termination path.  A native launcher can complete that task one
+            # event-loop turn before ``Process.returncode`` is updated.  Treat
+            # the completed wait result as terminal proof and do not signal or
+            # await the same task again; otherwise a concurrent cancellation
+            # can re-enter this lock while the first cleanup is waiting on an
+            # already-completed task.
+            if process_wait_task is None:
+                process_wait_task = active.process_wait_task
+            if process_wait_task is not None:
+                active.process_wait_task = process_wait_task
+            self._record_process_exit(active, process_wait_task)
+            if not _has_terminal_process_proof(active):
+                # Cancelling the deadline race's wait and creating a second
+                # ``process.wait()`` can race the asyncio subprocess
+                # transport on macOS, leaving the second wait unresolved
+                # after the child has been reaped.  Reusing the active
+                # process's task gives every termination path the same
+                # terminal proof.
+                if process_wait_task is None:
+                    process_wait_task = asyncio.create_task(process.wait())
+                    active.process_wait_task = process_wait_task
+                _signal_process_group(process, signal.SIGTERM)
+                if not process_wait_task.done():
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(process_wait_task),
+                            timeout=self.termination_grace_seconds,
+                        )
+                    except TimeoutError:
+                        if not process_wait_task.done():
+                            force_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
+                            _signal_process_group(process, force_signal, force=True)
+                        if not process_wait_task.done():
+                            await asyncio.shield(process_wait_task)
+                self._record_process_exit(active, process_wait_task)
+                if not _has_terminal_process_proof(active):
+                    raise RuntimeError(
+                        "subprocess wait completed without terminal process proof"
+                    )
+            # A native sandbox may have descendants that are outside the
+            # supervisor's process group (for example after bwrap creates a
+            # PID namespace).  Invoke the backend-owned kernel terminator
+            # even when the launcher itself has already exited; otherwise
+            # those descendants can retain stdout/stderr pipes forever and
+            # prevent the supervisor from reaching a terminal result.
+            if active.termination_callback is not None:
+                await active.termination_callback()
 
 
 async def _no_resource_violation() -> None:
     return None
+
+
+def _process_return_code(active: _ActiveProcess) -> int | None:
+    """Return the strongest available process-exit evidence."""
+    if active.reaped_return_code is not None:
+        return active.reaped_return_code
+    return active.process.returncode
+
+
+def _has_terminal_process_proof(active: _ActiveProcess) -> bool:
+    """Return whether the process has a reaping or transport terminal proof."""
+    return _process_return_code(active) is not None
 
 
 async def _drain_bounded(
@@ -935,17 +1041,26 @@ def _signal_process_group(
 ) -> None:
     if process.returncode is not None:
         return
+    group_signal_sent = False
     if os.name == "posix" and process.pid is not None:
         try:
             os.killpg(process.pid, sig)
-            return
+            group_signal_sent = True
         except ProcessLookupError:
-            return
+            if not force:
+                return
         except OSError:
             pass
     if force:
-        process.kill()
-    else:
+        # A successful group signal is not, by itself, proof that the direct
+        # child is still attached to that group.  The launcher/native backend
+        # must also receive SIGKILL so its asyncio wait task can settle and
+        # ownership can be closed deterministically.
+        try:
+            process.kill()
+        except ProcessLookupError:
+            return
+    elif not group_signal_sent:
         process.terminate()
 
 
