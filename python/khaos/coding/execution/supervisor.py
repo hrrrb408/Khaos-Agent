@@ -904,14 +904,25 @@ class ProcessSupervisor:
             process = active.process
             if process.returncode is None:
                 _signal_process_group(process, signal.SIGTERM)
+                # Keep the subprocess transport's wait task alive across the
+                # grace-period timeout.  ``asyncio.wait_for(process.wait(),
+                # ...)`` cancels the wait coroutine on timeout; on Python
+                # 3.13 that can leave a reaped subprocess with a closed
+                # transport whose later ``process.wait()`` never resolves.
+                # Shielding one owned wait task lets us signal the group and
+                # then await the same terminal proof reliably.
+                process_wait_task = asyncio.create_task(process.wait())
                 try:
                     await asyncio.wait_for(
-                        process.wait(), timeout=self.termination_grace_seconds
+                        asyncio.shield(process_wait_task),
+                        timeout=self.termination_grace_seconds,
                     )
                 except TimeoutError:
                     force_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
                     _signal_process_group(process, force_signal, force=True)
-                    await process.wait()
+                    await asyncio.shield(process_wait_task)
+                else:
+                    await asyncio.shield(process_wait_task)
             # A native sandbox may have descendants that are outside the
             # supervisor's process group (for example after bwrap creates a
             # PID namespace).  Invoke the backend-owned kernel terminator
