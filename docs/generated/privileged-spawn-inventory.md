@@ -13,10 +13,10 @@
 - `python/khaos/coding/execution/native_launcher_runtime.py:116` `os.execvpe` in `<module>.main` owner=`NativeLauncherTCB` threat-model=`fd-bound-exec-and-codesign` boundary=`native-launcher`
 - `python/khaos/coding/execution/native_launcher_runtime.py:297` `subprocess.run` in `<module>._authority_path` owner=`NativeLauncherTCB` threat-model=`fd-bound-exec-and-codesign` boundary=`native-launcher`
 - `python/khaos/coding/execution/native_launcher_runtime.py:309` `subprocess.run` in `<module>._authority_path` owner=`NativeLauncherTCB` threat-model=`fd-bound-exec-and-codesign` boundary=`native-launcher`
-- `python/khaos/coding/execution/platform.py:143` `subprocess.run` in `<module>.probe_capability` owner=`ExecutionBackend` threat-model=`kernel-sandbox-and-resource-control` boundary=`execution-service`
-- `python/khaos/coding/execution/platform.py:396` `asyncio.create_subprocess_exec` in `<module>.execute` owner=`ExecutionBackend` threat-model=`kernel-sandbox-and-resource-control` boundary=`execution-service`
-- `python/khaos/coding/execution/platform.py:834` `subprocess.run` in `<module>.probe_capability` owner=`ExecutionBackend` threat-model=`kernel-sandbox-and-resource-control` boundary=`execution-service`
-- `python/khaos/coding/execution/platform.py:1247` `subprocess.run` in `<module>.probe_capability` owner=`ExecutionBackend` threat-model=`kernel-sandbox-and-resource-control` boundary=`execution-service`
+- `python/khaos/coding/execution/platform.py:151` `subprocess.run` in `<module>.probe_capability` owner=`ExecutionBackend` threat-model=`kernel-sandbox-and-resource-control` boundary=`execution-service`
+- `python/khaos/coding/execution/platform.py:404` `asyncio.create_subprocess_exec` in `<module>.execute` owner=`ExecutionBackend` threat-model=`kernel-sandbox-and-resource-control` boundary=`execution-service`
+- `python/khaos/coding/execution/platform.py:842` `subprocess.run` in `<module>.probe_capability` owner=`ExecutionBackend` threat-model=`kernel-sandbox-and-resource-control` boundary=`execution-service`
+- `python/khaos/coding/execution/platform.py:1255` `subprocess.run` in `<module>.probe_capability` owner=`ExecutionBackend` threat-model=`kernel-sandbox-and-resource-control` boundary=`execution-service`
 - `python/khaos/coding/execution/service.py:1000` `asyncio.create_subprocess_exec` in `<module>._start_managed_after_admission` owner=`ExecutionService` threat-model=`authority-bound-child-spawn` boundary=`execution-service`
 - `python/khaos/coding/execution/supervisor.py:349` `asyncio.create_subprocess_exec` in `<module>.run` owner=`ProcessSupervisor` threat-model=`child-tree-lifecycle` boundary=`execution-service`
 - `python/khaos/coding/execution/supervisor.py:1306` `subprocess.run` in `<module>._darwin_deleted_open_file_usage` owner=`ProcessSupervisor` threat-model=`child-tree-lifecycle` boundary=`execution-service`
@@ -60,6 +60,6 @@
 - `rust/khaos-core/src/bin/khaos-exec-launcher.rs:459` `Command::new` in `rust::entrypoint` owner=`NativeExecLauncher` threat-model=`fd-bound-executable-authority` boundary=`native-launcher`
 - `rust/khaos-core/src/bin/khaos-exec-launcher.rs:512` `execveat` in `rust::entrypoint` owner=`NativeExecLauncher` threat-model=`fd-bound-executable-authority` boundary=`native-launcher`
 - `rust/khaos-core/src/bin/khaos-sandbox-launcher.rs:418` `execvp` in `rust::entrypoint` owner=`LinuxSandboxLauncher` threat-model=`seccomp-landlock-bwrap-boundary` boundary=`linux-sandbox`
-- `rust/khaos-core/src/bin/khaos-windows-sandbox.rs:1123` `Command::new` in `rust::entrypoint` owner=`WindowsSandboxTCB` threat-model=`restricted-token-job-acl-appcontainer-wfp` boundary=`windows-sandbox`
-- `rust/khaos-core/src/bin/khaos-windows-sandbox.rs:2237` `Command::new` in `rust::entrypoint` owner=`WindowsSandboxTCB` threat-model=`restricted-token-job-acl-appcontainer-wfp` boundary=`windows-sandbox`
-- `rust/khaos-core/src/bin/khaos-windows-sandbox.rs:2431` `Command::new` in `rust::entrypoint` owner=`WindowsSandboxTCB` threat-model=`restricted-token-job-acl-appcontainer-wfp` boundary=`windows-sandbox`
+- `rust/khaos-core/src/bin/khaos-windows-sandbox.rs:1127` `Command::new` in `rust::entrypoint` owner=`WindowsSandboxTCB` threat-model=`restricted-token-job-acl-appcontainer-wfp` boundary=`windows-sandbox`
+- `rust/khaos-core/src/bin/khaos-windows-sandbox.rs:2241` `Command::new` in `rust::entrypoint` owner=`WindowsSandboxTCB` threat-model=`restricted-token-job-acl-appcontainer-wfp` boundary=`windows-sandbox`
+- `rust/khaos-core/src/bin/khaos-windows-sandbox.rs:2435` `Command::new` in `rust::entrypoint` owner=`WindowsSandboxTCB` threat-model=`restricted-token-job-acl-appcontainer-wfp` boundary=`windows-sandbox`

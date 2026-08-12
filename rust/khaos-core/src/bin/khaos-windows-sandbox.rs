@@ -87,6 +87,10 @@ mod windows_backend {
     // hosted Windows runner enough time to complete that kernel-managed
     // transaction before reclaiming the child.
     const ADMIN_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+    // The probe child exercises the same restricted launch path as execution,
+    // but it must not inherit an overly short command budget. Keep this
+    // finite: a hung child is terminated before ACL/WFP cleanup.
+    const PROBE_CHILD_TIMEOUT_SECONDS: u64 = 30;
 
     pub enum ExecutionOutcome {
         Completed,
@@ -927,7 +931,7 @@ mod windows_backend {
             proxy_port: None,
             memory_bytes: 128 * 1024 * 1024,
             cpu_seconds: 120,
-            timeout_seconds: 10,
+            timeout_seconds: PROBE_CHILD_TIMEOUT_SECONDS,
             runtime_roots: Vec::new(),
             runtime_files: Vec::new(),
             command,

@@ -30,6 +30,7 @@ import hashlib
 import json
 import logging
 import sqlite3
+import threading
 import time
 import uuid
 from enum import Enum
@@ -561,14 +562,19 @@ class ApprovalTransitionResult(str, Enum):
 class PlanApprovalStore:
     """Atomic, durable store for plan approval + authorization state.
 
-    Thread-safe by virtue of SQLite's own ``BEGIN IMMEDIATE`` serialization
-    (no Python-level lock is needed). Every mutating method opens a
-    transaction, performs a Compare-And-Swap on the persisted status, and
-    either commits or rolls back atomically.
+    SQLite's ``BEGIN IMMEDIATE`` serializes separate connections. A
+    ``sqlite3.Connection`` can also be intentionally shared between threads
+    (the test/runtime contract uses ``check_same_thread=False``); in that
+    case transaction state belongs to the connection, not to the calling
+    thread. The store therefore serializes its atomic write paths with an
+    ``RLock`` as well. Every mutating method opens a transaction, performs a
+    Compare-And-Swap on the persisted status, and either commits or rolls back
+    atomically.
     """
 
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
+        self._transaction_lock = threading.RLock()
         self._conn.row_factory = sqlite3.Row
         self.ensure_schema()
         # Batch 2.6 §1: a name-mangled writer handle that ONLY the runtime
@@ -1528,6 +1534,36 @@ class PlanApprovalStore:
         audit_event: PlanApprovalAuditEvent | None = None,
         now: float,
     ) -> tuple[bool, PlanExecutionAuthorization | None]:
+        """Serialize minting with invalidation on a shared connection.
+
+        A ``CONSUMED`` request is never mintable; the locked implementation
+        performs that authoritative check before any authorization insert.
+
+        SQLite serializes ``BEGIN IMMEDIATE`` across connections, but a
+        single ``sqlite3.Connection`` has one transaction state shared by all
+        threads using it. The runtime and test harness may intentionally share
+        a connection, so the lock closes that second concurrency boundary.
+        """
+        with self._transaction_lock:
+            return self._mint_authorization_if_request_active(
+                auth,
+                server_epoch=server_epoch,
+                boot_id=boot_id,
+                expected_binding_digest=expected_binding_digest,
+                audit_event=audit_event,
+                now=now,
+            )
+
+    def _mint_authorization_if_request_active(
+        self,
+        auth: PlanExecutionAuthorization,
+        *,
+        server_epoch: int,
+        boot_id: str = "",
+        expected_binding_digest: str,
+        audit_event: PlanApprovalAuditEvent | None = None,
+        now: float,
+    ) -> tuple[bool, PlanExecutionAuthorization | None]:
         """Atomically mint an authorization only if the request is still
         APPROVED/NOT_REQUIRED and no prior ACTIVE/CONSUMED authorization exists.
 
@@ -2022,6 +2058,25 @@ class PlanApprovalStore:
     # ------------------------------------------------------------------
 
     def invalidate_request_authorizations_leases_and_receipt(
+        self,
+        request_id: str,
+        *,
+        target_status: PlanApprovalStatus,
+        expected_statuses: set[PlanApprovalStatus],
+        audit_event: PlanApprovalAuditEvent | None = None,
+        now: float | None = None,
+    ) -> ApprovalTransitionResult:
+        """Serialize invalidation with concurrent authorization minting."""
+        with self._transaction_lock:
+            return self._invalidate_request_authorizations_leases_and_receipt(
+                request_id,
+                target_status=target_status,
+                expected_statuses=expected_statuses,
+                audit_event=audit_event,
+                now=now,
+            )
+
+    def _invalidate_request_authorizations_leases_and_receipt(
         self,
         request_id: str,
         *,
