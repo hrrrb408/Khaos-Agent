@@ -14,7 +14,6 @@ from khaos.coding.execution.host import HostExecutionBackend
 from khaos.coding.execution.models import NetworkPolicy
 from khaos.coding.execution.service import ExecutionService
 from khaos.coding.workspace.models import WorkspaceState
-from khaos.security.network_broker import NetworkLease
 from khaos.tools.git_tools import (
     git_create_branch,
     git_pr_body,
@@ -37,20 +36,6 @@ class _LocalRemoteBackend(HostExecutionBackend):
         return await super().execute(
             replace(request, permission_profile=local_profile)
         )
-
-
-def _test_network_lease() -> NetworkLease:
-    """Provide an explicit lease for the isolated local-remote test backend."""
-    return NetworkLease(
-        endpoint="http://127.0.0.1:49152",
-        username="khaos-test",
-        password="test-secret",
-        capability_digest="test-capability",
-        allowed_domains=frozenset({"example.com"}),
-        blocked_domains=frozenset(),
-        allowed_ports=frozenset({443}),
-        protocols=frozenset({"https"}),
-    )
 
 
 def _ctx(repo, access_mode="vcs.destructive-write"):
@@ -104,7 +89,7 @@ async def _approved_ctx(repo, tool_name, arguments):
     context["approval_context"] = approval
     context["network_policy"] = "unrestricted-with-approval"
     if tool_name == "git_push":
-        context["network_lease"] = _test_network_lease()
+        context["network_lease"] = object()
     return context
 
 

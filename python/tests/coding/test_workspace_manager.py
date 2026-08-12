@@ -9,7 +9,6 @@ from khaos.coding.workspace.git_identity import GitIdentityError
 from khaos.coding.workspace.manager import WorkspaceError, WorkspaceManager
 from khaos.coding.workspace.models import WorkspaceState, WorkspaceTransition
 from khaos.coding.workspace.trusted_git import WorkspaceBootstrapLimits
-from khaos.security.authority import AuthorityEnvelope
 
 
 def _repo(path: Path) -> Path:
@@ -446,7 +445,7 @@ async def test_host_git_rejects_constructed_authority_envelope(
 ):
     repository = _repo(tmp_path / "repo")
     manager = WorkspaceManager(tmp_path / "worktrees")
-    authority = AuthorityEnvelope(
+    authority = manager._authority_broker.envelope(
         principal_id="principal",
         project_id="project",
         runtime_id="runtime",

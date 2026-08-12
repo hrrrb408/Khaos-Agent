@@ -4,8 +4,8 @@ An :class:`AuthorityEnvelope` is the common, typed context carried by local
 control-plane operations.  It is not itself an effect authority: callers must
 obtain an ``EffectCapability`` from ``AuthorityBroker`` before a privileged
 runner accepts it.  Keeping the context separate from the broker-issued
-capability makes audit identity explicit without treating a constructible
-dataclass as an authorization proof.
+capability makes audit identity explicit while requiring every envelope to be
+created and owned by the broker that can issue its capability.
 """
 
 from __future__ import annotations
@@ -13,13 +13,14 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$")
 _DIGEST = re.compile(r"^[A-Za-z0-9_.:-]{1,256}$")
+_AUTHORITY_ISSUER = object()
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class AuthorityEnvelope:
     """Bind one privileged effect to one immutable security context."""
 
@@ -34,6 +35,81 @@ class AuthorityEnvelope:
     resource_digest: str
     authorization_epoch: int = 0
     schema_version: int = 1
+    _broker: object | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
+
+    def __init__(
+        self,
+        *,
+        principal_id: str,
+        project_id: str,
+        runtime_id: str,
+        task_id: str,
+        workspace_id: str,
+        workspace_generation: int,
+        policy_digest: str,
+        operation_class: str,
+        resource_digest: str,
+        authorization_epoch: int = 0,
+        schema_version: int = 1,
+        _issuer: object | None = None,
+    ) -> None:
+        if _issuer is not _AUTHORITY_ISSUER:
+            raise TypeError(
+                "AuthorityEnvelope instances can only be created by AuthorityBroker"
+            )
+        for name, value in (
+            ("principal_id", principal_id),
+            ("project_id", project_id),
+            ("runtime_id", runtime_id),
+            ("task_id", task_id),
+            ("workspace_id", workspace_id),
+            ("workspace_generation", workspace_generation),
+            ("policy_digest", policy_digest),
+            ("operation_class", operation_class),
+            ("resource_digest", resource_digest),
+            ("authorization_epoch", authorization_epoch),
+            ("schema_version", schema_version),
+        ):
+            object.__setattr__(self, name, value)
+        object.__setattr__(self, "_broker", None)
+        self.__post_init__()
+
+    @classmethod
+    def _from_broker(
+        cls,
+        *,
+        broker: object,
+        principal_id: str,
+        project_id: str,
+        runtime_id: str,
+        task_id: str,
+        workspace_id: str,
+        workspace_generation: int,
+        policy_digest: str,
+        operation_class: str,
+        resource_digest: str,
+        authorization_epoch: int = 0,
+        schema_version: int = 1,
+    ) -> AuthorityEnvelope:
+        """Construct an envelope owned by one trusted AuthorityBroker."""
+        envelope = cls(
+            principal_id=principal_id,
+            project_id=project_id,
+            runtime_id=runtime_id,
+            task_id=task_id,
+            workspace_id=workspace_id,
+            workspace_generation=workspace_generation,
+            policy_digest=policy_digest,
+            operation_class=operation_class,
+            resource_digest=resource_digest,
+            authorization_epoch=authorization_epoch,
+            schema_version=schema_version,
+            _issuer=_AUTHORITY_ISSUER,
+        )
+        object.__setattr__(envelope, "_broker", broker)
+        return envelope
 
     def __post_init__(self) -> None:
         if self.schema_version != 1:
@@ -108,10 +184,21 @@ class AuthorityEnvelope:
         resource_digest: str | None = None,
     ) -> AuthorityEnvelope:
         """Derive a narrower operation without changing its owner binding."""
-        return replace(
-            self,
+        if self._broker is None:
+            raise ValueError("authority envelope is not broker-owned")
+        return self._from_broker(
+            broker=self._broker,
+            principal_id=self.principal_id,
+            project_id=self.project_id,
+            runtime_id=self.runtime_id,
+            task_id=self.task_id,
+            workspace_id=self.workspace_id,
+            workspace_generation=self.workspace_generation,
+            policy_digest=self.policy_digest,
             operation_class=operation_class,
             resource_digest=resource_digest or self.resource_digest,
+            authorization_epoch=self.authorization_epoch,
+            schema_version=self.schema_version,
         )
 
     def matches_context(
@@ -140,13 +227,15 @@ class AuthorityEnvelope:
     def system(
         cls,
         *,
+        broker: object,
         operation_class: str,
         resource_digest: str,
         task_id: str = "recovery",
         workspace_id: str = "system",
     ) -> AuthorityEnvelope:
         """Create the explicit envelope used by local recovery control paths."""
-        return cls(
+        return cls._from_broker(
+            broker=broker,
             principal_id="system",
             project_id="local",
             runtime_id="recovery",

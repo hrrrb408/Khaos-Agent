@@ -34,6 +34,47 @@ def test_selector_never_uses_host_for_read_without_platform_sandbox(monkeypatch)
     assert isinstance(BackendSelector().select(writable=False), UnsupportedBackend)
 
 
+def test_windows_missing_native_helper_is_unsupported(monkeypatch):
+    monkeypatch.setattr("khaos.coding.execution.platform.sys.platform", "win32")
+    monkeypatch.setattr(
+        "khaos.coding.execution.platform._windows_sandbox_helper",
+        lambda: None,
+    )
+
+    backend = BackendSelector().select(writable=True)
+
+    assert isinstance(backend, UnsupportedBackend)
+    assert "Host fallback is forbidden" in backend.reason
+
+
+def test_windows_failed_native_probe_is_unsupported(monkeypatch):
+    from khaos.coding.execution.platform import (
+        BackendAvailability,
+        WindowsSandboxBackend,
+    )
+
+    monkeypatch.setattr("khaos.coding.execution.platform.sys.platform", "win32")
+    monkeypatch.setattr(
+        "khaos.coding.execution.platform._windows_sandbox_helper",
+        lambda: object(),
+    )
+    monkeypatch.setattr(
+        WindowsSandboxBackend,
+        "probe_capability",
+        lambda self: BackendAvailability(
+            self.name,
+            False,
+            False,
+            "native Windows probe failed",
+        ),
+    )
+
+    backend = BackendSelector().select(writable=True)
+
+    assert isinstance(backend, UnsupportedBackend)
+    assert "native Windows probe failed" in backend.reason
+
+
 @pytest.mark.asyncio
 @pytest.mark.windows_fail_closed
 async def test_windows_never_falls_back_to_host(monkeypatch):

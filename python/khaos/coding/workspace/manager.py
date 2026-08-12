@@ -342,7 +342,7 @@ class WorkspaceManager:
         self._mutation_fence = fence
 
     def _default_git_authority(self, repository: Path) -> AuthorityEnvelope:
-        return AuthorityEnvelope(
+        return self._authority_broker.envelope(
             principal_id="legacy",
             project_id="local",
             runtime_id="workspace-manager",
@@ -675,7 +675,7 @@ class WorkspaceManager:
             if not (repository / ".git").exists():
                 raise WorkspaceError(f"not a git repository: {repository}")
             workspace_id = uuid.uuid4().hex[:12]
-            authority_context = AuthorityEnvelope(
+            authority_context = self._authority_broker.envelope(
                 principal_id=principal_id or "legacy",
                 project_id=project_id or "local",
                 runtime_id=creator_runtime_id or "legacy-runtime",
@@ -958,7 +958,7 @@ class WorkspaceManager:
             async with mutation_lock:
                 async with self._lock:
                     current = self._workspaces.get(workspace_id)
-                    if current is not workspace or current.state in {
+                    if current is None or current is not workspace or current.state in {
                         WorkspaceState.FAILED,
                         WorkspaceState.CANCELLED,
                         WorkspaceState.CLEANING,

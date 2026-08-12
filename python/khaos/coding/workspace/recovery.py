@@ -58,6 +58,7 @@ def discover_orphans(root: Path) -> tuple[OrphanWorkspace, ...]:
         if not path.is_dir() or path.is_symlink():
             continue
         authority = AuthorityEnvelope.system(
+            broker=broker,
             operation_class="git.recovery",
             resource_digest=hashlib.sha256(str(path.resolve()).encode("utf-8")).hexdigest(),
             task_id=path.name,

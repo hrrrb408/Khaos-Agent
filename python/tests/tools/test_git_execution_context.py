@@ -14,7 +14,6 @@ from khaos.coding.execution.host import HostExecutionBackend
 from khaos.coding.execution.models import ExecutionResult, NetworkPolicy
 from khaos.coding.execution.service import ExecutionService
 from khaos.coding.workspace.models import WorkspaceState
-from khaos.security.network_broker import NetworkLease
 from khaos.tools.git_tools import (
     git_branch,
     git_commit,
@@ -64,20 +63,6 @@ class _RecordingExecutionService:
     async def execute(self, request):
         self.requests.append(request)
         return ExecutionResult("exec", "passed", 0, next(self.outputs, ""), "", 1)
-
-
-def _test_network_lease() -> NetworkLease:
-    """Explicit network authority for fake execution-service tests only."""
-    return NetworkLease(
-        endpoint="http://127.0.0.1:49152",
-        username="khaos-test",
-        password="test-secret",
-        capability_digest="test-capability",
-        allowed_domains=frozenset({"example.com", "github.com"}),
-        blocked_domains=frozenset(),
-        allowed_ports=frozenset({443}),
-        protocols=frozenset({"https"}),
-    )
 
 
 def _read_context(tmp_path, *, task_id="task-a", state=WorkspaceState.RUNNING, outputs=None):
@@ -275,7 +260,7 @@ async def _approve_remote(service, task, *, requester="session", approval_id="pu
         "approval_broker": broker,
         "network_policy": "unrestricted-with-approval",
         "credential_context": credential_context,
-        "network_lease": _test_network_lease(),
+        "network_lease": object(),
     }
     approval = await prepare_remote_git_approval(
         "git_push",
@@ -293,7 +278,7 @@ async def _approve_remote(service, task, *, requester="session", approval_id="pu
         "approval_context": approval,
         "network_policy": "unrestricted-with-approval",
         "credential_context": credential_context,
-        "network_lease": _test_network_lease(),
+        "network_lease": object(),
     }, broker
 
 
@@ -762,7 +747,7 @@ async def test_git_push_injects_only_single_use_authorized_credential_scope(tmp_
         },
         network_policy="unrestricted-with-approval",
         credential_context=credential_context,
-        network_lease=_test_network_lease(),
+        network_lease=object(),
     ))
     assert result["pushed"] is True
     request = service.requests[-1]

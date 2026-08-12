@@ -2,10 +2,11 @@
 
 ``AuthorityEnvelope`` is intentionally only an owner/context description.  It
 is useful in audit records, but constructing one must never be enough to cross
-an effect boundary.  This module adds the missing boundary: the capability
-seal and live revocation registry live in a dedicated broker process.  A
-caller can copy a capability handle, but cannot manufacture a valid token or
-change its owner, resource, operation, generation, or expiry in place.
+an effect boundary.  This module adds the missing boundary: envelopes are
+broker-owned, and the capability seal and live revocation registry live in a
+dedicated broker process.  A caller can copy a capability handle, but cannot
+manufacture a valid token or change its owner, resource, operation, generation,
+or expiry in place.
 
 The broker is deliberately small and stdlib-only so it is available before
 the rest of Khaos is initialized.  It is an intra-user boundary for trusted
@@ -367,6 +368,10 @@ class AuthorityBroker:
         """Issue a capability after binding all authority context fields."""
         if not isinstance(authority, AuthorityEnvelope):
             raise AuthorityBrokerError("authority broker requires an AuthorityEnvelope context")
+        if authority._broker is not self:
+            raise AuthorityBrokerError(
+                "authority envelope was not created by this AuthorityBroker"
+            )
         operation = allowed_operation or authority.operation_class
         resource = resource_digest or authority.resource_digest
         if not _valid_operation(operation):
@@ -438,6 +443,40 @@ class AuthorityBroker:
             resource_digest=resource_digest,
             ttl_seconds=ttl_seconds,
         )
+
+    def envelope(
+        self,
+        *,
+        principal_id: str,
+        project_id: str,
+        runtime_id: str,
+        task_id: str,
+        workspace_id: str,
+        workspace_generation: int,
+        policy_digest: str,
+        operation_class: str,
+        resource_digest: str,
+        authorization_epoch: int = 0,
+        schema_version: int = 1,
+    ) -> AuthorityEnvelope:
+        """Create one broker-owned context for a later capability issue."""
+        try:
+            return AuthorityEnvelope._from_broker(
+                broker=self,
+                principal_id=principal_id,
+                project_id=project_id,
+                runtime_id=runtime_id,
+                task_id=task_id,
+                workspace_id=workspace_id,
+                workspace_generation=workspace_generation,
+                policy_digest=policy_digest,
+                operation_class=operation_class,
+                resource_digest=resource_digest,
+                authorization_epoch=authorization_epoch,
+                schema_version=schema_version,
+            )
+        except (TypeError, ValueError) as exc:
+            raise AuthorityBrokerError("authority envelope is invalid") from exc
 
     def validate(
         self,

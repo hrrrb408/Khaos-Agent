@@ -11,11 +11,13 @@ from khaos.security.network_broker import (
     NetworkBroker,
     NetworkBrokerError,
     NetworkBrokerFactory,
+    NetworkLease,
+    _NetworkRelayLease,
 )
 
 
-def _authority() -> AuthorityEnvelope:
-    return AuthorityEnvelope(
+def _authority(broker: AuthorityBroker) -> AuthorityEnvelope:
+    return broker.envelope(
         principal_id="principal",
         project_id="project",
         runtime_id="runtime",
@@ -46,6 +48,63 @@ def _tamper(capability, **changes):
     return clone
 
 
+def test_network_lease_constructor_is_not_an_authority_boundary() -> None:
+    with pytest.raises(TypeError, match="only be created"):
+        NetworkLease(
+            endpoint="http://127.0.0.1:49152",
+            username="khaos",
+            password="secret",
+            capability_digest="forged",
+            allowed_domains=frozenset({"allowed.example"}),
+            blocked_domains=frozenset(),
+            allowed_ports=frozenset({443}),
+            protocols=frozenset({"https"}),
+        )
+
+
+class _RetryableRelayWriter:
+    def __init__(self) -> None:
+        self.wait_closed_calls = 0
+
+    def close(self) -> None:
+        return None
+
+    async def wait_closed(self) -> None:
+        self.wait_closed_calls += 1
+        if self.wait_closed_calls == 1:
+            raise OSError("upstream close transient failure")
+
+
+@pytest.mark.asyncio
+async def test_network_broker_retries_retained_relay_after_close_failure() -> None:
+    authority_broker = AuthorityBroker()
+    try:
+        capability = authority_broker.issue(
+            _authority(authority_broker),
+            allowed_operation="network.*",
+        )
+        broker = NetworkBroker(
+            capability,
+            authority_broker=authority_broker,
+            allowed_domains=frozenset({"allowed.example"}),
+        )
+        writer = _RetryableRelayWriter()
+        lease = _NetworkRelayLease(writer)  # type: ignore[arg-type]
+        broker._relay_leases.add(lease)
+        broker._upstream_writers.add(writer)  # type: ignore[arg-type]
+
+        with pytest.raises(NetworkBrokerError, match="cleanup"):
+            await broker.close()
+        assert lease in broker._relay_leases
+        assert not broker.terminal_closed
+
+        await broker.close()
+        assert writer.wait_closed_calls >= 2
+        assert broker.terminal_closed
+    finally:
+        authority_broker.close()
+
+
 @pytest.mark.asyncio
 async def test_broker_resolves_and_pins_allowlisted_target() -> None:
     received: list[bytes] = []
@@ -65,7 +124,7 @@ async def test_broker_resolves_and_pins_allowlisted_target() -> None:
     authority_broker = AuthorityBroker()
     broker: NetworkBroker | None = None
     try:
-        capability = authority_broker.issue(_authority(), allowed_operation="network.*")
+        capability = authority_broker.issue(_authority(authority_broker), allowed_operation="network.*")
         broker = NetworkBroker(
             capability,
             authority_broker=authority_broker,
@@ -100,7 +159,7 @@ async def test_broker_resolves_and_pins_allowlisted_target() -> None:
 async def test_broker_rejects_wrong_domain_and_forged_capability() -> None:
     authority_broker = AuthorityBroker()
     try:
-        capability = authority_broker.issue(_authority(), allowed_operation="network.*")
+        capability = authority_broker.issue(_authority(authority_broker), allowed_operation="network.*")
         broker = NetworkBroker(
             capability,
             authority_broker=authority_broker,
@@ -150,7 +209,7 @@ async def test_broker_revalidates_lease_after_revocation() -> None:
     authority_broker = AuthorityBroker()
     broker: NetworkBroker | None = None
     try:
-        capability = authority_broker.issue(_authority(), allowed_operation="network.*")
+        capability = authority_broker.issue(_authority(authority_broker), allowed_operation="network.*")
         broker = NetworkBroker(
             capability,
             authority_broker=authority_broker,
