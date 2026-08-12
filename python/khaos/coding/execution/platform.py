@@ -253,6 +253,8 @@ class WindowsSandboxBackend:
             "--timeout-seconds",
             str(max(1, math.ceil(profile.resources.timeout_seconds))),
         ]
+        command_argv = list(request.argv)
+        python_launcher = "requested-executable"
         # A venv executable needs its lexical ``pyvenv.cfg`` and the base
         # interpreter runtime.  These paths come from the trusted Khaos
         # Python runtime, not from model-controlled request fields.  Pass
@@ -265,14 +267,37 @@ class WindowsSandboxBackend:
                 requested_executable = shutil.which(
                     requested_executable, path=environment.get("PATH")
                 ) or requested_executable
-            same_as_khaos_python = (
-                Path(requested_executable).resolve()
-                == Path(sys.executable).resolve()
-            )
+            requested_path = Path(requested_executable).resolve()
+            trusted_python_paths = {
+                Path(sys.executable).resolve(),
+                Path(getattr(sys, "_base_executable", sys.executable)).resolve(),
+            }
+            same_as_khaos_python = requested_path in trusted_python_paths
         except (OSError, RuntimeError):
             same_as_khaos_python = False
         if same_as_khaos_python:
             seen_runtime_paths: set[Path] = set()
+            base_executable = Path(
+                getattr(sys, "_base_executable", sys.executable)
+            ).expanduser().resolve()
+            if base_executable.is_file():
+                # On Windows a venv's Scripts/python.exe is a redirector that
+                # starts the base interpreter as a second process.  The
+                # native child-process policy must apply to the interpreter
+                # that executes the request, so launch the trusted base
+                # executable directly and carry only the venv's deterministic
+                # import root into the restricted environment.
+                command_argv[0] = str(base_executable)
+                python_launcher = "base-executable"
+                site_packages = Path(sys.prefix).expanduser().resolve() / "Lib" / "site-packages"
+                import_roots = [
+                    str(path)
+                    for path in (site_packages, Path(__file__).resolve().parents[3])
+                    if path.is_dir() and (path / "khaos").is_dir()
+                ]
+                if import_roots:
+                    environment["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(import_roots))
+                environment["PYTHONNOUSERSITE"] = "1"
             # The restricted-token path keeps the normal trusted interpreter
             # identity for reads and uses WRITE_RESTRICTED plus the exact
             # runtime-file ACLs for writes.  Avoiding a per-execution
@@ -307,7 +332,7 @@ class WindowsSandboxBackend:
         if lease is not None:
             environment.update(lease.proxy_environment())
             helper_args.extend(("--proxy-host", lease.host, "--proxy-port", str(lease.port)))
-        helper_args.extend(("--", *request.argv))
+        helper_args.extend(("--", *command_argv))
         flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         try:
             process = await asyncio.create_subprocess_exec(
@@ -357,6 +382,7 @@ class WindowsSandboxBackend:
                     if use_restricted_runtime
                     else "appcontainer"
                 ),
+                "python_launcher": python_launcher,
                 "stdout_truncated": stdout_truncated,
                 "stderr_truncated": stderr_truncated,
             }
