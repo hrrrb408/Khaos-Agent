@@ -47,6 +47,14 @@ logger = logging.getLogger(__name__)
 # propagates inheritable AppContainer ACEs synchronously.
 WINDOWS_HELPER_STARTUP_GRACE_SECONDS = 75
 
+# A capability probe performs several bounded ``icacls`` and ``netsh``
+# transactions, then restores every ACL and firewall rule before it returns.
+# The outer timeout must cover the complete setup/child/cleanup transaction;
+# otherwise killing the helper halfway through cleanup could strand a
+# temporary security rule.  Each privileged helper command remains bounded
+# separately, and this finite ceiling still fails closed on a hung probe.
+WINDOWS_NATIVE_PROBE_TIMEOUT_SECONDS = 180
+
 # Backwards-compatible public import for callers that historically imported
 # the evidence model from this module instead of ``capability``.
 CapabilityEvidence = _CapabilityEvidence
@@ -144,7 +152,7 @@ class WindowsSandboxBackend:
                 (str(helper), "--probe"),
                 capture_output=True,
                 text=True,
-                timeout=10,
+                timeout=WINDOWS_NATIVE_PROBE_TIMEOUT_SECONDS,
                 check=False,
             )
             payload = json.loads(completed.stdout or "{}")
