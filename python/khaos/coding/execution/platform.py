@@ -11,6 +11,7 @@ import math
 import os
 import secrets
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -261,11 +262,12 @@ class WindowsSandboxBackend:
         ]
         command_argv = list(request.argv)
         python_launcher = "requested-executable"
+        staged_runtime_root: Path | None = None
         # A venv executable needs its lexical ``pyvenv.cfg`` and the base
-        # interpreter runtime.  These paths come from the trusted Khaos
-        # Python runtime, not from model-controlled request fields.  Pass
-        # only the runtime's Lib/DLL trees and exact launcher files so ACL
-        # setup does not recursively rewrite unrelated tool-cache paths.
+        # interpreter runtime. These paths come from the trusted Khaos Python
+        # runtime, not from model-controlled request fields. Stage the exact
+        # runtime inputs into a disposable private tree so the native helper
+        # never mutates an active venv or the shared host tool cache.
         try:
             requested_executable = request.argv[0]
             if not Path(requested_executable).is_absolute():
@@ -285,62 +287,82 @@ class WindowsSandboxBackend:
             base_executable = Path(
                 getattr(sys, "_base_executable", sys.executable)
             ).expanduser().resolve()
+            if not base_executable.is_file():
+                raise PermissionError(
+                    "execution refused: trusted Windows base Python executable is unavailable"
+                )
             import_root_paths: list[Path] = []
             runtime_acl_roots: list[Path] = []
-            if base_executable.is_file():
-                # On Windows a venv's Scripts/python.exe is a redirector that
-                # starts the base interpreter as a second process.  The
-                # native child-process policy must apply to the interpreter
-                # that executes the request, so launch the trusted base
-                # executable directly and carry only the venv's deterministic
-                # import root into the restricted environment.
-                command_argv[0] = str(base_executable)
-                python_launcher = "base-executable"
-                venv_root = Path(sys.prefix).expanduser().resolve()
-                site_packages = venv_root / "Lib" / "site-packages"
-                source_root = Path(__file__).resolve().parents[3]
-                if (
-                    profile.network is NetworkPolicy.NONE
-                    and (source_root / "khaos").is_dir()
-                ):
-                    # The parent Khaos process normally runs from this same
-                    # venv. Recursively changing its ACL while it is active
-                    # can leave hosted Windows icacls waiting on open files.
-                    # AppContainer therefore receives the trusted source
-                    # package, not the live venv tree, for the no-network
-                    # path. The package directory is the smallest useful ACL
-                    # scope; its parent gets traverse-only access from the
-                    # native helper.
-                    import_root_paths.append(source_root)
-                    runtime_acl_roots.append(source_root / "khaos")
-                elif (site_packages / "khaos").is_dir():
-                    import_root_paths.append(site_packages)
-                    runtime_acl_roots.append(site_packages / "khaos")
-                elif (source_root / "khaos").is_dir():
-                    import_root_paths.append(source_root)
-                    runtime_acl_roots.append(source_root / "khaos")
-                import_roots = [str(path) for path in import_root_paths]
-                if import_roots:
-                    environment["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(import_roots))
-                environment["PYTHONNOUSERSITE"] = "1"
-                environment["PYTHONDONTWRITEBYTECODE"] = "1"
+            # On Windows a venv's Scripts/python.exe is a redirector that
+            # starts the base interpreter as a second process. The native
+            # child-process policy must apply to the interpreter that executes
+            # the request, so launch a staged copy of the trusted base
+            # executable under the native policy.
+            python_launcher = "staged-base-executable"
+            venv_root = Path(sys.prefix).expanduser().resolve()
+            site_packages = venv_root / "Lib" / "site-packages"
+            source_root = Path(__file__).resolve().parents[3]
+            staging_task = asyncio.create_task(
+                asyncio.to_thread(
+                    _stage_windows_python_runtime,
+                    base_executable,
+                    base_root=Path(sys.base_prefix).expanduser().resolve(),
+                    site_packages=site_packages,
+                    source_root=source_root,
+                )
+            )
+            try:
+                staged_runtime_root = await asyncio.shield(staging_task)
+            except asyncio.CancelledError:
+                try:
+                    staged_runtime_root = await asyncio.shield(staging_task)
+                except BaseException as staging_error:  # noqa: BLE001 - preserve cancellation
+                    logger.debug(
+                        "trusted Windows runtime staging produced no root: %s",
+                        type(staging_error).__name__,
+                    )
+                if staged_runtime_root is not None:
+                    await asyncio.shield(
+                        asyncio.to_thread(
+                            _remove_windows_python_runtime,
+                            staged_runtime_root,
+                        )
+                    )
+                raise
+            except (OSError, shutil.Error) as exc:
+                raise PermissionError(
+                    "execution refused: trusted Windows Python runtime staging failed"
+                ) from exc
+            command_argv[0] = str(
+                staged_runtime_root / base_executable.name
+            )
+            environment["PYTHONHOME"] = str(staged_runtime_root)
+            staged_source_root = staged_runtime_root / "source"
+            if (staged_source_root / "khaos").is_dir():
+                import_root_paths.append(staged_source_root)
+            staged_site_packages = staged_runtime_root / "site-packages"
+            if staged_site_packages.is_dir():
+                import_root_paths.append(staged_site_packages)
+            runtime_acl_roots.append(staged_runtime_root)
+            import_roots = [str(path) for path in import_root_paths]
+            if import_roots:
+                environment["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(import_roots))
+            environment["PYTHONNOUSERSITE"] = "1"
+            environment["PYTHONDONTWRITEBYTECODE"] = "1"
             # Network-none trusted Python uses the per-execution AppContainer
             # as its network authority.  This is required because Windows
             # Firewall image rules do not provide a dependable loopback
             # boundary on every supported runner.  Brokered execution keeps
             # the restricted-token path and its loopback-only WFP rules.
-            # The direct base interpreter uses the vendor standard-library
-            # zip when present, plus extension modules from DLLs.  The venv
-            # contributes only its installed packages.  Avoid granting the
-            # full base Lib tree when the zip is available: propagating an
-            # inheritable ACL through that tree is slow on hosted Windows
-            # images and is unnecessary for the interpreter's actual import
-            # path.
+            # The staged runtime contains the standard-library zip/DLLs,
+            # trusted package inputs, and the source package. Its ACL is the
+            # only runtime ACL transaction for trusted Python.
             base_root = Path(sys.base_prefix).expanduser().resolve()
             runtime_roots = [
                 *runtime_acl_roots,
-                base_root / "DLLs",
             ]
+            if staged_runtime_root is None:
+                runtime_roots.append(base_root / "DLLs")
             for path in runtime_roots:
                 if path.is_dir() and path not in seen_runtime_paths:
                     helper_args.extend(("--runtime-root", str(path)))
@@ -348,20 +370,16 @@ class WindowsSandboxBackend:
             standard_library_zip = base_root / (
                 f"python{sys.version_info.major}{sys.version_info.minor}.zip"
             )
-            if not standard_library_zip.is_file():
+            if staged_runtime_root is None and not standard_library_zip.is_file():
                 standard_library = base_root / "Lib"
                 if standard_library.is_dir() and standard_library not in seen_runtime_paths:
                     helper_args.extend(("--runtime-root", str(standard_library)))
                     seen_runtime_paths.add(standard_library)
-            base_runtime_files = [
+            base_runtime_files = [] if staged_runtime_root is not None else [
                 base_root / f"python{sys.version_info.major}{sys.version_info.minor}.dll",
                 standard_library_zip,
             ]
-            if profile.network is not NetworkPolicy.NONE:
-                # The AppContainer image is mapped by CreateProcessW before
-                # the low-box token is applied. Do not submit the active base
-                # executable for an additional ACL mutation; brokered
-                # restricted-token launches still need its exact file grant.
+            if staged_runtime_root is None and profile.network is not NetworkPolicy.NONE:
                 base_runtime_files.insert(0, base_executable)
             for path in base_runtime_files:
                 if path.is_file() and path not in seen_runtime_paths:
@@ -372,25 +390,26 @@ class WindowsSandboxBackend:
             helper_args.extend(("--proxy-host", lease.host, "--proxy-port", str(lease.port)))
         helper_args.extend(("--", *command_argv))
         flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        process: asyncio.subprocess.Process | None = None
         try:
-            process = await asyncio.create_subprocess_exec(
-                *helper_args,
-                cwd=str(request.cwd),
-                env=environment,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                creationflags=flags,
-            )
-        except OSError as exc:
-            raise PermissionError("Windows sandbox helper could not start") from exc
-        self._active[request.correlation_id] = process
-        started = asyncio.get_running_loop().time()
-        stdout_task = asyncio.create_task(_read_windows_output(process.stdout, profile.resources.output_bytes // 2))
-        stderr_task = asyncio.create_task(_read_windows_output(process.stderr, profile.resources.output_bytes - profile.resources.output_bytes // 2))
-        status = "failed"
-        timed_out = False
-        try:
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    *helper_args,
+                    cwd=str(request.cwd),
+                    env=environment,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    creationflags=flags,
+                )
+            except OSError as exc:
+                raise PermissionError("Windows sandbox helper could not start") from exc
+            self._active[request.correlation_id] = process
+            started = asyncio.get_running_loop().time()
+            stdout_task = asyncio.create_task(_read_windows_output(process.stdout, profile.resources.output_bytes // 2))
+            stderr_task = asyncio.create_task(_read_windows_output(process.stderr, profile.resources.output_bytes - profile.resources.output_bytes // 2))
+            status = "failed"
+            timed_out = False
             try:
                 await asyncio.wait_for(
                     process.wait(),
@@ -436,7 +455,26 @@ class WindowsSandboxBackend:
                 diagnostics=diagnostics,
             )
         finally:
-            self._active.pop(request.correlation_id, None)
+            if process is not None:
+                try:
+                    await asyncio.shield(
+                        self._terminate_process(request.correlation_id)
+                    )
+                finally:
+                    self._active.pop(request.correlation_id, None)
+            if staged_runtime_root is not None:
+                try:
+                    await asyncio.shield(
+                        asyncio.to_thread(
+                            _remove_windows_python_runtime,
+                            staged_runtime_root,
+                        )
+                    )
+                except Exception as cleanup_error:
+                    self._quarantined = True
+                    raise PermissionError(
+                        "Windows sandbox runtime staging cleanup is unproven"
+                    ) from cleanup_error
 
     async def terminate(self, execution_id: str) -> None:
         await self._terminate_process(execution_id)
@@ -516,6 +554,106 @@ def _windows_sandbox_helper() -> Path | None:
         if resolved.is_file() and info.st_size > 0:
             return resolved
     return None
+
+
+def _stage_windows_python_runtime(
+    base_executable: Path,
+    *,
+    base_root: Path,
+    site_packages: Path,
+    source_root: Path,
+) -> Path:
+    """Copy trusted Python inputs into an isolated, disposable runtime tree."""
+    staging_root = Path(tempfile.mkdtemp(prefix="khaos-windows-runtime-"))
+    try:
+        shutil.copy2(base_executable, staging_root / base_executable.name)
+        for runtime_file in base_root.iterdir():
+            if not runtime_file.is_file():
+                continue
+            if _windows_runtime_path_is_reparse(runtime_file):
+                raise PermissionError(
+                    f"trusted Windows runtime contains a reparse point: {runtime_file}"
+                )
+            if runtime_file.suffix.lower() == ".dll" or runtime_file.name.endswith("._pth"):
+                shutil.copy2(runtime_file, staging_root / runtime_file.name)
+        standard_library_zip = base_root / (
+            f"python{sys.version_info.major}{sys.version_info.minor}.zip"
+        )
+        if standard_library_zip.is_file():
+            shutil.copy2(standard_library_zip, staging_root / standard_library_zip.name)
+        else:
+            standard_library = base_root / "Lib"
+            if not standard_library.is_dir():
+                raise FileNotFoundError(
+                    f"trusted Python standard library is unavailable: {standard_library}"
+                )
+            _copy_windows_runtime_tree(
+                standard_library,
+                staging_root / "Lib",
+                ignore=shutil.ignore_patterns("__pycache__"),
+            )
+        dlls = base_root / "DLLs"
+        if dlls.is_dir():
+            _copy_windows_runtime_tree(
+                dlls,
+                staging_root / "DLLs",
+                ignore=shutil.ignore_patterns("__pycache__"),
+            )
+        if site_packages.is_dir():
+            _copy_windows_runtime_tree(
+                site_packages,
+                staging_root / "site-packages",
+                ignore=shutil.ignore_patterns("__pycache__", "*.pth", "*.egg-link"),
+            )
+        source_package = source_root / "khaos"
+        if source_package.is_dir():
+            _copy_windows_runtime_tree(
+                source_package,
+                staging_root / "source" / "khaos",
+                ignore=shutil.ignore_patterns("__pycache__"),
+            )
+        return staging_root
+    except (OSError, shutil.Error):
+        shutil.rmtree(staging_root, ignore_errors=True)
+        raise
+
+
+def _windows_runtime_path_is_reparse(path: Path) -> bool:
+    metadata = path.lstat()
+    return path.is_symlink() or bool(
+        getattr(metadata, "st_file_attributes", 0)
+        & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    )
+
+
+def _copy_windows_runtime_tree(
+    source: Path,
+    destination: Path,
+    *,
+    ignore,
+) -> None:
+    if _windows_runtime_path_is_reparse(source):
+        raise PermissionError(f"trusted Windows runtime contains a reparse point: {source}")
+    for root, directories, files in os.walk(source, followlinks=False):
+        for name in (*directories, *files):
+            candidate = Path(root) / name
+            if _windows_runtime_path_is_reparse(candidate):
+                raise PermissionError(
+                    f"trusted Windows runtime contains a reparse point: {candidate}"
+                )
+    shutil.copytree(source, destination, symlinks=False, ignore=ignore)
+
+
+def _remove_windows_python_runtime(staging_root: Path) -> None:
+    """Remove a disposable trusted runtime after the helper is fully closed."""
+    resolved = staging_root.expanduser().resolve()
+    temporary_root = Path(tempfile.gettempdir()).expanduser().resolve()
+    if (
+        resolved.parent != temporary_root
+        or not resolved.name.startswith("khaos-windows-runtime-")
+    ):
+        raise RuntimeError("refusing to remove an unrecognized Windows runtime staging path")
+    shutil.rmtree(resolved)
 
 
 class BackendSelector:

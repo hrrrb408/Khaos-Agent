@@ -177,7 +177,7 @@ def render() -> str:
         "| --- | --- | --- |",
         "| Linux namespace/cgroup/nftables and Compose isolation | Uses a helper-only netns root, but must pass real Linux CI with kernel capabilities | CI-only |",
         "| macOS Seatbelt | Fail-closed/native contract tests and hosted macOS security job | Local/CI |",
-        "| Windows | Native restricted-token/AppContainer/Job/ACL/WFP helper; native commands and trusted Python network=none use AppContainer, trusted Python launches the direct base executable with exact runtime-root/file ACLs, brokered mode uses restricted-token + exact loopback WFP; missing probe evidence refuses Host fallback | Windows native CI gate |",
+        "| Windows | Native restricted-token/AppContainer/Job/ACL/WFP helper; native commands and trusted Python network=none use AppContainer, trusted Python stages the base executable and grants exact temporary ACLs only to the disposable runtime tree, brokered mode uses restricted-token + exact loopback WFP; missing probe evidence refuses Host fallback | Windows native CI gate |",
         "| Remote audit/WORM and independent human review | Not implemented by this repository | Unknown/external gate |",
         "",
         "## Source fingerprints",

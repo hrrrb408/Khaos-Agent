@@ -1924,11 +1924,12 @@ mod windows_backend {
     /// execute/traverse access on parent directories; the restricted-token
     /// trusted-interpreter path uses the existing interactive-user traverse
     /// rights and therefore does not rewrite those ancestors. Explicitly
-    /// trusted runtime roots (for example Python's Lib/DLL trees) may receive
-    /// read/execute access through an inheritable root ACE. Windows propagates
-    /// that ACE to existing descendants, so the transaction does not need to
-    /// walk the whole runtime tree in the helper process. Every ACL root is
-    /// saved before mutation and restored before the helper reports success.
+    /// trusted runtime roots (for example a disposable staged Python tree)
+    /// may receive read/execute access through an inheritable root ACE.
+    /// Windows propagates that ACE to existing descendants, so the
+    /// transaction does not need to walk the whole runtime tree in the helper
+    /// process. Every ACL root is saved before mutation and restored before
+    /// the helper reports success.
     ///
     /// This is deliberately separate from ``WorkspaceAcl``: the child gets
     /// full access only to the task workspace, while the runtime is strictly

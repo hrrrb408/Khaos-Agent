@@ -8,7 +8,7 @@ pass for the current commit.
 | --- | --- | --- |
 | Linux | Supported when the launcher, bubblewrap, Landlock, cgroup and browser helper checks pass | Python runs non-root; missing isolation fails closed |
 | macOS | Supported through the Seatbelt backend when its probe passes | No Linux namespace/browser-kernel claim |
-| Windows | Supported when the native helper probe passes | Native commands and trusted Python use an OS-issued no-network AppContainer; trusted Python launches the resolved base executable directly with temporary runtime RX ACLs, while brokered mode uses the restricted primary token plus exact loopback-only WFP rules; all paths use child-process policy, transactional workspace ACLs, a one-process Job Object, and fail closed |
+| Windows | Supported when the native helper probe passes | Native commands and trusted Python use an OS-issued no-network AppContainer; trusted Python stages the resolved base executable and grants temporary runtime RX ACLs only to the disposable tree, while brokered mode uses the restricted primary token plus exact loopback-only WFP rules; all paths use child-process policy, transactional workspace ACLs, a one-process Job Object, and fail closed |
 
 Host execution on supported POSIX systems requires a trusted
 `khaos-exec-launcher`. The loader accepts a root-owned or current-EUID-owned
@@ -23,9 +23,9 @@ only with the explicit `KHAOS_DEV_MODE=1` development switch.
 The Windows backend is intentionally narrow: native commands and the trusted
 Khaos Python interpreter under `network=none` run in an OS-issued AppContainer
 with no declared network capability. Trusted Python launches the resolved base
-executable directly, and only the venv/base runtime roots receive temporary
-read/execute grants; this prevents a venv redirector from becoming an
-uncontained child while preserving the workspace write boundary. Brokered mode
+executable into a disposable private runtime tree, and only that tree receives
+temporary read/execute grants; this prevents a venv redirector from becoming
+an uncontained child while preserving the workspace write boundary. Brokered mode
 uses the restricted primary token and exact loopback-only WFP rules. All paths
 keep the child-process policy, inherited-handle allowlist, kill-on-close Job
 Object with an active-process limit of one, and transactional workspace ACL.

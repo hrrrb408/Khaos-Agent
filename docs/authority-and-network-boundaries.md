@@ -61,13 +61,13 @@ execution:
 3. for `network=none`, native commands and the trusted Python interpreter use
    an OS-issued per-execution AppContainer low-box with no declared network
    capabilities, verified from the child token. Trusted Python launches the
-   resolved base executable directly (avoiding a venv redirector outside the
-   child policy) and grants only temporary RX access to its venv/base runtime
-   roots; brokered execution uses the restricted-token/WFP path and remains
+   staged copy of the resolved base executable (avoiding a venv redirector outside the
+   child policy) and grants temporary RX access only to a disposable staged
+   runtime tree; brokered execution uses the restricted-token/WFP path and remains
    limited to the exact loopback NetworkBroker endpoint;
 4. transactionally granted/restored restricted-code ACLs: full access for the
    task workspace and read/execute plus ancestor traverse for the resolved
-   native runtime tree and explicitly trusted venv/base-runtime roots. The
+   native runtime tree and an explicitly staged trusted Python runtime. The
    TCB temporarily enables `SeSecurityPrivilege` on its own token to
    snapshot/restore integrity SACLs, restores the prior privilege state, and
    never passes that privilege to the restricted child;
