@@ -34,10 +34,15 @@ terminal subprocesses. Its protocol is intentionally narrow:
 - Domain, blocklist, port and protocol policy is checked before connect.
 - Proxy authentication, bounded concurrent connections, idle timeout, upload
   and download ceilings, and allow/deny audit events are mandatory.
-- The returned `NetworkLease` is bound to the exact endpoint and policy by a
-  second broker-issued capability. Backends validate that lease before launch
-  and the broker revalidates it for every connection, so expiry/revocation
-  closes new egress.
+- The returned `NetworkLease` is broker-issued and cannot be constructed by a
+  caller. It is bound to the exact endpoint and policy by a second
+  broker-issued capability. Backends validate that lease before launch and the
+  broker revalidates it for every connection, so expiry/revocation closes new
+  egress.
+- The broker owns listener, handler, client-writer, upstream-writer and relay
+  child-task lifetimes. A failed close retains the resource, enters quarantine
+  and can be retried; `terminal_closed` is true only after every owner and
+  capability revocation has terminal proof.
 
 On macOS and Windows, a brokered worker may use the exact loopback proxy
 endpoint. On Linux, a loopback proxy combined with `bwrap --unshare-net` is

@@ -61,8 +61,10 @@ privilege.
 
 ## Effect capabilities and managed egress
 
-`AuthorityEnvelope` is an immutable context record, not an effect grant. Git
-and network effect boundaries require a broker-issued `EffectCapability`. The
+`AuthorityEnvelope` is an immutable context record, not an effect grant, and
+its public constructor is closed: only the owning `AuthorityBroker` can issue
+an envelope that can enter the capability chain. Git and network effect
+boundaries require a broker-issued `EffectCapability`. The
 `AuthorityBroker` keeps the signing secret and live revocation registry in a
 separate spawned process; the capability handle is opaque to its public
 constructor, and every boundary validates operation, resource, generation,

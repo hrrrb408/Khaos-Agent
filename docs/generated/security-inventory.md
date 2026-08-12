@@ -59,9 +59,11 @@
 - `python/khaos/coding/execution/service.py`: `2f0ac90a3ee9955d911e53b63e3a8e4f8725315a483e8419439a2abf290b9736`
 - `python/khaos/coding/execution/binding.py`: `99f3d8eb14d80a837ecf0f0d076d556ccdb366b8798c9e0fde6c69d0bb1a5501`
 - `python/khaos/coding/execution/supervisor.py`: `e1fdbdcd535a5e531b7dd166ff69aa507d0e1ea23d2dbb68985d6f5220d03170`
-- `python/khaos/coding/workspace/manager.py`: `b72c4c76b533049e5c158c7bd09ae84df20768c58cb5e5e5514283004caa4378`
+- `python/khaos/coding/workspace/manager.py`: `dd6d5b6dde42f12121bd8071c4a75ef501892464409389c929f7c6e7db71ea3a`
 - `python/khaos/coding/workspace/trusted_git.py`: `ea9a2eac346357d86c316df7f3749342bde5ea2ad129d5f646d3661aa2462831`
-- `python/khaos/security/authority.py`: `fd998bb3cf073a5abf4c1c278245c38df49716a4a83c54735fae00959789a6cf`
+- `python/khaos/security/authority.py`: `512b1af6ac43568352f58f4aa8bca0d490f102aabcbf54bd366ad56b55129495`
+- `python/khaos/security/authority_broker.py`: `2a693daafedf9802bddd37628a7179ec1f33685b9b0bd173e05341b30d9de010`
+- `python/khaos/security/network_broker.py`: `5dc51bf1257252d5ba9347573ccf3501c32a0658c03e7cf6bd1c49dff2ed48f9`
 - `rust/khaos-core/src/bin/khaos-exec-launcher.rs`: `d1d61d338a35d863e127284eccfe0ed5ef32f7e2b51f17bad7b8e7b737ab29da`
 - `rust/khaos-core/src/bin/khaos-sandbox-launcher.rs`: `523e5dafa9037093d624bda6ebc2c56a5b4b7ab4d8c4cfd353834928b34ad6cb`
 - `python/khaos/grpc_server.py`: `595a2f38072d0153c43d1e703be197156c82a38105c2a8340734becac505d8ec`

@@ -122,6 +122,8 @@ def render() -> str:
         ("python/khaos/coding/workspace/manager.py", sha256(ROOT / "python" / "khaos" / "coding" / "workspace" / "manager.py")),
         ("python/khaos/coding/workspace/trusted_git.py", sha256(ROOT / "python" / "khaos" / "coding" / "workspace" / "trusted_git.py")),
         ("python/khaos/security/authority.py", sha256(ROOT / "python" / "khaos" / "security" / "authority.py")),
+        ("python/khaos/security/authority_broker.py", sha256(ROOT / "python" / "khaos" / "security" / "authority_broker.py")),
+        ("python/khaos/security/network_broker.py", sha256(ROOT / "python" / "khaos" / "security" / "network_broker.py")),
         ("rust/khaos-core/src/bin/khaos-exec-launcher.rs", sha256(ROOT / "rust" / "khaos-core" / "src" / "bin" / "khaos-exec-launcher.rs")),
         ("rust/khaos-core/src/bin/khaos-sandbox-launcher.rs", sha256(ROOT / "rust" / "khaos-core" / "src" / "bin" / "khaos-sandbox-launcher.rs")),
         ("python/khaos/grpc_server.py", sha256(ROOT / "python" / "khaos" / "grpc_server.py")),

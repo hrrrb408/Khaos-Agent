@@ -27,7 +27,7 @@ from khaos.coding.execution.platform import (
     _stage_windows_python_runtime,
     _validated_profile,
 )
-from khaos.security.network_broker import NetworkLease
+from khaos.security.network_broker import NetworkBrokerError, NetworkLease
 
 
 @pytest.mark.asyncio
@@ -60,17 +60,27 @@ def test_linux_brokered_profile_requires_a_real_namespace_lease(
     tmp_path: Path, monkeypatch
 ):
     monkeypatch.setattr("khaos.coding.execution.platform.sys.platform", "linux")
-    namespace_lease = NetworkLease(
-        endpoint="http://10.88.0.1:49152",
-        username="khaos",
-        password="secret",
-        capability_digest="broker-capability",
-        allowed_domains=frozenset({"example.com"}),
-        blocked_domains=frozenset(),
-        allowed_ports=frozenset({443}),
-        protocols=frozenset({"https"}),
-        namespace_environment=(("KHAOS_NETWORK_NETNS", "khaos-net-1234abcd"),),
-    )
+    with pytest.raises(TypeError, match="only be created"):
+        NetworkLease(
+            endpoint="http://10.88.0.1:49152",
+            username="khaos",
+            password="secret",
+            capability_digest="broker-capability",
+            allowed_domains=frozenset({"example.com"}),
+            blocked_domains=frozenset(),
+            allowed_ports=frozenset({443}),
+            protocols=frozenset({"https"}),
+            namespace_environment=(("KHAOS_NETWORK_NETNS", "khaos-net-1234abcd"),),
+        )
+
+    class NamespaceLease:
+        uses_network_namespace = True
+        namespace_environment = (("KHAOS_NETWORK_NETNS", "khaos-net-1234abcd"),)
+
+        def proxy_environment(self) -> dict[str, str]:
+            return {}
+
+    namespace_lease = NamespaceLease()
     argv = LinuxBubblewrapBackend().argv_prefix(
         tmp_path,
         network_broker=namespace_lease,
@@ -80,16 +90,15 @@ def test_linux_brokered_profile_requires_a_real_namespace_lease(
     assert "--unshare-net" not in argv
     assert not any(value.startswith("KHAOS_NETWORK_") for value in argv)
 
-    loopback_lease = NetworkLease(
-        endpoint="http://127.0.0.1:49152",
-        username="khaos",
-        password="secret",
-        capability_digest="broker-capability",
-        allowed_domains=frozenset({"example.com"}),
-        blocked_domains=frozenset(),
-        allowed_ports=frozenset({443}),
-        protocols=frozenset({"https"}),
-    )
+    class UnattestedLoopbackLease:
+        host = "127.0.0.1"
+        port = 49152
+        uses_network_namespace = False
+
+        def validate(self) -> None:
+            raise NetworkBrokerError("network lease was not broker-issued by NetworkBroker")
+
+    loopback_lease = UnattestedLoopbackLease()
     profile = PermissionProfile(
         network="brokered",
         network_broker=loopback_lease,
@@ -97,6 +106,18 @@ def test_linux_brokered_profile_requires_a_real_namespace_lease(
     request = ExecutionRequest(("true",), tmp_path, permission_profile=profile)
     with pytest.raises(PermissionError, match="broker-issued"):
         _validated_profile(request)
+
+    with pytest.raises(TypeError, match="only be created"):
+        NetworkLease(
+            endpoint="http://127.0.0.1:49152",
+            username="khaos",
+            password="secret",
+            capability_digest="broker-capability",
+            allowed_domains=frozenset({"example.com"}),
+            blocked_domains=frozenset(),
+            allowed_ports=frozenset({443}),
+            protocols=frozenset({"https"}),
+        )
 
 
 def test_writable_platform_profiles_protect_git_pointer(tmp_path: Path):

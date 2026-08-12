@@ -9,7 +9,6 @@ import pytest
 from khaos.agent.approval import ApprovalBroker
 from khaos.coding.execution.models import ExecutionResult, NetworkPolicy
 from khaos.coding.workspace.models import WorkspaceState
-from khaos.security.network_broker import NetworkLease
 from khaos.tools.github_tools import (
     GITHUB_TOOL_SPECS,
     github_comment_issue,
@@ -52,26 +51,6 @@ class _FakeGitHubExecutionService:
         raise AssertionError(f"unexpected argv: {request.argv}")
 
 
-def _test_network_lease() -> NetworkLease:
-    """Provide an explicit lease for the fake execution-service adapter.
-
-    These tests stop at ``ExecutionService.execute`` and never launch a
-    platform backend. Production scheduler calls receive a broker-issued
-    lease; the platform backends still reject this deliberately unattested
-    test lease if it is ever allowed past the fake adapter.
-    """
-    return NetworkLease(
-        endpoint="http://127.0.0.1:49152",
-        username="khaos-test",
-        password="test-secret",
-        capability_digest="test-capability",
-        allowed_domains=frozenset({"github.com"}),
-        blocked_domains=frozenset(),
-        allowed_ports=frozenset({443}),
-        protocols=frozenset({"https"}),
-    )
-
-
 def _context(service, *, operations, network_policy="unrestricted-with-approval"):
     context = {
         "task_id": "task",
@@ -87,7 +66,7 @@ def _context(service, *, operations, network_policy="unrestricted-with-approval"
         },
     }
     if network_policy == "unrestricted-with-approval":
-        context["network_lease"] = _test_network_lease()
+        context["network_lease"] = object()
     return context
 
 

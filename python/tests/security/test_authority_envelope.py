@@ -5,12 +5,21 @@ from __future__ import annotations
 import dataclasses
 
 import pytest
-
 from khaos.security.authority import AuthorityEnvelope
+from khaos.security.authority_broker import AuthorityBroker, AuthorityBrokerError
 
 
-def _envelope() -> AuthorityEnvelope:
-    return AuthorityEnvelope(
+@pytest.fixture
+def broker():
+    value = AuthorityBroker()
+    try:
+        yield value
+    finally:
+        value.close()
+
+
+def _envelope(broker: AuthorityBroker) -> AuthorityEnvelope:
+    return broker.envelope(
         principal_id="local-uid:501",
         project_id="project-1",
         runtime_id="runtime-1",
@@ -24,8 +33,8 @@ def _envelope() -> AuthorityEnvelope:
     )
 
 
-def test_envelope_digest_binds_every_context_field() -> None:
-    envelope = _envelope()
+def test_envelope_digest_binds_every_context_field(broker: AuthorityBroker) -> None:
+    envelope = _envelope(broker)
     assert envelope.matches_context(
         principal_id="local-uid:501",
         project_id="project-1",
@@ -49,8 +58,8 @@ def test_envelope_digest_binds_every_context_field() -> None:
     ).digest()
 
 
-def test_derived_envelope_keeps_owner_binding() -> None:
-    derived = _envelope().derive(
+def test_derived_envelope_keeps_owner_binding(broker: AuthorityBroker) -> None:
+    derived = _envelope(broker).derive(
         operation_class="git.cleanup",
         resource_digest="resource-2",
     )
@@ -60,11 +69,13 @@ def test_derived_envelope_keeps_owner_binding() -> None:
     assert derived.resource_digest == "resource-2"
 
 
-def test_envelope_is_frozen_and_rejects_invalid_identifiers() -> None:
+def test_envelope_is_frozen_and_rejects_invalid_identifiers(
+    broker: AuthorityBroker,
+) -> None:
     with pytest.raises(dataclasses.FrozenInstanceError):
-        _envelope().operation_class = "git.host"  # type: ignore[misc]
-    with pytest.raises(ValueError, match="operation_class"):
-        AuthorityEnvelope(
+        _envelope(broker).operation_class = "git.host"  # type: ignore[misc]
+    with pytest.raises(AuthorityBrokerError, match="invalid"):
+        broker.envelope(
             principal_id="local",
             project_id="project",
             runtime_id="runtime",

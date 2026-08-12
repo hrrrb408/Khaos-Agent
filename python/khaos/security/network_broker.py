@@ -23,9 +23,9 @@ import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import TypedDict
 from urllib.parse import quote, urlsplit, urlunsplit
 
-from khaos.security.authority import AuthorityEnvelope
 from khaos.security.authority_broker import (
     AuthorityBroker,
     AuthorityBrokerError,
@@ -33,6 +33,7 @@ from khaos.security.authority_broker import (
 )
 
 logger = logging.getLogger(__name__)
+_NETWORK_LEASE_ISSUER = object()
 
 _MAX_HEADER_BYTES = 64 * 1024
 _MAX_CONNECTIONS = 32
@@ -40,13 +41,29 @@ _MAX_UPLOAD_BYTES = 64 * 1024 * 1024
 _MAX_DOWNLOAD_BYTES = 256 * 1024 * 1024
 _IDLE_TIMEOUT = 60.0
 _CONNECT_TIMEOUT = 15.0
+_HANDLER_DRAIN_TIMEOUT = 10.0
+
+
+class _NetworkConfigurationFields(TypedDict):
+    endpoint: str
+    username: str
+    password: str
+    allowed_domains: frozenset[str]
+    blocked_domains: frozenset[str]
+    allowed_ports: frozenset[int]
+    protocols: frozenset[str]
+    namespace_environment: tuple[tuple[str, str], ...]
+
+
+class _NetworkLeaseFields(_NetworkConfigurationFields):
+    capability_digest: str
 
 
 class NetworkBrokerError(PermissionError):
     """Raised when a brokered network request is not authorized."""
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class NetworkLease:
     """The only network material a managed child may receive."""
 
@@ -66,35 +83,105 @@ class NetworkLease:
         default=None, init=False, repr=False, compare=False
     )
 
+    def __init__(
+        self,
+        *,
+        endpoint: str,
+        username: str,
+        password: str,
+        capability_digest: str,
+        allowed_domains: frozenset[str],
+        blocked_domains: frozenset[str],
+        allowed_ports: frozenset[int],
+        protocols: frozenset[str],
+        namespace_environment: tuple[tuple[str, str], ...] = (),
+        _issuer: object | None = None,
+    ) -> None:
+        if _issuer is not _NETWORK_LEASE_ISSUER:
+            raise TypeError(
+                "NetworkLease instances can only be created by NetworkBroker"
+            )
+        for name, value in (
+            ("endpoint", endpoint),
+            ("username", username),
+            ("password", password),
+            ("capability_digest", capability_digest),
+            ("allowed_domains", allowed_domains),
+            ("blocked_domains", blocked_domains),
+            ("allowed_ports", allowed_ports),
+            ("protocols", protocols),
+            ("namespace_environment", namespace_environment),
+        ):
+            object.__setattr__(self, name, value)
+        object.__setattr__(self, "_capability", None)
+        object.__setattr__(self, "_authority_broker", None)
+
     @classmethod
     def _from_broker(
         cls,
         *,
         capability: EffectCapability,
         authority_broker: AuthorityBroker,
-        **fields: object,
+        endpoint: str,
+        username: str,
+        password: str,
+        capability_digest: str,
+        allowed_domains: frozenset[str],
+        blocked_domains: frozenset[str],
+        allowed_ports: frozenset[int],
+        protocols: frozenset[str],
+        namespace_environment: tuple[tuple[str, str], ...] = (),
     ) -> NetworkLease:
         """Create a lease only after NetworkBroker has bound its authority."""
-        lease = cls(**fields)
+        lease = cls(
+            endpoint=endpoint,
+            username=username,
+            password=password,
+            capability_digest=capability_digest,
+            allowed_domains=allowed_domains,
+            blocked_domains=blocked_domains,
+            allowed_ports=allowed_ports,
+            protocols=protocols,
+            namespace_environment=namespace_environment,
+            _issuer=_NETWORK_LEASE_ISSUER,
+        )
         object.__setattr__(lease, "_capability", capability)
         object.__setattr__(lease, "_authority_broker", authority_broker)
         lease.validate()
         return lease
 
+    @staticmethod
+    def _configuration_digest_for_fields(
+        fields: _NetworkConfigurationFields,
+    ) -> str:
+        """Digest lease configuration before the attested object exists."""
+        payload = (
+            fields["endpoint"],
+            fields["username"],
+            fields["password"],
+            tuple(sorted(fields["allowed_domains"])),
+            tuple(sorted(fields["blocked_domains"])),
+            tuple(sorted(fields["allowed_ports"])),
+            tuple(sorted(fields["protocols"])),
+            fields["namespace_environment"],
+        )
+        return hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()
+
     @property
     def configuration_digest(self) -> str:
         """Digest every transport and policy field except its attestation."""
-        payload = (
-            self.endpoint,
-            self.username,
-            self.password,
-            tuple(sorted(self.allowed_domains)),
-            tuple(sorted(self.blocked_domains)),
-            tuple(sorted(self.allowed_ports)),
-            tuple(sorted(self.protocols)),
-            self.namespace_environment,
+        return self._configuration_digest_for_fields(
+            {
+                "endpoint": self.endpoint,
+                "username": self.username,
+                "password": self.password,
+                "allowed_domains": self.allowed_domains,
+                "blocked_domains": self.blocked_domains,
+                "allowed_ports": self.allowed_ports,
+                "protocols": self.protocols,
+                "namespace_environment": self.namespace_environment,
+            }
         )
-        return hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()
 
     def validate(self) -> None:
         """Validate the live broker attestation before a child is launched."""
@@ -177,6 +264,54 @@ class _ConnectionStats:
     started_at: float = field(default_factory=time.monotonic)
 
 
+@dataclass(eq=False)
+class _NetworkRelayLease:
+    """Own one generic proxy upstream and both relay child tasks."""
+
+    upstream_writer: asyncio.StreamWriter
+    tasks: set[asyncio.Task[None]] = field(default_factory=set)
+    terminal: bool = False
+    _close_error: BaseException | None = None
+    _close_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    _close_task: asyncio.Task[None] | None = field(default=None, repr=False)
+
+    def create_task(self, coroutine) -> asyncio.Task[None]:
+        """Publish a relay child before the next cancellable await."""
+        task = asyncio.create_task(coroutine)
+        self.tasks.add(task)
+        return task
+
+    async def close(self) -> None:
+        """Cancel, await, and close the upstream transport with retry proof."""
+        async with self._close_lock:
+            if self.terminal:
+                return
+            close_task = self._close_task
+            if close_task is None or close_task.done():
+                close_task = asyncio.ensure_future(self._run_close())
+                self._close_task = close_task
+        await asyncio.shield(close_task)
+
+    async def _run_close(self) -> None:
+        for task in tuple(self.tasks):
+            if not task.done():
+                task.cancel()
+        if self.tasks:
+            await asyncio.gather(*tuple(self.tasks), return_exceptions=True)
+        self.tasks = {task for task in self.tasks if not task.done()}
+        try:
+            self.upstream_writer.close()
+            await self.upstream_writer.wait_closed()
+        except BaseException as exc:
+            self._close_error = exc
+            self.terminal = False
+            raise NetworkBrokerError(
+                "network relay upstream transport did not reach terminal state"
+            ) from exc
+        self.tasks.clear()
+        self.terminal = True
+
+
 class NetworkBroker:
     """Capability-bound HTTP CONNECT/absolute-form proxy.
 
@@ -240,10 +375,14 @@ class NetworkBroker:
         self._server: asyncio.Server | None = None
         self._tasks: set[asyncio.Task[None]] = set()
         self._writers: set[asyncio.StreamWriter] = set()
+        self._relay_leases: set[_NetworkRelayLease] = set()
+        self._upstream_writers: set[asyncio.StreamWriter] = set()
         self._semaphore = asyncio.Semaphore(max_connections)
         self._auth_username = "khaos"
         self._auth_password = secrets.token_urlsafe(32)
         self._state = "new"
+        self._lifecycle_lock = asyncio.Lock()
+        self._close_task: asyncio.Task[None] | None = None
         self._lease: NetworkLease | None = None
         self._linux_namespace = linux_namespace
         self._network_sandbox = None
@@ -260,7 +399,42 @@ class NetworkBroker:
 
     @property
     def terminal_closed(self) -> bool:
-        return self._state == "closed" and self._server is None and not self._tasks and not self._writers
+        return (
+            self._state == "closed"
+            and self._server is None
+            and not self._tasks
+            and not self._writers
+            and not self._upstream_writers
+            and not self._relay_leases
+            and self._lease is None
+            and self._capability is None
+        )
+
+    @property
+    def is_quarantined(self) -> bool:
+        """Return whether cleanup failed and the broker remains retryable."""
+        return self._state == "quarantined"
+
+    def owned_resources(self) -> tuple[str, ...]:
+        """Return non-secret resources that still require owner-level cleanup."""
+        resources: list[str] = []
+        if self._server is not None:
+            resources.append("listener")
+        if self._tasks:
+            resources.append(f"handlers:{len(self._tasks)}")
+        if self._writers:
+            resources.append(f"client-writers:{len(self._writers)}")
+        if self._relay_leases:
+            resources.append(f"relay-leases:{len(self._relay_leases)}")
+        if self._upstream_writers:
+            resources.append(f"upstream-writers:{len(self._upstream_writers)}")
+        if self._network_sandbox is not None:
+            resources.append("network-namespace")
+        if self._lease is not None:
+            resources.append("network-lease")
+        if self._capability is not None:
+            resources.append("authority-capability")
+        return tuple(resources)
 
     async def start(self) -> NetworkLease:
         if self._state == "open":
@@ -373,7 +547,7 @@ class NetworkBroker:
                     f"network namespace egress pin failed: {exc}"
                 ) from exc
         try:
-            lease_fields = {
+            lease_fields: _NetworkLeaseFields = {
                 "endpoint": f"http://{_endpoint_host(self._bind_host)}:{port}",
                 "username": self._auth_username,
                 "password": self._auth_password,
@@ -384,11 +558,12 @@ class NetworkBroker:
                 "protocols": self._protocols,
                 "namespace_environment": namespace_environment,
             }
-            candidate = NetworkLease(**lease_fields)
             lease_capability = self._authority_broker.reissue(
                 self._capability,
                 operation_class="network.connect",
-                resource_digest=candidate.configuration_digest,
+                resource_digest=NetworkLease._configuration_digest_for_fields(
+                    lease_fields
+                ),
             )
             lease_fields["capability_digest"] = lease_capability.digest
             self._lease = NetworkLease._from_broker(
@@ -414,44 +589,134 @@ class NetworkBroker:
         return self.lease
 
     async def close(self) -> None:
-        if self._state == "closed":
-            return
-        self._state = "closing"
+        async with self._lifecycle_lock:
+            if self._state == "closed":
+                return
+            self._state = "closing"
+            if self._close_task is None or self._close_task.done():
+                self._close_task = asyncio.ensure_future(self._run_close())
+            close_task = self._close_task
+        await asyncio.shield(close_task)
+
+    async def _run_close(self) -> None:
+        """Close all transitive resources, retaining any failed owner for retry."""
+        errors: list[BaseException] = []
         server = self._server
         if server is not None:
             server.close()
-            await server.wait_closed()
-            self._server = None
-        for writer in tuple(self._writers):
-            writer.close()
-        if self._writers:
-            await asyncio.gather(
-                *(writer.wait_closed() for writer in tuple(self._writers)),
-                return_exceptions=True,
-            )
-        for task in tuple(self._tasks):
+
+        tasks = tuple(self._tasks)
+        pending: set[asyncio.Task[None]] = set()
+        for task in tasks:
             if not task.done():
                 task.cancel()
-        if self._tasks:
-            await asyncio.gather(*tuple(self._tasks), return_exceptions=True)
-        self._tasks.clear()
-        self._writers.clear()
-        if self._network_sandbox is not None:
-            result = await asyncio.to_thread(self._network_sandbox.teardown)
-            if not result.fully_closed:
-                self._state = "quarantined"
-                raise NetworkBrokerError(
-                    "network namespace teardown is unproven; broker quarantined"
+        if tasks:
+            _done, pending = await asyncio.wait(
+                tasks,
+                timeout=_HANDLER_DRAIN_TIMEOUT,
+            )
+            if _done:
+                await asyncio.gather(*_done, return_exceptions=True)
+            self._tasks.difference_update(_done)
+            if pending:
+                errors.append(
+                    NetworkBrokerError(
+                        "network broker handler drain is unproven"
+                    )
                 )
-            self._network_sandbox = None
+        self._tasks.difference_update(
+            {task for task in self._tasks if task.done()}
+        )
+
+        for relay in tuple(self._relay_leases):
+            try:
+                await relay.close()
+            except asyncio.CancelledError:
+                raise
+            except BaseException as exc:  # noqa: BLE001 - retain failed lease
+                errors.append(exc)
+            else:
+                if relay.terminal:
+                    self._relay_leases.discard(relay)
+                    self._upstream_writers.discard(relay.upstream_writer)
+                else:
+                    errors.append(
+                        NetworkBrokerError(
+                            f"network relay {id(relay)} lacks terminal proof"
+                        )
+                    )
+
+        if server is not None and not pending:
+            try:
+                await server.wait_closed()
+            except asyncio.CancelledError:
+                raise
+            except BaseException as exc:  # noqa: BLE001 - retain failed server
+                errors.append(exc)
+            else:
+                self._server = None
+
+        for writer in tuple(self._writers):
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except asyncio.CancelledError:
+                raise
+            except BaseException as exc:  # noqa: BLE001 - retain failed client writer
+                errors.append(exc)
+            else:
+                self._writers.discard(writer)
+
+        for writer in tuple(self._upstream_writers):
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except asyncio.CancelledError:
+                raise
+            except BaseException as exc:  # noqa: BLE001 - retain failed upstream writer
+                errors.append(exc)
+            else:
+                self._upstream_writers.discard(writer)
+
+        if self._network_sandbox is not None:
+            try:
+                result = await asyncio.to_thread(self._network_sandbox.teardown)
+            except asyncio.CancelledError:
+                raise
+            except BaseException as exc:  # noqa: BLE001 - retain failed namespace
+                errors.append(exc)
+            else:
+                if result.fully_closed:
+                    self._network_sandbox = None
+                else:
+                    errors.append(
+                        NetworkBrokerError(
+                            "network namespace teardown is unproven"
+                        )
+                    )
+
         if self._lease is not None and self._lease._capability is not None:
             try:
                 self._authority_broker.revoke(self._lease._capability)
             except AuthorityBrokerError as exc:
-                self._state = "quarantined"
-                raise NetworkBrokerError(
-                    "network lease revocation is unproven; broker quarantined"
-                ) from exc
+                errors.append(exc)
+            else:
+                self._lease = None
+
+        if self._capability is not None:
+            try:
+                self._authority_broker.revoke(self._capability)
+            except AuthorityBrokerError as exc:
+                errors.append(exc)
+            else:
+                self._capability = None
+
+        if errors:
+            self._state = "quarantined"
+            raise NetworkBrokerError(
+                "network broker cleanup is unproven; broker quarantined"
+            ) from errors[0]
+        self._close_task = None
         self._state = "closed"
         self._audit({"event": "network-broker-closed"})
 
@@ -496,9 +761,15 @@ class NetworkBroker:
         finally:
             self._semaphore.release()
             writer.close()
-            with contextlib.suppress(Exception):
+            try:
                 await writer.wait_closed()
-            self._writers.discard(writer)
+            except asyncio.CancelledError:
+                raise
+            except BaseException as exc:
+                # Keep failed transports registered for owner-level retry.
+                logger.debug("network client writer did not close", exc_info=exc)
+            else:
+                self._writers.discard(writer)
 
     def _validate_proxy_auth(self, header: bytes) -> None:
         value: str | None = None
@@ -538,6 +809,7 @@ class NetworkBroker:
         port = parsed.port or 80
         self._authorize_target(host, port, scheme)
         upstream_reader, upstream_writer, _ = await self._open_pinned(host, port)
+        self._upstream_writers.add(upstream_writer)
         stats.host, stats.port = host, port
         path = urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
         lines = header.decode("latin-1").split("\r\n")
@@ -557,8 +829,15 @@ class NetworkBroker:
             await self._relay(reader, writer, upstream_reader, upstream_writer, stats)
         finally:
             upstream_writer.close()
-            with contextlib.suppress(Exception):
+            try:
                 await upstream_writer.wait_closed()
+            except asyncio.CancelledError:
+                raise
+            except BaseException as exc:
+                # Retain an unproven transport for NetworkBroker.close().
+                logger.debug("network HTTP upstream writer did not close", exc_info=exc)
+            else:
+                self._upstream_writers.discard(upstream_writer)
 
     async def _handle_connect(
         self,
@@ -582,6 +861,7 @@ class NetworkBroker:
         port = parsed.port or 443
         self._authorize_target(host, port, "https")
         upstream_reader, upstream_writer, _ = await self._open_pinned(host, port)
+        self._upstream_writers.add(upstream_writer)
         stats.host, stats.port = host, port
         try:
             writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
@@ -595,8 +875,15 @@ class NetworkBroker:
             await self._relay(reader, writer, upstream_reader, upstream_writer, stats)
         finally:
             upstream_writer.close()
-            with contextlib.suppress(Exception):
+            try:
                 await upstream_writer.wait_closed()
+            except asyncio.CancelledError:
+                raise
+            except BaseException as exc:
+                # Retain an unproven transport for NetworkBroker.close().
+                logger.debug("network CONNECT upstream writer did not close", exc_info=exc)
+            else:
+                self._upstream_writers.discard(upstream_writer)
 
     def _authorize_target(self, host: str, port: int, protocol: str) -> None:
         if protocol not in self._protocols:
@@ -674,23 +961,48 @@ class NetworkBroker:
                 else:
                     stats.downloaded = total
 
+        lease = _NetworkRelayLease(upstream_writer)
+        self._relay_leases.add(lease)
+        self._upstream_writers.add(upstream_writer)
         tasks = (
-            asyncio.create_task(copy_stream(client_reader, upstream_writer, "upload", self._max_upload)),
-            asyncio.create_task(copy_stream(upstream_reader, client_writer, "download", self._max_download)),
+            lease.create_task(
+                copy_stream(client_reader, upstream_writer, "upload", self._max_upload)
+            ),
+            lease.create_task(
+                copy_stream(upstream_reader, client_writer, "download", self._max_download)
+            ),
         )
-        # HTTP/1.1 ``Connection: close`` is a normal terminal signal from
-        # either side.  Stop the opposite relay as soon as one direction
-        # reaches EOF; waiting for an exception would keep the client side
-        # open until the idle timeout and incorrectly turn a successful
-        # response into a 403.
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        for task in pending:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        for task in done:
-            error = task.exception()
-            if error is not None:
-                raise error
+        try:
+            # HTTP/1.1 ``Connection: close`` is a normal terminal signal from
+            # either side.  Stop the opposite relay as soon as one direction
+            # reaches EOF; waiting for an exception would keep the client side
+            # open until the idle timeout and incorrectly turn a successful
+            # response into a 403.
+            done, pending = await asyncio.wait(
+                tasks, return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            for task in done:
+                error = task.exception()
+                if error is not None:
+                    raise error
+        finally:
+            cleanup = asyncio.create_task(lease.close())
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                result = await asyncio.gather(cleanup, return_exceptions=True)
+                if result and isinstance(result[0], BaseException):
+                    logger.warning(
+                        "network relay cleanup retained for broker retry: %s",
+                        type(result[0]).__name__,
+                    )
+                raise
+            if lease.terminal:
+                self._relay_leases.discard(lease)
+                self._upstream_writers.discard(upstream_writer)
 
     @staticmethod
     async def _reject(writer: asyncio.StreamWriter, status: int, reason: str) -> None:
@@ -768,7 +1080,7 @@ class NetworkBrokerFactory:
                 )
             ).encode("utf-8")
         ).hexdigest()
-        authority = AuthorityEnvelope(
+        authority = self.authority_broker.envelope(
             principal_id=principal_id,
             project_id=project_id,
             runtime_id=runtime_id,
