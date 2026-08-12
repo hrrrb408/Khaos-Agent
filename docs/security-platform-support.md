@@ -8,7 +8,7 @@ pass for the current commit.
 | --- | --- | --- |
 | Linux | Supported when the launcher, bubblewrap, Landlock, cgroup and browser helper checks pass | Python runs non-root; missing isolation fails closed |
 | macOS | Supported through the Seatbelt backend when its probe passes | No Linux namespace/browser-kernel claim |
-| Windows | Supported when the native helper probe passes | `network=none`: OS-issued AppContainer low-box with no network capability + one-process Job Object (outer helper owns cleanup) + transactional workspace ACL + WFP-backed Firewall; brokered mode separately uses the restricted token and is exact loopback-only; missing evidence fails closed |
+| Windows | Supported when the native helper probe passes | Native commands use an OS-issued no-network AppContainer; the trusted Python interpreter uses the restricted primary token plus child-process policy, exact WFP image block, transactional workspace ACL, and exact runtime-file ACLs; both use a one-process Job Object and fail closed; brokered mode is exact loopback-only |
 
 Host execution on supported POSIX systems requires a trusted
 `khaos-exec-launcher`. The loader accepts a root-owned or current-EUID-owned
@@ -20,12 +20,15 @@ interpreter, then replaces itself with the requested command. A missing or
 untrusted launcher fails closed; the standalone Python boundary is available
 only with the explicit `KHAOS_DEV_MODE=1` development switch.
 
-The Windows backend is intentionally narrow: `network=none` runs native
-executables under an OS-issued AppContainer with no declared network
-capability, a restricted primary token, a kill-on-close Job Object with an
-active-process limit of one, a transactional ACL grant for the workspace and
-trusted venv/base-runtime read/execute roots, and a WFP-backed Firewall
-transaction. The TCB may temporarily enable
+The Windows backend is intentionally narrow: native commands under
+`network=none` run in an OS-issued AppContainer with no declared network
+capability. The trusted Khaos Python interpreter uses the restricted primary
+token path instead: the child-process policy and inherited-handle allowlist
+remain mandatory, WFP blocks the exact interpreter image, and only exact
+trusted runtime files receive a temporary read/execute grant. This avoids a
+per-execution recursive ACL transaction over a large venv while preserving the
+workspace write boundary. Both paths use a kill-on-close Job Object with an
+active-process limit of one and a transactional workspace ACL. The TCB may temporarily enable
 `SeSecurityPrivilege` only to snapshot/restore integrity SACLs and restores
 its prior state before returning; the restricted child receives no such
 privilege. Brokered network access is limited to the exact IPv4 loopback proxy

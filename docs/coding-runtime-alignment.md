@@ -40,7 +40,7 @@ Coding runtime 的安全默认值是：
 - 非 Python 语言当前为 Legacy/正则级解析，尚未达到完整语义精度。
 - LSP 查询 enrichment、完整引用/调用边和 FTS5 尚未完成。
 - VerificationPipeline 尚未提供完整 flaky/baseline 报告。
-- Windows native helper 已实现 `network=none` AppContainer/no-network、restricted token、Job Object 单 native runtime 上限、workspace ACL 与 WFP Firewall contract；外层 helper 负责等待与清理；真实执行能力仍以当前 commit 的 Windows hosted probe/执行 job 为准。
+- Windows native helper 已实现 native `network=none` 的 AppContainer/no-network、trusted Python 的 restricted-token + child-process policy + exact WFP image block、Job Object 单 native runtime 上限、workspace ACL、精确 runtime-file ACL 与 WFP Firewall contract；外层 helper 负责等待与清理；真实执行能力仍以当前 commit 的 Windows hosted probe/执行 job 为准。
 
 ## 离线验证
 

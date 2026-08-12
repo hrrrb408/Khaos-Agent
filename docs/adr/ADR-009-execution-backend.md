@@ -68,8 +68,9 @@ workspace 外 write、network、pasteboard 与 Keychain IPC 失败后才返回 b
 Seatbelt 不得使用全局 `allow mach-lookup`，只允许显式的最小运行时 service
 allowlist；只检查可执行文件存在不构成
 capability。Windows selector 只有在 native helper probe 同时证明 brokered restricted
-token、`network=none` AppContainer/no-network、Job Object 单 native runtime 上限、workspace
-ACL 与 WFP Firewall 后才返回 backend；helper 缺失或
+token、native `network=none` AppContainer/no-network、trusted Python restricted-token +
+child-process policy + exact WFP image block、Job Object 单 native runtime 上限、workspace
+ACL、精确 runtime-file ACL 与 WFP Firewall 后才返回 backend；helper 缺失或
 任一证据失败均带平台原因 fail closed，不能走 Host。未知平台同样拒绝。
 
 Docker allowlist 只接受 `@sha256:` 固定镜像，运行使用 `--pull never`、只读 rootfs、

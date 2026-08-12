@@ -90,7 +90,9 @@ trade-off.
 restricted primary token, Job Object limits with one native runtime process
 (the outer helper owns the wait/cleanup transaction),
 transactional workspace ACL, an OS-issued no-network AppContainer for
-`network=none`, and WFP-backed Firewall policy. The hosted
+native commands, and WFP-backed Firewall policy. The trusted Python
+interpreter uses the restricted-token/WFP path with exact runtime-file ACLs so
+a large venv is not recursively rewritten per execution. The hosted
 `windows-fail-closed-security` and `contract (windows-2025)` jobs build the
 helper and set `KHAOS_REQUIRE_WINDOWS_NATIVE=1`; the merge claim remains
 pending until those jobs pass on this head. Windows private-desktop parity and
@@ -104,12 +106,14 @@ authorize unknown descendants during a discovery race; the outer helper is
 outside the Job and does not execute the model command.
 
 **Resolution in this head.** Use the native helper as the only Windows Coding
-backend: restricted token, per-execution no-network AppContainer for
-`network=none`, Job Object kill-on-close/resource limits and active process
-limit one native runtime, transactional ACL grant/restore, exact native
-executable resolution, and WFP-backed Firewall rules. Brokered egress accepts
-only the loopback NetworkBroker endpoint. Any missing primitive, cleanup proof,
-or unsupported command fails closed.
+backend: restricted token, child-process policy, inherited-handle allowlist,
+per-execution no-network AppContainer for native `network=none` commands,
+the restricted-token/WFP path with exact runtime-file ACLs for the trusted
+Python interpreter, Job Object kill-on-close/resource limits and active
+process limit one, transactional ACL grant/restore, exact native executable
+resolution, and WFP-backed Firewall rules. Brokered egress accepts only the
+loopback NetworkBroker endpoint. Any missing primitive, cleanup proof, or
+unsupported command fails closed.
 
 **Prerequisite.** A passing current-head Windows runner is required before
 release; private-desktop support remains outside this closure.

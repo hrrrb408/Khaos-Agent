@@ -258,6 +258,7 @@ class WindowsSandboxBackend:
         # Python runtime, not from model-controlled request fields.  Pass
         # only the runtime's Lib/DLL trees and exact launcher files so ACL
         # setup does not recursively rewrite unrelated tool-cache paths.
+        use_restricted_runtime = False
         try:
             requested_executable = request.argv[0]
             if not Path(requested_executable).is_absolute():
@@ -272,17 +273,25 @@ class WindowsSandboxBackend:
             same_as_khaos_python = False
         if same_as_khaos_python:
             seen_runtime_paths: set[Path] = set()
-            # The venv owns third-party imports under its Lib tree.  The
-            # base install is handled below by exact launcher/DLL files;
-            # recursively ACL-ing the hosted base standard-library tree is
-            # both unnecessary for the native probe and too slow on CI.
-            for prefix in (sys.prefix,):
-                runtime_root = Path(prefix).expanduser().resolve()
-                for relative_root in ("Lib", "DLLs"):
-                    path = runtime_root / relative_root
-                    if path.is_dir() and path not in seen_runtime_paths:
-                        helper_args.extend(("--runtime-root", str(path)))
-                        seen_runtime_paths.add(path)
+            # The restricted-token path keeps the normal trusted interpreter
+            # identity for reads and uses WRITE_RESTRICTED plus the exact
+            # runtime-file ACLs for writes.  Avoiding a per-execution
+            # AppContainer SID means the venv's large Lib tree never needs an
+            # ACL transaction; network=none remains denied by the exact WFP
+            # image rule and the native child-process policy.
+            use_restricted_runtime = profile.network is NetworkPolicy.NONE
+            if use_restricted_runtime:
+                helper_args.append("--no-appcontainer")
+            else:
+                # Brokered execution is already restricted-token based. The
+                # venv owns third-party imports under its Lib/DLL trees.
+                for prefix in (sys.prefix,):
+                    runtime_root = Path(prefix).expanduser().resolve()
+                    for relative_root in ("Lib", "DLLs"):
+                        path = runtime_root / relative_root
+                        if path.is_dir() and path not in seen_runtime_paths:
+                            helper_args.extend(("--runtime-root", str(path)))
+                            seen_runtime_paths.add(path)
             for prefix in (sys.prefix, sys.base_prefix):
                 runtime_root = Path(prefix).expanduser().resolve()
                 exact_files = (
@@ -336,11 +345,18 @@ class WindowsSandboxBackend:
             diagnostics = {
                 "backend": self.name,
                 "restricted_token": True,
-                "appcontainer": profile.network is NetworkPolicy.NONE,
+                "appcontainer": (
+                    profile.network is NetworkPolicy.NONE and not use_restricted_runtime
+                ),
                 "job_object": True,
                 "process_tree": True,
                 "workspace_acl": True,
                 "wfp_network_policy": profile.network.value,
+                "network_authority": (
+                    "wfp-image-block"
+                    if use_restricted_runtime
+                    else "appcontainer"
+                ),
                 "stdout_truncated": stdout_truncated,
                 "stderr_truncated": stderr_truncated,
             }

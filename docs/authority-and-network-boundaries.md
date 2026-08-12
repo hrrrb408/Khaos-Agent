@@ -58,10 +58,12 @@ execution:
 2. a kill-on-close Job Object with resource limits and an active-process limit
    of one native runtime process; the outer helper remains outside the Job and
    owns the wait/cleanup transaction;
-3. for `network=none`, an OS-issued per-execution AppContainer low-box with no
-   declared network capabilities, verified from the child token; brokered
-   execution remains the separate restricted-token/WFP path and is limited to
-   the exact loopback NetworkBroker endpoint;
+3. for `network=none`, native commands use an OS-issued per-execution
+   AppContainer low-box with no declared network capabilities, verified from
+   the child token; the trusted Python interpreter uses the separate
+   restricted-token/WFP path with the same child-process and handle
+   containment, while brokered execution remains limited to the exact
+   loopback NetworkBroker endpoint;
 4. transactionally granted/restored restricted-code ACLs: full access for the
    task workspace and read/execute plus ancestor traverse for the resolved
    native runtime tree and explicitly trusted venv/base-runtime roots. The
