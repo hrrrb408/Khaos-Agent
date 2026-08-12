@@ -286,6 +286,7 @@ class WindowsSandboxBackend:
                 getattr(sys, "_base_executable", sys.executable)
             ).expanduser().resolve()
             import_root_paths: list[Path] = []
+            runtime_acl_roots: list[Path] = []
             if base_executable.is_file():
                 # On Windows a venv's Scripts/python.exe is a redirector that
                 # starts the base interpreter as a second process.  The
@@ -298,10 +299,26 @@ class WindowsSandboxBackend:
                 venv_root = Path(sys.prefix).expanduser().resolve()
                 site_packages = venv_root / "Lib" / "site-packages"
                 source_root = Path(__file__).resolve().parents[3]
-                if (site_packages / "khaos").is_dir():
+                if (
+                    profile.network is NetworkPolicy.NONE
+                    and (source_root / "khaos").is_dir()
+                ):
+                    # The parent Khaos process normally runs from this same
+                    # venv. Recursively changing its ACL while it is active
+                    # can leave hosted Windows icacls waiting on open files.
+                    # AppContainer therefore receives the trusted source
+                    # package, not the live venv tree, for the no-network
+                    # path. The package directory is the smallest useful ACL
+                    # scope; its parent gets traverse-only access from the
+                    # native helper.
+                    import_root_paths.append(source_root)
+                    runtime_acl_roots.append(source_root / "khaos")
+                elif (site_packages / "khaos").is_dir():
                     import_root_paths.append(site_packages)
+                    runtime_acl_roots.append(site_packages / "khaos")
                 elif (source_root / "khaos").is_dir():
                     import_root_paths.append(source_root)
+                    runtime_acl_roots.append(source_root / "khaos")
                 import_roots = [str(path) for path in import_root_paths]
                 if import_roots:
                     environment["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(import_roots))
@@ -321,7 +338,7 @@ class WindowsSandboxBackend:
             # path.
             base_root = Path(sys.base_prefix).expanduser().resolve()
             runtime_roots = [
-                *import_root_paths,
+                *runtime_acl_roots,
                 base_root / "DLLs",
             ]
             for path in runtime_roots:
