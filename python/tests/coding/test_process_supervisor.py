@@ -92,6 +92,40 @@ async def test_supervisor_terminate_kills_complete_process_group(tmp_path: Path)
 
 
 @pytest.mark.asyncio
+async def test_supervisor_runs_backend_termination_callback_before_draining_output(
+    tmp_path: Path,
+):
+    """A backend may need a kernel tree kill after the launcher exits.
+
+    The callback is intentionally exercised through the public supervisor
+    lifecycle so a native sandbox cannot leave descendants holding captured
+    output pipes open after the direct process has been reaped.
+    """
+    supervisor = ProcessSupervisor(termination_grace_seconds=0.1)
+    callback_called = asyncio.Event()
+    request = ExecutionRequest(
+        (sys.executable, "-c", "import time; time.sleep(30)"),
+        tmp_path,
+        budget=ResourceBudget(timeout_seconds=0.05),
+        correlation_id="backend-termination-callback",
+    )
+
+    async def terminate_backend_tree() -> None:
+        callback_called.set()
+
+    running = asyncio.create_task(
+        supervisor.run(request, termination_callback=terminate_backend_tree)
+    )
+    await _wait_until_active(supervisor, "backend-termination-callback")
+
+    result = await asyncio.wait_for(running, timeout=5)
+
+    assert result.status == "timed-out"
+    assert callback_called.is_set()
+    assert supervisor.active_execution_ids == ()
+
+
+@pytest.mark.asyncio
 async def test_cancelling_run_cleans_process_group_and_registry(tmp_path: Path):
     supervisor = ProcessSupervisor(termination_grace_seconds=0.1)
     request = ExecutionRequest(

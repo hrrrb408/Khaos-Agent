@@ -13,6 +13,7 @@ import stat
 import subprocess
 import sys
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -64,6 +65,7 @@ class SupervisorClosedError(RuntimeError):
 @dataclass
 class _ActiveProcess:
     process: asyncio.subprocess.Process
+    termination_callback: Callable[[], Awaitable[None]] | None = None
     termination_requested: bool = False
     termination_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     watchdog_task: asyncio.Task[dict | None] | None = None
@@ -221,6 +223,7 @@ class ProcessSupervisor:
         directory_binding: ExecutionDirectoryBinding | None = None,
         use_native_launcher: bool = True,
         preserve_directory_fds: bool = False,
+        termination_callback: Callable[[], Awaitable[None]] | None = None,
     ) -> ExecutionResult:
         """Run one foreground process with bounded, fairly split output.
 
@@ -229,6 +232,11 @@ class ProcessSupervisor:
         its own backend validates the request and applies the container
         boundary.  It still receives a new session, but it must not inherit
         the payload's host directory/rlimit launcher arguments.
+
+        ``termination_callback`` is an optional backend-owned kernel cleanup
+        hook.  It runs after the direct child is reaped and before captured
+        output is drained, which lets a namespace backend terminate
+        descendants that are not in the supervisor's process group.
         """
         execution_id = request.correlation_id
         if not execution_id:
@@ -393,7 +401,10 @@ class ProcessSupervisor:
                 error=RuntimeError("subprocess spawn did not produce a process"),
             )
             raise RuntimeError("subprocess spawn did not produce a process")
-        active = _ActiveProcess(process)
+        active = _ActiveProcess(
+            process,
+            termination_callback=termination_callback,
+        )
         storage_roots = _storage_roots(
             process.pid, tmp_root, sandbox_storage_paths
         )
@@ -891,18 +902,24 @@ class ProcessSupervisor:
     async def _terminate_active(self, active: _ActiveProcess) -> None:
         async with active.termination_lock:
             process = active.process
-            if process.returncode is not None:
-                return
-            _signal_process_group(process, signal.SIGTERM)
-            try:
-                await asyncio.wait_for(
-                    process.wait(), timeout=self.termination_grace_seconds
-                )
-                return
-            except TimeoutError:
-                force_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
-                _signal_process_group(process, force_signal, force=True)
-                await process.wait()
+            if process.returncode is None:
+                _signal_process_group(process, signal.SIGTERM)
+                try:
+                    await asyncio.wait_for(
+                        process.wait(), timeout=self.termination_grace_seconds
+                    )
+                except TimeoutError:
+                    force_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
+                    _signal_process_group(process, force_signal, force=True)
+                    await process.wait()
+            # A native sandbox may have descendants that are outside the
+            # supervisor's process group (for example after bwrap creates a
+            # PID namespace).  Invoke the backend-owned kernel terminator
+            # even when the launcher itself has already exited; otherwise
+            # those descendants can retain stdout/stderr pipes forever and
+            # prevent the supervisor from reaching a terminal result.
+            if active.termination_callback is not None:
+                await active.termination_callback()
 
 
 async def _no_resource_violation() -> None:
