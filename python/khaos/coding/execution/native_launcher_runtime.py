@@ -7,11 +7,15 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import resource
 import stat
 import subprocess
 import sys
 import tempfile
+
+try:
+    import resource
+except ModuleNotFoundError:  # pragma: no cover - resource is POSIX-only
+    resource = None  # type: ignore[assignment]
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
@@ -391,7 +395,7 @@ def _authority_path(
 
 def _set_limit(name: str, options: dict[str, object]) -> None:
     key = name.lower()
-    if key not in options or not hasattr(resource, name):
+    if resource is None or key not in options or not hasattr(resource, name):
         return
     resource_id = getattr(resource, name)
     requested = int(options[key])

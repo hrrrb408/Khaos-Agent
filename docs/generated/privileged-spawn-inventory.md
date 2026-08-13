@@ -8,11 +8,11 @@
 - `python/khaos/cli/main.py:366` `subprocess.run` in `<module>.cmd_test` owner=`CliGatewayProcess` threat-model=`user-authorized-local-gateway` boundary=`cli-runtime`
 - `python/khaos/cli/main.py:376` `subprocess.run` in `<module>.cmd_test` owner=`CliGatewayProcess` threat-model=`user-authorized-local-gateway` boundary=`cli-runtime`
 - `python/khaos/coding/execution/capability.py:263` `subprocess.run` in `<module>._capability_evidence` owner=`SandboxCapabilityProbe` threat-model=`trusted-tcb-probe` boundary=`execution-capability`
-- `python/khaos/coding/execution/native_launcher_runtime.py:112` `os.execve` in `<module>.main` owner=`NativeLauncherTCB` threat-model=`fd-bound-exec-and-codesign` boundary=`native-launcher`
-- `python/khaos/coding/execution/native_launcher_runtime.py:121` `os.execve` in `<module>.main` owner=`NativeLauncherTCB` threat-model=`fd-bound-exec-and-codesign` boundary=`native-launcher`
-- `python/khaos/coding/execution/native_launcher_runtime.py:127` `os.execvpe` in `<module>.main` owner=`NativeLauncherTCB` threat-model=`fd-bound-exec-and-codesign` boundary=`native-launcher`
-- `python/khaos/coding/execution/native_launcher_runtime.py:357` `subprocess.run` in `<module>._authority_path` owner=`NativeLauncherTCB` threat-model=`fd-bound-exec-and-codesign` boundary=`native-launcher`
-- `python/khaos/coding/execution/native_launcher_runtime.py:369` `subprocess.run` in `<module>._authority_path` owner=`NativeLauncherTCB` threat-model=`fd-bound-exec-and-codesign` boundary=`native-launcher`
+- `python/khaos/coding/execution/native_launcher_runtime.py:116` `os.execve` in `<module>.main` owner=`NativeLauncherTCB` threat-model=`fd-bound-exec-and-codesign` boundary=`native-launcher`
+- `python/khaos/coding/execution/native_launcher_runtime.py:125` `os.execve` in `<module>.main` owner=`NativeLauncherTCB` threat-model=`fd-bound-exec-and-codesign` boundary=`native-launcher`
+- `python/khaos/coding/execution/native_launcher_runtime.py:131` `os.execvpe` in `<module>.main` owner=`NativeLauncherTCB` threat-model=`fd-bound-exec-and-codesign` boundary=`native-launcher`
+- `python/khaos/coding/execution/native_launcher_runtime.py:361` `subprocess.run` in `<module>._authority_path` owner=`NativeLauncherTCB` threat-model=`fd-bound-exec-and-codesign` boundary=`native-launcher`
+- `python/khaos/coding/execution/native_launcher_runtime.py:373` `subprocess.run` in `<module>._authority_path` owner=`NativeLauncherTCB` threat-model=`fd-bound-exec-and-codesign` boundary=`native-launcher`
 - `python/khaos/coding/execution/platform.py:151` `subprocess.run` in `<module>.probe_capability` owner=`ExecutionBackend` threat-model=`kernel-sandbox-and-resource-control` boundary=`execution-service`
 - `python/khaos/coding/execution/platform.py:404` `asyncio.create_subprocess_exec` in `<module>.execute` owner=`ExecutionBackend` threat-model=`kernel-sandbox-and-resource-control` boundary=`execution-service`
 - `python/khaos/coding/execution/platform.py:842` `subprocess.run` in `<module>.probe_capability` owner=`ExecutionBackend` threat-model=`kernel-sandbox-and-resource-control` boundary=`execution-service`

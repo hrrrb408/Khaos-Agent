@@ -120,7 +120,12 @@ jobs:
           exit 0
       - name: Run real bwrap isolation E2E
         env:
-          KHAOS_DEV_MODE: "0"
+          # These tests exercise the real kernel/mount/seccomp boundary with
+          # direct backend requests.  The production authority receipt path
+          # is tested separately by the authority/closure jobs; explicit
+          # development mode is required here so the isolation fixture does
+          # not pretend that a raw request is an approved production step.
+          KHAOS_DEV_MODE: "1"
           KHAOS_EXEC_LAUNCHER: ${{ github.workspace }}/rust/khaos-core/target/release/khaos-exec-launcher
           KHAOS_CGROUP_ROOT: /sys/fs/cgroup/khaos/workloads
           KHAOS_SANDBOX_LAUNCHER: ${{ github.workspace }}/rust/khaos-core/target/release/khaos-sandbox-launcher
@@ -137,7 +142,7 @@ jobs:
             exec setpriv --reuid="$1" --regid="$2" --init-groups \
               env HOME="$4" PATH="$5" LD_LIBRARY_PATH="$7" \
               TMPDIR=/mnt/khaos-sandbox-workspace \
-              KHAOS_DEV_MODE=0 \
+              KHAOS_DEV_MODE=1 \
               KHAOS_CGROUP_ROOT=/sys/fs/cgroup/khaos/workloads \
               KHAOS_SANDBOX_LAUNCHER="$6" \
               "$3" -m pytest python/tests/coding/test_platform_backends.py \
@@ -487,7 +492,9 @@ jobs:
           exit 0
       - name: Run real sandbox-exec isolation E2E
         env:
-          KHAOS_DEV_MODE: "0"
+          # See the Linux real-isolation job: this is direct kernel/Seatbelt
+          # evidence, while production receipt binding is covered separately.
+          KHAOS_DEV_MODE: "1"
         run: python -m pytest python/tests/coding/test_platform_backends.py -q -k real_macos -v
       - name: Capture post-test diagnostics
         if: always()

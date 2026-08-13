@@ -1,5 +1,5 @@
 # Stage 0: native security TCB
-FROM rust:1.82-bookworm@sha256:d9c3c6f1264a547d84560e06ffd79ed7a799ce0bff0980b26cf10d29af888377 AS rust-tcb-builder
+FROM rust:1.85-bookworm@sha256:e51d0265072d2d9d5d320f6a44dde6b9ef13653b035098febd68cce8fa7c0bc4 AS rust-tcb-builder
 
 WORKDIR /build
 COPY rust/khaos-core/ rust/khaos-core/

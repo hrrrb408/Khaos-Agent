@@ -20,7 +20,7 @@
 ## Container and supply-chain inventory
 
 - Docker base/service images found with immutable digests:
-  - `Dockerfile:2`: `sha256:d9c3c6f1264a547d84560e06ffd79ed7a799ce0bff0980b26cf10d29af888377`
+  - `Dockerfile:2`: `sha256:e51d0265072d2d9d5d320f6a44dde6b9ef13653b035098febd68cce8fa7c0bc4`
   - `Dockerfile:13`: `sha256:b18992999dbe963a45a8a4da40ac2b1975be1a776d939d098c647482bcad5cba`
   - `Dockerfile:73`: `sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818`
   - `Dockerfile:90`: `sha256:1699c10032ca2582ec89a24a1312d986a3f094aed3d5c1147b19880afe40e052`
