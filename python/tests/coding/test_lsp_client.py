@@ -263,7 +263,10 @@ async def test_lsp_pending_spawn_stays_owned_until_rollback(tmp_path):
 
     async def wait_for_close_admission() -> None:
         while client._lifecycle_state is not _LspState.CLOSING:
-            await asyncio.sleep(0)
+            # A zero-delay busy poll can starve the task running close() on
+            # Windows' Proactor loop.  Keep the synchronization bounded while
+            # yielding a real timer turn to the close task and wait_for().
+            await asyncio.sleep(0.01)
 
     # ``generation_admission_closed`` is already true during STARTING.  It
     # therefore does not prove that the concurrent close task has won the
