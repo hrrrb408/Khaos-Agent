@@ -35,6 +35,9 @@ async def run():
     operating_system.system('x')
     spawn('x', ['x'], {})
     terminal.spawn('x')
+
+launch = sp.Popen
+launch(['x'])
 """,
         encoding="utf-8",
     )
@@ -49,6 +52,7 @@ async def run():
         "os.posix_spawn",
         "pty.spawn",
     } <= symbols
+    assert sum(symbol == "subprocess.Popen" for _, symbol, _ in sites) >= 2
 
 
 def test_go_package_aliases_and_comments_are_scanned(tmp_path: Path) -> None:
@@ -69,6 +73,8 @@ func run() {
     command.CommandContext(nil, "x")
     operatingSystem.StartProcess("x", nil, nil)
     syscall.Exec("x", nil, nil)
+    spawn := command.Command
+    spawn("x")
 }
 ''',
         encoding="utf-8",
@@ -77,6 +83,7 @@ func run() {
     sites = MODULE._go_sites(source)
     symbols = {symbol for _, symbol, _ in sites}
     assert {"exec.CommandContext", "os.StartProcess", "syscall.Exec"} <= symbols
+    assert any(symbol == "exec.Command" for _, symbol, _ in sites)
 
 
 def test_rust_command_alias_is_scanned(tmp_path: Path) -> None:
@@ -87,6 +94,8 @@ use std::process::Command as SpawnCommand;
 
 fn run() {
     let _child = SpawnCommand::new("x");
+    let launch = SpawnCommand::new;
+    launch("x");
 }
 """,
         encoding="utf-8",
@@ -94,3 +103,4 @@ fn run() {
 
     sites = MODULE._rust_sites(source)
     assert any(symbol == "SpawnCommand::new" for _, symbol, _ in sites)
+    assert any(symbol == "launch" for _, symbol, _ in sites)

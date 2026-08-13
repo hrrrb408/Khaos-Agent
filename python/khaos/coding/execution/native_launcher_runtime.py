@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import resource
 import stat
@@ -12,9 +13,19 @@ import subprocess
 import sys
 import tempfile
 
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+from khaos.security.authorityd_protocol import SignedAuthorizationReceipt
+
 
 def main(argv: list[str]) -> int:
     options, command = _parse(argv)
+    if options.get("require_authority_receipt"):
+        receipt_fd = options.get("authority_receipt_fd")
+        public_key_fd = options.get("authority_public_key_fd")
+        if receipt_fd is None or public_key_fd is None:
+            raise PermissionError("signed authority receipt is required")
+        _verify_authority_receipt(int(receipt_fd), int(public_key_fd))
     if options.get("new_session"):
         os.setsid()
     for prefix in ("root", "cwd"):
@@ -150,6 +161,12 @@ def _parse(argv: list[str]) -> tuple[dict[str, object], list[str]]:
             options["preserve_directory_fds"] = True
             index += 1
             continue
+        if value == "--require-authority-receipt":
+            if options.get("require_authority_receipt"):
+                raise ValueError("duplicate --require-authority-receipt")
+            options["require_authority_receipt"] = True
+            index += 1
+            continue
         if not value.startswith("--") or index + 1 >= len(argv):
             raise ValueError(f"invalid launcher option: {value}")
         key = value[2:].replace("-", "_")
@@ -170,6 +187,8 @@ def _parse(argv: list[str]) -> tuple[dict[str, object], list[str]]:
             "interpreter_digest",
             "interpreter_argv0",
             "interpreter_arg",
+            "authority_receipt_fd",
+            "authority_public_key_fd",
         }:
             raise ValueError(f"unknown launcher option: {value}")
         if key == "interpreter_arg":
@@ -214,6 +233,14 @@ def _validate_authority_options(options: dict[str, object]) -> None:
     interpreter_args = options.get("interpreter_args", ())
     if interpreter_args and interpreter_fd is None:
         raise ValueError("interpreter arguments require interpreter authority")
+    receipt_fd = options.get("authority_receipt_fd")
+    public_key_fd = options.get("authority_public_key_fd")
+    if (receipt_fd is None) != (public_key_fd is None):
+        raise ValueError("incomplete signed authority receipt")
+    if options.get("require_authority_receipt") and (
+        receipt_fd is None or public_key_fd is None
+    ):
+        raise ValueError("signed authority receipt is required")
 
 
 def _verify_fd(fd: int, device: int, inode: int, label: str) -> None:
@@ -242,6 +269,39 @@ def _verify_executable_fd(fd: int, expected_digest: str) -> None:
         offset += len(chunk)
     if digest.hexdigest() != expected_digest:
         raise PermissionError("executable authority content changed before exec")
+
+
+def _verify_authority_receipt(receipt_fd: int, public_key_fd: int) -> None:
+    """Verify the same signed receipt contract as the Rust launcher."""
+    receipt_payload = _read_fd(receipt_fd, 64 * 1024)
+    public_key_payload = _read_fd(public_key_fd, 4096)
+    try:
+        receipt = SignedAuthorizationReceipt.from_dict(json.loads(receipt_payload))
+        key_bytes = public_key_payload
+        if len(key_bytes) != 32:
+            import base64
+
+            key_bytes = base64.b64decode(key_bytes, validate=True)
+        receipt.verify(Ed25519PublicKey.from_public_bytes(key_bytes))
+    except (OSError, TypeError, ValueError, UnicodeError, json.JSONDecodeError) as exc:
+        raise PermissionError("signed authority receipt is invalid") from exc
+
+
+def _read_fd(fd: int, maximum: int) -> bytes:
+    duplicate = os.dup(fd)
+    try:
+        os.lseek(duplicate, 0, os.SEEK_SET)
+        chunks: list[bytes] = []
+        total = 0
+        while total <= maximum:
+            chunk = os.read(duplicate, min(1024 * 1024, maximum + 1 - total))
+            if not chunk:
+                return b"".join(chunks)
+            chunks.append(chunk)
+            total += len(chunk)
+        raise PermissionError("authority descriptor exceeds its bound")
+    finally:
+        os.close(duplicate)
 
 
 def _fd_path(fd: int) -> str:

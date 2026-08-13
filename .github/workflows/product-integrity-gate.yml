@@ -89,6 +89,43 @@ jobs:
         run: >-
           uv run pytest python/tests/ -vv
           -m "not browser_real and not docker_sandbox_real and not production_sandbox_real and not kernel_real and not platform_sandbox_real"
+
+  # Windows is a first-class fail-closed execution target.  Keep one full
+  # product cell in this gate so the claim is not limited to the narrow native
+  # helper probe in Platform Sandbox Security.  File-tool paths that require
+  # POSIX dirfd primitives must fail closed on this runner; they are not
+  # silently redirected to a Host backend.
+  python-product-windows:
+    name: Python Product Suite (Windows 3.11)
+    runs-on: windows-2025
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install Windows product dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --require-hashes -r python/bootstrap-requirements.txt
+          uv sync --frozen --extra test --extra tui --extra tree-sitter
+          "$env:GITHUB_WORKSPACE/.venv/Scripts" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Build native Windows sandbox helper
+        shell: pwsh
+        run: cargo build --locked --release --no-default-features --bin khaos-windows-sandbox --manifest-path rust/khaos-core/Cargo.toml
+      - name: Require native Windows evidence
+        shell: pwsh
+        run: |
+          "KHAOS_WINDOWS_SANDBOX_HELPER=$env:GITHUB_WORKSPACE\rust\khaos-core\target\release\khaos-windows-sandbox.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "KHAOS_REQUIRE_WINDOWS_NATIVE=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Run FULL Windows Python product suite
+        shell: pwsh
+        run: >-
+          uv run pytest python/tests/ -vv
+          -m "not browser_real and not docker_sandbox_real and not production_sandbox_real and not kernel_real and not platform_sandbox_real"
   # ─── Full Go product suite with the race detector ──────────────────────
   go-product:
     name: Go Product Suite
@@ -128,6 +165,7 @@ jobs:
     if: always()
     needs:
       - python-product
+      - python-product-windows
       - go-product
       - rust-product
     runs-on: ubuntu-24.04
@@ -142,9 +180,10 @@ jobs:
         # a pass.
         env:
           PYTHON_PRODUCT: ${{ needs.python-product.result }}
+          PYTHON_PRODUCT_WINDOWS: ${{ needs.python-product-windows.result }}
           GO_PRODUCT: ${{ needs.go-product.result }}
           RUST_PRODUCT: ${{ needs.rust-product.result }}
         run: |
-          for result in "$PYTHON_PRODUCT" "$GO_PRODUCT" "$RUST_PRODUCT"; do
+          for result in "$PYTHON_PRODUCT" "$PYTHON_PRODUCT_WINDOWS" "$GO_PRODUCT" "$RUST_PRODUCT"; do
             test "$result" = "success"
           done

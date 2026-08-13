@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Require an owner and threat model for every runtime host-spawn site.
+"""Require an owner and threat model for every detected runtime host-spawn site.
 
 The gate intentionally scans source syntax rather than grep text, so comments
 and documentation cannot hide a new privileged spawn.  Each production source
@@ -9,7 +9,10 @@ file containing a spawn must carry a file-level declaration:
 
 The generated inventory is an auditable snapshot of all discovered call sites;
 adding a new site or moving one changes the generated artifact and therefore
-requires an explicit security review in the same change.
+requires an explicit security review in the same change.  The scanner also
+follows simple assignment aliases (``launch = subprocess.Popen``,
+``spawn := exec.Command``, and ``let spawn = Command::new``); indirect or
+dynamic dispatch remains forbidden in security-critical host-spawn code.
 """
 
 from __future__ import annotations
@@ -92,6 +95,7 @@ def _python_sites(path: Path) -> list[tuple[int, str, str]]:
     stack: list[str] = ["<module>"]
     module_aliases: dict[str, str] = {}
     symbol_aliases: dict[str, str] = {}
+    assignment_aliases: dict[str, str] = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -111,7 +115,10 @@ def _python_sites(path: Path) -> list[tuple[int, str, str]]:
 
     def resolve(node: ast.AST) -> str:
         if isinstance(node, ast.Name):
-            return symbol_aliases.get(node.id, module_aliases.get(node.id, node.id))
+            return assignment_aliases.get(
+                node.id,
+                symbol_aliases.get(node.id, module_aliases.get(node.id, node.id)),
+            )
         if isinstance(node, ast.Attribute):
             left = resolve(node.value)
             return f"{left}.{node.attr}" if left else node.attr
@@ -131,6 +138,23 @@ def _python_sites(path: Path) -> list[tuple[int, str, str]]:
         }:
             return True
         return name.startswith(("os.exec", "os.spawn"))
+
+    class AliasCollector(ast.NodeVisitor):
+        def visit_Assign(self, node: ast.Assign) -> None:
+            resolved = resolve(node.value)
+            if is_spawn_call(resolved):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        assignment_aliases[target.id] = resolved
+            self.generic_visit(node)
+
+        def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+            resolved = resolve(node.value) if node.value is not None else ""
+            if is_spawn_call(resolved) and isinstance(node.target, ast.Name):
+                assignment_aliases[node.target.id] = resolved
+            self.generic_visit(node)
+
+    AliasCollector().visit(tree)
 
     class Visitor(ast.NodeVisitor):
         def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
@@ -158,6 +182,14 @@ def _rust_sites(path: Path) -> list[tuple[int, str, str]]:
         source,
     ):
         aliases.add(match.group("alias"))
+    assigned_aliases = {
+        match.group("alias")
+        for match in re.finditer(
+            r"\blet\s+(?P<alias>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*"
+            rf"(?:{'|'.join(re.escape(alias) for alias in sorted(aliases))})::new\b",
+            source,
+        )
+    }
     sites: list[tuple[int, str, str]] = []
     call = re.compile(
         rf"\b(?:{'|'.join(re.escape(alias) for alias in sorted(aliases))})::new\b"
@@ -166,8 +198,15 @@ def _rust_sites(path: Path) -> list[tuple[int, str, str]]:
     for line_number, line in enumerate(source.splitlines(), 1):
         code = line.split("//", 1)[0]
         match = call.search(code) or RUST_CALL.search(code)
+        if match is None and assigned_aliases:
+            alias_call = re.search(
+                rf"\b(?:{'|'.join(re.escape(alias) for alias in sorted(assigned_aliases))})\s*\(",
+                code,
+            )
+            match = alias_call
         if match:
-            sites.append((line_number, match.group(0), "rust::entrypoint"))
+            symbol = match.group(0).rstrip("(").strip()
+            sites.append((line_number, symbol, "rust::entrypoint"))
     return sites
 
 
@@ -248,6 +287,21 @@ def _go_sites(path: Path) -> list[tuple[int, str, str]]:
     code = _strip_go_comments_and_strings(source)
     aliases = _go_import_aliases(source)
     sites: list[tuple[int, str, str]] = []
+    assignment_aliases: dict[str, str] = {}
+    for alias, package in aliases.items():
+        if alias == ".":
+            continue
+        functions = "|".join(
+            re.escape(function) for function in GO_CALLS[package]
+        )
+        assignment = re.compile(
+            rf"\b(?P<local>[A-Za-z_][A-Za-z0-9_]*)\s*(?::=|=)\s*"
+            rf"{re.escape(alias)}\.(?P<function>{functions})\b"
+        )
+        for match in assignment.finditer(code):
+            assignment_aliases[match.group("local")] = (
+                f"{package.rsplit('/', 1)[-1]}.{match.group('function')}"
+            )
     for alias, package in aliases.items():
         functions = GO_CALLS[package]
         for function in functions:
@@ -264,6 +318,10 @@ def _go_sites(path: Path) -> list[tuple[int, str, str]]:
                 for match in pattern.finditer(code):
                     line = code.count("\n", 0, match.start()) + 1
                     sites.append((line, f"{package.rsplit('/', 1)[-1]}.{function}", "go::function"))
+    for local, symbol in assignment_aliases.items():
+        for match in re.finditer(rf"\b{re.escape(local)}\s*\(", code):
+            line = code.count("\n", 0, match.start()) + 1
+            sites.append((line, symbol, "go::function"))
     return sorted(set(sites))
 
 
@@ -313,7 +371,7 @@ def render() -> str:
         "# Generated Privileged Spawn Inventory",
         "",
         "> Generated by `scripts/check_privileged_spawn_sites.py`; do not edit manually.",
-        "> Every runtime host process start must have an owner, threat model, and enforcement boundary.",
+        "> Every host-spawn primitive detected by this enforced static verifier must have an owner, threat model, and enforcement boundary. Indirect or dynamic dispatch is not proven by this inventory.",
         "",
     ]
     for site in sites:

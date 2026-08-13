@@ -9,6 +9,10 @@
 // KHAOS-PRIVILEGED-SPAWN owner=NativeExecLauncher threat-model=fd-bound-executable-authority boundary=native-launcher
 
 #[cfg(unix)]
+#[path = "../authority_receipt.rs"]
+mod authority_receipt;
+
+#[cfg(unix)]
 mod unix {
     use sha2::{Digest, Sha256};
     use std::env;
@@ -56,6 +60,9 @@ mod unix {
         interpreter_digest: Option<String>,
         interpreter_argv0: Option<OsString>,
         interpreter_args: Vec<OsString>,
+        require_authority_receipt: bool,
+        authority_receipt_fd: Option<RawFd>,
+        authority_public_key_fd: Option<RawFd>,
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -69,6 +76,15 @@ mod unix {
 
     pub fn run() -> io::Result<()> {
         let (options, command) = parse_args(env::args_os().skip(1))?;
+        if options.require_authority_receipt {
+            let receipt_fd = options
+                .authority_receipt_fd
+                .ok_or_else(|| invalid("signed authority receipt is required"))?;
+            let public_key_fd = options
+                .authority_public_key_fd
+                .ok_or_else(|| invalid("authorityd public key is required"))?;
+            crate::authority_receipt::verify_from_fds(receipt_fd, public_key_fd, None)?;
+        }
         if options.new_session {
             let result = unsafe { libc::setsid() };
             if result < 0 {
@@ -558,6 +574,14 @@ mod unix {
                 index += 1;
                 continue;
             }
+            if values[index] == "--require-authority-receipt" {
+                if options.require_authority_receipt {
+                    return Err(invalid("duplicate --require-authority-receipt"));
+                }
+                options.require_authority_receipt = true;
+                index += 1;
+                continue;
+            }
             let name = values[index]
                 .to_str()
                 .ok_or_else(|| invalid("launcher option is not UTF-8"))?;
@@ -611,6 +635,14 @@ mod unix {
                 "rlimit-as" => set_once(&mut options.rlimit_as, Some(number), key)?,
                 "exec-fd" => set_once(&mut options.exec_fd, checked_fd(number), key)?,
                 "interpreter-fd" => set_once(&mut options.interpreter_fd, checked_fd(number), key)?,
+                "authority-receipt-fd" => {
+                    set_once(&mut options.authority_receipt_fd, checked_fd(number), key)?
+                }
+                "authority-public-key-fd" => set_once(
+                    &mut options.authority_public_key_fd,
+                    checked_fd(number),
+                    key,
+                )?,
                 _ => return Err(invalid(&format!("unknown launcher option: --{key}"))),
             }
             index += 2;
@@ -647,6 +679,14 @@ mod unix {
             || (!options.interpreter_args.is_empty() && options.interpreter_fd.is_none())
         {
             return Err(invalid("incomplete interpreter authority"));
+        }
+        if options.authority_receipt_fd.is_some() != options.authority_public_key_fd.is_some() {
+            return Err(invalid("incomplete signed authority receipt"));
+        }
+        if options.require_authority_receipt
+            && (options.authority_receipt_fd.is_none() || options.authority_public_key_fd.is_none())
+        {
+            return Err(invalid("signed authority receipt is required"));
         }
         Ok(())
     }

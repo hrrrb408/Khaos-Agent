@@ -56,9 +56,17 @@ loopback、仍强制 API key、project root 和 Python capability。生产入口
 `/run/khaos-helper/cgroup`；helper 会拒绝普通目录、符号链接或越界 journal，不能把
 整个 `/sys/fs/cgroup` 作为读写挂载。Linux 原生部署先
 审查并以 root 执行 `scripts/install-native-tcb.sh`，再启用 systemd 服务。不支持的
-Windows sandbox 路径明确拒绝执行，不回退 Host，也不报告 isolated。详细边界见
+Windows Coding 执行使用 native helper：只有 helper probe、token/AppContainer、Job
+Object、ACL 与 WFP 证据全部通过才执行；失败时拒绝，不回退 Host，也不报告
+isolated。Windows 文件工具若缺少原生 no-follow handle backend 会直接 fail closed，
+不会把 POSIX dirfd 假设伪装成 Windows 隔离。详细边界见
 `docs/browser-threat-model.md`、`docs/platform-security-guarantees.md` 和
-`docs/security-platform-support.md`。当前 API key 是单实例本地控制面认证，不是多租户隔离。
+`docs/security-platform-support.md`。需要把 host execution 提升到独立
+authorityd receipt 模式时，部署 `khaos-authorityd` 为独立 OS service，并设置
+`KHAOS_REQUIRE_AUTHORITY_RECEIPT=1`、`KHAOS_AUTHORITYD_SOCKET`、
+`KHAOS_AUTHORITYD_PUBLIC_KEY_PATH`、`KHAOS_EFFECTIVE_POLICY_DIGEST` 与远端审计
+endpoint；authorityd 只签发与自身编译 policy digest 相同的收据，缺少任一生产证明时会
+fail closed。完整协议见 `docs/authority-control-plane.md`。当前 API key 是单实例本地控制面认证，不是多租户隔离。
 
 ## 开发
 

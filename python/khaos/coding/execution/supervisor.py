@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import math
 import os
@@ -35,6 +37,11 @@ from khaos.coding.workspace.storage import (
     WorkspaceStorageLimits,
     WorkspaceStorageSnapshot,
     capture_workspace_snapshot,
+)
+from khaos.security.authority_broker import (
+    AuthorityBroker,
+    AuthorityBrokerError,
+    EffectCapability,
 )
 
 logger = logging.getLogger(__name__)
@@ -307,6 +314,14 @@ class ProcessSupervisor:
             if directory_binding is not None:
                 directory_binding.close()
             raise PermissionError("executable identity changed before native spawn")
+        authority_capability: EffectCapability | None = None
+        if use_native_launcher and _authority_receipt_required():
+            authority_capability = _issue_execution_capability(request)
+            if not os.environ.get("KHAOS_AUTHORITYD_PUBLIC_KEY_PATH"):
+                _revoke_execution_capability(authority_capability)
+                raise PermissionError(
+                    "KHAOS_AUTHORITYD_PUBLIC_KEY_PATH is required for native execution"
+                )
         if use_native_launcher:
             authority = None
             try:
@@ -329,8 +344,16 @@ class ProcessSupervisor:
                     environment=safe_environment,
                     expected_identity=request.executable_identity,
                     executable_authority=authority,
+                    authority_capability=authority_capability,
+                    authority_public_key_path=(
+                        Path(os.environ["KHAOS_AUTHORITYD_PUBLIC_KEY_PATH"])
+                        if authority_capability is not None
+                        else None
+                    ),
                 )
             except BaseException:
+                if authority_capability is not None:
+                    _revoke_execution_capability(authority_capability)
                 if authority is not None:
                     authority.close()
                 if directory_binding is not None:
@@ -389,6 +412,8 @@ class ProcessSupervisor:
             )
             raise
         except BaseException as spawn_error:
+            if authority_capability is not None:
+                _revoke_execution_capability(authority_capability)
             await self._finish_pending_spawn(
                 execution_id, pending_spawn, error=spawn_error
             )
@@ -439,6 +464,8 @@ class ProcessSupervisor:
             try:
                 await _kill_orphaned_process(process)
             finally:
+                if authority_capability is not None:
+                    _revoke_execution_capability(authority_capability)
                 watchdog_task.cancel()
                 await asyncio.gather(watchdog_task, return_exceptions=True)
                 await self._finish_pending_spawn(
@@ -460,6 +487,7 @@ class ProcessSupervisor:
         )
         status = "failed"
         diagnostics: dict[str, object] = {}
+        authority_committed = False
         # Batch 11.6 (round-11 §十): track the race tasks so the finally
         # block can cancel + await them on every exit path (including
         # CancelledError).  Without this, a cancelled long-timeout run
@@ -550,6 +578,22 @@ class ProcessSupervisor:
                     asyncio.gather(stdout_task, stderr_task)
                 )
                 watchdog_task.cancel()
+                if authority_capability is not None:
+                    try:
+                        await asyncio.shield(
+                            _commit_execution_capability(
+                                authority_capability,
+                                result="unknown",
+                                result_digest=_execution_result_digest(
+                                    "unknown", _process_return_code(active), b"", b""
+                                ),
+                            )
+                        )
+                        authority_committed = True
+                    except BaseException:
+                        logger.exception(
+                            "execution authority result could not be committed during cancellation"
+                        )
                 raise
             try:
                 # The supervisor owns the watchdog task, so shutdown may
@@ -580,6 +624,27 @@ class ProcessSupervisor:
                 status = "cancelled"
             stdout, stdout_total = await stdout_task
             stderr, stderr_total = await stderr_task
+            if authority_capability is not None:
+                try:
+                    await asyncio.shield(
+                        _commit_execution_capability(
+                            authority_capability,
+                            result="success" if status == "passed" else "failed",
+                            result_digest=_execution_result_digest(
+                                status,
+                                _process_return_code(active),
+                                stdout,
+                                stderr,
+                            ),
+                        )
+                    )
+                    authority_committed = True
+                except BaseException as exc:  # noqa: BLE001 - unknown result must not become success
+                    # A completed process whose result cannot be durably
+                    # recorded is not a success.  Preserve the evidence as an
+                    # explicit unknown outcome rather than guessing.
+                    status = "unknown"
+                    diagnostics["authority_result_commit_error"] = str(exc)
         finally:
             # Batch 11.6: cancel + await ALL race tasks on every exit
             # path so no pending task outlives run().  This closes the
@@ -594,6 +659,22 @@ class ProcessSupervisor:
             if not watchdog_task.done():
                 watchdog_task.cancel()
                 await asyncio.gather(watchdog_task, return_exceptions=True)
+            if authority_capability is not None and not authority_committed:
+                try:
+                    await asyncio.shield(
+                        _commit_execution_capability(
+                            authority_capability,
+                            result="unknown",
+                            result_digest=_execution_result_digest(
+                                "unknown", _process_return_code(active), b"", b""
+                            ),
+                        )
+                    )
+                    authority_committed = True
+                except BaseException:
+                    logger.exception(
+                        "execution authority result could not be committed; execution remains unknown"
+                    )
             try:
                 await self._unregister(execution_id, active)
             finally:
@@ -1365,6 +1446,100 @@ def _darwin_deleted_open_file_usage(
                 return 0, False
     commit()
     return total, True
+
+
+def _authority_receipt_required() -> bool:
+    """Return whether host execution must cross the external authority gate."""
+    # Production has no safe in-process authority fallback.  The explicit
+    # development profile is the only place where the test broker may remain.
+    return os.environ.get("KHAOS_DEV_MODE") != "1"
+
+
+def _issue_execution_capability(request: ExecutionRequest) -> EffectCapability:
+    """Issue one exact host-execution receipt from the immutable spawn plan."""
+    authority = request.execution_authority
+    if authority is None or not authority.is_valid():
+        raise PermissionError(
+            "production native execution requires an immutable ExecutionAuthority"
+        )
+    plan = authority.spawn_plan
+    step = authority.step_authority
+    if plan.workspace_generation <= 0:
+        raise PermissionError("production native execution requires a live workspace generation")
+    if step.policy_digest in {"", "policy:unspecified", "legacy-unbound"}:
+        raise PermissionError("production native execution requires an effective policy digest")
+    broker = AuthorityBroker.default()
+    envelope = broker.envelope(
+        principal_id=step.principal_id,
+        project_id=step.project_id,
+        runtime_id=step.session_id,
+        task_id=step.task_id,
+        workspace_id=step.workspace_id,
+        workspace_generation=plan.workspace_generation,
+        policy_digest=step.policy_digest,
+        operation_class="exec.host",
+        resource_digest=plan.digest(),
+        authorization_epoch=step.authorization_epoch,
+    )
+    capability = broker.issue(
+        envelope,
+        allowed_operation="exec.*",
+        resource_digest=plan.digest(),
+    )
+    if capability.receipt is None:
+        _revoke_execution_capability(capability)
+        raise PermissionError(
+            "production native execution requires an authorityd-signed receipt"
+        )
+    return capability
+
+
+def _revoke_execution_capability(capability: EffectCapability) -> None:
+    broker = capability.authority._broker
+    revoke = getattr(broker, "revoke", None)
+    if not callable(revoke):
+        return
+    try:
+        revoke(capability)
+    except (AuthorityBrokerError, OSError):
+        logger.exception("execution authority revoke could not be committed")
+
+
+async def _commit_execution_capability(
+    capability: EffectCapability,
+    *,
+    result: str,
+    result_digest: str,
+) -> None:
+    broker = capability.authority._broker
+    complete = getattr(broker, "complete", None)
+    if not callable(complete):
+        raise AuthorityBrokerError("execution authority has no result commit operation")
+    await asyncio.to_thread(
+        complete,
+        capability,
+        result=result,
+        result_digest=result_digest,
+    )
+
+
+def _execution_result_digest(
+    status: str,
+    return_code: int | None,
+    stdout: bytes,
+    stderr: bytes,
+) -> str:
+    payload = {
+        "status": status,
+        "return_code": return_code,
+        "stdout_sha256": hashlib.sha256(stdout).hexdigest(),
+        "stderr_sha256": hashlib.sha256(stderr).hexdigest(),
+        "stdout_bytes": len(stdout),
+        "stderr_bytes": len(stderr),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
 
 
 def _linux_process_group_pids(process_group_id: int) -> tuple[int, ...]:

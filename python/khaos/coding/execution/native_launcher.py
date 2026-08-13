@@ -23,6 +23,12 @@ from khaos.coding.execution.identity import (
     open_executable_authority,
 )
 from khaos.coding.execution.models import ResourceBudget
+from khaos.security.authority_broker import EffectCapability
+from khaos.security.authorityd_protocol import (
+    AuthorityReceiptFDs,
+    SignedAuthorizationReceipt,
+    open_authority_receipt_fds,
+)
 
 
 @dataclass(frozen=True)
@@ -34,11 +40,15 @@ class ProcessLaunch:
     pass_fds: tuple[int, ...]
     start_new_session: bool
     executable_authority: ExecutableAuthority | None = None
+    authority_receipt_handles: AuthorityReceiptFDs | None = None
+    authority_capability: EffectCapability | None = None
 
     def close_owned_fds(self) -> None:
         """Close parent-side executable authority descriptors after spawn."""
         if self.executable_authority is not None:
             self.executable_authority.close()
+        if self.authority_receipt_handles is not None:
+            self.authority_receipt_handles.close()
 
 
 def build_process_launch(
@@ -52,6 +62,12 @@ def build_process_launch(
     environment: dict[str, str] | None = None,
     expected_identity: str | None = None,
     executable_authority: ExecutableAuthority | None = None,
+    authority_receipt_fd: int | None = None,
+    authority_public_key_fd: int | None = None,
+    require_authority_receipt: bool | None = None,
+    authority_receipt: SignedAuthorizationReceipt | None = None,
+    authority_public_key_path: Path | None = None,
+    authority_capability: EffectCapability | None = None,
 ) -> ProcessLaunch:
     """Compile a safe launch into either the native or explicit dev boundary.
 
@@ -66,24 +82,71 @@ def build_process_launch(
         raise ValueError(
             "preserving directory descriptors requires a directory binding"
         )
+    if (authority_receipt_fd is None) != (authority_public_key_fd is None):
+        raise ValueError("signed authority receipt requires both descriptors")
+    if authority_capability is not None:
+        if authority_receipt is not None:
+            raise ValueError("authority capability and receipt cannot both be supplied")
+        authority_receipt = authority_capability.receipt
+    require_receipt = (
+        os.environ.get("KHAOS_DEV_MODE") != "1"
+        if require_authority_receipt is None
+        else require_authority_receipt
+    )
+    if not require_receipt and os.environ.get("KHAOS_DEV_MODE") != "1":
+        raise PermissionError(
+            "production native execution cannot disable authority receipts"
+        )
+    if authority_receipt_fd is not None:
+        require_receipt = True
+    receipt_handles: AuthorityReceiptFDs | None = None
+    if authority_receipt is not None:
+        if authority_receipt_fd is not None or authority_public_key_fd is not None:
+            raise ValueError(
+                "signed authority receipt cannot mix object and descriptor inputs"
+            )
+        if authority_public_key_path is None:
+            raise PermissionError("authority public-key trust anchor is required")
+        receipt_handles = open_authority_receipt_fds(
+            authority_receipt, authority_public_key_path
+        )
+        authority_receipt_fd, authority_public_key_fd = receipt_handles.pass_fds
+        require_receipt = True
     if os.name != "posix":
         raise PermissionError(
             "host execution resource and directory guarantees are unsupported on this platform"
         )
     owned_authority = executable_authority
-    if owned_authority is None:
-        owned_authority = open_executable_authority(
-            command_tuple,
-            environment,
-            expected_identity=expected_identity,
-        )
+    try:
+        if owned_authority is None:
+            owned_authority = open_executable_authority(
+                command_tuple,
+                environment,
+                expected_identity=expected_identity,
+            )
+    except BaseException:
+        if receipt_handles is not None:
+            receipt_handles.close()
+        raise
     launcher = _find_launcher()
     development = launcher is None and os.environ.get("KHAOS_DEV_MODE") == "1"
     if launcher is None and not development:
         owned_authority.close()
+        if receipt_handles is not None:
+            receipt_handles.close()
         raise PermissionError(
             "native execution launcher is required; build khaos-exec-launcher "
             "or set KHAOS_DEV_MODE=1 for an explicit development fallback"
+        )
+    if require_receipt and (
+        authority_receipt is None
+        and (authority_receipt_fd is None or authority_public_key_fd is None)
+    ):
+        owned_authority.close()
+        if receipt_handles is not None:
+            receipt_handles.close()
+        raise PermissionError(
+            "production native execution requires a signed authority receipt"
         )
     args = [launcher] if launcher is not None else [sys.executable, "-m", "khaos.coding.execution.native_launcher_runtime"]
     args.append("--new-session")
@@ -146,16 +209,36 @@ def build_process_launch(
             args.extend(("--interpreter-argv0", owned_authority.interpreter_argv0))
         for interpreter_arg in owned_authority.interpreter_args:
             args.extend(("--interpreter-arg", interpreter_arg))
+    if require_receipt:
+        assert authority_receipt_fd is not None
+        assert authority_public_key_fd is not None
+        args.extend(
+            (
+                "--require-authority-receipt",
+                "--authority-receipt-fd",
+                str(authority_receipt_fd),
+                "--authority-public-key-fd",
+                str(authority_public_key_fd),
+            )
+        )
     args.extend(("--", *command_tuple))
+    receipt_fds = (
+        (authority_receipt_fd, authority_public_key_fd)
+        if authority_receipt_fd is not None and authority_public_key_fd is not None
+        else ()
+    )
     return ProcessLaunch(
         argv=tuple(args),
         cwd=(None if directory_binding is not None else str(cwd)),
         pass_fds=(
             (directory_binding.pass_fds if directory_binding is not None else ())
             + owned_authority.pass_fds
+            + receipt_fds
         ),
         start_new_session=False,
         executable_authority=owned_authority,
+        authority_receipt_handles=receipt_handles,
+        authority_capability=authority_capability,
     )
 
 

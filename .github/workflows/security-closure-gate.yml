@@ -91,7 +91,10 @@ jobs:
           python scripts/generate_security_inventory.py --check
           python scripts/check_privileged_spawn_sites.py --check
           python scripts/generate_browser_kernel_protocol.py --check
-          python -m pytest python/tests/security/test_schema_fuzz.py -q -v
+          python -m pytest \
+            python/tests/security/test_schema_fuzz.py \
+            python/tests/security/test_privileged_spawn_verifier.py \
+            -q -v
           python scripts/build_security_closure_evidence.py test-fragment \
             --commit "$GITHUB_SHA" --run-id "$GITHUB_RUN_ID" \
             --job closure-adversarial --test schema_injection \

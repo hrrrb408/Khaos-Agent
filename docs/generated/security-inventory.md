@@ -32,7 +32,7 @@
 
 ## GitHub Actions governance
 
-- Workflow action references inspected: `77`; immutable SHA-pinned/local references: `77`.
+- Workflow action references inspected: `79`; immutable SHA-pinned/local references: `79`.
 - Unpinned third-party actions (must remain empty): none.
 - Security-sensitive paths are covered by `.github/CODEOWNERS`; the repository reference ruleset preserves sole-maintainer liveness, so independent approval remains an external release prerequisite and is not verified locally.
 
@@ -54,17 +54,22 @@
 - `python/khaos/coding/execution/authority.py`: `abce06886df49008a109a1a89391ea0ca0f8b029f79e764c8ae29aeec5d82ae5`
 - `python/khaos/coding/execution/identity.py`: `5f159cf59788242902e0010bd59a05a2f7c14dd2f8251f62cafa2a1c3cc5e265`
 - `python/khaos/coding/execution/models.py`: `8f165d586928c0cd95823b9008777b4b35281c4202c9847c9994c3d2258f6579`
-- `python/khaos/coding/execution/native_launcher.py`: `4c27b61db7c7c0be2319a55c909b4d17658b563c74d70d8217f00387a5b2cf07`
+- `python/khaos/coding/execution/native_launcher.py`: `e0ac3ed2a3f253b316c6cf262caac22e781c28eaa2076514784daddbb2539fc0`
 - `python/khaos/coding/execution/platform.py`: `e950b1ab69fcc4b32d92555cfbf9b494102a7aa2801b755b35364ee860d2df0b`
 - `python/khaos/coding/execution/service.py`: `2f0ac90a3ee9955d911e53b63e3a8e4f8725315a483e8419439a2abf290b9736`
 - `python/khaos/coding/execution/binding.py`: `99f3d8eb14d80a837ecf0f0d076d556ccdb366b8798c9e0fde6c69d0bb1a5501`
-- `python/khaos/coding/execution/supervisor.py`: `e1fdbdcd535a5e531b7dd166ff69aa507d0e1ea23d2dbb68985d6f5220d03170`
-- `python/khaos/coding/workspace/manager.py`: `dd6d5b6dde42f12121bd8071c4a75ef501892464409389c929f7c6e7db71ea3a`
-- `python/khaos/coding/workspace/trusted_git.py`: `ea9a2eac346357d86c316df7f3749342bde5ea2ad129d5f646d3661aa2462831`
+- `python/khaos/coding/execution/supervisor.py`: `c35665a24782aa1e37ce99d1376b81627705de72328e21ab3a558a92a3131578`
+- `python/khaos/coding/workspace/manager.py`: `bd518589d4d1daa7861438f7f6c0d2c7a0786abf2aa8815f16b02e1c515a0d4c`
+- `python/khaos/coding/workspace/trusted_git.py`: `8fc59d736bff785248d30d9f38adfc63aecc318101e81815e4992b956ccff1c5`
 - `python/khaos/security/authority.py`: `512b1af6ac43568352f58f4aa8bca0d490f102aabcbf54bd366ad56b55129495`
-- `python/khaos/security/authority_broker.py`: `2a693daafedf9802bddd37628a7179ec1f33685b9b0bd173e05341b30d9de010`
+- `python/khaos/security/authority_broker.py`: `58f21cf470b12392de28e57bc38e4e8a353fc8647f3e953ca67a0d242c57548c`
+- `python/khaos/security/authorityd.py`: `9fc3c2ccd35301b217c0c0656de74fd88ba39f89ef32515e50b9c76082914524`
+- `python/khaos/security/authorityd_protocol.py`: `798b9502e51f886e06c67c41948ade18a4644c130a83a20404a562e3b42ea424`
+- `python/khaos/security/identity_isolation.py`: `9068df0b9e7a228f2f7534c7114311e843db44ecf57d60d4fa7e402802da658d`
+- `python/khaos/security/remote_audit.py`: `58a5d9a35c8446304a17e99ab6d3b20b52d9197e47a53372ac567867794207b2`
 - `python/khaos/security/network_broker.py`: `5dc51bf1257252d5ba9347573ccf3501c32a0658c03e7cf6bd1c49dff2ed48f9`
-- `rust/khaos-core/src/bin/khaos-exec-launcher.rs`: `d1d61d338a35d863e127284eccfe0ed5ef32f7e2b51f17bad7b8e7b737ab29da`
+- `python/khaos/coding/workspace/boundary.py`: `e1a310f3bfe2b1ca085f02be14b11f35dd1b52e923c7a2893bb5a68b9a3ff91e`
+- `rust/khaos-core/src/bin/khaos-exec-launcher.rs`: `a793acd7f687ab159df34fc4e1dfe492d64d49ba9bedd2f74c46846483841cd4`
 - `rust/khaos-core/src/bin/khaos-sandbox-launcher.rs`: `523e5dafa9037093d624bda6ebc2c56a5b4b7ab4d8c4cfd353834928b34ad6cb`
 - `python/khaos/grpc_server.py`: `595a2f38072d0153c43d1e703be197156c82a38105c2a8340734becac505d8ec`
 - `go/internal/api/handler.go`: `119a049cdc45ea2c949f558a179752edaa30409a744f3f352e888e7e829343f3`

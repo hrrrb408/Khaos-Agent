@@ -57,6 +57,7 @@ include-package-data = true
 
 [project.scripts]
 khaos = "khaos.cli.main:main"
+khaos-authorityd = "khaos.security.authorityd_main:main"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

@@ -154,6 +154,91 @@ class SafeWorkspaceFS:
         finally:
             parent.close()
 
+    def lstat(self, target: str | Path) -> os.stat_result | None:
+        """Read one leaf identity without following a symlink."""
+        relative = self.relative(target)
+        parent = self._parent(relative)
+        try:
+            info = parent.lstat()
+            parent.revalidate()
+            return info
+        finally:
+            parent.close()
+
+    def open_regular_file(
+        self, target: str | Path
+    ) -> tuple[int, os.stat_result]:
+        """Open one regular file through a no-follow parent dirfd.
+
+        The returned descriptor is the authority for subsequent reads.  The
+        pathname is not handed to a second process, so replacing the leaf or
+        any parent directory after this method returns cannot redirect the
+        reader.  Callers must close the descriptor and revalidate it with
+        ``os.fstat`` after consuming the file.
+        """
+        relative = self.relative(target)
+        parent = self._parent(relative)
+        try:
+            info = parent.lstat()
+            if info is None:
+                raise FileNotFoundError(relative)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise WorkspaceBoundaryError(
+                    "target is not a single-link regular file"
+                )
+            descriptor = os.open(
+                parent.leaf,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent.parent_fd,
+            )
+            try:
+                opened = os.fstat(descriptor)
+                if (
+                    opened.st_dev,
+                    opened.st_ino,
+                    opened.st_mode,
+                    opened.st_nlink,
+                ) != (
+                    info.st_dev,
+                    info.st_ino,
+                    info.st_mode,
+                    info.st_nlink,
+                ):
+                    raise WorkspaceBoundaryError(
+                        "target identity changed while opening"
+                    )
+                parent.revalidate()
+                return descriptor, opened
+            except Exception:
+                os.close(descriptor)
+                raise
+        except (OSError, SafePathError) as exc:
+            raise WorkspaceBoundaryError(str(exc)) from exc
+        finally:
+            parent.close()
+
+    def read_symlink_bytes(
+        self, target: str | Path, *, max_bytes: int = 4096
+    ) -> tuple[bytes, os.stat_result]:
+        """Read a symlink target through fixed parent dirfds."""
+        relative = self.relative(target)
+        parent = self._parent(relative)
+        try:
+            info = parent.lstat()
+            if info is None or not stat.S_ISLNK(info.st_mode):
+                raise WorkspaceBoundaryError("target is not a symlink")
+            raw = os.fsencode(
+                os.readlink(parent.leaf, dir_fd=parent.parent_fd)
+            )
+            if len(raw) > max_bytes or b"\0" in raw:
+                raise WorkspaceBoundaryError("symlink target exceeds its bound")
+            parent.revalidate()
+            return raw, info
+        except (OSError, SafePathError) as exc:
+            raise WorkspaceBoundaryError(str(exc)) from exc
+        finally:
+            parent.close()
+
     def snapshot_file(
         self,
         target: str | Path,
