@@ -6,6 +6,8 @@ from pathlib import Path
 
 import khaos.coding.execution.supervisor as supervisor_module
 import pytest
+
+pytestmark = pytest.mark.posix_host
 from khaos.coding.execution import (
     ExecutionRequest,
     ExecutionResult,

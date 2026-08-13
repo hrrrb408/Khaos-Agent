@@ -1,5 +1,7 @@
 """P1-4 typed persistent permission resource rules."""
 
+import os
+
 import pytest
 from types import SimpleNamespace
 from pathlib import Path
@@ -49,7 +51,7 @@ async def test_filesystem_root_rule_is_typed_and_scoped(tmp_path):
     assert rule.resource_spec == {
         "operation": "read",
         "recursive": True,
-        "root": "/repo/src",
+        "root": os.path.realpath("/repo/src"),
     }
     allowed = await engine.check(
         "read_file", {"path": "/repo/src/main.py"}, "read", "coding",

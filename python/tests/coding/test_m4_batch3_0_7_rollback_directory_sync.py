@@ -7,6 +7,8 @@ import threading
 
 import pytest
 
+pytestmark = pytest.mark.posix_host
+
 from test_m4_batch3_0_6_rollback_ownership import (
     _crash_after_applied,
     _restart_runtime,

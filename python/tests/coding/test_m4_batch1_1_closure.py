@@ -73,6 +73,7 @@ def _make_service(store, tmp_path: Path, *, repo_id: str = "repo", **kwargs):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
+@pytest.mark.posix_host
 async def test_01_ordinary_index_ts_import_is_not_deterministic_reexport(tmp_path: Path):
     """A plain ``import {x} from './index.ts'`` is a reverse-import, not a re-export."""
     files = {
@@ -204,6 +205,7 @@ async def test_05_reverse_import_vs_reexport_not_confused(tmp_path: Path):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
+@pytest.mark.posix_host
 async def test_06_python_verification_only_for_python(planner):
     """Python pytest must only appear for Python-affected plans."""
     service, _ = planner
@@ -219,6 +221,7 @@ async def test_06_python_verification_only_for_python(planner):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
+@pytest.mark.posix_host
 async def test_07_go_verification_uses_go_test(planner):
     """Go plans must include ``go test`` from go.mod provenance."""
     service, _ = planner
@@ -236,6 +239,7 @@ async def test_07_go_verification_uses_go_test(planner):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
+@pytest.mark.posix_host
 async def test_08_rust_verification_uses_cargo(planner):
     """Rust plans must include ``cargo test`` or ``cargo check`` from Cargo.toml."""
     service, _ = planner
@@ -253,6 +257,7 @@ async def test_08_rust_verification_uses_cargo(planner):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
+@pytest.mark.posix_host
 async def test_09_js_ts_script_must_exist(planner):
     """Only npm scripts that exist in package.json may be generated."""
     service, _ = planner
@@ -269,6 +274,7 @@ async def test_09_js_ts_script_must_exist(planner):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
+@pytest.mark.posix_host
 async def test_10_legacy_command_no_cross_language_propagation(tmp_path: Path):
     """A server rule without ``language`` must NOT propagate to any language."""
     files = {
@@ -299,6 +305,7 @@ async def test_10_legacy_command_no_cross_language_propagation(tmp_path: Path):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
+@pytest.mark.posix_host
 async def test_11_config_hash_drift_makes_plan_stale(tmp_path: Path):
     """Changing a config file after planning must invalidate the plan."""
     files = {
@@ -336,6 +343,7 @@ def test_12_planning_service_does_not_access_store_conn():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
+@pytest.mark.posix_host
 async def test_13_leaf_planning_detects_full_table_scan(tmp_path: Path):
     """Leaf planning must not enumerate all code_files — proved by sql_rows_returned."""
     for i in range(200):
@@ -376,6 +384,7 @@ async def test_13_leaf_planning_detects_full_table_scan(tmp_path: Path):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
+@pytest.mark.posix_host
 async def test_14_unified_budget_covers_all_impact_sources(tmp_path: Path):
     """All impact sources (callers, references, reverse imports, re-exports,
     test associations) must share a single budget and respect its limits."""

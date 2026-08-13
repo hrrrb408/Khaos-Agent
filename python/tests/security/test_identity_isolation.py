@@ -6,6 +6,8 @@ import os
 from pathlib import Path
 
 import pytest
+
+pytestmark = pytest.mark.posix_host
 from khaos.security.identity_isolation import (
     AuthorityIdentityContract,
     IdentityIsolationError,

@@ -133,9 +133,20 @@ def _path_from_file_uri(uri: str) -> Path:
         )
 
     decoded_path = unquote(parsed.path)
-    hostname = parsed.netloc.lower()
-    if hostname and hostname != "localhost":
-        decoded_path = f"//{parsed.netloc}{decoded_path}"
+    decoded_netloc = unquote(parsed.netloc)
+    hostname = decoded_netloc.lower()
+    if (
+        os.name == "nt"
+        and len(decoded_netloc) >= 2
+        and decoded_netloc[1] == ":"
+    ):
+        # Some Windows LSP clients emit the legacy form
+        # ``file://C:\\worktree\\file.py`` instead of the RFC 8089 form
+        # ``file:///C:/worktree/file.py``.  urlparse places that drive path
+        # in ``netloc``; treating it as a UNC host creates ``\\\\C:\\...``.
+        decoded_path = f"{decoded_netloc}{decoded_path}"
+    elif hostname and hostname != "localhost":
+        decoded_path = f"//{decoded_netloc}{decoded_path}"
     elif (
         os.name == "nt"
         and len(decoded_path) >= 3

@@ -20,6 +20,7 @@ from khaos.coding.execution import (
 )
 from khaos.coding.planning.safe_workspace_path import SafePathError
 from khaos.coding.workspace.boundary import SafeWorkspaceFS
+from khaos.skills import SkillLoader, SkillParseError
 
 pytestmark = [
     pytest.mark.windows_fail_closed,
@@ -116,3 +117,14 @@ def test_windows_workspace_mutation_refuses_missing_dirfd_capability(tmp_path):
         SafeWorkspaceFS(tmp_path)
 
     assert not target.exists()
+
+
+def test_windows_skill_loader_refuses_without_native_no_follow(tmp_path):
+    skill = tmp_path / "SKILL.md"
+    skill.write_text(
+        "---\nname: windows-skill\ndescription: test skill\n---\nbody\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SkillParseError, match="no-follow"):
+        SkillLoader().load_file(skill)

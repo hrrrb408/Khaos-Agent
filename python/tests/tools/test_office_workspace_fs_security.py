@@ -2,6 +2,8 @@ import os
 
 import pytest
 
+pytestmark = pytest.mark.posix_host
+
 from khaos.coding.workspace.boundary import (
     DEFAULT_FILE_TOOL_BYTES,
     SafeWorkspaceFS,

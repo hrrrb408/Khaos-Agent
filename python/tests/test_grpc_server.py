@@ -31,6 +31,7 @@ from khaos.grpc_server import (
 )
 from khaos.channels import ChannelType, PlatformMessage, Sender
 from khaos.runtime import RequestContext
+from khaos.runtime.context import local_principal_id
 
 
 def _test_ctx(*, principal_id: str = "", session_id: str = "") -> RequestContext:
@@ -376,7 +377,7 @@ async def test_agent_service_permission_waits_for_confirm(tmp_path):
             permission["data"]["id"],
             True,
             False,
-            principal_id=f"local-uid:{os.getuid()}",
+            principal_id=local_principal_id(),
             binding_digest=permission["data"]["binding_digest"],
         )
     )
@@ -386,7 +387,7 @@ async def test_agent_service_permission_waits_for_confirm(tmp_path):
     assert any(event["event"] == "tool_result" and event["data"]["success"] for event in events)
     # C-1-5a: AgentService no longer holds a server-level task_manager.
     # Query the DB directly to find the per-turn task's worktree_path.
-    tasks = await db.list_coding_tasks(principal_id=f"local-uid:{os.getuid()}")
+    tasks = await db.list_coding_tasks(principal_id=local_principal_id())
     assert len(tasks) == 1
     target_path = tasks[0].get("metadata", {}).get("worktree_path")
     from pathlib import Path

@@ -135,6 +135,14 @@ class SkillLoader:
         shipped skills) so the prompt renderer can mark untrusted sources.
         """
         path = Path(path)
+        if os.name == "nt" and not hasattr(os, "O_NOFOLLOW"):
+            # Following a reparse point here could redirect an untrusted
+            # skill outside its declared root. Until a Windows native
+            # no-follow handle path is available, fail closed instead of
+            # silently degrading to ordinary ``open`` semantics.
+            raise SkillParseError(
+                f"{path}: secure open failed: Windows no-follow handle support is unavailable"
+            )
         flags = os.O_RDONLY
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
@@ -273,6 +281,17 @@ class SkillLoader:
         budget_exceeded = False
         try:
             with os.scandir(root) as entries:
+                # ``SKILL.md`` is the conventional root entry. Probe it
+                # explicitly before consuming the bounded directory stream;
+                # otherwise a large attacker-controlled prefix of noise
+                # entries can hide the root skill behind the scan cap.
+                conventional = root / "SKILL.md"
+                if (
+                    conventional.is_file()
+                    and not conventional.is_symlink()
+                    and _is_skill_filename(conventional)
+                ):
+                    top_level.append(conventional)
                 for entry in entries:
                     entries_scanned += 1
                     global_entry_budget[0] += 1
@@ -283,6 +302,8 @@ class SkillLoader:
                         budget_exceeded = True
                         break
                     entry_path = Path(entry.path)
+                    if entry_path == conventional:
+                        continue
                     if entry.is_file(follow_symlinks=False) and _is_skill_filename(entry_path):
                         top_level.append(entry_path)
                     elif entry.is_dir(follow_symlinks=False):

@@ -9,6 +9,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+
+pytestmark = pytest.mark.posix_host
 from khaos.agent.approval import ApprovalBroker
 from khaos.coding.execution.host import HostExecutionBackend
 from khaos.coding.execution.models import ExecutionResult, NetworkPolicy

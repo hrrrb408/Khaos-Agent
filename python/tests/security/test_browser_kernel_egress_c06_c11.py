@@ -22,6 +22,8 @@ from urllib.parse import urlsplit
 
 import pytest
 
+pytestmark = pytest.mark.posix_host
+
 from khaos.security.browser_egress_proxy import (
     BrowserEgressProxy,
     _ByteLimitExceeded,

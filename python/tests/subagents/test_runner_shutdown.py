@@ -23,11 +23,16 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from unittest.mock import MagicMock
+
+import pytest
+
 from khaos.db import Database
 from khaos.modes import ModeManager
 from khaos.runtime import RuntimeCleanupAuthority
 from khaos.subagents.runner import SubAgentRunner
 from khaos.subagents.spawner import SubAgentConfig, SubAgentSpawner, SubAgentTask
+
+pytestmark = pytest.mark.posix_host
 
 
 async def _build_runner(

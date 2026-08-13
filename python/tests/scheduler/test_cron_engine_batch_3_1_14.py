@@ -27,6 +27,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.posix_host
+
 from khaos.db import Database
 from khaos.exceptions import ServiceShutdownError
 from khaos.scheduler import CronEngine, ScheduleConfig, ScheduledTask, TaskStatus

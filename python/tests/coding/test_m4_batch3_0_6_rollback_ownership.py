@@ -10,6 +10,8 @@ from dataclasses import replace
 
 import pytest
 
+pytestmark = pytest.mark.posix_host
+
 from _m4_batch2_helpers import FakeContextProvider, SyncBroker
 from test_m4_batch2_5_runtime_authority import DeepFakePlanningService
 from test_m4_batch2_8_boot_scope_closure import _real_runtime

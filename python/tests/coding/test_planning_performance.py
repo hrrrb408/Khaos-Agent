@@ -14,6 +14,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.posix_host
+
 from khaos.coding.intelligence.index import IndexStore, RepositoryIndexer
 from khaos.coding.intelligence.query import CodeQueryService
 from khaos.coding.intelligence.resolution.service import ResolutionService

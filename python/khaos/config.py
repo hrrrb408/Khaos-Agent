@@ -31,6 +31,18 @@ USER_CONFIG_PATH = Path("~/.khaos/config.yaml")
 PROJECT_CONFIG_PATH = Path("config.yaml")
 
 
+def _user_config_path() -> Path:
+    """Resolve the user config using the current process environment.
+
+    ``Path('~').expanduser()`` follows ``USERPROFILE`` on Windows and does
+    not honor a deployment/test-provided ``HOME`` override. Khaos treats
+    HOME as its portable configuration root, so use it explicitly and fall
+    back to the platform's normal home lookup.
+    """
+    home = os.environ.get("HOME") or str(Path.home())
+    return Path(home) / ".khaos" / "config.yaml"
+
+
 class ConfigAuthority(Enum):
     """Authorities that may contribute effective configuration fields."""
 
@@ -396,7 +408,7 @@ def set_nested_value(config: dict[str, Any], dotted_key: str, value: Any) -> Non
 
 def user_config_path() -> Path:
     """Return the current user's config path."""
-    return USER_CONFIG_PATH.expanduser()
+    return _user_config_path()
 
 
 def config_for_models(config: dict[str, Any], model_names: set[str]) -> dict[str, Any]:

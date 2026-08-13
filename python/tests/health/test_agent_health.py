@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import pytest
 from khaos.db import Database
 from khaos.grpc_server import AgentService
+
+pytestmark = pytest.mark.posix_host
 
 
 async def test_agent_service_health_checks_real_dependencies(tmp_path):

@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.posix_host
+
 from _m4_batch2_helpers import verification
 from test_m4_batch3_0_workspace_mutation import (
     _apply, _authorize, _bundle, _hash, _plan, _workspace,

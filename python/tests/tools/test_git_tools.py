@@ -5,6 +5,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+pytestmark = pytest.mark.posix_host
+
 from khaos.tools.git_tools import (
     git_branch,
     git_commit,

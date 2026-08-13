@@ -14,6 +14,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.posix_host
+
 from _m4_batch2_helpers import high_risk, make_plan
 from test_m4_batch2_8_boot_scope_closure import (
     _mint_unapplied,

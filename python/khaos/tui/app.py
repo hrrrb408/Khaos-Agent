@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import threading
 import time
 import uuid
@@ -24,6 +23,7 @@ from khaos.db import Database
 from khaos.db.state_root import project_id as compute_project_id
 from khaos.memory import MemoryManager
 from khaos.modes import ModeManager
+from khaos.runtime.context import local_principal_id
 from khaos.skills import SkillManager
 from khaos.tools import create_runtime_registry
 from khaos.tui.chat_panel import ChatPanel
@@ -174,7 +174,7 @@ class KhaosApp(App):
         # mode switches are principal-scoped (matching the runtime below).
         self.mode_manager = ModeManager(
             self.db, project_root=self.project_root,
-            principal_id=f"local-uid:{os.getuid()}",
+            principal_id=local_principal_id(),
             project_id=self._tui_project_id,
         )
         await self.mode_manager.load()
@@ -182,7 +182,7 @@ class KhaosApp(App):
             await self.mode_manager.switch(ModeManager.parse(self.mode_override))
         await self.db.create_session(
             self.session_id, self.mode_manager.current_mode.value,
-            principal_id=f"local-uid:{os.getuid()}",
+            principal_id=local_principal_id(),
             # M4 batch 3.1.16A-5-1b: stamp the project identity on every
             # TUI session row.  ``self._tui_project_id`` is computed once
             # in ``__init__`` (or here on first use) from the TUI's
@@ -217,7 +217,7 @@ class KhaosApp(App):
             confirm_callback=self._confirm_callback,
             coding_context_builder=self._build_coding_context_builder(),
             skill_manager=self.skill_manager,
-            principal_id=f"local-uid:{os.getuid()}",
+            principal_id=local_principal_id(),
             # M4 batch 3.1.16A-5-1b: pass the cached project identity so
             # the runtime's AgentLoop._bound_project_id matches the
             # session row's stamp above.
@@ -498,7 +498,7 @@ class KhaosApp(App):
             asyncio.ensure_future(
                 self.db.create_session(
                     self.session_id, self.mode_manager.current_mode.value,
-                    principal_id=f"local-uid:{os.getuid()}",
+                    principal_id=local_principal_id(),
                     # M4 batch 3.1.16A-5-1b: stamp the cached project
                     # identity (see ``_tui_project_id``).
                     project_id=self._tui_project_id,

@@ -725,6 +725,7 @@ def test_20_batch3_stubs_refuse_context_after_cancel_or_shutdown(scenario):
 # ===========================================================================
 
 
+@pytest.mark.posix_host
 def test_21_manager_adapter_calls_coordinator():
     """TaskManager.cancel and WorkspaceManager.cleanup invoke the
     lease-invalidation hook registered by the Coordinator."""

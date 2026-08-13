@@ -376,6 +376,7 @@ def _resolved(
     )
 
 
+@pytest.mark.posix_host
 async def test_docker_backend_builds_hardened_fixed_argv(tmp_path):
     backend = _InspectableDockerBackend()
     process = _FakeProcess()
@@ -449,6 +450,7 @@ async def test_docker_backend_prepares_concrete_daemon_and_hardening_decision(tm
     assert decision.command_digest
 
 
+@pytest.mark.posix_host
 async def test_docker_deleted_open_file_watchdog_maps_to_resource_violation(tmp_path):
     backend = _InspectableDockerBackend()
     process = _FakeProcess(returncode=173)
@@ -564,6 +566,7 @@ async def test_docker_backend_rejects_untrusted_resolved_context(tmp_path, viola
         await backend.execute_resolved(context)
 
 
+@pytest.mark.posix_host
 async def test_docker_backend_timeout_cleanup_output_truncation_and_shutdown(tmp_path):
     backend = _InspectableDockerBackend()
     budget = ResourceBudget(timeout_seconds=0.01, output_bytes=4)

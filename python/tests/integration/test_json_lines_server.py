@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.posix_host
+
 from khaos.db import Database
 from khaos.grpc_server import AgentService, ChatRequest
 from khaos.runtime import RequestContext

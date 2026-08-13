@@ -51,6 +51,7 @@ def _intent() -> AuthorizationIntent:
     )
 
 
+@pytest.mark.posix_host
 def test_authorityd_prepare_and_complete_are_two_phase(tmp_path: Path) -> None:
     key = Ed25519KeyStore.load_or_create(
         tmp_path / "khaos-authorityd-test-key.pem", create=True
@@ -83,6 +84,7 @@ def test_production_daemon_requires_independent_audit_writer(tmp_path: Path) -> 
         )
 
 
+@pytest.mark.posix_host
 def test_production_daemon_requires_its_compiled_policy_digest(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -173,6 +175,7 @@ def test_daemon_broker_uses_signed_receipts_and_reissues_narrowly(tmp_path: Path
         broker.validate(narrowed, expected_operation="git.update-ref")
 
 
+@pytest.mark.posix_host
 def test_native_launcher_receives_only_verified_receipt_fds(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -11,6 +11,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.posix_host
+
 from khaos.security.kernel_helper_client import (
     KernelAuthorityClient,
     KernelHelperRejected,

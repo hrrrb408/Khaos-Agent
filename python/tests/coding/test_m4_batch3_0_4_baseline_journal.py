@@ -2,6 +2,8 @@
 import unicodedata
 import pytest
 
+pytestmark = pytest.mark.posix_host
+
 from khaos.coding.planning.safe_identifiers import (
     SafeRecoveryArtifactName, SafeRecoveryRunId, SafeWorkspaceRelativePath,
     UnsafePersistedIdentifier,

@@ -377,6 +377,7 @@ def _parse_migrate_args(argv: list[str]):
     return parser.parse_args(argv)
 
 
+@pytest.mark.posix_host
 async def test_acceptance_13_cli_dry_run_makes_no_writes(tmp_path, monkeypatch, capsys):
     """A5-2 #13: ``cmd_migrate --dry-run`` makes no writes.
 
@@ -420,6 +421,7 @@ async def test_acceptance_13_cli_dry_run_makes_no_writes(tmp_path, monkeypatch, 
         await db.close()
 
 
+@pytest.mark.posix_host
 async def test_acceptance_14_cli_yes_writes_and_prints_counts(tmp_path, monkeypatch, capsys):
     """A5-2 #14: ``cmd_migrate --yes`` writes and prints per-table counts.
 
@@ -461,6 +463,7 @@ async def test_acceptance_14_cli_yes_writes_and_prints_counts(tmp_path, monkeypa
         await db.close()
 
 
+@pytest.mark.posix_host
 def test_acceptance_15_cli_no_subcommand_prints_usage_and_returns_2(
     tmp_path, monkeypatch, capsys,
 ):

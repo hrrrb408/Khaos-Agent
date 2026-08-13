@@ -6,6 +6,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from khaos.cli.main import build_command_parser, cmd_start
 
 
@@ -53,6 +55,7 @@ def test_chat_parser_exposes_interactive_options():
     assert args.yes is True
 
 
+@pytest.mark.posix_host
 def test_managed_gateway_receives_capability_by_inherited_fd(
     tmp_path, monkeypatch,
 ):

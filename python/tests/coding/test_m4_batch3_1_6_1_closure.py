@@ -11,6 +11,8 @@ from dataclasses import replace
 
 import pytest
 
+pytestmark = pytest.mark.posix_host
+
 from test_m4_batch3_1_trusted_verification import (
     _ConfigurableExitBackend,
     _cleanup_proof,

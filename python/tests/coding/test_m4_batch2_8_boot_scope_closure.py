@@ -8,6 +8,8 @@ from dataclasses import replace
 
 import pytest
 
+pytestmark = pytest.mark.posix_host
+
 from _m4_batch2_helpers import FakeContextProvider, SyncBroker, high_risk, make_plan
 from test_m4_batch2_5_runtime_authority import DeepFakePlanningService
 from khaos.coding.intelligence.index.repository import RepositoryIndexer

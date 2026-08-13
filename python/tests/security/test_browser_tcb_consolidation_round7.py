@@ -24,6 +24,8 @@ from unittest.mock import patch
 
 import pytest
 
+pytestmark = pytest.mark.posix_host
+
 from khaos.security.browser_sandbox import (
     BrowserNetworkSandbox,
     EnforcementStatus,

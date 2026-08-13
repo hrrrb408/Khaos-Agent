@@ -3,6 +3,8 @@ import subprocess
 from pathlib import Path
 
 import pytest
+
+pytestmark = pytest.mark.posix_host
 from khaos.coding.workspace import manager as workspace_manager_module
 from khaos.coding.workspace.boundary import PROTECTED_WORKSPACE_NAMES
 from khaos.coding.workspace.git_identity import GitIdentityError

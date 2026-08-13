@@ -8,6 +8,8 @@ import sys
 from pathlib import Path
 
 import pytest
+
+pytestmark = pytest.mark.posix_host
 from khaos.coding.workspace.boundary import SafeWorkspaceFS
 from khaos.coding.workspace.trusted_git import (
     TrustedGitError,
