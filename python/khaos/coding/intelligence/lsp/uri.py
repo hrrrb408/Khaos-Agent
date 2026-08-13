@@ -21,7 +21,8 @@ Rejected conditions:
 """
 from __future__ import annotations
 
-from pathlib import Path, PurePosixPath
+import os
+from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 
@@ -69,23 +70,7 @@ def map_lsp_uri_to_workspace_path(
         WorkspaceEscapeError: Path is outside the active workspace.
         SymlinkEscapeError: A symlink target escapes the workspace.
     """
-    parsed = urlparse(uri)
-    if parsed.scheme != "file":
-        raise NonFileUriError(
-            "non-file-uri",
-            f"LSP URI must be a file URI, got scheme {parsed.scheme!r}",
-        )
-
-    # Percent-decode the path component. urlparse already splits the path,
-    # but does NOT decode percent-encoding — we do that explicitly to handle
-    # Unicode filenames and spaces.
-    decoded_path = unquote(parsed.path)
-
-    # On macOS, file URIs for the root disk may carry a leading empty
-    # component (e.g. ``file:///Users/...`` → path ``/Users/...``), which
-    # is correct. On Windows the path would include a drive letter; we do
-    # not support Windows LSP URIs in this iteration.
-    raw = Path(decoded_path)
+    raw = _path_from_file_uri(uri)
 
     # Reject ``..`` traversal before resolution. ``resolve()`` would
     # neutralise it, but we want an explicit rejection so callers know
@@ -135,13 +120,33 @@ def workspace_root_from_uri(uri: str) -> Path:
     Used by callers that need the raw decoded path for logging before
     applying boundary checks via :func:`map_lsp_uri_to_workspace_path`.
     """
+    return _path_from_file_uri(uri)
+
+
+def _path_from_file_uri(uri: str) -> Path:
+    """Decode a local or UNC file URI using the host platform's path rules."""
     parsed = urlparse(uri)
     if parsed.scheme != "file":
         raise NonFileUriError(
             "non-file-uri",
             f"LSP URI must be a file URI, got scheme {parsed.scheme!r}",
         )
-    return Path(unquote(parsed.path))
+
+    decoded_path = unquote(parsed.path)
+    hostname = parsed.netloc.lower()
+    if hostname and hostname != "localhost":
+        decoded_path = f"//{parsed.netloc}{decoded_path}"
+    elif (
+        os.name == "nt"
+        and len(decoded_path) >= 3
+        and decoded_path[0] == "/"
+        and decoded_path[2] == ":"
+    ):
+        # ``urlparse('file:///C:/worktree').path`` is ``/C:/worktree``.
+        # The leading slash is URI syntax, not part of the Windows drive
+        # path; retaining it creates the invalid path ``\\C:\\...``.
+        decoded_path = decoded_path[1:]
+    return Path(decoded_path)
 
 
 def _resolve_within_workspace(path: Path, workspace_root: Path) -> Path:
@@ -212,5 +217,6 @@ def _resolve_within_workspace(path: Path, workspace_root: Path) -> Path:
 def path_to_file_uri(path: Path) -> str:
     """Encode an absolute ``Path`` as a ``file:`` URI (for LSP requests)."""
     resolved = path.expanduser().resolve()
-    # PurePosixPath is used to ensure forward slashes regardless of platform.
-    return "file://" + PurePosixPath(str(resolved)).as_posix()
+    # Path.as_uri() handles drive letters, UNC roots, percent-encoding, and
+    # forward slashes correctly on both POSIX and Windows.
+    return resolved.as_uri()

@@ -8,7 +8,6 @@ import logging
 from collections.abc import Awaitable
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import unquote, urlparse
 
 from khaos.coding.execution.cleanup_ledger import CleanupLedger
 from khaos.coding.execution.models import (
@@ -16,6 +15,7 @@ from khaos.coding.execution.models import (
     NetworkPolicy,
     ResourceBudget,
 )
+from khaos.coding.intelligence.lsp.uri import NonFileUriError, workspace_root_from_uri
 
 logger = logging.getLogger(__name__)
 
@@ -623,10 +623,10 @@ class LspClient:
         self._pending.clear()
 
     def _validate_root_uri(self, root_uri: str) -> Path:
-        parsed = urlparse(root_uri)
-        if parsed.scheme != "file":
-            raise ValueError("LSP rootUri must be a file URI")
-        root = Path(unquote(parsed.path)).expanduser().resolve()
+        try:
+            root = workspace_root_from_uri(root_uri).expanduser().resolve()
+        except NonFileUriError as exc:
+            raise ValueError("LSP rootUri must be a file URI") from exc
         workspace = self.execution_service.workspace_manager.get(self.workspace_id)
         if workspace is None or workspace.task_id != self.task_id:
             raise PermissionError("task/workspace binding is invalid")
