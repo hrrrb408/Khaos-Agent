@@ -195,6 +195,19 @@ def test_windows_product_suite_declares_posix_host_applicability_boundary():
     assert "explicitly marked ``posix_host`` tests" in product
 
 
+def test_windows_product_suite_runs_complete_collection_in_isolated_shards():
+    """Windows sharding must isolate resources without shrinking coverage."""
+    product = (WORKFLOWS / "product-integrity-gate.yml").read_text(
+        encoding="utf-8"
+    )
+    runner = (ROOT / "scripts" / "run_windows_product_suite.py").read_text(
+        encoding="utf-8"
+    )
+    assert "scripts/run_windows_product_suite.py --shards 4" in product
+    assert "every test selected by its marker" in runner
+    assert "assigned to exactly one child process" in runner
+
+
 def test_production_docker_image_reference_matches_preload():
     """Production Docker tests and CI must use the same pinned reference."""
     workflow = (WORKFLOWS / "docker-security.yml").read_text(encoding="utf-8")

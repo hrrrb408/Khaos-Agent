@@ -516,7 +516,17 @@ def _open_config_parent(path: Path) -> int:
     Explicit non-user paths remain supported for tests and deployments, but
     their final parent is still created owner-only and opened no-follow.
     """
-    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    if (
+        os.name != "posix"
+        or not hasattr(os, "O_DIRECTORY")
+        or not hasattr(os, "O_NOFOLLOW")
+        or os.open not in getattr(os, "supports_dir_fd", ())
+        or os.mkdir not in getattr(os, "supports_dir_fd", ())
+    ):
+        raise ConfigError(
+            "secure config writes require POSIX dirfd/no-follow support"
+        )
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     target = path.expanduser()
     canonical_user = user_config_path()
     if target == canonical_user:

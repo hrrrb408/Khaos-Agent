@@ -59,7 +59,7 @@
 - `python/khaos/coding/execution/service.py`: `2f0ac90a3ee9955d911e53b63e3a8e4f8725315a483e8419439a2abf290b9736`
 - `python/khaos/coding/execution/binding.py`: `99f3d8eb14d80a837ecf0f0d076d556ccdb366b8798c9e0fde6c69d0bb1a5501`
 - `python/khaos/coding/execution/supervisor.py`: `c35665a24782aa1e37ce99d1376b81627705de72328e21ab3a558a92a3131578`
-- `python/khaos/coding/workspace/manager.py`: `bd518589d4d1daa7861438f7f6c0d2c7a0786abf2aa8815f16b02e1c515a0d4c`
+- `python/khaos/coding/workspace/manager.py`: `0f4f5e74a71cce267a515c477b3c68ffc3c0e1929a1ccdfd81c798d6a4918932`
 - `python/khaos/coding/workspace/trusted_git.py`: `8fc59d736bff785248d30d9f38adfc63aecc318101e81815e4992b956ccff1c5`
 - `python/khaos/security/authority.py`: `512b1af6ac43568352f58f4aa8bca0d490f102aabcbf54bd366ad56b55129495`
 - `python/khaos/security/authority_broker.py`: `58f21cf470b12392de28e57bc38e4e8a353fc8647f3e953ca67a0d242c57548c`
@@ -71,7 +71,7 @@
 - `python/khaos/coding/workspace/boundary.py`: `e1a310f3bfe2b1ca085f02be14b11f35dd1b52e923c7a2893bb5a68b9a3ff91e`
 - `rust/khaos-core/src/bin/khaos-exec-launcher.rs`: `a793acd7f687ab159df34fc4e1dfe492d64d49ba9bedd2f74c46846483841cd4`
 - `rust/khaos-core/src/bin/khaos-sandbox-launcher.rs`: `523e5dafa9037093d624bda6ebc2c56a5b4b7ab4d8c4cfd353834928b34ad6cb`
-- `python/khaos/grpc_server.py`: `2d557b9b174c978c45d0d6f80e7ac42a12dc1a3622f7b7777f230e9c585533c5`
+- `python/khaos/grpc_server.py`: `0841b23878452be967eca270b03ffc23b1f7248916a1af6570810fe4dbab8fc0`
 - `go/internal/api/handler.go`: `119a049cdc45ea2c949f558a179752edaa30409a744f3f352e888e7e829343f3`
 - `go/cmd/gateway/main.go`: `75d14ad26917ddf15ddc38ce75f6bc0a1fcd214909c958849e7ae18054b81ed7`
 - `go/internal/platform/python_client.go`: `c4e68301ae6f54999636c9924bc832e57c46173f69ad852df7963af9d6de9df6`

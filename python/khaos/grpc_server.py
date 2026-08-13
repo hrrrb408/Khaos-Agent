@@ -650,6 +650,10 @@ async def _emergency_instance_cleanup(
 def _load_rpc_capability() -> str:
     path_value = os.environ.get("KHAOS_PYTHON_CAPABILITY_FILE", "").strip()
     if path_value:
+        if os.name != "posix" or not hasattr(os, "O_NOFOLLOW"):
+            raise PermissionError(
+                "protected RPC capability files require POSIX no-follow support"
+            )
         path = Path(path_value).expanduser()
         if not path.is_absolute():
             raise PermissionError("RPC capability file path must be absolute")

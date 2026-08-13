@@ -27,9 +27,14 @@ def discover_orphans(root: Path) -> tuple[OrphanWorkspace, ...]:
     try:
         authority_root = root.resolve(strict=True)
         root_info = authority_root.stat()
+        current_uid = getattr(os, "getuid", None)
+        if current_uid is None:
+            raise TrustedGitError(
+                "recovery root ownership proof requires a POSIX uid API"
+            )
         if (
             not stat.S_ISDIR(root_info.st_mode)
-            or root_info.st_uid != os.getuid()
+            or root_info.st_uid != current_uid()
             or root_info.st_mode & 0o022
         ):
             raise TrustedGitError("recovery root is not a private user-owned directory")

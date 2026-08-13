@@ -237,6 +237,14 @@ def _copy_verified_artifact(
 
 def _open_private_authority_root(configured: Path) -> tuple[Path, FileIdentity]:
     """Create a private root without following attacker-controlled components."""
+    if (
+        os.name != "posix"
+        or not hasattr(os, "O_DIRECTORY")
+        or not hasattr(os, "O_NOFOLLOW")
+    ):
+        raise PermissionError(
+            "private workspace authority roots require POSIX dirfd/no-follow support"
+        )
     missing: list[str] = []
     ancestor = configured
     while not ancestor.exists():

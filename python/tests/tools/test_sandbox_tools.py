@@ -626,6 +626,7 @@ async def test_docker_backend_concurrent_shutdown_joins_shared_task():
     assert backend.terminal_closed
 
 
+@pytest.mark.posix_host
 async def test_docker_backend_shutdown_spawn_barrier_keeps_late_child_owned(tmp_path):
     """Shutdown must wait for a Docker CLI spawn reserved after lease publish."""
     backend = _InspectableDockerBackend()
@@ -644,7 +645,7 @@ async def test_docker_backend_shutdown_spawn_barrier_keeps_late_child_owned(tmp_
         new=delayed_spawn,
     ):
         running = asyncio.create_task(backend.execute_resolved(context))
-        await spawn_entered.wait()
+        await asyncio.wait_for(spawn_entered.wait(), timeout=5)
         assert backend._active
         shutdown = asyncio.create_task(backend.shutdown())
         await asyncio.sleep(0)

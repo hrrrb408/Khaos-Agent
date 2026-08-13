@@ -23,6 +23,11 @@ ACTION_SHA_RE = re.compile(r"^[^@\s]+@[0-9a-f]{40}$")
 IMAGE_DIGEST_RE = re.compile(r"@sha256:[0-9a-f]{64}")
 
 
+def repo_relative(path: Path) -> str:
+    """Render repository paths with stable POSIX separators on every host."""
+    return path.relative_to(ROOT).as_posix()
+
+
 def read(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
@@ -66,7 +71,7 @@ def docker_digests() -> list[tuple[str, str]]:
             continue
         for line_number, line in enumerate(read(path).splitlines(), 1):
             for digest in IMAGE_DIGEST_RE.findall(line):
-                entries.append((f"{path.relative_to(ROOT)}:{line_number}", digest[1:]))
+                entries.append((f"{repo_relative(path)}:{line_number}", digest[1:]))
     return entries
 
 
@@ -79,7 +84,7 @@ def workflow_actions() -> tuple[list[str], list[str]]:
             if not match:
                 continue
             action = match.group(1)
-            location = f"{path.relative_to(ROOT)}:{line_number}"
+            location = f"{repo_relative(path)}:{line_number}"
             if action.startswith("./"):
                 pinned.append(f"{location} {action} (local reusable workflow)")
             elif ACTION_SHA_RE.match(action):
@@ -103,7 +108,7 @@ def render() -> str:
         ROOT / "python" / "requirements-lock.txt",
     ]
     lock_entries = [
-        (str(path.relative_to(ROOT)), sha256(path))
+        (repo_relative(path), sha256(path))
         for path in lockfiles if path.is_file()
     ]
     source_fingerprints = [

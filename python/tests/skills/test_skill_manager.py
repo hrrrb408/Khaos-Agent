@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pathlib import Path
+import pytest
 
 from khaos.skills import Skill, SkillManager, SkillRegistry
 
@@ -107,6 +107,7 @@ def test_match_limit_caps_results():
     assert len(matched) == 3
 
 
+@pytest.mark.posix_host
 def test_load_from_dir_loads_skills(tmp_path):
     skills_dir = tmp_path / "skills"
     skills_dir.mkdir()

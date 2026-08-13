@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import pytest
+
 from khaos.coding.planning.contracts import GoalIntent, ImpactStatus
 from khaos.coding.planning.dag import validate_steps
-from test_planning_contracts import planner  # noqa: F401
+from test_planning_contracts import planner  # noqa: F401, F811
 
 
 def test_goal_classifier_is_explicit_and_rejects_unsafe_path(planner):
@@ -13,6 +15,7 @@ def test_goal_classifier_is_explicit_and_rejects_unsafe_path(planner):
     assert unsafe.diagnostics[0].code == "unsafe-path"
 
 
+@pytest.mark.posix_host
 def test_impact_analysis_is_deterministic_and_bounded(planner):
     service, _ = planner
     plan = service.plan(repository_id="repo", task_id="t", workspace_id="ws", user_goal="modify function public_api", base_sha="abc")
@@ -24,8 +27,9 @@ def test_impact_analysis_is_deterministic_and_bounded(planner):
     assert first.content_hash == second.content_hash
     assert first.truncated or all(edge.status in (ImpactStatus.DIRECT, ImpactStatus.INDIRECT) for edge in first.direct_impacts)
 
+@pytest.mark.posix_host
 def test_case_sensitive_target_and_staged_steps(planner):
-    service, store = planner
+    service, _store = planner
     # M3 evidence is case-sensitive; no casefolded target is queried.
     result = service.classify_goal(repository_id="repo", user_goal="MODIFY function public_api")
     assert result.intents == (GoalIntent.MODIFY_SYMBOL,)
