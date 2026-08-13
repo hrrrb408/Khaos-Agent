@@ -13,7 +13,9 @@ and every collected node id is assigned to exactly one child process.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
+import io
 import os
 import subprocess
 import sys
@@ -55,15 +57,58 @@ class _ShardSelection:
             config.hook.pytest_deselected(items=deselected)
 
 
-def _collect(marker: str) -> tuple[str, ...]:
+def _collect_in_process(marker: str) -> tuple[str, ...]:
     capture = _CollectionCapture()
-    exit_code = pytest.main(
-        [TEST_ROOT, "-m", marker, "--collect-only", "-q", "--disable-warnings"],
-        plugins=[capture],
-    )
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        exit_code = pytest.main(
+            [TEST_ROOT, "-m", marker, "--collect-only", "-q", "--disable-warnings"],
+            plugins=[capture],
+        )
     if exit_code != pytest.ExitCode.OK:
         raise RuntimeError(f"pytest collection failed with exit code {int(exit_code)}")
     return capture.nodeids
+
+
+def _run_collection_child(marker: str) -> int:
+    """Collect nodes in a disposable process and emit a private manifest stream."""
+    try:
+        nodeids = _collect_in_process(marker)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr, flush=True)
+        return 1
+    for nodeid in nodeids:
+        print(f"NODE\t{nodeid}")
+    return 0
+
+
+def _collect(marker: str) -> tuple[str, ...]:
+    """Collect in a process that exits before any test shard is launched."""
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--collect",
+            "--marker",
+            marker,
+        ],
+        env=os.environ.copy(),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise RuntimeError(
+            f"pytest collection child failed with exit code {result.returncode}: {detail}"
+        )
+    nodeids = tuple(
+        line.removeprefix("NODE\t")
+        for line in result.stdout.splitlines()
+        if line.startswith("NODE\t")
+    )
+    if not nodeids:
+        raise RuntimeError("pytest collection child returned no test node ids")
+    return nodeids
 
 
 def _manifest_path(directory: Path, index: int, nodeids: list[str]) -> Path:
@@ -163,8 +208,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--shards", type=int, default=4)
     parser.add_argument("--marker", default=DEFAULT_MARKER)
+    parser.add_argument("--collect", action="store_true")
     parser.add_argument("--run-shard", type=Path)
     args = parser.parse_args(argv)
+    if args.collect:
+        return _run_collection_child(args.marker)
     if args.run_shard is not None:
         return _run_shard(args.run_shard, args.marker)
     if args.shards < 1 or args.shards > 8:
