@@ -173,6 +173,7 @@ async def test_execution_service_closes_transitive_linux_owner_on_retry(
 
 
 @pytest.mark.asyncio
+@pytest.mark.posix_host
 async def test_linux_backend_releases_cgroup_when_setup_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -247,6 +248,7 @@ async def test_linux_backend_cleans_unregistered_duplicate_cgroup(
     assert not retained.exists()
 
 
+@pytest.mark.posix_host
 def test_descriptor_authority_survives_path_replacement(tmp_path: Path) -> None:
     executable = tmp_path / "tool"
     original = b"#!/bin/sh\nprintf original\n"
@@ -269,6 +271,7 @@ def test_descriptor_authority_survives_path_replacement(tmp_path: Path) -> None:
         authority.close()
 
 
+@pytest.mark.posix_host
 def test_descriptor_authority_binds_script_interpreter(tmp_path: Path) -> None:
     script = tmp_path / "script"
     script.write_text(f"#!{sys.executable}\nprint('ok')\n", encoding="utf-8")
@@ -323,6 +326,7 @@ def test_python_launcher_parses_descriptor_digest_and_interpreter_args() -> None
     assert command == ["/tmp/script", "arg"]
 
 
+@pytest.mark.posix_host
 def test_native_launcher_executes_pinned_script_after_path_replacement(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -1,3 +1,4 @@
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -18,6 +19,7 @@ from khaos.coding.workspace.manager import WorkspaceManager
 
 
 @pytest.mark.asyncio
+@pytest.mark.posix_host
 async def test_execution_service_rejects_cross_task_workspace(tmp_path: Path):
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -36,6 +38,7 @@ async def test_execution_service_rejects_cross_task_workspace(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.posix_host
 async def test_execution_service_rejects_cross_principal_workspace(tmp_path: Path):
     repo = tmp_path / "repo-owner"
     repo.mkdir()
@@ -85,6 +88,16 @@ def test_native_launcher_is_required_outside_explicit_development(
     monkeypatch.setattr(
         "khaos.coding.execution.native_launcher._find_launcher", lambda: None
     )
+    if os.name != "posix":
+        with pytest.raises(PermissionError, match="unsupported on this platform"):
+            build_process_launch(
+                ("true",),
+                cwd=tmp_path,
+                directory_binding=None,
+                budget=ResourceBudget(),
+                enforce_resource_limits=True,
+            )
+        return
     with pytest.raises(PermissionError, match="native execution launcher"):
         build_process_launch(
             ("true",),
@@ -107,6 +120,7 @@ def test_native_launcher_is_required_outside_explicit_development(
 
 
 @pytest.mark.asyncio
+@pytest.mark.posix_host
 async def test_supervisor_uses_pinned_directory_fd_for_child_cwd(tmp_path: Path):
     root = tmp_path / "worktree"
     cwd = root / "src"
@@ -136,6 +150,7 @@ async def test_supervisor_uses_pinned_directory_fd_for_child_cwd(tmp_path: Path)
     assert result.stdout.strip() == str(cwd)
 
 
+@pytest.mark.posix_host
 def test_directory_binding_rejects_symlinked_cwd_component(tmp_path: Path):
     root = tmp_path / "worktree"
     outside = tmp_path / "outside"
@@ -148,6 +163,7 @@ def test_directory_binding_rejects_symlinked_cwd_component(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.posix_host
 async def test_execution_git_pointer_drift_is_quarantined_before_return(tmp_path: Path):
     repo = tmp_path / "repo"
     repo.mkdir()

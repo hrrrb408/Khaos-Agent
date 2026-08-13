@@ -8,6 +8,7 @@ from khaos.coding.execution.models import ExecutionRequest, NetworkPolicy, Resou
 
 
 @pytest.mark.asyncio
+@pytest.mark.posix_host
 async def test_host_backend_confines_cwd_and_filters_environment(tmp_path: Path):
     backend = HostExecutionBackend()
     result = await backend.execute(
@@ -25,6 +26,7 @@ async def test_host_backend_confines_cwd_and_filters_environment(tmp_path: Path)
 
 
 @pytest.mark.asyncio
+@pytest.mark.posix_host
 async def test_host_backend_timeout_and_process_group_cleanup(tmp_path: Path):
     result = await HostExecutionBackend().execute(
         ExecutionRequest((sys.executable, "-c", "import time; time.sleep(5)"), tmp_path, (tmp_path,), budget=ResourceBudget(timeout_seconds=0.05))

@@ -93,8 +93,12 @@ jobs:
   # Windows is a first-class fail-closed execution target.  Keep one full
   # product cell in this gate so the claim is not limited to the narrow native
   # helper probe in Platform Sandbox Security.  File-tool paths that require
-  # POSIX dirfd primitives must fail closed on this runner; they are not
-  # silently redirected to a Host backend.
+  # POSIX dirfd/process-group/host-managed-launch primitives must fail closed
+  # on this runner; they are not silently redirected to a Host backend.  The
+  # explicitly marked ``posix_host`` tests are not applicable to Windows and
+  # are excluded here so this is an auditable applicability boundary rather
+  # than a hidden failure or a silent test drop.  Native Windows coverage is
+  # provided by this job and platform-sandbox-security.yml.
   python-product-windows:
     name: Python Product Suite (Windows 3.11)
     runs-on: windows-2025
@@ -125,7 +129,7 @@ jobs:
         shell: pwsh
         run: >-
           uv run pytest python/tests/ -vv
-          -m "not browser_real and not docker_sandbox_real and not production_sandbox_real and not kernel_real and not platform_sandbox_real"
+          -m "not browser_real and not docker_sandbox_real and not production_sandbox_real and not kernel_real and not platform_sandbox_real and not posix_host"
   # ─── Full Go product suite with the race detector ──────────────────────
   go-product:
     name: Go Product Suite

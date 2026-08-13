@@ -87,6 +87,7 @@ def _client(service, workspace, server: Path, *, timeout=1):
     )
 
 
+@pytest.mark.posix_host
 async def test_lsp_managed_lifecycle_request_notification_and_close(tmp_path: Path):
     service, workspace = _runtime(tmp_path)
     server = tmp_path / "server.py"
@@ -148,6 +149,7 @@ async def test_lsp_rejects_untrusted_server_command(tmp_path):
     assert result["diagnostic"].code == "untrusted-command"
 
 
+@pytest.mark.posix_host
 async def test_lsp_timeout_eof_stderr_and_runtime_shutdown(tmp_path):
     service, workspace = _runtime(tmp_path)
     server = tmp_path / "server.py"
@@ -223,6 +225,7 @@ class _FakeManagedProcess:
         self.stdout.feed_eof()
 
 
+@pytest.mark.posix_host
 async def test_lsp_works_with_fake_managed_process(tmp_path):
     service, workspace = _runtime(tmp_path)
     fake = _FakeManagedProcess()
@@ -267,6 +270,7 @@ async def test_lsp_pending_spawn_stays_owned_until_rollback(tmp_path):
     assert client.owned_resources() == ()
 
 
+@pytest.mark.posix_host
 async def test_execution_service_managed_process_backend_and_environment_fail_closed(tmp_path):
     service, workspace = _runtime(tmp_path)
     server = tmp_path / "server.py"

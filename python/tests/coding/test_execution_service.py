@@ -1,4 +1,5 @@
 import asyncio
+import os
 import sys
 from pathlib import Path
 
@@ -10,6 +11,12 @@ from khaos.coding.execution import ExecutionRequest, ExecutionService, HostExecu
 @pytest.mark.asyncio
 async def test_execution_service_is_single_delegation_point(tmp_path: Path):
     service = ExecutionService(HostExecutionBackend())
+    if os.name != "posix":
+        with pytest.raises(PermissionError, match="unsupported on this platform|POSIX"):
+            await service.execute(
+                ExecutionRequest((sys.executable, "-c", "print('ok')"), tmp_path, (tmp_path,))
+            )
+        return
     result = await service.execute(ExecutionRequest((sys.executable, "-c", "print('ok')"), tmp_path, (tmp_path,)))
     assert result.status == "passed"
 
@@ -309,7 +316,7 @@ async def test_shutdown_retry_skips_completed_steps():
     """Batch 15.3: after a partial shutdown failure, a retry only attempts
     the failed steps — completed terminates, supervisor, and docker are
     skipped via the CleanupLedger."""
-    from unittest.mock import AsyncMock, MagicMock
+    from unittest.mock import MagicMock
 
     from khaos.coding.execution.service import (
         ExecutionServiceShutdownError, _ShutdownState,
@@ -410,6 +417,7 @@ async def test_shutdown_retry_succeeds_when_failed_step_recovers():
 
 
 @pytest.mark.asyncio
+@pytest.mark.posix_host
 async def test_shutdown_cancels_in_flight_managed_spawn(tmp_path: Path):
     """Batch 15.7: shutdown() must cancel a ``start_managed_process()``
     that is paused inside ``managed_process_factory`` (between admission
@@ -489,6 +497,7 @@ async def test_shutdown_cancels_in_flight_managed_spawn(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.posix_host
 async def test_late_publish_after_closing_kills_handle(tmp_path: Path):
     """Batch 15.7: if ``_shutdown_state`` transitions away from OPEN
     between the final re-check and the ``_active`` publish (the

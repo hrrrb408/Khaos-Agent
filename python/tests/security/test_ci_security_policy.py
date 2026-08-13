@@ -186,6 +186,15 @@ def test_product_infra_marker_exclusions_have_dedicated_owners():
     assert "real_macos" in platform
 
 
+def test_windows_product_suite_declares_posix_host_applicability_boundary():
+    """Windows must record POSIX-host exclusions explicitly, not hide them."""
+    product = (WORKFLOWS / "product-integrity-gate.yml").read_text(
+        encoding="utf-8"
+    )
+    assert 'and not posix_host' in product
+    assert "explicitly marked ``posix_host`` tests" in product
+
+
 def test_production_docker_image_reference_matches_preload():
     """Production Docker tests and CI must use the same pinned reference."""
     workflow = (WORKFLOWS / "docker-security.yml").read_text(encoding="utf-8")

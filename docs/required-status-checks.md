@@ -100,7 +100,7 @@ the product as a whole is not regressed. Both are required merge authorities.
 | Check name | Proves |
 |---|---|
 | `Python Product Suite` | full `python/tests/` across the Python 3.11/3.12/3.13 × Ubuntu 24.04 and macOS 14 matrix (infrastructure-only suites remain owned by their dedicated security workflows) |
-| `Python Product Suite (Windows 3.11)` | full `python/tests/` on Windows with the native sandbox helper required; POSIX-only descriptor APIs fail closed and are not replaced by Host |
+| `Python Product Suite (Windows 3.11)` | full applicable `python/tests/` on Windows with the native sandbox helper required; explicitly marked `posix_host` tests are excluded as a documented POSIX applicability boundary, while Windows native-or-fail-closed coverage remains required |
 | `Go Product Suite` | full `go test -race ./...` |
 | `Rust Product Suite` | `cargo test --locked --all-targets` + `cargo clippy --all-targets -- -D warnings` |
 | `Product Integrity Gate` | aggregate — Linux/macOS/Windows Python plus Go and Rust suites green (exact success required; cancelled/skipped blocks) |
