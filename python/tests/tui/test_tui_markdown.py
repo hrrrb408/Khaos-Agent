@@ -298,7 +298,7 @@ def test_chat_panel_welcome_dashboard_contains_runtime_context(monkeypatch):
     assert "Khaos Agent" in output
     assert "office" in output
     assert "qwen/qwen3.5-122b-a10b" in output
-    assert "/tmp/khaos" in output
+    assert str(Path("/tmp/khaos")) in output
 
 
 def test_brand_art_renders_image_mark_without_caption():

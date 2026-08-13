@@ -208,6 +208,8 @@ def test_windows_product_suite_runs_complete_collection_in_isolated_shards():
     assert "assigned to exactly one child process" in runner
     assert "Shards run serially" in runner
     assert "Do not overlap child processes" in runner
+    assert "DEDICATED_FIRST_SHARD_PREFIXES" in runner
+    assert "global Winsock provider state" in runner
 
 
 def test_production_docker_image_reference_matches_preload():

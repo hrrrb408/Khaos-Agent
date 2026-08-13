@@ -28,6 +28,7 @@ DEFAULT_MARKER = (
     "not platform_sandbox_real and not posix_host"
 )
 TEST_ROOT = "python/tests/"
+DEDICATED_FIRST_SHARD_PREFIXES = ("python/tests/test_cli.py::",)
 
 
 class _CollectionCapture:
@@ -96,11 +97,24 @@ def _run_parent(shards: int, marker: str) -> int:
     if not nodeids:
         raise RuntimeError("Windows product suite collected no applicable tests")
     buckets: list[list[str]] = [[] for _ in range(shards)]
+    dedicated = [
+        nodeid
+        for nodeid in nodeids
+        if nodeid.startswith(DEDICATED_FIRST_SHARD_PREFIXES)
+    ]
+    remaining = [nodeid for nodeid in nodeids if nodeid not in dedicated]
+    # CLI tests launch fresh Python interpreters and import asyncio.  Run them
+    # first in a clean child before any test can perturb the hosted runner's
+    # global Winsock provider state.  They remain part of the exact collected
+    # set; this is only an ordering/isolation rule, not a coverage exclusion.
+    buckets[0].extend(sorted(dedicated))
     # Stable hashing keeps the same node in the same shard across retries,
     # while distributing parametrized and directory-grouped tests.
-    for nodeid in nodeids:
+    regular_shards = max(shards - 1, 1)
+    for nodeid in remaining:
         digest = hashlib.sha256(nodeid.encode("utf-8")).digest()
-        buckets[int.from_bytes(digest[:4], "big") % shards].append(nodeid)
+        offset = int.from_bytes(digest[:4], "big") % regular_shards
+        buckets[offset + 1 if shards > 1 else 0].append(nodeid)
 
     print(
         f"Windows product suite: {len(nodeids)} applicable test node(s) "

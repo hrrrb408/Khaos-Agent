@@ -170,6 +170,7 @@ async def test_process_control_rejects_cross_runtime_replay():
     await authority.shutdown()
 
 
+@pytest.mark.posix_host
 async def test_terminal_argv_never_parses_shell_operators(tmp_path):
     result = await terminal_argv(
         ["echo", "hello | touch escaped"],
