@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Awaitable
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -329,58 +330,41 @@ class LspClient:
             raise RuntimeError(f"LSP server stream ended: {self._stream_error}")
         await _write_message(self._process, {"jsonrpc": "2.0", "method": method, "params": params})
 
-    async def close(self) -> None:
-        """Close the LSP client, terminating the server if needed.
+    def close(self) -> Awaitable[None]:
+        """Begin closing immediately and return the shared awaitable.
 
-        Round-17 review §三: close() now uses a shared ``_close_task`` so
-        concurrent callers observe the same result (like ExecutionService).
-        The actual cleanup runs in ``_run_close()`` which:
-
-        1. Transitions to CLOSING and fails pending requests (unblocking
-           any in-flight ``start()`` initialize).
-        2. Waits for an in-flight start transaction to either publish
-           ``_process`` or rollback — so close() sees any spawned process.
-        3. Runs the per-step cleanup ledger (process_terminate,
-           reader_cancel, fail_pending, exec_terminate) with postcondition
-           verification.  CancelledError during exec_terminate now enters
-           QUARANTINED (not CLOSED) because ownership release is unproven.
-
-        CRITICAL: if close() is called from within start() (i.e., the
-        current task IS the start task), ``_run_close()`` is called
-        directly instead of creating a separate ``_close_task``.  This
-        avoids a deadlock: ``_run_close()`` Phase 2 would try to
-        ``await asyncio.shield(start_task)``, but the start task is the
-        one calling close() and cannot complete until close() returns.
-        Calling ``_run_close()`` directly in the same task makes the
-        Phase 2 ``start_task is not current`` check correctly skip the
-        wait.
+        The admission fence must be published at the call site, not only
+        after a separately scheduled coroutine gets a turn on the event loop.
+        That distinction matters on Windows' Proactor loop: a concurrent
+        ``start()`` could otherwise remain in ``STARTING`` while the caller
+        was already waiting for close to win the race.  Creating the shared
+        cleanup task here also makes concurrent callers observe one owner.
         """
         if self._lifecycle_state is _LspState.CLOSED:
-            return
+            return self._completed_close()
         if self._lifecycle_state is _LspState.NEW:
             self._lifecycle_state = _LspState.CLOSED
-            return
-        # Deadlock avoidance: if close() is called from within start()
-        # (i.e., the current task IS the start task), run _run_close()
-        # directly instead of creating a separate _close_task.  Otherwise
-        # _run_close() Phase 2 would await shield(start_task), but
-        # start_task is the one calling close() and cannot complete until
-        # close() returns — a circular dependency / deadlock.  Running
-        # _run_close() in the same task makes the Phase 2 ``start_task is
-        # not current`` check correctly skip the wait.
+            return self._completed_close()
+
+        # This method is called from an active event loop by all production
+        # and test callers.  The current-task check preserves the deadlock
+        # avoidance used when start() closes itself from its exception path.
         current_task = asyncio.current_task()
+        self._lifecycle_state = _LspState.CLOSING
         if self._start_task is current_task:
-            await self._run_close()
-            return
-        # Reuse an in-flight close task so concurrent callers observe the
-        # same result.  A completed (failed) task is NOT reused —
-        # QUARANTINED is retryable and a new task is created to use the
-        # ledger to skip completed steps.
-        if self._close_task is not None and not self._close_task.done():
-            await asyncio.shield(self._close_task)
-            return
-        self._close_task = asyncio.ensure_future(self._run_close())
-        await asyncio.shield(self._close_task)
+            return self._run_close()
+
+        if self._close_task is None or self._close_task.done():
+            self._close_task = asyncio.ensure_future(self._run_close())
+        return self._await_close_task(self._close_task)
+
+    @staticmethod
+    async def _completed_close() -> None:
+        return
+
+    @staticmethod
+    async def _await_close_task(task: asyncio.Task) -> None:
+        await asyncio.shield(task)
 
     async def _run_close(self) -> None:
         """The actual cleanup sequence — may run multiple times via retry."""
