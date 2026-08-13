@@ -112,7 +112,7 @@ async def test_supervisor_terminate_kills_complete_process_group(tmp_path: Path)
     running = asyncio.create_task(supervisor.run(request))
     await _wait_until_active(supervisor, "tree-termination")
     child_pid: int | None = None
-    for _ in range(100):
+    for _ in range(500):
         try:
             child_pid = int(pid_file.read_text())
         except (FileNotFoundError, ValueError):
@@ -120,6 +120,11 @@ async def test_supervisor_terminate_kills_complete_process_group(tmp_path: Path)
         else:
             break
     if child_pid is None:
+        # Hosted macOS runners can briefly starve a freshly spawned child
+        # while the full suite is draining.  Clean up before failing so the
+        # supervisor cannot retain a live process or emit a shutdown error.
+        await supervisor.terminate("tree-termination")
+        await asyncio.wait_for(running, timeout=5)
         pytest.fail("child process did not publish a valid PID")
 
     assert await supervisor.terminate("tree-termination") is True
