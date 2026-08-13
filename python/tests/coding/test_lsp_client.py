@@ -2,6 +2,7 @@ import asyncio
 import inspect
 import json
 import sys
+import traceback
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -276,8 +277,29 @@ async def test_lsp_pending_spawn_stays_owned_until_rollback(tmp_path):
     await asyncio.wait_for(wait_for_close_admission(), timeout=1.0)
     release.set()
 
-    result = await start_task
-    await close_task
+    async def await_with_diagnostics(task: asyncio.Task, label: str):
+        try:
+            return await asyncio.wait_for(asyncio.shield(task), timeout=15.0)
+        except TimeoutError as exc:
+            print(f"{label} did not settle; dumping live asyncio tasks", flush=True)
+            current = asyncio.current_task()
+            for pending in asyncio.all_tasks():
+                if pending is current:
+                    continue
+                print(
+                    f"task={pending.get_name()} done={pending.done()} "
+                    f"coro={pending.get_coro()!r}",
+                    flush=True,
+                )
+                for frame in pending.get_stack():
+                    print("".join(traceback.format_stack(frame)), flush=True)
+            start_task.cancel()
+            close_task.cancel()
+            await asyncio.gather(start_task, close_task, return_exceptions=True)
+            raise AssertionError(f"{label} did not settle within 15 seconds") from exc
+
+    result = await await_with_diagnostics(start_task, "LSP start task")
+    await await_with_diagnostics(close_task, "LSP close task")
     assert result["ok"] is False
     assert fake.returncode is not None
     assert client.terminal_closed
