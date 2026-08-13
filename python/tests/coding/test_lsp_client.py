@@ -258,9 +258,36 @@ async def test_lsp_pending_spawn_stays_owned_until_rollback(tmp_path):
     service.terminate = AsyncMock()
     client = _client(service, workspace, tmp_path / "trusted-server")
 
+    lifecycle_tasks: list[asyncio.Task] = []
+
+    async def await_with_diagnostics(awaitable, label: str):
+        try:
+            return await asyncio.wait_for(asyncio.shield(awaitable), timeout=15.0)
+        except TimeoutError as exc:
+            print(f"{label} did not settle; dumping live asyncio tasks", flush=True)
+            current = asyncio.current_task()
+            tasks = list(asyncio.all_tasks())
+            tasks.extend(task for task in lifecycle_tasks if task not in tasks)
+            for pending in tasks:
+                if pending is current:
+                    continue
+                print(
+                    f"task={pending.get_name()} done={pending.done()} "
+                    f"coro={pending.get_coro()!r}",
+                    flush=True,
+                )
+                for frame in pending.get_stack():
+                    print("".join(traceback.format_stack(frame)), flush=True)
+            for task in lifecycle_tasks:
+                task.cancel()
+            await asyncio.gather(*lifecycle_tasks, return_exceptions=True)
+            raise AssertionError(f"{label} did not settle within 15 seconds") from exc
+
     start_task = asyncio.create_task(client.start(workspace.worktree_path.as_uri()))
-    await spawned.wait()
+    lifecycle_tasks.append(start_task)
+    await await_with_diagnostics(spawned.wait(), "LSP spawn admission")
     close_task = asyncio.create_task(client.close())
+    lifecycle_tasks.append(close_task)
 
     async def wait_for_close_admission() -> None:
         while client._lifecycle_state is not _LspState.CLOSING:
@@ -274,29 +301,10 @@ async def test_lsp_pending_spawn_stays_owned_until_rollback(tmp_path):
     # start/close race.  Wait for the explicit CLOSING fence so the test is
     # deterministic on event loops with different task scheduling semantics
     # (notably Windows' Proactor loop).
-    await asyncio.wait_for(wait_for_close_admission(), timeout=1.0)
+    await await_with_diagnostics(
+        wait_for_close_admission(), "LSP close admission",
+    )
     release.set()
-
-    async def await_with_diagnostics(task: asyncio.Task, label: str):
-        try:
-            return await asyncio.wait_for(asyncio.shield(task), timeout=15.0)
-        except TimeoutError as exc:
-            print(f"{label} did not settle; dumping live asyncio tasks", flush=True)
-            current = asyncio.current_task()
-            for pending in asyncio.all_tasks():
-                if pending is current:
-                    continue
-                print(
-                    f"task={pending.get_name()} done={pending.done()} "
-                    f"coro={pending.get_coro()!r}",
-                    flush=True,
-                )
-                for frame in pending.get_stack():
-                    print("".join(traceback.format_stack(frame)), flush=True)
-            start_task.cancel()
-            close_task.cancel()
-            await asyncio.gather(start_task, close_task, return_exceptions=True)
-            raise AssertionError(f"{label} did not settle within 15 seconds") from exc
 
     result = await await_with_diagnostics(start_task, "LSP start task")
     await await_with_diagnostics(close_task, "LSP close task")
