@@ -7,13 +7,16 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-
 from khaos.coding.execution.host import HostExecutionBackend
 from khaos.coding.execution.managed import ManagedProcessHandle
 from khaos.coding.execution.service import ExecutionService
-from khaos.coding.intelligence.lsp.client import LspClient, LspCloseError, _LspState, _read_message
+from khaos.coding.intelligence.lsp.client import (
+    LspClient,
+    LspCloseError,
+    _LspState,
+    _read_message,
+)
 from khaos.coding.workspace.models import WorkspaceState
-
 
 FAKE_SERVER = r'''import json,sys,time
 def read():
@@ -257,8 +260,17 @@ async def test_lsp_pending_spawn_stays_owned_until_rollback(tmp_path):
     start_task = asyncio.create_task(client.start(workspace.worktree_path.as_uri()))
     await spawned.wait()
     close_task = asyncio.create_task(client.close())
-    await asyncio.sleep(0)
-    assert client.generation_admission_closed
+
+    async def wait_for_close_admission() -> None:
+        while client._lifecycle_state is not _LspState.CLOSING:
+            await asyncio.sleep(0)
+
+    # ``generation_admission_closed`` is already true during STARTING.  It
+    # therefore does not prove that the concurrent close task has won the
+    # start/close race.  Wait for the explicit CLOSING fence so the test is
+    # deterministic on event loops with different task scheduling semantics
+    # (notably Windows' Proactor loop).
+    await asyncio.wait_for(wait_for_close_admission(), timeout=1.0)
     release.set()
 
     result = await start_task
