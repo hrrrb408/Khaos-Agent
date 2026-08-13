@@ -3,9 +3,11 @@
 The Windows job intentionally executes every test selected by its marker
 expression.  It is split into deterministic shards only to give each shard a
 fresh asyncio/Winsock/process state and to prevent one leaked native resource
-from starving the rest of the product suite.  This is not a coverage filter:
-the parent collection is the source of truth and every collected node id is
-assigned to exactly one child process.
+from starving the rest of the product suite.  Shards run serially: Winsock
+provider state is global to the hosted Windows runner, so concurrent pytest
+children can exhaust it even though each child has its own Python process.
+This is not a coverage filter: the parent collection is the source of truth
+and every collected node id is assigned to exactly one child process.
 """
 
 from __future__ import annotations
@@ -113,7 +115,7 @@ def _run_parent(shards: int, marker: str) -> int:
         ]
         environment = os.environ.copy()
         environment["PYTHONUNBUFFERED"] = "1"
-        processes: list[tuple[int, subprocess.Popen[bytes]]] = []
+        results: list[tuple[int, int]] = []
         for index, manifest in enumerate(manifests, 1):
             print(
                 f"Starting Windows product shard {index}/{shards} "
@@ -131,10 +133,9 @@ def _run_parent(shards: int, marker: str) -> int:
                 ],
                 env=environment,
             )
-            processes.append((index, process))
-
-        results: list[tuple[int, int]] = []
-        for index, process in processes:
+            # Do not overlap child processes.  The Windows runner shares
+            # Winsock provider state across processes; serial fresh children
+            # retain isolation without multiplying native resource pressure.
             results.append((index, process.wait()))
         failures = [(index, code) for index, code in results if code != 0]
         if failures:

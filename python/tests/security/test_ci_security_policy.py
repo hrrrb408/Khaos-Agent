@@ -206,6 +206,8 @@ def test_windows_product_suite_runs_complete_collection_in_isolated_shards():
     assert "scripts/run_windows_product_suite.py --shards 4" in product
     assert "every test selected by its marker" in runner
     assert "assigned to exactly one child process" in runner
+    assert "Shards run serially" in runner
+    assert "Do not overlap child processes" in runner
 
 
 def test_production_docker_image_reference_matches_preload():

@@ -43,8 +43,14 @@ def git_output(*args: str) -> str:
     return result.stdout.strip() or "unavailable"
 
 
+def canonical_bytes(path: Path) -> bytes:
+    """Return deterministic bytes for repository text files on every host."""
+    return path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+
+
 def sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    """Hash source text independently of Git's Windows line-ending policy."""
+    return hashlib.sha256(canonical_bytes(path)).hexdigest()
 
 
 def permission_types() -> list[tuple[str, str]]:

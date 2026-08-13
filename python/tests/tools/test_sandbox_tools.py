@@ -703,6 +703,7 @@ async def test_docker_backend_finalizer_survives_double_cancellation():
     await backend.shutdown()
 
 
+@pytest.mark.posix_host
 async def test_docker_backend_truncates_output_without_unbounded_artifact(tmp_path):
     backend = _InspectableDockerBackend()
     process = _FakeProcess(stdout=b"0123456789", stderr=b"abcdefghij")

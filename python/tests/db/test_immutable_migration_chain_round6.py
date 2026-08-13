@@ -106,6 +106,17 @@ def test_s101_no_runtime_read_text_in_registry_checksum_path():
     )
 
 
+def test_s101_manifest_text_normalizes_checkout_line_endings(tmp_path, monkeypatch):
+    """The release checksum must be stable across POSIX and Windows checkouts."""
+    migration = tmp_path / "line-endings.sql"
+    migration.write_bytes(b"CREATE TABLE example (\r\n    id INTEGER\r\n);\r\n")
+    monkeypatch.setattr(_registry, "_THIS_DIR", tmp_path)
+
+    assert _registry._read_sql(migration.name) == (
+        "CREATE TABLE example (\n    id INTEGER\n);\n"
+    )
+
+
 def test_s101_stored_constant_equals_manifest_recomputation():
     """§10.1/§10.2: every NON-historical spec's stored sha256 constant
     must equal what ``compute_manifest_checksum`` re-derives from the live
@@ -569,4 +580,3 @@ async def test_idempotent_rerun_leaves_ledger_unchanged(tmp_path):
     )["n"]
     assert before == after == len(REGISTRY_BY_VERSION)
     await db.close()
-

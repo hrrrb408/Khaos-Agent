@@ -1216,6 +1216,7 @@ def test_rpc_capability_loads_protected_file_and_rejects_default_env(tmp_path, m
         _load_rpc_capability()
 
 
+@pytest.mark.posix_host
 def test_rpc_capability_rejects_symlink(tmp_path, monkeypatch):
     capability_file = tmp_path / "rpc-capability"
     capability_file.write_text("c" * 48, encoding="utf-8")
