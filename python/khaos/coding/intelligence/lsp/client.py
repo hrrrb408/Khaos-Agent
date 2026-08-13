@@ -20,6 +20,7 @@ from khaos.coding.execution.models import (
 logger = logging.getLogger(__name__)
 
 _MAX_MESSAGE_BYTES = 8 * 1024 * 1024
+_START_SETTLE_TIMEOUT_SECONDS = 5.0
 
 
 @dataclass(frozen=True)
@@ -386,7 +387,10 @@ class LspClient:
         # Phase 2: if a DIFFERENT start transaction is in flight, wait
         # for it to either publish _process or rollback.  The lock is NOT
         # held during this wait so the start task can acquire it to check
-        # state / publish / rollback.  This ensures _run_close sees any
+        # state / publish / rollback.  Use explicit timer turns instead of
+        # awaiting the task directly: Windows' Proactor loop can otherwise
+        # leave the start/close hand-off unscheduled while a close task is
+        # waiting on the start task.  This ensures _run_close sees any
         # spawned process before deciding to skip process_terminate.
         #
         # CRITICAL: if start_task is the CURRENT task (i.e., start()
@@ -400,12 +404,29 @@ class LspClient:
             and not start_task.done()
             and start_task is not current
         ):
-            try:
-                await asyncio.shield(start_task)
-            except asyncio.CancelledError:
-                logger.debug("LSP start task cancelled while close was waiting", exc_info=True)
-            except Exception:
-                logger.debug("LSP start task failed while close was waiting", exc_info=True)
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + max(
+                _START_SETTLE_TIMEOUT_SECONDS,
+                self.timeout * 5,
+            )
+            while not start_task.done() and loop.time() < deadline:
+                await asyncio.sleep(0.01)
+            if not start_task.done():
+                # A start transaction that cannot settle is itself an
+                # ownership failure.  Cancel it so its finally block can
+                # release the transaction, then let Phase 3 clean any
+                # process it published before cancellation.  If the task
+                # remains uncooperative, the cleanup ledger below retains
+                # the resource instead of falsely reporting CLOSED.
+                start_task.cancel()
+                try:
+                    await asyncio.wait_for(asyncio.shield(start_task), 1.0)
+                except asyncio.CancelledError:
+                    pass
+                except TimeoutError:
+                    logger.warning("LSP start transaction did not settle during close")
+                except (OSError, PermissionError, RuntimeError, ValueError):
+                    logger.warning("LSP start transaction did not settle during close")
 
         # Phase 3: cleanup with lock held.
         cancel_requested = False
