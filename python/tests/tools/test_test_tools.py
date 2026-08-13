@@ -249,6 +249,7 @@ async def test_test_run_without_execution_service_fails_closed(tmp_path):
     assert "ExecutionService unavailable" in result["error"]
 
 
+@pytest.mark.posix_host
 async def test_test_run_executes_real_command(tmp_path):
     # ``python3 -c`` doubles as a deterministic "test" that exits 0 with known
     # stdout so we exercise the full ExecutionService path without a real runner.
@@ -268,6 +269,7 @@ async def test_test_run_executes_real_command(tmp_path):
     assert result["passed"] == 3
 
 
+@pytest.mark.posix_host
 async def test_test_run_unknown_command_reports_failure(tmp_path):
     execution, workspace = await _workspace_execution(tmp_path)
     result = json.loads(

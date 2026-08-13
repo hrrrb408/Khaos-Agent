@@ -4,6 +4,8 @@ from dataclasses import replace
 
 import pytest
 
+pytestmark = pytest.mark.posix_host
+
 from khaos.coding.planning.contracts import ImpactStatus, PlanOperation, PlanStatus
 from khaos.coding.planning.service import DeterministicPlanningService
 from test_planning_contracts import planner  # noqa: F401

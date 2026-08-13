@@ -2,18 +2,22 @@ import asyncio
 import inspect
 import json
 import sys
+import traceback
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-
 from khaos.coding.execution.host import HostExecutionBackend
 from khaos.coding.execution.managed import ManagedProcessHandle
 from khaos.coding.execution.service import ExecutionService
-from khaos.coding.intelligence.lsp.client import LspClient, LspCloseError, _LspState, _read_message
+from khaos.coding.intelligence.lsp.client import (
+    LspClient,
+    LspCloseError,
+    _LspState,
+    _read_message,
+)
 from khaos.coding.workspace.models import WorkspaceState
-
 
 FAKE_SERVER = r'''import json,sys,time
 def read():
@@ -87,6 +91,7 @@ def _client(service, workspace, server: Path, *, timeout=1):
     )
 
 
+@pytest.mark.posix_host
 async def test_lsp_managed_lifecycle_request_notification_and_close(tmp_path: Path):
     service, workspace = _runtime(tmp_path)
     server = tmp_path / "server.py"
@@ -148,6 +153,7 @@ async def test_lsp_rejects_untrusted_server_command(tmp_path):
     assert result["diagnostic"].code == "untrusted-command"
 
 
+@pytest.mark.posix_host
 async def test_lsp_timeout_eof_stderr_and_runtime_shutdown(tmp_path):
     service, workspace = _runtime(tmp_path)
     server = tmp_path / "server.py"
@@ -223,6 +229,7 @@ class _FakeManagedProcess:
         self.stdout.feed_eof()
 
 
+@pytest.mark.posix_host
 async def test_lsp_works_with_fake_managed_process(tmp_path):
     service, workspace = _runtime(tmp_path)
     fake = _FakeManagedProcess()
@@ -251,15 +258,56 @@ async def test_lsp_pending_spawn_stays_owned_until_rollback(tmp_path):
     service.terminate = AsyncMock()
     client = _client(service, workspace, tmp_path / "trusted-server")
 
+    lifecycle_tasks: list[asyncio.Task] = []
+
+    async def await_with_diagnostics(awaitable, label: str):
+        try:
+            return await asyncio.wait_for(asyncio.shield(awaitable), timeout=15.0)
+        except TimeoutError as exc:
+            print(f"{label} did not settle; dumping live asyncio tasks", flush=True)
+            current = asyncio.current_task()
+            tasks = list(asyncio.all_tasks())
+            tasks.extend(task for task in lifecycle_tasks if task not in tasks)
+            for pending in tasks:
+                if pending is current:
+                    continue
+                print(
+                    f"task={pending.get_name()} done={pending.done()} "
+                    f"coro={pending.get_coro()!r}",
+                    flush=True,
+                )
+                for frame in pending.get_stack():
+                    print("".join(traceback.format_stack(frame)), flush=True)
+            for task in lifecycle_tasks:
+                task.cancel()
+            await asyncio.gather(*lifecycle_tasks, return_exceptions=True)
+            raise AssertionError(f"{label} did not settle within 15 seconds") from exc
+
     start_task = asyncio.create_task(client.start(workspace.worktree_path.as_uri()))
-    await spawned.wait()
+    lifecycle_tasks.append(start_task)
+    await await_with_diagnostics(spawned.wait(), "LSP spawn admission")
     close_task = asyncio.create_task(client.close())
-    await asyncio.sleep(0)
-    assert client.generation_admission_closed
+    lifecycle_tasks.append(close_task)
+
+    async def wait_for_close_admission() -> None:
+        while client._lifecycle_state is not _LspState.CLOSING:
+            # A zero-delay busy poll can starve the task running close() on
+            # Windows' Proactor loop.  Keep the synchronization bounded while
+            # yielding a real timer turn to the close task and wait_for().
+            await asyncio.sleep(0.01)
+
+    # ``generation_admission_closed`` is already true during STARTING.  It
+    # therefore does not prove that the concurrent close task has won the
+    # start/close race.  Wait for the explicit CLOSING fence so the test is
+    # deterministic on event loops with different task scheduling semantics
+    # (notably Windows' Proactor loop).
+    await await_with_diagnostics(
+        wait_for_close_admission(), "LSP close admission",
+    )
     release.set()
 
-    result = await start_task
-    await close_task
+    result = await await_with_diagnostics(start_task, "LSP start task")
+    await await_with_diagnostics(close_task, "LSP close task")
     assert result["ok"] is False
     assert fake.returncode is not None
     assert client.terminal_closed
@@ -267,6 +315,7 @@ async def test_lsp_pending_spawn_stays_owned_until_rollback(tmp_path):
     assert client.owned_resources() == ()
 
 
+@pytest.mark.posix_host
 async def test_execution_service_managed_process_backend_and_environment_fail_closed(tmp_path):
     service, workspace = _runtime(tmp_path)
     server = tmp_path / "server.py"

@@ -34,6 +34,7 @@ from khaos.db.state_root import (
     project_id as compute_project_id,
 )
 from khaos.modes import ModeManager
+from khaos.runtime.context import local_principal_id
 
 
 async def run_once(args: argparse.Namespace) -> int:
@@ -47,7 +48,7 @@ async def run_once(args: argparse.Namespace) -> int:
 
     mode_manager = ModeManager(
         db, project_root=Path.cwd(),
-        principal_id=f"local-uid:{os.getuid()}",
+        principal_id=local_principal_id(),
         project_id=compute_project_id(Path.cwd()),
     )
     await mode_manager.load()
@@ -63,7 +64,7 @@ async def run_once(args: argparse.Namespace) -> int:
     cli_project_id = compute_project_id(Path.cwd())
     await db.create_session(
         session_id, mode_manager.current_mode.value,
-        principal_id=f"local-uid:{os.getuid()}",
+        principal_id=local_principal_id(),
         project_id=cli_project_id,
     )
 
@@ -74,7 +75,7 @@ async def run_once(args: argparse.Namespace) -> int:
     )
     runtime = None
     try:
-        runtime = await build_production_runtime(ProductionRuntimeConfig(db=db, mode_manager=mode_manager, confirm_callback=_confirm_from_args(args), principal_id=f"local-uid:{os.getuid()}", source_transport="cli", foreground_session=True, project_id=cli_project_id))
+        runtime = await build_production_runtime(ProductionRuntimeConfig(db=db, mode_manager=mode_manager, confirm_callback=_confirm_from_args(args), principal_id=local_principal_id(), source_transport="cli", foreground_session=True, project_id=cli_project_id))
         print(f"session_id: {session_id}", flush=True)
         async for message in runtime.loop.run(args.message, session_id):
             print(encode_sse(message), end="", flush=True)
@@ -96,7 +97,7 @@ async def run_repl(args: argparse.Namespace) -> int:
 
     mode_manager = ModeManager(
         db, project_root=Path.cwd(),
-        principal_id=f"local-uid:{os.getuid()}",
+        principal_id=local_principal_id(),
         project_id=compute_project_id(Path.cwd()),
     )
     await mode_manager.load()
@@ -105,7 +106,7 @@ async def run_repl(args: argparse.Namespace) -> int:
     cli_project_id = compute_project_id(Path.cwd())
     await db.create_session(
         session_id, mode_manager.current_mode.value,
-        principal_id=f"local-uid:{os.getuid()}",
+        principal_id=local_principal_id(),
         project_id=cli_project_id,
     )
     from khaos.runtime import (
@@ -115,7 +116,7 @@ async def run_repl(args: argparse.Namespace) -> int:
     )
     runtime = None
     try:
-        runtime = await build_production_runtime(ProductionRuntimeConfig(db=db, mode_manager=mode_manager, confirm_callback=_interactive_confirm(args), principal_id=f"local-uid:{os.getuid()}", source_transport="cli", foreground_session=True, project_id=cli_project_id))
+        runtime = await build_production_runtime(ProductionRuntimeConfig(db=db, mode_manager=mode_manager, confirm_callback=_interactive_confirm(args), principal_id=local_principal_id(), source_transport="cli", foreground_session=True, project_id=cli_project_id))
         loop = runtime.loop
         skill_manager = runtime.skill_manager
         print(f"session_id: {session_id}")
@@ -134,7 +135,7 @@ async def run_repl(args: argparse.Namespace) -> int:
                 await mode_manager.switch(target)
                 await db.create_session(
                     session_id, target.value,
-                    principal_id=f"local-uid:{os.getuid()}",
+                    principal_id=local_principal_id(),
                     project_id=cli_project_id,
                 )
                 print(f"mode: {target.value}")
@@ -174,7 +175,7 @@ def build_command_parser() -> argparse.ArgumentParser:
 
     start_parser = subparsers.add_parser("start", help="Start Khaos agent server + gateway")
     start_parser.add_argument(
-        "--socket", default=f"/tmp/khaos-{os.getuid()}/agent.sock"
+        "--socket", default=f"/tmp/khaos-{local_principal_id().removeprefix('local-uid:')}/agent.sock"
     )
     start_parser.add_argument(
         "--db",

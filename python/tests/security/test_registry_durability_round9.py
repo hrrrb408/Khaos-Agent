@@ -18,6 +18,8 @@ from unittest.mock import patch
 
 import pytest
 
+pytestmark = pytest.mark.posix_host
+
 from khaos.security import browser_sandbox as bs
 from khaos.security.browser_sandbox import BrowserNetworkSandbox
 

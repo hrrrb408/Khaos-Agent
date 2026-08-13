@@ -71,7 +71,11 @@ def _require_absolute_path(value: str, *, name: str, source: str) -> str:
     normalized = os.path.normpath(value)
     if not os.path.isabs(normalized):
         raise ValueError(f"{source}: typed resource field {name!r} is not a valid path")
-    return normalized
+    # Permission observations use ``realpath`` before matching. Resolve the
+    # rule's drive/root here too so a POSIX-looking rule such as
+    # ``/workspace/*`` becomes ``D:\\workspace\\*`` on Windows instead of
+    # remaining drive-relative and failing closed for every legitimate call.
+    return os.path.realpath(normalized)
 
 
 def _canonical_host(value: str, *, source: str) -> str:
@@ -151,6 +155,7 @@ def validate_typed_rule(
             raise ValueError(
                 f"{source}: filesystem rule needs path, root, or source+destination"
             )
+        raw_root = str(spec.get("root", ""))
         for name in selectors:
             spec[name] = _require_absolute_path(str(spec[name]), name=name, source=source)
         if "destination" in spec:
@@ -161,7 +166,7 @@ def validate_typed_rule(
             raise ValueError(f"{source}: filesystem recursive must be boolean")
         if "root" in spec:
             spec["recursive"] = bool(spec.get("recursive", True))
-            if relaxing and spec["root"] == os.path.sep:
+            if relaxing and os.path.normpath(raw_root) in {os.path.sep, "/", "\\"}:
                 raise ValueError(f"{source}: relaxing filesystem root cannot be '/'")
         elif "path" in spec:
             spec["recursive"] = bool(spec.get("recursive", False))

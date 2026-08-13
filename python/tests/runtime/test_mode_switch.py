@@ -1,8 +1,10 @@
+import pytest
 from khaos.db import Database
 from khaos.db.state_root import project_id
 from khaos.runtime import RuntimeConfig, build_runtime
 
 
+@pytest.mark.posix_host
 async def test_office_to_coding_switch_enables_per_turn_components(tmp_path):
     (tmp_path / "prompts").mkdir()
     (tmp_path / "prompts" / "office.md").write_text("office", encoding="utf-8")

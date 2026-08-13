@@ -15,6 +15,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.posix_host
+
 from khaos.security.browser_sandbox import (
     BrowserSandboxError,
     _resolve_tcb_tool,

@@ -86,6 +86,7 @@ async def _drain_chat(gen):
 # ───────────────────────── F-07-A: build failure → error terminal ─────
 
 
+@pytest.mark.posix_host
 async def test_f07_a_build_runtime_failure_appends_error_terminal(tmp_path):
     """F-07-A: when ``_build_runtime`` raises, a shielded ``error``
     terminal event is appended so the ledger always has a terminal."""
@@ -124,6 +125,7 @@ async def test_f07_a_build_runtime_failure_appends_error_terminal(tmp_path):
 # ───────────────────── F-07-B: cancellation → interrupted ─────────────
 
 
+@pytest.mark.posix_host
 async def test_f07_b_cancellation_appends_interrupted_terminal(tmp_path):
     """F-07-B: ``CancelledError`` during the chat appends a terminal
     ``interrupted`` event (distinct from ``error``)."""
@@ -165,6 +167,7 @@ async def test_f07_b_cancellation_appends_interrupted_terminal(tmp_path):
 # ─────────── F-07-C: normal done is not double-terminated ─────────────
 
 
+@pytest.mark.posix_host
 async def test_f07_c_normal_done_is_not_double_terminated(tmp_path):
     """F-07-C: when the loop already produced a ``done`` terminal, the
     except clause is a no-op (no second terminal appended)."""

@@ -104,7 +104,9 @@ class CodeParser:
             if not symbols:
                 continue
             try:
-                key = str(path.relative_to(root))
+                # Repository evidence is a protocol value, not a host path;
+                # keep it POSIX-stable on Windows as well as Unix.
+                key = path.relative_to(root).as_posix()
             except ValueError:
                 key = str(path)
             symbol_table[key] = symbols

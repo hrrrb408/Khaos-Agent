@@ -57,6 +57,7 @@ include-package-data = true
 
 [project.scripts]
 khaos = "khaos.cli.main:main"
+khaos-authorityd = "khaos.security.authorityd_main:main"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -76,6 +77,7 @@ markers = [
     "tree_sitter_real: requires locked Tree-sitter optional dependencies",
     "lsp_real: requires a trusted pre-installed Language Server (never downloaded at test time)",
     "production_sandbox_real: requires a supported production sandbox daemon and pinned image",
+    "posix_host: requires POSIX dirfd, process-group, or host-managed-launch semantics; Windows must use native-or-fail-closed coverage",
     # M2: real Playwright + Chromium binaries.  Tests marked with this
     # exercise the live ``context.route`` route guard, BrowserContext
     # lifecycle / refcount, scheme allowlist and concurrent-session

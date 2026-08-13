@@ -31,6 +31,7 @@ from khaos.grpc_server import (
 )
 from khaos.channels import ChannelType, PlatformMessage, Sender
 from khaos.runtime import RequestContext
+from khaos.runtime.context import local_principal_id
 
 
 def _test_ctx(*, principal_id: str = "", session_id: str = "") -> RequestContext:
@@ -54,6 +55,7 @@ def _test_ctx(*, principal_id: str = "", session_id: str = "") -> RequestContext
     )
 
 
+@pytest.mark.posix_host
 async def test_agent_service_chat_streams_events(tmp_path):
     (tmp_path / "prompts").mkdir()
     (tmp_path / "prompts" / "office.md").write_text("office prompt", encoding="utf-8")
@@ -116,6 +118,7 @@ async def test_agent_service_starts_and_stops_cron_engine(tmp_path):
     await db.close()
 
 
+@pytest.mark.posix_host
 async def test_agent_service_owns_shared_audit_logger_across_turns(tmp_path):
     """H3: a turn borrows the logger; only server shutdown closes it."""
     (tmp_path / "prompts").mkdir()
@@ -345,6 +348,7 @@ async def test_stale_task_approval_never_publishes_running_state(tmp_path):
     await db.close()
 
 
+@pytest.mark.posix_host
 async def test_agent_service_permission_waits_for_confirm(tmp_path):
     project = tmp_path / "project"
     (project / "prompts").mkdir(parents=True)
@@ -376,7 +380,7 @@ async def test_agent_service_permission_waits_for_confirm(tmp_path):
             permission["data"]["id"],
             True,
             False,
-            principal_id=f"local-uid:{os.getuid()}",
+            principal_id=local_principal_id(),
             binding_digest=permission["data"]["binding_digest"],
         )
     )
@@ -386,7 +390,7 @@ async def test_agent_service_permission_waits_for_confirm(tmp_path):
     assert any(event["event"] == "tool_result" and event["data"]["success"] for event in events)
     # C-1-5a: AgentService no longer holds a server-level task_manager.
     # Query the DB directly to find the per-turn task's worktree_path.
-    tasks = await db.list_coding_tasks(principal_id=f"local-uid:{os.getuid()}")
+    tasks = await db.list_coding_tasks(principal_id=local_principal_id())
     assert len(tasks) == 1
     target_path = tasks[0].get("metadata", {}).get("worktree_path")
     from pathlib import Path
@@ -1197,6 +1201,7 @@ def test_rpc_peer_uid_is_sufficient_when_container_pid_is_unavailable(monkeypatc
         bound.verify_peer(Writer())
 
 
+@pytest.mark.posix_host
 def test_rpc_capability_loads_protected_file_and_rejects_default_env(tmp_path, monkeypatch):
     capability_file = tmp_path / "rpc-capability"
     capability_file.write_text("0123456789abcdef0123456789abcdef\n", encoding="utf-8")
@@ -1211,6 +1216,7 @@ def test_rpc_capability_loads_protected_file_and_rejects_default_env(tmp_path, m
         _load_rpc_capability()
 
 
+@pytest.mark.posix_host
 def test_rpc_capability_rejects_symlink(tmp_path, monkeypatch):
     capability_file = tmp_path / "rpc-capability"
     capability_file.write_text("c" * 48, encoding="utf-8")
@@ -1301,6 +1307,7 @@ models:
         load_router_from_config(project_config, project_root=tmp_path)
 
 
+@pytest.mark.posix_host
 async def test_build_runtime_wires_token_engine_and_skills(tmp_path):
     """_build_runtime must assemble a working token engine and (if present)
     a skill_manager. The token engine is Rust when available, else the pure-

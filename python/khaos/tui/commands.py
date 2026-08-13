@@ -7,12 +7,12 @@ unit-testable without a running Textual app. The TUI widgets call into
 
 from __future__ import annotations
 
-import os
 import shlex
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from khaos.runtime.context import local_principal_id
 from khaos.skills import SkillManager
 
 
@@ -195,7 +195,7 @@ async def _cmd_mode(args: list[str], ctx: TuiContext) -> CommandResult:
     if ctx.db and ctx.session_id:
         await ctx.db.create_session(
             ctx.session_id, target.value,
-            principal_id=f"local-uid:{os.getuid()}",
+            principal_id=local_principal_id(),
             # M4 batch 3.1.16A-5-1b: stamp the cached project identity
             # (set by the TUI app from ``KhaosTUI._tui_project_id``).
             project_id=ctx.project_id,

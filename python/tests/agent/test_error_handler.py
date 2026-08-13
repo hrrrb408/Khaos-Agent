@@ -1,11 +1,15 @@
-import os
-
 import httpx
 import pytest
 from khaos.agent import ErrorCode, ErrorEvent, ErrorHandler, Message
 from khaos.agent.error_handler import ModelContextTooLongError, ModelRateLimitError
 from khaos.db import Database
 from khaos.exceptions import CompressionCircuitOpenError
+from khaos.runtime.context import RequestContext
+
+
+def _local_principal_id() -> str:
+    """Use the production CLI identity contract on every supported OS."""
+    return RequestContext.for_cli().principal_id
 
 
 def test_error_event_to_message():
@@ -30,7 +34,7 @@ async def test_handle_uses_exception_type_when_message_is_empty(tmp_path):
     db = Database(tmp_path / "khaos.db")
     await db.connect()
     await db.run_migrations()
-    principal_id = f"local-uid:{os.getuid()}"
+    principal_id = _local_principal_id()
     await db.create_session("s1", principal_id=principal_id)
     handler = ErrorHandler(db=db, principal_id=principal_id)
 
@@ -45,7 +49,7 @@ async def test_handle_audits_error(tmp_path):
     db = Database(tmp_path / "khaos.db")
     await db.connect()
     await db.run_migrations()
-    principal_id = f"local-uid:{os.getuid()}"
+    principal_id = _local_principal_id()
     await db.create_session("s1", principal_id=principal_id)
     handler = ErrorHandler(db=db, principal_id=principal_id)
 
@@ -117,7 +121,7 @@ async def test_agent_loop_error_handler_integration(tmp_path):
     db = Database(tmp_path / "khaos.db")
     await db.connect()
     await db.run_migrations()
-    principal_id = f"local-uid:{os.getuid()}"
+    principal_id = _local_principal_id()
     await db.create_session("s1", principal_id=principal_id)
     loop = AgentLoop(
         AgentConfig(),

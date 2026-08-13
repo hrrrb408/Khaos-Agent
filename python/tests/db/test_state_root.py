@@ -28,6 +28,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.posix_host
+
 from khaos.db import state_root as sr
 from khaos.db.state_root import (
     StateRootError,

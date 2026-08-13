@@ -239,6 +239,7 @@ async def test_supervisor_cancelled_error_enters_quarantine_not_closed() -> None
     assert not supervisor.terminal_closed
 
 
+@pytest.mark.posix_host
 async def test_supervisor_closed_implies_no_owned_resources(tmp_path: str) -> None:
     """CLOSED ⇒ no live/owned resource."""
     supervisor = ProcessSupervisor(termination_grace_seconds=_SHORT_GRACE)

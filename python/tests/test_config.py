@@ -173,6 +173,7 @@ def test_trusted_environment_uses_fixed_provider_endpoint(monkeypatch, tmp_path)
     ).authority is ConfigAuthority.MANAGED_REQUIREMENT
 
 
+@pytest.mark.posix_host
 def test_set_user_config_value(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
     target = set_user_config_value("models.default_model", "test-model")
@@ -184,6 +185,7 @@ def test_set_user_config_value(monkeypatch, tmp_path):
     assert target.parent.stat().st_mode & 0o777 == 0o700
 
 
+@pytest.mark.posix_host
 def test_setup_writes_complete_trusted_provider_definition(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
     target = write_provider_config("openai", "test-secret")
@@ -195,6 +197,7 @@ def test_setup_writes_complete_trusted_provider_definition(monkeypatch, tmp_path
     assert provider["models"][0]["name"] == data["models"]["default_model"]
 
 
+@pytest.mark.posix_host
 def test_config_writer_rejects_symlink_and_hardlink_targets(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
     config_dir = tmp_path / ".khaos"

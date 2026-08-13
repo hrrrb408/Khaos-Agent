@@ -18,6 +18,8 @@ thiserror = "1"
 libc = "0.2"
 hmac = "0.12"
 sha2 = "0.10"
+ed25519-dalek = { version = "2.1", features = ["std"] }
+base64 = "0.22"
 
 [features]
 default = ["pyo3"]

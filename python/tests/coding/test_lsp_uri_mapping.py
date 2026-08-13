@@ -14,10 +14,11 @@ Covers:
 from __future__ import annotations
 
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
+from types import SimpleNamespace
 
 import pytest
-
+from khaos.coding.intelligence.lsp import uri as uri_module
 from khaos.coding.intelligence.lsp.uri import (
     NonFileUriError,
     SymlinkEscapeError,
@@ -175,3 +176,9 @@ class TestPathToUri:
         file = root / "src" / "app.py"
         uri = path_to_file_uri(file)
         assert "\\" not in uri
+
+    def test_windows_drive_uri_drops_uri_only_leading_slash(self, monkeypatch):
+        monkeypatch.setattr(uri_module, "os", SimpleNamespace(name="nt"))
+        monkeypatch.setattr(uri_module, "Path", PureWindowsPath)
+        decoded = workspace_root_from_uri("file:///C:/worktree/src/app.py")
+        assert decoded.as_posix() == "C:/worktree/src/app.py"

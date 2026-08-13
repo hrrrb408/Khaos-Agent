@@ -376,6 +376,7 @@ def _resolved(
     )
 
 
+@pytest.mark.posix_host
 async def test_docker_backend_builds_hardened_fixed_argv(tmp_path):
     backend = _InspectableDockerBackend()
     process = _FakeProcess()
@@ -449,6 +450,7 @@ async def test_docker_backend_prepares_concrete_daemon_and_hardening_decision(tm
     assert decision.command_digest
 
 
+@pytest.mark.posix_host
 async def test_docker_deleted_open_file_watchdog_maps_to_resource_violation(tmp_path):
     backend = _InspectableDockerBackend()
     process = _FakeProcess(returncode=173)
@@ -564,6 +566,7 @@ async def test_docker_backend_rejects_untrusted_resolved_context(tmp_path, viola
         await backend.execute_resolved(context)
 
 
+@pytest.mark.posix_host
 async def test_docker_backend_timeout_cleanup_output_truncation_and_shutdown(tmp_path):
     backend = _InspectableDockerBackend()
     budget = ResourceBudget(timeout_seconds=0.01, output_bytes=4)
@@ -623,6 +626,7 @@ async def test_docker_backend_concurrent_shutdown_joins_shared_task():
     assert backend.terminal_closed
 
 
+@pytest.mark.posix_host
 async def test_docker_backend_shutdown_spawn_barrier_keeps_late_child_owned(tmp_path):
     """Shutdown must wait for a Docker CLI spawn reserved after lease publish."""
     backend = _InspectableDockerBackend()
@@ -641,7 +645,7 @@ async def test_docker_backend_shutdown_spawn_barrier_keeps_late_child_owned(tmp_
         new=delayed_spawn,
     ):
         running = asyncio.create_task(backend.execute_resolved(context))
-        await spawn_entered.wait()
+        await asyncio.wait_for(spawn_entered.wait(), timeout=5)
         assert backend._active
         shutdown = asyncio.create_task(backend.shutdown())
         await asyncio.sleep(0)
@@ -699,6 +703,7 @@ async def test_docker_backend_finalizer_survives_double_cancellation():
     await backend.shutdown()
 
 
+@pytest.mark.posix_host
 async def test_docker_backend_truncates_output_without_unbounded_artifact(tmp_path):
     backend = _InspectableDockerBackend()
     process = _FakeProcess(stdout=b"0123456789", stderr=b"abcdefghij")

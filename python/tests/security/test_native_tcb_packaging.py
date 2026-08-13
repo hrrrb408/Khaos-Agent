@@ -1,5 +1,6 @@
 """Static deployment contracts for the native privileged TCB."""
 
+import re
 from pathlib import Path
 
 import yaml
@@ -45,7 +46,9 @@ def test_python_container_consumes_frozen_dependency_authority() -> None:
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
     python_stage = dockerfile.split(" AS kernel-helper", 1)[0]
 
-    assert "FROM rust:1.82-bookworm@sha256:" in dockerfile
+    assert re.search(
+        r"FROM rust:\d+\.\d+-bookworm@sha256:[0-9a-f]{64}", dockerfile
+    )
     assert "FROM python:3.11-slim-bookworm@sha256:" in dockerfile
     assert "FROM debian:bookworm-slim@sha256:" in dockerfile
     assert "FROM golang:1.22-alpine@sha256:" in dockerfile

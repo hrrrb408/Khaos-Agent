@@ -20,14 +20,27 @@ import atexit
 import hashlib
 import hmac
 import multiprocessing
+import os
 import secrets
+import sys
 import threading
 import time
 from dataclasses import dataclass
 from multiprocessing.connection import Connection
+from pathlib import Path
 from typing import Any
 
 from khaos.security.authority import AuthorityEnvelope
+from khaos.security.authorityd_protocol import (
+    AuthorityControlPlaneError,
+    AuthorityDaemonClient,
+    AuthorizationIntent,
+    SignedAuthorizationReceipt,
+)
+from khaos.security.identity_isolation import (
+    read_contract_from_environment,
+    require_distinct_linux_identities,
+)
 
 _BROKER_PROTOCOL = 1
 _DEFAULT_TTL_SECONDS = 300.0
@@ -61,6 +74,7 @@ class EffectCapability:
     token: str
     seal: str
     schema_version: int = 1
+    receipt: SignedAuthorizationReceipt | None = None
 
     def __init__(
         self,
@@ -76,6 +90,7 @@ class EffectCapability:
         token: str,
         seal: str,
         schema_version: int = 1,
+        receipt: SignedAuthorizationReceipt | None = None,
         _issuer: object | None = None,
     ) -> None:
         if _issuer is not _CAPABILITY_ISSUER:
@@ -94,6 +109,7 @@ class EffectCapability:
             ("token", token),
             ("seal", seal),
             ("schema_version", schema_version),
+            ("receipt", receipt),
         ):
             object.__setattr__(self, name, value)
         self._validate_shape()
@@ -114,6 +130,13 @@ class EffectCapability:
         for label, value in (("nonce", self.nonce), ("token", self.token), ("seal", self.seal)):
             if not isinstance(value, str) or not value or len(value) > 512:
                 raise ValueError(f"effect capability {label} is invalid")
+        if self.receipt is not None:
+            if self.receipt.nonce != self.nonce or self.receipt.signature != self.seal:
+                raise ValueError("effect capability receipt does not match its handles")
+            if self.receipt.resource_digest != self.resource_digest:
+                raise ValueError("effect capability receipt resource does not match")
+            if self.receipt.authorization_epoch != self.authorization_epoch:
+                raise ValueError("effect capability receipt epoch does not match")
 
     @classmethod
     def _from_broker(cls, **fields: Any) -> EffectCapability:
@@ -147,6 +170,15 @@ class EffectCapability:
         resource_digest: str | None = None,
     ) -> EffectCapability:
         """Narrow the current operation while retaining the broker token."""
+        broker = self.authority._broker
+        if self.receipt is not None and broker is not None:
+            narrow = getattr(broker, "reissue", None)
+            if callable(narrow):
+                return narrow(
+                    self,
+                    operation_class=operation_class,
+                    resource_digest=resource_digest or self.resource_digest,
+                )
         if resource_digest is not None and resource_digest != self.resource_digest:
             raise ValueError(
                 "effect capability resources can only be narrowed by a broker reissue"
@@ -167,6 +199,7 @@ class EffectCapability:
             token=self.token,
             seal=self.seal,
             schema_version=self.schema_version,
+            receipt=self.receipt,
         )
 
 
@@ -340,10 +373,56 @@ class AuthorityBroker:
 
     @classmethod
     def default(cls) -> AuthorityBroker:
-        """Return the process-wide control-plane broker."""
+        """Return the process-wide control-plane broker.
+
+        Production is fail-closed: the default broker is a client of an
+        independently deployed ``khaos-authorityd`` and no local HMAC broker
+        is created.  The local broker remains available only when the test /
+        development profile is explicit (``KHAOS_DEV_MODE=1``) or when a
+        caller constructs ``AuthorityBroker()`` directly for unit tests.
+        """
         with cls._default_lock:
             if cls._default is None or cls._default.closed:
-                cls._default = cls()
+                if os.environ.get("KHAOS_DEV_MODE") == "1":
+                    cls._default = cls()
+                else:
+                    socket_value = os.environ.get("KHAOS_AUTHORITYD_SOCKET")
+                    if not socket_value:
+                        raise AuthorityBrokerError(
+                            "production AuthorityBroker requires KHAOS_AUTHORITYD_SOCKET"
+                        )
+                    try:
+                        contract = read_contract_from_environment()
+                        contract.validate(production=True)
+                        if os.name == "nt" or sys.platform == "darwin":
+                            raise AuthorityBrokerError(
+                                "production authorityd requires the native Windows Named Pipe "
+                                "or macOS launchd/XPC transport adapter"
+                            )
+                        if os.name != "nt" and sys.platform != "darwin":
+                            if (
+                                contract.agent_uid is None
+                                or contract.authority_uid is None
+                                or contract.job_uid is None
+                            ):
+                                raise AuthorityBrokerError(
+                                    "Linux authority contract is missing execution UIDs"
+                                )
+                            require_distinct_linux_identities(
+                                agent_uid=contract.agent_uid,
+                                authority_uid=contract.authority_uid,
+                                job_uid=contract.job_uid,
+                            )
+                    except (OSError, PermissionError, ValueError) as exc:
+                        raise AuthorityBrokerError(
+                            "production AuthorityBroker requires native identity handles"
+                        ) from exc
+                    cls._default = AuthorityDaemonBroker(
+                        AuthorityDaemonClient(
+                            Path(socket_value),
+                            expected_authority_uid=contract.authority_uid,
+                        )
+                    )
                 atexit.register(cls._close_default)
             return cls._default
 
@@ -550,6 +629,166 @@ class AuthorityBroker:
             return response
 
 
+class AuthorityDaemonBroker(AuthorityBroker):
+    """AuthorityBroker-compatible client backed by independent authorityd."""
+
+    def __init__(self, client: AuthorityDaemonClient) -> None:
+        self._authorityd = client
+        self._connection = None
+        self._process = None
+        self._lock = threading.RLock()
+        self._closed = False
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def issue(
+        self,
+        authority: AuthorityEnvelope,
+        *,
+        allowed_operation: str | None = None,
+        resource_digest: str | None = None,
+        ttl_seconds: float = _DEFAULT_TTL_SECONDS,
+    ) -> EffectCapability:
+        if not isinstance(authority, AuthorityEnvelope) or authority._broker is not self:
+            raise AuthorityBrokerError("authority envelope was not created by this broker")
+        operation = allowed_operation or authority.operation_class
+        resource = resource_digest or authority.resource_digest
+        if (
+            not _valid_operation(operation)
+            or not _operation_allowed(operation, authority.operation_class)
+            or resource != authority.resource_digest
+        ):
+            raise AuthorityBrokerError("invalid daemon authority request")
+        if not 0 < ttl_seconds <= _MAX_TTL_SECONDS:
+            raise AuthorityBrokerError("capability TTL is outside the allowed range")
+        intent = AuthorizationIntent(
+            principal_id=authority.principal_id,
+            project_id=authority.project_id,
+            runtime_id=authority.runtime_id,
+            task_id=authority.task_id,
+            workspace_id=authority.workspace_id,
+            # The signed receipt carries the exact operation admitted at this
+            # boundary.  ``allowed_operation`` remains a caller-side family
+            # label (for example ``git.*``), but a native helper must never
+            # validate a wildcard receipt against a concrete operation.
+            operation=authority.operation_class,
+            resource_digest=resource,
+            policy_digest=authority.policy_digest,
+            nonce=secrets.token_hex(16),
+            authorization_epoch=authority.authorization_epoch,
+        )
+        try:
+            receipt = self._authorityd.prepare(intent)
+        except AuthorityControlPlaneError as exc:
+            raise AuthorityBrokerError(str(exc)) from exc
+        return EffectCapability._from_broker(
+            authority=authority,
+            allowed_operation=operation,
+            resource_digest=resource,
+            generation=authority.workspace_generation,
+            authorization_epoch=authority.authorization_epoch,
+            issued_at=receipt.issued_at,
+            expires_at=receipt.expires_at,
+            nonce=receipt.nonce,
+            token=receipt.nonce,
+            seal=receipt.signature,
+            receipt=receipt,
+        )
+
+    def reissue(
+        self,
+        capability: EffectCapability,
+        *,
+        operation_class: str,
+        resource_digest: str,
+        ttl_seconds: float = _DEFAULT_TTL_SECONDS,
+    ) -> EffectCapability:
+        if capability.receipt is None:
+            raise AuthorityBrokerError("daemon reissue requires a signed receipt")
+        if not _valid_operation(operation_class) or not resource_digest:
+            raise AuthorityBrokerError("invalid daemon reissue authority")
+        self.validate(
+            capability,
+            expected_operation=capability.receipt.operation,
+        )
+        try:
+            receipt = self._authorityd.narrow(
+                capability.receipt,
+                operation=operation_class,
+                resource_digest=resource_digest,
+            )
+        except AuthorityControlPlaneError as exc:
+            raise AuthorityBrokerError(str(exc)) from exc
+        authority = capability.authority.derive(
+            operation_class=operation_class,
+            resource_digest=resource_digest,
+        )
+        return EffectCapability._from_broker(
+            authority=authority,
+            allowed_operation=operation_class,
+            resource_digest=resource_digest,
+            generation=authority.workspace_generation,
+            authorization_epoch=authority.authorization_epoch,
+            issued_at=receipt.issued_at,
+            expires_at=receipt.expires_at,
+            nonce=receipt.nonce,
+            token=receipt.nonce,
+            seal=receipt.signature,
+            receipt=receipt,
+        )
+
+    def validate(
+        self,
+        capability: EffectCapability,
+        *,
+        expected_operation: str | None = None,
+        expected_resource_digest: str | None = None,
+    ) -> None:
+        if not isinstance(capability, EffectCapability) or capability.receipt is None:
+            raise AuthorityBrokerError("effect boundary requires a signed receipt")
+        try:
+            capability._validate_shape()
+            self._authorityd.validate(
+                capability.receipt,
+                expected_operation=expected_operation or capability.authority.operation_class,
+                expected_resource_digest=expected_resource_digest,
+            )
+        except (AuthorityControlPlaneError, TypeError, ValueError) as exc:
+            raise AuthorityBrokerError(str(exc)) from exc
+
+    def revoke(self, capability: EffectCapability) -> None:
+        if not isinstance(capability, EffectCapability) or capability.receipt is None:
+            raise AuthorityBrokerError("cannot revoke a non-receipt capability")
+        try:
+            self._authorityd.revoke(capability.receipt)
+        except AuthorityControlPlaneError as exc:
+            raise AuthorityBrokerError(str(exc)) from exc
+
+    def complete(
+        self,
+        capability: EffectCapability,
+        *,
+        result: str,
+        result_digest: str,
+    ) -> None:
+        """Commit the native execution result through the external authority."""
+        if not isinstance(capability, EffectCapability) or capability.receipt is None:
+            raise AuthorityBrokerError("execution result requires a signed receipt")
+        try:
+            self._authorityd.complete(
+                capability.receipt,
+                result=result,
+                result_digest=result_digest,
+            )
+        except AuthorityControlPlaneError as exc:
+            raise AuthorityBrokerError(str(exc)) from exc
+
+    def close(self) -> None:
+        self._closed = True
+
+
 def _valid_operation(operation: str) -> bool:
     return (
         isinstance(operation, str)
@@ -560,4 +799,9 @@ def _valid_operation(operation: str) -> bool:
     )
 
 
-__all__ = ["AuthorityBroker", "AuthorityBrokerError", "EffectCapability"]
+__all__ = [
+    "AuthorityBroker",
+    "AuthorityBrokerError",
+    "AuthorityDaemonBroker",
+    "EffectCapability",
+]

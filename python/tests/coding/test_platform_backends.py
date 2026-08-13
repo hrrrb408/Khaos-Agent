@@ -120,6 +120,7 @@ def test_linux_brokered_profile_requires_a_real_namespace_lease(
         )
 
 
+@pytest.mark.posix_host
 def test_writable_platform_profiles_protect_git_pointer(tmp_path: Path):
     pointer = tmp_path / ".git"
     pointer.write_text("gitdir: /not-used\n", encoding="utf-8")
@@ -137,6 +138,7 @@ def test_writable_platform_profiles_protect_git_pointer(tmp_path: Path):
     assert ("--ro-bind", str(pointer.resolve()), "/workspace/.git") in mounts
 
 
+@pytest.mark.posix_host
 def test_writable_platform_profiles_protect_all_control_metadata(tmp_path: Path):
     for name in (".agents", ".codex", ".khaos"):
         (tmp_path / name).mkdir()
@@ -154,6 +156,7 @@ def test_writable_platform_profiles_protect_all_control_metadata(tmp_path: Path)
     assert ("--ro-bind", str(policy.resolve()), "/workspace/khaos_policy.yaml") in mounts
 
 
+@pytest.mark.posix_host
 def test_macos_profile_denies_creation_of_missing_control_metadata(tmp_path: Path):
     profile = MacOSSandboxBackend().profile(tmp_path)
     for name in (".agents", ".codex", ".khaos", "khaos_policy.yaml"):
@@ -219,6 +222,7 @@ def test_linux_profile_requires_landlock_allowlists_after_mount_setup(tmp_path: 
     assert write_roots == sorted(set(write_roots))
 
 
+@pytest.mark.posix_host
 def test_linux_cgroup_v2_leaf_has_hard_limits(tmp_path: Path, monkeypatch):
     from khaos.coding.execution import platform as platform_module
 
@@ -275,6 +279,7 @@ def test_linux_cgroup_process_kill_proves_empty_before_return(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.posix_host
 async def test_linux_execute_joins_cgroup_before_bwrap_and_seccomp_after(
     tmp_path: Path, monkeypatch,
 ):
@@ -332,6 +337,7 @@ async def test_linux_execute_joins_cgroup_before_bwrap_and_seccomp_after(
     assert "/run/khaos-cgroup.procs" not in argv
 
 
+@pytest.mark.posix_host
 def test_macos_profile_uses_positive_read_allowlist(tmp_path: Path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -440,6 +446,7 @@ def test_windows_runtime_reparse_alias_is_not_staged(tmp_path: Path):
         _remove_windows_python_runtime(staged)
 
 
+@pytest.mark.posix_host
 def test_linux_profile_preserves_cwd_relative_to_workspace(tmp_path: Path):
     workspace = tmp_path / "workspace"
     cwd = workspace / "src" / "pkg"

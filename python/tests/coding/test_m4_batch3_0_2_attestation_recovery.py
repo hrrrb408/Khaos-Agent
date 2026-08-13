@@ -7,6 +7,8 @@ from dataclasses import replace
 
 import pytest
 
+pytestmark = pytest.mark.posix_host
+
 from khaos.coding.planning.execution_models import (
     ExecutionRunStatus,
     PlannedEditOperation,

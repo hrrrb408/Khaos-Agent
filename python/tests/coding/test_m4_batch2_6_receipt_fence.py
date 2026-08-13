@@ -470,6 +470,7 @@ def test_09_initialize_reconcile_failure_full_rollback():
 # ===========================================================================
 
 
+@pytest.mark.posix_host
 def test_10_cleanup_invalidation_failure_does_not_delete_workspace():
     """If lease invalidation fails during cleanup, the worktree is NOT removed."""
     import tempfile

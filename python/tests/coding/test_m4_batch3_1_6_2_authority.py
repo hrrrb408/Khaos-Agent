@@ -15,6 +15,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.posix_host
+
 from khaos.coding.planning.execution_models import ExecutionRunStatus
 from khaos.coding.planning.verification_authority import (
     PROTECTED_SCHEMA_OBJECTS,

@@ -9,6 +9,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.posix_host
+
 from khaos.agent import AgentConfig, AgentLoop, Message
 from khaos.agent.approval import ApprovalBroker
 from khaos.coding.execution import ExecutionService, HostExecutionBackend

@@ -48,6 +48,21 @@ _INJECTED_CAPABILITY_FIELDS = frozenset({
     "browser_manager", "cron_engine",
 })
 
+
+def _local_principal_id() -> str:
+    """Return the local interactive principal without importing runtime.
+
+    ``registry`` is imported by the runtime factory, so importing the
+    runtime package here would create a circular dependency.  Keep this
+    tiny platform adapter local; the runtime context exposes the same
+    contract to higher-level callers.
+    """
+    try:
+        uid: int | str = os.getuid()
+    except AttributeError:
+        uid = "windows"
+    return f"local-uid:{uid}"
+
 # Effect classification is an explicit reviewed declaration, never derived
 # from ``permission_level``.  Tools omitted from these sets remain
 # ``unknown`` and therefore cannot invite a blind retry after a handler has
@@ -799,11 +814,7 @@ class ToolInvocationBroker:
             if capability.name == "host.integration" and mode == "coding":
                 raise PermissionError("host integration is unavailable to Coding Agent")
             if capability.name.startswith(("host.notes.", "host.clipboard.")):
-                local_uid = (
-                    f"local-uid:{os.getuid()}"
-                    if hasattr(os, "getuid")
-                    else "local-uid:windows"
-                )
+                local_uid = _local_principal_id()
                 if (
                     context.get("principal_id") != local_uid
                     or context.get("source_transport") not in {"cli", "tui"}

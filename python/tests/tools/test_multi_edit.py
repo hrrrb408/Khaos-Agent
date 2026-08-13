@@ -2,6 +2,8 @@ import json
 
 import pytest
 
+pytestmark = pytest.mark.posix_host
+
 from khaos.coding.workspace.office_authority import OfficeMutationAuthority
 from khaos.tools.file_tools import multi_edit
 

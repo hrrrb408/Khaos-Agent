@@ -9,6 +9,7 @@ async def test_factory_requires_db():
         await build_runtime(RuntimeConfig())
 
 
+@pytest.mark.posix_host
 async def test_factory_wires_office_and_coding_runtime(tmp_path):
     (tmp_path / "prompts").mkdir()
     (tmp_path / "prompts" / "office.md").write_text("office", encoding="utf-8")

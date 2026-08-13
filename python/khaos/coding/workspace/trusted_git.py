@@ -14,8 +14,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import signal
 import stat
+import subprocess
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path, PurePosixPath
 
 from khaos.coding.execution.environment import scrub_spawn_environment
@@ -98,8 +101,256 @@ class TrustedGitError(RuntimeError):
     """Raised when a host-side Git authority or invocation is not trusted."""
 
 
+class TrustedGitProcessState(str, Enum):
+    """Terminal ownership state for one host-side Git process."""
+
+    NEW = "new"
+    SPAWNED = "spawned"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+    FAILED = "failed"
+    QUARANTINED = "quarantined"
+
+
+class TrustedGitProcessOwner:
+    """Own a Git subprocess from spawn through a proved terminal state.
+
+    ``asyncio.create_subprocess_exec`` is launched in a task and shielded so a
+    caller cancellation cannot abandon the process between kernel spawn and
+    assignment to the owner.  Once a process exists, cancellation and error
+    cleanup are themselves shielded and operate on the whole POSIX process
+    group.  If exit cannot be proved, the owner remains quarantined and the
+    caller receives a hard failure instead of a false success.
+    """
+
+    def __init__(
+        self,
+        label: str,
+        *,
+        terminate_grace_seconds: float = 0.75,
+        spawn_adoption_seconds: float = 5.0,
+    ) -> None:
+        if not label or terminate_grace_seconds <= 0 or spawn_adoption_seconds <= 0:
+            raise ValueError("invalid TrustedGitProcessOwner limits")
+        self.label = label
+        self.terminate_grace_seconds = terminate_grace_seconds
+        self.spawn_adoption_seconds = spawn_adoption_seconds
+        self.state = TrustedGitProcessState.NEW
+        self.process: asyncio.subprocess.Process | None = None
+        self.quarantine_reason: str | None = None
+
+    @property
+    def terminal(self) -> bool:
+        return self.state in {
+            TrustedGitProcessState.COMPLETED,
+            TrustedGitProcessState.CANCELLED,
+            TrustedGitProcessState.FAILED,
+            TrustedGitProcessState.QUARANTINED,
+        }
+
+    @staticmethod
+    def _spawn_options() -> dict[str, object]:
+        if os.name == "nt":
+            return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+        return {"start_new_session": True}
+
+    async def spawn(self, *argv: str, **kwargs: object) -> asyncio.subprocess.Process:
+        """Spawn and publish the child, adopting it if the caller is cancelled."""
+        if self.state is not TrustedGitProcessState.NEW:
+            raise TrustedGitError(f"Git process owner {self.label} was reused")
+        spawn_task = asyncio.create_task(
+            asyncio.create_subprocess_exec(*argv, **self._spawn_options(), **kwargs)
+        )
+        try:
+            process = await asyncio.shield(spawn_task)
+        except asyncio.CancelledError:
+            try:
+                process = await asyncio.shield(
+                    asyncio.wait_for(
+                        asyncio.shield(spawn_task), self.spawn_adoption_seconds
+                    )
+                )
+            except TimeoutError as exc:
+                self.state = TrustedGitProcessState.QUARANTINED
+                self.quarantine_reason = "spawn could not be adopted after cancellation"
+                # ``wait_for(spawn_task)`` would cancel the spawn coroutine,
+                # but cancellation of subprocess creation does not prove
+                # that a kernel child was not created. Keep the original task
+                # alive and attach an owner-side reaper that adopts and
+                # terminates a child if it appears later.
+                asyncio.create_task(
+                    self._adopt_late_spawn(spawn_task),
+                    name=f"khaos-git-reaper:{self.label}",
+                )
+                raise TrustedGitError(
+                    f"Git process {self.label} could not be adopted after cancellation"
+                ) from exc
+            self.process = process
+            self.state = TrustedGitProcessState.SPAWNED
+            await asyncio.shield(self.abort(cancelled=True))
+            raise
+        except Exception:
+            if not spawn_task.done():
+                spawn_task.cancel()
+                try:
+                    await spawn_task
+                except asyncio.CancelledError:
+                    pass
+            self.state = TrustedGitProcessState.FAILED
+            raise
+        self.process = process
+        self.state = TrustedGitProcessState.RUNNING
+        return process
+
+    async def _adopt_late_spawn(
+        self, spawn_task: asyncio.Task[asyncio.subprocess.Process]
+    ) -> None:
+        """Reap a spawn that outlived the caller's bounded adoption window."""
+        try:
+            process = await spawn_task
+        except BaseException:  # noqa: BLE001 - reaper must consume late spawn failures
+            # A failed/cancelled spawn proves that no process was published.
+            return
+        self.process = process
+        self.state = TrustedGitProcessState.SPAWNED
+        try:
+            await self.abort(cancelled=True)
+        except TrustedGitError as exc:
+            self.state = TrustedGitProcessState.QUARANTINED
+            self.quarantine_reason = str(exc) or "late Git process cleanup failed"
+
+    async def communicate_after_spawn(
+        self,
+        *argv: str,
+        input_bytes: bytes | None = None,
+        **kwargs: object,
+    ) -> tuple[bytes, bytes]:
+        """Spawn one command and communicate under the same owner."""
+        await self.spawn(*argv, **kwargs)
+        return await self.communicate(input_bytes)
+
+    async def communicate(
+        self, input_bytes: bytes | None = None
+    ) -> tuple[bytes, bytes]:
+        """Communicate with cancellation-safe ownership transfer."""
+        process = self._require_process()
+        try:
+            stdout, stderr = await process.communicate(input=input_bytes)
+        except asyncio.CancelledError:
+            await asyncio.shield(self.abort(cancelled=True))
+            raise
+        except Exception:
+            await asyncio.shield(self.abort(cancelled=False))
+            raise
+        self.state = (
+            TrustedGitProcessState.COMPLETED
+            if process.returncode == 0
+            else TrustedGitProcessState.FAILED
+        )
+        return stdout, stderr
+
+    async def wait(self) -> int:
+        """Wait for a process that has already had its pipes drained."""
+        process = self._require_process()
+        try:
+            returncode = await process.wait()
+        except asyncio.CancelledError:
+            await asyncio.shield(self.abort(cancelled=True))
+            raise
+        except Exception:
+            await asyncio.shield(self.abort(cancelled=False))
+            raise
+        self.state = (
+            TrustedGitProcessState.COMPLETED
+            if returncode == 0
+            else TrustedGitProcessState.FAILED
+        )
+        return returncode
+
+    async def abort(self, *, cancelled: bool) -> None:
+        """Terminate the child and prove that it is no longer running."""
+        process = self.process
+        target_state = (
+            TrustedGitProcessState.CANCELLED
+            if cancelled
+            else TrustedGitProcessState.FAILED
+        )
+        if process is None:
+            self.state = target_state
+            return
+        try:
+            if process.returncode is None:
+                self._signal(process, force=False)
+                try:
+                    await asyncio.wait_for(
+                        process.wait(), self.terminate_grace_seconds
+                    )
+                except TimeoutError:
+                    self._signal(process, force=True)
+                    await asyncio.wait_for(
+                        process.wait(), self.terminate_grace_seconds
+                    )
+            if process.returncode is None:
+                raise TrustedGitError("Git process exit could not be proved")
+        except Exception as exc:
+            self.state = TrustedGitProcessState.QUARANTINED
+            self.quarantine_reason = str(exc) or "Git process cleanup failed"
+            raise TrustedGitError(
+                f"Git process {self.label} is quarantined: {self.quarantine_reason}"
+            ) from exc
+        self.state = target_state
+
+    def _require_process(self) -> asyncio.subprocess.Process:
+        if self.process is None:
+            raise TrustedGitError(f"Git process {self.label} was not spawned")
+        return self.process
+
+    @staticmethod
+    def _signal(process: asyncio.subprocess.Process, *, force: bool) -> None:
+        if process.returncode is not None:
+            return
+        if os.name == "nt":
+            process.kill() if force else process.terminate()
+            return
+        signum = signal.SIGKILL if force else signal.SIGTERM
+        try:
+            os.killpg(process.pid, signum)
+        except ProcessLookupError:
+            return
+        except OSError:
+            if force:
+                process.kill()
+            else:
+                process.terminate()
+
+
 def _identity(info: os.stat_result) -> FileIdentity:
     return (int(info.st_dev), int(info.st_ino), int(info.st_uid), int(info.st_mode))
+
+
+def _verify_same_file_snapshot(
+    current: os.stat_result, expected: os.stat_result
+) -> None:
+    """Reject descriptor content drift that a pathname check cannot see."""
+    if (
+        current.st_dev,
+        current.st_ino,
+        current.st_mode,
+        current.st_nlink,
+        current.st_size,
+        current.st_mtime_ns,
+        current.st_ctime_ns,
+    ) != (
+        expected.st_dev,
+        expected.st_ino,
+        expected.st_mode,
+        expected.st_nlink,
+        expected.st_size,
+        expected.st_mtime_ns,
+        expected.st_ctime_ns,
+    ):
+        raise TrustedGitError("Git hash input changed while being consumed")
 
 
 def _file_digest(path: Path) -> str:
@@ -366,8 +617,9 @@ class TrustedGitRunner:
             return "dirty" if dirty else ""
         self._verify()
         self._authority_or_fail(authority)
+        owner = TrustedGitProcessOwner("git.run")
         try:
-            process = await asyncio.create_subprocess_exec(
+            stdout, stderr = await owner.communicate_after_spawn(
                 str(self.executable),
                 *self._argv(tuple(args)),
                 cwd=str(repository),
@@ -375,10 +627,9 @@ class TrustedGitRunner:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout, stderr = await process.communicate()
         except OSError as exc:
             raise TrustedGitError("trusted Git process could not start") from exc
-        if process.returncode != 0:
+        if owner.process is None or owner.process.returncode != 0:
             message = stderr.decode("utf-8", errors="replace").strip()
             raise TrustedGitError(message or "trusted Git command failed")
         output = stdout.decode("utf-8", errors="replace")
@@ -394,8 +645,9 @@ class TrustedGitRunner:
         """Run one binary-producing Git command with the same authority gate."""
         self._verify()
         self._authority_or_fail(authority)
+        owner = TrustedGitProcessOwner("git.run-bytes")
         try:
-            process = await asyncio.create_subprocess_exec(
+            stdout, stderr = await owner.communicate_after_spawn(
                 str(self.executable),
                 *self._argv(tuple(args)),
                 cwd=str(repository),
@@ -403,10 +655,9 @@ class TrustedGitRunner:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout, stderr = await process.communicate()
         except OSError as exc:
             raise TrustedGitError("trusted Git process could not start") from exc
-        if process.returncode != 0:
+        if owner.process is None or owner.process.returncode != 0:
             message = stderr.decode("utf-8", errors="replace").strip()
             raise TrustedGitError(message or "trusted Git command failed")
         return stdout
@@ -426,8 +677,9 @@ class TrustedGitRunner:
             raise TrustedGitError("trusted Git input exceeds the configured bound")
         self._verify()
         self._authority_or_fail(authority)
+        owner = TrustedGitProcessOwner("git.run-with-input")
         try:
-            process = await asyncio.create_subprocess_exec(
+            stdout, stderr = await owner.communicate_after_spawn(
                 str(self.executable),
                 *self._argv(tuple(args)),
                 cwd=str(repository),
@@ -435,16 +687,119 @@ class TrustedGitRunner:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                input_bytes=input_bytes,
             )
-            stdout, stderr = await process.communicate(input=input_bytes)
         except OSError as exc:
             raise TrustedGitError("trusted Git process could not start") from exc
         if len(stdout) > max_output_bytes or len(stderr) > _MAX_GIT_ERROR_BYTES:
             raise TrustedGitError("trusted Git output exceeds the configured bound")
-        if process.returncode != 0:
+        if owner.process is None or owner.process.returncode != 0:
             message = stderr.decode("utf-8", errors="replace").strip()
             raise TrustedGitError(message or "trusted Git command failed")
         return stdout.decode("utf-8", errors="replace").strip()
+
+    async def hash_fd(
+        self,
+        repository: Path,
+        descriptor: int,
+        expected: os.stat_result,
+        *,
+        authority: EffectCapability,
+        max_bytes: int,
+        index_file: Path | None = None,
+    ) -> str:
+        """Hash a pinned regular-file descriptor without handing Git a path.
+
+        ``git hash-object <pathname>`` is deliberately not used for mutable
+        workspace entries.  The descriptor is opened by ``SafeWorkspaceFS``
+        with no-follow parent traversal, streamed in bounded chunks, and
+        revalidated after the stream.  A replacement of the leaf or a parent
+        directory therefore cannot turn Git into a host-file confused deputy.
+        """
+        if max_bytes <= 0:
+            raise ValueError("max_bytes must be positive")
+        if not stat.S_ISREG(expected.st_mode) or expected.st_nlink != 1:
+            raise TrustedGitError("Git hash input is not a single-link regular file")
+        self._verify()
+        self._authority_or_fail(authority)
+        try:
+            opened = os.fstat(descriptor)
+            _verify_same_file_snapshot(opened, expected)
+            os.lseek(descriptor, 0, os.SEEK_SET)
+        except OSError as exc:
+            raise TrustedGitError("Git hash input descriptor is unavailable") from exc
+
+        owner = TrustedGitProcessOwner("git.hash-fd")
+        stderr_task: asyncio.Task[tuple[bytes, bool]] | None = None
+        stdout_task: asyncio.Task[tuple[bytes, bool]] | None = None
+        try:
+            process = await owner.spawn(
+                str(self.executable),
+                *self._argv(("hash-object", "--stdin", "--no-filters", "-w")),
+                cwd=str(repository),
+                env=self._environment(index_file=index_file),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            if process.stdin is None or process.stdout is None or process.stderr is None:
+                raise TrustedGitError("trusted Git hash process has unusable pipes")
+            stdout_task = asyncio.create_task(
+                _drain_stream_limited(process.stdout, 4096)
+            )
+            stderr_task = asyncio.create_task(
+                _drain_stream_limited(process.stderr, _MAX_GIT_ERROR_BYTES)
+            )
+            total = 0
+            while True:
+                chunk = await asyncio.to_thread(os.read, descriptor, _MAX_GIT_CHUNK_BYTES)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise TrustedGitError("Git hash input exceeds its configured bound")
+                process.stdin.write(chunk)
+                await process.stdin.drain()
+            process.stdin.close()
+            await process.stdin.wait_closed()
+            stdout, stdout_overflow = await stdout_task
+            stdout_task = None
+            stderr, stderr_overflow = await stderr_task
+            stderr_task = None
+            await owner.wait()
+            if stdout_overflow or stderr_overflow:
+                raise TrustedGitError("trusted Git hash output exceeds its bound")
+            if process.returncode != 0:
+                message = stderr.decode("utf-8", errors="replace").strip()
+                raise TrustedGitError(message or "trusted Git hash command failed")
+            try:
+                final = os.fstat(descriptor)
+                _verify_same_file_snapshot(final, expected)
+            except OSError as exc:
+                raise TrustedGitError("Git hash input changed during hashing") from exc
+            object_id = stdout.decode("ascii", errors="strict").strip()
+            if not object_id or len(object_id) not in {40, 64}:
+                raise TrustedGitError("Git hash command returned an invalid object id")
+            return object_id
+        except asyncio.CancelledError:
+            await asyncio.shield(owner.abort(cancelled=True))
+            raise
+        except (OSError, UnicodeError, TrustedGitError) as exc:
+            if not owner.terminal:
+                await asyncio.shield(owner.abort(cancelled=False))
+            if isinstance(exc, TrustedGitError):
+                raise
+            raise TrustedGitError("trusted Git hash input failed") from exc
+        finally:
+            for task in (stdout_task, stderr_task):
+                if task is not None:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+            if not owner.terminal:
+                await asyncio.shield(owner.abort(cancelled=False))
 
     async def stream_to_file(
         self,
@@ -462,6 +817,7 @@ class TrustedGitRunner:
         self._verify()
         self._authority_or_fail(authority)
         process: asyncio.subprocess.Process | None = None
+        owner = TrustedGitProcessOwner("git.stream-to-file")
         stderr_task: asyncio.Task[bytes] | None = None
         descriptor: int | None = None
         completed = False
@@ -475,7 +831,7 @@ class TrustedGitRunner:
                 | getattr(os, "O_NOFOLLOW", 0),
                 0o600,
             )
-            process = await asyncio.create_subprocess_exec(
+            process = await owner.spawn(
                 str(self.executable),
                 *self._argv(tuple(args)),
                 cwd=str(repository),
@@ -506,7 +862,7 @@ class TrustedGitRunner:
             descriptor = None
             stderr, stderr_overflow = await stderr_task
             stderr_task = None
-            await process.wait()
+            await owner.wait()
             if stderr_overflow:
                 raise TrustedGitError(
                     "trusted Git diagnostic output exceeds its bound"
@@ -520,9 +876,16 @@ class TrustedGitRunner:
                 sha256=digest.hexdigest(),
                 preview=preview.decode("utf-8", errors="replace"),
             )
+        except asyncio.CancelledError:
+            await asyncio.shield(owner.abort(cancelled=True))
+            raise
         except TrustedGitError:
+            if not owner.terminal:
+                await asyncio.shield(owner.abort(cancelled=False))
             raise
         except OSError as exc:
+            if not owner.terminal:
+                await asyncio.shield(owner.abort(cancelled=False))
             raise TrustedGitError("trusted Git artifact stream failed") from exc
         finally:
             if stderr_task is not None:
@@ -531,9 +894,8 @@ class TrustedGitRunner:
                     await stderr_task
                 except asyncio.CancelledError:
                     pass
-            if process is not None and process.returncode is None:
-                process.kill()
-                await process.wait()
+            if not completed and not owner.terminal:
+                await asyncio.shield(owner.abort(cancelled=False))
             if descriptor is not None:
                 os.close(descriptor)
             if not completed:
@@ -553,9 +915,10 @@ class TrustedGitRunner:
         self._verify()
         self._authority_or_fail(authority)
         process: asyncio.subprocess.Process | None = None
+        owner = TrustedGitProcessOwner("git.run-bytes-limited")
         stderr_task: asyncio.Task[bytes] | None = None
         try:
-            process = await asyncio.create_subprocess_exec(
+            process = await owner.spawn(
                 str(self.executable),
                 *self._argv(tuple(args)),
                 cwd=str(repository),
@@ -577,7 +940,7 @@ class TrustedGitRunner:
                     raise TrustedGitError("trusted Git output exceeds the configured bound")
             stderr, stderr_overflow = await stderr_task
             stderr_task = None
-            await process.wait()
+            await owner.wait()
             if stderr_overflow:
                 raise TrustedGitError(
                     "trusted Git diagnostic output exceeds its bound"
@@ -586,9 +949,16 @@ class TrustedGitRunner:
                 message = stderr.decode("utf-8", errors="replace").strip()
                 raise TrustedGitError(message or "trusted Git command failed")
             return bytes(output)
+        except asyncio.CancelledError:
+            await asyncio.shield(owner.abort(cancelled=True))
+            raise
         except TrustedGitError:
+            if not owner.terminal:
+                await asyncio.shield(owner.abort(cancelled=False))
             raise
         except (OSError, asyncio.IncompleteReadError) as exc:
+            if not owner.terminal:
+                await asyncio.shield(owner.abort(cancelled=False))
             raise TrustedGitError("trusted Git process could not be read") from exc
         finally:
             if stderr_task is not None:
@@ -597,9 +967,8 @@ class TrustedGitRunner:
                     await stderr_task
                 except asyncio.CancelledError:
                     pass
-            if process is not None and process.returncode is None:
-                process.kill()
-                await process.wait()
+            if not owner.terminal:
+                await asyncio.shield(owner.abort(cancelled=False))
 
     async def materialize_tree(
         self,
@@ -662,8 +1031,9 @@ class TrustedGitRunner:
         self._verify()
         self._authority_or_fail(authority)
         process: asyncio.subprocess.Process | None = None
+        owner = TrustedGitProcessOwner("git.materialize-blobs")
         try:
-            process = await asyncio.create_subprocess_exec(
+            process = await owner.spawn(
                 str(self.executable),
                 *self._argv(("cat-file", "--batch")),
                 cwd=str(repository),
@@ -758,7 +1128,7 @@ class TrustedGitRunner:
                 if process.stderr is not None
                 else (b"", False)
             )
-            await process.wait()
+            await owner.wait()
             if stderr_overflow:
                 raise TrustedGitError(
                     "trusted Git diagnostic output exceeds its bound"
@@ -766,20 +1136,20 @@ class TrustedGitRunner:
             if process.returncode != 0:
                 message = stderr.decode("utf-8", errors="replace").strip()
                 raise TrustedGitError(message or "trusted Git blob process failed")
+        except asyncio.CancelledError:
+            await asyncio.shield(owner.abort(cancelled=True))
+            raise
         except TrustedGitError:
-            if process is not None and process.returncode is None:
-                process.kill()
-                await process.wait()
+            if not owner.terminal:
+                await asyncio.shield(owner.abort(cancelled=False))
             raise
         except (OSError, asyncio.IncompleteReadError, ValueError) as exc:
-            if process is not None and process.returncode is None:
-                process.kill()
-                await process.wait()
+            if not owner.terminal:
+                await asyncio.shield(owner.abort(cancelled=False))
             raise TrustedGitError("trusted Git blob materialization failed") from exc
         finally:
-            if process is not None and process.returncode is None:
-                process.kill()
-                await process.wait()
+            if not owner.terminal:
+                await asyncio.shield(owner.abort(cancelled=False))
 
     async def _object_id_length(
         self, repository: Path, *, authority: EffectCapability

@@ -516,6 +516,7 @@ class _FakeRequest:
         self.mode = mode
 
 
+@pytest.mark.posix_host
 async def test_6_1_h_concurrent_chat_on_same_session_rejected(tmp_path):
     """6.1-H: ``AgentService.chat`` rejects a second concurrent chat RPC
     on the same ``session_id`` with ``SessionBusyError`` (Review §八
@@ -608,6 +609,7 @@ async def test_6_1_h_concurrent_chat_on_same_session_rejected(tmp_path):
 # ───── 6.1-I: session lock released on build failure ──────────────────
 
 
+@pytest.mark.posix_host
 async def test_6_1_i_session_lock_released_on_build_failure(tmp_path):
     """6.1-I: if ``_build_runtime`` raises, the session lock MUST be
     released in the finally block so the next chat on the same session

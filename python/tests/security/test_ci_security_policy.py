@@ -186,6 +186,34 @@ def test_product_infra_marker_exclusions_have_dedicated_owners():
     assert "real_macos" in platform
 
 
+def test_windows_product_suite_declares_posix_host_applicability_boundary():
+    """Windows must record POSIX-host exclusions explicitly, not hide them."""
+    product = (WORKFLOWS / "product-integrity-gate.yml").read_text(
+        encoding="utf-8"
+    )
+    assert 'and not posix_host' in product
+    assert "explicitly marked ``posix_host`` tests" in product
+
+
+def test_windows_product_suite_runs_complete_collection_in_isolated_shards():
+    """Windows sharding must isolate resources without shrinking coverage."""
+    product = (WORKFLOWS / "product-integrity-gate.yml").read_text(
+        encoding="utf-8"
+    )
+    runner = (ROOT / "scripts" / "run_windows_product_suite.py").read_text(
+        encoding="utf-8"
+    )
+    assert "scripts/run_windows_product_suite.py --shards 4" in product
+    assert "every test selected by its marker" in runner
+    assert "assigned to exactly one child process" in runner
+    assert "Shards run serially" in runner
+    assert "Do not overlap child processes" in runner
+    assert "DEDICATED_FIRST_SHARD_PREFIXES" in runner
+    assert "global Winsock provider state" in runner
+    assert "--collect" in runner
+    assert "Collect in a process that exits before any test shard is launched" in runner
+
+
 def test_production_docker_image_reference_matches_preload():
     """Production Docker tests and CI must use the same pinned reference."""
     workflow = (WORKFLOWS / "docker-security.yml").read_text(encoding="utf-8")

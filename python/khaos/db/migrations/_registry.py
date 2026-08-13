@@ -115,9 +115,23 @@ class MigrationSpec:
 # ---------------------------------------------------------------------------
 
 
+def _read_normalized_text(path: Path) -> str:
+    """Read UTF-8 source with checkout-independent line endings.
+
+    Git's Windows checkout may materialize LF files as CRLF.  The migration
+    executor decodes SQL as text, so the integrity manifest must bind the
+    resulting text rather than a host-specific checkout representation.
+    """
+    return (
+        path.read_bytes()
+        .decode("utf-8")
+        .replace("\r\n", "\n")
+        .replace("\r", "\n")
+    )
+
+
 def _read_sql(name: str) -> str:
-    path = _THIS_DIR / name
-    return path.read_text(encoding="utf-8")
+    return _read_normalized_text(_THIS_DIR / name)
 
 
 def _extract_symbol_source(symbol_names: tuple[str, ...]) -> str:
@@ -131,7 +145,7 @@ def _extract_symbol_source(symbol_names: tuple[str, ...]) -> str:
     """
     if not symbol_names:
         return ""
-    source = _DATABASE_PY.read_text(encoding="utf-8")
+    source = _read_normalized_text(_DATABASE_PY)
     tree = ast.parse(source)
     wanted = set(symbol_names)
     found: dict[str, str] = {}

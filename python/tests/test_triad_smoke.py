@@ -23,6 +23,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.posix_host
+
 from khaos.agent import Message
 from khaos.grpc_server import serve_json_lines
 

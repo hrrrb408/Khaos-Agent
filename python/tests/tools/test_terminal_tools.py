@@ -52,6 +52,7 @@ def test_shell_capable_text_tools_are_never_classified_read_only():
     assert not is_read_only_command("awk 'BEGIN { system(\"touch pwned\") }'")
 
 
+@pytest.mark.posix_host
 async def test_terminal_foreground_success(tmp_path):
     result = await terminal(
         "echo hello", cwd=str(tmp_path), timeout=5, execution_service=_execution_service()
@@ -61,6 +62,7 @@ async def test_terminal_foreground_success(tmp_path):
     assert result["stdout"] == "hello\n"
 
 
+@pytest.mark.posix_host
 async def test_terminal_blocks_dangerous_command(tmp_path):
     result = await terminal("rm -rf /", cwd=str(tmp_path), timeout=5)
 
@@ -82,6 +84,7 @@ def test_terminal_security_has_no_runtime_disable_switch():
     assert not hasattr(terminal_tools, "_SECURITY_ENABLED")
 
 
+@pytest.mark.posix_host
 async def test_terminal_without_execution_service_fails_closed(tmp_path):
     """Coding Agent reachable terminal() must fail closed without ExecutionService."""
     result = await terminal("echo hello", cwd=str(tmp_path), timeout=5)
@@ -91,6 +94,7 @@ async def test_terminal_without_execution_service_fails_closed(tmp_path):
     assert result["risk_level"] == "blocked"
 
 
+@pytest.mark.posix_host
 async def test_terminal_background_without_execution_service_fails_closed(tmp_path):
     """Background terminal spawn must also fail closed without ExecutionService."""
     result = await terminal("echo background", cwd=str(tmp_path), background=True)
@@ -166,6 +170,7 @@ async def test_process_control_rejects_cross_runtime_replay():
     await authority.shutdown()
 
 
+@pytest.mark.posix_host
 async def test_terminal_argv_never_parses_shell_operators(tmp_path):
     result = await terminal_argv(
         ["echo", "hello | touch escaped"],

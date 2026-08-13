@@ -20,6 +20,7 @@ def test_unknown_project_has_no_plan(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.posix_host
 async def test_pipeline_runs_steps_through_execution_backend(tmp_path: Path):
     (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n", encoding="utf-8")
     pipeline = VerificationPipeline(backend=HostExecutionBackend())

@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.posix_host
+
 from khaos.skills import Skill, SkillLoader, SkillParseError
 from khaos.skills.loader import MAX_SKILL_FILE_BYTES, MAX_SKILL_FILES
 

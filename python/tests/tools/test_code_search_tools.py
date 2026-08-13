@@ -33,6 +33,7 @@ def test_runtime_registry_binds_code_search_tools():
     assert registry.get("code_symbols").permission_level == "read"
 
 
+@pytest.mark.posix_host
 async def test_coding_code_search_rejects_symlink_escape(tmp_path):
     outside = tmp_path.parent / f"{tmp_path.name}-outside"
     outside.mkdir()

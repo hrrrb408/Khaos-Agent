@@ -1,5 +1,7 @@
 import pytest
 
+pytestmark = pytest.mark.posix_host
+
 from khaos.coding.workspace.office_authority import OfficeMutationAuthority
 from khaos.tools.file_tools import patch, read_file, search_files, write_file
 

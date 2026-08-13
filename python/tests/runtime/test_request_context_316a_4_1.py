@@ -24,7 +24,6 @@ behavioural tests (DB queries actually filter by ``ctx.principal_id``).
 from __future__ import annotations
 
 import inspect
-import os
 
 import pytest
 
@@ -36,6 +35,7 @@ from khaos.grpc_server import (
     _handle_optional_subagent,
 )
 from khaos.runtime import RequestContext
+from khaos.runtime.context import local_principal_id
 
 
 def _test_ctx(*, principal_id: str = "", session_id: str = "") -> RequestContext:
@@ -83,11 +83,7 @@ def test_request_context_for_cli_uses_local_uid():
     ctx = RequestContext.for_cli()
     # On Unix, principal is ``local-uid:<uid>``.  On Windows (no
     # ``os.getuid``), falls back to ``local-uid:windows``.
-    try:
-        expected = f"local-uid:{os.getuid()}"
-    except AttributeError:
-        expected = "local-uid:windows"
-    assert ctx.principal_id == expected
+    assert ctx.principal_id == local_principal_id()
     assert ctx.source_transport == "cli"
 
 
@@ -218,6 +214,7 @@ async def test_handle_optional_subagent_ignores_payload_principal():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.posix_host
 async def test_switch_mode_uses_transport_principal(tmp_path, monkeypatch):
     """``switch_mode`` MUST bind the new mode to ``ctx.principal_id``,
     not the hardcoded ``local-uid``.  Previously an API principal A
@@ -261,6 +258,7 @@ async def test_switch_mode_uses_transport_principal(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.posix_host
 async def test_build_runtime_propagates_session_id(tmp_path, monkeypatch):
     """``_build_runtime`` MUST pass ``session_id`` into the
     ``RuntimeConfig``.  Previously it always passed ``""``, which

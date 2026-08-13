@@ -2,21 +2,26 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 from khaos.cli.main import build_command_parser, cmd_start
 
 
 def run_cli(*args: str) -> subprocess.CompletedProcess[str]:
     """Run the package CLI in a subprocess."""
     project_root = Path(__file__).resolve().parents[2]
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(project_root / "python")
     return subprocess.run(
         [sys.executable, "-m", "khaos.cli", *args],
         capture_output=True,
         cwd=str(project_root),
-        env={"PYTHONPATH": str(project_root / "python")},
+        env=environment,
+        check=False,
         text=True,
         timeout=10,
     )
@@ -53,6 +58,7 @@ def test_chat_parser_exposes_interactive_options():
     assert args.yes is True
 
 
+@pytest.mark.posix_host
 def test_managed_gateway_receives_capability_by_inherited_fd(
     tmp_path, monkeypatch,
 ):

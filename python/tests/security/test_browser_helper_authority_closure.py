@@ -6,6 +6,8 @@ from unittest.mock import Mock
 
 import pytest
 
+pytestmark = pytest.mark.posix_host
+
 from khaos.security.browser_sandbox import (
     BrowserNetworkSandbox,
     BrowserSandboxError,

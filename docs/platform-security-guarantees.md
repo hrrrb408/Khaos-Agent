@@ -4,6 +4,11 @@ These guarantees are deliberately narrower than “absolute security”. A claim
 is valid only for a commit whose required `Security Closure Gate` passed with
 complete provenance-backed evidence.
 
+The independent authority daemon, signed receipt, OS identity, and remote
+audit boundaries are specified in
+[`docs/authority-control-plane.md`](authority-control-plane.md).  Local audit
+chains remain tamper-evident rather than tamper-proof.
+
 ## Trusted Git workspace bootstrap
 
 Host Git is a control-plane dependency, not a trust boundary. Khaos pins the
@@ -31,25 +36,26 @@ build.
 
 The guarantees below defend the host against **untrusted repository content**,
 **model-generated commands**, **cross-project authority drift**, and **peer
-processes outside the OS-user identity**. They are not a claim of isolation
-from every local adversary.
+processes outside the relevant OS identity**. They are not a claim of
+isolation from every local adversary.
 
-> **The operating-system user account is a trust boundary.**
+> **The operating-system identity assigned to each control-plane role is a trust boundary.**
 >
-> Khaos protects the host from untrusted repository content, model-generated
-> commands and cross-project authority drift. Khaos does **not** claim to
-> isolate itself from arbitrary malicious processes already executing as the
-> same OS user.
+> In development mode, the local broker and its caller intentionally remain
+> same-user test components. In production, host execution requires the Agent,
+> authorityd, and job roles to use distinct native identities; authorityd and
+> the result sink are not replaced by a same-UID Python process.
 
-Concretely, a process already running as the same OS user can typically read
-the user's 0600 files (API keys, capability files, `~/.khaos` state), call the
-same-UID Unix domain socket, access workspaces the user owns, and impersonate
-the local CLI/TUI user. The file-mode, peer-UID, socket-ownership and
-capability-file checks throughout Khaos defend against *other* OS users, the
-model, repository payloads, path traversal and rogue Gateways — not against a
-same-UID attacker. Defending against a hostile same-UID process would require
-running the complete state writer and credential store under a separate OS
-identity, which is out of scope for the single-user local deployment model.
+Concretely, a process running as the Agent UID can still impersonate Agent
+client behavior and access Agent-owned 0600 state; that role is not an
+anti-malware boundary. It cannot satisfy the authorityd socket's peer-UID
+check when authorityd runs under its dedicated UID, and it cannot forge an
+Ed25519 receipt without the authorityd key. The file-mode, peer-UID,
+socket-ownership and capability-file checks still defend against *other* OS
+users, the model, repository payloads, path traversal and rogue Gateways.
+macOS and Windows use the same fail-closed rule but require their native
+launchd/XPC or Named Pipe service packages; the repository does not emulate
+those transports.
 
 The HTTP Gateway authenticates a single principal derived from the API key
 digest (`api-key:<sha256>`). All clients holding the same key are the *same*

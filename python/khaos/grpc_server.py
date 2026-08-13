@@ -70,6 +70,7 @@ from khaos.modes import ModeManager
 from khaos.routing import ModelRouter
 from khaos.routing.router import create_default_router
 from khaos.runtime import RequestContext
+from khaos.runtime.context import local_principal_id
 from khaos.rust_bridge import get_token_engine
 from khaos.scheduler import CronEngine
 from khaos.security.middleware import SecurityMiddleware
@@ -649,6 +650,10 @@ async def _emergency_instance_cleanup(
 def _load_rpc_capability() -> str:
     path_value = os.environ.get("KHAOS_PYTHON_CAPABILITY_FILE", "").strip()
     if path_value:
+        if os.name != "posix" or not hasattr(os, "O_NOFOLLOW"):
+            raise PermissionError(
+                "protected RPC capability files require POSIX no-follow support"
+            )
         path = Path(path_value).expanduser()
         if not path.is_absolute():
             raise PermissionError("RPC capability file path must be absolute")
@@ -722,7 +727,14 @@ class GatewayRPCAuthenticator:
         if len(capability) < 32:
             raise ValueError("Gateway RPC capability must contain at least 32 characters")
         self._key = capability.encode("utf-8")
-        self._expected_uid = os.getuid() if expected_uid is None else expected_uid
+        # Windows has no Unix peer-UID API and the production listener is
+        # unavailable there. Keep construction safe for metadata-only tests;
+        # ``verify_peer`` still fails closed without native peer identity.
+        self._expected_uid = (
+            (os.getuid() if hasattr(os, "getuid") else -1)
+            if expected_uid is None
+            else expected_uid
+        )
         self._expected_pid = expected_pid
         self._require_protocol_v2 = (
             os.environ.get("KHAOS_DEV_MODE") != "1"
@@ -1195,7 +1207,7 @@ class AgentService:
                 # so audit attribution matches the runtime that produced it.
                 # ``runtime_id`` is left None at the server level; per-runtime
                 # AuditLoggers constructed by ``build_runtime`` carry it.
-                principal_id=f"local-uid:{os.getuid()}",
+                principal_id=local_principal_id(),
                 policy_digest=self._effective_policy.digest,
                 # M4 batch 3.1.16A-5-1b: stamp the server-bound project
                 # identity on every audit row.  The dispatcher's drift

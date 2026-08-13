@@ -13,6 +13,8 @@ from types import SimpleNamespace
 
 import pytest
 
+pytestmark = pytest.mark.posix_host
+
 from khaos.coding.planning.approval.store import PlanApprovalStore
 from khaos.coding.planning.execution_models import (
     ExecutionRunStatus,

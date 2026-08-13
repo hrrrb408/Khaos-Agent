@@ -19,6 +19,28 @@ async def _recording_executor(task_id: str, prompt: str) -> str:
     return f"executed:{prompt}"
 
 
+async def _wait_for_persisted_run_count(db, task_id: str, expected: int) -> dict:
+    """Wait for the durable executor result instead of sleeping a fixed time.
+
+    The scheduler tick and SQLite commit run in separate asyncio turns.  A
+    fixed 300 ms sleep was usually sufficient locally but was not a valid
+    synchronization contract on a loaded CI runner (notably Python 3.13).
+    Keep the test bounded while waiting for the state it actually asserts.
+    """
+
+    import asyncio
+
+    async def poll() -> dict:
+        while True:
+            rows = await db.list_scheduled_tasks()
+            row = next((item for item in rows if item["id"] == task_id), None)
+            if row is not None and int(row["run_count"] or 0) >= expected:
+                return row
+            await asyncio.sleep(0.01)
+
+    return await asyncio.wait_for(poll(), timeout=5.0)
+
+
 # ---------------------------------------------------------------------------
 # create / list / get
 # ---------------------------------------------------------------------------
@@ -3394,8 +3416,6 @@ async def test_recurring_task_consecutive_executions_both_persist(tmp_path) -> N
     discarded, the task appeared stuck at its pre-execution
     ``next_run``, and a process restart could re-fire the task.
     """
-    import asyncio
-
     from khaos.db import Database
 
     db = Database(tmp_path / "khaos.db")
@@ -3416,7 +3436,7 @@ async def test_recurring_task_consecutive_executions_both_persist(tmp_path) -> N
 
         # Force the first execution.
         engine._tasks[task_id].next_run = utc_now_naive()
-        await asyncio.sleep(0.3)
+        await _wait_for_persisted_run_count(db, task_id, 1)
 
         # Verify the first execution persisted.
         rows = await db.list_scheduled_tasks()
@@ -3427,7 +3447,7 @@ async def test_recurring_task_consecutive_executions_both_persist(tmp_path) -> N
 
         # Force the second execution.
         engine._tasks[task_id].next_run = utc_now_naive()
-        await asyncio.sleep(0.3)
+        await _wait_for_persisted_run_count(db, task_id, 2)
 
         # Verify the second execution persisted — this is the key
         # assertion that previously failed (the conditional UPDATE
@@ -3463,8 +3483,6 @@ async def test_executor_persists_after_engine_restart(tmp_path) -> None:
     the DB version was already N, and every subsequent executor write
     matched 0 rows and was discarded.
     """
-    import asyncio
-
     from khaos.db import Database
 
     db_path = tmp_path / "khaos.db"
@@ -3486,7 +3504,7 @@ async def test_executor_persists_after_engine_restart(tmp_path) -> None:
 
         # First execution.
         engine._tasks[task_id].next_run = utc_now_naive()
-        await asyncio.sleep(0.3)
+        await _wait_for_persisted_run_count(db, task_id, 1)
         rows = await db.list_scheduled_tasks()
         row = next(r for r in rows if r["id"] == task_id)
         assert row["run_count"] == 1
@@ -3529,7 +3547,7 @@ async def test_executor_persists_after_engine_restart(tmp_path) -> None:
         # Force a second execution — the conditional UPDATE MUST
         # succeed (rowcount 1), not be discarded as a version mismatch.
         engine2._tasks[task_id].next_run = utc_now_naive()
-        await asyncio.sleep(0.3)
+        await _wait_for_persisted_run_count(db2, task_id, 2)
 
         rows = await db2.list_scheduled_tasks()
         row = next(r for r in rows if r["id"] == task_id)
@@ -3556,8 +3574,6 @@ async def test_pause_resume_after_execution_keeps_versions_aligned(tmp_path) -> 
     (which was now BEHIND the DB version) and the conditional UPDATE
     matched 0 rows.
     """
-    import asyncio
-
     from khaos.db import Database
 
     db = Database(tmp_path / "khaos.db")
@@ -3578,7 +3594,7 @@ async def test_pause_resume_after_execution_keeps_versions_aligned(tmp_path) -> 
 
         # First execution.
         engine._tasks[task_id].next_run = utc_now_naive()
-        await asyncio.sleep(0.3)
+        await _wait_for_persisted_run_count(db, task_id, 1)
 
         # After execution, memory and DB versions MUST both be 0
         # (executor does not bump the version).
@@ -3604,7 +3620,7 @@ async def test_pause_resume_after_execution_keeps_versions_aligned(tmp_path) -> 
         # Force a second execution — the conditional UPDATE MUST
         # succeed (expected_version=2 matches DB version=2).
         engine._tasks[task_id].next_run = utc_now_naive()
-        await asyncio.sleep(0.3)
+        await _wait_for_persisted_run_count(db, task_id, 2)
 
         rows = await db.list_scheduled_tasks()
         row = next(r for r in rows if r["id"] == task_id)

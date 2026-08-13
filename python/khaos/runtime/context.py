@@ -29,6 +29,21 @@ import os
 from dataclasses import dataclass
 
 
+def local_principal_id() -> str:
+    """Return the local CLI principal without assuming POSIX ``getuid``.
+
+    Windows native identity binding is enforced by the production authority
+    boundary. This fallback only keeps CLI plumbing from crashing on a
+    platform without ``os.getuid``; it is not proof of a Windows service
+    identity.
+    """
+    try:
+        uid: int | str = os.getuid()
+    except AttributeError:
+        uid = "windows"
+    return f"local-uid:{uid}"
+
+
 @dataclass(frozen=True)
 class RequestContext:
     """Immutable per-request security context.
@@ -105,13 +120,8 @@ class RequestContext:
         server (which is Unix-only), so this context is only
         constructed in tests on Windows — the fallback is safe.
         """
-        try:
-            uid: int | str = os.getuid()
-        except AttributeError:
-            # Windows — use a stable local identifier.
-            uid = "windows"
         return cls(
-            principal_id=f"local-uid:{uid}",
+            principal_id=local_principal_id(),
             project_id=project_id,
             source_transport="cli",
             policy_digest=policy_digest,
