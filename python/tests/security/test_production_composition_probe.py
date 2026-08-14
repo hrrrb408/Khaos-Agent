@@ -49,3 +49,16 @@ def test_read_bwrap_child_pid_accepts_multiline_info_metadata() -> None:
         os.close(write_fd)
 
     assert production_composition_probe._read_bwrap_child_pid(read_fd) == 123
+
+
+def test_read_bwrap_child_pid_accepts_json_lines_metadata() -> None:
+    read_fd, write_fd = os.pipe()
+    try:
+        os.write(
+            write_fd,
+            b'{"child-pid": 123, "pid-namespace": 456}\n{"exit-code": 0}\n',
+        )
+    finally:
+        os.close(write_fd)
+
+    assert production_composition_probe._read_bwrap_child_pid(read_fd) == 123

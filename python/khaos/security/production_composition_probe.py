@@ -25,6 +25,8 @@ from khaos.security.authority_broker import (
 from khaos.security.authorityd_protocol import AuthorityDaemonClient
 from khaos.security.identity_isolation import read_linux_process_identity
 
+_BWRAP_INFO_MAX_BYTES = 8192
+
 
 def _resource_digest(command: tuple[str, ...], workspace: Path) -> str:
     payload = json.dumps(
@@ -55,16 +57,42 @@ def _mapping_contains_pair(mapping: str, namespace_id: int, host_id: int) -> boo
 
 def _read_bwrap_child_pid(info_fd: int) -> int:
     try:
-        with os.fdopen(info_fd, "r", encoding="ascii") as stream:
-            raw_info = stream.read(8192)
+        with os.fdopen(info_fd, "r", encoding="ascii", newline="") as stream:
+            raw_info = stream.read(_BWRAP_INFO_MAX_BYTES + 1)
     except (OSError, UnicodeError) as exc:
         raise SystemExit("bubblewrap child identity metadata is unavailable") from exc
+    if not raw_info:
+        raise SystemExit("bubblewrap child identity metadata is unavailable")
+    if len(raw_info) > _BWRAP_INFO_MAX_BYTES:
+        raise SystemExit("bubblewrap child identity metadata exceeds the size limit")
+
+    decoder = json.JSONDecoder()
+    offset = 0
+    child_pid: int | None = None
     try:
-        info = json.loads(raw_info)
+        while offset < len(raw_info):
+            while offset < len(raw_info) and raw_info[offset].isspace():
+                offset += 1
+            if offset == len(raw_info):
+                break
+            info, next_offset = decoder.raw_decode(raw_info, offset)
+            offset = next_offset
+            if not isinstance(info, dict) or "child-pid" not in info:
+                continue
+            candidate = info["child-pid"]
+            if isinstance(candidate, bool) or not isinstance(candidate, int) or candidate <= 0:
+                raise SystemExit(
+                    "bubblewrap child identity metadata has no valid PID"
+                )
+            if child_pid is not None and child_pid != candidate:
+                raise SystemExit("bubblewrap child identity metadata has conflicting PIDs")
+            child_pid = candidate
     except json.JSONDecodeError as exc:
-        raise SystemExit("bubblewrap child identity metadata is malformed") from exc
-    child_pid = info.get("child-pid") if isinstance(info, dict) else None
-    if isinstance(child_pid, bool) or not isinstance(child_pid, int) or child_pid <= 0:
+        preview = raw_info[:256].replace("\n", "\\n")
+        raise SystemExit(
+            f"bubblewrap child identity metadata is malformed: {preview!r}"
+        ) from exc
+    if child_pid is None:
         raise SystemExit("bubblewrap child identity metadata has no valid PID")
     return child_pid
 
