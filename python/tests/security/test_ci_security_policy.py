@@ -214,6 +214,25 @@ def test_windows_product_suite_runs_complete_collection_in_isolated_shards():
     assert "Collect in a process that exits before any test shard is launched" in runner
 
 
+def test_macos_product_suite_runs_complete_collection_in_isolated_shards():
+    """macOS must isolate the full applicable suite without dropping POSIX tests."""
+    product = (WORKFLOWS / "product-integrity-gate.yml").read_text(
+        encoding="utf-8"
+    )
+    assert "Run FULL Python product suite in isolated macOS shards" in product
+    assert "if: matrix.os == 'macos-14'" in product
+    assert (
+        "uv run python scripts/run_windows_product_suite.py --shards 4"
+        in product
+    )
+    assert (
+        'not browser_real and not docker_sandbox_real and '
+        'not production_sandbox_real and not kernel_real and '
+        'not platform_sandbox_real"'
+        in product
+    )
+
+
 def test_production_docker_image_reference_matches_preload():
     """Production Docker tests and CI must use the same pinned reference."""
     workflow = (WORKFLOWS / "docker-security.yml").read_text(encoding="utf-8")
