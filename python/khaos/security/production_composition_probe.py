@@ -35,6 +35,21 @@ def _resource_digest(command: tuple[str, ...], workspace: Path) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _spawn_probe_process(
+    prefix: tuple[str, ...],
+    command: tuple[str, ...],
+    workspace: Path,
+) -> subprocess.Popen:
+    return subprocess.Popen(
+        (*prefix, "--", *command),
+        cwd=workspace,
+        env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+
 def main() -> int:
     if os.environ.get("KHAOS_DEV_MODE") == "1":
         raise SystemExit("production composition probe refuses KHAOS_DEV_MODE=1")
@@ -85,13 +100,7 @@ def main() -> int:
             environment={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"},
             include_network_authority=False,
         )
-        process = subprocess.Popen(
-            (*prefix, "--", *command),
-            cwd=workspace,
-            env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"},
-            capture_output=True,
-            text=True,
-        )
+        process = _spawn_probe_process(prefix, command, workspace)
         try:
             evidence = read_linux_process_identity(process.pid)
             expected_job_uid = int(job_uid)
