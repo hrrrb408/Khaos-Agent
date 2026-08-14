@@ -212,6 +212,8 @@ def test_windows_product_suite_runs_complete_collection_in_isolated_shards():
     assert "global Winsock provider state" in runner
     assert "--collect" in runner
     assert "Collect in a process that exits before any test shard is launched" in runner
+    assert "python/tests/coding/test_runtime_approval_e2e.py::" in runner
+    assert "python/tests/tools/test_terminal_tools.py::" in runner
 
 
 def test_macos_product_suite_runs_complete_collection_in_isolated_shards():
