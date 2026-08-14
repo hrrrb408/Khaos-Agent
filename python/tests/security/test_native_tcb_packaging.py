@@ -181,6 +181,8 @@ def test_production_compose_has_independent_authorityd_sidecar() -> None:
     ]
     assert "10003" in {str(value) for value in agent["group_add"]}
     assert "khaos-authority-runtime:/run/khaos-authorityd:ro" in agent["volumes"]
+    assert agent["security_opt"] == ["seccomp:unconfined"]
+    assert "SYS_ADMIN" not in agent.get("cap_add", [])
 
 
 def test_systemd_units_deprivilege_python_and_pin_helper_client_pid() -> None:

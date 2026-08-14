@@ -94,6 +94,16 @@ because it would not actually reach the broker.
 | macOS | `sandbox-exec` Seatbelt profile restricts content, metadata, directory listing, credential roots, Mach services, network and writable workspace boundaries | no browser kernel namespace claim; a failed probe or invalid launcher rejects execution |
 | Windows | native helper after a passing probe: native commands and trusted Python under `network=none` use an OS-issued AppContainer low-box; trusted Python stages the resolved base executable and grants exact temporary ACLs only to the disposable runtime tree; brokered mode uses a restricted primary token and exact loopback-only WFP rules; all paths use child-process policy, a one-process Job Object, and transactional workspace ACL | missing helper/probe evidence, non-native command, ACL/firewall/token/AppContainer failure, or unsupported network endpoint rejects execution; never falls back to Host |
 
+For the production Docker composition, `khaos-agent` explicitly uses
+`seccomp:unconfined` because Docker's default outer profile blocks the
+unprivileged user-namespace syscalls needed to create the bwrap boundary.
+This is a container-composition compatibility requirement, not a payload
+authorization: the Agent remains UID 10001, receives no `SYS_ADMIN` capability
+through Compose, and the Rust launcher, bwrap mount boundary, Landlock,
+seccomp, cgroup, and authority receipt checks remain mandatory. Deployments
+that cannot preserve this exact composition must refuse production execution;
+they must not grant `SYS_ADMIN` to Python or fall back to Host execution.
+
 `KHAOS_DEV_MODE=1` is an explicit development-only mode. It is not a weaker
 production profile and must never generate production security evidence.
 

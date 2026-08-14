@@ -25,6 +25,8 @@ linux:
   job_uid_mapping: bwrap_unshare_user_uid_gid
   host_uid_distinction: not_claimed_without_native_host_mapping_proof
   identity_oracle: proc_status_uid_map_gid_map
+  docker_outer_seccomp: unconfined_required_for_bwrap_user_namespace
+  docker_agent_sys_admin: forbidden
   production_dev_mode_fallback: forbidden
 platform_boundaries:
   macos_authority_transport: native_launchd_or_xpc_adapter_required
