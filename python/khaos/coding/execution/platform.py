@@ -1338,7 +1338,20 @@ class LinuxBubblewrapBackend:
             "--tmpfs", "/",
             "--dir", "/home",
             "--dir", "/etc",
-            "--dev", "/dev",
+            # A full bwrap --dev also creates devpts and can require a
+            # privileged root/overflow UID mapping.  That mapping is not
+            # available to the non-root Agent inside the production Docker
+            # composition.  Keep the device namespace minimal and explicit;
+            # no host device tree or PTY namespace is needed for piped tool
+            # execution.
+            "--tmpfs", "/dev",
+            # --dev-bind is required for device access under the tmpfs's
+            # default nodev mount.  These are the only four device nodes
+            # exposed; /dev/null is needed for ordinary output redirection.
+            "--dev-bind", "/dev/null", "/dev/null",
+            "--dev-bind", "/dev/zero", "/dev/zero",
+            "--dev-bind", "/dev/random", "/dev/random",
+            "--dev-bind", "/dev/urandom", "/dev/urandom",
             "--proc", "/proc",
             "--size", str(budget.tmpfs_bytes),
             "--tmpfs", "/home/khaos",
