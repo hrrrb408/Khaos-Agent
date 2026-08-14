@@ -29,6 +29,19 @@ def _fd_probe_command(*fds: int) -> str:
     )
 
 
+def test_python_launcher_validates_darwin_signature_mode() -> None:
+    from khaos.coding.execution.native_launcher_runtime import _parse
+
+    options, command = _parse(
+        ["--darwin-signature-mode", "adhoc", "--", "/bin/true"]
+    )
+
+    assert options["darwin_signature_mode"] == "adhoc"
+    assert command == ["/bin/true"]
+    with pytest.raises(ValueError, match="invalid Darwin signature mode"):
+        _parse(["--darwin-signature-mode", "unknown", "--", "/bin/true"])
+
+
 def test_rust_launcher_has_stdio_only_fd_policy() -> None:
     source = (
         ROOT / "rust/khaos-core/src/bin/khaos-exec-launcher.rs"

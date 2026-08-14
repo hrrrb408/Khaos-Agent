@@ -12,8 +12,11 @@ before ``exec`` and is never selected by the production images.
 from __future__ import annotations
 
 import os
+import shutil
 import stat
+import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -30,6 +33,9 @@ from khaos.security.authorityd_protocol import (
     SignedAuthorizationReceipt,
     open_authority_receipt_fds,
 )
+
+
+_DARWIN_SIGNATURE_MODE: str | None = None
 
 
 @dataclass(frozen=True)
@@ -131,13 +137,14 @@ def build_process_launch(
         raise
     launcher = _find_launcher()
     development = os.environ.get("KHAOS_DEV_MODE") == "1"
-    # A locally built Rust launcher on macOS can be terminated by AMFI when
-    # it stages an already-signed system executable from an ad-hoc checkout.
+    darwin_signature_mode: str | None = None
     # The explicit development wrapper performs the same fd/digest/rlimit
-    # checks and is the documented test fallback; production (KHAOS_DEV_MODE
-    # != 1) still requires the packaged Rust TCB below.
+    # checks and selects a host-proven macOS staging-signature mode;
+    # production (KHAOS_DEV_MODE != 1) still requires the packaged Rust TCB
+    # below.
     if development and sys.platform == "darwin":
         launcher = None
+        darwin_signature_mode = _darwin_signature_mode()
     if launcher is None and not development:
         owned_authority.close()
         if receipt_handles is not None:
@@ -198,6 +205,8 @@ def build_process_launch(
         )
         args = [sys.executable, "-c", wrapper, str(source_root), str(runtime)]
     args.append("--new-session")
+    if darwin_signature_mode is not None:
+        args.extend(("--darwin-signature-mode", darwin_signature_mode))
     if directory_binding is not None:
         args.extend(
             (
@@ -322,6 +331,79 @@ def _find_launcher() -> str | None:
         if _is_secure_executable(candidate):
             return str(candidate)
     return None
+
+
+def _darwin_signature_mode() -> str:
+    """Probe which signature form the current macOS execution policy accepts.
+
+    macOS releases and host sandboxes differ on whether a copied platform
+    Mach-O may retain its embedded platform CodeDirectory.  Probe a fixed,
+    system-owned ``/bin/sh`` binary once in the parent process so every staged
+    authority uses a mode the host has actually accepted.  The probe never
+    uses a model-controlled path or command; failure of both modes is a hard
+    refusal.
+    """
+    global _DARWIN_SIGNATURE_MODE
+    if _DARWIN_SIGNATURE_MODE is not None:
+        return _DARWIN_SIGNATURE_MODE
+    if sys.platform != "darwin":
+        raise PermissionError(
+            "Darwin signature probing is unavailable on this platform"
+        )
+
+    source = Path("/bin/sh")
+    if not source.is_file():
+        raise PermissionError("macOS signature probe binary is unavailable")
+    for mode in ("preserve", "adhoc"):
+        staging_directory = Path(tempfile.mkdtemp(prefix="khaos-signature-probe-"))
+        staged = staging_directory / "sh"
+        try:
+            shutil.copyfile(source, staged)
+            staged.chmod(0o700)
+            if mode == "preserve":
+                signature = subprocess.run(
+                    ["/usr/bin/codesign", "-d", "--verbose=4", str(staged)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                    timeout=5,
+                )
+                if signature.returncode != 0:
+                    continue
+            else:
+                signed = subprocess.run(
+                    [
+                        "/usr/bin/codesign",
+                        "--force",
+                        "--sign",
+                        "-",
+                        "--timestamp=none",
+                        str(staged),
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                    timeout=5,
+                )
+                if signed.returncode != 0:
+                    continue
+            executed = subprocess.run(
+                [str(staged), "-c", "exit 0"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=5,
+            )
+            if executed.returncode == 0:
+                _DARWIN_SIGNATURE_MODE = mode
+                return mode
+        except (OSError, subprocess.SubprocessError):
+            continue
+        finally:
+            shutil.rmtree(staging_directory, ignore_errors=True)
+    raise PermissionError(
+        "macOS rejected both preserved and ad-hoc staged executable signatures"
+    )
 
 
 def _is_secure_executable(path: Path) -> bool:
