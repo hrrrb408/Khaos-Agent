@@ -9,6 +9,8 @@ checkout that has not built Rust yet; that process still performs all checks
 before ``exec`` and is never selected by the production images.
 """
 
+# KHAOS-PRIVILEGED-SPAWN owner=NativeLauncherBoundary threat-model=fd-bound-exec-and-host-signature-probe boundary=native-launcher
+
 from __future__ import annotations
 
 import os
