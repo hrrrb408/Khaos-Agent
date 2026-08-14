@@ -57,10 +57,11 @@ loopback、仍强制 API key、project root 和 Python capability。生产入口
 `KHAOS_BROWSER_HELPER_CGROUP_SOURCE` 覆盖）挂到 helper 的
 `/run/khaos-helper/cgroup`；helper 会拒绝普通目录、符号链接或越界 journal，不能把
 整个 `/sys/fs/cgroup` 作为读写挂载。
-生产 Docker 的 `khaos-agent` 还必须保留 `security_opt: ["seccomp:unconfined"]`，因为
-Docker 默认 seccomp 会阻止 bwrap 创建非特权 user namespace；这只是外层容器兼容性要求，
-不向 Python Agent 授予 `SYS_ADMIN`，也不能用 Host 回退替代。等价的自定义 profile 必须
-先通过真实 production composition probe，否则应 fail closed。Linux 原生部署先
+生产 Docker 的 `khaos-agent` 还必须保留 `security_opt: ["seccomp:unconfined", "apparmor:unconfined", "systempaths:unconfined"]`，因为
+Docker 默认的 seccomp、AppArmor 和 system-path 约束会阻止 bwrap 创建并固定非特权
+namespace/mount 边界；这只是外层容器兼容性要求，不向 Python Agent 授予 `SYS_ADMIN`，
+也不能用 Host 回退替代。等价的自定义 profile 必须先通过真实 production composition
+probe，否则应 fail closed。Linux 原生部署先
 审查并以 root 执行 `scripts/install-native-tcb.sh`，再启用 systemd 服务。不支持的
 Windows Coding 执行使用 native helper：只有 helper probe、token/AppContainer、Job
 Object、ACL 与 WFP 证据全部通过才执行；失败时拒绝，不回退 Host，也不报告

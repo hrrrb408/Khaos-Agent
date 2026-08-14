@@ -33,8 +33,8 @@ def test_security_facts_define_the_receipt_and_platform_contract() -> None:
     )
     assert facts["linux"]["job_uid_mapping"] == "bwrap_unshare_user_uid_gid"
     assert facts["linux"]["identity_oracle"] == "proc_status_uid_map_gid_map"
-    assert facts["linux"]["docker_outer_seccomp"] == (
-        "unconfined_required_for_bwrap_user_namespace"
+    assert facts["linux"]["docker_outer_profile"] == (
+        "seccomp_apparmor_systempaths_unconfined_required_for_bwrap"
     )
     assert facts["linux"]["docker_agent_sys_admin"] == "forbidden"
     assert facts["platform_boundaries"]["unsupported_platform_behavior"] == (

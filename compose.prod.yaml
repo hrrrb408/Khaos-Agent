@@ -106,12 +106,15 @@ services:
         condition: service_healthy
     group_add:
       - "10003"
-    # Docker's default seccomp profile denies the unprivileged user-namespace
-    # syscalls required by bubblewrap. This relaxes only the outer container
-    # profile; the agent remains non-root and the Rust launcher plus bubblewrap
-    # still enforce the inner execution boundary. Do not add SYS_ADMIN here.
+    # Docker's default seccomp, AppArmor, and system-path restrictions deny
+    # the nested namespace/mount setup required by bubblewrap. These relax only
+    # the outer container profile; the agent remains non-root and the Rust
+    # launcher plus bubblewrap still enforce the inner execution boundary.
+    # Do not add SYS_ADMIN here.
     security_opt:
       - "seccomp:unconfined"
+      - "apparmor:unconfined"
+      - "systempaths:unconfined"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import socket; s=socket.socket(socket.AF_UNIX); s.connect('/run/khaos/agent.sock'); s.close()"]
