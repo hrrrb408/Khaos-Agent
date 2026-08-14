@@ -39,6 +39,9 @@ def test_security_facts_define_the_receipt_and_platform_contract() -> None:
     assert facts["linux"]["docker_ci_outer_profile"] == (
         "unconfined_for_disposable_composition_probe_only"
     )
+    assert facts["evidence"]["production_composition_probe_network"] == (
+        "shared_container_network_no_network_claim"
+    )
     assert facts["linux"]["docker_agent_sys_admin"] == "forbidden"
     assert facts["platform_boundaries"]["unsupported_platform_behavior"] == (
         "fail_closed"

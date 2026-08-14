@@ -41,6 +41,15 @@ def test_platform_profiles_are_network_denying(tmp_path: Path):
     assert "--unshare-net" in LinuxBubblewrapBackend().argv_prefix(tmp_path)
 
 
+def test_shared_linux_network_mode_is_explicit_and_does_not_change_default(
+    tmp_path: Path,
+):
+    argv = LinuxBubblewrapBackend().argv_prefix(tmp_path, network_mode="shared")
+
+    assert "--share-net" in argv
+    assert "--unshare-net" not in argv
+
+
 @pytest.mark.asyncio
 async def test_windows_output_reader_drains_after_first_chunk():
     class ChunkedStream:

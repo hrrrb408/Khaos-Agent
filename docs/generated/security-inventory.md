@@ -55,7 +55,7 @@
 - `python/khaos/coding/execution/identity.py`: `5f159cf59788242902e0010bd59a05a2f7c14dd2f8251f62cafa2a1c3cc5e265`
 - `python/khaos/coding/execution/models.py`: `8f165d586928c0cd95823b9008777b4b35281c4202c9847c9994c3d2258f6579`
 - `python/khaos/coding/execution/native_launcher.py`: `d9c368f44b1f970cb8742675d67559de3069935ebe6555a3112bbe78c97d8e4f`
-- `python/khaos/coding/execution/platform.py`: `1925d32ed41d9a33b801b58b28bd57da4ce30bfa7b54663285958579b497fd5a`
+- `python/khaos/coding/execution/platform.py`: `d4679346e881b4a2391566c5559ef0ad5e7e1ba728cf5a76360d4ccd119675d5`
 - `python/khaos/coding/execution/service.py`: `2f0ac90a3ee9955d911e53b63e3a8e4f8725315a483e8419439a2abf290b9736`
 - `python/khaos/coding/execution/binding.py`: `99f3d8eb14d80a837ecf0f0d076d556ccdb366b8798c9e0fde6c69d0bb1a5501`
 - `python/khaos/coding/execution/supervisor.py`: `0cb9e6512c9a5e0c59b88042b91a0c2973189f0ae62f36b81be019bc7c4de6a3`

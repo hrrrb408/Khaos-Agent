@@ -69,7 +69,9 @@ enforce the inner boundary. The disposable composition probe may explicitly
 use the three `*=unconfined` values on its temporary CI host only; they are not
 production defaults. Removing or replacing any setting requires an equivalent
 profile that passes the real composition probe; otherwise production execution
-must fail closed.
+must fail closed. The probe shares the container network for its non-network
+identity/result command and makes no network-isolation claim; that claim is
+owned by the real-kernel Linux security gate.
 
 Long-lived state is bounded by maintenance policy: terminal chat streams,
 terminal turn journals, no-effect tool-operation claims, and approval events

@@ -37,4 +37,5 @@ evidence:
   local_platform_sandbox: diagnostic_only
   required_linux_proof: real_kernel_ci
   production_composition_probe: authorityd_worm_claim_bwrap_command_result
+  production_composition_probe_network: shared_container_network_no_network_claim
   closure_gate: aggregate_required_checks_on_exact_commit

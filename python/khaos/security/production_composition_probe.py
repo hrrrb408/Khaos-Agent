@@ -215,6 +215,12 @@ def main() -> int:
             command=("/bin/sh",),
             environment={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"},
             include_network_authority=False,
+            # This command only proves the authorityd -> WORM -> bwrap ->
+            # result chain. It never opens a network socket. Sharing the
+            # container network avoids requiring NET_ADMIN merely for bwrap's
+            # loopback setup; network isolation remains covered by the
+            # dedicated real-kernel Linux security gate.
+            network_mode="shared",
         )
         process, info_fd = _spawn_probe_process(prefix, command, workspace)
         try:
@@ -281,7 +287,10 @@ def main() -> int:
             pass
         else:
             raise SystemExit("completed authority receipt was reusable")
-        print("production authority composition: prepare claim bwrap result success")
+        print(
+            "production authority composition: prepare claim bwrap result success "
+            "(shared probe network; network isolation is a separate gate)"
+        )
         return 0
     except BaseException:
         if claimed and not committed:

@@ -15,3 +15,6 @@ any is missing. Docker uses `name=value` syntax; the disposable composition
 probe may use explicit `unconfined` values for its temporary CI host, but that
 test setup is not a production default. It must not replace the inner boundary
 with `SYS_ADMIN` on the Python Agent or a Host-execution fallback.
+The disposable production composition probe shares the container network only
+for its non-network identity/result command; it makes no network-isolation
+claim, which remains a real-kernel security gate.

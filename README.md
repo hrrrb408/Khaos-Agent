@@ -65,8 +65,9 @@ AppArmor 和 system-path 约束会阻止 bwrap 创建并固定非特权 namespac
 外层容器兼容性要求，不向 Python Agent 授予 `SYS_ADMIN`，也不能用 Host 回退替代。等价
 的自定义 profile 必须先通过真实 production composition probe，否则应 fail closed。仅
 `scripts/compose-security-e2e.sh` 的 disposable CI/local 探针会临时使用显式
-`seccomp=unconfined`、`apparmor=unconfined`、`systempaths=unconfined` 兼容值；这不是生产默认。Linux 原生部署先
-审查并以 root 执行 `scripts/install-native-tcb.sh`，再启用 systemd 服务。不支持的
+`seccomp=unconfined`、`apparmor=unconfined`、`systempaths=unconfined` 兼容值；这不是生产默认。
+该探针的命令只验证 authorityd/WORM/bwrap/收据结果链，使用容器已有网络且不宣称网络隔离；`--unshare-net` 的证明由 real-kernel Linux gate 负责。
+Linux 原生部署先审查并以 root 执行 `scripts/install-native-tcb.sh`，再启用 systemd 服务。不支持的
 Windows Coding 执行使用 native helper：只有 helper probe、token/AppContainer、Job
 Object、ACL 与 WFP 证据全部通过才执行；失败时拒绝，不回退 Host，也不报告
 isolated。Windows 文件工具若缺少原生 no-follow handle backend 会直接 fail closed，

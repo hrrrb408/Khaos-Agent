@@ -18,7 +18,7 @@ import tempfile
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
 from khaos.coding.execution.binding import (
     ExecutionDirectoryBinding,
@@ -1318,6 +1318,7 @@ class LinuxBubblewrapBackend:
         workspace_source: str | None = None,
         network_broker=None,
         include_network_authority: bool = True,
+        network_mode: Literal["isolated", "shared"] = "isolated",
     ) -> tuple[str, ...]:
         canonical_worktree = worktree.expanduser().absolute()
         canonical_cwd = (cwd or canonical_worktree).expanduser().absolute()
@@ -1416,11 +1417,17 @@ class LinuxBubblewrapBackend:
         # deny-default mount construction makes unreadable roots absent.  They
         # must never be mounted merely to cover them with another mount.
         _ = unreadable_roots
+        if network_mode not in {"isolated", "shared"}:
+            raise ValueError(f"unsupported Linux bubblewrap network mode: {network_mode}")
         network_namespace = bool(
             network_broker is not None
             and getattr(network_broker, "uses_network_namespace", False)
         )
-        network_option = "--share-net" if network_namespace else "--unshare-net"
+        network_option = (
+            "--share-net"
+            if network_mode == "shared" or network_namespace
+            else "--unshare-net"
+        )
         prefix.extend((
             network_option,
             *linux_job_namespace_args(),

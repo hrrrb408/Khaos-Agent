@@ -111,6 +111,11 @@ that cannot preserve an equivalent passing composition must refuse production
 execution; they must not grant `SYS_ADMIN` to Python or fall back to Host
 execution.
 
+The composition probe itself uses the container's existing network namespace
+for its non-network identity/result command, so it does not claim network
+isolation. The real-kernel Linux security gate remains the authority for the
+`--unshare-net` proof.
+
 `KHAOS_DEV_MODE=1` is an explicit development-only mode. It is not a weaker
 production profile and must never generate production security evidence.
 
