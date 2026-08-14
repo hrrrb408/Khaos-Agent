@@ -57,13 +57,17 @@ Compose deployments must provide an already delegated cgroup v2 subtree through
 `/run/khaos-helper/cgroup`; the helper rejects a normal directory, symlink, or
 missing cgroup controllers, so a Docker Desktop/host without that delegated
 subtree fails closed instead of silently running without process isolation.
-The production `khaos-agent` service also sets
-`seccomp:unconfined`, `apparmor:unconfined`, and `systempaths:unconfined`:
-Docker's default outer restrictions block the unprivileged namespace and
+The production `khaos-agent` service requires three host-reviewed outer
+profiles through `KHAOS_DOCKER_SECCOMP_OPT`,
+`KHAOS_DOCKER_APPARMOR_OPT`, and `KHAOS_DOCKER_SYSTEMPATHS_OPT`; missing any
+variable makes Compose fail closed. Docker uses `name=value` syntax. Docker's
+default outer restrictions can block the unprivileged namespace and
 mount-propagation syscalls required by bwrap. These settings do not grant
 `SYS_ADMIN` to the Agent; they preserve the non-root outer identity while the
 Rust launcher, bwrap, Landlock, seccomp, cgroup, and authority receipt checks
-enforce the inner boundary. Removing any setting requires an equivalent
+enforce the inner boundary. The disposable composition probe may explicitly
+use the three `*=unconfined` values on its temporary CI host only; they are not
+production defaults. Removing or replacing any setting requires an equivalent
 profile that passes the real composition probe; otherwise production execution
 must fail closed.
 

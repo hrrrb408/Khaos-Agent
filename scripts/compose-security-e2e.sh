@@ -191,6 +191,14 @@ PY
     active_compose_file=""
 }
 
+# compose.prod.yaml deliberately requires explicit outer profiles and has no
+# deployment default. These values are scoped to this disposable CI/local
+# composition probe only; a production deployment must provide host-reviewed
+# profiles through its own environment and must not inherit this test setup.
+export KHAOS_DOCKER_SECCOMP_OPT="${KHAOS_DOCKER_SECCOMP_OPT:-seccomp=unconfined}"
+export KHAOS_DOCKER_APPARMOR_OPT="${KHAOS_DOCKER_APPARMOR_OPT:-apparmor=unconfined}"
+export KHAOS_DOCKER_SYSTEMPATHS_OPT="${KHAOS_DOCKER_SYSTEMPATHS_OPT:-systempaths=unconfined}"
+
 run_profile compose.dev.yaml http://127.0.0.1:8080/api/health
 run_profile compose.prod.yaml https://127.0.0.1:8443/api/health
 printf '%s\n' "Compose development and production security smoke tests passed"
