@@ -43,7 +43,7 @@
 - `python/khaos/security/browser_sandbox.py:2187` `subprocess.run` in `<module>._has_net_admin` owner=`BrowserKernel` threat-model=`privileged-netns-and-nft` boundary=`browser-kernel`
 - `python/khaos/security/browser_sandbox.py:2193` `subprocess.run` in `<module>._has_net_admin` owner=`BrowserKernel` threat-model=`privileged-netns-and-nft` boundary=`browser-kernel`
 - `python/khaos/security/browser_sandbox.py:2217` `subprocess.run` in `<module>._run_command` owner=`BrowserKernel` threat-model=`privileged-netns-and-nft` boundary=`browser-kernel`
-- `python/khaos/security/production_composition_probe.py:43` `subprocess.Popen` in `<module>._spawn_probe_process` owner=`ProductionCompositionProbe` threat-model=`compose-job-identity` boundary=`production-compose-e2e`
+- `python/khaos/security/production_composition_probe.py:79` `subprocess.Popen` in `<module>._spawn_probe_process` owner=`ProductionCompositionProbe` threat-model=`compose-job-identity` boundary=`production-compose-e2e`
 - `python/khaos/tools/clipboard_tools.py:25` `subprocess.run` in `<module>._clipboard_read_sync` owner=`HostClipboard` threat-model=`foreground-user-host-integration` boundary=`host-integration`
 - `python/khaos/tools/clipboard_tools.py:51` `subprocess.run` in `<module>._clipboard_write_sync` owner=`HostClipboard` threat-model=`foreground-user-host-integration` boundary=`host-integration`
 - `rust/khaos-core/src/bin/khaos-browser-kernel-helper.rs:963` `Command::new` in `rust::entrypoint` owner=`BrowserKernelHelper` threat-model=`root-owned-browser-kernel` boundary=`browser-kernel`

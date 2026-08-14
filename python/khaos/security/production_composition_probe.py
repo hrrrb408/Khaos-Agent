@@ -35,19 +35,62 @@ def _resource_digest(command: tuple[str, ...], workspace: Path) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _mapping_contains_pair(mapping: str, namespace_id: int, host_id: int) -> bool:
+    for line in mapping.splitlines():
+        fields = line.split()
+        if len(fields) != 3:
+            continue
+        try:
+            namespace_start, host_start, count = (int(field, 10) for field in fields)
+        except ValueError:
+            continue
+        if (
+            count > 0
+            and namespace_start <= namespace_id < namespace_start + count
+            and host_start <= host_id < host_start + count
+        ):
+            return True
+    return False
+
+
+def _read_bwrap_child_pid(info_fd: int) -> int:
+    try:
+        with os.fdopen(info_fd, "r", encoding="ascii") as stream:
+            raw_info = stream.read(8192)
+    except (OSError, UnicodeError) as exc:
+        raise SystemExit("bubblewrap child identity metadata is unavailable") from exc
+    try:
+        info = json.loads(raw_info)
+    except json.JSONDecodeError as exc:
+        raise SystemExit("bubblewrap child identity metadata is malformed") from exc
+    child_pid = info.get("child-pid") if isinstance(info, dict) else None
+    if isinstance(child_pid, bool) or not isinstance(child_pid, int) or child_pid <= 0:
+        raise SystemExit("bubblewrap child identity metadata has no valid PID")
+    return child_pid
+
+
 def _spawn_probe_process(
     prefix: tuple[str, ...],
     command: tuple[str, ...],
     workspace: Path,
-) -> subprocess.Popen:
-    return subprocess.Popen(
-        (*prefix, "--", *command),
-        cwd=workspace,
-        env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"},
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
+) -> tuple[subprocess.Popen, int]:
+    info_read_fd, info_write_fd = os.pipe()
+    try:
+        process = subprocess.Popen(
+            (*prefix, "--info-fd", str(info_write_fd), "--", *command),
+            cwd=workspace,
+            env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            pass_fds=(info_write_fd,),
+            text=True,
+        )
+    except BaseException:
+        os.close(info_read_fd)
+        raise
+    finally:
+        os.close(info_write_fd)
+    return process, info_read_fd
 
 
 def main() -> int:
@@ -65,7 +108,7 @@ def main() -> int:
     command = (
         "/bin/sh",
         "-c",
-        "printf 'composition-probe\\n'; id -u; cat /proc/self/uid_map",
+        "printf 'composition-probe\\n'; id -u; id -g; cat /proc/self/uid_map; cat /proc/self/gid_map",
     )
     broker = AuthorityDaemonBroker(
         AuthorityDaemonClient(
@@ -100,18 +143,27 @@ def main() -> int:
             environment={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"},
             include_network_authority=False,
         )
-        process = _spawn_probe_process(prefix, command, workspace)
+        process, info_fd = _spawn_probe_process(prefix, command, workspace)
         try:
-            evidence = read_linux_process_identity(process.pid)
+            child_pid = _read_bwrap_child_pid(info_fd)
             expected_job_uid = int(job_uid)
+            expected_agent_uid = os.getuid()
+            expected_agent_gid = os.getgid()
+            evidence = read_linux_process_identity(child_pid)
             if (
-                evidence.uid != expected_job_uid
-                or evidence.euid != expected_job_uid
-                or evidence.gid != expected_job_uid
-                or evidence.egid != expected_job_uid
+                evidence.uid != expected_agent_uid
+                or evidence.euid != expected_agent_uid
+                or evidence.gid != expected_agent_gid
+                or evidence.egid != expected_agent_gid
+                or not _mapping_contains_pair(
+                    evidence.uid_map, expected_job_uid, expected_agent_uid
+                )
+                or not _mapping_contains_pair(
+                    evidence.gid_map, expected_job_uid, expected_agent_gid
+                )
             ):
                 raise SystemExit(
-                    "external /proc identity oracle did not observe the configured job UID"
+                    "external /proc identity oracle did not observe the configured job UID/GID mapping"
                 )
             stdout, stderr = process.communicate(timeout=15)
         except BaseException:
@@ -135,9 +187,9 @@ def main() -> int:
                 f"production job namespace command failed: {completed.stderr.strip()}"
             )
         lines = completed.stdout.splitlines()
-        if len(lines) < 3 or lines[0] != "composition-probe":
+        if len(lines) < 4 or lines[0] != "composition-probe":
             raise SystemExit("production composition probe output is malformed")
-        if lines[1] != job_uid or not lines[2].strip():
+        if lines[1] != job_uid or lines[2] != job_uid or not lines[3].strip():
             raise SystemExit(
                 "production composition probe did not observe the configured job UID"
             )
