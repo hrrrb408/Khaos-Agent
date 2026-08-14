@@ -1,3 +1,4 @@
+import asyncio
 import os
 import subprocess
 from pathlib import Path
@@ -275,6 +276,41 @@ async def test_workspace_bootstrap_publish_failure_cleans_final_worktree(
         await manager.create(repository, "task-publish-failure")
 
     assert manager._workspaces == {}
+    assert list(manager.root.iterdir()) == []
+    assert subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        cwd=repository,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.count("worktree ") == 1
+
+
+@pytest.mark.asyncio
+async def test_workspace_bootstrap_cancellation_rolls_back_transaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Cancellation during materialization cannot orphan a branch/worktree."""
+    repository = _repo(tmp_path / "repo")
+    manager = WorkspaceManager(tmp_path / "worktrees")
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def delayed_materialize(*args, **kwargs):
+        entered.set()
+        await release.wait()
+
+    monkeypatch.setattr(manager, "_materialize_git_tree", delayed_materialize)
+    task = asyncio.create_task(manager.create(repository, "task-cancel-bootstrap"))
+    await asyncio.wait_for(entered.wait(), timeout=10)
+    assert manager._bootstrap_transactions
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert manager._bootstrap_transactions == {}
+    assert manager._quarantined_bootstraps == {}
+    assert manager._task_ids == set()
     assert list(manager.root.iterdir()) == []
     assert subprocess.run(
         ["git", "worktree", "list", "--porcelain"],

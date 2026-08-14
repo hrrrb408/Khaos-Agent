@@ -152,18 +152,58 @@ def test_production_compose_requires_tls_and_host_allowlist() -> None:
     assert "khaos-runtime:/run/khaos:ro" in gateway["volumes"]
 
 
+def test_production_compose_has_independent_authorityd_sidecar() -> None:
+    compose = yaml.safe_load((ROOT / "compose.prod.yaml").read_text(encoding="utf-8"))
+    init = compose["services"]["khaos-authorityd-init"]
+    authority = compose["services"]["khaos-authorityd"]
+    agent = compose["services"]["khaos-agent"]
+
+    assert init["user"] == "0:0"
+    assert init["restart"] == "no"
+    assert init["entrypoint"] == [
+        "python",
+        "/usr/local/sbin/khaos-authorityd-key-init.py",
+    ]
+    assert authority["user"] == "10003:10003"
+    assert authority["environment"].count("KHAOS_DEV_MODE=0") == 1
+    assert authority["depends_on"]["khaos-authorityd-init"]["condition"] == (
+        "service_completed_successfully"
+    )
+    assert authority["environment"].count(
+        "KHAOS_AUDIT_WORM_ENDPOINT=${KHAOS_AUDIT_WORM_ENDPOINT:?KHAOS_AUDIT_WORM_ENDPOINT must be an HTTPS WORM endpoint}"
+    ) == 1
+    assert agent["depends_on"]["khaos-authorityd"]["condition"] == "service_healthy"
+    assert "KHAOS_AUTHORITYD_SOCKET=/run/khaos-authorityd/authorityd.sock" in agent[
+        "environment"
+    ]
+    assert "KHAOS_AUTHORITYD_PUBLIC_KEY_PATH=/run/khaos-authorityd/authorityd.pub" in agent[
+        "environment"
+    ]
+    assert "10003" in {str(value) for value in agent["group_add"]}
+    assert "khaos-authority-runtime:/run/khaos-authorityd:ro" in agent["volumes"]
+
+
 def test_systemd_units_deprivilege_python_and_pin_helper_client_pid() -> None:
     agent = (ROOT / "packaging/systemd/khaos-agent.service").read_text(
         encoding="utf-8"
     )
+    authority = (ROOT / "packaging/systemd/khaos-authorityd.service").read_text(
+        encoding="utf-8"
+    )
     helper = (
         ROOT / "packaging/systemd/khaos-browser-kernel-helper.service"
-    ).read_text(encoding="utf-8")
+        ).read_text(encoding="utf-8")
 
     assert "User=khaos" in agent
     assert "CapabilityBoundingSet=\n" in agent
     assert "AmbientCapabilities=\n" in agent
     assert "KHAOS_DEV_MODE=0" in agent
+    assert "Requires=khaos-authorityd.service" in agent
+    assert "SupplementaryGroups=khaos-authority" in agent
+    assert "User=khaos-authority" in authority
+    assert "Group=khaos-authority" in authority
+    assert "EnvironmentFile=/etc/khaos/authorityd.env" in authority
+    assert "ExecStartPre=/usr/local/sbin/khaos-authorityd-key-init.py" in authority
     assert "User=root" in helper
     assert "systemctl show --property MainPID" in helper
     assert "KHAOS_BROWSER_KERNEL_HELPER_CLIENT_PID" in helper

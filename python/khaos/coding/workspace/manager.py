@@ -11,6 +11,7 @@ import tempfile
 import uuid
 from collections.abc import Callable
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, TypeVar
 
@@ -67,6 +68,31 @@ MAX_CHANGESET_ARTIFACT_BYTES = 256 * 1024 * 1024
 
 class WorkspaceError(RuntimeError):
     """Raised when a worktree operation cannot be completed safely."""
+
+
+@dataclass
+class WorkspaceBootstrapTransaction:
+    """Durable in-memory ownership record for a worktree bootstrap.
+
+    A worktree and its branch are real Git resources before ``TaskWorkspace``
+    is published to ``_workspaces``.  Keeping this transaction in a parent
+    registry closes that acquire-to-publish gap: cancellation or a late Git
+    failure cannot make the directory/branch disappear from the lifecycle
+    graph merely because the normal workspace object was never constructed.
+    """
+
+    workspace_id: str
+    task_id: str
+    repository: Path
+    branch_name: str
+    base_sha: str
+    pending_path: Path
+    final_path: Path
+    authority_capability: EffectCapability
+    phase: str = "admitted"
+    branch_created: bool = False
+    published: bool = False
+    cleanup_error: BaseException | None = None
 
 
 def _install_protected_metadata_guards(worktree: Path) -> None:
@@ -334,6 +360,8 @@ class WorkspaceManager:
         self.bootstrap_limits = bootstrap_limits or WorkspaceBootstrapLimits()
         self._workspaces: dict[str, TaskWorkspace] = {}
         self._task_ids: set[str] = set()
+        self._bootstrap_transactions: dict[str, WorkspaceBootstrapTransaction] = {}
+        self._quarantined_bootstraps: dict[str, WorkspaceBootstrapTransaction] = {}
         self._lock = asyncio.Lock()
         self._storage_mutation_locks: dict[str, asyncio.Lock] = {}
         # Batch 2.5 §4: optional lease invalidation hook. When set
@@ -354,6 +382,63 @@ class WorkspaceManager:
     def set_mutation_fence(self, fence: Any) -> None:
         """Batch 2.6 §5: register the shared per-workspace mutation fence."""
         self._mutation_fence = fence
+
+    def owned_resources(self) -> tuple[str, ...]:
+        """Describe workspaces and bootstrap transactions still owned here."""
+        resources = [f"workspace:{workspace_id}" for workspace_id in self._workspaces]
+        resources.extend(
+            f"bootstrap:{workspace_id}"
+            for workspace_id in {
+                *self._bootstrap_transactions,
+                *self._quarantined_bootstraps,
+            }
+        )
+        runner_resources = getattr(self._git_runner, "owned_resources", None)
+        if callable(runner_resources):
+            resources.extend(f"git:{item}" for item in runner_resources())
+        return tuple(sorted(resources))
+
+    def terminal_postcondition(self) -> bool:
+        """Prove that no bootstrap or child Git process is unaccounted for."""
+        runner_terminal = getattr(self._git_runner, "terminal_postcondition", None)
+        return (
+            not self._bootstrap_transactions
+            and not self._quarantined_bootstraps
+            and (not callable(runner_terminal) or bool(runner_terminal()))
+        )
+
+    @property
+    def is_quarantined(self) -> bool:
+        """Whether a bootstrap cleanup failure retained an owned resource."""
+        return bool(self._quarantined_bootstraps)
+
+    async def retry_quarantined_bootstraps(self) -> None:
+        """Retry retained bootstrap cleanup without dropping its ownership."""
+        for workspace_id in tuple(self._quarantined_bootstraps):
+            transaction = self._quarantined_bootstraps[workspace_id]
+            try:
+                await self._rollback_bootstrap(transaction)
+            except BaseException as exc:  # noqa: BLE001 - retain quarantine
+                transaction.cleanup_error = exc
+                logger.error(
+                    "workspace bootstrap remains quarantined: %s: %s",
+                    workspace_id,
+                    exc,
+                )
+                continue
+            self._quarantined_bootstraps.pop(workspace_id, None)
+            self._task_ids.discard(transaction.task_id)
+
+    async def close(self) -> None:
+        """Close the trusted Git owner after all bootstrap transactions settle."""
+        await self.retry_quarantined_bootstraps()
+        close_runner = getattr(self._git_runner, "close", None)
+        if callable(close_runner):
+            await close_runner()
+        if not self.terminal_postcondition():
+            raise WorkspaceError(
+                "WorkspaceManager close could not prove bootstrap/Git ownership is terminal"
+            )
 
     @asynccontextmanager
     async def _changeset_mutation_scope(
@@ -439,19 +524,14 @@ class WorkspaceManager:
         preserve_output: bool = False,
     ) -> str:
         try:
-            # Reconstruct from the manager-owned identity on every call.  The
-            # explicit fields are intentionally mutable only through the
-            # manager's startup/revalidation contract; this preserves the
-            # digest-drift test and prevents a stale cached runner from
-            # becoming an authority bypass.
-            runner = TrustedGitRunner(
-                self._git_executable,
-                self._git_identity,
-                self._git_digest,
-                self.root,
-                self._root_identity,
-                self._authority_broker,
-            )
+            # Keep one manager-owned runner so every Git process owner is
+            # visible to the parent lifecycle registry.  Re-apply the
+            # manager's startup/revalidation fields before each call so the
+            # existing digest-drift fail-closed contract remains intact.
+            runner = self._git_runner
+            runner.executable = self._git_executable
+            runner.git_identity = self._git_identity
+            runner.git_digest = self._git_digest
             if authority is None:
                 context = self._default_git_authority(repository)
                 capability = self._authority_broker.issue(
@@ -483,14 +563,10 @@ class WorkspaceManager:
         authority: EffectCapability,
     ) -> None:
         try:
-            runner = TrustedGitRunner(
-                self._git_executable,
-                self._git_identity,
-                self._git_digest,
-                self.root,
-                self._root_identity,
-                self._authority_broker,
-            )
+            runner = self._git_runner
+            runner.executable = self._git_executable
+            runner.git_identity = self._git_identity
+            runner.git_digest = self._git_digest
             if not isinstance(authority, EffectCapability):
                 raise WorkspaceError(
                     "trusted Git materialization requires a broker capability"
@@ -814,6 +890,60 @@ class WorkspaceManager:
                 index_file=index_file,
             )
 
+    async def _rollback_bootstrap(
+        self, transaction: WorkspaceBootstrapTransaction
+    ) -> None:
+        """Remove every Git resource acquired by a failed bootstrap.
+
+        The operation is deliberately idempotent and uses Git for both
+        worktree administration and branch deletion.  A CAS old-value on the
+        branch prevents a late cleanup from deleting a ref that advanced
+        outside this transaction.
+        """
+        transaction.phase = "rolling-back"
+        errors: list[BaseException] = []
+        for candidate in (transaction.pending_path, transaction.final_path):
+            if not candidate.exists() and not candidate.is_symlink():
+                continue
+            try:
+                await self._git(
+                    transaction.repository,
+                    "worktree",
+                    "remove",
+                    "--force",
+                    str(candidate),
+                    authority=transaction.authority_capability,
+                )
+            except BaseException as exc:  # noqa: BLE001 - quarantine on proof failure
+                errors.append(exc)
+        for candidate in (transaction.pending_path, transaction.final_path):
+            if candidate.exists() or candidate.is_symlink():
+                errors.append(
+                    WorkspaceError(
+                        f"bootstrap worktree path remains after rollback: {candidate}"
+                    )
+                )
+        try:
+            await self._git(
+                transaction.repository,
+                "update-ref",
+                "-d",
+                _safe_branch_ref(transaction.branch_name),
+                transaction.base_sha,
+                authority=transaction.authority_capability,
+            )
+        except BaseException as exc:  # noqa: BLE001 - retain branch ownership
+            errors.append(exc)
+        if errors:
+            transaction.phase = "quarantined"
+            raise WorkspaceError(
+                "bootstrap rollback did not prove terminal cleanup: "
+                + "; ".join(type(error).__name__ for error in errors)
+            ) from errors[0]
+        transaction.phase = "rolled-back"
+        transaction.branch_created = False
+        transaction.published = False
+
     async def create(
         self,
         repository_root: Path,
@@ -826,7 +956,13 @@ class WorkspaceManager:
     ) -> TaskWorkspace:
         repository = repository_root.resolve()
         async with self._lock:
-            if task_id in self._task_ids:
+            if task_id in self._task_ids or any(
+                transaction.task_id == task_id
+                for transaction in (
+                    *self._bootstrap_transactions.values(),
+                    *self._quarantined_bootstraps.values(),
+                )
+            ):
                 raise WorkspaceError(f"task already has an active workspace: {task_id}")
             if not (repository / ".git").exists():
                 raise WorkspaceError(f"not a git repository: {repository}")
@@ -868,8 +1004,20 @@ class WorkspaceManager:
             path.parent.mkdir(parents=True, exist_ok=True)
             if path.exists() or path.is_symlink() or pending_path.exists() or pending_path.is_symlink():
                 raise WorkspaceError("workspace bootstrap path already exists")
-            active_path: Path | None = pending_path
+            transaction = WorkspaceBootstrapTransaction(
+                workspace_id=workspace_id,
+                task_id=task_id,
+                repository=repository,
+                branch_name=branch,
+                base_sha=base_sha,
+                pending_path=pending_path,
+                final_path=path,
+                authority_capability=authority_capability,
+            )
+            self._bootstrap_transactions[workspace_id] = transaction
+            self._task_ids.add(task_id)
             try:
+                transaction.phase = "creating-worktree"
                 await self._git(
                     repository,
                     "worktree",
@@ -881,6 +1029,8 @@ class WorkspaceManager:
                     base_sha,
                     authority=authority_capability,
                 )
+                transaction.branch_created = True
+                transaction.phase = "worktree-created"
                 git_identity = await asyncio.to_thread(
                     capture_git_worktree_identity, repository, pending_path
                 )
@@ -919,7 +1069,8 @@ class WorkspaceManager:
                     str(path),
                     authority=authority_capability,
                 )
-                active_path = path
+                transaction.published = True
+                transaction.phase = "published"
                 git_identity = await asyncio.to_thread(
                     capture_git_worktree_identity, repository, path
                 )
@@ -948,32 +1099,39 @@ class WorkspaceManager:
                 )
                 workspace.storage_baseline = baseline
                 self._workspaces[workspace_id] = workspace
-                self._task_ids.add(task_id)
-                active_path = None
+                transaction.phase = "committed"
+                self._bootstrap_transactions.pop(workspace_id, None)
                 return workspace
-            except Exception:
-                # A bootstrap failure must not leave a directory that looks
-                # usable but is absent from the in-memory lifecycle registry.
-                # Git owns the administrative metadata, so cleanup stays on
-                # the trusted worktree path rather than using host ``rmtree``.
-                if active_path is not None:
+            except BaseException:
+                # Cancellation is part of the transaction protocol: cleanup
+                # must finish (or be retained in quarantine) before the
+                # caller receives the original cancellation/failure.
+                cleanup_task = asyncio.create_task(
+                    self._rollback_bootstrap(transaction),
+                    name=f"khaos-bootstrap-rollback:{workspace_id}",
+                )
+                cleanup_error: BaseException | None = None
+                while not cleanup_task.done():
                     try:
-                        await self._git(
-                            repository,
-                            "worktree",
-                            "remove",
-                            "--force",
-                            str(active_path),
-                            authority=authority_capability,
-                        )
-                    except Exception as cleanup_error:  # noqa: BLE001 - preserve original failure
-                        logger.error(
-                            "bootstrap cleanup failed for %s: %s",
-                            active_path,
-                            cleanup_error,
-                        )
+                        await asyncio.shield(cleanup_task)
+                    except asyncio.CancelledError:
+                        continue
+                try:
+                    await cleanup_task
+                except BaseException as exc:  # noqa: BLE001 - retain ownership
+                    cleanup_error = exc
                 self._workspaces.pop(workspace_id, None)
-                self._task_ids.discard(task_id)
+                self._bootstrap_transactions.pop(workspace_id, None)
+                if cleanup_error is None:
+                    self._task_ids.discard(task_id)
+                else:
+                    transaction.cleanup_error = cleanup_error
+                    self._quarantined_bootstraps[workspace_id] = transaction
+                    logger.error(
+                        "bootstrap cleanup failed; transaction quarantined: %s: %s",
+                        workspace_id,
+                        cleanup_error,
+                    )
                 raise
 
     async def transition(self, workspace_id: str, target: WorkspaceState) -> WorkspaceTransition:
@@ -1538,6 +1696,18 @@ class WorkspaceManager:
                         str(workspace.worktree_path),
                         authority=authority.derive(operation_class="git.cleanup"),
                     )
+                # A successful worktree removal does not remove the local
+                # task ref.  Delete it with the last known commit as a CAS so
+                # cleanup cannot erase a ref that advanced outside this
+                # workspace owner.
+                await self._git(
+                    workspace.repository_root,
+                    "update-ref",
+                    "-d",
+                    _safe_branch_ref(workspace.branch_name),
+                    workspace.base_sha,
+                    authority=authority.derive(operation_class="git.cleanup-ref"),
+                )
             except Exception:  # noqa: BLE001 - worktree cleanup failure is persisted
                 workspace.state = WorkspaceState.FAILED
                 return WorkspaceTransition.FAILED

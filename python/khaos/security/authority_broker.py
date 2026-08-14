@@ -721,14 +721,15 @@ class AuthorityDaemonBroker(AuthorityBroker):
             )
         except AuthorityControlPlaneError as exc:
             raise AuthorityBrokerError(str(exc)) from exc
+        signed_resource = receipt.resource_digest
         authority = capability.authority.derive(
             operation_class=operation_class,
-            resource_digest=resource_digest,
+            resource_digest=signed_resource,
         )
         return EffectCapability._from_broker(
             authority=authority,
             allowed_operation=operation_class,
-            resource_digest=resource_digest,
+            resource_digest=signed_resource,
             generation=authority.workspace_generation,
             authorization_epoch=authority.authorization_epoch,
             issued_at=receipt.issued_at,

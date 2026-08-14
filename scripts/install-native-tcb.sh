@@ -6,6 +6,11 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
+if ! id -u khaos-authority >/dev/null 2>&1; then
+  useradd --system --uid 10003 --home-dir /nonexistent \
+    --shell /usr/sbin/nologin khaos-authority
+fi
+
 repository="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 cd "$repository"
 
@@ -41,6 +46,12 @@ chmod 0600 /var/lib/khaos/browser-helper.secret
 install -o root -g root -m 0644 \
   packaging/systemd/khaos-agent.service \
   /etc/systemd/system/khaos-agent.service
+install -o root -g root -m 0755 \
+  packaging/docker/authorityd-key-init.py \
+  /usr/local/sbin/khaos-authorityd-key-init.py
+install -o root -g root -m 0644 \
+  packaging/systemd/khaos-authorityd.service \
+  /etc/systemd/system/khaos-authorityd.service
 install -o root -g root -m 0644 \
   packaging/systemd/khaos-browser-kernel-helper.service \
   /etc/systemd/system/khaos-browser-kernel-helper.service

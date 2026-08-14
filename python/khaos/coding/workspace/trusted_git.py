@@ -17,7 +17,7 @@ import os
 import signal
 import stat
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path, PurePosixPath
 
@@ -139,6 +139,7 @@ class TrustedGitProcessOwner:
         self.state = TrustedGitProcessState.NEW
         self.process: asyncio.subprocess.Process | None = None
         self.quarantine_reason: str | None = None
+        self._late_spawn_task: asyncio.Task[None] | None = None
 
     @property
     def terminal(self) -> bool:
@@ -146,8 +147,16 @@ class TrustedGitProcessOwner:
             TrustedGitProcessState.COMPLETED,
             TrustedGitProcessState.CANCELLED,
             TrustedGitProcessState.FAILED,
-            TrustedGitProcessState.QUARANTINED,
         }
+
+    @property
+    def terminal_postcondition(self) -> bool:
+        """Prove that no late spawn task or live Git child remains."""
+        return (
+            (self.process is None or self.process.returncode is not None)
+            and (self._late_spawn_task is None or self._late_spawn_task.done())
+            and self.state is not TrustedGitProcessState.QUARANTINED
+        )
 
     @staticmethod
     def _spawn_options() -> dict[str, object]:
@@ -179,7 +188,7 @@ class TrustedGitProcessOwner:
                 # that a kernel child was not created. Keep the original task
                 # alive and attach an owner-side reaper that adopts and
                 # terminates a child if it appears later.
-                asyncio.create_task(
+                self._late_spawn_task = asyncio.create_task(
                     self._adopt_late_spawn(spawn_task),
                     name=f"khaos-git-reaper:{self.label}",
                 )
@@ -211,6 +220,7 @@ class TrustedGitProcessOwner:
             process = await spawn_task
         except BaseException:  # noqa: BLE001 - reaper must consume late spawn failures
             # A failed/cancelled spawn proves that no process was published.
+            self.state = TrustedGitProcessState.CANCELLED
             return
         self.process = process
         self.state = TrustedGitProcessState.SPAWNED
@@ -219,6 +229,26 @@ class TrustedGitProcessOwner:
         except TrustedGitError as exc:
             self.state = TrustedGitProcessState.QUARANTINED
             self.quarantine_reason = str(exc) or "late Git process cleanup failed"
+
+    async def close(self) -> None:
+        """Retry late adoption/termination and retain failure as quarantine."""
+        late_spawn = self._late_spawn_task
+        if late_spawn is not None and not late_spawn.done():
+            await asyncio.shield(late_spawn)
+        if self.process is not None and self.process.returncode is None:
+            await asyncio.shield(self.abort(cancelled=True))
+        if self.state is TrustedGitProcessState.QUARANTINED:
+            if self.process is None or self.process.returncode is not None:
+                self.state = TrustedGitProcessState.CANCELLED
+            else:
+                raise TrustedGitError(
+                    f"Git process {self.label} remains quarantined: "
+                    f"{self.quarantine_reason or 'terminal proof is missing'}"
+                )
+        if not self.terminal_postcondition:
+            raise TrustedGitError(
+                f"Git process {self.label} terminal ownership proof is missing"
+            )
 
     async def communicate_after_spawn(
         self,
@@ -429,7 +459,7 @@ def _verify_identity(
         raise TrustedGitError(f"{label} trust policy failed")
 
 
-@dataclass(frozen=True)
+@dataclass
 class TrustedGitRunner:
     """Run bounded Git operations under a broker-issued capability."""
 
@@ -439,6 +469,7 @@ class TrustedGitRunner:
     authority_root: Path
     authority_root_identity: FileIdentity
     authority_broker: AuthorityBroker | None = None
+    _owners: dict[str, TrustedGitProcessOwner] = field(default_factory=dict, init=False, repr=False)
 
     @classmethod
     def for_authority_root(
@@ -457,6 +488,53 @@ class TrustedGitRunner:
             root_identity,
             authority_broker or AuthorityBroker.default(),
         )
+
+    def _new_owner(self, label: str) -> TrustedGitProcessOwner:
+        """Register a Git process owner before the native spawn begins."""
+        owner = TrustedGitProcessOwner(label)
+        self._owners[f"{label}:{id(owner)}"] = owner
+        return owner
+
+    def _release_owner(self, owner: TrustedGitProcessOwner) -> None:
+        """Release only after the owner has an independently proven terminal state."""
+        if not owner.terminal_postcondition:
+            return
+        for key, current in tuple(self._owners.items()):
+            if current is owner:
+                self._owners.pop(key, None)
+                return
+
+    def owned_resources(self) -> tuple[str, ...]:
+        """Return the parent-owned Git process/reaper inventory."""
+        resources: list[str] = []
+        for key, owner in self._owners.items():
+            resources.append(key)
+            if owner._late_spawn_task is not None and not owner._late_spawn_task.done():
+                resources.append(f"{key}:late-spawn")
+        return tuple(sorted(resources))
+
+    @property
+    def is_quarantined(self) -> bool:
+        return any(owner.state is TrustedGitProcessState.QUARANTINED for owner in self._owners.values())
+
+    def terminal_postcondition(self) -> bool:
+        return not self._owners
+
+    async def close(self) -> None:
+        """Retry every retained owner and never manufacture an empty registry."""
+        errors: list[BaseException] = []
+        for key, owner in tuple(self._owners.items()):
+            try:
+                await asyncio.shield(owner.close())
+            except BaseException as exc:  # noqa: BLE001 - retain owner
+                errors.append(exc)
+                continue
+            self._release_owner(owner)
+        if errors or self._owners:
+            raise TrustedGitError(
+                "TrustedGitRunner close retained owned resources: "
+                + "; ".join(type(error).__name__ for error in errors)
+            ) from (errors[0] if errors else None)
 
     def _verify(self) -> None:
         _verify_identity(
@@ -617,7 +695,7 @@ class TrustedGitRunner:
             return "dirty" if dirty else ""
         self._verify()
         self._authority_or_fail(authority)
-        owner = TrustedGitProcessOwner("git.run")
+        owner = self._new_owner("git.run")
         try:
             stdout, stderr = await owner.communicate_after_spawn(
                 str(self.executable),
@@ -629,6 +707,8 @@ class TrustedGitRunner:
             )
         except OSError as exc:
             raise TrustedGitError("trusted Git process could not start") from exc
+        finally:
+            self._release_owner(owner)
         if owner.process is None or owner.process.returncode != 0:
             message = stderr.decode("utf-8", errors="replace").strip()
             raise TrustedGitError(message or "trusted Git command failed")
@@ -645,7 +725,7 @@ class TrustedGitRunner:
         """Run one binary-producing Git command with the same authority gate."""
         self._verify()
         self._authority_or_fail(authority)
-        owner = TrustedGitProcessOwner("git.run-bytes")
+        owner = self._new_owner("git.run-bytes")
         try:
             stdout, stderr = await owner.communicate_after_spawn(
                 str(self.executable),
@@ -657,6 +737,8 @@ class TrustedGitRunner:
             )
         except OSError as exc:
             raise TrustedGitError("trusted Git process could not start") from exc
+        finally:
+            self._release_owner(owner)
         if owner.process is None or owner.process.returncode != 0:
             message = stderr.decode("utf-8", errors="replace").strip()
             raise TrustedGitError(message or "trusted Git command failed")
@@ -677,7 +759,7 @@ class TrustedGitRunner:
             raise TrustedGitError("trusted Git input exceeds the configured bound")
         self._verify()
         self._authority_or_fail(authority)
-        owner = TrustedGitProcessOwner("git.run-with-input")
+        owner = self._new_owner("git.run-with-input")
         try:
             stdout, stderr = await owner.communicate_after_spawn(
                 str(self.executable),
@@ -691,6 +773,8 @@ class TrustedGitRunner:
             )
         except OSError as exc:
             raise TrustedGitError("trusted Git process could not start") from exc
+        finally:
+            self._release_owner(owner)
         if len(stdout) > max_output_bytes or len(stderr) > _MAX_GIT_ERROR_BYTES:
             raise TrustedGitError("trusted Git output exceeds the configured bound")
         if owner.process is None or owner.process.returncode != 0:
@@ -729,7 +813,7 @@ class TrustedGitRunner:
         except OSError as exc:
             raise TrustedGitError("Git hash input descriptor is unavailable") from exc
 
-        owner = TrustedGitProcessOwner("git.hash-fd")
+        owner = self._new_owner("git.hash-fd")
         stderr_task: asyncio.Task[tuple[bytes, bool]] | None = None
         stdout_task: asyncio.Task[tuple[bytes, bool]] | None = None
         try:
@@ -787,6 +871,7 @@ class TrustedGitRunner:
         except (OSError, UnicodeError, TrustedGitError) as exc:
             if not owner.terminal:
                 await asyncio.shield(owner.abort(cancelled=False))
+            self._release_owner(owner)
             if isinstance(exc, TrustedGitError):
                 raise
             raise TrustedGitError("trusted Git hash input failed") from exc
@@ -800,6 +885,7 @@ class TrustedGitRunner:
                         pass
             if not owner.terminal:
                 await asyncio.shield(owner.abort(cancelled=False))
+            self._release_owner(owner)
 
     async def stream_to_file(
         self,
@@ -817,7 +903,7 @@ class TrustedGitRunner:
         self._verify()
         self._authority_or_fail(authority)
         process: asyncio.subprocess.Process | None = None
-        owner = TrustedGitProcessOwner("git.stream-to-file")
+        owner = self._new_owner("git.stream-to-file")
         stderr_task: asyncio.Task[bytes] | None = None
         descriptor: int | None = None
         completed = False
@@ -900,6 +986,7 @@ class TrustedGitRunner:
                 os.close(descriptor)
             if not completed:
                 destination.unlink(missing_ok=True)
+            self._release_owner(owner)
 
     async def run_bytes_limited(
         self,
@@ -915,7 +1002,7 @@ class TrustedGitRunner:
         self._verify()
         self._authority_or_fail(authority)
         process: asyncio.subprocess.Process | None = None
-        owner = TrustedGitProcessOwner("git.run-bytes-limited")
+        owner = self._new_owner("git.run-bytes-limited")
         stderr_task: asyncio.Task[bytes] | None = None
         try:
             process = await owner.spawn(
@@ -955,6 +1042,7 @@ class TrustedGitRunner:
         except TrustedGitError:
             if not owner.terminal:
                 await asyncio.shield(owner.abort(cancelled=False))
+            self._release_owner(owner)
             raise
         except (OSError, asyncio.IncompleteReadError) as exc:
             if not owner.terminal:
@@ -969,6 +1057,7 @@ class TrustedGitRunner:
                     pass
             if not owner.terminal:
                 await asyncio.shield(owner.abort(cancelled=False))
+            self._release_owner(owner)
 
     async def materialize_tree(
         self,
@@ -1031,7 +1120,7 @@ class TrustedGitRunner:
         self._verify()
         self._authority_or_fail(authority)
         process: asyncio.subprocess.Process | None = None
-        owner = TrustedGitProcessOwner("git.materialize-blobs")
+        owner = self._new_owner("git.materialize-blobs")
         try:
             process = await owner.spawn(
                 str(self.executable),
@@ -1150,6 +1239,7 @@ class TrustedGitRunner:
         finally:
             if not owner.terminal:
                 await asyncio.shield(owner.abort(cancelled=False))
+            self._release_owner(owner)
 
     async def _object_id_length(
         self, repository: Path, *, authority: EffectCapability

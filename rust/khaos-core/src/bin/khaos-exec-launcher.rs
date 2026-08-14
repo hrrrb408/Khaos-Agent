@@ -14,6 +14,7 @@ mod authority_receipt;
 
 #[cfg(unix)]
 mod unix {
+    use serde_json::json;
     use sha2::{Digest, Sha256};
     use std::env;
     #[cfg(not(target_os = "linux"))]
@@ -83,7 +84,14 @@ mod unix {
             let public_key_fd = options
                 .authority_public_key_fd
                 .ok_or_else(|| invalid("authorityd public key is required"))?;
-            crate::authority_receipt::verify_from_fds(receipt_fd, public_key_fd, None)?;
+            let resource_digest = execution_binding_digest(&options, &command)?;
+            crate::authority_receipt::verify_from_fds_bound(
+                receipt_fd,
+                public_key_fd,
+                None,
+                "exec.host",
+                &resource_digest,
+            )?;
         }
         if options.new_session {
             let result = unsafe { libc::setsid() };
@@ -648,6 +656,70 @@ mod unix {
             index += 2;
         }
         Err(invalid("launcher command separator is required"))
+    }
+
+    fn execution_binding_digest(
+        options: &Options,
+        command: &[std::ffi::OsString],
+    ) -> io::Result<String> {
+        let command = command
+            .iter()
+            .map(|value| {
+                value
+                    .to_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| invalid("launcher command is not UTF-8"))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        let interpreter_args = options
+            .interpreter_args
+            .iter()
+            .map(|value| {
+                value
+                    .to_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| invalid("interpreter argument is not UTF-8"))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        let interpreter_argv0 = options
+            .interpreter_argv0
+            .as_ref()
+            .map(|value| {
+                value
+                    .to_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| invalid("interpreter argv0 is not UTF-8"))
+            })
+            .transpose()?;
+        let mut environment = env::vars().collect::<Vec<_>>();
+        environment.sort_by(|left, right| left.0.cmp(&right.0));
+        let environment = environment
+            .into_iter()
+            .map(|(key, value)| json!([key, value]))
+            .collect::<Vec<_>>();
+        let payload = json!({
+            "schema_version": 1,
+            "command": command,
+            "root_device": options.root_device,
+            "root_inode": options.root_inode,
+            "cwd_device": options.cwd_device,
+            "cwd_inode": options.cwd_inode,
+            "exec_digest": options.exec_digest,
+            "interpreter_digest": options.interpreter_digest,
+            "interpreter_argv0": interpreter_argv0,
+            "interpreter_args": interpreter_args,
+            "rlimit_fsize": options.rlimit_fsize,
+            "rlimit_nofile": options.rlimit_nofile,
+            "rlimit_cpu": options.rlimit_cpu,
+            "rlimit_as": options.rlimit_as,
+            "environment": environment,
+            "new_session": options.new_session,
+            "preserve_directory_fds": options.preserve_directory_fds,
+        });
+        let canonical = crate::authority_receipt::canonical_json(&payload);
+        let mut digest = Sha256::new();
+        digest.update(canonical.as_bytes());
+        Ok(format!("{:x}", digest.finalize()))
     }
 
     fn validate_identity_pairs(options: &Options) -> io::Result<()> {

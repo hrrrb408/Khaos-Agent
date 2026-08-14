@@ -34,6 +34,7 @@ from khaos.security.authorityd_protocol import (
     SignedAuthorizationReceipt,
     _canonical,
     _digest,
+    derive_resource_digest,
 )
 from khaos.security.identity_isolation import (
     IdentityIsolationError,
@@ -169,6 +170,8 @@ class AuthorityDaemon:
         resource_digest: str,
     ) -> SignedAuthorizationReceipt:
         self.validate(receipt)
+        if not resource_digest:
+            raise AuthorityControlPlaneError("narrowed resource scope is required")
         intent = AuthorizationIntent(
             principal_id=receipt.principal_id,
             project_id=receipt.project_id,
@@ -176,7 +179,13 @@ class AuthorityDaemon:
             task_id=receipt.task_id,
             workspace_id=receipt.workspace_id,
             operation=operation,
-            resource_digest=resource_digest,
+            resource_digest=(
+                receipt.resource_digest
+                if resource_digest == receipt.resource_digest
+                else derive_resource_digest(
+                    receipt.resource_digest, operation, resource_digest
+                )
+            ),
             policy_digest=receipt.policy_digest,
             nonce=secrets.token_hex(16),
             authorization_epoch=receipt.authorization_epoch,
@@ -325,7 +334,7 @@ class AuthorityPolicyKernel:
 
 
 def serve_unix(daemon: AuthorityDaemon, *, production: bool = True) -> None:
-    """Serve newline-delimited requests on a private 0600 Unix socket."""
+    """Serve requests on a private 0600 socket or agent-group 0660 socket."""
     if os.name == "nt" or sys.platform == "darwin":
         raise AuthorityControlPlaneError(
             "native authorityd transport is required on this platform; use the "
@@ -345,7 +354,18 @@ def serve_unix(daemon: AuthorityDaemon, *, production: bool = True) -> None:
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         listener.bind(str(daemon.socket_path))
-        os.chmod(daemon.socket_path, 0o600)
+        configured_mode = os.environ.get("KHAOS_AUTHORITYD_SOCKET_MODE", "0600")
+        try:
+            socket_mode = int(configured_mode, 8)
+        except ValueError as exc:
+            raise AuthorityControlPlaneError(
+                "KHAOS_AUTHORITYD_SOCKET_MODE must be octal"
+            ) from exc
+        if socket_mode not in {0o600, 0o660}:
+            raise AuthorityControlPlaneError(
+                "authorityd socket mode must be 0600 or 0660"
+            )
+        os.chmod(daemon.socket_path, socket_mode)
         if production:
             validate_private_unix_socket(
                 daemon.socket_path, expected_uid=contract.authority_uid

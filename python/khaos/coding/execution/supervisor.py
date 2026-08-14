@@ -32,6 +32,7 @@ from khaos.coding.execution.identity import (
 )
 from khaos.coding.execution.models import ExecutionRequest, ExecutionResult
 from khaos.coding.execution.native_launcher import build_process_launch
+from khaos.coding.execution.receipt_binding import execution_binding_digest
 from khaos.coding.workspace.storage import (
     WorkspaceStorageAuthority,
     WorkspaceStorageLimits,
@@ -119,6 +120,10 @@ class ProcessSupervisor:
         self.storage_authority = storage_authority or WorkspaceStorageAuthority()
         self._active: dict[str, _ActiveProcess] = {}
         self._pending_spawns: dict[str, _PendingSpawn] = {}
+        # A process whose kill/unregister proof failed is not dropped from the
+        # graph.  It lives here until a later shutdown/terminate retry proves
+        # that the kernel child and its watchdog are terminal.
+        self._orphans: dict[str, _ActiveProcess] = {}
         self._registry_lock = asyncio.Lock()
         self._state = _SupervisorState.OPEN
         # Round-17 review §四: shared shutdown task so concurrent shutdown()
@@ -134,9 +139,18 @@ class ProcessSupervisor:
         """Return spawn transactions not yet released by their owner."""
         return tuple(sorted(self._pending_spawns))
 
+    @property
+    def orphan_execution_ids(self) -> tuple[str, ...]:
+        """Return spawn/registration failures retained for quarantine retry."""
+        return tuple(sorted(self._orphans))
+
     def owns_execution(self, execution_id: str) -> bool:
         """Return whether the supervisor still owns an execution id."""
-        return execution_id in self._active or execution_id in self._pending_spawns
+        return (
+            execution_id in self._active
+            or execution_id in self._pending_spawns
+            or execution_id in self._orphans
+        )
 
     @property
     def is_closed(self) -> bool:
@@ -170,6 +184,7 @@ class ProcessSupervisor:
             self._state is _SupervisorState.CLOSED
             and not self._active
             and not self._pending_spawns
+            and not self._orphans
         )
 
     @property
@@ -196,6 +211,11 @@ class ProcessSupervisor:
             for execution_id in self.pending_execution_ids
             if execution_id not in self._active
         )
+        resources.extend(f"orphan:{execution_id}" for execution_id in self.orphan_execution_ids)
+        for execution_id in self.orphan_execution_ids:
+            active = self._orphans.get(execution_id)
+            if active is not None and active.watchdog_task is not None and not active.watchdog_task.done():
+                resources.append(f"watchdog:{execution_id}")
         return tuple(resources)
 
     def terminal_postcondition(self) -> bool:
@@ -211,7 +231,16 @@ class ProcessSupervisor:
                 return False
             if active.watchdog_task is not None and not active.watchdog_task.done():
                 return False
-        return len(self._active) == 0 and len(self._pending_spawns) == 0
+        for active in self._orphans.values():
+            if not _has_terminal_process_proof(active):
+                return False
+            if active.watchdog_task is not None and not active.watchdog_task.done():
+                return False
+        return (
+            len(self._active) == 0
+            and len(self._pending_spawns) == 0
+            and len(self._orphans) == 0
+        )
 
     async def close(self) -> None:
         """Round-17 review §十四: ResourceOwner protocol — alias for
@@ -315,21 +344,35 @@ class ProcessSupervisor:
                 directory_binding.close()
             raise PermissionError("executable identity changed before native spawn")
         authority_capability: EffectCapability | None = None
-        if use_native_launcher and _authority_receipt_required():
-            authority_capability = _issue_execution_capability(request)
-            if not os.environ.get("KHAOS_AUTHORITYD_PUBLIC_KEY_PATH"):
-                _revoke_execution_capability(authority_capability)
-                raise PermissionError(
-                    "KHAOS_AUTHORITYD_PUBLIC_KEY_PATH is required for native execution"
-                )
+        authority = None
         if use_native_launcher:
-            authority = None
             try:
                 authority = open_executable_authority(
                     request.argv,
                     safe_environment,
                     expected_identity=request.executable_identity,
                 )
+                if _authority_receipt_required():
+                    authority_capability = _issue_execution_capability(
+                        request,
+                        resource_digest=execution_binding_digest(
+                            request.argv,
+                            directory_binding=directory_binding,
+                            budget=(
+                                request.permission_profile.resources
+                                if enforce_resource_limits
+                                else None
+                            ),
+                            enforce_resource_limits=enforce_resource_limits,
+                            preserve_directory_fds=preserve_directory_fds,
+                            environment=safe_environment,
+                            executable_authority=authority,
+                        ),
+                    )
+                    if not os.environ.get("KHAOS_AUTHORITYD_PUBLIC_KEY_PATH"):
+                        raise PermissionError(
+                            "KHAOS_AUTHORITYD_PUBLIC_KEY_PATH is required for native execution"
+                        )
                 launch = build_process_launch(
                     request.argv,
                     cwd=cwd or request.cwd,
@@ -399,11 +442,21 @@ class ProcessSupervisor:
                 pending_spawn.process = process
                 if process is None:
                     raise RuntimeError("subprocess spawn returned no process")
-                await _kill_orphaned_process(process)
+                try:
+                    await asyncio.shield(_kill_orphaned_process(process))
+                except BaseException as cleanup_error:
+                    await self._retain_orphan(
+                        execution_id,
+                        _ActiveProcess(process),
+                        pending=pending_spawn,
+                        error=cleanup_error,
+                    )
+                    raise
             except BaseException as spawn_error:
-                await self._finish_pending_spawn(
-                    execution_id, pending_spawn, error=spawn_error
-                )
+                if execution_id not in self._orphans:
+                    await self._finish_pending_spawn(
+                        execution_id, pending_spawn, error=spawn_error
+                    )
                 raise
             await self._finish_pending_spawn(
                 execution_id,
@@ -461,18 +514,28 @@ class ProcessSupervisor:
             # Round-15 review P0-2: spawn committed but registration
             # failed (supervisor closed during spawn, or duplicate id).
             # Kill the just-spawned process group so we don't leak it.
+            cleanup_error: BaseException | None = None
             try:
-                await _kill_orphaned_process(process)
+                await asyncio.shield(_kill_orphaned_process(process))
+            except BaseException as exc:  # noqa: BLE001 - retain orphan
+                cleanup_error = exc
+                await self._retain_orphan(
+                    execution_id,
+                    active,
+                    pending=pending_spawn,
+                    error=exc,
+                )
             finally:
                 if authority_capability is not None:
                     _revoke_execution_capability(authority_capability)
-                watchdog_task.cancel()
-                await asyncio.gather(watchdog_task, return_exceptions=True)
-                await self._finish_pending_spawn(
-                    execution_id,
-                    pending_spawn,
-                    error=RuntimeError("spawn ownership registration failed"),
-                )
+                if cleanup_error is None:
+                    watchdog_task.cancel()
+                    await asyncio.gather(watchdog_task, return_exceptions=True)
+                    await self._finish_pending_spawn(
+                        execution_id,
+                        pending_spawn,
+                        error=RuntimeError("spawn ownership registration failed"),
+                    )
             raise
         if process is None:
             raise RuntimeError("subprocess spawn returned no process")
@@ -726,7 +789,14 @@ class ProcessSupervisor:
         id), the just-spawned process is killed so the caller doesn't leak it.
         """
         if self._state is not _SupervisorState.OPEN:
-            await _kill_orphaned_process(process)
+            try:
+                await asyncio.shield(_kill_orphaned_process(process))
+            except BaseException as cleanup_error:  # noqa: BLE001 - retain orphan
+                await self._retain_orphan(
+                    execution_id,
+                    _ActiveProcess(process),
+                    error=cleanup_error,
+                )
             raise SupervisorClosedError(
                 f"ProcessSupervisor is {self._state.value}, "
                 f"not accepting new registrations"
@@ -749,10 +819,18 @@ class ProcessSupervisor:
         except BaseException:
             # Round-15 review P0-2: spawn committed but registration
             # failed — kill the process group so we don't leak it.
+            cleanup_error: BaseException | None = None
             try:
-                await _kill_orphaned_process(process)
+                await asyncio.shield(_kill_orphaned_process(process))
+            except BaseException as exc:  # noqa: BLE001 - retain orphan
+                cleanup_error = exc
+                await self._retain_orphan(
+                    execution_id,
+                    active,
+                    error=exc,
+                )
             finally:
-                if watchdog_task is not None:
+                if watchdog_task is not None and cleanup_error is None:
                     watchdog_task.cancel()
                     await asyncio.gather(watchdog_task, return_exceptions=True)
             raise
@@ -760,7 +838,7 @@ class ProcessSupervisor:
 
     async def unregister_process(self, execution_id: str) -> None:
         async with self._registry_lock:
-            active = self._active.get(execution_id)
+            active = self._active.get(execution_id) or self._orphans.get(execution_id)
         if active is None:
             return
         if not _has_terminal_process_proof(active):
@@ -771,12 +849,17 @@ class ProcessSupervisor:
         async with self._registry_lock:
             if self._active.get(execution_id) is active:
                 self._active.pop(execution_id, None)
+            elif self._orphans.get(execution_id) is active:
+                self._orphans.pop(execution_id, None)
 
     async def terminate(self, execution_id: str) -> bool:
         """Terminate one complete process group, returning whether it existed."""
         async with self._registry_lock:
             active = self._active.get(execution_id)
+            orphan = self._orphans.get(execution_id)
             pending = self._pending_spawns.get(execution_id)
+        if active is None:
+            active = orphan
         if active is None:
             if pending is None:
                 return False
@@ -794,6 +877,14 @@ class ProcessSupervisor:
         current_pending = self._pending_spawns.get(execution_id)
         if current_pending is not None:
             await asyncio.shield(current_pending.done.wait())
+        async with self._registry_lock:
+            if (
+                execution_id in self._orphans
+                and _has_terminal_process_proof(active)
+            ):
+                awaitable_watchdog = active.watchdog_task
+                if awaitable_watchdog is None or awaitable_watchdog.done():
+                    self._orphans.pop(execution_id, None)
         return True
 
     async def shutdown(self) -> None:
@@ -847,7 +938,7 @@ class ProcessSupervisor:
         # QUARANTINED is retryable — transition back to CLOSING so we
         # attempt to terminate any remaining active processes.
         if self._state is _SupervisorState.QUARANTINED:
-            if not self._active:
+            if not self._active and not self._orphans and not self._pending_spawns:
                 self._state = _SupervisorState.CLOSED
                 return
             self._state = _SupervisorState.CLOSING
@@ -860,7 +951,11 @@ class ProcessSupervisor:
         errors: list[Exception] = []
         cancel_requested = False
         execution_ids = tuple(
-            sorted(set(self.active_execution_ids) | set(self.pending_execution_ids))
+            sorted(
+                set(self.active_execution_ids)
+                | set(self.pending_execution_ids)
+                | set(self.orphan_execution_ids)
+            )
         )
         for execution_id in execution_ids:
             try:
@@ -872,7 +967,10 @@ class ProcessSupervisor:
                 await asyncio.shield(self.terminate(execution_id))
                 async with self._registry_lock:
                     active = self._active.get(execution_id)
+                    orphan = self._orphans.get(execution_id)
                     pending = self._pending_spawns.get(execution_id)
+                if active is None:
+                    active = orphan
                 if active is not None:
                     await asyncio.shield(self._settle_watchdog(active))
                     if not _has_terminal_process_proof(active):
@@ -882,6 +980,8 @@ class ProcessSupervisor:
                     async with self._registry_lock:
                         if self._active.get(execution_id) is active:
                             self._active.pop(execution_id, None)
+                        elif self._orphans.get(execution_id) is active:
+                            self._orphans.pop(execution_id, None)
                         else:
                             raise RuntimeError(
                                 f"execution {execution_id} ownership changed during shutdown"
@@ -913,7 +1013,7 @@ class ProcessSupervisor:
         # Do not clear the registry to manufacture the CLOSED invariant.
         # Any surviving entry is a failed terminal proof and must remain
         # visible for quarantine/retry.
-        if self._active or self._pending_spawns:
+        if self._active or self._pending_spawns or self._orphans:
             self._state = _SupervisorState.QUARANTINED
             raise SupervisorClosedError(
                 "ProcessSupervisor shutdown left owned resources after cleanup"
@@ -984,6 +1084,26 @@ class ProcessSupervisor:
             pending.ready.set()
             pending.done.set()
             self._pending_spawns.pop(execution_id, None)
+
+    async def _retain_orphan(
+        self,
+        execution_id: str,
+        active: _ActiveProcess,
+        *,
+        pending: _PendingSpawn | None = None,
+        error: BaseException | None = None,
+    ) -> None:
+        """Move an unproven child into the retryable orphan registry."""
+        if error is not None and pending is not None:
+            pending.error = error
+        if pending is not None:
+            pending.ready.set()
+            pending.done.set()
+        async with self._registry_lock:
+            self._orphans[execution_id] = active
+            if pending is not None and self._pending_spawns.get(execution_id) is pending:
+                self._pending_spawns.pop(execution_id, None)
+            self._state = _SupervisorState.QUARANTINED
 
     async def _settle_watchdog(self, active: _ActiveProcess) -> None:
         """Cancel and await a watchdog before releasing its owner entry."""
@@ -1146,19 +1266,21 @@ def _signal_process_group(
 
 
 async def _kill_orphaned_process(process: asyncio.subprocess.Process) -> None:
-    """Round-15 review P0-2: best-effort kill+wait for a process whose
-    ownership publication failed.  Swallows all errors — this is cleanup
-    of a half-spawned child that the caller is about to abandon."""
+    """Kill and prove a process whose ownership publication failed.
+
+    Cleanup failure is an ownership result, not a log-only condition.  The
+    caller must retain the process in its orphan registry when this function
+    raises so a later shutdown can retry it.
+    """
     if process.returncode is not None:
         return
     try:
         _signal_process_group(process, signal.SIGKILL, force=True)
-    except BaseException:  # noqa: BLE001 — best-effort orphan cleanup
-        return
-    try:
-        await asyncio.wait_for(process.wait(), timeout=2.0)
-    except BaseException:
-        logger.debug("orphaned process did not settle after SIGKILL", exc_info=True)
+        await asyncio.wait_for(asyncio.shield(process.wait()), timeout=2.0)
+    except BaseException as exc:
+        raise RuntimeError("orphaned process termination could not be proved") from exc
+    if process.returncode is None:
+        raise RuntimeError("orphaned process remains live after SIGKILL")
 
 
 def _resource_limit_diagnostics(budget) -> dict[str, object]:
@@ -1455,8 +1577,12 @@ def _authority_receipt_required() -> bool:
     return os.environ.get("KHAOS_DEV_MODE") != "1"
 
 
-def _issue_execution_capability(request: ExecutionRequest) -> EffectCapability:
-    """Issue one exact host-execution receipt from the immutable spawn plan."""
+def _issue_execution_capability(
+    request: ExecutionRequest,
+    *,
+    resource_digest: str,
+) -> EffectCapability:
+    """Issue one exact host-execution receipt for the native launch binding."""
     authority = request.execution_authority
     if authority is None or not authority.is_valid():
         raise PermissionError(
@@ -1468,6 +1594,8 @@ def _issue_execution_capability(request: ExecutionRequest) -> EffectCapability:
         raise PermissionError("production native execution requires a live workspace generation")
     if step.policy_digest in {"", "policy:unspecified", "legacy-unbound"}:
         raise PermissionError("production native execution requires an effective policy digest")
+    if not resource_digest:
+        raise PermissionError("production native execution requires a launch binding digest")
     broker = AuthorityBroker.default()
     envelope = broker.envelope(
         principal_id=step.principal_id,
@@ -1478,13 +1606,13 @@ def _issue_execution_capability(request: ExecutionRequest) -> EffectCapability:
         workspace_generation=plan.workspace_generation,
         policy_digest=step.policy_digest,
         operation_class="exec.host",
-        resource_digest=plan.digest(),
+        resource_digest=resource_digest,
         authorization_epoch=step.authorization_epoch,
     )
     capability = broker.issue(
         envelope,
         allowed_operation="exec.*",
-        resource_digest=plan.digest(),
+        resource_digest=resource_digest,
     )
     if capability.receipt is None:
         _revoke_execution_capability(capability)

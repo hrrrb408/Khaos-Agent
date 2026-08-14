@@ -1,0 +1,36 @@
+[Unit]
+Description=Khaos independent authority daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=khaos-authority
+Group=khaos-authority
+WorkingDirectory=/opt/khaos
+EnvironmentFile=/etc/khaos/authorityd.env
+Environment=KHAOS_DEV_MODE=0
+Environment=KHAOS_AUTHORITYD_SOCKET=/run/khaos-authorityd/authorityd.sock
+Environment=KHAOS_AUTHORITYD_KEY_PATH=/var/lib/khaos-authorityd/authorityd.pem
+Environment=KHAOS_AUTHORITYD_PUBLIC_KEY_PATH=/run/khaos-authorityd/authorityd.pub
+Environment=KHAOS_AUTHORITYD_SOCKET_MODE=0660
+Environment=KHAOS_AGENT_UID=10001
+Environment=KHAOS_AUTHORITYD_UID=10003
+Environment=KHAOS_JOB_UID=10004
+RuntimeDirectory=khaos-authorityd
+RuntimeDirectoryMode=0750
+StateDirectory=khaos-authorityd
+UMask=0077
+ExecStartPre=/usr/local/sbin/khaos-authorityd-key-init.py --key /var/lib/khaos-authorityd/authorityd.pem --public /run/khaos-authorityd/authorityd.pub
+ExecStart=/opt/khaos/venv/bin/python -m khaos.security.authorityd_main
+Restart=on-failure
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/run/khaos-authorityd /var/lib/khaos-authorityd
+
+[Install]
+WantedBy=multi-user.target

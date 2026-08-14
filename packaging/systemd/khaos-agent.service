@@ -1,15 +1,24 @@
 [Unit]
 Description=Khaos non-root agent runtime
-After=network.target
+Requires=khaos-authorityd.service
+After=network.target khaos-authorityd.service
 
 [Service]
 Type=simple
 User=khaos
 Group=khaos
 WorkingDirectory=/opt/khaos
+EnvironmentFile=/etc/khaos/authorityd.env
 Environment=KHAOS_DEV_MODE=0
 Environment=KHAOS_SANDBOX_LAUNCHER=/usr/local/bin/khaos-sandbox-launcher
 Environment=KHAOS_BROWSER_KERNEL_HELPER_SOCKET=/run/khaos-helper/browser-kernel-helper.sock
+Environment=KHAOS_AUTHORITYD_SOCKET=/run/khaos-authorityd/authorityd.sock
+Environment=KHAOS_AUTHORITYD_PUBLIC_KEY_PATH=/run/khaos-authorityd/authorityd.pub
+Environment=KHAOS_AGENT_UID=10001
+Environment=KHAOS_AUTHORITYD_UID=10003
+Environment=KHAOS_JOB_UID=10004
+Environment=KHAOS_AUTHORITYD_SOCKET_MODE=0660
+SupplementaryGroups=khaos-authority
 RuntimeDirectory=khaos
 RuntimeDirectoryMode=0700
 ExecStart=/opt/khaos/venv/bin/khaos start --socket /run/khaos/agent.sock --db /var/lib/khaos/khaos.db
@@ -21,6 +30,7 @@ PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/run/khaos /var/lib/khaos /run/khaos-helper
+ReadOnlyPaths=/run/khaos-authorityd/authorityd.pub
 
 [Install]
 WantedBy=multi-user.target

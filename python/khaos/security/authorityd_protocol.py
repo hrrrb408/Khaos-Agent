@@ -67,6 +67,32 @@ def _digest(value: object) -> str:
     return hashlib.sha256(_canonical(value)).hexdigest()
 
 
+def derive_resource_digest(
+    parent_digest: str, operation: str, requested_scope: str
+) -> str:
+    """Bind a narrowed resource to its parent and typed operation.
+
+    ``resource_digest`` is intentionally opaque at the native boundary.  A
+    narrowing request therefore carries the requested scope into a new
+    digest; the authority daemon, rather than the client, decides the parent
+    relation and signs the resulting child resource.  Replacing a resource
+    with an unrelated digest is no longer an accepted narrowing operation.
+    """
+
+    _required_text("parent_resource_digest", parent_digest)
+    _required_text("operation", operation)
+    _required_text("requested_resource_scope", requested_scope)
+    return _digest(
+        {
+            "schema_version": 1,
+            "kind": "authority-resource-subset-v1",
+            "parent_resource_digest": parent_digest,
+            "operation": operation,
+            "requested_resource_scope": requested_scope,
+        }
+    )
+
+
 def _required_text(name: str, value: object, *, max_length: int = 512) -> str:
     if not isinstance(value, str) or not value or len(value) > max_length:
         raise AuthorityControlPlaneError(f"{name} is invalid")
@@ -542,5 +568,6 @@ __all__ = [
     "RemoteAuditUnavailableError",
     "SignedAuthorizationReceipt",
     "UnknownExecutionError",
+    "derive_resource_digest",
     "open_authority_receipt_fds",
 ]
