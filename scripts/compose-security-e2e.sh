@@ -43,6 +43,43 @@ export KHAOS_TLS_CERT_FILE="$secret_dir/tls-cert.pem"
 export KHAOS_TLS_KEY_FILE="$secret_dir/tls-key.pem"
 export KHAOS_ALLOWED_HOSTS="localhost,127.0.0.1"
 
+# The production profile deliberately refuses to start without the digest of
+# the *compiled* effective policy.  Compute it inside the same Python image
+# that will run the agent, so this smoke test cannot drift from the runtime's
+# YAML parser or policy compiler.  An explicitly supplied digest is accepted
+# for deployment-driven runs, but is still format-checked below.
+policy_image="${project_name}-policy-digest"
+if [[ -z "${KHAOS_EFFECTIVE_POLICY_DIGEST:-}" ]]; then
+    docker build \
+        --quiet \
+        --target python-agent \
+        --tag "$policy_image" \
+        "$repo_root" >/dev/null
+    KHAOS_EFFECTIVE_POLICY_DIGEST="$({
+        docker run --rm \
+            --read-only \
+            --tmpfs /tmp \
+            --env HOME=/var/lib/khaos \
+            --volume "$repo_root/khaos_policy.yaml:/app/khaos_policy.yaml:ro" \
+            "$policy_image" \
+            python -c 'from pathlib import Path; from khaos.security.effective_policy import load_effective_policy; print(load_effective_policy(Path("/app")).digest)'
+    })"
+fi
+if [[ ! "$KHAOS_EFFECTIVE_POLICY_DIGEST" =~ ^[0-9a-f]{64}$ ]]; then
+    printf '%s\n' "KHAOS_EFFECTIVE_POLICY_DIGEST must be a compiled 64-character SHA-256 digest" >&2
+    exit 1
+fi
+export KHAOS_EFFECTIVE_POLICY_DIGEST
+
+# The smoke profile does not issue an authority mutation, so it only needs a
+# syntactically valid HTTPS endpoint to prove production wiring.  Real
+# deployments must provide their independent WORM service explicitly; this
+# loopback placeholder is never a usable audit authority outside this health
+# check.
+if [[ -z "${KHAOS_AUDIT_WORM_ENDPOINT:-}" ]]; then
+    export KHAOS_AUDIT_WORM_ENDPOINT="https://127.0.0.1:9443/ci-worm-audit"
+fi
+
 cd "$repo_root"
 
 run_profile() {
