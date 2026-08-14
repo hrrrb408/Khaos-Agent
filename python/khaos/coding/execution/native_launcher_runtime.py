@@ -19,6 +19,7 @@ except ModuleNotFoundError:  # pragma: no cover - resource is POSIX-only
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
+from khaos.coding.execution.receipt_binding import launcher_binding_digest
 from khaos.security.authorityd_protocol import SignedAuthorizationReceipt
 
 
@@ -29,7 +30,15 @@ def main(argv: list[str]) -> int:
         public_key_fd = options.get("authority_public_key_fd")
         if receipt_fd is None or public_key_fd is None:
             raise PermissionError("signed authority receipt is required")
-        _verify_authority_receipt(int(receipt_fd), int(public_key_fd))
+        _verify_authority_receipt(
+            int(receipt_fd),
+            int(public_key_fd),
+            expected_resource_digest=launcher_binding_digest(
+                command,
+                options,
+                os.environ,
+            ),
+        )
     if options.get("new_session"):
         os.setsid()
     for prefix in ("root", "cwd"):
@@ -275,7 +284,12 @@ def _verify_executable_fd(fd: int, expected_digest: str) -> None:
         raise PermissionError("executable authority content changed before exec")
 
 
-def _verify_authority_receipt(receipt_fd: int, public_key_fd: int) -> None:
+def _verify_authority_receipt(
+    receipt_fd: int,
+    public_key_fd: int,
+    *,
+    expected_resource_digest: str,
+) -> None:
     """Verify the same signed receipt contract as the Rust launcher."""
     receipt_payload = _read_fd(receipt_fd, 64 * 1024)
     public_key_payload = _read_fd(public_key_fd, 4096)
@@ -287,6 +301,12 @@ def _verify_authority_receipt(receipt_fd: int, public_key_fd: int) -> None:
 
             key_bytes = base64.b64decode(key_bytes, validate=True)
         receipt.verify(Ed25519PublicKey.from_public_bytes(key_bytes))
+        if receipt.operation != "exec.host":
+            raise PermissionError("signed authority receipt operation is not exec.host")
+        if receipt.resource_digest != expected_resource_digest:
+            raise PermissionError(
+                "signed authority receipt is not bound to the exact launch"
+            )
     except (OSError, TypeError, ValueError, UnicodeError, json.JSONDecodeError) as exc:
         raise PermissionError("signed authority receipt is invalid") from exc
 

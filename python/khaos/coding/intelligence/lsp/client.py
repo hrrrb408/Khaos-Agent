@@ -563,11 +563,24 @@ class LspClient:
                     logger.debug("LSP rollback: process terminate failed: %s", exc)
             if process.returncode is None:
                 errors.append(RuntimeError("LSP rollback process remains live"))
-            try:
-                await self.execution_service.terminate(process.execution_id)
-            except BaseException as exc:  # noqa: BLE001 — retain ownership on cancellation
-                errors.append(exc)
-                logger.debug("LSP rollback: exec terminate failed: %s", exc)
+            # A process returned by a test double or an alternate spawn
+            # adapter may be owned only by this client.  Calling the parent
+            # service for an execution it never admitted can block forever
+            # on adapters that wait for a registry entry.  Only unregister
+            # through the parent when its ownership oracle proves that edge
+            # exists; the direct process termination above is the complete
+            # rollback for an unregistered handle.
+            if self._execution_service_owns(process):
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(
+                            self.execution_service.terminate(process.execution_id)
+                        ),
+                        max(2.0, self.timeout * 2),
+                    )
+                except BaseException as exc:  # noqa: BLE001 — retain ownership on cancellation
+                    errors.append(exc)
+                    logger.debug("LSP rollback: exec terminate failed: %s", exc)
             if self._execution_service_owns(process):
                 errors.append(RuntimeError("LSP rollback execution ownership remains active"))
         finally:

@@ -106,8 +106,11 @@ def validate_private_unix_socket(path: Path, *, expected_uid: int | None) -> Non
         info = path.lstat()
     except OSError as exc:
         raise IdentityIsolationError("authority socket is unavailable") from exc
-    if not stat.S_ISSOCK(info.st_mode) or info.st_mode & 0o077:
-        raise IdentityIsolationError("authority socket must be a private socket")
+    mode = stat.S_IMODE(info.st_mode)
+    if not stat.S_ISSOCK(info.st_mode) or mode not in {0o600, 0o660}:
+        raise IdentityIsolationError(
+            "authority socket must be 0600 or 0660 with no other access"
+        )
     if expected_uid is not None and info.st_uid != expected_uid:
         raise IdentityIsolationError("authority socket owner is not the authority UID")
 

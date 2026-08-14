@@ -1,6 +1,7 @@
 import os
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -12,8 +13,13 @@ from khaos.coding.execution import (
     HostExecutionBackend,
 )
 from khaos.coding.execution.binding import open_execution_directory_binding
+from khaos.coding.execution.identity import (
+    executable_identity,
+    open_executable_authority,
+)
 from khaos.coding.execution.models import ResourceBudget
 from khaos.coding.execution.native_launcher import build_process_launch
+from khaos.coding.execution.receipt_binding import execution_binding_digest
 from khaos.coding.execution.supervisor import ProcessSupervisor
 from khaos.coding.workspace.manager import WorkspaceManager
 
@@ -196,3 +202,64 @@ async def test_execution_git_pointer_drift_is_quarantined_before_return(tmp_path
         await service.execute(request)
 
     assert not workspace.worktree_path.exists()
+
+
+@pytest.mark.posix_host
+def test_execution_binding_digest_covers_all_native_launch_controls(tmp_path: Path):
+    root = tmp_path / "root"
+    cwd = root / "cwd"
+    other_root = tmp_path / "other-root"
+    other_cwd = other_root / "cwd"
+    cwd.mkdir(parents=True)
+    other_cwd.mkdir(parents=True)
+    binding = open_execution_directory_binding(root, cwd)
+    other_binding = open_execution_directory_binding(other_root, other_cwd)
+    command = (sys.executable, "-c", "print('bound')")
+    environment = {
+        "PATH": "/usr/bin:/bin",
+        "PYTHONPATH": str(Path(__file__).resolve().parents[3] / "python"),
+    }
+    executable_authority = open_executable_authority(
+        command,
+        environment,
+        expected_identity=executable_identity(command, environment),
+    )
+    budget = ResourceBudget()
+
+    def digest(**overrides: object) -> str:
+        values = {
+            "command": command,
+            "directory_binding": binding,
+            "budget": budget,
+            "enforce_resource_limits": True,
+            "preserve_directory_fds": False,
+            "environment": environment,
+            "executable_authority": executable_authority,
+        }
+        values.update(overrides)
+        return execution_binding_digest(**values)  # type: ignore[arg-type]
+
+    try:
+        baseline = digest()
+        variants = (
+            ("command", digest(command=(sys.executable, "-c", "print('changed')"))),
+            ("directory", digest(directory_binding=other_binding)),
+            ("limits", digest(budget=replace(budget, file_bytes=budget.file_bytes + 1))),
+            ("environment", digest(environment={**environment, "LANG": "C"})),
+            ("preserve-fds", digest(preserve_directory_fds=True)),
+            (
+                "executable",
+                digest(
+                    executable_authority=replace(
+                        executable_authority,
+                        executable_digest="0" * len(executable_authority.executable_digest),
+                    )
+                ),
+            ),
+        )
+        for name, variant in variants:
+            assert variant != baseline, name
+    finally:
+        binding.close()
+        other_binding.close()
+        executable_authority.close()

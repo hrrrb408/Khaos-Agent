@@ -13,17 +13,31 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_RECEIPT_BYTES: usize = 64 * 1024;
 
-pub fn verify_from_fds(
+pub fn verify_from_fds_bound(
     receipt_fd: RawFd,
     public_key_fd: RawFd,
     now: Option<f64>,
+    expected_operation: &str,
+    expected_resource_digest: &str,
 ) -> io::Result<()> {
     let receipt = read_fd(receipt_fd, MAX_RECEIPT_BYTES)?;
     let public_key = read_fd(public_key_fd, 4096)?;
-    verify_json(&receipt, &public_key, now)
+    verify_json_bound(
+        &receipt,
+        &public_key,
+        now,
+        Some(expected_operation),
+        Some(expected_resource_digest),
+    )
 }
 
-pub fn verify_json(receipt: &[u8], public_key: &[u8], now: Option<f64>) -> io::Result<()> {
+fn verify_json_bound(
+    receipt: &[u8],
+    public_key: &[u8],
+    now: Option<f64>,
+    expected_operation: Option<&str>,
+    expected_resource_digest: Option<&str>,
+) -> io::Result<()> {
     let mut value: Value =
         serde_json::from_slice(receipt).map_err(|error| invalid(error.to_string()))?;
     let object = value
@@ -81,6 +95,20 @@ pub fn verify_json(receipt: &[u8], public_key: &[u8], now: Option<f64>) -> io::R
         .ok_or_else(|| invalid("authorization receipt issued_at is missing"))?;
     if expires_at <= issued_at || expires_at - issued_at > 300.0 {
         return Err(invalid("authorization receipt expiry is invalid"));
+    }
+    if let Some(expected_operation) = expected_operation {
+        if object.get("operation").and_then(Value::as_str) != Some(expected_operation) {
+            return Err(invalid(
+                "authorization receipt operation is outside authority",
+            ));
+        }
+    }
+    if let Some(expected_resource_digest) = expected_resource_digest {
+        if object.get("resource_digest").and_then(Value::as_str) != Some(expected_resource_digest) {
+            return Err(invalid(
+                "authorization receipt resource is not bound to the native launch",
+            ));
+        }
     }
     let current = now.unwrap_or_else(|| {
         SystemTime::now()
@@ -144,7 +172,7 @@ fn canonical(value: &Value) -> Value {
     }
 }
 
-fn canonical_json(value: &Value) -> String {
+pub(crate) fn canonical_json(value: &Value) -> String {
     serde_json::to_string(&canonical(value)).expect("JSON canonicalization cannot fail")
 }
 
@@ -172,10 +200,12 @@ mod tests {
         value["operation"] = Value::String("git.update-ref".to_owned());
         let public =
             base64::engine::general_purpose::STANDARD.encode(signing.verifying_key().to_bytes());
-        assert!(verify_json(
+        assert!(verify_json_bound(
             value.to_string().as_bytes(),
             public.as_bytes(),
-            Some(1050.0)
+            Some(1050.0),
+            None,
+            None,
         )
         .is_err());
     }
@@ -205,6 +235,13 @@ mod tests {
         value["signature"] =
             Value::String(base64::engine::general_purpose::STANDARD.encode(signature.to_bytes()));
         let public = signing.verifying_key().to_bytes();
-        assert!(verify_json(value.to_string().as_bytes(), &public, Some(1050.0)).is_ok());
+        assert!(verify_json_bound(
+            value.to_string().as_bytes(),
+            &public,
+            Some(1050.0),
+            None,
+            None,
+        )
+        .is_ok());
     }
 }

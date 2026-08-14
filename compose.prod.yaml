@@ -2,6 +2,59 @@
 # override with the same project name, only after supplying all secret/cert
 # files and a concrete KHAOS_ALLOWED_HOSTS value.
 services:
+  khaos-authorityd-init:
+    build:
+      context: .
+      target: python-agent
+    container_name: khaos-authorityd-init
+    user: "0:0"
+    entrypoint: ["python", "/usr/local/sbin/khaos-authorityd-key-init.py"]
+    command:
+      - --key
+      - /var/lib/khaos-authorityd/authorityd.pem
+      - --public
+      - /run/khaos-authorityd/authorityd.pub
+      - --uid
+      - "10003"
+      - --gid
+      - "10003"
+    volumes:
+      - khaos-authority-state:/var/lib/khaos-authorityd
+      - khaos-authority-runtime:/run/khaos-authorityd
+    restart: "no"
+
+  khaos-authorityd:
+    build:
+      context: .
+      target: python-agent
+    container_name: khaos-authorityd
+    user: "10003:10003"
+    command: ["python", "-m", "khaos.security.authorityd_main"]
+    volumes:
+      - khaos-authority-state:/var/lib/khaos-authorityd
+      - khaos-authority-runtime:/run/khaos-authorityd
+    environment:
+      - KHAOS_DEV_MODE=0
+      - KHAOS_AUTHORITYD_SOCKET=/run/khaos-authorityd/authorityd.sock
+      - KHAOS_AUTHORITYD_KEY_PATH=/var/lib/khaos-authorityd/authorityd.pem
+      - KHAOS_AUTHORITYD_PUBLIC_KEY_PATH=/run/khaos-authorityd/authorityd.pub
+      - KHAOS_AUTHORITYD_SOCKET_MODE=0660
+      - KHAOS_AGENT_UID=10001
+      - KHAOS_AUTHORITYD_UID=10003
+      - KHAOS_JOB_UID=10004
+      - KHAOS_EFFECTIVE_POLICY_DIGEST=${KHAOS_EFFECTIVE_POLICY_DIGEST:?KHAOS_EFFECTIVE_POLICY_DIGEST must be compiled for production}
+      - KHAOS_AUDIT_WORM_ENDPOINT=${KHAOS_AUDIT_WORM_ENDPOINT:?KHAOS_AUDIT_WORM_ENDPOINT must be an HTTPS WORM endpoint}
+      - KHAOS_AUDIT_WORM_TOKEN=${KHAOS_AUDIT_WORM_TOKEN:-}
+    depends_on:
+      khaos-authorityd-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.socket(socket.AF_UNIX); s.connect('/run/khaos-authorityd/authorityd.sock'); s.close()"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
   khaos-agent-init:
     build:
       context: .
@@ -27,6 +80,7 @@ services:
       - khaos-state:/var/lib/khaos
       - khaos-runtime:/run/khaos
       - khaos-helper-runtime:/run/khaos-helper:ro
+      - khaos-authority-runtime:/run/khaos-authorityd:ro
       - ./config.yaml:/app/config.yaml:ro
     environment:
       - KHAOS_MODE=office
@@ -35,9 +89,19 @@ services:
       - KHAOS_SANDBOX_LAUNCHER=/usr/local/bin/khaos-sandbox-launcher
       - KHAOS_BROWSER_KERNEL_HELPER_SOCKET=/run/khaos-helper/browser-kernel-helper.sock
       - KHAOS_PYTHON_CAPABILITY_FILE=/var/lib/khaos/rpc-capability
+      - KHAOS_AUTHORITYD_SOCKET=/run/khaos-authorityd/authorityd.sock
+      - KHAOS_AUTHORITYD_PUBLIC_KEY_PATH=/run/khaos-authorityd/authorityd.pub
+      - KHAOS_AUTHORITYD_UID=10003
+      - KHAOS_AGENT_UID=10001
+      - KHAOS_JOB_UID=10004
+      - KHAOS_EFFECTIVE_POLICY_DIGEST=${KHAOS_EFFECTIVE_POLICY_DIGEST:?KHAOS_EFFECTIVE_POLICY_DIGEST must be compiled for production}
     depends_on:
       khaos-agent-init:
         condition: service_completed_successfully
+      khaos-authorityd:
+        condition: service_healthy
+    group_add:
+      - "10003"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import socket; s=socket.socket(socket.AF_UNIX); s.connect('/run/khaos/agent.sock'); s.close()"]
@@ -150,6 +214,8 @@ volumes:
   khaos-runtime:
   khaos-helper-runtime:
   khaos-helper-netns:
+  khaos-authority-state:
+  khaos-authority-runtime:
 
 secrets:
   khaos_python_capability:

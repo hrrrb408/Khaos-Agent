@@ -23,6 +23,7 @@ from khaos.coding.execution.identity import (
     open_executable_authority,
 )
 from khaos.coding.execution.models import ResourceBudget
+from khaos.coding.execution.receipt_binding import execution_binding_digest
 from khaos.security.authority_broker import EffectCapability
 from khaos.security.authorityd_protocol import (
     AuthorityReceiptFDs,
@@ -148,6 +149,28 @@ def build_process_launch(
         raise PermissionError(
             "production native execution requires a signed authority receipt"
         )
+    if authority_receipt is not None:
+        expected_resource_digest = execution_binding_digest(
+            command_tuple,
+            directory_binding=directory_binding,
+            budget=budget,
+            enforce_resource_limits=enforce_resource_limits,
+            preserve_directory_fds=preserve_directory_fds,
+            environment=environment or {},
+            executable_authority=owned_authority,
+        )
+        if authority_receipt.operation != "exec.host":
+            owned_authority.close()
+            if receipt_handles is not None:
+                receipt_handles.close()
+            raise PermissionError("native execution receipt operation is not exec.host")
+        if authority_receipt.resource_digest != expected_resource_digest:
+            owned_authority.close()
+            if receipt_handles is not None:
+                receipt_handles.close()
+            raise PermissionError(
+                "native execution receipt is not bound to the exact launch"
+            )
     args = [launcher] if launcher is not None else [sys.executable, "-m", "khaos.coding.execution.native_launcher_runtime"]
     args.append("--new-session")
     if directory_binding is not None:

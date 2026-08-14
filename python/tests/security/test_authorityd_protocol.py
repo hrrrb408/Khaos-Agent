@@ -8,9 +8,13 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from khaos.coding.execution.identity import executable_identity
+from khaos.coding.execution.identity import (
+    executable_identity,
+    open_executable_authority,
+)
 from khaos.coding.execution.models import ResourceBudget
 from khaos.coding.execution.native_launcher import build_process_launch
+from khaos.coding.execution.receipt_binding import execution_binding_digest
 from khaos.security.authority_broker import (
     AuthorityBrokerError,
     AuthorityDaemonBroker,
@@ -25,6 +29,7 @@ from khaos.security.authorityd_protocol import (
     AuthorizationIntent,
     Ed25519KeyStore,
     SignedAuthorizationReceipt,
+    derive_resource_digest,
 )
 
 
@@ -170,6 +175,9 @@ def test_daemon_broker_uses_signed_receipts_and_reissues_narrowly(tmp_path: Path
     )
     assert narrowed.receipt is not None
     assert narrowed.receipt.operation == "git.hash"
+    assert narrowed.resource_digest == derive_resource_digest(
+        "resource", "git.hash", "resource-hash"
+    )
     broker.validate(narrowed, expected_operation="git.hash")
     with pytest.raises(AuthorityBrokerError):
         broker.validate(narrowed, expected_operation="git.update-ref")
@@ -221,6 +229,25 @@ def test_native_launcher_receives_only_verified_receipt_fds(
             daemon.complete(receipt, result=result, result_digest=result_digest)
 
     broker = AuthorityDaemonBroker(_Client())  # type: ignore[arg-type]
+    command = (sys.executable, "-c", "print('receipt-ok')")
+    environment = {
+        "PATH": "/usr/bin:/bin",
+        "PYTHONPATH": str(Path(__file__).resolve().parents[3] / "python"),
+    }
+    executable_authority = open_executable_authority(
+        command,
+        environment,
+        expected_identity=executable_identity(command, environment),
+    )
+    resource_digest = execution_binding_digest(
+        command,
+        directory_binding=None,
+        budget=None,
+        enforce_resource_limits=False,
+        preserve_directory_fds=False,
+        environment=environment,
+        executable_authority=executable_authority,
+    )
     authority = broker.envelope(
         principal_id="agent",
         project_id="project",
@@ -230,14 +257,9 @@ def test_native_launcher_receives_only_verified_receipt_fds(
         workspace_generation=1,
         policy_digest="policy",
         operation_class="exec.host",
-        resource_digest="exec-resource",
+        resource_digest=resource_digest,
     )
     capability = broker.issue(authority, allowed_operation="exec.*")
-    command = (sys.executable, "-c", "print('receipt-ok')")
-    environment = {
-        "PATH": "/usr/bin:/bin",
-        "PYTHONPATH": str(Path(__file__).resolve().parents[3] / "python"),
-    }
     monkeypatch.setenv("KHAOS_DEV_MODE", "1")
     monkeypatch.setattr(
         "khaos.coding.execution.native_launcher._find_launcher", lambda: None
@@ -250,6 +272,7 @@ def test_native_launcher_receives_only_verified_receipt_fds(
         enforce_resource_limits=False,
         environment=environment,
         expected_identity=executable_identity(command, environment),
+        executable_authority=executable_authority,
         authority_capability=capability,
         authority_public_key_path=public_key_path,
     )
@@ -267,4 +290,24 @@ def test_native_launcher_receives_only_verified_receipt_fds(
         launch.close_owned_fds()
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout.strip() == "receipt-ok"
+
+    changed_command = (sys.executable, "-c", "print('receipt-changed')")
+    changed_authority = open_executable_authority(
+        changed_command,
+        environment,
+        expected_identity=executable_identity(changed_command, environment),
+    )
+    with pytest.raises(PermissionError, match="exact launch"):
+        build_process_launch(
+            changed_command,
+            cwd=tmp_path,
+            directory_binding=None,
+            budget=ResourceBudget(),
+            enforce_resource_limits=False,
+            environment=environment,
+            expected_identity=executable_identity(changed_command, environment),
+            executable_authority=changed_authority,
+            authority_capability=capability,
+            authority_public_key_path=public_key_path,
+        )
     broker.complete(capability, result="success", result_digest="result")

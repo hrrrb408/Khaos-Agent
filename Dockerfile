@@ -41,9 +41,11 @@ COPY AGENTS.md KHAOS.md config.yaml ./
 COPY --from=rust-tcb-builder /build/rust/khaos-core/target/release/khaos-sandbox-launcher /usr/local/bin/khaos-sandbox-launcher
 COPY --from=rust-tcb-builder /build/rust/khaos-core/target/release/khaos-exec-launcher /usr/local/bin/khaos-exec-launcher
 COPY packaging/docker/agent-secret-init.py /usr/local/sbin/khaos-agent-secret-init.py
+COPY packaging/docker/authorityd-key-init.py /usr/local/sbin/khaos-authorityd-key-init.py
 
 # Data directories.
 RUN useradd --system --uid 10001 --home-dir /nonexistent --shell /usr/sbin/nologin khaos \
+    && useradd --system --uid 10003 --home-dir /nonexistent --shell /usr/sbin/nologin khaos-authority \
     && chown root:root /usr/local/bin/khaos-sandbox-launcher \
     && chmod 0755 /usr/local/bin/khaos-sandbox-launcher \
     && setcap cap_sys_admin=ep /usr/local/bin/khaos-sandbox-launcher \
@@ -51,8 +53,12 @@ RUN useradd --system --uid 10001 --home-dir /nonexistent --shell /usr/sbin/nolog
     && chmod 0755 /usr/local/bin/khaos-exec-launcher \
     && chown root:root /usr/local/sbin/khaos-agent-secret-init.py \
     && chmod 0755 /usr/local/sbin/khaos-agent-secret-init.py \
+    && chown root:root /usr/local/sbin/khaos-authorityd-key-init.py \
+    && chmod 0755 /usr/local/sbin/khaos-authorityd-key-init.py \
     && mkdir -p /app/data /app/skills /run/khaos /run/khaos-helper /var/lib/khaos \
+        /run/khaos-authorityd /var/lib/khaos-authorityd \
     && chown -R khaos:khaos /app/data /app/skills /var/lib/khaos \
+    && chown -R khaos-authority:khaos-authority /run/khaos-authorityd /var/lib/khaos-authorityd \
     && chown khaos:root /run/khaos \
     && chmod 02750 /run/khaos \
     && chown root:root /run/khaos-helper \
