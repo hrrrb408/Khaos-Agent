@@ -116,6 +116,7 @@ class AuthorizationIntent:
     policy_digest: str
     nonce: str
     authorization_epoch: int
+    schema_version: int = 1
 
     def __post_init__(self) -> None:
         for name in (
@@ -130,12 +131,16 @@ class AuthorizationIntent:
             "nonce",
         ):
             _required_text(name, getattr(self, name))
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            raise AuthorityControlPlaneError(
+                "unsupported authorization intent schema"
+            )
         if self.authorization_epoch < 0:
             raise AuthorityControlPlaneError("authorization_epoch is invalid")
 
     def payload(self) -> dict[str, object]:
         return {
-            "schema_version": 1,
+            "schema_version": self.schema_version,
             "principal_id": self.principal_id,
             "project_id": self.project_id,
             "runtime_id": self.runtime_id,

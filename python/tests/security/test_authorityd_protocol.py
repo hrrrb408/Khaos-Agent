@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 import threading
@@ -31,6 +32,7 @@ from khaos.security.authorityd import (
     build_production_daemon,
 )
 from khaos.security.authorityd_protocol import (
+    AUTHORITYD_PROTOCOL,
     AuthorityControlPlaneError,
     AuthorizationIntent,
     Ed25519KeyStore,
@@ -204,6 +206,43 @@ def test_incomplete_authorityd_connection_is_bounded(tmp_path: Path) -> None:
         worker.join(timeout=1)
     assert not worker.is_alive()
     assert b'"ok":false' in response
+
+
+def test_authorityd_socket_round_trip_accepts_versioned_intent_payload(
+    tmp_path: Path,
+) -> None:
+    daemon = AuthorityDaemon(
+        socket_path=tmp_path / "authorityd.sock",
+        signing_key=Ed25519KeyStore.load_or_create(tmp_path / "key.pem", create=True),
+        audit_writer=_MemoryWorm(),
+        issuer_id="test-authorityd",
+        policy=lambda _intent: None,
+    )
+    client, server = socketpair()
+    worker = threading.Thread(
+        target=_serve_connection,
+        args=(daemon, server, None, 1.0),
+    )
+    worker.start()
+    try:
+        request = {
+            "protocol": AUTHORITYD_PROTOCOL,
+            "operation": "prepare",
+            "intent": _intent().payload(),
+        }
+        client.sendall((json.dumps(request, separators=(",", ":")) + "\n").encode())
+        response = json.loads(client.recv(4096).decode())
+    finally:
+        client.close()
+        worker.join(timeout=1)
+    assert not worker.is_alive()
+    assert response["ok"] is True
+    assert response["receipt"]["schema_version"] == 1
+
+
+def test_authorization_intent_rejects_unknown_schema_version() -> None:
+    with pytest.raises(AuthorityControlPlaneError, match="schema"):
+        replace(_intent(), schema_version=2)
 
 
 def test_production_daemon_requires_independent_audit_writer(tmp_path: Path) -> None:
