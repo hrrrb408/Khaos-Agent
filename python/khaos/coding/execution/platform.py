@@ -38,6 +38,7 @@ from khaos.coding.execution.environment import scrub_spawn_environment
 from khaos.coding.execution.identity import executable_identity
 from khaos.coding.execution.models import ExecutionResult, NetworkPolicy, ResourceBudget
 from khaos.coding.execution.supervisor import ProcessSupervisor
+from khaos.security.identity_isolation import linux_job_namespace_args
 
 logger = logging.getLogger(__name__)
 
@@ -1421,7 +1422,9 @@ class LinuxBubblewrapBackend:
         )
         network_option = "--share-net" if network_namespace else "--unshare-net"
         prefix.extend((
-            network_option, "--unshare-pid", "--unshare-ipc", "--unshare-uts",
+            network_option,
+            *linux_job_namespace_args(),
+            "--unshare-pid", "--unshare-ipc", "--unshare-uts",
             "--new-session", "--die-with-parent",
             "--chdir", str(sandbox_cwd),
         ))

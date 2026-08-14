@@ -5,8 +5,14 @@ repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 secret_dir="$(mktemp -d "${TMPDIR:-/tmp}/khaos-compose-e2e.XXXXXX")"
 project_name="${COMPOSE_PROJECT_NAME:-khaos-compose-e2e}"
 active_compose_file=""
+worm_pid=""
+worm_store="$secret_dir/worm-audit.jsonl"
 
 cleanup() {
+    if [[ -n "$worm_pid" ]]; then
+        kill "$worm_pid" 2>/dev/null || true
+        wait "$worm_pid" 2>/dev/null || true
+    fi
     if [[ -n "$active_compose_file" ]]; then
         docker compose \
             --project-name "$project_name" \
@@ -27,6 +33,32 @@ chmod 0400 \
     "$secret_dir/browser-helper-secret" \
     "$secret_dir/gateway-api-key"
 bash "$repo_root/scripts/generate-dev-cert.sh" "$secret_dir"
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+    -keyout "$secret_dir/worm-key.pem" \
+    -out "$secret_dir/worm-cert.pem" \
+    -subj "/CN=host.docker.internal" \
+    -addext "subjectAltName=DNS:host.docker.internal,IP:127.0.0.1"
+chmod 0400 "$secret_dir/worm-key.pem"
+chmod 0444 "$secret_dir/worm-cert.pem"
+python3 "$repo_root/scripts/ci-worm-server.py" \
+    --bind 0.0.0.0 \
+    --port "${KHAOS_WORM_PORT:-9443}" \
+    --cert "$secret_dir/worm-cert.pem" \
+    --key "$secret_dir/worm-key.pem" \
+    --store "$worm_store" \
+    >"$secret_dir/worm-server.log" 2>&1 &
+worm_pid="$!"
+for attempt in $(seq 1 50); do
+    if curl --silent --show-error --fail \
+        --cacert "$secret_dir/worm-cert.pem" \
+        "https://127.0.0.1:${KHAOS_WORM_PORT:-9443}/healthz" >/dev/null; then
+        break
+    fi
+    sleep 0.1
+done
+curl --silent --show-error --fail \
+    --cacert "$secret_dir/worm-cert.pem" \
+    "https://127.0.0.1:${KHAOS_WORM_PORT:-9443}/healthz" >/dev/null
 # Standalone Docker Compose ignores the long-syntax secret mode and exposes
 # file-backed secrets with the source file's mode. The temporary directory
 # remains 0700, while direct Gateway secrets must be readable by its non-root
@@ -71,14 +103,11 @@ if [[ ! "$KHAOS_EFFECTIVE_POLICY_DIGEST" =~ ^[0-9a-f]{64}$ ]]; then
 fi
 export KHAOS_EFFECTIVE_POLICY_DIGEST
 
-# The smoke profile does not issue an authority mutation, so it only needs a
-# syntactically valid HTTPS endpoint to prove production wiring.  Real
-# deployments must provide their independent WORM service explicitly; this
-# loopback placeholder is never a usable audit authority outside this health
-# check.
-if [[ -z "${KHAOS_AUDIT_WORM_ENDPOINT:-}" ]]; then
-    export KHAOS_AUDIT_WORM_ENDPOINT="https://127.0.0.1:9443/ci-worm-audit"
-fi
+# The production profile must reach an actual HTTPS append-only fixture.  This
+# is separate from the application health endpoint so authorityd cannot pass
+# by merely having a syntactically valid WORM URL.
+export KHAOS_AUDIT_WORM_ENDPOINT="https://host.docker.internal:${KHAOS_WORM_PORT:-9443}/ci-worm-audit"
+export KHAOS_AUDIT_WORM_CA_FILE="$secret_dir/worm-cert.pem"
 
 cd "$repo_root"
 
@@ -125,6 +154,34 @@ run_profile() {
     fi
 
     curl "${curl_options[@]}" "$health_url"
+
+    if [[ "$compose_file" == "compose.prod.yaml" ]]; then
+        if ! docker compose \
+            --project-name "$project_name" \
+            --project-directory "$repo_root" \
+            --file "$repo_root/$compose_file" \
+            exec -T khaos-agent \
+            python -m khaos.security.production_composition_probe; then
+            docker compose \
+                --project-name "$project_name" \
+                --project-directory "$repo_root" \
+                --file "$repo_root/$compose_file" \
+                logs --no-color --tail=200 khaos-authorityd khaos-agent || true
+            return 1
+        fi
+        python3 - "$worm_store" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    kinds = [json.loads(line)["record"]["kind"] for line in stream if line.strip()]
+required = ["execution.prepare", "execution.claimed", "execution.success"]
+missing = [kind for kind in required if kind not in kinds]
+if missing:
+    raise SystemExit(f"WORM fixture is missing authority evidence: {missing}")
+print("production WORM evidence:", ", ".join(required))
+PY
+    fi
 
     docker compose \
         --project-name "$project_name" \

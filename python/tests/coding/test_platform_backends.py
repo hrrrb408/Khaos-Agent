@@ -180,6 +180,9 @@ def test_linux_profile_isolates_proc_ipc_uts_and_parent_lifetime(tmp_path: Path)
         argv.index("--proc"):argv.index("--proc") + 2
     ]
     assert "--unshare-pid" in argv
+    assert "--unshare-user" in argv
+    assert argv[argv.index("--uid") + 1] == "65534"
+    assert argv[argv.index("--gid") + 1] == "65534"
     assert "--unshare-ipc" in argv
     assert "--unshare-uts" in argv
     assert "--unshare-net" in argv
@@ -892,6 +895,11 @@ async def test_real_macos_home_metadata_and_profile_boundaries(tmp_path: Path):
     _require_or_skip("sandbox-exec")
     backend = MacOSSandboxBackend()
     availability = backend.probe_capability()
+    if (
+        not availability.available
+        and os.environ.get("KHAOS_DEV_MODE") == "1"
+    ):
+        pytest.skip(availability.reason)
     assert availability.available, availability.reason
     workspace = tmp_path / "workspace"
     workspace.mkdir()

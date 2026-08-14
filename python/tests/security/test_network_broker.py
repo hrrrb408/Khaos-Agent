@@ -4,6 +4,7 @@ import asyncio
 import base64
 import contextlib
 
+import khaos.security.network_broker as network_broker_module
 import pytest
 from khaos.security.authority import AuthorityEnvelope
 from khaos.security.authority_broker import AuthorityBroker
@@ -60,6 +61,37 @@ def test_network_lease_constructor_is_not_an_authority_boundary() -> None:
             allowed_ports=frozenset({443}),
             protocols=frozenset({"https"}),
         )
+
+
+def test_network_lease_renews_from_grant_after_effect_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    authority_broker = AuthorityBroker()
+    try:
+        authority = _authority(authority_broker)
+        capability = authority_broker.issue(authority, allowed_operation="network.connect")
+        lease = NetworkLease._from_broker(
+            capability=capability,
+            authority_broker=authority_broker,
+            endpoint="http://127.0.0.1:49152",
+            username="khaos",
+            password="secret",
+            capability_digest=capability.digest,
+            allowed_domains=frozenset({"allowed.example"}),
+            blocked_domains=frozenset(),
+            allowed_ports=frozenset({443}),
+            protocols=frozenset({"https"}),
+        )
+        monkeypatch.setattr(
+            network_broker_module.time,
+            "time",
+            lambda: capability.expires_at + 1,
+        )
+        lease.validate()
+        assert lease._capability is not capability
+        assert lease.capability_digest == lease._capability.digest
+    finally:
+        authority_broker.close()
 
 
 class _RetryableRelayWriter:

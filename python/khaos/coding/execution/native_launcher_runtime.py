@@ -378,18 +378,12 @@ def _authority_path(
                 offset += len(chunk)
             stream.flush()
             os.fchmod(stream.fileno(), 0o700)
-        signature = subprocess.run(
-            ["/usr/bin/codesign", "-d", "--verbose=4", path],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-        if signature.returncode == 0:
-            # Preserve a valid embedded CodeDirectory from platform-signed
-            # binaries such as /bin/cat.  Replacing it with an ad-hoc
-            # signature can make macOS AMFI kill the staged process with
-            # SIGKILL even though the bytes and digest are unchanged.
-            return path
+        # A copied platform binary can retain an embedded CodeDirectory while
+        # still being rejected by AMFI at its new path.  Re-sign the staged
+        # generation after the descriptor digest has been verified.  The
+        # executable code and all authority-relevant source bytes came from
+        # that verified descriptor; the new ad-hoc signature is relocation
+        # metadata required for the disposable staging path.
         completed = subprocess.run(
             ["/usr/bin/codesign", "--force", "--sign", "-", "--timestamp=none", path],
             stdout=subprocess.DEVNULL,

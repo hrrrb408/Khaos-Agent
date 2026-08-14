@@ -144,11 +144,99 @@ def require_distinct_linux_identities(
         )
 
 
+def linux_job_namespace_args() -> tuple[str, ...]:
+    """Return the fail-closed bwrap identity mapping for coding jobs.
+
+    The configured job UID is the UID visible inside the private user
+    namespace.  Production additionally requires the deployment contract and
+    distinct agent/authority/job identities; development uses the nobody-like
+    65534 default only under the explicit dev flag.
+    """
+    development = os.environ.get("KHAOS_DEV_MODE") == "1"
+    contract = read_contract_from_environment()
+    if development:
+        job_uid = contract.job_uid if contract.job_uid is not None else 65534
+    else:
+        if (
+            contract.agent_uid is None
+            or contract.authority_uid is None
+            or contract.job_uid is None
+        ):
+            raise IdentityIsolationError(
+                "Linux production authority requires agent, authority, and job UIDs"
+            )
+        if len({contract.agent_uid, contract.authority_uid, contract.job_uid}) != 3:
+            raise IdentityIsolationError(
+                "Linux job UID must be distinct from agent and authority UIDs"
+            )
+        if os.geteuid() != contract.agent_uid:
+            raise IdentityIsolationError(
+                "Linux sandbox builder is not running as the configured agent UID"
+            )
+        job_uid = contract.job_uid
+    if not 0 <= job_uid <= 2**32 - 1:
+        raise IdentityIsolationError("Linux job UID is outside the namespace range")
+    return ("--unshare-user", "--uid", str(job_uid), "--gid", str(job_uid))
+
+
+@dataclass(frozen=True)
+class LinuxProcessIdentityEvidence:
+    """Host-observable identity evidence for a sandboxed process."""
+
+    pid: int
+    uid: int
+    euid: int
+    gid: int
+    egid: int
+    uid_map: str
+    gid_map: str
+
+
+def read_linux_process_identity(pid: int) -> LinuxProcessIdentityEvidence:
+    """Read /proc identity and namespace maps without trusting the child."""
+    if pid <= 0 or not sys_platform().startswith("linux"):
+        raise IdentityIsolationError("Linux process identity oracle is unavailable")
+    root = Path(f"/proc/{pid}")
+    try:
+        status = (root / "status").read_text(encoding="utf-8")
+        uid_map = (root / "uid_map").read_text(encoding="ascii")
+        gid_map = (root / "gid_map").read_text(encoding="ascii")
+    except (OSError, UnicodeError) as exc:
+        raise IdentityIsolationError("Linux process identity evidence is unavailable") from exc
+    values: dict[str, tuple[int, ...]] = {}
+    for line in status.splitlines():
+        key, separator, raw = line.partition(":")
+        if separator and key in {"Uid", "Gid"}:
+            try:
+                values[key] = tuple(int(value) for value in raw.split())
+            except ValueError as exc:
+                raise IdentityIsolationError("Linux process identity evidence is malformed") from exc
+    try:
+        uid, euid = values["Uid"][:2]
+        gid, egid = values["Gid"][:2]
+    except (KeyError, ValueError) as exc:
+        raise IdentityIsolationError("Linux process identity fields are incomplete") from exc
+    if not uid_map.strip() or not gid_map.strip():
+        raise IdentityIsolationError("Linux process namespace maps are empty")
+    return LinuxProcessIdentityEvidence(
+        pid=pid,
+        uid=uid,
+        euid=euid,
+        gid=gid,
+        egid=egid,
+        uid_map=uid_map,
+        gid_map=gid_map,
+    )
+
+
 __all__ = [
     "AuthorityIdentityContract",
     "IdentityIsolationError",
+    "LinuxProcessIdentityEvidence",
+    "linux_job_namespace_args",
     "peer_uid",
     "read_contract_from_environment",
+    "read_linux_process_identity",
     "require_distinct_linux_identities",
     "validate_private_unix_socket",
 ]

@@ -1,0 +1,37 @@
+schema_version: 1
+authority:
+  long_lived_grant: AuthorityGrant
+  compatibility_grant_class: AuthorityEnvelope
+  short_lived_effect: EffectCapability
+  receipt_ttl_seconds: 300
+  receipt_states:
+    - prepared
+    - claimed
+    - success
+    - failed
+    - unknown
+    - expired
+    - revoked
+  expiry_semantics: expiry_blocks_new_claims_but_not_result_commit_after_claim
+  pending_receipt_gc: bounded_with_per_principal_and_global_quotas
+  local_audit_role: diagnostic_forensics_only
+  remote_worm_role: independent_effect_authorization_evidence
+  authorityd_policy_scope: issuer_policy_digest_and_operation_family_gate
+  full_effect_policy_scope: agent_runtime_and_workspace_authorities
+linux:
+  sandbox_backend: bubblewrap_plus_native_launcher_and_cgroup
+  job_identity: dedicated_user_namespace_uid
+  job_uid_contract: KHAOS_JOB_UID
+  job_uid_mapping: bwrap_unshare_user_uid_gid
+  host_uid_distinction: not_claimed_without_native_host_mapping_proof
+  identity_oracle: proc_status_uid_map_gid_map
+  production_dev_mode_fallback: forbidden
+platform_boundaries:
+  macos_authority_transport: native_launchd_or_xpc_adapter_required
+  windows_authority_transport: native_named_pipe_service_sid_adapter_required
+  unsupported_platform_behavior: fail_closed
+evidence:
+  local_platform_sandbox: diagnostic_only
+  required_linux_proof: real_kernel_ci
+  production_composition_probe: authorityd_worm_claim_bwrap_command_result
+  closure_gate: aggregate_required_checks_on_exact_commit

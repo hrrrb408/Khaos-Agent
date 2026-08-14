@@ -9,9 +9,10 @@ object is never described as an independent authority or WORM audit.
 
 ```text
 agent intent
-    -> khaos-authorityd policy + identity check
+    -> khaos-authorityd issuer/policy-digest/family gate + identity check
     -> remote/WORM append(execution.prepare)
-    -> Ed25519 signed receipt
+    -> Ed25519 signed PREPARED receipt
+    -> CLAIMED immediately before the effect starts
     -> native helper verifies receipt from already-open descriptors
     -> helper returns result digest
     -> remote/WORM append(execution.success|failed|unknown)
@@ -23,6 +24,14 @@ The receipt binds `principal_id`, `project_id`, `runtime_id`, `task_id`,
 authority daemon or unavailable audit writer refuses `prepare`; a result that
 cannot be committed is `unknown`/quarantined and must not be reported as
 success.
+
+`AuthorityGrant` (`AuthorityEnvelope` is the compatibility class name) is the
+long-lived, broker-owned context.  `EffectCapability` is a short-lived,
+one-shot receipt handle.  Expiry blocks a new claim, but a receipt that was
+already claimed may commit `success`, `failed`, or `unknown` after the
+300-second launch TTL.  Prepared expiry is garbage-collected into a bounded
+tombstone inventory; global and per-principal pending quotas prevent memory
+growth.
 
 Python callers use `AuthorityDaemonClient` through `AuthorityDaemonBroker` in
 production.  `AuthorityBroker()` remains a test-only in-process broker; the
@@ -45,13 +54,20 @@ returned outcome is `unknown`; it is never converted into `passed`.  A
 production host spawn without the immutable execution authority, authorityd
 receipt, public-key anchor, or native launcher is refused.
 
+The daemon is an independent issuer and policy-digest/operation-family gate;
+the Agent runtime, TaskWorkspace, exact command binding, and platform backend
+remain separate effect-policy authorities.  The daemon does not claim to
+reimplement those higher-level policy decisions.
+
 ## OS identity contract
 
 The daemon is a separate service, not merely another process in the Agent's
 UID:
 
 - Linux requires distinct Agent, authorityd, and job UIDs, a private `0600`
-  Unix socket, and `SO_PEERCRED` validation.
+  Unix socket, `SO_PEERCRED` validation, and bwrap `--unshare-user` with the
+  configured job UID/GID.  The job identity is namespace-visible; a distinct
+  host UID is not claimed unless native host mapping evidence proves it.
 - macOS production deployment must provide launchd/XPC service identity,
   signed daemon code, and Keychain/Secure Enclave access-group ACLs.
 - Windows production deployment must provide a service SID, Named Pipe ACL,

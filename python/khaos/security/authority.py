@@ -1,4 +1,4 @@
-"""Immutable authority contexts for privileged local effects.
+"""Immutable authority grants for privileged local effects.
 
 An :class:`AuthorityEnvelope` is the common, typed context carried by local
 control-plane operations.  It is not itself an effect authority: callers must
@@ -22,7 +22,11 @@ _AUTHORITY_ISSUER = object()
 
 @dataclass(frozen=True, slots=True, init=False)
 class AuthorityEnvelope:
-    """Bind one privileged effect to one immutable security context."""
+    """Bind a renewable grant to one immutable security context.
+
+    A runner exchanges this grant for a short-lived, one-shot effect
+    capability and must finish that receipt before returning the result.
+    """
 
     principal_id: str
     project_id: str
@@ -248,4 +252,9 @@ class AuthorityEnvelope:
         )
 
 
-__all__ = ["AuthorityEnvelope"]
+# Security-facing name used by the lease/receipt design.  Keep the original
+# class name for persisted and test fixtures.
+AuthorityGrant = AuthorityEnvelope
+
+
+__all__ = ["AuthorityEnvelope", "AuthorityGrant"]

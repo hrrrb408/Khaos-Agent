@@ -11,6 +11,11 @@ if ! id -u khaos-authority >/dev/null 2>&1; then
     --shell /usr/sbin/nologin khaos-authority
 fi
 
+if ! id -u khaos-job >/dev/null 2>&1; then
+  useradd --system --uid 10004 --home-dir /nonexistent \
+    --shell /usr/sbin/nologin khaos-job
+fi
+
 repository="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 cd "$repository"
 

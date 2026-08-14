@@ -130,7 +130,14 @@ def build_process_launch(
             receipt_handles.close()
         raise
     launcher = _find_launcher()
-    development = launcher is None and os.environ.get("KHAOS_DEV_MODE") == "1"
+    development = os.environ.get("KHAOS_DEV_MODE") == "1"
+    # A locally built Rust launcher on macOS can be terminated by AMFI when
+    # it stages an already-signed system executable from an ad-hoc checkout.
+    # The explicit development wrapper performs the same fd/digest/rlimit
+    # checks and is the documented test fallback; production (KHAOS_DEV_MODE
+    # != 1) still requires the packaged Rust TCB below.
+    if development and sys.platform == "darwin":
+        launcher = None
     if launcher is None and not development:
         owned_authority.close()
         if receipt_handles is not None:
@@ -171,7 +178,25 @@ def build_process_launch(
             raise PermissionError(
                 "native execution receipt is not bound to the exact launch"
             )
-    args = [launcher] if launcher is not None else [sys.executable, "-m", "khaos.coding.execution.native_launcher_runtime"]
+    if launcher is not None:
+        args = [launcher]
+    else:
+        # Keep the explicit development fallback runnable from a source
+        # checkout whose package is not installed and whose child environment
+        # deliberately omits PYTHONPATH.  The wrapper restores only the
+        # source root for the launcher module, then replaces argv before the
+        # runtime parses its security options; the payload still receives the
+        # scrubbed environment and the same fd/digest checks.
+        runtime = Path(__file__).with_name("native_launcher_runtime.py")
+        source_root = Path(__file__).resolve().parents[3]
+        wrapper = (
+            "import runpy,sys; "
+            "sys.path.insert(0,sys.argv[1]); "
+            "runtime=sys.argv[2]; "
+            "sys.argv=[runtime,*sys.argv[3:]]; "
+            "runpy.run_path(runtime,run_name='__main__')"
+        )
+        args = [sys.executable, "-c", wrapper, str(source_root), str(runtime)]
     args.append("--new-session")
     if directory_binding is not None:
         args.extend(

@@ -90,7 +90,7 @@ because it would not actually reach the broker.
 
 | Platform | Production guarantee | Unsupported behavior |
 |---|---|---|
-| Linux | non-root, zero-capability Python; bwrap filesystem isolation; cgroup v2 budgets; root Rust helper as the sole netns/veth/nft/cgroup authority; default-deny browser egress | missing launcher/helper/cgroup delegation rejects execution; no Host, `ip`, `nft`, or proxy-only fallback |
+| Linux | non-root, zero-capability Python; bwrap filesystem isolation with a dedicated job user namespace UID/GID; cgroup v2 budgets; root Rust helper as the sole netns/veth/nft/cgroup authority; default-deny browser egress | missing launcher/helper/cgroup delegation/user namespace rejects execution; no Host, `ip`, `nft`, or proxy-only fallback |
 | macOS | `sandbox-exec` Seatbelt profile restricts content, metadata, directory listing, credential roots, Mach services, network and writable workspace boundaries | no browser kernel namespace claim; a failed probe or invalid launcher rejects execution |
 | Windows | native helper after a passing probe: native commands and trusted Python under `network=none` use an OS-issued AppContainer low-box; trusted Python stages the resolved base executable and grants exact temporary ACLs only to the disposable runtime tree; brokered mode uses a restricted primary token and exact loopback-only WFP rules; all paths use child-process policy, a one-process Job Object, and transactional workspace ACL | missing helper/probe evidence, non-native command, ACL/firewall/token/AppContainer failure, or unsupported network endpoint rejects execution; never falls back to Host |
 

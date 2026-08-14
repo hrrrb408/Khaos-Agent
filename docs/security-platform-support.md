@@ -68,5 +68,7 @@ an operator performs the signed gzip archive/tombstone workflow. Operators
 must export/archive before shortening a retention window. The SQLite audit
 chain also has an explicit signed gzip export; it never deletes rows, so
 database rotation remains a separately approved administrative action. The
-SQLite audit hash chain and independent anchor remain the authoritative
-tamper-evidence record; these controls are not a remote WORM service.
+SQLite audit hash chain and independent anchor remain local diagnostic and
+forensic tamper-evidence records; they are not an independent effect authority
+or remote WORM service.  Remote WORM evidence is a separate production
+prerequisite for authorityd receipt prepare/claim/result events.
