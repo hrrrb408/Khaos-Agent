@@ -31,10 +31,6 @@ pub fn verify_from_fds_bound(
     )
 }
 
-pub fn verify_json(receipt: &[u8], public_key: &[u8], now: Option<f64>) -> io::Result<()> {
-    verify_json_bound(receipt, public_key, now, None, None)
-}
-
 fn verify_json_bound(
     receipt: &[u8],
     public_key: &[u8],
@@ -204,10 +200,12 @@ mod tests {
         value["operation"] = Value::String("git.update-ref".to_owned());
         let public =
             base64::engine::general_purpose::STANDARD.encode(signing.verifying_key().to_bytes());
-        assert!(verify_json(
+        assert!(verify_json_bound(
             value.to_string().as_bytes(),
             public.as_bytes(),
-            Some(1050.0)
+            Some(1050.0),
+            None,
+            None,
         )
         .is_err());
     }
@@ -237,6 +235,13 @@ mod tests {
         value["signature"] =
             Value::String(base64::engine::general_purpose::STANDARD.encode(signature.to_bytes()));
         let public = signing.verifying_key().to_bytes();
-        assert!(verify_json(value.to_string().as_bytes(), &public, Some(1050.0)).is_ok());
+        assert!(verify_json_bound(
+            value.to_string().as_bytes(),
+            &public,
+            Some(1050.0),
+            None,
+            None,
+        )
+        .is_ok());
     }
 }
