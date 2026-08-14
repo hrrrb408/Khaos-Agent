@@ -26,6 +26,7 @@ from khaos.security.authorityd_protocol import AuthorityDaemonClient
 from khaos.security.identity_isolation import read_linux_process_identity
 
 _BWRAP_INFO_MAX_BYTES = 8192
+_BWRAP_ERROR_MAX_BYTES = 1024
 
 
 def _resource_digest(command: tuple[str, ...], workspace: Path) -> str:
@@ -121,6 +122,29 @@ def _spawn_probe_process(
     return process, info_read_fd
 
 
+def _terminate_probe_process(process: subprocess.Popen) -> str:
+    """Terminate a failed probe and retain a bounded launcher diagnostic."""
+    if process.poll() is None:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+    try:
+        _stdout, stderr = process.communicate(timeout=15)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            _stdout, stderr = process.communicate(timeout=1)
+        except (OSError, subprocess.TimeoutExpired):
+            return ""
+    except OSError:
+        return ""
+    return stderr.strip()[:_BWRAP_ERROR_MAX_BYTES]
+
+
 def main() -> int:
     if os.environ.get("KHAOS_DEV_MODE") == "1":
         raise SystemExit("production composition probe refuses KHAOS_DEV_MODE=1")
@@ -194,9 +218,10 @@ def main() -> int:
                     "external /proc identity oracle did not observe the configured job UID/GID mapping"
                 )
             stdout, stderr = process.communicate(timeout=15)
-        except BaseException:
-            process.kill()
-            process.communicate()
+        except BaseException as exc:
+            stderr = _terminate_probe_process(process)
+            if stderr and isinstance(exc, SystemExit) and isinstance(exc.code, str):
+                raise SystemExit(f"{exc.code}; bwrap stderr: {stderr}") from exc
             raise
         completed = subprocess.CompletedProcess(
             process.args,
