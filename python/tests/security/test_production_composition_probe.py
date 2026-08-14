@@ -3,6 +3,7 @@ import subprocess
 from pathlib import Path
 
 from khaos.security import production_composition_probe
+from khaos.security.identity_isolation import IdentityIsolationError
 
 
 def test_spawn_probe_process_uses_popen_stream_pipes(monkeypatch, tmp_path: Path) -> None:
@@ -39,6 +40,28 @@ def test_mapping_contains_expected_namespace_and_host_ids() -> None:
     assert production_composition_probe._mapping_contains_pair(mapping, 10004, 10001)
     assert not production_composition_probe._mapping_contains_pair(mapping, 10003, 10001)
     assert not production_composition_probe._mapping_contains_pair(mapping, 10004, 10003)
+
+
+def test_identity_oracle_retries_transient_empty_namespace_maps(monkeypatch) -> None:
+    attempts = 0
+    expected = object()
+
+    def fake_read(_pid: int) -> object:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise IdentityIsolationError("Linux process namespace maps are empty")
+        return expected
+
+    monkeypatch.setattr(
+        production_composition_probe,
+        "read_linux_process_identity",
+        fake_read,
+    )
+    monkeypatch.setattr(production_composition_probe.time, "sleep", lambda _seconds: None)
+
+    assert production_composition_probe._read_linux_process_identity_when_ready(123) is expected
+    assert attempts == 3
 
 
 def test_read_bwrap_child_pid_accepts_multiline_info_metadata() -> None:

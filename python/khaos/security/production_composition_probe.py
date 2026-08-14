@@ -15,6 +15,7 @@ import json
 import os
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 from khaos.coding.execution.platform import LinuxBubblewrapBackend
@@ -23,10 +24,16 @@ from khaos.security.authority_broker import (
     AuthorityDaemonBroker,
 )
 from khaos.security.authorityd_protocol import AuthorityDaemonClient
-from khaos.security.identity_isolation import read_linux_process_identity
+from khaos.security.identity_isolation import (
+    IdentityIsolationError,
+    LinuxProcessIdentityEvidence,
+    read_linux_process_identity,
+)
 
 _BWRAP_INFO_MAX_BYTES = 8192
 _BWRAP_ERROR_MAX_BYTES = 1024
+_IDENTITY_ORACLE_TIMEOUT_SECONDS = 2.0
+_IDENTITY_ORACLE_RETRY_SECONDS = 0.01
 
 
 def _resource_digest(command: tuple[str, ...], workspace: Path) -> str:
@@ -145,6 +152,20 @@ def _terminate_probe_process(process: subprocess.Popen) -> str:
     return stderr.strip()[:_BWRAP_ERROR_MAX_BYTES]
 
 
+def _read_linux_process_identity_when_ready(
+    pid: int,
+) -> LinuxProcessIdentityEvidence:
+    """Wait briefly for bwrap to publish its proc namespace mappings."""
+    deadline = time.monotonic() + _IDENTITY_ORACLE_TIMEOUT_SECONDS
+    while True:
+        try:
+            return read_linux_process_identity(pid)
+        except IdentityIsolationError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(_IDENTITY_ORACLE_RETRY_SECONDS)
+
+
 def main() -> int:
     if os.environ.get("KHAOS_DEV_MODE") == "1":
         raise SystemExit("production composition probe refuses KHAOS_DEV_MODE=1")
@@ -160,7 +181,7 @@ def main() -> int:
     command = (
         "/bin/sh",
         "-c",
-        "printf 'composition-probe\\n'; id -u; id -g; cat /proc/self/uid_map; cat /proc/self/gid_map",
+        "printf 'composition-probe\\n'; id -u; id -g; cat /proc/self/uid_map; cat /proc/self/gid_map; sleep 1",
     )
     broker = AuthorityDaemonBroker(
         AuthorityDaemonClient(
@@ -201,7 +222,7 @@ def main() -> int:
             expected_job_uid = int(job_uid)
             expected_agent_uid = os.getuid()
             expected_agent_gid = os.getgid()
-            evidence = read_linux_process_identity(child_pid)
+            evidence = _read_linux_process_identity_when_ready(child_pid)
             if (
                 evidence.uid != expected_agent_uid
                 or evidence.euid != expected_agent_uid
@@ -222,6 +243,8 @@ def main() -> int:
             stderr = _terminate_probe_process(process)
             if stderr and isinstance(exc, SystemExit) and isinstance(exc.code, str):
                 raise SystemExit(f"{exc.code}; bwrap stderr: {stderr}") from exc
+            if stderr and isinstance(exc, IdentityIsolationError):
+                raise IdentityIsolationError(f"{exc}; bwrap stderr: {stderr}") from exc
             raise
         completed = subprocess.CompletedProcess(
             process.args,
