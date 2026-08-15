@@ -169,8 +169,23 @@ async def test_acceptance_2_claim_commit_then_raise_read_back(tmp_path) -> None:
             principal_id="alice",
         )
 
-        # Let tick fire and the executor complete.
-        await asyncio.sleep(0.3)
+        # Let tick fire and the executor complete.  A fixed short sleep is
+        # not sufficient on the Windows product runner: the executor can
+        # have returned while the terminal CAS is still queued on the event
+        # loop.  Wait for the durable terminal state with a bounded timeout
+        # instead, so this acceptance test checks the invariant rather than
+        # the scheduler speed of a particular runner.
+        deadline = asyncio.get_running_loop().time() + 5.0
+        row = None
+        while asyncio.get_running_loop().time() < deadline:
+            row = await db.get_scheduled_task(task.id)
+            if (
+                row is not None
+                and row["status"] == "completed"
+                and row["execution_id"] is None
+            ):
+                break
+            await asyncio.sleep(0.05)
 
         # The executor MUST have been called exactly once.
         assert len(executor_calls) == 1, (
