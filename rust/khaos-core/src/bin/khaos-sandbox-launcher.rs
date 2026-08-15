@@ -27,6 +27,11 @@ mod linux {
     const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
     const SECCOMP_MODE_FILTER: libc::c_ulong = 2;
     const DEFAULT_HELPER_SOCKET: &str = "/run/khaos/browser-kernel-helper.sock";
+    // The Agent's production execution subtree is mounted at this fixed
+    // destination by Compose.  Native/systemd installs keep their cgroups
+    // below the host cgroup mount.  Do not accept an arbitrary path or an
+    // environment-selected root here: this launcher is part of the TCB.
+    const TRUSTED_CGROUP_ROOTS: [&str; 2] = ["/sys/fs/cgroup", "/run/khaos-execution-cgroup"];
 
     // Landlock syscall numbers are stable across the supported Linux
     // architectures.  Keep them local instead of depending on the libc crate
@@ -945,6 +950,14 @@ mod linux {
         Ok((response, descriptor))
     }
 
+    fn is_trusted_cgroup_procs_path(path: &Path) -> bool {
+        path.file_name() == Some(std::ffi::OsStr::new("cgroup.procs"))
+            && TRUSTED_CGROUP_ROOTS
+                .iter()
+                .map(Path::new)
+                .any(|root| path.starts_with(root))
+    }
+
     /// Move this process into an existing cgroup-v2 leaf without applying
     /// ordinary-file creation or truncation flags to the cgroupfs control
     /// file.  `std::fs::write` uses `File::create`, whose O_CREAT/O_TRUNC
@@ -952,9 +965,7 @@ mod linux {
     /// rejected with EROFS even when the delegated control file is writable.
     fn join_cgroup(procs: &std::ffi::OsStr) -> io::Result<()> {
         let path = PathBuf::from(procs);
-        if path.file_name() != Some(std::ffi::OsStr::new("cgroup.procs"))
-            || !path.starts_with("/sys/fs/cgroup")
-        {
+        if !is_trusted_cgroup_procs_path(&path) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "cgroup target must be an absolute cgroup.procs path",
@@ -1727,6 +1738,39 @@ mod linux {
         install_landlock_if_required()?;
         install_seccomp()?;
         exec(&args)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::is_trusted_cgroup_procs_path;
+        use std::path::Path;
+
+        #[test]
+        fn accepts_the_compose_execution_cgroup_mount() {
+            assert!(is_trusted_cgroup_procs_path(Path::new(
+                "/run/khaos-execution-cgroup/exec-1/cgroup.procs",
+            )));
+        }
+
+        #[test]
+        fn accepts_the_native_cgroup_mount() {
+            assert!(is_trusted_cgroup_procs_path(Path::new(
+                "/sys/fs/cgroup/khaos/exec-1/cgroup.procs",
+            )));
+        }
+
+        #[test]
+        fn rejects_untrusted_or_lookalike_paths() {
+            assert!(!is_trusted_cgroup_procs_path(Path::new(
+                "/tmp/khaos-execution-cgroup/exec-1/cgroup.procs",
+            )));
+            assert!(!is_trusted_cgroup_procs_path(Path::new(
+                "/run/khaos-execution-cgroup-escape/exec-1/cgroup.procs",
+            )));
+            assert!(!is_trusted_cgroup_procs_path(Path::new(
+                "/run/khaos-execution-cgroup/exec-1/tasks",
+            )));
+        }
     }
 }
 
