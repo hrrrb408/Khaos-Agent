@@ -27,6 +27,10 @@ v2 subtree through `KHAOS_EXECUTION_CGROUP_SOURCE`, mounted only at
 `/run/khaos-execution-cgroup` and fixed as `KHAOS_CGROUP_ROOT`; the backend
 confirms the destination is a real cgroup2 mount. The browser helper's cgroup
 subtree is independent. Missing or incomplete execution delegation fails
-closed.
+closed. The production exact-effect probe also needs `/app/data` on a
+block-backed filesystem that accepts `io.max`; Docker CI supplies an explicit
+loop-backed ext4 directory through `KHAOS_PRODUCTION_DATA_SOURCE`, while a
+deployment using the Compose-managed volume must still fail closed if its
+actual device cannot accept the I/O limit.
 The independent real-kernel network gate remains the authority for broader
 network-isolation coverage.

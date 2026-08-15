@@ -86,5 +86,23 @@ jobs:
             exit 1
           fi
           echo "KHAOS_EXECUTION_CGROUP_SOURCE=/sys/fs/cgroup/khaos-compose" >> "$GITHUB_ENV"
+      - name: Prepare block-backed production workspace
+        run: |
+          set -euo pipefail
+          # Docker named volumes can expose an overlay/pseudo device inside
+          # the container. The exact-effect probe must exercise io.max against
+          # a real block-backed filesystem, just like the Linux kernel gate.
+          sudo truncate -s 2G /var/tmp/khaos-compose-workspace.img
+          sudo mkfs.ext4 -F -q /var/tmp/khaos-compose-workspace.img
+          sudo mkdir -p /mnt/khaos-compose-workspace
+          sudo mount -o loop,noatime /var/tmp/khaos-compose-workspace.img /mnt/khaos-compose-workspace
+          sudo chown 10001:10001 /mnt/khaos-compose-workspace
+          test -w /mnt/khaos-compose-workspace
+          echo "KHAOS_PRODUCTION_DATA_SOURCE=/mnt/khaos-compose-workspace" >> "$GITHUB_ENV"
       - name: Run Compose development and production E2E
         run: bash scripts/compose-security-e2e.sh
+      - name: Remove block-backed production workspace
+        if: always()
+        run: |
+          sudo umount /mnt/khaos-compose-workspace || true
+          sudo rm -f /var/tmp/khaos-compose-workspace.img

@@ -59,9 +59,12 @@ backend verifies through `/proc/self/mountinfo` that the destination is a real
 cgroup2 mount, rather than trusting a directory marker. The source must be a
 real non-symlink subtree with `cpu`, `memory`, `pids`, and `io` controllers
 enabled, and it must be delegated to the image's exact Agent UID 10001.
-The production exact-effect probe places its temporary workspace in the
-Compose named volume mounted at `/app/data`, so `io.max` is checked against a
-real volume device rather than a container overlay filesystem.
+The production exact-effect probe places its temporary workspace in
+`/app/data`, so `io.max` is checked against a real block-backed device rather
+than a container overlay filesystem. The Docker CI path sets
+`KHAOS_PRODUCTION_DATA_SOURCE` to a loop-backed ext4 host directory; a normal
+deployment may retain the Compose-managed volume only when its actual device
+supports the same cgroup write, otherwise the probe fails closed.
 `KHAOS_BROWSER_HELPER_CGROUP_SOURCE` (default `/sys/fs/cgroup/khaos-browser`)
 is separate and is mounted only at the privileged helper's
 `/run/khaos-helper/cgroup`. A Docker Desktop/host without both reviewed

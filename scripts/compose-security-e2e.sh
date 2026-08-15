@@ -149,6 +149,44 @@ validate_execution_cgroup_source() {
     printf '%s\n' "validated delegated execution cgroup v2 subtree: $canonical"
 }
 
+validate_production_workspace_source() {
+    local source="${KHAOS_PRODUCTION_DATA_SOURCE:-}"
+    local canonical
+    local mount_source
+    local mount_fstype
+    if [[ -z "$source" ]]; then
+        printf '%s\n' "using Compose-managed khaos-data for /app/data; the exact-effect probe must still prove io.max support"
+        return 0
+    fi
+    if [[ "$source" != /* || -L "$source" || ! -d "$source" ]]; then
+        printf '%s\n' "KHAOS_PRODUCTION_DATA_SOURCE must be an absolute, real, non-symlink directory" >&2
+        return 1
+    fi
+    if ! canonical="$(realpath -e -- "$source")"; then
+        printf '%s\n' "KHAOS_PRODUCTION_DATA_SOURCE must resolve to an existing directory" >&2
+        return 1
+    fi
+    if [[ ! -w "$canonical" ]]; then
+        printf '%s\n' "KHAOS_PRODUCTION_DATA_SOURCE must be writable before Compose startup" >&2
+        return 1
+    fi
+    if ! command -v findmnt >/dev/null 2>&1; then
+        printf '%s\n' "findmnt is required to validate the block-backed production workspace" >&2
+        return 1
+    fi
+    if ! read -r mount_source mount_fstype < <(
+        findmnt -T "$canonical" -no SOURCE,FSTYPE
+    ); then
+        printf '%s\n' "unable to identify the filesystem backing KHAOS_PRODUCTION_DATA_SOURCE" >&2
+        return 1
+    fi
+    if [[ "$mount_source" != /dev/* || "$mount_fstype" == "overlay" || "$mount_fstype" == "tmpfs" ]]; then
+        printf '%s\n' "KHAOS_PRODUCTION_DATA_SOURCE must resolve to a block-backed filesystem: ${mount_source:-unknown} ${mount_fstype:-unknown}" >&2
+        return 1
+    fi
+    printf '%s\n' "validated block-backed production workspace: $canonical ($mount_source $mount_fstype)"
+}
+
 run_profile() {
     local compose_file="$1"
     local health_url="$2"
@@ -169,6 +207,7 @@ run_profile() {
     active_compose_file="$compose_file"
     if [[ "$compose_file" == "compose.prod.yaml" ]]; then
         validate_execution_cgroup_source
+        validate_production_workspace_source
     fi
     docker compose \
         --project-name "$project_name" \

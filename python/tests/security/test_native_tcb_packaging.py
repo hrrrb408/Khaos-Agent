@@ -181,6 +181,9 @@ def test_production_compose_has_independent_authorityd_sidecar() -> None:
     ]
     assert "10003" in {str(value) for value in agent["group_add"]}
     assert "khaos-authority-runtime:/run/khaos-authorityd:ro" in agent["volumes"]
+    assert "${KHAOS_PRODUCTION_DATA_SOURCE:-khaos-data}:/app/data" in agent[
+        "volumes"
+    ]
     assert (
         "${KHAOS_EXECUTION_CGROUP_SOURCE:?KHAOS_EXECUTION_CGROUP_SOURCE must point to a delegated cgroup v2 subtree}:/run/khaos-execution-cgroup:rw"
         in agent["volumes"]
@@ -203,6 +206,9 @@ def test_compose_security_probe_supplies_only_disposable_outer_profiles() -> Non
     assert 'KHAOS_DOCKER_SYSTEMPATHS_OPT:-systempaths=unconfined' in script
     assert "KHAOS_EXECUTION_CGROUP_SOURCE" in script
     assert "validate_execution_cgroup_source" in script
+    assert "KHAOS_PRODUCTION_DATA_SOURCE" in script
+    assert "validate_production_workspace_source" in script
+    assert "findmnt -T" in script
     assert "production deployment must provide host-reviewed" in script
     assert "seccomp:unconfined" not in script
     assert "apparmor:unconfined" not in script

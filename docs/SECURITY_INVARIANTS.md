@@ -65,7 +65,10 @@ class for each invariant remains explicit below.
     backend verifies that destination is a real cgroup2 mount, requires the
     `cpu`, `memory`, `pids`, and `io` controllers, and is distinct from the
     privileged browser helper's cgroup subtree. Missing or incomplete
-    delegation fails closed.
+    delegation fails closed. The production exact-effect probe must apply
+    `io.max` to a block-backed `/app/data` filesystem; its CI path supplies
+    `KHAOS_PRODUCTION_DATA_SOURCE` from a loop-backed ext4 mount and rejects
+    overlay or pseudo-device sources before starting Compose.
 12. Local unit tests, local Linux probes, CI-only Windows/Docker/kernel jobs,
     remote WORM evidence, and organization governance are reported as separate
     evidence classes. No local result is promoted to a Codex-equivalent or

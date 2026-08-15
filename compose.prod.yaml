@@ -80,7 +80,11 @@ services:
       target: python-agent
     container_name: khaos-agent
     volumes:
-      - khaos-data:/app/data
+      # A normal deployment may use the Compose-managed volume. The disposable
+      # production probe overrides this with an explicit block-backed host
+      # directory so the exact-effect cgroup io.max write is observable on the
+      # Docker host rather than being inferred from an overlay device.
+      - "${KHAOS_PRODUCTION_DATA_SOURCE:-khaos-data}:/app/data"
       - khaos-state:/var/lib/khaos
       - khaos-runtime:/run/khaos
       - khaos-helper-runtime:/run/khaos-helper:ro

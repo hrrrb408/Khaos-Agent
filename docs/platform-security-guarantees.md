@@ -127,7 +127,10 @@ through `KHAOS_EXECUTION_CGROUP_SOURCE`, mounted at
 `/run/khaos-execution-cgroup`; the
 production helper's cgroup subtree is independent. The composition probe
 preflights the required controllers and fails closed when the execution
-delegation is absent or incomplete. The real-kernel Linux security gate remains
+delegation is absent or incomplete. Its `/app/data` workspace must expose a
+block-backed device that accepts `io.max`; the Docker CI path supplies this
+through `KHAOS_PRODUCTION_DATA_SOURCE` and rejects overlay/pseudo-device
+sources before startup. The real-kernel Linux security gate remains
 the authority for the broader
 `--unshare-net` and network-policy matrix.
 
