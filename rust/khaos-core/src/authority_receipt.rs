@@ -12,6 +12,8 @@ use std::os::fd::{FromRawFd, RawFd};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_RECEIPT_BYTES: usize = 64 * 1024;
+const AUTHORITY_TIMESTAMP_SCALE: f64 = 1000.0;
+const MAX_WIRE_TIMESTAMP: u64 = (1_u64 << 53) - 1;
 
 pub fn verify_from_fds_bound(
     receipt_fd: RawFd,
@@ -85,14 +87,8 @@ fn verify_json_bound(
     {
         return Err(invalid("authorization receipt epoch is invalid"));
     }
-    let expires_at = object
-        .get("expires_at")
-        .and_then(Value::as_f64)
-        .ok_or_else(|| invalid("authorization receipt expiry is missing"))?;
-    let issued_at = object
-        .get("issued_at")
-        .and_then(Value::as_f64)
-        .ok_or_else(|| invalid("authorization receipt issued_at is missing"))?;
+    let expires_at = receipt_timestamp(object, "expires_at")?;
+    let issued_at = receipt_timestamp(object, "issued_at")?;
     if expires_at <= issued_at || expires_at - issued_at > 300.0 {
         return Err(invalid("authorization receipt expiry is invalid"));
     }
@@ -143,6 +139,17 @@ fn verify_json_bound(
         .map_err(|error| invalid(error.to_string()))
 }
 
+fn receipt_timestamp(object: &Map<String, Value>, field: &str) -> io::Result<f64> {
+    let encoded = object
+        .get(field)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| invalid(format!("authorization receipt {field} is invalid")))?;
+    if encoded > MAX_WIRE_TIMESTAMP {
+        return Err(invalid(format!("authorization receipt {field} is invalid")));
+    }
+    Ok(encoded as f64 / AUTHORITY_TIMESTAMP_SCALE)
+}
+
 fn read_fd(fd: RawFd, max_bytes: usize) -> io::Result<Vec<u8>> {
     let duplicated = unsafe { libc::dup(fd) };
     if duplicated < 0 {
@@ -190,8 +197,8 @@ mod tests {
         let signing = SigningKey::from_bytes(&[7_u8; 32]);
         let mut value = serde_json::json!({
             "algorithm": "Ed25519",
-            "issued_at": 1000.0,
-            "expires_at": 1100.0,
+            "issued_at": 1_000_000,
+            "expires_at": 1_100_000,
             "operation": "git.workspace"
         });
         let signature = signing.sign(canonical_json(&value).as_bytes());
@@ -226,10 +233,10 @@ mod tests {
             "policy_digest": "policy",
             "nonce": "nonce",
             "authorization_epoch": 1,
-            "expires_at": 1100.0,
+            "expires_at": 1_100_000,
             "audit_intent_digest": "audit",
             "issuer_id": "authorityd",
-            "issued_at": 1000.0
+            "issued_at": 1_000_000
         });
         let signature = signing.sign(canonical_json(&value).as_bytes());
         value["signature"] =
@@ -241,6 +248,23 @@ mod tests {
             Some(1050.0),
             None,
             None,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn accepts_python_signed_receipt_with_integer_timestamps() {
+        // This vector is signed by Python's authorityd protocol canonicalizer.
+        // It protects the actual Python -> Rust production boundary rather
+        // than only testing Rust against its own serializer.
+        let receipt = br#"{"algorithm":"Ed25519","audit_intent_digest":"audit","authorization_epoch":7,"expires_at":2000000300000,"issued_at":2000000000000,"issuer_id":"authorityd-python-fixture","nonce":"nonce-python-fixture","operation":"exec.host","policy_digest":"policy","principal_id":"agent","project_id":"project","resource_digest":"resource","runtime_id":"runtime","schema_version":1,"signature":"sPkdS7jVnKCqFC5NsW3m2pyxHuM7WatlzNd/saRaFvZBJ8znYiPdolSsQw+VxmOyu/HACauFuJjkiwWOQz94AQ==","task_id":"task","workspace_id":"workspace"}"#;
+        let public = [13_u8; 32];
+        assert!(verify_json_bound(
+            receipt,
+            &public,
+            Some(2_000_000_100.0),
+            Some("exec.host"),
+            Some("resource"),
         )
         .is_ok());
     }

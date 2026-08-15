@@ -38,6 +38,12 @@ AUTHORITYD_PROTOCOL = 1
 MAX_MESSAGE_BYTES = 1024 * 1024
 MAX_TTL_SECONDS = 300.0
 MAX_GRANT_TTL_SECONDS = 24 * 60 * 60.0
+# Receipt timestamps are part of the signed wire payload. JSON floating-point
+# spellings are not stable across Python and Rust serializers, so the wire
+# contract uses exact, non-negative integer milliseconds while the Python API
+# continues to expose seconds as floats.
+AUTHORITY_TIMESTAMP_SCALE = 1000
+MAX_WIRE_TIMESTAMP = (1 << 53) - 1
 
 
 class AuthorityControlPlaneError(PermissionError):
@@ -67,6 +73,31 @@ def _canonical(value: object) -> bytes:
 
 def _digest(value: object) -> str:
     return hashlib.sha256(_canonical(value)).hexdigest()
+
+
+def _encode_receipt_timestamp(value: object, *, field: str) -> int:
+    """Encode a receipt timestamp into the cross-language wire contract."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise AuthorityControlPlaneError(f"authorization receipt {field} is invalid")
+    numeric = float(value)
+    if not math.isfinite(numeric) or numeric < 0:
+        raise AuthorityControlPlaneError(f"authorization receipt {field} is invalid")
+    try:
+        encoded = int(round(numeric * AUTHORITY_TIMESTAMP_SCALE))
+    except (OverflowError, ValueError) as exc:
+        raise AuthorityControlPlaneError(
+            f"authorization receipt {field} is invalid"
+        ) from exc
+    if encoded < 0 or encoded > MAX_WIRE_TIMESTAMP:
+        raise AuthorityControlPlaneError(f"authorization receipt {field} is invalid")
+    return encoded
+
+
+def _decode_receipt_timestamp(value: object, *, field: str) -> float:
+    """Decode the exact integer timestamp representation from the wire."""
+    if type(value) is not int or value < 0 or value > MAX_WIRE_TIMESTAMP:
+        raise AuthorityControlPlaneError(f"authorization receipt {field} is invalid")
+    return value / AUTHORITY_TIMESTAMP_SCALE
 
 
 def derive_resource_digest(
@@ -226,6 +257,8 @@ class SignedAuthorizationReceipt:
             raise AuthorityControlPlaneError("authorization receipt expiry is invalid")
         if not math.isfinite(self.issued_at) or not math.isfinite(self.expires_at):
             raise AuthorityControlPlaneError("authorization receipt timestamps are invalid")
+        _encode_receipt_timestamp(self.issued_at, field="issued_at")
+        _encode_receipt_timestamp(self.expires_at, field="expires_at")
         if self.expires_at - self.issued_at > MAX_TTL_SECONDS:
             raise AuthorityControlPlaneError("authorization receipt TTL is too long")
         if self.authorization_epoch < 0:
@@ -256,10 +289,14 @@ class SignedAuthorizationReceipt:
             "policy_digest": self.policy_digest,
             "nonce": self.nonce,
             "authorization_epoch": self.authorization_epoch,
-            "expires_at": self.expires_at,
+            "expires_at": _encode_receipt_timestamp(
+                self.expires_at, field="expires_at"
+            ),
             "audit_intent_digest": self.audit_intent_digest,
             "issuer_id": self.issuer_id,
-            "issued_at": self.issued_at,
+            "issued_at": _encode_receipt_timestamp(
+                self.issued_at, field="issued_at"
+            ),
         }
         if self.grant_id is not None:
             payload["grant_id"] = self.grant_id
@@ -291,10 +328,14 @@ class SignedAuthorizationReceipt:
                 policy_digest=str(value["policy_digest"]),
                 nonce=str(value["nonce"]),
                 authorization_epoch=int(value["authorization_epoch"]),
-                expires_at=float(value["expires_at"]),
+                expires_at=_decode_receipt_timestamp(
+                    value["expires_at"], field="expires_at"
+                ),
                 audit_intent_digest=str(value["audit_intent_digest"]),
                 issuer_id=str(value["issuer_id"]),
-                issued_at=float(value["issued_at"]),
+                issued_at=_decode_receipt_timestamp(
+                    value["issued_at"], field="issued_at"
+                ),
                 signature=str(value["signature"]),
                 schema_version=int(value.get("schema_version", 1)),
                 algorithm=str(value.get("algorithm", "Ed25519")),

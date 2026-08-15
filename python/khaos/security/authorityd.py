@@ -37,6 +37,7 @@ from khaos.security.authorityd_protocol import (
     RemoteAuditUnavailableError,
     SignedAuthorizationReceipt,
     _canonical,
+    _encode_receipt_timestamp,
     _digest,
     _required_text,
     derive_resource_digest,
@@ -765,7 +766,14 @@ class AuthorityDaemon:
                 ):
                     if receipt_fields[optional_field] is None:
                         receipt_fields.pop(optional_field)
-                signature = self.signing_key.sign(_canonical(receipt_fields))
+                wire_receipt_fields = dict(receipt_fields)
+                wire_receipt_fields["expires_at"] = _encode_receipt_timestamp(
+                    receipt_fields["expires_at"], field="expires_at"
+                )
+                wire_receipt_fields["issued_at"] = _encode_receipt_timestamp(
+                    receipt_fields["issued_at"], field="issued_at"
+                )
+                signature = self.signing_key.sign(_canonical(wire_receipt_fields))
                 receipt = SignedAuthorizationReceipt(
                     **receipt_fields,
                     signature=__import__("base64").b64encode(signature).decode("ascii"),

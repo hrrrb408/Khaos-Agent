@@ -25,6 +25,11 @@ authority daemon or unavailable audit writer refuses `prepare`; a result that
 cannot be committed is `unknown`/quarantined and must not be reported as
 success.
 
+The signed wire representation encodes `issued_at` and `expires_at` as
+non-negative integer milliseconds.  Python callers decode those values back to
+seconds, but the integer contract is required because Python and Rust JSON
+float serializers do not promise identical signed bytes.
+
 `AuthorityGrant` (`AuthorityEnvelope` is the compatibility class name) is the
 long-lived, broker-owned context. It contains an opaque grant id and expiry,
 but the live grant registry remains in the broker/authorityd owner; copying or

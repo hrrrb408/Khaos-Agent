@@ -117,6 +117,33 @@ def test_authorityd_prepare_and_complete_are_two_phase(tmp_path: Path) -> None:
         daemon.complete(receipt, result="success", result_digest="again")
 
 
+def test_receipt_wire_timestamps_are_integer_milliseconds(tmp_path: Path) -> None:
+    key = Ed25519KeyStore.load_or_create(
+        tmp_path / "khaos-authorityd-wire-key.pem", create=True
+    )
+    daemon = AuthorityDaemon(
+        socket_path=tmp_path / "authorityd.sock",
+        signing_key=key,
+        audit_writer=_MemoryWorm(),
+        issuer_id="test-authorityd",
+        policy=lambda _intent: None,
+    )
+
+    receipt = daemon.prepare(_intent())
+    wire = receipt.to_dict()
+    assert type(wire["issued_at"]) is int
+    assert type(wire["expires_at"]) is int
+    assert wire["expires_at"] - wire["issued_at"] == 300_000
+
+    decoded = SignedAuthorizationReceipt.from_dict(wire)
+    decoded.verify(key.public_key())
+
+    malformed = dict(wire)
+    malformed["issued_at"] = float(wire["issued_at"])
+    with pytest.raises(AuthorityControlPlaneError, match="issued_at"):
+        SignedAuthorizationReceipt.from_dict(malformed)
+
+
 def test_claimed_receipt_can_commit_after_launch_ttl(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
