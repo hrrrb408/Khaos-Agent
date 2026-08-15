@@ -52,6 +52,7 @@ from khaos.coding.workspace.trusted_git import (
 from khaos.security.authority import AuthorityEnvelope
 from khaos.security.authority_broker import (
     AuthorityBroker,
+    AuthorityBrokerError,
     EffectCapability,
 )
 
@@ -336,6 +337,7 @@ class WorkspaceManager:
         storage_authority: WorkspaceStorageAuthority | None = None,
         bootstrap_limits: WorkspaceBootstrapLimits | None = None,
         policy_digest: str = "legacy-unbound",
+        authorization_epoch: int = 1,
     ) -> None:
         configured_root = (
             root or Path(tempfile.gettempdir()) / "khaos" / "worktrees"
@@ -356,6 +358,9 @@ class WorkspaceManager:
         self._git_identity = self._git_runner.git_identity
         self._git_digest = self._git_runner.git_digest
         self.policy_digest = policy_digest
+        if authorization_epoch <= 0:
+            raise ValueError("workspace authorization epoch must be positive")
+        self.authorization_epoch = authorization_epoch
         self.storage_limits = storage_limits or WorkspaceStorageLimits()
         self.storage_authority = storage_authority or WorkspaceStorageAuthority()
         self.bootstrap_limits = bootstrap_limits or WorkspaceBootstrapLimits()
@@ -423,6 +428,16 @@ class WorkspaceManager:
                 transaction.cleanup_error = exc
                 logger.error(
                     "workspace bootstrap remains quarantined: %s: %s",
+                    workspace_id,
+                    exc,
+                )
+                continue
+            try:
+                self._authority_broker.revoke_grant(transaction.authority_grant)
+            except BaseException as exc:  # noqa: BLE001 - retain live grant ownership
+                transaction.cleanup_error = exc
+                logger.error(
+                    "workspace bootstrap grant remains live: %s: %s",
                     workspace_id,
                     exc,
                 )
@@ -512,6 +527,7 @@ class WorkspaceManager:
             workspace_generation=1,
             policy_digest=self.policy_digest,
             operation_class="git.host",
+            authorization_epoch=self.authorization_epoch,
             resource_digest=hashlib.sha256(
                 str(repository.resolve()).encode("utf-8")
             ).hexdigest(),
@@ -933,17 +949,18 @@ class WorkspaceManager:
                         f"bootstrap worktree path remains after rollback: {candidate}"
                     )
                 )
-        try:
-            await self._git(
-                transaction.repository,
-                "update-ref",
-                "-d",
-                _safe_branch_ref(transaction.branch_name),
-                transaction.base_sha,
-                authority_grant=transaction.authority_grant,
-            )
-        except BaseException as exc:  # noqa: BLE001 - retain branch ownership
-            errors.append(exc)
+        if transaction.branch_created:
+            try:
+                await self._git(
+                    transaction.repository,
+                    "update-ref",
+                    "-d",
+                    _safe_branch_ref(transaction.branch_name),
+                    transaction.base_sha,
+                    authority_grant=transaction.authority_grant,
+                )
+            except BaseException as exc:  # noqa: BLE001 - retain branch ownership
+                errors.append(exc)
         if errors:
             transaction.phase = "quarantined"
             raise WorkspaceError(
@@ -986,36 +1003,20 @@ class WorkspaceManager:
                 workspace_generation=1,
                 policy_digest=self.policy_digest,
                 operation_class="git.bootstrap",
+                authorization_epoch=self.authorization_epoch,
                 resource_digest=hashlib.sha256(
                     str(repository).encode("utf-8")
                 ).hexdigest(),
             )
-            dirty = await self._git(
-                repository,
-                "status",
-                "--porcelain",
-                authority_grant=authority_context,
-            )
-            if dirty:
-                raise WorkspaceError("主工作树存在未提交修改，拒绝创建可写 Worktree")
-            base_sha = await self._git(
-                repository,
-                "rev-parse",
-                base_ref,
-                authority_grant=authority_context,
-            )
             branch = f"khaos/task/{task_id}"
             path = (self.root / workspace_id).resolve()
             pending_path = (self.root / f".pending-{workspace_id}").resolve()
-            path.parent.mkdir(parents=True, exist_ok=True)
-            if path.exists() or path.is_symlink() or pending_path.exists() or pending_path.is_symlink():
-                raise WorkspaceError("workspace bootstrap path already exists")
             transaction = WorkspaceBootstrapTransaction(
                 workspace_id=workspace_id,
                 task_id=task_id,
                 repository=repository,
                 branch_name=branch,
-                base_sha=base_sha,
+                base_sha="",
                 pending_path=pending_path,
                 final_path=path,
                 authority_grant=authority_context,
@@ -1023,6 +1024,29 @@ class WorkspaceManager:
             self._bootstrap_transactions[workspace_id] = transaction
             self._task_ids.add(task_id)
             try:
+                dirty = await self._git(
+                    repository,
+                    "status",
+                    "--porcelain",
+                    authority_grant=authority_context,
+                )
+                if dirty:
+                    raise WorkspaceError("主工作树存在未提交修改，拒绝创建可写 Worktree")
+                base_sha = await self._git(
+                    repository,
+                    "rev-parse",
+                    base_ref,
+                    authority_grant=authority_context,
+                )
+                transaction.base_sha = base_sha
+                path.parent.mkdir(parents=True, exist_ok=True)
+                if (
+                    path.exists()
+                    or path.is_symlink()
+                    or pending_path.exists()
+                    or pending_path.is_symlink()
+                ):
+                    raise WorkspaceError("workspace bootstrap path already exists")
                 transaction.phase = "creating-worktree"
                 await self._git(
                     repository,
@@ -1126,6 +1150,11 @@ class WorkspaceManager:
                     await cleanup_task
                 except BaseException as exc:  # noqa: BLE001 - retain ownership
                     cleanup_error = exc
+                if cleanup_error is None:
+                    try:
+                        self._authority_broker.revoke_grant(authority_context)
+                    except BaseException as exc:  # noqa: BLE001 - retain live grant ownership
+                        cleanup_error = exc
                 self._workspaces.pop(workspace_id, None)
                 self._bootstrap_transactions.pop(workspace_id, None)
                 if cleanup_error is None:
@@ -1676,45 +1705,47 @@ class WorkspaceManager:
                     )
                     return WorkspaceTransition.FAILED
             workspace.state = WorkspaceState.CLEANING
-            try:
-                if workspace.git_identity is not None:
-                    await asyncio.to_thread(
-                        restore_git_pointer_for_cleanup,
-                        workspace.git_identity,
-                    )
-                authority = self._workspace_authority(workspace, "git.cleanup")
-                if force:
+            if not workspace.git_cleanup_complete:
+                try:
+                    if workspace.git_identity is not None:
+                        await asyncio.to_thread(
+                            restore_git_pointer_for_cleanup,
+                            workspace.git_identity,
+                        )
+                    authority = self._workspace_authority(workspace, "git.cleanup")
+                    if force:
+                        await self._git(
+                            workspace.repository_root,
+                            "worktree",
+                            "remove",
+                            "--force",
+                            str(workspace.worktree_path),
+                            authority_grant=authority,
+                        )
+                    else:
+                        await self._git(
+                            workspace.repository_root,
+                            "worktree",
+                            "remove",
+                            str(workspace.worktree_path),
+                            authority_grant=authority,
+                        )
+                    # A successful worktree removal does not remove the local
+                    # task ref.  Delete it with the last known commit as a CAS so
+                    # cleanup cannot erase a ref that advanced outside this
+                    # workspace owner.
                     await self._git(
                         workspace.repository_root,
-                        "worktree",
-                        "remove",
-                        "--force",
-                        str(workspace.worktree_path),
-                        authority_grant=authority,
+                        "update-ref",
+                        "-d",
+                        _safe_branch_ref(workspace.branch_name),
+                        workspace.base_sha,
+                        authority_grant=self._workspace_authority(workspace, "git.cleanup-ref"),
                     )
-                else:
-                    await self._git(
-                        workspace.repository_root,
-                        "worktree",
-                        "remove",
-                        str(workspace.worktree_path),
-                        authority_grant=authority,
-                    )
-                # A successful worktree removal does not remove the local
-                # task ref.  Delete it with the last known commit as a CAS so
-                # cleanup cannot erase a ref that advanced outside this
-                # workspace owner.
-                await self._git(
-                    workspace.repository_root,
-                    "update-ref",
-                    "-d",
-                    _safe_branch_ref(workspace.branch_name),
-                    workspace.base_sha,
-                    authority_grant=self._workspace_authority(workspace, "git.cleanup-ref"),
-                )
-            except Exception:  # noqa: BLE001 - worktree cleanup failure is persisted
-                workspace.state = WorkspaceState.FAILED
-                return WorkspaceTransition.FAILED
+                    workspace.git_cleanup_complete = True
+                except Exception:  # noqa: BLE001 - worktree cleanup failure is persisted
+                    workspace.state = WorkspaceState.FAILED
+                    return WorkspaceTransition.FAILED
             try:
                 for artifact in tuple(workspace.change_artifacts):
                     if artifact.parent != workspace.worktree_path.parent:
@@ -1724,6 +1755,17 @@ class WorkspaceManager:
                 workspace.change_artifact_bytes = 0
             except (OSError, WorkspaceError):
                 workspace.state = WorkspaceState.FAILED
+                return WorkspaceTransition.FAILED
+            try:
+                if workspace.authority_envelope is not None:
+                    self._authority_broker.revoke_grant(workspace.authority_envelope)
+            except (AuthorityBrokerError, OSError, ValueError) as exc:
+                workspace.state = WorkspaceState.FAILED
+                logger.warning(
+                    "workspace authority grant revocation failed for %s: %s",
+                    workspace_id,
+                    exc,
+                )
                 return WorkspaceTransition.FAILED
             workspace.state = WorkspaceState.CLEANED
             self._task_ids.discard(workspace.task_id)

@@ -37,6 +37,7 @@ from khaos.security.identity_isolation import (
 AUTHORITYD_PROTOCOL = 1
 MAX_MESSAGE_BYTES = 1024 * 1024
 MAX_TTL_SECONDS = 300.0
+MAX_GRANT_TTL_SECONDS = 24 * 60 * 60.0
 
 
 class AuthorityControlPlaneError(PermissionError):
@@ -117,6 +118,9 @@ class AuthorizationIntent:
     nonce: str
     authorization_epoch: int
     schema_version: int = 1
+    workspace_generation: int | None = None
+    grant_id: str | None = None
+    grant_context_digest: str | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -137,9 +141,20 @@ class AuthorizationIntent:
             )
         if self.authorization_epoch < 0:
             raise AuthorityControlPlaneError("authorization_epoch is invalid")
+        if self.workspace_generation is not None and self.workspace_generation <= 0:
+            raise AuthorityControlPlaneError("workspace_generation is invalid")
+        if (self.grant_id is None) != (self.grant_context_digest is None):
+            raise AuthorityControlPlaneError(
+                "grant_id and grant_context_digest must be supplied together"
+            )
+        if self.grant_id is not None:
+            _required_text("grant_id", self.grant_id, max_length=128)
+            _required_text(
+                "grant_context_digest", self.grant_context_digest, max_length=128
+            )
 
     def payload(self) -> dict[str, object]:
-        return {
+        payload = {
             "schema_version": self.schema_version,
             "principal_id": self.principal_id,
             "project_id": self.project_id,
@@ -152,6 +167,12 @@ class AuthorizationIntent:
             "nonce": self.nonce,
             "authorization_epoch": self.authorization_epoch,
         }
+        if self.grant_id is not None:
+            payload["grant_id"] = self.grant_id
+            payload["grant_context_digest"] = self.grant_context_digest
+        if self.workspace_generation is not None:
+            payload["workspace_generation"] = self.workspace_generation
+        return payload
 
     @property
     def digest(self) -> str:
@@ -179,6 +200,9 @@ class SignedAuthorizationReceipt:
     signature: str
     schema_version: int = 1
     algorithm: str = "Ed25519"
+    workspace_generation: int | None = None
+    grant_id: str | None = None
+    grant_context_digest: str | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -206,9 +230,20 @@ class SignedAuthorizationReceipt:
             raise AuthorityControlPlaneError("authorization receipt TTL is too long")
         if self.authorization_epoch < 0:
             raise AuthorityControlPlaneError("authorization_epoch is invalid")
+        if self.workspace_generation is not None and self.workspace_generation <= 0:
+            raise AuthorityControlPlaneError("workspace_generation is invalid")
+        if (self.grant_id is None) != (self.grant_context_digest is None):
+            raise AuthorityControlPlaneError(
+                "receipt grant_id and grant_context_digest must be supplied together"
+            )
+        if self.grant_id is not None:
+            _required_text("grant_id", self.grant_id, max_length=128)
+            _required_text(
+                "grant_context_digest", self.grant_context_digest, max_length=128
+            )
 
     def unsigned_payload(self) -> dict[str, object]:
-        return {
+        payload = {
             "schema_version": self.schema_version,
             "algorithm": self.algorithm,
             "principal_id": self.principal_id,
@@ -226,6 +261,12 @@ class SignedAuthorizationReceipt:
             "issuer_id": self.issuer_id,
             "issued_at": self.issued_at,
         }
+        if self.grant_id is not None:
+            payload["grant_id"] = self.grant_id
+            payload["grant_context_digest"] = self.grant_context_digest
+        if self.workspace_generation is not None:
+            payload["workspace_generation"] = self.workspace_generation
+        return payload
 
     @property
     def digest(self) -> str:
@@ -257,6 +298,21 @@ class SignedAuthorizationReceipt:
                 signature=str(value["signature"]),
                 schema_version=int(value.get("schema_version", 1)),
                 algorithm=str(value.get("algorithm", "Ed25519")),
+                workspace_generation=(
+                    int(value["workspace_generation"])
+                    if value.get("workspace_generation") is not None
+                    else None
+                ),
+                grant_id=(
+                    str(value["grant_id"])
+                    if value.get("grant_id") is not None
+                    else None
+                ),
+                grant_context_digest=(
+                    str(value["grant_context_digest"])
+                    if value.get("grant_context_digest") is not None
+                    else None
+                ),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise AuthorityControlPlaneError(
@@ -416,6 +472,70 @@ class AuthorityDaemonClient:
     def prepare(self, intent: AuthorizationIntent) -> SignedAuthorizationReceipt:
         response = self.request({"operation": "prepare", "intent": intent.payload()})
         return SignedAuthorizationReceipt.from_dict(response.get("receipt"))
+
+    def grant(
+        self,
+        *,
+        principal_id: str,
+        project_id: str,
+        runtime_id: str,
+        task_id: str,
+        workspace_id: str,
+        workspace_generation: int,
+        policy_digest: str,
+        operation_class: str,
+        resource_digest: str,
+        authorization_epoch: int,
+        ttl_seconds: float = 60 * 60.0,
+    ) -> tuple[str, float]:
+        response = self.request(
+            {
+                "operation": "grant",
+                "principal_id": _required_text("principal_id", principal_id),
+                "project_id": _required_text("project_id", project_id),
+                "runtime_id": _required_text("runtime_id", runtime_id),
+                "task_id": _required_text("task_id", task_id),
+                "workspace_id": _required_text("workspace_id", workspace_id),
+                "workspace_generation": workspace_generation,
+                "policy_digest": _required_text("policy_digest", policy_digest),
+                "operation_class": _required_text("operation_class", operation_class),
+                "resource_digest": _required_text("resource_digest", resource_digest),
+                "authorization_epoch": authorization_epoch,
+                "ttl_seconds": ttl_seconds,
+            }
+        )
+        try:
+            grant_id = str(response["grant_id"])
+            expires_at = float(response["expires_at"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise AuthorityControlPlaneError("authorityd returned malformed grant") from exc
+        return grant_id, expires_at
+
+    def revoke_grant(self, grant_id: str) -> None:
+        self.request(
+            {
+                "operation": "revoke_grant",
+                "grant_id": _required_text("grant_id", grant_id, max_length=128),
+            }
+        )
+
+    def rotate_authorization_epoch(
+        self,
+        *,
+        principal_id: str,
+        project_id: str,
+        workspace_id: str,
+        authorization_epoch: int,
+    ) -> None:
+        self.request(
+            {
+                "operation": "rotate_authorization_epoch",
+                "principal_id": _required_text("principal_id", principal_id),
+                "project_id": _required_text("project_id", project_id),
+                "workspace_id": _required_text("workspace_id", workspace_id),
+                "authorization_epoch": authorization_epoch,
+            }
+        )
 
     def complete(
         self,

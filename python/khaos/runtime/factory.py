@@ -974,7 +974,8 @@ async def build_runtime(
         )
         await task_manager.load()
     workspace_manager = cfg.workspace_manager or WorkspaceManager(
-        policy_digest=effective_policy.digest
+        policy_digest=effective_policy.digest,
+        authorization_epoch=await permission_engine.authorization_snapshot(),
     )
     injected_workspace_policy = getattr(workspace_manager, "policy_digest", None)
     if (

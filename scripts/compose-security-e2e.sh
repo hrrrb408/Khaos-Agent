@@ -198,6 +198,7 @@ PY
 export KHAOS_DOCKER_SECCOMP_OPT="${KHAOS_DOCKER_SECCOMP_OPT:-seccomp=unconfined}"
 export KHAOS_DOCKER_APPARMOR_OPT="${KHAOS_DOCKER_APPARMOR_OPT:-apparmor=unconfined}"
 export KHAOS_DOCKER_SYSTEMPATHS_OPT="${KHAOS_DOCKER_SYSTEMPATHS_OPT:-systempaths=unconfined}"
+python3 "$repo_root/scripts/validate_docker_outer_profiles.py" --disposable
 
 run_profile compose.dev.yaml http://127.0.0.1:8080/api/health
 run_profile compose.prod.yaml https://127.0.0.1:8443/api/health

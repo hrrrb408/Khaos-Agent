@@ -26,12 +26,28 @@ cannot be committed is `unknown`/quarantined and must not be reported as
 success.
 
 `AuthorityGrant` (`AuthorityEnvelope` is the compatibility class name) is the
-long-lived, broker-owned context.  `EffectCapability` is a short-lived,
-one-shot receipt handle.  Expiry blocks a new claim, but a receipt that was
+long-lived, broker-owned context. It contains an opaque grant id and expiry,
+but the live grant registry remains in the broker/authorityd owner; copying or
+mutating a stale Python object cannot mint a new capability. The grant binds a
+single operation family, initial resource scope, workspace generation, policy
+digest, and authorization epoch. Direct effects must stay inside that initial
+scope; a resource transition is accepted only through a live parent narrow
+transaction. Revocation and epoch rotation invalidate the live record before
+a stale object can issue again. `EffectCapability` is a short-lived,
+one-shot receipt handle. Expiry blocks a new claim, but a receipt that was
 already claimed may commit `success`, `failed`, or `unknown` after the
-300-second launch TTL.  Prepared expiry is garbage-collected into a bounded
+300-second launch TTL. Prepared expiry is garbage-collected into a bounded
 tombstone inventory; global and per-principal pending quotas prevent memory
 growth.
+
+Narrowing creates a child resource digest from the parent digest, target
+operation, and requested scope, and authorityd enforces same-family
+transitions. The daemon intentionally does not interpret arbitrary resource
+digests as a full policy decision; semantic subset rules belong to the typed
+resource/policy authority above it. A successful narrowing consumes the parent
+receipt and records a `narrowed` terminal tombstone. Both the child prepare
+event and parent terminal event reserve bounded audit capacity before either
+authority transition can become irreversible.
 
 Python callers use `AuthorityDaemonClient` through `AuthorityDaemonBroker` in
 production.  `AuthorityBroker()` remains a test-only in-process broker; the
@@ -86,6 +102,12 @@ fallback.  The deployment must use object-lock compliance mode, a separate
 append-only service, or an equivalent independently administered log.  The
 local SQLite hash chain and JSONL file remain useful diagnostic evidence but
 cannot defend against a same-UID actor that can rewrite both local stores.
+
+The Windows helper uses the same ownership rule at the process boundary:
+pending spawn, active process, and orphan/quarantine records are retained until
+terminal wait and output-pipe proof is complete. Repeated cancellation is
+drained behind a shielded cleanup task; a helper is never removed from the
+ownership graph merely because the caller observed cancellation.
 
 ## Governance prerequisite
 

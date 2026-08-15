@@ -192,6 +192,7 @@ def test_production_compose_has_independent_authorityd_sidecar() -> None:
 def test_compose_security_probe_supplies_only_disposable_outer_profiles() -> None:
     script = (ROOT / "scripts/compose-security-e2e.sh").read_text(encoding="utf-8")
 
+    assert "validate_docker_outer_profiles.py\" --disposable" in script
     assert 'KHAOS_DOCKER_SECCOMP_OPT:-seccomp=unconfined' in script
     assert 'KHAOS_DOCKER_APPARMOR_OPT:-apparmor=unconfined' in script
     assert 'KHAOS_DOCKER_SYSTEMPATHS_OPT:-systempaths=unconfined' in script

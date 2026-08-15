@@ -57,21 +57,30 @@ Compose deployments must provide an already delegated cgroup v2 subtree through
 `/run/khaos-helper/cgroup`; the helper rejects a normal directory, symlink, or
 missing cgroup controllers, so a Docker Desktop/host without that delegated
 subtree fails closed instead of silently running without process isolation.
-The production `khaos-agent` service requires three host-reviewed outer
+The production `khaos-agent` service requires three host-reviewed, hash-pinned
 profiles through `KHAOS_DOCKER_SECCOMP_OPT`,
 `KHAOS_DOCKER_APPARMOR_OPT`, and `KHAOS_DOCKER_SYSTEMPATHS_OPT`; missing any
-variable makes Compose fail closed. Docker uses `name=value` syntax. Docker's
+variable makes Compose fail closed. Run
+`python scripts/validate_docker_outer_profiles.py --manifest <manifest>`
+before startup; it matches the exact options, hashes seccomp/AppArmor source
+files, and requires `systempaths=default`. Docker uses `name=value` syntax.
+Docker's
 default outer restrictions can block the unprivileged namespace and
 mount-propagation syscalls required by bwrap. These settings do not grant
 `SYS_ADMIN` to the Agent; they preserve the non-root outer identity while the
 Rust launcher, bwrap, Landlock, seccomp, cgroup, and authority receipt checks
 enforce the inner boundary. The disposable composition probe may explicitly
-use the three `*=unconfined` values on its temporary CI host only; they are not
-production defaults. Removing or replacing any setting requires an equivalent
-profile that passes the real composition probe; otherwise production execution
-must fail closed. The probe shares the container network for its non-network
-identity/result command and makes no network-isolation claim; that claim is
-owned by the real-kernel Linux security gate.
+use the three `*=unconfined` values on its temporary CI host only; the script
+validates that exception explicitly and they are not production defaults.
+Removing or replacing any setting requires an equivalent profile manifest that
+passes the real composition probe; otherwise production execution must fail
+closed. Khaos does not claim a universal Docker outer profile because the
+required nested-namespace compatibility is host-runtime-specific. The probe
+runs the exact `ExecutionService` ->
+`ProcessSupervisor` -> native launcher -> bwrap path with `network=none` and
+checks the supervisor-owned process tree through an external `/proc` identity
+oracle. The real-kernel Linux security gate owns the broader network-policy
+matrix.
 
 Long-lived state is bounded by maintenance policy: terminal chat streams,
 terminal turn journals, no-effect tool-operation claims, and approval events

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from dataclasses import dataclass, field
 
@@ -39,6 +40,8 @@ class AuthorityEnvelope:
     resource_digest: str
     authorization_epoch: int = 0
     schema_version: int = 1
+    grant_id: str = ""
+    grant_expires_at: float = 0.0
     _broker: object | None = field(
         default=None, init=False, repr=False, compare=False
     )
@@ -57,6 +60,8 @@ class AuthorityEnvelope:
         resource_digest: str,
         authorization_epoch: int = 0,
         schema_version: int = 1,
+        grant_id: str = "",
+        grant_expires_at: float = 0.0,
         _issuer: object | None = None,
     ) -> None:
         if _issuer is not _AUTHORITY_ISSUER:
@@ -75,6 +80,8 @@ class AuthorityEnvelope:
             ("resource_digest", resource_digest),
             ("authorization_epoch", authorization_epoch),
             ("schema_version", schema_version),
+            ("grant_id", grant_id),
+            ("grant_expires_at", grant_expires_at),
         ):
             object.__setattr__(self, name, value)
         object.__setattr__(self, "_broker", None)
@@ -96,6 +103,8 @@ class AuthorityEnvelope:
         resource_digest: str,
         authorization_epoch: int = 0,
         schema_version: int = 1,
+        grant_id: str,
+        grant_expires_at: float,
     ) -> AuthorityEnvelope:
         """Construct an envelope owned by one trusted AuthorityBroker."""
         envelope = cls(
@@ -110,6 +119,8 @@ class AuthorityEnvelope:
             resource_digest=resource_digest,
             authorization_epoch=authorization_epoch,
             schema_version=schema_version,
+            grant_id=grant_id,
+            grant_expires_at=grant_expires_at,
             _issuer=_AUTHORITY_ISSUER,
         )
         object.__setattr__(envelope, "_broker", broker)
@@ -128,6 +139,8 @@ class AuthorityEnvelope:
         ):
             if not isinstance(value, str) or _IDENTIFIER.fullmatch(value) is None:
                 raise ValueError(f"invalid authority envelope {label}")
+        if "." not in self.operation_class or "*" in self.operation_class:
+            raise ValueError("invalid authority envelope operation class")
         for label, value in (
             ("policy_digest", self.policy_digest),
             ("resource_digest", self.resource_digest),
@@ -138,6 +151,10 @@ class AuthorityEnvelope:
             raise ValueError("authority envelope workspace generation must be positive")
         if self.authorization_epoch < 0:
             raise ValueError("authority envelope authorization epoch cannot be negative")
+        if not isinstance(self.grant_id, str) or _IDENTIFIER.fullmatch(self.grant_id) is None:
+            raise ValueError("authority envelope grant id is invalid")
+        if not math.isfinite(self.grant_expires_at) or self.grant_expires_at <= 0:
+            raise ValueError("authority envelope grant expiry is invalid")
 
     def payload(self) -> dict[str, object]:
         """Return the canonical, non-secret binding payload."""
@@ -153,6 +170,8 @@ class AuthorityEnvelope:
             "operation_class": self.operation_class,
             "resource_digest": self.resource_digest,
             "authorization_epoch": self.authorization_epoch,
+            "grant_id": self.grant_id,
+            "grant_expires_at": self.grant_expires_at,
         }
 
     def digest(self) -> str:
@@ -203,6 +222,8 @@ class AuthorityEnvelope:
             resource_digest=resource_digest or self.resource_digest,
             authorization_epoch=self.authorization_epoch,
             schema_version=self.schema_version,
+            grant_id=self.grant_id,
+            grant_expires_at=self.grant_expires_at,
         )
 
     def matches_context(
@@ -238,8 +259,10 @@ class AuthorityEnvelope:
         workspace_id: str = "system",
     ) -> AuthorityEnvelope:
         """Create the explicit envelope used by local recovery control paths."""
-        return cls._from_broker(
-            broker=broker,
+        issue_context = getattr(broker, "envelope", None)
+        if not callable(issue_context):
+            raise TypeError("system authority requires a live AuthorityBroker")
+        return issue_context(
             principal_id="system",
             project_id="local",
             runtime_id="recovery",
@@ -249,6 +272,7 @@ class AuthorityEnvelope:
             policy_digest="system-recovery",
             operation_class=operation_class,
             resource_digest=resource_digest,
+            authorization_epoch=1,
         )
 
 

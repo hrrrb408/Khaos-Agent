@@ -16,10 +16,10 @@
 - `python/khaos/coding/execution/native_launcher_runtime.py:149` `os.execvpe` in `<module>.main` owner=`NativeLauncherTCB` threat-model=`fd-bound-exec-and-codesign` boundary=`native-launcher`
 - `python/khaos/coding/execution/native_launcher_runtime.py:403` `subprocess.run` in `<module>._authority_path` owner=`NativeLauncherTCB` threat-model=`fd-bound-exec-and-codesign` boundary=`native-launcher`
 - `python/khaos/coding/execution/native_launcher_runtime.py:413` `subprocess.run` in `<module>._authority_path` owner=`NativeLauncherTCB` threat-model=`fd-bound-exec-and-codesign` boundary=`native-launcher`
-- `python/khaos/coding/execution/platform.py:152` `subprocess.run` in `<module>.probe_capability` owner=`ExecutionBackend` threat-model=`kernel-sandbox-and-resource-control` boundary=`execution-service`
-- `python/khaos/coding/execution/platform.py:405` `asyncio.create_subprocess_exec` in `<module>.execute` owner=`ExecutionBackend` threat-model=`kernel-sandbox-and-resource-control` boundary=`execution-service`
-- `python/khaos/coding/execution/platform.py:843` `subprocess.run` in `<module>.probe_capability` owner=`ExecutionBackend` threat-model=`kernel-sandbox-and-resource-control` boundary=`execution-service`
-- `python/khaos/coding/execution/platform.py:1256` `subprocess.run` in `<module>.probe_capability` owner=`ExecutionBackend` threat-model=`kernel-sandbox-and-resource-control` boundary=`execution-service`
+- `python/khaos/coding/execution/platform.py:200` `subprocess.run` in `<module>.probe_capability` owner=`ExecutionBackend` threat-model=`kernel-sandbox-and-resource-control` boundary=`execution-service`
+- `python/khaos/coding/execution/platform.py:470` `asyncio.create_subprocess_exec` in `<module>.execute` owner=`ExecutionBackend` threat-model=`kernel-sandbox-and-resource-control` boundary=`execution-service`
+- `python/khaos/coding/execution/platform.py:1196` `subprocess.run` in `<module>.probe_capability` owner=`ExecutionBackend` threat-model=`kernel-sandbox-and-resource-control` boundary=`execution-service`
+- `python/khaos/coding/execution/platform.py:1609` `subprocess.run` in `<module>.probe_capability` owner=`ExecutionBackend` threat-model=`kernel-sandbox-and-resource-control` boundary=`execution-service`
 - `python/khaos/coding/execution/service.py:1000` `asyncio.create_subprocess_exec` in `<module>._start_managed_after_admission` owner=`ExecutionService` threat-model=`authority-bound-child-spawn` boundary=`execution-service`
 - `python/khaos/coding/execution/supervisor.py:465` `asyncio.create_subprocess_exec` in `<module>.run` owner=`ProcessSupervisor` threat-model=`child-tree-lifecycle` boundary=`execution-service`
 - `python/khaos/coding/execution/supervisor.py:1594` `subprocess.run` in `<module>._darwin_deleted_open_file_usage` owner=`ProcessSupervisor` threat-model=`child-tree-lifecycle` boundary=`execution-service`
@@ -47,7 +47,6 @@
 - `python/khaos/security/browser_sandbox.py:2187` `subprocess.run` in `<module>._has_net_admin` owner=`BrowserKernel` threat-model=`privileged-netns-and-nft` boundary=`browser-kernel`
 - `python/khaos/security/browser_sandbox.py:2193` `subprocess.run` in `<module>._has_net_admin` owner=`BrowserKernel` threat-model=`privileged-netns-and-nft` boundary=`browser-kernel`
 - `python/khaos/security/browser_sandbox.py:2217` `subprocess.run` in `<module>._run_command` owner=`BrowserKernel` threat-model=`privileged-netns-and-nft` boundary=`browser-kernel`
-- `python/khaos/security/production_composition_probe.py:115` `subprocess.Popen` in `<module>._spawn_probe_process` owner=`ProductionCompositionProbe` threat-model=`compose-job-identity` boundary=`production-compose-e2e`
 - `python/khaos/tools/clipboard_tools.py:25` `subprocess.run` in `<module>._clipboard_read_sync` owner=`HostClipboard` threat-model=`foreground-user-host-integration` boundary=`host-integration`
 - `python/khaos/tools/clipboard_tools.py:51` `subprocess.run` in `<module>._clipboard_write_sync` owner=`HostClipboard` threat-model=`foreground-user-host-integration` boundary=`host-integration`
 - `rust/khaos-core/src/bin/khaos-browser-kernel-helper.rs:963` `Command::new` in `rust::entrypoint` owner=`BrowserKernelHelper` threat-model=`root-owned-browser-kernel` boundary=`browser-kernel`

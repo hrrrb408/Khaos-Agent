@@ -95,10 +95,14 @@ because it would not actually reach the broker.
 | Windows | native helper after a passing probe: native commands and trusted Python under `network=none` use an OS-issued AppContainer low-box; trusted Python stages the resolved base executable and grants exact temporary ACLs only to the disposable runtime tree; brokered mode uses a restricted primary token and exact loopback-only WFP rules; all paths use child-process policy, a one-process Job Object, and transactional workspace ACL | missing helper/probe evidence, non-native command, ACL/firewall/token/AppContainer failure, or unsupported network endpoint rejects execution; never falls back to Host |
 
 For the production Docker composition, `khaos-agent` requires three
-host-reviewed outer profiles supplied through
+host-reviewed, hash-pinned outer profile declarations supplied through
 `KHAOS_DOCKER_SECCOMP_OPT`, `KHAOS_DOCKER_APPARMOR_OPT`, and
 `KHAOS_DOCKER_SYSTEMPATHS_OPT`; `compose.prod.yaml` fails closed if any is
-missing. Docker uses `name=value` syntax. Docker's default outer restrictions
+missing. The operator must run
+`python scripts/validate_docker_outer_profiles.py --manifest <manifest>`
+before `docker compose`; the manifest must match all three exact options,
+hash each seccomp/AppArmor source file, and pin `systempaths=default`. Docker
+uses `name=value` syntax. Docker's default outer restrictions
 can block the unprivileged namespace and mount-propagation syscalls needed to
 create the bwrap boundary. These profiles are container-composition
 compatibility controls, not payload authorization: the Agent remains UID
@@ -106,15 +110,20 @@ compatibility controls, not payload authorization: the Agent remains UID
 launcher, bwrap mount boundary, Landlock, seccomp, cgroup, and authority receipt
 checks remain mandatory. The disposable composition probe may explicitly use
 `seccomp=unconfined`, `apparmor=unconfined`, and `systempaths=unconfined` on its
-temporary CI host only; those values are not production defaults. Deployments
+temporary CI host only; the compose probe validates that exception explicitly,
+and those values are not production defaults. Deployments
 that cannot preserve an equivalent passing composition must refuse production
 execution; they must not grant `SYS_ADMIN` to Python or fall back to Host
-execution.
+execution. Khaos does not ship one universal hardened outer profile because
+seccomp/AppArmor behavior and nested-user-namespace compatibility are
+host-runtime-specific; the manifest is the deployment pin and evidence
+boundary rather than an unreviewed universal default.
 
-The composition probe itself uses the container's existing network namespace
-for its non-network identity/result command, so it does not claim network
-isolation. The real-kernel Linux security gate remains the authority for the
-`--unshare-net` proof.
+The composition probe runs the exact `ExecutionService` ->
+`ProcessSupervisor` -> native launcher -> bwrap path with `network=none`, and
+uses an external `/proc` oracle over the supervisor-owned process tree. The
+real-kernel Linux security gate remains the authority for the broader
+`--unshare-net` and network-policy matrix.
 
 `KHAOS_DEV_MODE=1` is an explicit development-only mode. It is not a weaker
 production profile and must never generate production security evidence.

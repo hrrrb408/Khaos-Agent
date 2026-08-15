@@ -74,6 +74,7 @@ class TaskWorkspace:
     change_artifacts: set[Path] = field(default_factory=set, repr=False)
     change_artifact_bytes: int = field(default=0, repr=False)
     change_artifact_reservations: int = field(default=0, repr=False)
+    git_cleanup_complete: bool = field(default=False, repr=False)
     _authority_sealed: bool = field(default=False, init=False, repr=False)
 
     _IMMUTABLE_AUTHORITY_FIELDS = frozenset(
