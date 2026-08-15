@@ -55,6 +55,10 @@ Compose deployments must provide two independent, already delegated cgroup v2
 subtrees. `KHAOS_EXECUTION_CGROUP_SOURCE` is required for the non-root Agent and
 is mounted only at `/run/khaos-execution-cgroup`; the Agent creates its
 per-execution leaves there with `KHAOS_CGROUP_ROOT` fixed to that mount. The
+production Compose Agent uses the host cgroup namespace so the kernel accepts
+the migration into this host-delegated subtree; this does not grant the Agent
+write access to the rest of the cgroup hierarchy because only the explicit
+subtree bind mount is writable and the Agent has no `SYS_ADMIN` capability. The
 backend verifies through `/proc/self/mountinfo` that the destination is a real
 cgroup2 mount, rather than trusting a directory marker. The source must be a
 real non-symlink subtree with `cpu`, `memory`, `pids`, and `io` controllers

@@ -79,6 +79,13 @@ services:
       context: .
       target: python-agent
     container_name: khaos-agent
+    # The delegated execution subtree is created in the host cgroup
+    # namespace. A private container cgroup namespace can read the bind mount
+    # but cannot migrate a process into that host-owned subtree, so production
+    # execution would fail closed at cgroup.procs. The Agent still receives
+    # only the explicitly bind-mounted subtree below and remains non-root with
+    # no SYS_ADMIN capability.
+    cgroup: host
     volumes:
       # A normal deployment may use the Compose-managed volume. The disposable
       # production probe overrides this with an explicit block-backed host

@@ -62,6 +62,9 @@ class for each invariant remains explicit below.
 11. Production Docker execution also requires a separate, host-reviewed
     delegated cgroup v2 subtree through `KHAOS_EXECUTION_CGROUP_SOURCE`; it is
     mounted only at the non-root Agent's `/run/khaos-execution-cgroup`; the
+    production Agent explicitly joins the host cgroup namespace so it can
+    migrate into that host-delegated subtree; only the explicit subtree bind
+    mount is writable and the Agent has no `SYS_ADMIN` capability;
     backend verifies that destination is a real cgroup2 mount, requires the
     `cpu`, `memory`, `pids`, and `io` controllers, and is distinct from the
     privileged browser helper's cgroup subtree. Missing or incomplete

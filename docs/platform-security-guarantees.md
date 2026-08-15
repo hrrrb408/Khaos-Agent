@@ -133,6 +133,10 @@ uses an external `/proc` oracle over the supervisor-owned process tree. The
 production Agent receives a separate host-reviewed delegated cgroup v2 subtree
 through `KHAOS_EXECUTION_CGROUP_SOURCE`, mounted at
 `/run/khaos-execution-cgroup`; the
+Compose service uses the host cgroup namespace because a private container
+cgroup namespace cannot migrate into a host-delegated subtree; the Agent still
+receives only that explicit bind mount as writable and has no `SYS_ADMIN`
+capability. The
 production helper's cgroup subtree is independent. The composition probe
 preflights the required controllers and fails closed when the execution
 delegation is absent or incomplete. Its `/app/data` workspace must expose a

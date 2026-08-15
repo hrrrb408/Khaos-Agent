@@ -175,6 +175,7 @@ def test_production_compose_has_independent_authorityd_sidecar() -> None:
     assert authority["environment"].count(
         "KHAOS_AUDIT_WORM_ENDPOINT=${KHAOS_AUDIT_WORM_ENDPOINT:?KHAOS_AUDIT_WORM_ENDPOINT must be an HTTPS WORM endpoint}"
     ) == 1
+    assert agent["cgroup"] == "host"
     assert agent["depends_on"]["khaos-authorityd"]["condition"] == "service_healthy"
     assert "KHAOS_AUTHORITYD_SOCKET=/run/khaos-authorityd/authorityd.sock" in agent[
         "environment"
