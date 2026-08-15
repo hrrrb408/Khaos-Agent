@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 
 import pytest
+from khaos.security import docker_profiles
 from khaos.security.docker_profiles import (
     DockerProfileValidationError,
     validate_disposable_environment,
@@ -61,6 +62,31 @@ def test_profile_manifest_requires_exact_options_and_hashes(tmp_path: Path) -> N
     digest = validate_profile_manifest(manifest, environment=environment)
 
     assert digest == hashlib.sha256(manifest.read_bytes()).hexdigest()
+
+
+def test_profile_manifest_does_not_treat_windows_mode_bits_as_acl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest, environment = _write_manifest(tmp_path)
+    for path in (
+        manifest,
+        tmp_path / "seccomp.json",
+        tmp_path / "khaos-agent.apparmor",
+    ):
+        os.chmod(path, 0o666)
+
+    monkeypatch.setattr(docker_profiles, "_POSIX_MODE_BITS_AVAILABLE", False)
+
+    assert validate_profile_manifest(manifest, environment=environment)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits are unavailable")
+def test_profile_manifest_rejects_group_world_writable_manifest(tmp_path: Path) -> None:
+    manifest, environment = _write_manifest(tmp_path)
+    os.chmod(manifest, 0o666)
+
+    with pytest.raises(DockerProfileValidationError, match="group/world writable"):
+        validate_profile_manifest(manifest, environment=environment)
 
 
 def test_profile_manifest_rejects_source_digest_drift(tmp_path: Path) -> None:

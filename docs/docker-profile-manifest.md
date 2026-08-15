@@ -32,9 +32,12 @@ SHA-256 digests for the source files:
 }
 ```
 
-The validator rejects symlinks, non-regular or group/world-writable files,
-option drift, missing digests, `systempaths=unconfined`, and all
-`*=unconfined` values in production mode. The disposable
+The validator rejects symlinks, non-regular or group/world-writable files on
+POSIX hosts, option drift, missing digests, `systempaths=unconfined`, and all
+`*=unconfined` values in production mode. Windows `st_mode` values do not
+represent NTFS ACLs, so this Docker/POSIX preflight does not treat synthetic
+Windows mode bits as an ACL oracle; Windows ACL enforcement remains in the
+native sandbox/service boundary. The disposable
 `scripts/compose-security-e2e.sh` path is the only caller allowed to pass
 `--disposable`; it is explicitly non-production evidence.
 

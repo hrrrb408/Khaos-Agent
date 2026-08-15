@@ -26,6 +26,7 @@ PROFILE_ENVIRONMENT = {
 }
 MANIFEST_SCHEMA_VERSION = 1
 _SHA256_LENGTH = 64
+_POSIX_MODE_BITS_AVAILABLE = os.name != "nt"
 
 
 class DockerProfileValidationError(ValueError):
@@ -60,7 +61,13 @@ def _secure_regular_file(path: Path, *, label: str) -> None:
         raise DockerProfileValidationError(
             f"{label} must be a regular non-symlink file: {path}"
         )
-    if metadata.st_mode & 0o022:
+    # ``st_mode`` does not expose NTFS DACLs.  On Windows CPython reports
+    # synthetic POSIX permission bits for ordinary files, so treating those
+    # bits as an ACL oracle would reject every normal temporary/test file
+    # before the manifest's semantic and digest checks run.  Docker's
+    # production composition is a POSIX deployment boundary; Windows native
+    # ACL claims are owned by the native sandbox/service package instead.
+    if _POSIX_MODE_BITS_AVAILABLE and metadata.st_mode & 0o022:
         raise DockerProfileValidationError(
             f"{label} must not be group/world writable: {path}"
         )

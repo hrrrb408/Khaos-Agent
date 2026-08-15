@@ -419,6 +419,7 @@ def test_production_daemon_requires_its_compiled_policy_digest(
         daemon.prepare(replace(_intent(), policy_digest="other-policy"))
 
 
+@pytest.mark.posix_host
 def test_production_daemon_requires_live_grant_and_same_operation_family(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
