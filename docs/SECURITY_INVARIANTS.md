@@ -59,7 +59,13 @@ class for each invariant remains explicit below.
     only by the disposable `scripts/compose-security-e2e.sh` probe and are not
     production defaults. Khaos does not claim one universal profile across
     host runtimes; the manifest is the deployment-specific pin.
-11. Local unit tests, local Linux probes, CI-only Windows/Docker/kernel jobs,
+11. Production Docker execution also requires a separate, host-reviewed
+    delegated cgroup v2 subtree through `KHAOS_EXECUTION_CGROUP_SOURCE`; it is
+    mounted only at the non-root Agent's `/sys/fs/cgroup/khaos`, requires the
+    `cpu`, `memory`, `pids`, and `io` controllers, and is distinct from the
+    privileged browser helper's cgroup subtree. Missing or incomplete
+    delegation fails closed.
+12. Local unit tests, local Linux probes, CI-only Windows/Docker/kernel jobs,
     remote WORM evidence, and organization governance are reported as separate
     evidence classes. No local result is promoted to a Codex-equivalent or
     independently administered security claim.

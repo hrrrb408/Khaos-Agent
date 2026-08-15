@@ -41,6 +41,7 @@ from khaos.security.identity_isolation import (
 
 _IDENTITY_ORACLE_TIMEOUT_SECONDS = 15.0
 _IDENTITY_ORACLE_RETRY_SECONDS = 0.01
+_FAILURE_DETAIL_LIMIT = 512
 
 
 def _resource_digest(command: tuple[str, ...], workspace: Path) -> str:
@@ -133,6 +134,21 @@ def _matches_job_identity(
     )
 
 
+def _bounded_detail(value: object) -> str:
+    """Return compact diagnostic text without leaking an unbounded payload."""
+    message = " ".join(str(value).split())
+    if not message:
+        return "<no detail>"
+    if len(message) > _FAILURE_DETAIL_LIMIT:
+        return message[: _FAILURE_DETAIL_LIMIT - 3] + "..."
+    return message
+
+
+def _failure_detail(error: BaseException) -> str:
+    """Include the real exception type and bounded message in probe failures."""
+    return f"{type(error).__name__}: {_bounded_detail(error)}"
+
+
 async def _wait_for_supervisor_job_identity(
     supervisor: ProcessSupervisor,
     execution_id: str,
@@ -165,14 +181,16 @@ async def _wait_for_supervisor_job_identity(
                     "production exact-effect task was cancelled before the "
                     "external identity oracle observed it"
                 ) from error
-            except Exception as error:
+            except BaseException as error:
                 raise SystemExit(
                     "production exact-effect task failed before the external "
-                    "identity oracle observed it"
+                    f"identity oracle observed it ({_failure_detail(error)})"
                 ) from error
             raise SystemExit(
                 "production exact-effect task finished before the external "
-                f"identity oracle observed it: {getattr(result, 'status', 'unknown')}"
+                f"identity oracle observed it: {getattr(result, 'status', 'unknown')} "
+                f"return_code={getattr(result, 'return_code', 'unknown')} "
+                f"stderr={_bounded_detail(getattr(result, 'stderr', ''))}"
             )
         if time.monotonic() >= deadline:
             raise SystemExit(
@@ -322,7 +340,19 @@ def main() -> int:
             "production composition probe requires authority socket, public key, "
             "policy digest, and job UID"
         )
-    workspace = Path(tempfile.mkdtemp(prefix="khaos-composition-"))
+    # The cgroup-v2 io.max contract needs a real block-backed device. The
+    # production Compose profile mounts /app/data as a named volume; using
+    # /tmp here would make the probe depend on the container overlay device
+    # and could fail after all other isolation checks had already passed.
+    workspace_parent = Path("/app/data")
+    if not workspace_parent.is_dir():
+        raise SystemExit(
+            "production composition probe requires the mounted /app/data "
+            "workspace volume for cgroup io.max evidence"
+        )
+    workspace = Path(
+        tempfile.mkdtemp(prefix="khaos-composition-", dir=workspace_parent)
+    )
     command = (
         "/bin/sh",
         "-c",

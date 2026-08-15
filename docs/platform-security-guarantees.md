@@ -122,7 +122,12 @@ boundary rather than an unreviewed universal default.
 The composition probe runs the exact `ExecutionService` ->
 `ProcessSupervisor` -> native launcher -> bwrap path with `network=none`, and
 uses an external `/proc` oracle over the supervisor-owned process tree. The
-real-kernel Linux security gate remains the authority for the broader
+production Agent receives a separate host-reviewed delegated cgroup v2 subtree
+through `KHAOS_EXECUTION_CGROUP_SOURCE`, mounted at `/sys/fs/cgroup/khaos`; the
+production helper's cgroup subtree is independent. The composition probe
+preflights the required controllers and fails closed when the execution
+delegation is absent or incomplete. The real-kernel Linux security gate remains
+the authority for the broader
 `--unshare-net` and network-policy matrix.
 
 `KHAOS_DEV_MODE=1` is an explicit development-only mode. It is not a weaker

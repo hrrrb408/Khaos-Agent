@@ -39,6 +39,9 @@ def test_security_facts_define_the_receipt_and_platform_contract() -> None:
     assert facts["linux"]["docker_ci_outer_profile"] == (
         "unconfined_for_disposable_composition_probe_only"
     )
+    assert facts["linux"]["docker_execution_cgroup"] == (
+        "delegated_v2_subtree_required_for_agent_uid_10001"
+    )
     assert facts["evidence"]["production_composition_probe"] == (
         "exact_execution_service_supervisor_native_launcher_bwrap_worm"
     )

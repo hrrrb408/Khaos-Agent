@@ -111,6 +111,44 @@ export KHAOS_AUDIT_WORM_CA_FILE="$secret_dir/worm-cert.pem"
 
 cd "$repo_root"
 
+validate_execution_cgroup_source() {
+    local source="${KHAOS_EXECUTION_CGROUP_SOURCE:-}"
+    local canonical
+    if [[ -z "$source" ]]; then
+        printf '%s\n' "KHAOS_EXECUTION_CGROUP_SOURCE is required for the production composition probe" >&2
+        return 1
+    fi
+    if [[ "$source" != /sys/fs/cgroup/* || "$source" == "/sys/fs/cgroup" ]]; then
+        printf '%s\n' "KHAOS_EXECUTION_CGROUP_SOURCE must be a child of /sys/fs/cgroup" >&2
+        return 1
+    fi
+    if [[ -L "$source" || ! -d "$source" ]]; then
+        printf '%s\n' "KHAOS_EXECUTION_CGROUP_SOURCE must be a real, non-symlink directory" >&2
+        return 1
+    fi
+    if ! canonical="$(realpath -e -- "$source")" || [[ "$canonical" != /sys/fs/cgroup/* ]]; then
+        printf '%s\n' "KHAOS_EXECUTION_CGROUP_SOURCE must resolve inside /sys/fs/cgroup" >&2
+        return 1
+    fi
+    for entry in cgroup.controllers cgroup.procs cgroup.subtree_control; do
+        if [[ ! -f "$canonical/$entry" ]]; then
+            printf '%s\n' "delegated cgroup subtree is missing $entry: $canonical" >&2
+            return 1
+        fi
+    done
+    for controller in cpu memory pids io; do
+        if ! grep -qw "$controller" "$canonical/cgroup.controllers"; then
+            printf '%s\n' "delegated cgroup subtree lacks controller $controller: $canonical" >&2
+            return 1
+        fi
+        if ! grep -qw "$controller" "$canonical/cgroup.subtree_control"; then
+            printf '%s\n' "delegated cgroup subtree has not enabled controller $controller: $canonical" >&2
+            return 1
+        fi
+    done
+    printf '%s\n' "validated delegated execution cgroup v2 subtree: $canonical"
+}
+
 run_profile() {
     local compose_file="$1"
     local health_url="$2"
@@ -129,6 +167,9 @@ run_profile() {
     fi
 
     active_compose_file="$compose_file"
+    if [[ "$compose_file" == "compose.prod.yaml" ]]; then
+        validate_execution_cgroup_source
+    fi
     docker compose \
         --project-name "$project_name" \
         --project-directory "$repo_root" \

@@ -138,6 +138,7 @@ def render() -> str:
         ("python/khaos/security/authorityd_protocol.py", sha256(ROOT / "python" / "khaos" / "security" / "authorityd_protocol.py")),
         ("python/khaos/security/docker_profiles.py", sha256(ROOT / "python" / "khaos" / "security" / "docker_profiles.py")),
         ("python/khaos/security/identity_isolation.py", sha256(ROOT / "python" / "khaos" / "security" / "identity_isolation.py")),
+        ("python/khaos/security/production_composition_probe.py", sha256(ROOT / "python" / "khaos" / "security" / "production_composition_probe.py")),
         ("python/khaos/security/remote_audit.py", sha256(ROOT / "python" / "khaos" / "security" / "remote_audit.py")),
         ("python/khaos/security/network_broker.py", sha256(ROOT / "python" / "khaos" / "security" / "network_broker.py")),
         ("python/khaos/coding/workspace/boundary.py", sha256(ROOT / "python" / "khaos" / "coding" / "workspace" / "boundary.py")),

@@ -27,6 +27,7 @@ linux:
   identity_oracle: proc_status_uid_map_gid_map
   docker_outer_profile: hash_pinned_operator_supplied_seccomp_apparmor_systempaths_manifest
   docker_ci_outer_profile: unconfined_for_disposable_composition_probe_only
+  docker_execution_cgroup: delegated_v2_subtree_required_for_agent_uid_10001
   docker_agent_sys_admin: forbidden
   production_dev_mode_fallback: forbidden
 platform_boundaries:

@@ -4,6 +4,18 @@ from khaos.security import production_composition_probe
 from khaos.security.identity_isolation import IdentityIsolationError
 
 
+def test_failure_detail_is_bounded_and_names_the_real_exception() -> None:
+    detail = production_composition_probe._failure_detail(
+        PermissionError("  delegated cgroup v2 limits unavailable: " + "x" * 600)
+    )
+
+    assert detail.startswith("PermissionError: delegated cgroup v2 limits unavailable:")
+    assert len(detail) <= production_composition_probe._FAILURE_DETAIL_LIMIT + len(
+        "PermissionError: "
+    )
+    assert detail.endswith("...")
+
+
 def test_mapping_contains_expected_namespace_and_host_ids() -> None:
     mapping = "0 65534 1\n10004 10001 1\n"
 
@@ -23,6 +35,15 @@ def test_probe_request_binds_immutable_execution_authority(tmp_path: Path) -> No
     assert request.execution_authority.is_valid()
     assert request.permission_profile is not None
     assert request.permission_profile.validate_resolved() is None
+
+
+def test_production_probe_uses_the_named_volume_for_io_limits() -> None:
+    source = Path(
+        production_composition_probe.__file__
+    ).read_text(encoding="utf-8")
+
+    assert 'workspace_parent = Path("/app/data")' in source
+    assert 'dir=workspace_parent' in source
 
 
 def test_identity_oracle_retries_transient_empty_namespace_maps(monkeypatch) -> None:

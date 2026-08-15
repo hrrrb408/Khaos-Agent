@@ -51,12 +51,19 @@ mode 0660 with an explicit Gateway UID/GID check, so group access cannot be
 turned into directory write access. The
 privileged browser kernel helper is a separate, narrowly scoped authority and
 is the only service that intentionally shares the Agent PID/network namespace.
-Compose deployments must provide an already delegated cgroup v2 subtree through
-`KHAOS_BROWSER_HELPER_CGROUP_SOURCE` (default
-`/sys/fs/cgroup/khaos-browser`). It is mounted only at the helper's
-`/run/khaos-helper/cgroup`; the helper rejects a normal directory, symlink, or
-missing cgroup controllers, so a Docker Desktop/host without that delegated
-subtree fails closed instead of silently running without process isolation.
+Compose deployments must provide two independent, already delegated cgroup v2
+subtrees. `KHAOS_EXECUTION_CGROUP_SOURCE` is required for the non-root Agent and
+is mounted only at `/sys/fs/cgroup/khaos`; the Agent creates its per-execution
+leaves there with `KHAOS_CGROUP_ROOT` fixed to that mount. The source must be a
+real non-symlink subtree with `cpu`, `memory`, `pids`, and `io` controllers
+enabled, and it must be delegated to the image's exact Agent UID 10001.
+The production exact-effect probe places its temporary workspace in the
+Compose named volume mounted at `/app/data`, so `io.max` is checked against a
+real volume device rather than a container overlay filesystem.
+`KHAOS_BROWSER_HELPER_CGROUP_SOURCE` (default `/sys/fs/cgroup/khaos-browser`)
+is separate and is mounted only at the privileged helper's
+`/run/khaos-helper/cgroup`. A Docker Desktop/host without both reviewed
+delegations fails closed instead of silently running without process isolation.
 The production `khaos-agent` service requires three host-reviewed, hash-pinned
 profiles through `KHAOS_DOCKER_SECCOMP_OPT`,
 `KHAOS_DOCKER_APPARMOR_OPT`, and `KHAOS_DOCKER_SYSTEMPATHS_OPT`; missing any

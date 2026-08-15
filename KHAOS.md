@@ -22,5 +22,10 @@ not a production default. It must not replace the inner boundary with
 The disposable production composition probe now runs the exact
 `ExecutionService -> ProcessSupervisor -> native launcher -> bwrap` path with
 `network=none`; its external `/proc` oracle proves the configured job mapping.
+The production Agent also requires a separate, host-reviewed delegated cgroup
+v2 subtree through `KHAOS_EXECUTION_CGROUP_SOURCE`, mounted only at
+`/sys/fs/cgroup/khaos` and fixed as `KHAOS_CGROUP_ROOT`; the browser helper's
+cgroup subtree is independent. Missing or incomplete execution delegation
+fails closed.
 The independent real-kernel network gate remains the authority for broader
 network-isolation coverage.
