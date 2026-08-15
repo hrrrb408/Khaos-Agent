@@ -276,6 +276,25 @@ elif command == "rm":
     asyncio.run(exercise())
 
 
+def test_docker_already_absent_rm_is_a_successful_cleanup(tmp_path):
+    """An absent container is success after authoritative inspect proof."""
+    backend = _unit_backend()
+
+    async def fake_docker(_args, **_kwargs):
+        return 1, b"", b"No such container"
+
+    async def fake_inspect(_container_id_or_name):
+        return None
+
+    backend._run_docker_command = fake_docker
+    backend.inspect_instance = fake_inspect
+    terminated_ok, removed_ok = asyncio.run(
+        backend.terminate_and_remove_instance("already-absent")
+    )
+    assert terminated_ok is True
+    assert removed_ok is True
+
+
 @pytest.mark.parametrize("language,executable,absolute,argv", [
     ("python", "python", "/usr/local/bin/python3", ("python", "-m", "pytest", "-q")),
     ("javascript", "npm", "/usr/local/bin/npm", ("npm", "run", "test")),
@@ -3239,7 +3258,55 @@ def _artifact_runtime(tmp_path, *, backend=None):
     """Wire a runtime with an artifact root for §7 reconciliation tests."""
     if backend is None:
         backend = _FaultMatrixBackend(_profile())
-    return _fault_matrix_runtime(tmp_path, backend=backend)
+    runtime, result = _fault_matrix_runtime(tmp_path, backend=backend)
+    execution = runtime._store.get_execution_run(result.execution_run_id)
+    now = time.time()
+    runtime._verification_store.create_run(VerificationExecutionRun(
+        verification_run_id="verify1",
+        execution_run_id=execution.execution_run_id,
+        plan_id=execution.plan_id,
+        plan_content_hash=execution.plan_content_hash,
+        approval_request_id=execution.approval_request_id,
+        execution_context_id=execution.execution_context_id,
+        task_id=execution.task_id,
+        workspace_id=execution.workspace_id,
+        repository_id=execution.repository_id,
+        bundle_digest=execution.edit_bundle_digest,
+        final_mutation_attestation_digest="",
+        verification_plan_digest="artifact-fixture",
+        trusted_catalog_fingerprint="artifact-fixture",
+        sandbox_profile_digest="artifact-fixture",
+        status=VerificationRunStatus.CREATED,
+        started_at=now,
+        updated_at=now,
+    ))
+    return runtime, result
+
+
+def _ensure_verification_run(runtime, execution_run_id, *, verification_run_id="verify1"):
+    """Create a minimal CREATED verification run bound to an execution."""
+    execution = runtime._store.get_execution_run(execution_run_id)
+    now = time.time()
+    runtime._verification_store.create_run(VerificationExecutionRun(
+        verification_run_id=verification_run_id,
+        execution_run_id=execution.execution_run_id,
+        plan_id=execution.plan_id,
+        plan_content_hash=execution.plan_content_hash,
+        approval_request_id=execution.approval_request_id,
+        execution_context_id=execution.execution_context_id,
+        task_id=execution.task_id,
+        workspace_id=execution.workspace_id,
+        repository_id=execution.repository_id,
+        bundle_digest=execution.edit_bundle_digest,
+        final_mutation_attestation_digest="",
+        verification_plan_digest="fixture",
+        trusted_catalog_fingerprint="fixture",
+        sandbox_profile_digest="fixture",
+        status=VerificationRunStatus.CREATED,
+        started_at=now,
+        updated_at=now,
+    ))
+    return verification_run_id
 
 
 def _insert_artifact_row(store, *, artifact_id, verification_run_id="verify1",
@@ -3416,7 +3483,7 @@ def test_reconcile_artifacts_non_regular_file_raises_and_poisons(tmp_path):
     with pytest.raises(PermissionError, match="non-regular file"):
         runner._reconcile_artifacts()
     # The verification run must be poisoned.
-    scopes = runtime._store.list_workspace_poison_scopes("verify1")
+    scopes = runtime._store.list_workspace_poison_scopes("ws1")
     assert any("artifact-root-non-regular-file" in s[2] for s in scopes)
 
 
@@ -3463,6 +3530,16 @@ class _ConfigurableExitBackend(_FaultMatrixBackend):
             hashlib.sha256(b"").hexdigest(), False, False, False,
             container_id, attestation_digest,
         )
+
+
+class _CancellationCleanupUnprovenBackend(_ConfigurableExitBackend):
+    """Cancel during collection and retain an unproven container owner."""
+
+    async def collect_result(self, **_kwargs):
+        raise asyncio.CancelledError
+
+    async def confirm_instance_gone(self, _container_id_or_name):
+        return False
 
 
 def _optional_verification_plan(plan, workspace):
@@ -3577,6 +3654,93 @@ def test_sandbox_cleanup_failure_poisons_run(tmp_path):
         "SELECT state, failure_code FROM verification_sandbox_instances"
     ).fetchall()
     assert any(r[0] == "cleanup-failed" for r in instances)
+
+
+def test_cleanup_unproven_quarantines_canonical_workspace_across_restart(tmp_path):
+    """Cleanup quarantine must survive restart on the canonical workspace.
+
+    The disposable workspace and the sandbox owner are deliberately left
+    unresolved.  The test then proves that a new ApprovalRuntime restores the
+    canonical fence, and that only the exact cleanup owner can be removed
+    after reconciliation evidence is supplied.
+    """
+    backend = _CancellationCleanupUnprovenBackend(_profile())
+    runtime, result = _fault_matrix_runtime(tmp_path, backend=backend)
+
+    async def run_cancelled():
+        async with runtime.acquire_verification_context(
+            execution_run_id=result.execution_run_id, owner_execution_id="verifier",
+        ) as context:
+            with pytest.raises(asyncio.CancelledError):
+                await runtime.run_trusted_verification(context=context)
+
+    runtime._test_sync._loop.run_until_complete(run_cancelled())
+    verification = runtime._verification_store.get_run_by_execution(
+        result.execution_run_id,
+    )
+    records = runtime._verification_store.list_disposable_workspaces_for_run(
+        verification.verification_run_id,
+    )
+    assert len(records) == 1
+    disposable = records[0]
+    assert disposable.state == DisposableWorkspaceState.CLEANUP_FAILED
+    assert disposable.failure_code == "sandbox-cleanup-unproven"
+
+    scopes = runtime._store.list_workspace_poison_scopes()
+    cleanup_scopes = [
+        scope for scope in scopes if scope[2] == "sandbox-cleanup-unproven"
+    ]
+    assert len(cleanup_scopes) == 1
+    canonical_workspace_id, owner, _reason = cleanup_scopes[0]
+    assert canonical_workspace_id == "ws1"
+    assert canonical_workspace_id != verification.verification_run_id
+    assert canonical_workspace_id != disposable.workspace_id
+    assert owner == (
+        f"verification-cleanup:{verification.verification_run_id}:"
+        f"{disposable.workspace_id}"
+    )
+
+    db_path = runtime._store._conn.execute(
+        "PRAGMA database_list"
+    ).fetchone()[2]
+    factory_root = runtime._verification_runner._workspace_factory._root
+    runtime._store._conn.commit()
+    runtime._store._conn.close()
+    os.chmod(db_path, 0o600)
+    for sidecar in (f"{db_path}-wal", f"{db_path}-shm"):
+        if os.path.exists(sidecar):
+            os.chmod(sidecar, 0o600)
+    reopened_store = PlanApprovalStore(
+        sqlite3.connect(db_path, check_same_thread=False),
+    )
+    restarted, _, _, _ = _real_runtime(
+        tmp_path / "restarted-runtime", store=reopened_store,
+    )
+
+    async def denied_mutation():
+        with pytest.raises(PermissionError, match="poisoned"):
+            async with restarted._mutation_fence.use(
+                canonical_workspace_id, owner="mutation-probe",
+            ):
+                pass
+
+    restarted._test_sync._loop.run_until_complete(denied_mutation())
+
+    # Simulate the controlled reconciliation sequence: the exact disposable
+    # root is now removed, then the exact owner is cleared in durable state
+    # and in the restarted in-memory fence.  No broad workspace clear is used.
+    root = factory_root / disposable.instance_id
+    TrustedVerificationRunner._safe_destroy_prepared(root)
+    reopened_verification_store = VerificationExecutionStore(reopened_store)
+    reopened_verification_store.mark_disposable_workspace_cleaned(
+        disposable.workspace_id,
+    )
+    reopened_store.clear_workspace_poison_scope(
+        canonical_workspace_id, owner=owner,
+    )
+    restarted._mutation_fence.clear_poison(canonical_workspace_id, owner=owner)
+    assert reopened_store.list_workspace_poison_scopes(canonical_workspace_id) == ()
+    assert not restarted._mutation_fence.is_poisoned(canonical_workspace_id)
 
 
 def test_disposable_workspace_cleanup_failure_poisons_run(tmp_path):
@@ -3878,6 +4042,7 @@ def test_reconcile_prepared_workspace_safe_destroy_marks_cleaned(tmp_path):
     )
     runner = runtime._verification_runner
     store = runner._store
+    _ensure_verification_run(runtime, result.execution_run_id)
     # Create a PREPARED workspace directory with regular files.
     instance_id = "prep-inst-1"
     ws_root = ws_factory._root / instance_id
@@ -3887,7 +4052,7 @@ def test_reconcile_prepared_workspace_safe_destroy_marks_cleaned(tmp_path):
     (ws_root / "sub" / "deep.py").write_text("# deep\n")
     # Insert a PREPARED disposable workspace record.
     record = DisposableWorkspaceRecord(
-        workspace_id="dvw-prep-1", verification_run_id=result.execution_run_id,
+        workspace_id="dvw-prep-1", verification_run_id="verify1",
         step_run_id="", instance_id=instance_id, manifest_digest="",
         manifest_json="[]", allowed_generated_output=(),
         state=DisposableWorkspaceState.PREPARED, boot_id="boot1",
@@ -3925,6 +4090,7 @@ def test_reconcile_prepared_workspace_symlink_marks_cleanup_failed(tmp_path):
     )
     runner = runtime._verification_runner
     store = runner._store
+    _ensure_verification_run(runtime, result.execution_run_id)
     # Create a PREPARED workspace directory with a symlink inside.
     instance_id = "prep-sym-1"
     ws_root = ws_factory._root / instance_id
@@ -3932,7 +4098,7 @@ def test_reconcile_prepared_workspace_symlink_marks_cleanup_failed(tmp_path):
     (ws_root / "a.py").write_text("data\n")
     (ws_root / "escape").symlink_to(tmp_path / "outside")
     record = DisposableWorkspaceRecord(
-        workspace_id="dvw-prep-sym", verification_run_id=result.execution_run_id,
+        workspace_id="dvw-prep-sym", verification_run_id="verify1",
         step_run_id="", instance_id=instance_id, manifest_digest="",
         manifest_json="[]", allowed_generated_output=(),
         state=DisposableWorkspaceState.PREPARED, boot_id="boot1",

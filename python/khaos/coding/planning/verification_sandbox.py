@@ -926,13 +926,19 @@ class DockerVerificationSandboxBackend:
         return False
 
     async def remove_instance(self, container_id_or_name: str) -> bool:
-        """Remove a stopped container. Returns True if removed."""
+        """Remove a container and prove absence.
+
+        A non-zero ``docker rm`` is not itself proof that cleanup failed: the
+        container may already have been removed by another owned cleanup path.
+        The authoritative inspect distinguishes explicit absence (success)
+        from daemon/inspect failure (unknown and fail-closed).
+        """
         return_code, _stdout, _stderr = await self._run_docker_command(
             ("rm", "-f", container_id_or_name),
             stdout=asyncio.subprocess.DEVNULL,
         )
         if return_code != 0:
-            return False
+            return await self.inspect_instance(container_id_or_name) is None
         return await self.inspect_instance(container_id_or_name) is None
 
     async def terminate_and_remove_instance(
@@ -1019,8 +1025,8 @@ class DockerVerificationSandboxBackend:
     ) -> bool:
         """Batch 3.1.3 §2: confirm a container does not exist.
 
-        Returns True only if inspect returns None.  Never raises — the
-        caller must check the return value before marking TERMINATED.
+        Returns True only if inspect returns None.  An inspect/daemon error
+        propagates as unknown; callers must keep cleanup fail-closed.
         """
         return await self.inspect_instance(container_id_or_name) is None
 

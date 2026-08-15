@@ -50,6 +50,7 @@ from khaos.coding.planning.approval.models import (
     PlanExecutionAuthorization,
     verify_nonce,
 )
+from khaos.coding.planning.security_identities import CanonicalWorkspaceId
 
 logger = logging.getLogger(__name__)
 
@@ -2344,7 +2345,7 @@ class PlanApprovalStore:
         return tuple((str(row["workspace_id"]), str(row["reason"])) for row in rows)
 
     def add_workspace_poison_scope(
-        self, workspace_id: str, *, owner: str, reason: str
+        self, workspace_id: CanonicalWorkspaceId, *, owner: str, reason: str
     ) -> None:
         self._conn.execute(
             "INSERT OR REPLACE INTO workspace_mutation_poison_scopes "
@@ -2353,7 +2354,9 @@ class PlanApprovalStore:
         )
         self._conn.commit()
 
-    def clear_workspace_poison_scope(self, workspace_id: str, *, owner: str) -> bool:
+    def clear_workspace_poison_scope(
+        self, workspace_id: CanonicalWorkspaceId, *, owner: str
+    ) -> bool:
         cur = self._conn.execute(
             "DELETE FROM workspace_mutation_poison_scopes "
             "WHERE workspace_id=? AND poison_owner=?",

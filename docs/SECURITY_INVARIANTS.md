@@ -49,6 +49,10 @@ class for each invariant remains explicit below.
    from admission through controlled publish or rollback. Preflight failure,
    cancellation, grant-revocation failure, and worktree cleanup failure stay
    retryable/quarantined until both Git ownership and the grant are terminal.
+   Verification quarantine scopes are keyed by the canonical `TaskWorkspace`
+   identity; `VerificationRunId` and disposable verification-workspace IDs may
+   appear only in poison-owner metadata. Missing or ambiguous identity
+   resolution fails closed instead of creating a phantom workspace fence.
 9. A workspace authority uses the permission engine's current authorization
    epoch. The positive epoch default is only a library safety floor; production
    runtime construction supplies the database-backed snapshot.

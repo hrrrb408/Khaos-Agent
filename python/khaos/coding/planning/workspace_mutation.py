@@ -51,6 +51,7 @@ from khaos.coding.planning.safe_workspace_path import (
     SafePathError,
     WorkspacePathHandle,
 )
+from khaos.coding.planning.security_identities import CanonicalWorkspaceId
 from khaos.coding.workspace.models import WorkspaceState
 
 logger = logging.getLogger(__name__)
@@ -1779,7 +1780,7 @@ class WorkspaceMutationEngine:
         owner = f"run:{run_id}"
         self._fence.poison(workspace_id, reason, owner=owner)
         self._store.add_workspace_poison_scope(
-            workspace_id, owner=owner, reason=reason
+            CanonicalWorkspaceId(workspace_id), owner=owner, reason=reason
         )
 
     def _validated_journal(self, run: PlanExecutionRun, *, allow_partial: bool = False) -> ValidatedRecoveryJournal:
