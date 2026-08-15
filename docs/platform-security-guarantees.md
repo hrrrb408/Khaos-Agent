@@ -133,6 +133,9 @@ uses an external `/proc` oracle over the supervisor-owned process tree. The
 production Agent receives a separate host-reviewed delegated cgroup v2 subtree
 through `KHAOS_EXECUTION_CGROUP_SOURCE`, mounted at
 `/run/khaos-execution-cgroup`; the
+Compose deployment must set `KHAOS_EXECUTION_CGROUP_PARENT` to that same
+delegated cgroup parent so the Agent's Docker cgroup and its execution leaves
+share a delegated common ancestor;
 Compose service uses the host cgroup namespace because a private container
 cgroup namespace cannot migrate into a host-delegated subtree; the Agent still
 receives only that explicit bind mount as writable and has no `SYS_ADMIN`

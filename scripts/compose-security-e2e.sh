@@ -113,7 +113,12 @@ cd "$repo_root"
 
 validate_execution_cgroup_source() {
     local source="${KHAOS_EXECUTION_CGROUP_SOURCE:-}"
+    local parent="${KHAOS_EXECUTION_CGROUP_PARENT:-}"
     local canonical
+    if [[ -z "$parent" ]]; then
+        printf '%s\n' "KHAOS_EXECUTION_CGROUP_PARENT is required for the production composition probe" >&2
+        return 1
+    fi
     if [[ -z "$source" ]]; then
         printf '%s\n' "KHAOS_EXECUTION_CGROUP_SOURCE is required for the production composition probe" >&2
         return 1
@@ -146,7 +151,7 @@ validate_execution_cgroup_source() {
             return 1
         fi
     done
-    printf '%s\n' "validated delegated execution cgroup v2 subtree: $canonical"
+    printf '%s\n' "validated delegated execution cgroup v2 parent: $parent ($canonical)"
 }
 
 validate_production_workspace_source() {
@@ -185,6 +190,44 @@ validate_production_workspace_source() {
         return 1
     fi
     printf '%s\n' "validated block-backed production workspace: $canonical ($mount_source $mount_fstype)"
+}
+
+validate_agent_cgroup_parent() {
+    local compose_file="$1"
+    local expected_parent="${KHAOS_EXECUTION_CGROUP_PARENT:-}"
+    local expected_path
+    if [[ -z "$expected_parent" ]]; then
+        printf '%s\n' "KHAOS_EXECUTION_CGROUP_PARENT is required before Agent cgroup validation" >&2
+        return 1
+    fi
+    if [[ "$expected_parent" == /* ]]; then
+        expected_path="${expected_parent%/}"
+    else
+        expected_path="/${expected_parent%/}"
+    fi
+    docker compose \
+        --project-name "$project_name" \
+        --project-directory "$repo_root" \
+        --file "$repo_root/$compose_file" \
+        exec -T \
+        -e KHAOS_EXPECTED_CGROUP_PARENT="$expected_path" \
+        khaos-agent \
+        python -c '
+import os
+from pathlib import Path
+
+expected = os.environ["KHAOS_EXPECTED_CGROUP_PARENT"]
+line = next(
+    (line for line in Path("/proc/self/cgroup").read_text(encoding="ascii").splitlines() if line.startswith("0::")),
+    "",
+)
+actual = line[3:]
+if actual != expected and not actual.startswith(expected + "/"):
+    raise SystemExit(
+        f"Agent cgroup {actual!r} is not below delegated parent {expected!r}"
+    )
+print(f"validated Agent cgroup parent: {expected} (current={actual})")
+'
 }
 
 run_profile() {
@@ -230,6 +273,15 @@ run_profile() {
             --project-directory "$repo_root" \
             --file "$repo_root/$compose_file" \
             logs --no-color --tail=200 khaos-gateway khaos-agent || true
+        return 1
+    fi
+
+    if [[ "$compose_file" == "compose.prod.yaml" ]] && ! validate_agent_cgroup_parent "$compose_file"; then
+        docker compose \
+            --project-name "$project_name" \
+            --project-directory "$repo_root" \
+            --file "$repo_root/$compose_file" \
+            ps || true
         return 1
     fi
 

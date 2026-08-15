@@ -60,32 +60,53 @@ jobs:
       - name: Delegate execution cgroup v2 subtree for production agent
         run: |
           set -euo pipefail
+          cgroup_driver="$(docker info --format '{{.CgroupDriver}}')"
+          case "$cgroup_driver" in
+            systemd)
+              # A hyphen-free slice name keeps the delegated parent at the
+              # host root instead of making systemd parse a nested slice path.
+              cgroup_parent="khaoscompose.slice"
+              cgroup_source="/sys/fs/cgroup/khaoscompose.slice"
+              ;;
+            cgroupfs)
+              cgroup_parent="/khaoscompose"
+              cgroup_source="/sys/fs/cgroup/khaoscompose"
+              ;;
+            *)
+              echo "unsupported Docker cgroup driver: $cgroup_driver" >&2
+              exit 1
+              ;;
+          esac
+          echo "Docker cgroup driver: $cgroup_driver"
+          echo "Delegated cgroup parent: $cgroup_parent"
+          echo "Delegated cgroup source: $cgroup_source"
           test -f /sys/fs/cgroup/cgroup.controllers
           for controller in cpu memory pids io; do
             grep -qw "$controller" /sys/fs/cgroup/cgroup.controllers
             echo "+$controller" | sudo tee /sys/fs/cgroup/cgroup.subtree_control >/dev/null
           done
-          sudo mkdir -p /sys/fs/cgroup/khaos-compose
+          sudo mkdir -p "$cgroup_source"
           for controller in cpu memory pids io; do
-            grep -qw "$controller" /sys/fs/cgroup/khaos-compose/cgroup.controllers
-            echo "+$controller" | sudo tee /sys/fs/cgroup/khaos-compose/cgroup.subtree_control >/dev/null
+            grep -qw "$controller" "$cgroup_source/cgroup.controllers"
+            echo "+$controller" | sudo tee "$cgroup_source/cgroup.subtree_control" >/dev/null
           done
           # The production image runs the Agent as UID 10001. Delegation must
           # give that exact identity authority to create and configure leaves;
           # the workflow runner itself does not receive this capability.
-          sudo chown -R 10001:10001 /sys/fs/cgroup/khaos-compose
-          test -f /sys/fs/cgroup/khaos-compose/cgroup.controllers
-          test -f /sys/fs/cgroup/khaos-compose/cgroup.procs
-          test -f /sys/fs/cgroup/khaos-compose/cgroup.subtree_control
+          sudo chown -R 10001:10001 "$cgroup_source"
+          test -f "$cgroup_source/cgroup.controllers"
+          test -f "$cgroup_source/cgroup.procs"
+          test -f "$cgroup_source/cgroup.subtree_control"
           for controller in cpu memory pids io; do
-            grep -qw "$controller" /sys/fs/cgroup/khaos-compose/cgroup.controllers
-            grep -qw "$controller" /sys/fs/cgroup/khaos-compose/cgroup.subtree_control
+            grep -qw "$controller" "$cgroup_source/cgroup.controllers"
+            grep -qw "$controller" "$cgroup_source/cgroup.subtree_control"
           done
-          if [[ -n "$(sudo cat /sys/fs/cgroup/khaos-compose/cgroup.procs)" ]]; then
+          if [[ -n "$(sudo cat "$cgroup_source/cgroup.procs")" ]]; then
             echo "execution cgroup delegation must start empty" >&2
             exit 1
           fi
-          echo "KHAOS_EXECUTION_CGROUP_SOURCE=/sys/fs/cgroup/khaos-compose" >> "$GITHUB_ENV"
+          echo "KHAOS_EXECUTION_CGROUP_PARENT=$cgroup_parent" >> "$GITHUB_ENV"
+          echo "KHAOS_EXECUTION_CGROUP_SOURCE=$cgroup_source" >> "$GITHUB_ENV"
       - name: Prepare block-backed production workspace
         run: |
           set -euo pipefail

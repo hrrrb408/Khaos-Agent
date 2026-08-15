@@ -55,6 +55,9 @@ Compose deployments must provide two independent, already delegated cgroup v2
 subtrees. `KHAOS_EXECUTION_CGROUP_SOURCE` is required for the non-root Agent and
 is mounted only at `/run/khaos-execution-cgroup`; the Agent creates its
 per-execution leaves there with `KHAOS_CGROUP_ROOT` fixed to that mount. The
+required `KHAOS_EXECUTION_CGROUP_PARENT` must identify the same host cgroup
+parent, so the Docker service cgroup is created below the delegated boundary
+and cgroup v2 migration never crosses an undelegated common ancestor. The
 production Compose Agent uses the host cgroup namespace so the kernel accepts
 the migration into this host-delegated subtree; this does not grant the Agent
 write access to the rest of the cgroup hierarchy because only the explicit

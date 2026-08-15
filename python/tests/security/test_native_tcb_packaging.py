@@ -176,6 +176,9 @@ def test_production_compose_has_independent_authorityd_sidecar() -> None:
         "KHAOS_AUDIT_WORM_ENDPOINT=${KHAOS_AUDIT_WORM_ENDPOINT:?KHAOS_AUDIT_WORM_ENDPOINT must be an HTTPS WORM endpoint}"
     ) == 1
     assert agent["cgroup"] == "host"
+    assert agent["cgroup_parent"] == (
+        "${KHAOS_EXECUTION_CGROUP_PARENT:?KHAOS_EXECUTION_CGROUP_PARENT must identify the delegated cgroup parent}"
+    )
     assert agent["depends_on"]["khaos-authorityd"]["condition"] == "service_healthy"
     assert "KHAOS_AUTHORITYD_SOCKET=/run/khaos-authorityd/authorityd.sock" in agent[
         "environment"
@@ -213,6 +216,8 @@ def test_compose_security_probe_supplies_only_disposable_outer_profiles() -> Non
     assert 'KHAOS_DOCKER_APPARMOR_OPT:-apparmor=unconfined' in script
     assert 'KHAOS_DOCKER_SYSTEMPATHS_OPT:-systempaths=unconfined' in script
     assert "KHAOS_EXECUTION_CGROUP_SOURCE" in script
+    assert "KHAOS_EXECUTION_CGROUP_PARENT" in script
+    assert "validate_agent_cgroup_parent" in script
     assert "validate_execution_cgroup_source" in script
     assert "KHAOS_PRODUCTION_DATA_SOURCE" in script
     assert "validate_production_workspace_source" in script
