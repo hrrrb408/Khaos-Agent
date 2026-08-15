@@ -65,7 +65,7 @@
 - `python/khaos/security/authority_broker.py`: `7c7a18a30fed6bf6f572d54f0c1732022ac003174df4756836647af76c3c2d61`
 - `python/khaos/security/authorityd.py`: `85499fa6b074d93aaccc5079cc5d80aacfa854372adaf6d606b743269875583e`
 - `python/khaos/security/authorityd_protocol.py`: `6822d182ece803e31c455ddfb8dada93fc74a385f54ff404113fbaa50ca65876`
-- `python/khaos/security/docker_profiles.py`: `2b941f0703bf79fc8a5aa920381bbc0292c90eeb601d84a1fc0ce0ededcf608c`
+- `python/khaos/security/docker_profiles.py`: `2831d9e219f2070fa320e05ed7970392c1b9218c0a3247a30419dc4e700fd222`
 - `python/khaos/security/identity_isolation.py`: `3c05a709c80742243604b913669af33b6addb3ab57cc7307b18a040a910cc37b`
 - `python/khaos/security/production_composition_probe.py`: `538b6591f6b7193d9889a38a568dafa5f797071195fc3f555f941bfd2c0c121b`
 - `python/khaos/security/remote_audit.py`: `58a5d9a35c8446304a17e99ab6d3b20b52d9197e47a53372ac567867794207b2`

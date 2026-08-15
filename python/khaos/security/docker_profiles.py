@@ -144,7 +144,11 @@ def _parse_profile(
     if kind in {"seccomp", "apparmor"}:
         if allow_disposable and source is None and sha256 is None:
             return DockerProfileSpec(option=option, source=None, sha256=None)
-        if source is None and value.startswith("/"):
+        # The option may carry a native absolute host path.  A POSIX-only
+        # prefix check would make the production manifest unverifiable on
+        # Windows, where the same digest-bearing option is written as a
+        # drive-letter path or a UNC path.
+        if source is None and Path(value).is_absolute():
             source = Path(value)
             _secure_regular_file(source, label=f"{kind} profile")
         if source is None or sha256 is None:
