@@ -28,6 +28,7 @@ from khaos.security.authority_broker import (
 from khaos.security.authorityd import (
     AuthorityDaemon,
     AuthorityPolicyKernel,
+    _dispatch,
     _serve_connection,
     build_production_daemon,
 )
@@ -334,6 +335,51 @@ def test_authorityd_socket_round_trip_accepts_versioned_intent_payload(
     assert not worker.is_alive()
     assert response["ok"] is True
     assert response["receipt"]["schema_version"] == 1
+
+
+def test_authorityd_socket_receipt_wire_round_trip_supports_claim_and_complete(
+    tmp_path: Path,
+) -> None:
+    """A receipt reconstructed from JSON must remain lifecycle-addressable."""
+    daemon = AuthorityDaemon(
+        socket_path=tmp_path / "authorityd.sock",
+        signing_key=Ed25519KeyStore.load_or_create(tmp_path / "key.pem", create=True),
+        audit_writer=_MemoryWorm(),
+        issuer_id="test-authorityd",
+        policy=lambda _intent: None,
+    )
+    prepared = _dispatch(
+        daemon,
+        {
+            "protocol": AUTHORITYD_PROTOCOL,
+            "operation": "prepare",
+            "intent": _intent().payload(),
+        },
+    )
+    wire_receipt = json.loads(json.dumps(prepared["receipt"]))
+
+    claimed = _dispatch(
+        daemon,
+        {
+            "protocol": AUTHORITYD_PROTOCOL,
+            "operation": "claim",
+            "receipt": wire_receipt,
+        },
+    )
+    completed = _dispatch(
+        daemon,
+        {
+            "protocol": AUTHORITYD_PROTOCOL,
+            "operation": "complete",
+            "receipt": wire_receipt,
+            "result": "success",
+            "result_digest": "wire-round-trip-result",
+        },
+    )
+
+    assert claimed == {"ok": True}
+    assert completed == {"ok": True}
+    assert daemon.pending_count == 0
 
 
 def test_authorization_intent_rejects_unknown_schema_version() -> None:

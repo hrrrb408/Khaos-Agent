@@ -67,6 +67,22 @@ class _ReceiptRecord:
     state: str = _RECEIPT_PREPARED
 
 
+def _same_receipt(
+    left: SignedAuthorizationReceipt, right: SignedAuthorizationReceipt
+) -> bool:
+    """Compare receipts by their exact signed wire representation.
+
+    The daemon stores the in-process receipt with Python seconds-based
+    floats, while a client crossing the JSON socket reconstructs it from the
+    integer-millisecond wire representation.  Dataclass equality would treat
+    those two equivalent receipts as different objects and incorrectly make a
+    valid claim or completion look unknown.  Comparing the canonical wire
+    dictionaries preserves the nonce/signature binding without trusting the
+    transport's in-memory object identity.
+    """
+    return left.to_dict() == right.to_dict()
+
+
 @dataclass
 class _GrantRecord:
     principal_id: str
@@ -592,7 +608,7 @@ class AuthorityDaemon:
         parent_record = self._states.get(parent_receipt.nonce)
         if (
             parent_record is None
-            or parent_record.receipt != parent_receipt
+            or not _same_receipt(parent_record.receipt, parent_receipt)
             or parent_record.state != _RECEIPT_NARROWING
             or parent_receipt.grant_id != intent.grant_id
             or parent_receipt.grant_context_digest != intent.grant_context_digest
@@ -697,7 +713,12 @@ class AuthorityDaemon:
 
     def _record_locked(self, receipt: SignedAuthorizationReceipt) -> _ReceiptRecord:
         record = self._states.get(receipt.nonce)
-        if record is None or self._pending.get(receipt.nonce) != receipt:
+        pending = self._pending.get(receipt.nonce)
+        if (
+            record is None
+            or pending is None
+            or not _same_receipt(pending, receipt)
+        ):
             terminal = self._terminal.get(receipt.nonce)
             suffix = f" ({terminal})" if terminal else ""
             raise AuthorityControlPlaneError(f"receipt is unknown or revoked{suffix}")
@@ -1023,7 +1044,7 @@ class AuthorityDaemon:
             self._release_audit_reservation(narrow_token)
             with self._lock:
                 record = self._states.get(receipt.nonce)
-                if record is not None and record.receipt == receipt:
+                if record is not None and _same_receipt(record.receipt, receipt):
                     if record.state != _RECEIPT_NARROWING:
                         raise AuthorityControlPlaneError(
                             "receipt narrowing rollback state changed"
@@ -1050,7 +1071,7 @@ class AuthorityDaemon:
         with self._lock:
             self._bind_audit_reservation_locked(narrow_token, narrowed_event)
             record = self._states.get(receipt.nonce)
-            if record is None or record.receipt != receipt:
+            if record is None or not _same_receipt(record.receipt, receipt):
                 raise AuthorityControlPlaneError(
                     "receipt narrowing parent disappeared before terminalization"
                 )

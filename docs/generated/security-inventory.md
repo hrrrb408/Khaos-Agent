@@ -63,7 +63,7 @@
 - `python/khaos/coding/workspace/trusted_git.py`: `4453e3f953bac05d034991c349767b40126324cb1842d7991bfba2d32e243891`
 - `python/khaos/security/authority.py`: `0c520850cf5ca3c017d096871a3045da5b6884ab0ae04815109a9c3287c0ed25`
 - `python/khaos/security/authority_broker.py`: `7c7a18a30fed6bf6f572d54f0c1732022ac003174df4756836647af76c3c2d61`
-- `python/khaos/security/authorityd.py`: `27cbccd383af5ca76558377ac478640f380c26e33fa32b6e344512608f60a681`
+- `python/khaos/security/authorityd.py`: `b8585b1f5e3a6e290a5498f66233962ec6d3ca447f7a343d89a72e2192e3e147`
 - `python/khaos/security/authorityd_protocol.py`: `93c1f24a5fd21b1a3075bc6ab1aa24f255dca46f9286148c8f783422a4529a04`
 - `python/khaos/security/docker_profiles.py`: `9c9887c631f4e439833636b76a6d143bf54033aaefac0fcc91a2f8edf65ab921`
 - `python/khaos/security/identity_isolation.py`: `3c05a709c80742243604b913669af33b6addb3ab57cc7307b18a040a910cc37b`

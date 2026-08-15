@@ -258,7 +258,11 @@ mod tests {
         // It protects the actual Python -> Rust production boundary rather
         // than only testing Rust against its own serializer.
         let receipt = br#"{"algorithm":"Ed25519","audit_intent_digest":"audit","authorization_epoch":7,"expires_at":2000000300000,"issued_at":2000000000000,"issuer_id":"authorityd-python-fixture","nonce":"nonce-python-fixture","operation":"exec.host","policy_digest":"policy","principal_id":"agent","project_id":"project","resource_digest":"resource","runtime_id":"runtime","schema_version":1,"signature":"sPkdS7jVnKCqFC5NsW3m2pyxHuM7WatlzNd/saRaFvZBJ8znYiPdolSsQw+VxmOyu/HACauFuJjkiwWOQz94AQ==","task_id":"task","workspace_id":"workspace"}"#;
-        let public = [13_u8; 32];
+        let public = [
+            0x91, 0xa2, 0x8a, 0x0b, 0x74, 0x38, 0x15, 0x93, 0xa4, 0xd9, 0x46, 0x95, 0x79, 0x20,
+            0x89, 0x26, 0xaf, 0xc8, 0xad, 0x82, 0xc8, 0x83, 0x9b, 0x76, 0x44, 0x35, 0x9b, 0x9e,
+            0xba, 0x9a, 0x4b, 0x3a,
+        ];
         assert!(verify_json_bound(
             receipt,
             &public,
