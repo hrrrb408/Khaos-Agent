@@ -96,7 +96,11 @@ jobs:
           sudo mkfs.ext4 -F -q /var/tmp/khaos-compose-workspace.img
           sudo mkdir -p /mnt/khaos-compose-workspace
           sudo mount -o loop,noatime /var/tmp/khaos-compose-workspace.img /mnt/khaos-compose-workspace
-          sudo chown 10001:10001 /mnt/khaos-compose-workspace
+          # The workflow runner validates the source before Compose starts,
+          # while the container Agent writes it as UID/GID 10001. Keep the
+          # runner as owner and grant only the Agent's exact group access.
+          sudo chown "$(id -u):10001" /mnt/khaos-compose-workspace
+          sudo chmod 0770 /mnt/khaos-compose-workspace
           test -w /mnt/khaos-compose-workspace
           echo "KHAOS_PRODUCTION_DATA_SOURCE=/mnt/khaos-compose-workspace" >> "$GITHUB_ENV"
       - name: Run Compose development and production E2E
