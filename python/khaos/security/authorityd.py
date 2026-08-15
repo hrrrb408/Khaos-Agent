@@ -37,8 +37,8 @@ from khaos.security.authorityd_protocol import (
     RemoteAuditUnavailableError,
     SignedAuthorizationReceipt,
     _canonical,
-    _encode_receipt_timestamp,
     _digest,
+    _encode_receipt_timestamp,
     _required_text,
     derive_resource_digest,
 )

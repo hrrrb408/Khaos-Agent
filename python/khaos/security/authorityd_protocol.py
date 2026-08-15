@@ -83,7 +83,7 @@ def _encode_receipt_timestamp(value: object, *, field: str) -> int:
     if not math.isfinite(numeric) or numeric < 0:
         raise AuthorityControlPlaneError(f"authorization receipt {field} is invalid")
     try:
-        encoded = int(round(numeric * AUTHORITY_TIMESTAMP_SCALE))
+        encoded = round(numeric * AUTHORITY_TIMESTAMP_SCALE)
     except (OverflowError, ValueError) as exc:
         raise AuthorityControlPlaneError(
             f"authorization receipt {field} is invalid"
