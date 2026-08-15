@@ -119,6 +119,14 @@ seccomp/AppArmor behavior and nested-user-namespace compatibility are
 host-runtime-specific; the manifest is the deployment pin and evidence
 boundary rather than an unreviewed universal default.
 
+The coding execution path and browser authority path use separate launcher
+inodes. `KHAOS_EXECUTION_SANDBOX_LAUNCHER` points to the capability-free copy
+used by `ExecutionService`; `KHAOS_SANDBOX_LAUNCHER` points to the distinct
+browser launcher whose file capability is reserved for the authenticated
+browser helper transition. Missing or invalid execution-launcher packaging
+fails closed; coding execution never falls back to the browser authority
+binary.
+
 The composition probe runs the exact `ExecutionService` ->
 `ProcessSupervisor` -> native launcher -> bwrap path with `network=none`, and
 uses an external `/proc` oracle over the supervisor-owned process tree. The

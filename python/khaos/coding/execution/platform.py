@@ -2030,14 +2030,20 @@ def _resolve_bwrap_path() -> str:
 
 
 def _linux_sandbox_launcher() -> Path | None:
-    """Resolve the reviewed Rust inner TCB.
+    """Resolve the reviewed Rust execution inner TCB.
 
     P1-1 (round-13): secure production mode
     validates the launcher via ``_validate_tcb_binary`` (canonical path,
     owner/mode, parent chain) — the same checks the browser path uses.
-    Dev mode accepts any candidate that is a regular executable file.
+    Production Docker/systemd deployments must provide a dedicated
+    capability-free execution copy through
+    ``KHAOS_EXECUTION_SANDBOX_LAUNCHER``.  The browser launcher remains a
+    separate ``KHAOS_SANDBOX_LAUNCHER`` because only its authenticated helper
+    path needs the file capability for ``setns``; it is never a coding
+    execution fallback.  Dev mode accepts any candidate that is a regular
+    executable file, but still keeps the browser authority path separate.
     """
-    configured = os.environ.get("KHAOS_SANDBOX_LAUNCHER", "").strip()
+    configured = os.environ.get("KHAOS_EXECUTION_SANDBOX_LAUNCHER", "").strip()
     candidates: list[Path] = []
     if configured:
         candidates.append(Path(configured).expanduser())
@@ -2052,7 +2058,7 @@ def _linux_sandbox_launcher() -> Path | None:
             repository_root / "rust" / "khaos-core" / "target" / "debug"
             / "khaos-sandbox-launcher"
         )
-    located = shutil.which("khaos-sandbox-launcher")
+    located = shutil.which("khaos-execution-sandbox-launcher")
     if located:
         candidates.append(Path(located))
     require = not _development_mode()

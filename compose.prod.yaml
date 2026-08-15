@@ -99,6 +99,7 @@ services:
       - KHAOS_DEV_MODE=0
       - KHAOS_PROJECT_ROOT=/app
       - KHAOS_SANDBOX_LAUNCHER=/usr/local/bin/khaos-sandbox-launcher
+      - KHAOS_EXECUTION_SANDBOX_LAUNCHER=/usr/local/bin/khaos-execution-sandbox-launcher
       - KHAOS_BROWSER_KERNEL_HELPER_SOCKET=/run/khaos-helper/browser-kernel-helper.sock
       - KHAOS_PYTHON_CAPABILITY_FILE=/var/lib/khaos/rpc-capability
       - KHAOS_AUTHORITYD_SOCKET=/run/khaos-authorityd/authorityd.sock

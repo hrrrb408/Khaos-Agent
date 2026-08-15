@@ -22,9 +22,9 @@
 - Docker base/service images found with immutable digests:
   - `Dockerfile:2`: `sha256:e51d0265072d2d9d5d320f6a44dde6b9ef13653b035098febd68cce8fa7c0bc4`
   - `Dockerfile:13`: `sha256:b18992999dbe963a45a8a4da40ac2b1975be1a776d939d098c647482bcad5cba`
-  - `Dockerfile:80`: `sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818`
-  - `Dockerfile:97`: `sha256:1699c10032ca2582ec89a24a1312d986a3f094aed3d5c1147b19880afe40e052`
-  - `Dockerfile:104`: `sha256:6baf43584bcb78f2e5847d1de515f23499913ac9f12bdf834811a3145eb11ca1`
+  - `Dockerfile:89`: `sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818`
+  - `Dockerfile:106`: `sha256:1699c10032ca2582ec89a24a1312d986a3f094aed3d5c1147b19880afe40e052`
+  - `Dockerfile:113`: `sha256:6baf43584bcb78f2e5847d1de515f23499913ac9f12bdf834811a3145eb11ca1`
 - Lockfile fingerprints:
   - `uv.lock`: `7291ab982371106b5fdcb7fe0b49d86e52e3ba3c7a2efc823b8d8395ef19dae9`
   - `python/bootstrap-requirements.txt`: `72082c05288cd1b6f61b0304a4f90f01bbcae2ec6d6262d56de5a9ff03dc5acd`
@@ -55,7 +55,7 @@
 - `python/khaos/coding/execution/identity.py`: `5f159cf59788242902e0010bd59a05a2f7c14dd2f8251f62cafa2a1c3cc5e265`
 - `python/khaos/coding/execution/models.py`: `8f165d586928c0cd95823b9008777b4b35281c4202c9847c9994c3d2258f6579`
 - `python/khaos/coding/execution/native_launcher.py`: `1721401d920f9cf8ebec100db58e5f6bb0f43a9dd1fd1784e83ea8d4a2da2e0b`
-- `python/khaos/coding/execution/platform.py`: `49e79b8f69e54c9db08b568abff8e157388bc6778bc2e7ced721a748476ad200`
+- `python/khaos/coding/execution/platform.py`: `2749cd54298a06dacddb9309265d6883e568ca1d4c6d41450a7b109443182618`
 - `python/khaos/coding/execution/service.py`: `2f0ac90a3ee9955d911e53b63e3a8e4f8725315a483e8419439a2abf290b9736`
 - `python/khaos/coding/execution/binding.py`: `99f3d8eb14d80a837ecf0f0d076d556ccdb366b8798c9e0fde6c69d0bb1a5501`
 - `python/khaos/coding/execution/supervisor.py`: `0cb9e6512c9a5e0c59b88042b91a0c2973189f0ae62f36b81be019bc7c4de6a3`

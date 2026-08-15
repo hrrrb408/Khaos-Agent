@@ -29,6 +29,8 @@ linux:
   docker_ci_outer_profile: unconfined_for_disposable_composition_probe_only
   docker_execution_cgroup: delegated_v2_subtree_required_for_agent_uid_10001
   docker_agent_sys_admin: forbidden
+  docker_execution_launcher: capability_free_dedicated_copy
+  browser_authority_launcher: separate_cap_sys_admin_transition_only
   production_dev_mode_fallback: forbidden
 platform_boundaries:
   macos_authority_transport: native_launchd_or_xpc_adapter_required

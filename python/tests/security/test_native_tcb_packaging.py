@@ -26,6 +26,9 @@ def test_python_container_is_non_root_and_contains_no_kernel_cli() -> None:
 
     assert "USER 10001:10001" in python_stage
     assert "khaos-sandbox-launcher" in python_stage
+    assert "khaos-execution-sandbox-launcher" in python_stage
+    assert "setcap cap_sys_admin=ep /usr/local/bin/khaos-sandbox-launcher" in python_stage
+    assert "setcap cap_sys_admin=ep /usr/local/bin/khaos-execution-sandbox-launcher" not in python_stage
     assert "HOME=/var/lib/khaos" in python_stage
     assert 'CMD ["python", "-m", "khaos.cli", "start", "--socket", "/run/khaos/agent.sock", "--gateway-uid", "10002", "--gateway-gid", "0"]' in python_stage
     assert "chown khaos:root /run/khaos" in python_stage
@@ -189,6 +192,10 @@ def test_production_compose_has_independent_authorityd_sidecar() -> None:
         in agent["volumes"]
     )
     assert "KHAOS_CGROUP_ROOT=/run/khaos-execution-cgroup" in agent["environment"]
+    assert (
+        "KHAOS_EXECUTION_SANDBOX_LAUNCHER=/usr/local/bin/khaos-execution-sandbox-launcher"
+        in agent["environment"]
+    )
     assert agent["security_opt"] == [
         "${KHAOS_DOCKER_SECCOMP_OPT:?KHAOS_DOCKER_SECCOMP_OPT must select an approved seccomp profile}",
         "${KHAOS_DOCKER_APPARMOR_OPT:?KHAOS_DOCKER_APPARMOR_OPT must select an approved AppArmor profile}",
@@ -251,10 +258,22 @@ def test_installer_never_grants_kernel_capabilities_to_python() -> None:
     installer = (ROOT / "scripts/install-native-tcb.sh").read_text(encoding="utf-8")
 
     assert "setcap cap_sys_admin=ep /usr/local/bin/khaos-sandbox-launcher" in installer
+    assert "/usr/local/bin/khaos-execution-sandbox-launcher" in installer
+    assert "setcap cap_sys_admin=ep /usr/local/bin/khaos-execution-sandbox-launcher" not in installer
     assert "khaos-browser-kernel-helper" in installer
     assert "khaos-browser-kernel-helper.sha256" in installer
     assert "setcap" not in "\n".join(
         line for line in installer.splitlines() if "python" in line.lower()
+    )
+
+
+def test_systemd_execution_launcher_is_capability_free() -> None:
+    agent = (ROOT / "packaging/systemd/khaos-agent.service").read_text(
+        encoding="utf-8"
+    )
+    assert (
+        "Environment=KHAOS_EXECUTION_SANDBOX_LAUNCHER=/usr/local/bin/"
+        "khaos-execution-sandbox-launcher" in agent
     )
 
 

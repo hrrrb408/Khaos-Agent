@@ -94,6 +94,13 @@ checks the supervisor-owned process tree through an external `/proc` identity
 oracle. The real-kernel Linux security gate owns the broader network-policy
 matrix.
 
+The Docker and systemd coding paths select the dedicated capability-free
+`khaos-execution-sandbox-launcher`. The separate
+`khaos-sandbox-launcher` is reserved for the browser authority transition and
+is the only launcher that may carry its narrowly scoped file capability.
+Missing or invalid execution-launcher packaging fails closed; coding execution
+does not fall back to the browser authority launcher.
+
 Long-lived state is bounded by maintenance policy: terminal chat streams,
 terminal turn journals, no-effect tool-operation claims, and approval events
 have explicit retention windows. Applied/partial/unknown operation rows remain

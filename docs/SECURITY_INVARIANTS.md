@@ -69,7 +69,12 @@ class for each invariant remains explicit below.
     `io.max` to a block-backed `/app/data` filesystem; its CI path supplies
     `KHAOS_PRODUCTION_DATA_SOURCE` from a loop-backed ext4 mount and rejects
     overlay or pseudo-device sources before starting Compose.
-12. Local unit tests, local Linux probes, CI-only Windows/Docker/kernel jobs,
+12. Coding execution and browser authority use separate Linux launcher inodes.
+    `KHAOS_EXECUTION_SANDBOX_LAUNCHER` must resolve to the capability-free
+    execution copy; `KHAOS_SANDBOX_LAUNCHER` is reserved for the authenticated
+    browser helper transition and must never be a coding fallback. Missing or
+    invalid execution-launcher packaging fails closed.
+13. Local unit tests, local Linux probes, CI-only Windows/Docker/kernel jobs,
     remote WORM evidence, and organization governance are reported as separate
     evidence classes. No local result is promoted to a Codex-equivalent or
     independently administered security claim.

@@ -49,6 +49,12 @@ def test_security_facts_define_the_receipt_and_platform_contract() -> None:
         "isolated_network_namespace_with_external_proc_oracle"
     )
     assert facts["linux"]["docker_agent_sys_admin"] == "forbidden"
+    assert facts["linux"]["docker_execution_launcher"] == (
+        "capability_free_dedicated_copy"
+    )
+    assert facts["linux"]["browser_authority_launcher"] == (
+        "separate_cap_sys_admin_transition_only"
+    )
     assert facts["platform_boundaries"]["unsupported_platform_behavior"] == (
         "fail_closed"
     )
