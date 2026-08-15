@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import secrets
 import time
 import uuid
@@ -40,6 +41,8 @@ from khaos.coding.planning.verification_sandbox_instance import (
     VerificationSandboxInstance,
 )
 from khaos.coding.planning.verification_store import VerificationExecutionStore
+
+logger = logging.getLogger(__name__)
 
 # Batch 3.1.2 §8: conservative default for files verification may generate.
 # These are cache/build byproducts that don't affect verification integrity.
@@ -204,9 +207,28 @@ class TrustedVerificationRunner:
     # Batch 3.1.3 §2: Real cleanup states for sandbox instances
     # ------------------------------------------------------------------
 
+    async def _terminate_and_remove_sandbox(
+        self,
+        container_id_or_name: str,
+        *,
+        expected_labels: dict[str, str] | None = None,
+    ) -> tuple[bool, bool]:
+        """Use label-bound cleanup whenever the production backend supports it."""
+        owned_cleanup = getattr(
+            self._backend, "terminate_and_remove_owned_instance", None,
+        )
+        if expected_labels and callable(owned_cleanup):
+            return await owned_cleanup(
+                container_id_or_name, expected_labels=expected_labels,
+            )
+        return await self._backend.terminate_and_remove_instance(
+            container_id_or_name,
+        )
+
     async def _cleanup_sandbox_instance(
         self, sandbox_instance_id: str, container_id_or_name: str,
-    ) -> None:
+        *, expected_labels: dict[str, str] | None = None,
+    ) -> bool:
         """Batch 3.1.3 §2: attempt cleanup after a lifecycle failure.
 
         Marks CLEANUP_PENDING, attempts terminate_and_remove, and only
@@ -226,12 +248,12 @@ class TrustedVerificationRunner:
                 cleanup_status="absent",
                 terminated_at=time.time(),
             )
-            return
+            return True
         try:
-            _terminated_ok, removed_ok = (
-                await self._backend.terminate_and_remove_instance(container_id_or_name)
+            _terminated_ok, removed_ok = await self._terminate_and_remove_sandbox(
+                container_id_or_name, expected_labels=expected_labels,
             )
-        except Exception:  # noqa: BLE001 - cleanup failure is persisted for reconciliation
+        except BaseException:  # noqa: BLE001 - cleanup failure is persisted for reconciliation
             removed_ok = False
         if removed_ok:
             self._store.update_sandbox_instance(
@@ -244,7 +266,7 @@ class TrustedVerificationRunner:
             # Best-effort: try to confirm gone via inspect.
             try:
                 gone = await self._backend.confirm_instance_gone(container_id_or_name)
-            except Exception:  # noqa: BLE001 - inspect failure keeps cleanup fail-closed
+            except BaseException:  # noqa: BLE001 - inspect failure keeps cleanup fail-closed
                 gone = False
             if gone:
                 self._store.update_sandbox_instance(
@@ -253,12 +275,26 @@ class TrustedVerificationRunner:
                     cleanup_status="absent",
                     terminated_at=time.time(),
                 )
+                return True
             else:
                 self._store.update_sandbox_instance(
                     sandbox_instance_id,
                     state=SandboxInstanceState.CLEANUP_FAILED,
                     failure_code="cleanup-failed-after-lifecycle-failure",
                 )
+                return False
+
+    @staticmethod
+    async def _await_cleanup_result(awaitable: Any) -> tuple[Any, bool]:
+        """Await cleanup despite repeated cancellation, then report it."""
+        task = asyncio.ensure_future(awaitable)
+        cancellation_requested = False
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                cancellation_requested = True
+        return await task, cancellation_requested
 
     # ------------------------------------------------------------------
     # Batch 3.1.2 §8: Disposable workspace reconciliation
@@ -828,6 +864,10 @@ class TrustedVerificationRunner:
         # already ran it.
         cleanup_failed = False
         cleanup_done = False
+        sandbox_cleanup_terminal = True
+        active_sandbox_instance_id = ""
+        active_container_id_or_name = ""
+        active_sandbox_labels: dict[str, str] = {}
         try:
             # Revalidate immediately before creating any process or copy.
             self._validate_live(context, expected_catalog=catalog.fingerprint,
@@ -1004,6 +1044,10 @@ class TrustedVerificationRunner:
                     instance_id=sandbox_instance_id, boot_id=self._boot.boot_id,
                     manifest_digest=disposable.manifest_digest,
                 )
+                active_sandbox_instance_id = sandbox_instance_id
+                active_container_id_or_name = instance_name
+                active_sandbox_labels = dict(labels)
+                sandbox_cleanup_terminal = False
                 started_monotonic = time.monotonic()
                 container_id = ""
                 attestation = None
@@ -1065,12 +1109,40 @@ class TrustedVerificationRunner:
                         attestation_digest=attestation.attestation_digest,
                         remove=False,
                     )
+                except asyncio.CancelledError:
+                    cleanup_ok, _cleanup_cancelled = await self._await_cleanup_result(
+                        self._cleanup_sandbox_instance(
+                            sandbox_instance_id,
+                            container_id or instance_name,
+                            expected_labels=labels,
+                        )
+                    )
+                    sandbox_cleanup_terminal = bool(cleanup_ok)
+                    cleanup_failed = not sandbox_cleanup_terminal
+                    self._store.abort_step_and_run(
+                        step.step_run_id,
+                        verification_run_id=run.verification_run_id,
+                        failure_code="cancelled",
+                    )
+                    active_sandbox_instance_id = ""
+                    active_container_id_or_name = ""
+                    active_sandbox_labels = {}
+                    raise
                 except Exception:
                     # Batch 3.1.3 §2: real cleanup states.  Do NOT mark
                     # TERMINATED unless we confirm the container is gone.
                     await self._cleanup_sandbox_instance(
                         sandbox_instance_id, container_id or instance_name,
+                        expected_labels=labels,
                     )
+                    sandbox_cleanup_terminal = (
+                        self._store.get_sandbox_instance(sandbox_instance_id).state
+                        == SandboxInstanceState.TERMINATED
+                    )
+                    cleanup_failed = not sandbox_cleanup_terminal
+                    active_sandbox_instance_id = ""
+                    active_container_id_or_name = ""
+                    active_sandbox_labels = {}
                     self._store.abort_step_and_run(
                         step.step_run_id,
                         verification_run_id=run.verification_run_id,
@@ -1086,7 +1158,9 @@ class TrustedVerificationRunner:
                 )
                 try:
                     _terminated_ok, removed_ok = (
-                        await self._backend.terminate_and_remove_instance(container_id)
+                        await self._terminate_and_remove_sandbox(
+                            container_id, expected_labels=labels,
+                        )
                     )
                 except Exception:  # noqa: BLE001 - cleanup failure is retained for recovery
                     # Cleanup failed — mark CLEANUP_PENDING, attempt best-effort.
@@ -1096,7 +1170,9 @@ class TrustedVerificationRunner:
                         failure_code="terminate-remove-exception",
                     )
                     try:
-                        await self._backend.terminate_and_remove_instance(container_id)
+                        await self._terminate_and_remove_sandbox(
+                            container_id, expected_labels=labels,
+                        )
                         gone = await self._backend.confirm_instance_gone(container_id)
                     except Exception:  # noqa: BLE001 - retry cleanup remains fail-closed
                         gone = False
@@ -1130,6 +1206,17 @@ class TrustedVerificationRunner:
                             failure_code="remove-returned-false",
                         )
                         cleanup_failed = True
+                current_sandbox = self._store.get_sandbox_instance(
+                    sandbox_instance_id
+                )
+                sandbox_cleanup_terminal = bool(
+                    current_sandbox is not None
+                    and current_sandbox.state == SandboxInstanceState.TERMINATED
+                )
+                cleanup_failed = cleanup_failed or not sandbox_cleanup_terminal
+                active_sandbox_instance_id = ""
+                active_container_id_or_name = ""
+                active_sandbox_labels = {}
                 # §3: write artifact with RESERVED→SEALED protocol.
                 try:
                     artifact_id = self._write_artifact(
@@ -1289,6 +1376,51 @@ class TrustedVerificationRunner:
             return VerificationResult(
                 run.verification_run_id, terminal, tuple(completed), False, failure_code,
             )
+        except asyncio.CancelledError:
+            # A caller cancellation is not allowed to jump directly to
+            # disposable-workspace cleanup while the Docker daemon still owns
+            # a container.  Complete the sandbox owner first; if absence is
+            # unproven, retain/quarantine the workspace for reconciliation.
+            if active_sandbox_instance_id and active_container_id_or_name:
+                cleanup_ok, _cleanup_cancelled = await self._await_cleanup_result(
+                    self._cleanup_sandbox_instance(
+                        active_sandbox_instance_id,
+                        active_container_id_or_name,
+                        expected_labels=active_sandbox_labels,
+                    )
+                )
+                sandbox_cleanup_terminal = bool(cleanup_ok)
+                cleanup_failed = not sandbox_cleanup_terminal
+                active_sandbox_instance_id = ""
+                active_container_id_or_name = ""
+                active_sandbox_labels = {}
+            current = self._store.get_run_by_execution(execution.execution_run_id)
+            if current is not None and current.status in {
+                VerificationRunStatus.VALIDATING,
+                VerificationRunStatus.PREPARING_SANDBOX,
+                VerificationRunStatus.RUNNING,
+                VerificationRunStatus.FINALIZING,
+            }:
+                try:
+                    if "step" in locals() and current.status == VerificationRunStatus.RUNNING:
+                        self._store.abort_step_and_run(
+                            step.step_run_id,
+                            verification_run_id=run.verification_run_id,
+                            failure_code="cancelled",
+                        )
+                    else:
+                        self._store.transition_run(
+                            current.verification_run_id,
+                            expected=(current.status,),
+                            target=VerificationRunStatus.CANCELLED,
+                            failure_code="cancelled",
+                        )
+                except Exception:
+                    logger.debug(
+                        "verification cancellation terminal transition was already handled",
+                        exc_info=True,
+                    )
+            raise
         except Exception as exc:
             current = self._store.get_run_by_execution(execution.execution_run_id)
             if current and current.status in {
@@ -1313,7 +1445,8 @@ class TrustedVerificationRunner:
         finally:
             # Batch 3.1.3 §8: only run cleanup here if the success path
             # didn't already do it (i.e. an exception was raised).
-            if not cleanup_done and disposable is not None:
+            if (not cleanup_done and disposable is not None
+                    and sandbox_cleanup_terminal):
                 try:
                     self._cleanup_disposable_or_raise(
                         verification_run_id=run.verification_run_id,
@@ -1333,6 +1466,20 @@ class TrustedVerificationRunner:
                     raise RuntimeError(
                         "verification cleanup evidence could not be persisted"
                     ) from cleanup_exc
+            elif not cleanup_done and disposable is not None:
+                # Keep the lease and physical workspace when container absence
+                # is unknown.  A later boot can reconcile both owners in the
+                # required container-before-workspace order.
+                self._store.mark_disposable_workspace_cleanup_failed(
+                    workspace_id,
+                    failure_code="sandbox-cleanup-unproven",
+                )
+                self._approval_store.add_workspace_poison_scope(
+                    run.verification_run_id,
+                    owner=f"verification-cleanup:{workspace_id}",
+                    reason="sandbox-cleanup-unproven",
+                )
+                cleanup_done = True
 
     def _new_run(
         self, *, context: VerificationPhaseContext, execution: Any,

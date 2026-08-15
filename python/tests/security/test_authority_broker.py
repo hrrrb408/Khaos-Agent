@@ -215,3 +215,41 @@ def test_authorization_epoch_rotation_invalidates_old_grant() -> None:
         broker.issue(fresh, allowed_operation="git.*")
     finally:
         broker.close()
+
+
+def test_workspace_generation_rotation_invalidates_old_grant() -> None:
+    broker = AuthorityBroker()
+    try:
+        authority = broker.envelope(
+            principal_id="principal",
+            project_id="project",
+            runtime_id="runtime",
+            task_id="task",
+            workspace_id="workspace",
+            workspace_generation=1,
+            policy_digest="policy",
+            operation_class="git.workspace",
+            resource_digest="resource",
+        )
+        broker.rotate_workspace_generation(
+            principal_id="principal",
+            project_id="project",
+            workspace_id="workspace",
+            workspace_generation=2,
+        )
+        with pytest.raises(AuthorityBrokerError, match="grant"):
+            broker.issue(authority, allowed_operation="git.*")
+        fresh = broker.envelope(
+            principal_id="principal",
+            project_id="project",
+            runtime_id="runtime",
+            task_id="task",
+            workspace_id="workspace",
+            workspace_generation=2,
+            policy_digest="policy",
+            operation_class="git.workspace",
+            resource_digest="resource",
+        )
+        broker.issue(fresh, allowed_operation="git.*")
+    finally:
+        broker.close()

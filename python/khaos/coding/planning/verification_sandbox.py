@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any, ClassVar, Protocol
 
 from khaos.coding.execution.environment import scrub_spawn_environment
+from khaos.coding.execution.supervisor import ProcessSupervisor
 from khaos.coding.planning.trusted_verification import (
     DisposableVerificationWorkspace,
     SandboxProfile,
@@ -163,6 +164,22 @@ class SandboxStepResult:
     attestation_digest: str = ""
 
 
+@dataclass
+class _DockerProcessOwner:
+    """Own one Docker CLI child until its terminal proof is complete.
+
+    The Docker daemon is an external resource manager: a cancelled CLI does
+    not prove that the daemon-side operation was cancelled.  Keeping the CLI
+    child in a separate owner registry lets cancellation wait for spawn,
+    terminate/reap the child through ``ProcessSupervisor``, and retain the
+    owner when either proof fails.
+    """
+
+    execution_id: str
+    process: asyncio.subprocess.Process
+    communicate_task: asyncio.Task[tuple[bytes, bytes]] | None = None
+
+
 class VerificationSandboxBackend(Protocol):
     profile: SandboxProfile
 
@@ -277,6 +294,7 @@ class DockerVerificationSandboxBackend:
         secret_values: Iterable[str] = (),
         host_paths: Iterable[Path] = (),
         kill_grace_seconds: float = 1.0,
+        process_supervisor: ProcessSupervisor | None = None,
     ) -> None:
         # Batch 3.1.4 §4 / Batch 3.1.5 §1: accept both bare config ID
         # (sha256:...) and full repository@sha256:digest reference.  The
@@ -301,6 +319,15 @@ class DockerVerificationSandboxBackend:
         self._secrets = tuple(value for value in secret_values if value)
         self._host_paths = tuple(str(path.resolve()) for path in host_paths)
         self._grace = kill_grace_seconds
+        # Every Docker CLI child is admitted to the same process owner used by
+        # the normal execution layer.  The extra pending map closes the
+        # interval before ``register_process`` can publish the child.
+        self._process_supervisor = process_supervisor or ProcessSupervisor(
+            termination_grace_seconds=max(kill_grace_seconds, 0.1),
+        )
+        self._pending_docker_spawns: dict[str, asyncio.Task[Any]] = {}
+        self._docker_processes: dict[str, _DockerProcessOwner] = {}
+        self._attach_processes: dict[str, str] = {}
 
     def _execution_image_reference(self, image_digest: str) -> str:
         """Resolve the legacy profile digest to the pinned repository reference.
@@ -320,6 +347,156 @@ class DockerVerificationSandboxBackend:
         """Return the local config ID for a profile/reference image selector."""
         reference = self._execution_image_reference(image_digest)
         return await self.inspect_image(reference)
+
+    @staticmethod
+    async def _await_task_to_completion(task: asyncio.Future[Any]) -> tuple[Any, bool]:
+        """Await a child task even when the caller is cancelled repeatedly."""
+        cancellation_requested = False
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                cancellation_requested = True
+        return await task, cancellation_requested
+
+    async def _await_cleanup(self, awaitable: Any) -> Any:
+        """Run owner cleanup to completion before re-delivering cancellation."""
+        task = asyncio.ensure_future(awaitable)
+        _result, _cancelled = await self._await_task_to_completion(task)
+        return _result
+
+    async def _spawn_docker_process(
+        self,
+        args: tuple[str, ...],
+        *,
+        stdin: Any = None,
+        stdout: Any = asyncio.subprocess.PIPE,
+        stderr: Any = asyncio.subprocess.PIPE,
+    ) -> _DockerProcessOwner:
+        """Spawn and publish a Docker CLI owner with a cancellation fence."""
+        execution_id = f"verification-docker:{secrets.token_hex(16)}"
+        spawn_task = asyncio.create_task(
+            asyncio.create_subprocess_exec(
+                str(self._docker), *args,
+                stdin=stdin, stdout=stdout, stderr=stderr,
+                env=_docker_cli_environment(),
+                start_new_session=True,
+            )
+        )
+        self._pending_docker_spawns[execution_id] = spawn_task
+        try:
+            process, spawn_cancelled = await self._await_task_to_completion(spawn_task)
+            owner = _DockerProcessOwner(execution_id, process)
+            registration_task = asyncio.create_task(
+                self._process_supervisor.register_process(execution_id, process)
+            )
+            try:
+                _registration_result, registration_cancelled = (
+                    await self._await_task_to_completion(registration_task)
+                )
+            except BaseException:
+                # ProcessSupervisor retains an orphan when registration cannot
+                # prove termination.  Keep our own owner too; dropping it
+                # here would make the child invisible to the backend.
+                self._docker_processes[execution_id] = owner
+                raise
+            self._docker_processes[execution_id] = owner
+            if spawn_cancelled or registration_cancelled:
+                await self._await_cleanup(self._terminate_docker_process(owner))
+                raise asyncio.CancelledError()
+            return owner
+        except asyncio.CancelledError:
+            # If the daemon-side CLI spawn raced cancellation, wait for the
+            # child to publish and terminate it.  The caller still receives
+            # cancellation only after this owner has been settled.
+            if not spawn_task.done():
+                try:
+                    process, _ = await self._await_task_to_completion(spawn_task)
+                except asyncio.CancelledError:
+                    process = None
+                except Exception:  # noqa: BLE001 - failed spawn has no process proof
+                    process = None
+                if process is not None:
+                    owner = _DockerProcessOwner(execution_id, process)
+                    self._docker_processes[execution_id] = owner
+                    try:
+                        registration_task = asyncio.create_task(
+                            self._process_supervisor.register_process(
+                                execution_id, process,
+                            )
+                        )
+                        await self._await_task_to_completion(registration_task)
+                    except asyncio.CancelledError:
+                        logger.debug(
+                            "Docker CLI owner registration was cancelled during cleanup",
+                            exc_info=True,
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Docker CLI owner registration failed during cleanup",
+                            exc_info=True,
+                        )
+                    await self._await_cleanup(self._terminate_docker_process(owner))
+            raise
+        finally:
+            self._pending_docker_spawns.pop(execution_id, None)
+
+    async def _terminate_docker_process(self, owner: _DockerProcessOwner) -> None:
+        """Terminate/reap a CLI child and release it only after proof."""
+        await self._process_supervisor.terminate(owner.execution_id)
+        if owner.communicate_task is not None:
+            await self._await_task_to_completion(owner.communicate_task)
+        await self._process_supervisor.unregister_process(owner.execution_id)
+        self._docker_processes.pop(owner.execution_id, None)
+        for target, execution_id in tuple(self._attach_processes.items()):
+            if execution_id == owner.execution_id:
+                self._attach_processes.pop(target, None)
+
+    async def _release_docker_process(self, owner: _DockerProcessOwner) -> None:
+        """Release a normally completed CLI child after terminal proof."""
+        if owner.communicate_task is not None:
+            if not owner.communicate_task.done():
+                await self._await_task_to_completion(owner.communicate_task)
+        elif owner.process.returncode is None:
+            wait_task = asyncio.create_task(owner.process.wait())
+            await self._await_task_to_completion(wait_task)
+        await self._process_supervisor.unregister_process(owner.execution_id)
+        self._docker_processes.pop(owner.execution_id, None)
+        for target, execution_id in tuple(self._attach_processes.items()):
+            if execution_id == owner.execution_id:
+                self._attach_processes.pop(target, None)
+
+    async def _run_docker_command(
+        self,
+        args: tuple[str, ...],
+        *,
+        stdin: Any = None,
+        stdout: Any = asyncio.subprocess.PIPE,
+        stderr: Any = asyncio.subprocess.PIPE,
+    ) -> tuple[int, bytes, bytes]:
+        """Run one Docker CLI command with a durable process owner."""
+        owner = await self._spawn_docker_process(
+            args, stdin=stdin, stdout=stdout, stderr=stderr,
+        )
+        communicate_task = asyncio.create_task(owner.process.communicate())
+        owner.communicate_task = communicate_task
+        try:
+            output = await asyncio.shield(communicate_task)
+        except asyncio.CancelledError:
+            # Do not wait for the daemon-facing CLI to finish naturally after
+            # caller cancellation.  Terminate/reap the owned process first;
+            # _terminate_docker_process then drains the now-finite communicate
+            # task behind the cleanup shield.
+            await self._await_cleanup(self._terminate_docker_process(owner))
+            raise
+        except BaseException:
+            # A pipe/transport failure is also an ownership failure until the
+            # child has been reaped.  Retain the owner if cleanup itself fails.
+            await self._await_cleanup(self._terminate_docker_process(owner))
+            raise
+        await self._release_docker_process(owner)
+        stdout_bytes, stderr_bytes = output
+        return owner.process.returncode or 0, stdout_bytes, stderr_bytes
 
     # ------------------------------------------------------------------
     # §1: Explicit container lifecycle API
@@ -408,18 +585,35 @@ class DockerVerificationSandboxBackend:
             image_digest=self._execution_image_reference(image_digest),
             command=command, workspace_root=workspace_root, labels=labels,
         )
-        process = await asyncio.create_subprocess_exec(
-            *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            env=_docker_cli_environment(),
-        )
-        stdout, stderr = await process.communicate()
-        if process.returncode != 0:
+        try:
+            return_code, stdout, stderr = await self._run_docker_command(
+                tuple(args[1:]),
+            )
+        except asyncio.CancelledError:
+            # The CLI owner is already terminal, but the daemon may have
+            # committed the named container before cancellation was observed.
+            await self._cleanup_owned_container_for_failure(instance_name, labels)
+            raise
+        if return_code != 0:
+            # The daemon may have created the named container even when the
+            # CLI did not return a usable ID.  Reconcile by the deterministic
+            # name before reporting the create failure.
+            await self._await_cleanup(
+                self.terminate_and_remove_owned_instance(
+                    instance_name, expected_labels=labels,
+                )
+            )
             raise RuntimeError(
-                f"docker create failed (exit {process.returncode}): "
+                f"docker create failed (exit {return_code}): "
                 f"{stderr.decode('utf-8', 'replace')}"
             )
         container_id = stdout.decode("utf-8", "replace").strip()
         if not container_id:
+            await self._await_cleanup(
+                self.terminate_and_remove_owned_instance(
+                    instance_name, expected_labels=labels,
+                )
+            )
             raise RuntimeError("docker create produced no container ID")
         return container_id
 
@@ -465,7 +659,7 @@ class DockerVerificationSandboxBackend:
                 # Batch 3.1.4 §4: safe-delete the owned container before raising.
                 await self._safe_delete_owned_container(
                     container_id_or_name, container_id,
-                    reason="label-mismatch",
+                    reason="label-mismatch", expected_labels=expected_labels,
                 )
                 raise RuntimeError(
                     f"container label mismatch: {key} expected={expected_value} "
@@ -479,7 +673,7 @@ class DockerVerificationSandboxBackend:
         if local_image_id is None:
             await self._safe_delete_owned_container(
                 container_id_or_name, container_id,
-                reason="local-image-not-found",
+                reason="local-image-not-found", expected_labels=expected_labels,
             )
             raise RuntimeError(
                 f"local image not found: {expected_image_digest}"
@@ -494,7 +688,7 @@ class DockerVerificationSandboxBackend:
                     container_image_id != approved_config_id:
                 await self._safe_delete_owned_container(
                     container_id_or_name, container_id,
-                    reason="container-image-id-mismatch",
+                    reason="container-image-id-mismatch", expected_labels=expected_labels,
                 )
                 raise RuntimeError(
                     f"container .Image mismatch: container={container_image_id} "
@@ -506,7 +700,7 @@ class DockerVerificationSandboxBackend:
             if approved_config_id and local_image_id != approved_config_id:
                 await self._safe_delete_owned_container(
                     container_id_or_name, container_id,
-                    reason="local-image-id-drift",
+                    reason="local-image-id-drift", expected_labels=expected_labels,
                 )
                 raise RuntimeError(
                     f"local image ID drift: current={local_image_id} "
@@ -519,7 +713,7 @@ class DockerVerificationSandboxBackend:
             if container_image_id and container_image_id != local_image_id:
                 await self._safe_delete_owned_container(
                     container_id_or_name, container_id,
-                    reason="container-local-image-mismatch",
+                    reason="container-local-image-mismatch", expected_labels=expected_labels,
                 )
                 raise RuntimeError(
                     f"container image ID mismatch: container={container_image_id} "
@@ -534,7 +728,7 @@ class DockerVerificationSandboxBackend:
         ):
             await self._safe_delete_owned_container(
                 container_id_or_name, container_id,
-                reason="manifest-label-mismatch",
+                reason="manifest-label-mismatch", expected_labels=expected_labels,
             )
             raise RuntimeError(
                 f"manifest digest label mismatch: expected="
@@ -567,7 +761,7 @@ class DockerVerificationSandboxBackend:
 
     async def _safe_delete_owned_container(
         self, container_id_or_name: str, container_id: str, *,
-        reason: str,
+        reason: str, expected_labels: dict[str, str] | None = None,
     ) -> None:
         """Batch 3.1.4 §4: safe-delete an owned, not-yet-started container.
 
@@ -578,9 +772,19 @@ class DockerVerificationSandboxBackend:
         Failures are logged but do not mask the original mismatch error.
         """
         try:
-            await self.terminate_and_remove_instance(
-                container_id or container_id_or_name,
-            )
+            if expected_labels:
+                _terminated_ok, removed_ok = (
+                    await self.terminate_and_remove_owned_instance(
+                        container_id_or_name, expected_labels=expected_labels,
+                    )
+                )
+                if not removed_ok:
+                    logger.error(
+                        "refusing to delete an unproven verification container: %s",
+                        container_id_or_name,
+                    )
+                return
+            await self.terminate_and_remove_instance(container_id or container_id_or_name)
         except Exception as exc:
             # Best-effort cleanup — the mismatch error is the real signal.
             logger.debug("failed to clean up pre-launch mismatch container", exc_info=exc)
@@ -594,15 +798,12 @@ class DockerVerificationSandboxBackend:
         lose their stdout/stderr before ``attach_instance`` connects.
         Use :meth:`start_and_attach_instance` instead.
         """
-        process = await asyncio.create_subprocess_exec(
-            str(self._docker), "start", container_id_or_name,
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
-            env=_docker_cli_environment(),
+        return_code, _, stderr = await self._run_docker_command(
+            ("start", container_id_or_name), stdout=asyncio.subprocess.DEVNULL,
         )
-        _, stderr = await process.communicate()
-        if process.returncode != 0:
+        if return_code != 0:
             raise RuntimeError(
-                f"docker start failed (exit {process.returncode}): "
+                f"docker start failed (exit {return_code}): "
                 f"{stderr.decode('utf-8', 'replace')}"
             )
 
@@ -618,13 +819,11 @@ class DockerVerificationSandboxBackend:
         Returns (process, stdout_reader, stderr_reader).  The process
         completes when the container exits and the streams are drained.
         """
-        process = await asyncio.create_subprocess_exec(
-            str(self._docker), "attach", "--no-stdin",
-            container_id_or_name,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            env=_docker_cli_environment(),
+        owner = await self._spawn_docker_process(
+            ("attach", "--no-stdin", container_id_or_name),
         )
-        return process, process.stdout, process.stderr
+        self._attach_processes[container_id_or_name] = owner.execution_id
+        return owner.process, owner.process.stdout, owner.process.stderr
 
     async def start_and_attach_instance(
         self, container_id_or_name: str,
@@ -645,24 +844,19 @@ class DockerVerificationSandboxBackend:
         Returns ``(process, stdout_reader, stderr_reader)``.  The process
         completes when the container exits and the streams are drained.
         """
-        process = await asyncio.create_subprocess_exec(
-            str(self._docker), "start", "--attach",
-            container_id_or_name,
+        owner = await self._spawn_docker_process(
+            ("start", "--attach", container_id_or_name),
             stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            env=_docker_cli_environment(),
         )
-        return process, process.stdout, process.stderr
+        self._attach_processes[container_id_or_name] = owner.execution_id
+        return owner.process, owner.process.stdout, owner.process.stderr
 
     async def wait_instance(self, container_id_or_name: str) -> int:
         """Batch 3.1.2 §1: ``docker wait`` — returns the exit code."""
-        process = await asyncio.create_subprocess_exec(
-            str(self._docker), "wait", container_id_or_name,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            env=_docker_cli_environment(),
+        return_code, stdout, _stderr = await self._run_docker_command(
+            ("wait", container_id_or_name),
         )
-        stdout, _ = await process.communicate()
-        if process.returncode != 0:
+        if return_code != 0:
             raise RuntimeError(f"docker wait failed for {container_id_or_name}")
         try:
             return int(stdout.decode("utf-8", "replace").strip())
@@ -670,43 +864,57 @@ class DockerVerificationSandboxBackend:
             raise RuntimeError(f"docker wait returned non-integer: {stdout!r}")
 
     async def inspect_instance(self, container_id_or_name: str) -> dict[str, Any] | None:
-        """Inspect a container by name or ID. Returns None if not found."""
-        process = await asyncio.create_subprocess_exec(
-            str(self._docker), "inspect", container_id_or_name,
-            "--format", "{{json .}}",
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            env=_docker_cli_environment(),
+        """Inspect a container by name or ID.
+
+        ``None`` means an authoritative ``no such object`` response.  A
+        daemon/CLI/JSON failure raises so absence is never inferred from an
+        unavailable inspection oracle.
+        """
+        return_code, stdout, stderr = await self._run_docker_command(
+            ("inspect", container_id_or_name, "--format", "{{json .}}"),
         )
-        stdout, _stderr = await process.communicate()
-        if process.returncode != 0:
-            return None
+        if return_code != 0:
+            error_text = stderr.decode("utf-8", "replace").lower()
+            if "no such object" in error_text or "no such container" in error_text:
+                return None
+            raise RuntimeError(
+                f"docker inspect failed for {container_id_or_name}: "
+                f"{stderr.decode('utf-8', 'replace')}"
+            )
         try:
             return json.loads(stdout.decode("utf-8", "replace"))
-        except json.JSONDecodeError:
-            return None
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"docker inspect returned invalid JSON for {container_id_or_name}"
+            ) from exc
 
     async def inspect_image(self, image_digest: str) -> str | None:
         """Inspect a local image. Returns the actual image ID or None."""
-        process = await asyncio.create_subprocess_exec(
-            str(self._docker), "image", "inspect", image_digest,
-            "--format", "{{.Id}}",
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            env=_docker_cli_environment(),
+        return_code, stdout, _stderr = await self._run_docker_command(
+            ("image", "inspect", image_digest, "--format", "{{.Id}}"),
         )
-        stdout, _stderr = await process.communicate()
-        if process.returncode != 0:
+        if return_code != 0:
             return None
         return stdout.decode("utf-8", "replace").strip() or None
 
     async def terminate_instance(self, container_id_or_name: str) -> bool:
         """Terminate a container by name or ID. Returns True if terminated."""
+        await self._terminate_attached_process(container_id_or_name)
         for sig in ("TERM", "KILL"):
-            killer = await asyncio.create_subprocess_exec(
-                str(self._docker), "kill", "--signal", sig, container_id_or_name,
-                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-                env=_docker_cli_environment(),
+            return_code, _stdout, _stderr = await self._run_docker_command(
+                ("kill", "--signal", sig, container_id_or_name),
+                stdout=asyncio.subprocess.DEVNULL,
             )
-            await killer.wait()
+            if return_code != 0:
+                # The subsequent inspect is the authoritative distinction
+                # between an already-absent container and a failed kill.
+                info = await self.inspect_instance(container_id_or_name)
+                if info is None:
+                    return True
+                state = info.get("State", {})
+                if state.get("Status") == "exited" or state.get("Running") is False:
+                    return True
+                continue
             await asyncio.sleep(0.1)
             info = await self.inspect_instance(container_id_or_name)
             if info is None:
@@ -719,12 +927,12 @@ class DockerVerificationSandboxBackend:
 
     async def remove_instance(self, container_id_or_name: str) -> bool:
         """Remove a stopped container. Returns True if removed."""
-        remover = await asyncio.create_subprocess_exec(
-            str(self._docker), "rm", "-f", container_id_or_name,
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-            env=_docker_cli_environment(),
+        return_code, _stdout, _stderr = await self._run_docker_command(
+            ("rm", "-f", container_id_or_name),
+            stdout=asyncio.subprocess.DEVNULL,
         )
-        await remover.wait()
+        if return_code != 0:
+            return False
         return await self.inspect_instance(container_id_or_name) is None
 
     async def terminate_and_remove_instance(
@@ -743,6 +951,68 @@ class DockerVerificationSandboxBackend:
         # Double-check: inspect must return None.
         final_check = await self.inspect_instance(container_id_or_name)
         return terminated_ok, removed_ok and final_check is None
+
+    async def _terminate_attached_process(self, container_id_or_name: str) -> None:
+        execution_id = self._attach_processes.get(container_id_or_name)
+        if execution_id is None:
+            return
+        owner = self._docker_processes.get(execution_id)
+        if owner is None:
+            self._attach_processes.pop(container_id_or_name, None)
+            return
+        await self._terminate_docker_process(owner)
+
+    async def terminate_and_remove_owned_instance(
+        self,
+        container_id_or_name: str,
+        *,
+        expected_labels: dict[str, str],
+    ) -> tuple[bool, bool]:
+        """Clean a container only after proving Khaos label ownership.
+
+        This is the pre-ID path: the Docker daemon may have committed
+        ``docker create`` before its CLI returned the container ID.  The
+        deterministic name is usable only with a fresh inspect and a complete
+        label match; an inspect error or identity mismatch retains the owner.
+        """
+        if not expected_labels:
+            raise ValueError("owned container cleanup requires expected labels")
+        info = await self.inspect_instance(container_id_or_name)
+        if info is None:
+            return True, True
+        actual_labels = info.get("Config", {}).get("Labels", {}) or {}
+        if any(actual_labels.get(key) != value for key, value in expected_labels.items()):
+            logger.error(
+                "refusing to clean verification container with ownership mismatch: %s",
+                container_id_or_name,
+            )
+            return False, False
+        actual_id = str(info.get("Id", "")) or container_id_or_name
+        return await self.terminate_and_remove_instance(actual_id)
+
+    async def _cleanup_owned_container_for_failure(
+        self, container_id_or_name: str, expected_labels: dict[str, str],
+    ) -> bool:
+        """Best-effort failure cleanup whose result remains fail-closed."""
+        try:
+            _terminated_ok, removed_ok = await self._await_cleanup(
+                self.terminate_and_remove_owned_instance(
+                    container_id_or_name, expected_labels=expected_labels,
+                )
+            )
+            return bool(removed_ok)
+        except asyncio.CancelledError as exc:
+            logger.error(
+                "verification container cleanup was cancelled for %s: %s",
+                container_id_or_name, exc,
+            )
+            return False
+        except Exception as exc:  # noqa: BLE001 - retain cleanup failure as false
+            logger.error(
+                "verification container cleanup could not be proven for %s: %s",
+                container_id_or_name, exc,
+            )
+            return False
 
     async def confirm_instance_gone(
         self, container_id_or_name: str,
@@ -767,14 +1037,12 @@ class DockerVerificationSandboxBackend:
         """
         if not expected_labels:
             raise ValueError("reconcile_instances requires non-empty expected_labels")
-        process = await asyncio.create_subprocess_exec(
-            str(self._docker), "ps", "-a",
-            "--filter", "label=khaos.run-id",
-            "--format", "{{.Names}}\t{{.Labels}}",
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            env=_docker_cli_environment(),
+        return_code, stdout, _stderr = await self._run_docker_command(
+            ("ps", "-a", "--filter", "label=khaos.run-id",
+             "--format", "{{.Names}}\t{{.Labels}}"),
         )
-        stdout, _ = await process.communicate()
+        if return_code != 0:
+            raise RuntimeError("docker ps failed during verification reconciliation")
         found: list[str] = []
         terminated: list[str] = []
         unknown: list[str] = []
@@ -797,13 +1065,13 @@ class DockerVerificationSandboxBackend:
             )
             if matches:
                 found.append(name)
-                ok = await self.terminate_instance(name)
-                if ok:
-                    removed = await self.remove_instance(name)
-                    if removed:
-                        terminated.append(name)
-                    else:
-                        mismatches.append((name, "terminate-ok-remove-failed"))
+                ok, removed = await self.terminate_and_remove_owned_instance(
+                    name, expected_labels=expected_labels,
+                )
+                if ok and removed:
+                    terminated.append(name)
+                elif ok:
+                    mismatches.append((name, "terminate-ok-remove-failed"))
                 else:
                     mismatches.append((name, "terminate-failed"))
             elif any(k.startswith("khaos.") for k in container_labels):
@@ -820,14 +1088,12 @@ class DockerVerificationSandboxBackend:
         must decide what to do with each container.  Unknown containers
         from a different Khaos Runtime must not be affected.
         """
-        process = await asyncio.create_subprocess_exec(
-            str(self._docker), "ps", "-a",
-            "--filter", "label=khaos.run-id",
-            "--format", "{{.Names}}\t{{.Labels}}",
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            env=_docker_cli_environment(),
+        return_code, stdout, _stderr = await self._run_docker_command(
+            ("ps", "-a", "--filter", "label=khaos.run-id",
+             "--format", "{{.Names}}\t{{.Labels}}"),
         )
-        stdout, _ = await process.communicate()
+        if return_code != 0:
+            raise RuntimeError("docker ps failed while listing Khaos containers")
         results: list[dict[str, Any]] = []
         for line in stdout.decode("utf-8", "replace").splitlines():
             parts = line.split("\t", 1)
@@ -906,13 +1172,14 @@ class DockerVerificationSandboxBackend:
                     "reason": f"manifest-mismatch:{actual_manifest}!={expected_truncated}",
                 }
         # Full ownership proof — terminate and remove.
-        ok = await self.terminate_instance(actual_id or target)
+        ok, removed = await self.terminate_and_remove_owned_instance(
+            actual_id or target, expected_labels=expected_labels,
+        )
         if not ok:
             return {
                 "status": "cleanup-failed", "container_id": actual_id,
                 "reason": "terminate-failed",
             }
-        removed = await self.remove_instance(actual_id or target)
         if not removed:
             return {
                 "status": "cleanup-failed", "container_id": actual_id,
@@ -985,13 +1252,10 @@ class DockerVerificationSandboxBackend:
         # Extract the manifest digest from the reference (the part after @).
         reference_manifest_digest = image_reference.split("@", 1)[1]
         # Full image inspect for all fields.
-        process = await asyncio.create_subprocess_exec(
-            str(self._docker), "image", "inspect", image_reference,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            env=_docker_cli_environment(),
+        return_code, stdout, stderr = await self._run_docker_command(
+            ("image", "inspect", image_reference),
         )
-        stdout, stderr = await process.communicate()
-        if process.returncode != 0:
+        if return_code != 0:
             raise RuntimeError(
                 f"image inspect failed for {image_reference}: "
                 f"{stderr.decode('utf-8', 'replace')}"
@@ -1207,39 +1471,63 @@ class DockerVerificationSandboxBackend:
         for key, value in labels.items():
             args.extend(("--label", f"{key}={value}"))
         args.extend((execution_image_reference, *argv))
-        create_proc = await asyncio.create_subprocess_exec(
-            *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            env=_docker_cli_environment(),
-        )
-        create_stdout, create_stderr = await create_proc.communicate()
-        if create_proc.returncode != 0:
+        try:
+            create_return_code, create_stdout, create_stderr = (
+                await self._run_docker_command(tuple(args[1:]))
+            )
+        except asyncio.CancelledError:
+            cleanup_ok = await self._cleanup_owned_container_for_failure(
+                instance_name, labels,
+            )
             if use_persistent:
                 from khaos.coding.planning.verification_sandbox_instance import (
                     SandboxInstanceState,
                 )
                 store.update_sandbox_instance(
                     sandbox_instance_id,
-                    state=SandboxInstanceState.TERMINATED,
-                    cleanup_status="absent",
+                    state=(SandboxInstanceState.TERMINATED
+                           if cleanup_ok else SandboxInstanceState.CLEANUP_FAILED),
+                    cleanup_status="absent" if cleanup_ok else "failed",
+                    failure_code="docker-create-cancelled",
+                    terminated_at=_time.time() if cleanup_ok else None,
+                )
+            raise
+        if create_return_code != 0:
+            cleanup_ok = await self._cleanup_owned_container_for_failure(
+                instance_name, labels,
+            )
+            if use_persistent:
+                from khaos.coding.planning.verification_sandbox_instance import (
+                    SandboxInstanceState,
+                )
+                store.update_sandbox_instance(
+                    sandbox_instance_id,
+                    state=(SandboxInstanceState.TERMINATED
+                           if cleanup_ok else SandboxInstanceState.CLEANUP_FAILED),
+                    cleanup_status="absent" if cleanup_ok else "failed",
                     failure_code="docker-create-failed",
-                    terminated_at=_time.time(),
+                    terminated_at=_time.time() if cleanup_ok else None,
                 )
             raise RuntimeError(
-                f"attestation docker create failed (exit {create_proc.returncode}): "
+                f"attestation docker create failed (exit {create_return_code}): "
                 f"{create_stderr.decode('utf-8', 'replace')}"
             )
         container_id = create_stdout.decode("utf-8", "replace").strip()
         if not container_id:
+            cleanup_ok = await self._cleanup_owned_container_for_failure(
+                instance_name, labels,
+            )
             if use_persistent:
                 from khaos.coding.planning.verification_sandbox_instance import (
                     SandboxInstanceState,
                 )
                 store.update_sandbox_instance(
                     sandbox_instance_id,
-                    state=SandboxInstanceState.TERMINATED,
-                    cleanup_status="absent",
+                    state=(SandboxInstanceState.TERMINATED
+                           if cleanup_ok else SandboxInstanceState.CLEANUP_FAILED),
+                    cleanup_status="absent" if cleanup_ok else "failed",
                     failure_code="docker-create-no-id",
-                    terminated_at=_time.time(),
+                    terminated_at=_time.time() if cleanup_ok else None,
                 )
             raise RuntimeError("attestation docker create produced no container ID")
         if use_persistent:
@@ -1269,16 +1557,32 @@ class DockerVerificationSandboxBackend:
                             f"attestation container image mismatch: "
                             f"actual={actual_image!r} approved={approved_id!r}"
                         )
-            except Exception:
-                # Inspect failed — clean up via persistent lifecycle.
-                try:
-                    await self.terminate_and_remove_instance(container_id)
-                except Exception as cleanup_exc:
-                    logger.debug("failed to clean up attestation container", exc_info=cleanup_exc)
+            except asyncio.CancelledError:
+                cleanup_ok = await self._cleanup_owned_container_for_failure(
+                    container_id, labels,
+                )
                 store.update_sandbox_instance(
                     sandbox_instance_id,
-                    state=SandboxInstanceState.CLEANUP_FAILED,
+                    state=(SandboxInstanceState.TERMINATED
+                           if cleanup_ok else SandboxInstanceState.CLEANUP_FAILED),
+                    cleanup_status="absent" if cleanup_ok else "failed",
+                    failure_code="attestation-inspect-cancelled",
+                    terminated_at=time.time() if cleanup_ok else None,
+                )
+                raise
+            except Exception:
+                # Inspect failed — clean up via persistent lifecycle.  An
+                # inspect/daemon error is not evidence of absence.
+                cleanup_ok = await self._cleanup_owned_container_for_failure(
+                    container_id, labels,
+                )
+                store.update_sandbox_instance(
+                    sandbox_instance_id,
+                    state=(SandboxInstanceState.TERMINATED
+                           if cleanup_ok else SandboxInstanceState.CLEANUP_FAILED),
+                    cleanup_status="absent" if cleanup_ok else "failed",
                     failure_code="attestation-inspect-mismatch",
+                    terminated_at=time.time() if cleanup_ok else None,
                 )
                 raise
             # Persist CREATED_ATTESTED with the durable container ID.
@@ -1290,12 +1594,27 @@ class DockerVerificationSandboxBackend:
                 actual_container_image_id=actual_image,
             )
         # Batch 3.1.4 §1/§5: docker start --attach captures output atomically.
-        attach_proc = await asyncio.create_subprocess_exec(
-            str(self._docker), "start", "--attach", container_id,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            env=_docker_cli_environment(),
-        )
+        try:
+            attach_owner = await self._spawn_docker_process(
+                ("start", "--attach", container_id),
+                stdin=asyncio.subprocess.DEVNULL,
+            )
+        except asyncio.CancelledError:
+            cleanup_ok = await self._cleanup_owned_container_for_failure(
+                container_id, labels,
+            )
+            if use_persistent:
+                store.update_sandbox_instance(
+                    sandbox_instance_id,
+                    state=(SandboxInstanceState.TERMINATED
+                           if cleanup_ok else SandboxInstanceState.CLEANUP_FAILED),
+                    cleanup_status="absent" if cleanup_ok else "failed",
+                    failure_code="attestation-start-cancelled",
+                    terminated_at=time.time() if cleanup_ok else None,
+                )
+            raise
+        attach_proc = attach_owner.process
+        self._attach_processes[container_id] = attach_owner.execution_id
         if use_persistent:
             import time as _t2
 
@@ -1307,18 +1626,20 @@ class DockerVerificationSandboxBackend:
                 state=SandboxInstanceState.RUNNING,
                 started_at=_t2.time(),
             )
+        attach_owner.communicate_task = asyncio.create_task(
+            attach_proc.communicate()
+        )
         try:
             stdout, stderr = await asyncio.wait_for(
-                attach_proc.communicate(), timeout=timeout_seconds,
+                asyncio.shield(attach_owner.communicate_task), timeout=timeout_seconds,
             )
             exit_code = attach_proc.returncode
         except TimeoutError:
-            try:
-                attach_proc.kill()
-            except ProcessLookupError:
-                pass
+            await self._await_cleanup(self._terminate_docker_process(attach_owner))
             # Batch 3.1.4 §5: terminate and remove the container on timeout.
-            _, removed_ok = await self.terminate_and_remove_instance(container_id)
+            _, removed_ok = await self.terminate_and_remove_owned_instance(
+                container_id, expected_labels=labels,
+            )
             if use_persistent:
                 import time as _t3
 
@@ -1342,9 +1663,27 @@ class DockerVerificationSandboxBackend:
             raise RuntimeError(
                 f"attestation container timed out: argv={argv}"
             )
+        except asyncio.CancelledError:
+            await self._await_cleanup(self._terminate_docker_process(attach_owner))
+            cleanup_ok = await self._cleanup_owned_container_for_failure(
+                container_id, labels,
+            )
+            if use_persistent:
+                store.update_sandbox_instance(
+                    sandbox_instance_id,
+                    state=(SandboxInstanceState.TERMINATED
+                           if cleanup_ok else SandboxInstanceState.CLEANUP_FAILED),
+                    cleanup_status="absent" if cleanup_ok else "failed",
+                    failure_code="attestation-cancelled",
+                    terminated_at=time.time() if cleanup_ok else None,
+                )
+            raise
+        await self._release_docker_process(attach_owner)
         # Batch 3.1.4 §5: always terminate and remove the container after
         # output is captured.  No --rm containers — persistent lifecycle.
-        _, removed_ok = await self.terminate_and_remove_instance(container_id)
+        _, removed_ok = await self.terminate_and_remove_owned_instance(
+            container_id, expected_labels=labels,
+        )
         if use_persistent:
             import time as _t4
 
@@ -1645,6 +1984,10 @@ class DockerVerificationSandboxBackend:
         else:
             wait_task = asyncio.create_task(self.wait_instance(container_id))
         cancel_task = asyncio.create_task(cancellation.wait()) if cancellation else None
+        owner: _DockerProcessOwner | None = None
+        owner_id = self._attach_processes.get(container_id)
+        if owner_id is not None:
+            owner = self._docker_processes.get(owner_id)
         timed_out = False
         cancelled = False
         try:
@@ -1665,10 +2008,18 @@ class DockerVerificationSandboxBackend:
             # killing it before draining causes output loss.
             stdout, stdout_truncated = await stdout_task
             stderr, stderr_truncated = await stderr_task
+        except asyncio.CancelledError:
+            if owner is not None:
+                await self._await_cleanup(self._terminate_docker_process(owner))
+            elif attach_proc is not None and attach_proc.returncode is None:
+                attach_proc.kill()
+                await self._await_cleanup(attach_proc.wait())
+            raise
         finally:
             if cancel_task:
                 cancel_task.cancel()
-            if attach_proc is not None:
+                await asyncio.gather(cancel_task, return_exceptions=True)
+            if owner is None and attach_proc is not None and attach_proc.returncode is None:
                 try:
                     attach_proc.kill()
                 except ProcessLookupError:
@@ -1676,6 +2027,9 @@ class DockerVerificationSandboxBackend:
             # Cancel stream tasks if they haven't completed (e.g. exception).
             stdout_task.cancel()
             stderr_task.cancel()
+            await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+        if owner is not None:
+            await self._release_docker_process(owner)
         stdout = self._redact(stdout)
         stderr = self._redact(stderr)
         if remove:

@@ -11,8 +11,10 @@ class for each invariant remains explicit below.
    project, runtime, task, workspace, workspace generation, policy digest,
    authorization epoch, operation family, and an initial resource scope.
    Direct effects must stay inside that scope; a resource transition is
-   accepted only through a live parent narrow transaction. Revocation and
-   epoch rotation remove the live record before stale objects can issue again.
+   accepted only through a live parent narrow transaction. Revocation, epoch
+   rotation, and workspace-generation rotation atomically remove the live
+   record and invalidate its still-launchable PREPARING/PREPARED/NARROWING
+   descendants; CLAIMED receipts remain completable for terminal accounting.
 2. `AuthorityGrant`/`AuthorityEnvelope` is context, not effect authority.
    `EffectCapability` is minted and validated by the broker registry, and a
    capability cannot widen its operation family or resource digest.
@@ -37,29 +39,35 @@ class for each invariant remains explicit below.
    A late process is adopted or retained as an orphan; kill/wait/output proof
    must complete before the owner is released. Cleanup failure never produces a
    false `closed` postcondition.
-7. Workspace bootstrap records own the authority grant and every Git resource
+7. The Docker verification backend publishes every CLI child through a
+   pending/active owner registry backed by `ProcessSupervisor`. Cancellation
+   must reap the CLI owner, then prove the daemon-side container is absent by
+   deterministic name plus exact Khaos-label ownership; an inspect/daemon
+   error is unknown, not absence. A disposable verification workspace cannot
+   reach terminal release until that container-absence proof succeeds.
+8. Workspace bootstrap records own the authority grant and every Git resource
    from admission through controlled publish or rollback. Preflight failure,
    cancellation, grant-revocation failure, and worktree cleanup failure stay
    retryable/quarantined until both Git ownership and the grant are terminal.
-8. A workspace authority uses the permission engine's current authorization
+9. A workspace authority uses the permission engine's current authorization
    epoch. The positive epoch default is only a library safety floor; production
    runtime construction supplies the database-backed snapshot.
 
 ## Deployment and evidence boundaries
 
-9. Linux production composition evidence must traverse the real
+10. Linux production composition evidence must traverse the real
    `AuthorityDaemonClient`/WORM path, `ExecutionService`,
    `ProcessSupervisor`, the `exec.host` receipt, native launcher, actual
    bwrap, and an external `/proc` identity oracle. The probe uses
    `network=none`; the real-kernel gate owns the broader network-policy matrix.
-10. Production Docker composition requires three host-reviewed, hash-pinned
+11. Production Docker composition requires three host-reviewed, hash-pinned
     outer profile values. `scripts/validate_docker_outer_profiles.py` matches
     the exact options, verifies seccomp/AppArmor source SHA-256 values, and
     requires `systempaths=default`. Explicit `unconfined` values are allowed
     only by the disposable `scripts/compose-security-e2e.sh` probe and are not
     production defaults. Khaos does not claim one universal profile across
     host runtimes; the manifest is the deployment-specific pin.
-11. Production Docker execution also requires a separate, host-reviewed
+12. Production Docker execution also requires a separate, host-reviewed
     delegated cgroup v2 subtree through `KHAOS_EXECUTION_CGROUP_SOURCE`; it is
     mounted only at the non-root Agent's `/run/khaos-execution-cgroup`; the
     Compose service must also set the required
@@ -75,12 +83,12 @@ class for each invariant remains explicit below.
     `io.max` to a block-backed `/app/data` filesystem; its CI path supplies
     `KHAOS_PRODUCTION_DATA_SOURCE` from a loop-backed ext4 mount and rejects
     overlay or pseudo-device sources before starting Compose.
-12. Coding execution and browser authority use separate Linux launcher inodes.
+13. Coding execution and browser authority use separate Linux launcher inodes.
     `KHAOS_EXECUTION_SANDBOX_LAUNCHER` must resolve to the capability-free
     execution copy; `KHAOS_SANDBOX_LAUNCHER` is reserved for the authenticated
     browser helper transition and must never be a coding fallback. Missing or
     invalid execution-launcher packaging fails closed.
-13. Local unit tests, local Linux probes, CI-only Windows/Docker/kernel jobs,
+14. Local unit tests, local Linux probes, CI-only Windows/Docker/kernel jobs,
     remote WORM evidence, and organization governance are reported as separate
     evidence classes. No local result is promoted to a Codex-equivalent or
     independently administered security claim.

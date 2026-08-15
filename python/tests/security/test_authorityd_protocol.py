@@ -549,6 +549,254 @@ def test_expired_live_grant_is_terminally_audited_before_rejection(
     ]
 
 
+def test_grant_revoke_invalidates_prepared_receipts_but_not_claimed_receipts(
+    tmp_path: Path,
+) -> None:
+    worm = _MemoryWorm()
+    daemon = AuthorityDaemon(
+        socket_path=tmp_path / "authorityd.sock",
+        signing_key=Ed25519KeyStore.load_or_create(tmp_path / "key.pem", create=True),
+        audit_writer=worm,
+        issuer_id="test-authorityd",
+        policy=lambda _intent: None,
+        require_live_grants=True,
+    )
+
+    def issue_grant(nonce: str) -> tuple[str, SignedAuthorizationReceipt]:
+        grant_id, _ = daemon.grant(
+            principal_id="agent",
+            project_id="project",
+            runtime_id="runtime",
+            task_id="task",
+            workspace_id="workspace",
+            workspace_generation=1,
+            policy_digest="policy-digest",
+            operation_class="git.workspace",
+            resource_digest="workspace-digest",
+            authorization_epoch=2,
+        )
+        context_digest = authorityd_module._digest(
+            {
+                "schema_version": 1,
+                "principal_id": "agent",
+                "project_id": "project",
+                "runtime_id": "runtime",
+                "task_id": "task",
+                "workspace_id": "workspace",
+                "workspace_generation": 1,
+                "policy_digest": "policy-digest",
+                "authorization_epoch": 2,
+            }
+        )
+        receipt = daemon.prepare(
+            replace(
+                _intent(),
+                nonce=nonce,
+                grant_id=grant_id,
+                grant_context_digest=context_digest,
+                workspace_generation=1,
+            )
+        )
+        return grant_id, receipt
+
+    grant_id, prepared = issue_grant("prepared-before-revoke")
+    daemon.revoke_grant(grant_id)
+    assert daemon.pending_count == 0
+    assert daemon._terminal[prepared.nonce] == "revoked-by-grant"
+    with pytest.raises(AuthorityControlPlaneError, match="revoked"):
+        daemon.claim(prepared)
+
+    claimed_grant, claimed = issue_grant("claimed-before-revoke")
+    daemon.claim(claimed)
+    daemon.revoke_grant(claimed_grant)
+    daemon.complete(claimed, result="success", result_digest="claimed-result")
+    assert daemon.pending_count == 0
+    assert any(
+        record["kind"] == "execution.revoked-by-grant"
+        and record.get("receipt_nonce") == prepared.nonce
+        for record in worm.records
+    )
+
+
+def test_epoch_rotation_invalidates_prepared_grant_receipts(
+    tmp_path: Path,
+) -> None:
+    worm = _MemoryWorm()
+    daemon = AuthorityDaemon(
+        socket_path=tmp_path / "authorityd.sock",
+        signing_key=Ed25519KeyStore.load_or_create(tmp_path / "key.pem", create=True),
+        audit_writer=worm,
+        issuer_id="test-authorityd",
+        policy=lambda _intent: None,
+        require_live_grants=True,
+    )
+    grant_id, _ = daemon.grant(
+        principal_id="agent",
+        project_id="project",
+        runtime_id="runtime",
+        task_id="task",
+        workspace_id="workspace",
+        workspace_generation=1,
+        policy_digest="policy-digest",
+        operation_class="git.workspace",
+        resource_digest="workspace-digest",
+        authorization_epoch=2,
+    )
+    context_digest = authorityd_module._digest(
+        {
+            "schema_version": 1,
+            "principal_id": "agent",
+            "project_id": "project",
+            "runtime_id": "runtime",
+            "task_id": "task",
+            "workspace_id": "workspace",
+            "workspace_generation": 1,
+            "policy_digest": "policy-digest",
+            "authorization_epoch": 2,
+        }
+    )
+    receipt = daemon.prepare(
+        replace(
+            _intent(),
+            nonce="epoch-rotated-before-claim",
+            grant_id=grant_id,
+            grant_context_digest=context_digest,
+            workspace_generation=1,
+        )
+    )
+    daemon.rotate_authorization_epoch(
+        principal_id="agent",
+        project_id="project",
+        workspace_id="workspace",
+        authorization_epoch=3,
+    )
+    with pytest.raises(AuthorityControlPlaneError, match="revoked"):
+        daemon.claim(receipt)
+    assert daemon._terminal[receipt.nonce] == "revoked-by-grant"
+
+
+def test_workspace_generation_rotation_invalidates_prepared_grant_receipts(
+    tmp_path: Path,
+) -> None:
+    worm = _MemoryWorm()
+    daemon = AuthorityDaemon(
+        socket_path=tmp_path / "authorityd.sock",
+        signing_key=Ed25519KeyStore.load_or_create(tmp_path / "key.pem", create=True),
+        audit_writer=worm,
+        issuer_id="test-authorityd",
+        policy=lambda _intent: None,
+        require_live_grants=True,
+    )
+    grant_id, _ = daemon.grant(
+        principal_id="agent",
+        project_id="project",
+        runtime_id="runtime",
+        task_id="task",
+        workspace_id="workspace",
+        workspace_generation=1,
+        policy_digest="policy-digest",
+        operation_class="git.workspace",
+        resource_digest="workspace-digest",
+        authorization_epoch=2,
+    )
+    context_digest = authorityd_module._digest(
+        {
+            "schema_version": 1,
+            "principal_id": "agent",
+            "project_id": "project",
+            "runtime_id": "runtime",
+            "task_id": "task",
+            "workspace_id": "workspace",
+            "workspace_generation": 1,
+            "policy_digest": "policy-digest",
+            "authorization_epoch": 2,
+        }
+    )
+    receipt = daemon.prepare(
+        replace(
+            _intent(),
+            nonce="generation-rotated-before-claim",
+            grant_id=grant_id,
+            grant_context_digest=context_digest,
+            workspace_generation=1,
+        )
+    )
+    daemon.rotate_workspace_generation(
+        principal_id="agent",
+        project_id="project",
+        workspace_id="workspace",
+        workspace_generation=2,
+    )
+    with pytest.raises(AuthorityControlPlaneError, match="revoked"):
+        daemon.claim(receipt)
+    assert daemon._terminal[receipt.nonce] == "revoked-by-grant"
+    assert any(
+        record["kind"] == "authority.grant.revoked"
+        and record.get("workspace_generation") == 2
+        for record in worm.records
+    )
+
+
+def test_grant_expiry_invalidates_prepared_receipt_before_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [100.0]
+    monkeypatch.setattr(authorityd_module.time, "time", lambda: clock[0])
+    worm = _MemoryWorm()
+    daemon = AuthorityDaemon(
+        socket_path=tmp_path / "authorityd.sock",
+        signing_key=Ed25519KeyStore.load_or_create(tmp_path / "key.pem", create=True),
+        audit_writer=worm,
+        issuer_id="test-authorityd",
+        policy=lambda _intent: None,
+        require_live_grants=True,
+    )
+    grant_id, _ = daemon.grant(
+        principal_id="agent",
+        project_id="project",
+        runtime_id="runtime",
+        task_id="task",
+        workspace_id="workspace",
+        workspace_generation=1,
+        policy_digest="policy-digest",
+        operation_class="git.workspace",
+        resource_digest="workspace-digest",
+        authorization_epoch=2,
+        ttl_seconds=1.0,
+    )
+    context_digest = authorityd_module._digest(
+        {
+            "schema_version": 1,
+            "principal_id": "agent",
+            "project_id": "project",
+            "runtime_id": "runtime",
+            "task_id": "task",
+            "workspace_id": "workspace",
+            "workspace_generation": 1,
+            "policy_digest": "policy-digest",
+            "authorization_epoch": 2,
+        }
+    )
+    receipt = daemon.prepare(
+        replace(
+            _intent(),
+            nonce="expired-grant-prepared",
+            grant_id=grant_id,
+            grant_context_digest=context_digest,
+            workspace_generation=1,
+        )
+    )
+    clock[0] = 102.0
+    with pytest.raises(AuthorityControlPlaneError, match="expired|revoked"):
+        daemon.claim(receipt)
+    assert daemon._terminal[receipt.nonce] in {"expired-grant", "revoked-by-grant"}
+    assert any(
+        record["kind"] == "execution.revoked-by-grant"
+        and record.get("receipt_nonce") == receipt.nonce
+        for record in worm.records
+    )
+
+
 def test_authority_policy_kernel_closes_unregistered_and_cross_family_narrowing() -> None:
     kernel = AuthorityPolicyKernel()
     intent = _intent()

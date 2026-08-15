@@ -59,6 +59,7 @@ _RECEIPT_NARROWING = "narrowing"
 _RECEIPT_COMPLETING = "completing"
 _RECEIPT_REVOKING = "revoking"
 _RECEIPT_TERMINAL = "terminal"
+_RECEIPT_REVOKED_BY_GRANT = "revoked-by-grant"
 
 
 @dataclass
@@ -168,6 +169,144 @@ class AuthorityDaemon:
         self.require_live_grants = require_live_grants
         self._closed = False
 
+    def _remember_grant_terminal_locked(self, grant_id: str, state: str) -> None:
+        """Retain a bounded grant tombstone for stale receipt rejection."""
+        self._grant_terminal[grant_id] = state
+        while len(self._grant_terminal) > self.terminal_tombstone_limit:
+            self._grant_terminal.pop(next(iter(self._grant_terminal)))
+
+    def _grant_revocation_events_locked(
+        self,
+        grant_id: str,
+        record: _GrantRecord,
+        *,
+        reason: str,
+        authorization_epoch: int | None = None,
+        workspace_generation: int | None = None,
+        grant_event_kind: str = "authority.grant.revoked",
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        """Build grant and PREPARED-descendant terminal evidence."""
+        events: list[dict[str, Any]] = [
+            self._audit_event(
+                {
+                    "kind": grant_event_kind,
+                    "grant_id": grant_id,
+                    "context_digest": record.context_digest,
+                    "reason": reason,
+                    **(
+                        {"authorization_epoch": authorization_epoch}
+                        if authorization_epoch is not None else {}
+                    ),
+                    **(
+                        {"workspace_generation": workspace_generation}
+                        if workspace_generation is not None else {}
+                    ),
+                    "issuer_id": self.issuer_id,
+                }
+            )
+        ]
+        revoked_nonces: list[str] = []
+        # PREPARING is included to close the window between receipt insertion
+        # and the prepare audit append.  NARROWING is also non-claimable; it
+        # must not roll back into a live PREPARED parent after revocation.
+        revocable_states = {
+            _RECEIPT_PREPARING,
+            _RECEIPT_PREPARED,
+            _RECEIPT_NARROWING,
+        }
+        for nonce, receipt_record in tuple(self._states.items()):
+            receipt = receipt_record.receipt
+            if receipt.grant_id != grant_id or receipt_record.state not in revocable_states:
+                continue
+            revoked_nonces.append(nonce)
+            events.append(
+                self._audit_event(
+                    {
+                        "kind": "execution.revoked-by-grant",
+                        "grant_id": grant_id,
+                        "receipt_nonce": nonce,
+                        "receipt_digest": receipt.digest,
+                        "audit_intent_digest": receipt.audit_intent_digest,
+                        "reason": reason,
+                        "issuer_id": self.issuer_id,
+                    }
+                )
+            )
+        return events, revoked_nonces
+
+    def _commit_grant_revocation_locked(
+        self,
+        grant_id: str,
+        record: _GrantRecord,
+        *,
+        reason: str,
+        authorization_epoch: int | None = None,
+        workspace_generation: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Atomically reserve evidence and invalidate launchable descendants."""
+        return self._commit_grant_revocations_locked(
+            ((
+                grant_id,
+                record,
+                reason,
+                authorization_epoch,
+                workspace_generation,
+            ),)
+        )
+
+    def _commit_grant_revocations_locked(
+        self,
+        revocations: tuple[
+            tuple[str, _GrantRecord, str, int | None, int | None],
+            ...
+        ],
+    ) -> list[dict[str, Any]]:
+        """Commit several grant invalidations under one daemon lock."""
+        plans: list[tuple[str, list[dict[str, Any]], list[str]]] = []
+        events: list[dict[str, Any]] = []
+        for (
+            grant_id,
+            record,
+            reason,
+            authorization_epoch,
+            workspace_generation,
+        ) in revocations:
+            grant_events, revoked_nonces = self._grant_revocation_events_locked(
+                grant_id,
+                record,
+                reason=reason,
+                authorization_epoch=authorization_epoch,
+                workspace_generation=workspace_generation,
+            )
+            plans.append((grant_id, grant_events, revoked_nonces))
+            events.extend(grant_events)
+        new_event_ids = {
+            str(event["event_id"])
+            for event in events
+            if str(event["event_id"]) not in self._audit_obligations
+            and str(event["event_id"]) not in self._audit_reservations
+        }
+        available = (
+            self.max_audit_obligations
+            - len(self._audit_obligations)
+            - len(self._audit_reservations)
+        )
+        if len(new_event_ids) > available:
+            self._audit_quarantined = True
+            raise AuthorityControlPlaneError(
+                "authorityd audit reconciliation quota is exhausted"
+            )
+        for event in events:
+            self._reserve_audit_event_locked(event)
+        for grant_id, _grant_events, revoked_nonces in plans:
+            self._grants.pop(grant_id, None)
+            self._remember_grant_terminal_locked(grant_id, "revoked")
+            for nonce in revoked_nonces:
+                self._pending.pop(nonce, None)
+                self._states.pop(nonce, None)
+                self._remember_terminal_locked(nonce, _RECEIPT_REVOKED_BY_GRANT)
+        return events
+
     @property
     def public_key_bytes(self) -> bytes:
         return self.signing_key.public_key().public_bytes_raw()
@@ -189,36 +328,39 @@ class AuthorityDaemon:
         """Retire expired live grants while retaining bounded audit ownership."""
         with self._lock:
             now = time.time()
-            available = (
-                self.max_audit_obligations
-                - len(self._audit_obligations)
-                - len(self._audit_reservations)
-            )
-            if available <= 0:
-                self._audit_quarantined = True
-                return
-            expired = [
-                (grant_id, record)
-                for grant_id, record in self._grants.items()
-                if now >= record.expires_at
-            ][:available]
             events: list[dict[str, Any]] = []
-            for grant_id, record in expired:
-                event = self._audit_event(
-                    {
-                        "kind": "authority.grant.expired",
-                        "grant_id": grant_id,
-                        "context_digest": record.context_digest,
-                        "operation_family": record.operation_family,
-                        "issuer_id": self.issuer_id,
-                    }
+            for grant_id, record in tuple(self._grants.items()):
+                if now < record.expires_at:
+                    continue
+                grant_events, revoked_nonces = self._grant_revocation_events_locked(
+                    grant_id,
+                    record,
+                    reason="expired",
+                    grant_event_kind="authority.grant.expired",
                 )
-                self._reserve_audit_event_locked(event)
+                new_event_ids = {
+                    str(event["event_id"])
+                    for event in grant_events
+                    if str(event["event_id"]) not in self._audit_obligations
+                    and str(event["event_id"]) not in self._audit_reservations
+                }
+                available = (
+                    self.max_audit_obligations
+                    - len(self._audit_obligations)
+                    - len(self._audit_reservations)
+                )
+                if len(new_event_ids) > available:
+                    self._audit_quarantined = True
+                    break
+                for event in grant_events:
+                    self._reserve_audit_event_locked(event)
                 self._grants.pop(grant_id, None)
-                self._grant_terminal[grant_id] = "expired"
-                while len(self._grant_terminal) > self.terminal_tombstone_limit:
-                    self._grant_terminal.pop(next(iter(self._grant_terminal)))
-                events.append(event)
+                self._remember_grant_terminal_locked(grant_id, "expired")
+                for nonce in revoked_nonces:
+                    self._pending.pop(nonce, None)
+                    self._states.pop(nonce, None)
+                    self._remember_terminal_locked(nonce, "expired-grant")
+                events.extend(grant_events)
         for event in events:
             try:
                 self._append_or_queue_audit(event)
@@ -458,27 +600,27 @@ class AuthorityDaemon:
         return grant_id, expires_at
 
     def revoke_grant(self, grant_id: str) -> None:
-        """Revoke a grant before its expiry; stale envelopes then cannot issue."""
+        """Revoke a grant and atomically invalidate its PREPARED receipts."""
         self._expire_grants()
         with self._lock:
             record = self._grants.get(grant_id)
             if record is None:
                 return
-            event = self._audit_event(
-                {
-                    "kind": "authority.grant.revoked",
-                    "grant_id": grant_id,
-                    "context_digest": record.context_digest,
-                    "issuer_id": self.issuer_id,
-                }
+            events = self._commit_grant_revocation_locked(
+                grant_id,
+                record,
+                reason="explicit-revoke",
+                workspace_generation=None,
             )
-            self._reserve_audit_event_locked(event)
-            self._grants.pop(grant_id, None)
-        try:
-            self._append_or_queue_audit(event)
-        except BaseException:
-            logger.exception("authorityd grant revocation evidence is pending")
-            raise
+        first_error: BaseException | None = None
+        for event in events:
+            try:
+                self._append_or_queue_audit(event)
+            except BaseException as exc:
+                logger.exception("authorityd grant revocation evidence is pending")
+                first_error = first_error or exc
+        if first_error is not None:
+            raise first_error
 
     def rotate_authorization_epoch(
         self,
@@ -502,42 +644,77 @@ class AuthorityDaemon:
                     and record.authorization_epoch < authorization_epoch
                 )
             ]
-            events = [
-                (
-                    grant_id,
-                    self._audit_event(
-                        {
-                            "kind": "authority.grant.revoked",
-                            "grant_id": grant_id,
-                            "context_digest": record.context_digest,
-                            "reason": "authorization-epoch-rotated",
-                            "authorization_epoch": authorization_epoch,
-                            "issuer_id": self.issuer_id,
-                        }
-                    ),
+            events = self._commit_grant_revocations_locked(
+                tuple(
+                    (
+                        grant_id,
+                        record,
+                        "authorization-epoch-rotated",
+                        authorization_epoch,
+                        None,
+                    )
+                    for grant_id, record in revoked
                 )
-                for grant_id, record in revoked
-            ]
-            if (
-                len(self._audit_obligations)
-                + len(self._audit_reservations)
-                + len(events)
-                > self.max_audit_obligations
-            ):
-                self._audit_quarantined = True
-                raise AuthorityControlPlaneError(
-                    "authorityd audit reconciliation quota is exhausted"
-                )
-            for _grant_id, event in events:
-                self._reserve_audit_event_locked(event)
-            for grant_id, _record in revoked:
-                self._grants.pop(grant_id, None)
+            )
         first_error: BaseException | None = None
-        for _grant_id, event in events:
+        for event in events:
             try:
                 self._append_or_queue_audit(event)
             except BaseException as exc:
                 logger.exception("authorityd epoch revocation evidence is pending")
+                first_error = first_error or exc
+        if first_error is not None:
+            raise first_error
+
+    def rotate_workspace_generation(
+        self,
+        *,
+        principal_id: str,
+        project_id: str,
+        workspace_id: str,
+        workspace_generation: int,
+    ) -> None:
+        """Invalidate grants issued for older workspace generations.
+
+        A workspace generation is a monotonic identity boundary.  Rotation
+        atomically removes older live grants and their PREPARED descendants;
+        CLAIMED receipts remain completable so an already-started effect can
+        still receive terminal accounting.
+        """
+        self._expire_grants()
+        if workspace_generation <= 0:
+            raise AuthorityControlPlaneError("workspace generation is invalid")
+        with self._lock:
+            revoked = [
+                (grant_id, record)
+                for grant_id, record in self._grants.items()
+                if (
+                    record.principal_id == principal_id
+                    and record.project_id == project_id
+                    and record.workspace_id == workspace_id
+                    and record.workspace_generation < workspace_generation
+                )
+            ]
+            events = self._commit_grant_revocations_locked(
+                tuple(
+                    (
+                        grant_id,
+                        record,
+                        "workspace-generation-rotated",
+                        None,
+                        workspace_generation,
+                    )
+                    for grant_id, record in revoked
+                )
+            )
+        first_error: BaseException | None = None
+        for event in events:
+            try:
+                self._append_or_queue_audit(event)
+            except BaseException as exc:
+                logger.exception(
+                    "authorityd workspace-generation revocation evidence is pending"
+                )
                 first_error = first_error or exc
         if first_error is not None:
             raise first_error
@@ -548,6 +725,7 @@ class AuthorityDaemon:
         *,
         parent_receipt: SignedAuthorizationReceipt | None = None,
         requested_resource_scope: str | None = None,
+        allow_issued_descendant_resource: bool = False,
     ) -> None:
         if intent.grant_id is None:
             if self.require_live_grants:
@@ -557,10 +735,13 @@ class AuthorityDaemon:
             return
         record = self._grants.get(intent.grant_id)
         if record is None:
+            terminal_state = self._grant_terminal.get(intent.grant_id)
+            if terminal_state in {"expired", "revoked"}:
+                raise AuthorityControlPlaneError(
+                    f"authority grant is {terminal_state}"
+                )
             if not self.require_live_grants:
                 return
-            if self._grant_terminal.get(intent.grant_id) == "expired":
-                raise AuthorityControlPlaneError("authority grant has expired")
             raise AuthorityControlPlaneError("authority grant is unknown or revoked")
         if time.time() >= record.expires_at:
             event = self._audit_event(
@@ -600,7 +781,10 @@ class AuthorityDaemon:
                 "authority grant owner, workspace, or epoch is stale"
             )
         if parent_receipt is None:
-            if intent.resource_digest != record.resource_digest:
+            if (
+                not allow_issued_descendant_resource
+                and intent.resource_digest != record.resource_digest
+            ):
                 raise AuthorityControlPlaneError(
                     "authority grant resource is outside its live scope"
                 )
@@ -827,8 +1011,49 @@ class AuthorityDaemon:
             record.state = _RECEIPT_PREPARED
         return receipt
 
+    @staticmethod
+    def _receipt_grant_intent(
+        receipt: SignedAuthorizationReceipt,
+    ) -> AuthorizationIntent:
+        """Reconstruct the grant-bound intent carried by a signed receipt."""
+        return AuthorizationIntent(
+            principal_id=receipt.principal_id,
+            project_id=receipt.project_id,
+            runtime_id=receipt.runtime_id,
+            task_id=receipt.task_id,
+            workspace_id=receipt.workspace_id,
+            operation=receipt.operation,
+            resource_digest=receipt.resource_digest,
+            policy_digest=receipt.policy_digest,
+            nonce=receipt.nonce,
+            authorization_epoch=receipt.authorization_epoch,
+            workspace_generation=receipt.workspace_generation,
+            grant_id=receipt.grant_id,
+            grant_context_digest=receipt.grant_context_digest,
+        )
+
+    def _validate_receipt_grant_locked(
+        self, receipt: SignedAuthorizationReceipt,
+    ) -> None:
+        """Revalidate live grant state before a PREPARED receipt can launch."""
+        if receipt.grant_id is None:
+            return
+        # ``_validate_grant_locked`` is intentionally reused so owner,
+        # operation-family, epoch, generation, and context checks stay in one
+        # authority gate.  CLAIMED receipts never call this method: revoking a
+        # grant cannot retroactively invalidate an effect already admitted.
+        # A child receipt has a daemon-derived resource digest rather than the
+        # grant's initial digest.  Its presence in the daemon-owned pending
+        # registry plus its Ed25519 signature proves that the narrowing path
+        # issued it; owner/context/epoch/generation checks still run here.
+        self._validate_grant_locked(
+            self._receipt_grant_intent(receipt),
+            allow_issued_descendant_resource=True,
+        )
+
     def claim(self, receipt: SignedAuthorizationReceipt) -> None:
         """Move a receipt from prepared to launched before the effect starts."""
+        self._expire_grants()
         self._expire_pending()
         with self._lock:
             if self._audit_quarantined or self._audit_obligations:
@@ -839,6 +1064,7 @@ class AuthorityDaemon:
             if record.state != _RECEIPT_PREPARED:
                 raise AuthorityControlPlaneError("receipt is not claimable")
             receipt.verify(self.signing_key.public_key())
+            self._validate_receipt_grant_locked(receipt)
             claimed_event = self._audit_event(
                 {
                     "kind": "execution.claimed",
@@ -870,6 +1096,7 @@ class AuthorityDaemon:
         result: str,
         result_digest: str,
     ) -> None:
+        self._expire_grants()
         self._expire_pending()
         if result not in {"success", "failed", "unknown"}:
             raise AuthorityControlPlaneError("execution result is invalid")
@@ -942,11 +1169,13 @@ class AuthorityDaemon:
         expected_operation: str | None = None,
         expected_resource_digest: str | None = None,
     ) -> None:
+        self._expire_grants()
         self._expire_pending()
         with self._lock:
             record = self._record_locked(receipt)
             if record.state == _RECEIPT_PREPARED:
                 receipt.verify(self.signing_key.public_key())
+                self._validate_receipt_grant_locked(receipt)
             elif record.state == _RECEIPT_CLAIMED:
                 receipt.verify_signature(self.signing_key.public_key())
             else:
@@ -968,6 +1197,7 @@ class AuthorityDaemon:
         operation: str,
         resource_digest: str,
     ) -> SignedAuthorizationReceipt:
+        self._expire_grants()
         self._expire_pending()
         with self._lock:
             record = self._record_locked(receipt)
@@ -1408,6 +1638,14 @@ def _dispatch(daemon: AuthorityDaemon, request: object) -> dict[str, object]:
             project_id=str(request.get("project_id", "")),
             workspace_id=str(request.get("workspace_id", "")),
             authorization_epoch=int(request.get("authorization_epoch", -1)),
+        )
+        return {"ok": True}
+    if operation == "rotate_workspace_generation":
+        daemon.rotate_workspace_generation(
+            principal_id=str(request.get("principal_id", "")),
+            project_id=str(request.get("project_id", "")),
+            workspace_id=str(request.get("workspace_id", "")),
+            workspace_generation=int(request.get("workspace_generation", 0)),
         )
         return {"ok": True}
     if operation == "prepare":
