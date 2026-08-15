@@ -6,6 +6,7 @@ import hashlib
 import os
 import sqlite3
 import stat
+import sys
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -191,6 +192,88 @@ def test_verification_backend_discovers_docker_from_path(tmp_path, monkeypatch):
     backend = DockerVerificationSandboxBackend(profile=_profile())
 
     assert backend._docker == docker.resolve()
+
+
+def test_docker_create_cancellation_reconciles_container_before_id_return(tmp_path):
+    """A daemon-side create must remain owned even when the CLI is cancelled."""
+    state_file = tmp_path / "fake-container-state"
+    docker = tmp_path / "docker-fake"
+    fake_script = """#!PYTHON
+import json
+import sys
+import time
+from pathlib import Path
+
+state = Path(STATE_PATH)
+command = sys.argv[1] if len(sys.argv) > 1 else ""
+if command == "create":
+    args = sys.argv[2:]
+    name = args[args.index("--name") + 1]
+    labels = {}
+    for index, value in enumerate(args[:-1]):
+        if value == "--label":
+            key, label_value = args[index + 1].split("=", 1)
+            labels[key] = label_value
+    state.write_text(json.dumps({"name": name, "labels": labels}), encoding="utf-8")
+    time.sleep(60)
+    print("fake-container", flush=True)
+elif command == "inspect":
+    if not state.exists():
+        print("No such object", file=sys.stderr)
+        raise SystemExit(1)
+    record = json.loads(state.read_text(encoding="utf-8"))
+    print(json.dumps({
+        "Id": "fake-container",
+        "Image": "sha256:test",
+        "State": {"Status": "created", "Running": False},
+        "Config": {"Labels": record["labels"]},
+    }))
+elif command == "kill":
+    if not state.exists():
+        print("No such object", file=sys.stderr)
+        raise SystemExit(1)
+elif command == "rm":
+    state.unlink(missing_ok=True)
+""".replace("PYTHON", sys.executable, 1).replace(
+        "STATE_PATH", repr(str(state_file)), 1,
+    )
+    docker.write_text(fake_script, encoding="utf-8")
+    docker.chmod(0o755)
+    backend = DockerVerificationSandboxBackend(
+        profile=_profile(), docker_executable=docker, kill_grace_seconds=0.1,
+    )
+    command = _factory().build(
+        (_requirement(),), (_entry(),), profile_id="python-offline-v1",
+    )[0]
+    labels = {"khaos.owner": "cancel-window"}
+
+    async def exercise() -> None:
+        task = asyncio.create_task(
+            backend.create_instance(
+                instance_name="khaos-verify-cancel-window",
+                image_digest=IMAGE_REFERENCE,
+                command=command,
+                workspace_root=tmp_path,
+                labels=labels,
+            )
+        )
+        for _ in range(200):
+            if state_file.exists():
+                break
+            await asyncio.sleep(0.01)
+        else:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            raise AssertionError("fake Docker daemon never committed create")
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert not state_file.exists()
+        assert backend._pending_docker_spawns == {}
+        assert backend._docker_processes == {}
+        assert backend._attach_processes == {}
+
+    asyncio.run(exercise())
 
 
 @pytest.mark.parametrize("language,executable,absolute,argv", [

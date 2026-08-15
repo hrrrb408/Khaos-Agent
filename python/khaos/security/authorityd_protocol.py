@@ -578,6 +578,25 @@ class AuthorityDaemonClient:
             }
         )
 
+    def rotate_workspace_generation(
+        self,
+        *,
+        principal_id: str,
+        project_id: str,
+        workspace_id: str,
+        workspace_generation: int,
+    ) -> None:
+        """Invalidate grants bound to older workspace generations."""
+        self.request(
+            {
+                "operation": "rotate_workspace_generation",
+                "principal_id": _required_text("principal_id", principal_id),
+                "project_id": _required_text("project_id", project_id),
+                "workspace_id": _required_text("workspace_id", workspace_id),
+                "workspace_generation": workspace_generation,
+            }
+        )
+
     def complete(
         self,
         receipt: SignedAuthorizationReceipt,

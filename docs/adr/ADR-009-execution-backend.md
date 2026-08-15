@@ -77,8 +77,11 @@ Docker allowlist 只接受 `@sha256:` 固定镜像，运行使用 `--pull never`
 受限 tmpfs、非 root、drop-all capabilities、no-new-privileges、none network/IPC 和资源
 配额。每个容器带随机 owner nonce label；stop/kill/rm 前必须 inspect 并精确匹配 nonce，
 防止容器名冲突导致删除宿主现有容器。worktree mount 参数拒绝逗号/换行/NUL，所有
-Docker CLI 进程也由 supervisor 管理。真实 Docker destructive lifecycle 测试只在干净
-CI runner 执行。
+Docker CLI 进程也由 supervisor 管理。VerificationSandbox 另外保留 pending/active
+DockerCommandOwner；取消发生在 `docker create` 返回 ID 之前时，必须通过确定性容器名
+重新 inspect 并以完整标签匹配证明归属，inspect/daemon 错误不得当作不存在。CLI 终态回收
+和容器不存在证明完成前，不能释放 owner，也不能把绑定该容器的 disposable workspace
+标记为 terminal。真实 Docker destructive lifecycle 测试只在干净 CI runner 执行。
 
 `cpu_count` 只在具备 native quota controller 的 Docker backend 表示核心配额；POSIX
 host backend 不伪装成核心数限制，改用独立 `cpu_time_seconds` 驱动 `RLIMIT_CPU`，并在

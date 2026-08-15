@@ -346,6 +346,26 @@ def _broker_main(connection: Connection) -> None:
                 except (KeyError, TypeError, ValueError) as exc:
                     connection.send({"ok": False, "error": str(exc)})
                 continue
+            if operation == "rotate_workspace_generation":
+                try:
+                    principal_id = str(request["principal_id"])
+                    project_id = str(request["project_id"])
+                    workspace_id = str(request["workspace_id"])
+                    generation = int(request["workspace_generation"])
+                    if generation <= 0:
+                        raise ValueError("workspace generation is invalid")
+                    for grant_id, grant in tuple(grants.items()):
+                        if (
+                            grant["principal_id"] == principal_id
+                            and grant["project_id"] == project_id
+                            and grant["workspace_id"] == workspace_id
+                            and grant["generation"] < generation
+                        ):
+                            grants.pop(grant_id, None)
+                    connection.send({"ok": True})
+                except (KeyError, TypeError, ValueError) as exc:
+                    connection.send({"ok": False, "error": str(exc)})
+                continue
             if operation == "issue":
                 try:
                     parent = request.get("parent")
@@ -844,6 +864,26 @@ class AuthorityBroker:
             }
         )
 
+    def rotate_workspace_generation(
+        self,
+        *,
+        principal_id: str,
+        project_id: str,
+        workspace_id: str,
+        workspace_generation: int,
+    ) -> None:
+        if workspace_generation <= 0:
+            raise AuthorityBrokerError("workspace generation is invalid")
+        self._call(
+            {
+                "operation": "rotate_workspace_generation",
+                "principal_id": principal_id,
+                "project_id": project_id,
+                "workspace_id": workspace_id,
+                "workspace_generation": workspace_generation,
+            }
+        )
+
     def validate(
         self,
         capability: EffectCapability,
@@ -1053,6 +1093,29 @@ class AuthorityDaemonBroker(AuthorityBroker):
                 project_id=project_id,
                 workspace_id=workspace_id,
                 authorization_epoch=authorization_epoch,
+            )
+        except AuthorityControlPlaneError as exc:
+            raise AuthorityBrokerError(str(exc)) from exc
+
+    def rotate_workspace_generation(
+        self,
+        *,
+        principal_id: str,
+        project_id: str,
+        workspace_id: str,
+        workspace_generation: int,
+    ) -> None:
+        try:
+            rotate = getattr(self._authorityd, "rotate_workspace_generation", None)
+            if not callable(rotate):
+                raise AuthorityBrokerError(
+                    "production authorityd client does not support workspace generation rotation"
+                )
+            rotate(
+                principal_id=principal_id,
+                project_id=project_id,
+                workspace_id=workspace_id,
+                workspace_generation=workspace_generation,
             )
         except AuthorityControlPlaneError as exc:
             raise AuthorityBrokerError(str(exc)) from exc

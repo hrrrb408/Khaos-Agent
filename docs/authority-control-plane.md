@@ -37,13 +37,24 @@ mutating a stale Python object cannot mint a new capability. The grant binds a
 single operation family, initial resource scope, workspace generation, policy
 digest, and authorization epoch. Direct effects must stay inside that initial
 scope; a resource transition is accepted only through a live parent narrow
-transaction. Revocation and epoch rotation invalidate the live record before
-a stale object can issue again. `EffectCapability` is a short-lived,
+transaction. Explicit revoke, authorization-epoch rotation, and
+workspace-generation rotation atomically invalidate the live record plus every
+still-launchable `PREPARING`/`PREPARED`/`NARROWING` descendant before a stale
+object can issue or claim again. The daemon records a bounded grant tombstone
+and `execution.revoked-by-grant` evidence for each invalidated receipt.
+`EffectCapability` is a short-lived,
 one-shot receipt handle. Expiry blocks a new claim, but a receipt that was
 already claimed may commit `success`, `failed`, or `unknown` after the
 300-second launch TTL. Prepared expiry is garbage-collected into a bounded
 tombstone inventory; global and per-principal pending quotas prevent memory
 growth.
+
+The lifecycle distinction is intentional: `PREPARED` is still a launch ticket
+and is retroactively denied by grant/epoch/generation invalidation, while
+`CLAIMED` has crossed the effect boundary and remains completable for terminal
+accounting. This daemon is still an issuer and family/context gate, not a full
+semantic resource PDP; typed resource subset policy remains a separate
+authority and the independent-review/governance work is tracked in issue #169.
 
 Narrowing creates a child resource digest from the parent digest, target
 operation, and requested scope, and authorityd enforces same-family
