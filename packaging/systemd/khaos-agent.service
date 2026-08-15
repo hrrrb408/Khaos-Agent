@@ -11,6 +11,7 @@ WorkingDirectory=/opt/khaos
 EnvironmentFile=/etc/khaos/authorityd.env
 Environment=KHAOS_DEV_MODE=0
 Environment=KHAOS_SANDBOX_LAUNCHER=/usr/local/bin/khaos-sandbox-launcher
+Environment=KHAOS_EXECUTION_SANDBOX_LAUNCHER=/usr/local/bin/khaos-execution-sandbox-launcher
 Environment=KHAOS_BROWSER_KERNEL_HELPER_SOCKET=/run/khaos-helper/browser-kernel-helper.sock
 Environment=KHAOS_AUTHORITYD_SOCKET=/run/khaos-authorityd/authorityd.sock
 Environment=KHAOS_AUTHORITYD_PUBLIC_KEY_PATH=/run/khaos-authorityd/authorityd.pub

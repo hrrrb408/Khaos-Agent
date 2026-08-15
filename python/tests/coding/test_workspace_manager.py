@@ -12,6 +12,7 @@ from khaos.coding.workspace.git_identity import GitIdentityError
 from khaos.coding.workspace.manager import WorkspaceError, WorkspaceManager
 from khaos.coding.workspace.models import WorkspaceState, WorkspaceTransition
 from khaos.coding.workspace.trusted_git import WorkspaceBootstrapLimits
+from khaos.security.authority_broker import AuthorityBrokerError
 
 
 def _repo(path: Path) -> Path:
@@ -45,6 +46,33 @@ async def test_worktree_lifecycle_and_changeset_binding(tmp_path: Path):
     assert await manager.transition(workspace.id, WorkspaceState.FAILED) is WorkspaceTransition.UPDATED
     assert await manager.cleanup(workspace.id, force=True) is WorkspaceTransition.UPDATED
     assert not (workspace.worktree_path.parent / f"{changeset.id}.patch").exists()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_retries_grant_revocation_after_git_resources_are_gone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repository = _repo(tmp_path / "repo")
+    manager = WorkspaceManager(tmp_path / "worktrees")
+    workspace = await manager.create(repository, "task-grant-revoke")
+    assert await manager.transition(workspace.id, WorkspaceState.FAILED) is WorkspaceTransition.UPDATED
+
+    original_revoke = manager._authority_broker.revoke_grant
+    attempts = 0
+
+    def fail_once(authority):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise AuthorityBrokerError("simulated grant revocation outage")
+        return original_revoke(authority)
+
+    monkeypatch.setattr(manager._authority_broker, "revoke_grant", fail_once)
+
+    assert await manager.cleanup(workspace.id, force=True) is WorkspaceTransition.FAILED
+    assert workspace.git_cleanup_complete
+    assert await manager.cleanup(workspace.id, force=True) is WorkspaceTransition.UPDATED
+    assert workspace.state is WorkspaceState.CLEANED
 
 
 @pytest.mark.asyncio

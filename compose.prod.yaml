@@ -79,18 +79,35 @@ services:
       context: .
       target: python-agent
     container_name: khaos-agent
+    # The delegated execution subtree is the cgroup parent of this service.
+    # Keeping the container cgroup inside that delegated parent is required by
+    # cgroup v2 migration rules: the non-root Agent must have write access to
+    # the common ancestor's cgroup.procs, not merely to a sibling bind mount.
+    # The parent is deployment-selected and required; an unset or mismatched
+    # parent makes the production composition fail closed.
+    cgroup: host
+    cgroup_parent: "${KHAOS_EXECUTION_CGROUP_PARENT:?KHAOS_EXECUTION_CGROUP_PARENT must identify the delegated cgroup parent}"
     volumes:
-      - khaos-data:/app/data
+      # A normal deployment may use the Compose-managed volume. The disposable
+      # production probe overrides this with an explicit block-backed host
+      # directory so the exact-effect cgroup io.max write is observable on the
+      # Docker host rather than being inferred from an overlay device.
+      - "${KHAOS_PRODUCTION_DATA_SOURCE:-khaos-data}:/app/data"
       - khaos-state:/var/lib/khaos
       - khaos-runtime:/run/khaos
       - khaos-helper-runtime:/run/khaos-helper:ro
       - khaos-authority-runtime:/run/khaos-authorityd:ro
+      # The agent may create execution leaves only inside a host-reviewed,
+      # delegated cgroup-v2 subtree. There is deliberately no default: a
+      # production composition without real resource enforcement fails closed.
+      - "${KHAOS_EXECUTION_CGROUP_SOURCE:?KHAOS_EXECUTION_CGROUP_SOURCE must point to a delegated cgroup v2 subtree}:/run/khaos-execution-cgroup:rw"
       - ./config.yaml:/app/config.yaml:ro
     environment:
       - KHAOS_MODE=office
       - KHAOS_DEV_MODE=0
       - KHAOS_PROJECT_ROOT=/app
       - KHAOS_SANDBOX_LAUNCHER=/usr/local/bin/khaos-sandbox-launcher
+      - KHAOS_EXECUTION_SANDBOX_LAUNCHER=/usr/local/bin/khaos-execution-sandbox-launcher
       - KHAOS_BROWSER_KERNEL_HELPER_SOCKET=/run/khaos-helper/browser-kernel-helper.sock
       - KHAOS_PYTHON_CAPABILITY_FILE=/var/lib/khaos/rpc-capability
       - KHAOS_AUTHORITYD_SOCKET=/run/khaos-authorityd/authorityd.sock
@@ -98,6 +115,7 @@ services:
       - KHAOS_AUTHORITYD_UID=10003
       - KHAOS_AGENT_UID=10001
       - KHAOS_JOB_UID=10004
+      - KHAOS_CGROUP_ROOT=/run/khaos-execution-cgroup
       - KHAOS_EFFECTIVE_POLICY_DIGEST=${KHAOS_EFFECTIVE_POLICY_DIGEST:?KHAOS_EFFECTIVE_POLICY_DIGEST must be compiled for production}
     depends_on:
       khaos-agent-init:

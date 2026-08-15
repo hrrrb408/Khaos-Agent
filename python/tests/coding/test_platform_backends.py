@@ -21,6 +21,8 @@ from khaos.coding.execution.platform import (
     MacOSSandboxBackend,
     UnsupportedBackend,
     _create_linux_cgroup,
+    _linux_sandbox_launcher,
+    _mountinfo_has_cgroup_v2_path,
     _read_windows_output,
     _remove_windows_python_runtime,
     _runtime_read_roots,
@@ -39,6 +41,35 @@ async def test_unsupported_backend_refuses_writable_execution():
 def test_platform_profiles_are_network_denying(tmp_path: Path):
     assert "deny network" in MacOSSandboxBackend().profile(tmp_path)
     assert "--unshare-net" in LinuxBubblewrapBackend().argv_prefix(tmp_path)
+
+
+def test_execution_launcher_prefers_capability_free_dedicated_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    launcher = tmp_path / "khaos-execution-sandbox-launcher"
+    launcher.write_bytes(b"trusted launcher")
+    launcher.chmod(0o755)
+    monkeypatch.setenv("KHAOS_DEV_MODE", "1")
+    monkeypatch.setenv("KHAOS_EXECUTION_SANDBOX_LAUNCHER", str(launcher))
+    monkeypatch.setenv(
+        "KHAOS_SANDBOX_LAUNCHER", str(tmp_path / "browser-authority-launcher")
+    )
+
+    assert _linux_sandbox_launcher() == launcher
+
+
+def test_execution_launcher_never_falls_back_to_browser_authority_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    browser_launcher = tmp_path / "khaos-sandbox-launcher"
+    browser_launcher.write_bytes(b"browser authority launcher")
+    browser_launcher.chmod(0o755)
+    monkeypatch.setenv("KHAOS_DEV_MODE", "1")
+    monkeypatch.delenv("KHAOS_EXECUTION_SANDBOX_LAUNCHER", raising=False)
+    monkeypatch.setenv("KHAOS_SANDBOX_LAUNCHER", str(browser_launcher))
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+
+    assert _linux_sandbox_launcher() != browser_launcher
 
 
 def test_shared_linux_network_mode_is_explicit_and_does_not_change_default(
@@ -268,6 +299,21 @@ def test_linux_cgroup_v2_leaf_has_hard_limits(tmp_path: Path, monkeypatch):
     assert (group / "memory.swap.max").read_text() == "0"
     assert (group / "cpu.max").read_text() == "50000 100000"
     assert "rbps=" in (group / "io.max").read_text()
+
+
+def test_cgroup_root_requires_a_real_cgroup2_mount(tmp_path: Path) -> None:
+    mountpoint = tmp_path / "execution-cgroup"
+    mountinfo = (
+        f"42 1 0:42 / {mountpoint} rw,relatime - cgroup2 cgroup rw\n"
+    )
+
+    assert _mountinfo_has_cgroup_v2_path(mountpoint / "exec-1", mountinfo)
+    assert not _mountinfo_has_cgroup_v2_path(
+        tmp_path / "ordinary-directory", mountinfo
+    )
+
+    fake_mountinfo = mountinfo.replace("cgroup2 cgroup", "tmpfs tmpfs")
+    assert not _mountinfo_has_cgroup_v2_path(mountpoint, fake_mountinfo)
 
 
 def test_linux_cgroup_cleanup_failure_is_not_downgraded_to_warning(tmp_path: Path):

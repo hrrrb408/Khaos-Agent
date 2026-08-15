@@ -25,9 +25,13 @@ linux:
   job_uid_mapping: bwrap_unshare_user_uid_gid
   host_uid_distinction: not_claimed_without_native_host_mapping_proof
   identity_oracle: proc_status_uid_map_gid_map
-  docker_outer_profile: explicit_operator_supplied_seccomp_apparmor_systempaths_profile
+  docker_outer_profile: hash_pinned_operator_supplied_seccomp_apparmor_systempaths_manifest
   docker_ci_outer_profile: unconfined_for_disposable_composition_probe_only
+  docker_execution_cgroup: delegated_v2_subtree_required_for_agent_uid_10001
+  docker_execution_cgroup_parent: required_parent_of_agent_service_cgroup
   docker_agent_sys_admin: forbidden
+  docker_execution_launcher: capability_free_dedicated_copy
+  browser_authority_launcher: separate_cap_sys_admin_transition_only
   production_dev_mode_fallback: forbidden
 platform_boundaries:
   macos_authority_transport: native_launchd_or_xpc_adapter_required
@@ -36,6 +40,6 @@ platform_boundaries:
 evidence:
   local_platform_sandbox: diagnostic_only
   required_linux_proof: real_kernel_ci
-  production_composition_probe: authorityd_worm_claim_bwrap_command_result
-  production_composition_probe_network: shared_container_network_no_network_claim
+  production_composition_probe: exact_execution_service_supervisor_native_launcher_bwrap_worm
+  production_composition_probe_network: isolated_network_namespace_with_external_proc_oracle
   closure_gate: aggregate_required_checks_on_exact_commit

@@ -1,37 +1,19 @@
-import os
-import subprocess
 from pathlib import Path
 
 from khaos.security import production_composition_probe
 from khaos.security.identity_isolation import IdentityIsolationError
 
 
-def test_spawn_probe_process_uses_popen_stream_pipes(monkeypatch, tmp_path: Path) -> None:
-    captured: dict[str, object] = {}
-    expected_process = object()
-    closed: list[int] = []
-
-    def fake_popen(*args: object, **kwargs: object) -> object:
-        captured["args"] = args
-        captured.update(kwargs)
-        return expected_process
-
-    monkeypatch.setattr(production_composition_probe.os, "pipe", lambda: (41, 42))
-    monkeypatch.setattr(production_composition_probe.os, "close", closed.append)
-    monkeypatch.setattr(production_composition_probe.subprocess, "Popen", fake_popen)
-
-    process, info_fd = production_composition_probe._spawn_probe_process(
-        ("bwrap",), ("/bin/sh",), tmp_path
+def test_failure_detail_is_bounded_and_names_the_real_exception() -> None:
+    detail = production_composition_probe._failure_detail(
+        PermissionError("  delegated cgroup v2 limits unavailable: " + "x" * 600)
     )
 
-    assert process is expected_process
-    assert info_fd == 41
-    assert captured["args"] == (("bwrap", "--info-fd", "42", "--", "/bin/sh"),)
-    assert captured["stdout"] is subprocess.PIPE
-    assert captured["stderr"] is subprocess.PIPE
-    assert captured["pass_fds"] == (42,)
-    assert "capture_output" not in captured
-    assert closed == [42]
+    assert detail.startswith("PermissionError: delegated cgroup v2 limits unavailable:")
+    assert len(detail) <= production_composition_probe._FAILURE_DETAIL_LIMIT + len(
+        "PermissionError: "
+    )
+    assert detail.endswith("...")
 
 
 def test_mapping_contains_expected_namespace_and_host_ids() -> None:
@@ -40,6 +22,28 @@ def test_mapping_contains_expected_namespace_and_host_ids() -> None:
     assert production_composition_probe._mapping_contains_pair(mapping, 10004, 10001)
     assert not production_composition_probe._mapping_contains_pair(mapping, 10003, 10001)
     assert not production_composition_probe._mapping_contains_pair(mapping, 10004, 10003)
+
+
+def test_probe_request_binds_immutable_execution_authority(tmp_path: Path) -> None:
+    request = production_composition_probe._probe_request(
+        command=("/bin/sh", "-c", "printf exact"),
+        workspace=tmp_path,
+        policy_digest="policy-digest",
+    )
+
+    assert request.execution_authority is not None
+    assert request.execution_authority.is_valid()
+    assert request.permission_profile is not None
+    assert request.permission_profile.validate_resolved() is None
+
+
+def test_production_probe_uses_the_named_volume_for_io_limits() -> None:
+    source = Path(
+        production_composition_probe.__file__
+    ).read_text(encoding="utf-8")
+
+    assert 'workspace_parent = Path("/app/data")' in source
+    assert 'dir=workspace_parent' in source
 
 
 def test_identity_oracle_retries_transient_empty_namespace_maps(monkeypatch) -> None:
@@ -62,26 +66,3 @@ def test_identity_oracle_retries_transient_empty_namespace_maps(monkeypatch) -> 
 
     assert production_composition_probe._read_linux_process_identity_when_ready(123) is expected
     assert attempts == 3
-
-
-def test_read_bwrap_child_pid_accepts_multiline_info_metadata() -> None:
-    read_fd, write_fd = os.pipe()
-    try:
-        os.write(write_fd, b'{\n    "child-pid": 123\n}\n')
-    finally:
-        os.close(write_fd)
-
-    assert production_composition_probe._read_bwrap_child_pid(read_fd) == 123
-
-
-def test_read_bwrap_child_pid_accepts_json_lines_metadata() -> None:
-    read_fd, write_fd = os.pipe()
-    try:
-        os.write(
-            write_fd,
-            b'{"child-pid": 123, "pid-namespace": 456}\n{"exit-code": 0}\n',
-        )
-    finally:
-        os.close(write_fd)
-
-    assert production_composition_probe._read_bwrap_child_pid(read_fd) == 123

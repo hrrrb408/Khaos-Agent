@@ -111,6 +111,125 @@ export KHAOS_AUDIT_WORM_CA_FILE="$secret_dir/worm-cert.pem"
 
 cd "$repo_root"
 
+validate_execution_cgroup_source() {
+    local source="${KHAOS_EXECUTION_CGROUP_SOURCE:-}"
+    local parent="${KHAOS_EXECUTION_CGROUP_PARENT:-}"
+    local canonical
+    if [[ -z "$parent" ]]; then
+        printf '%s\n' "KHAOS_EXECUTION_CGROUP_PARENT is required for the production composition probe" >&2
+        return 1
+    fi
+    if [[ -z "$source" ]]; then
+        printf '%s\n' "KHAOS_EXECUTION_CGROUP_SOURCE is required for the production composition probe" >&2
+        return 1
+    fi
+    if [[ "$source" != /sys/fs/cgroup/* || "$source" == "/sys/fs/cgroup" ]]; then
+        printf '%s\n' "KHAOS_EXECUTION_CGROUP_SOURCE must be a child of /sys/fs/cgroup" >&2
+        return 1
+    fi
+    if [[ -L "$source" || ! -d "$source" ]]; then
+        printf '%s\n' "KHAOS_EXECUTION_CGROUP_SOURCE must be a real, non-symlink directory" >&2
+        return 1
+    fi
+    if ! canonical="$(realpath -e -- "$source")" || [[ "$canonical" != /sys/fs/cgroup/* ]]; then
+        printf '%s\n' "KHAOS_EXECUTION_CGROUP_SOURCE must resolve inside /sys/fs/cgroup" >&2
+        return 1
+    fi
+    for entry in cgroup.controllers cgroup.procs cgroup.subtree_control; do
+        if [[ ! -f "$canonical/$entry" ]]; then
+            printf '%s\n' "delegated cgroup subtree is missing $entry: $canonical" >&2
+            return 1
+        fi
+    done
+    for controller in cpu memory pids io; do
+        if ! grep -qw "$controller" "$canonical/cgroup.controllers"; then
+            printf '%s\n' "delegated cgroup subtree lacks controller $controller: $canonical" >&2
+            return 1
+        fi
+        if ! grep -qw "$controller" "$canonical/cgroup.subtree_control"; then
+            printf '%s\n' "delegated cgroup subtree has not enabled controller $controller: $canonical" >&2
+            return 1
+        fi
+    done
+    printf '%s\n' "validated delegated execution cgroup v2 parent: $parent ($canonical)"
+}
+
+validate_production_workspace_source() {
+    local source="${KHAOS_PRODUCTION_DATA_SOURCE:-}"
+    local canonical
+    local mount_source
+    local mount_fstype
+    if [[ -z "$source" ]]; then
+        printf '%s\n' "using Compose-managed khaos-data for /app/data; the exact-effect probe must still prove io.max support"
+        return 0
+    fi
+    if [[ "$source" != /* || -L "$source" || ! -d "$source" ]]; then
+        printf '%s\n' "KHAOS_PRODUCTION_DATA_SOURCE must be an absolute, real, non-symlink directory" >&2
+        return 1
+    fi
+    if ! canonical="$(realpath -e -- "$source")"; then
+        printf '%s\n' "KHAOS_PRODUCTION_DATA_SOURCE must resolve to an existing directory" >&2
+        return 1
+    fi
+    if [[ ! -w "$canonical" ]]; then
+        printf '%s\n' "KHAOS_PRODUCTION_DATA_SOURCE must be writable before Compose startup" >&2
+        return 1
+    fi
+    if ! command -v findmnt >/dev/null 2>&1; then
+        printf '%s\n' "findmnt is required to validate the block-backed production workspace" >&2
+        return 1
+    fi
+    if ! read -r mount_source mount_fstype < <(
+        findmnt -T "$canonical" -no SOURCE,FSTYPE
+    ); then
+        printf '%s\n' "unable to identify the filesystem backing KHAOS_PRODUCTION_DATA_SOURCE" >&2
+        return 1
+    fi
+    if [[ "$mount_source" != /dev/* || "$mount_fstype" == "overlay" || "$mount_fstype" == "tmpfs" ]]; then
+        printf '%s\n' "KHAOS_PRODUCTION_DATA_SOURCE must resolve to a block-backed filesystem: ${mount_source:-unknown} ${mount_fstype:-unknown}" >&2
+        return 1
+    fi
+    printf '%s\n' "validated block-backed production workspace: $canonical ($mount_source $mount_fstype)"
+}
+
+validate_agent_cgroup_parent() {
+    local compose_file="$1"
+    local expected_parent="${KHAOS_EXECUTION_CGROUP_PARENT:-}"
+    local expected_path
+    if [[ -z "$expected_parent" ]]; then
+        printf '%s\n' "KHAOS_EXECUTION_CGROUP_PARENT is required before Agent cgroup validation" >&2
+        return 1
+    fi
+    if [[ "$expected_parent" == /* ]]; then
+        expected_path="${expected_parent%/}"
+    else
+        expected_path="/${expected_parent%/}"
+    fi
+    docker compose \
+        --project-name "$project_name" \
+        --project-directory "$repo_root" \
+        --file "$repo_root/$compose_file" \
+        exec -T \
+        -e KHAOS_EXPECTED_CGROUP_PARENT="$expected_path" \
+        khaos-agent \
+        python -c '
+import os
+from pathlib import Path
+
+expected = os.environ["KHAOS_EXPECTED_CGROUP_PARENT"]
+line = next(
+    (line for line in Path("/proc/self/cgroup").read_text(encoding="ascii").splitlines() if line.startswith("0::")),
+    "",
+)
+actual = line[3:]
+if actual != expected and not actual.startswith(expected + "/"):
+    raise SystemExit(
+        f"Agent cgroup {actual!r} is not below delegated parent {expected!r}"
+    )
+print(f"validated Agent cgroup parent: {expected} (current={actual})")
+'
+}
+
 run_profile() {
     local compose_file="$1"
     local health_url="$2"
@@ -129,6 +248,10 @@ run_profile() {
     fi
 
     active_compose_file="$compose_file"
+    if [[ "$compose_file" == "compose.prod.yaml" ]]; then
+        validate_execution_cgroup_source
+        validate_production_workspace_source
+    fi
     docker compose \
         --project-name "$project_name" \
         --project-directory "$repo_root" \
@@ -150,6 +273,15 @@ run_profile() {
             --project-directory "$repo_root" \
             --file "$repo_root/$compose_file" \
             logs --no-color --tail=200 khaos-gateway khaos-agent || true
+        return 1
+    fi
+
+    if [[ "$compose_file" == "compose.prod.yaml" ]] && ! validate_agent_cgroup_parent "$compose_file"; then
+        docker compose \
+            --project-name "$project_name" \
+            --project-directory "$repo_root" \
+            --file "$repo_root/$compose_file" \
+            ps || true
         return 1
     fi
 
@@ -198,6 +330,7 @@ PY
 export KHAOS_DOCKER_SECCOMP_OPT="${KHAOS_DOCKER_SECCOMP_OPT:-seccomp=unconfined}"
 export KHAOS_DOCKER_APPARMOR_OPT="${KHAOS_DOCKER_APPARMOR_OPT:-apparmor=unconfined}"
 export KHAOS_DOCKER_SYSTEMPATHS_OPT="${KHAOS_DOCKER_SYSTEMPATHS_OPT:-systempaths=unconfined}"
+python3 "$repo_root/scripts/validate_docker_outer_profiles.py" --disposable
 
 run_profile compose.dev.yaml http://127.0.0.1:8080/api/health
 run_profile compose.prod.yaml https://127.0.0.1:8443/api/health

@@ -45,6 +45,7 @@ from khaos.security.identity_isolation import (
 _BROKER_PROTOCOL = 1
 _DEFAULT_TTL_SECONDS = 300.0
 _MAX_TTL_SECONDS = 3600.0
+_DEFAULT_GRANT_TTL_SECONDS = 60 * 60.0
 _CAPABILITY_ISSUER = object()
 
 
@@ -137,6 +138,12 @@ class EffectCapability:
                 raise ValueError("effect capability receipt resource does not match")
             if self.receipt.authorization_epoch != self.authorization_epoch:
                 raise ValueError("effect capability receipt epoch does not match")
+            if self.receipt.workspace_generation != self.generation:
+                raise ValueError("effect capability receipt generation does not match")
+            if self.receipt.grant_id != self.authority.grant_id:
+                raise ValueError("effect capability receipt grant does not match")
+            if self.receipt.grant_context_digest != self.authority.context_digest():
+                raise ValueError("effect capability receipt grant context does not match")
 
     @classmethod
     def _from_broker(cls, **fields: Any) -> EffectCapability:
@@ -231,6 +238,7 @@ def _canonical_record(
     expires_at: float,
     nonce: str,
     token: str,
+    grant_id: str,
 ) -> bytes:
     return "|".join(
         (
@@ -244,6 +252,7 @@ def _canonical_record(
             f"{expires_at:.9f}",
             nonce,
             token,
+            grant_id,
         )
     ).encode("utf-8")
 
@@ -251,6 +260,7 @@ def _canonical_record(
 def _broker_main(connection: Connection) -> None:
     """Own the token secret and registry in a separate process."""
     secret = secrets.token_bytes(32)
+    grants: dict[str, dict[str, Any]] = {}
     records: dict[str, dict[str, Any]] = {}
     try:
         while True:
@@ -265,8 +275,98 @@ def _broker_main(connection: Connection) -> None:
             if operation == "close":
                 connection.send({"ok": True})
                 return
+            if operation == "grant":
+                try:
+                    ttl = float(request["ttl_seconds"])
+                    if not 0 < ttl <= _DEFAULT_GRANT_TTL_SECONDS:
+                        raise ValueError("authority grant TTL is outside the allowed range")
+                    operation_class = str(request["operation_class"])
+                    resource_digest = str(request["resource_digest"])
+                    generation = int(request["generation"])
+                    authorization_epoch = int(request["authorization_epoch"])
+                    if (
+                        not _valid_operation(operation_class)
+                        or not resource_digest
+                        or generation <= 0
+                        or authorization_epoch < 0
+                    ):
+                        raise ValueError("invalid authority grant context")
+                    now = time.time()
+                    grant_id = secrets.token_hex(24)
+                    grants[grant_id] = {
+                        "context_digest": str(request["context_digest"]),
+                        "principal_id": str(request["principal_id"]),
+                        "project_id": str(request["project_id"]),
+                        "runtime_id": str(request["runtime_id"]),
+                        "task_id": str(request["task_id"]),
+                        "workspace_id": str(request["workspace_id"]),
+                        "generation": generation,
+                        "policy_digest": str(request["policy_digest"]),
+                        "resource_digest": resource_digest,
+                        "operation_family": operation_class.split(".", 1)[0],
+                        "authorization_epoch": authorization_epoch,
+                        "issued_at": now,
+                        "expires_at": now + ttl,
+                    }
+                    connection.send(
+                        {
+                            "ok": True,
+                            "grant_id": grant_id,
+                            "expires_at": now + ttl,
+                        }
+                    )
+                except (KeyError, TypeError, ValueError) as exc:
+                    connection.send({"ok": False, "error": str(exc)})
+                continue
+            if operation == "revoke_grant":
+                grant_id = request.get("grant_id")
+                if not isinstance(grant_id, str):
+                    connection.send({"ok": False, "error": "invalid authority grant id"})
+                else:
+                    grants.pop(grant_id, None)
+                    connection.send({"ok": True})
+                continue
+            if operation == "rotate_authorization_epoch":
+                try:
+                    principal_id = str(request["principal_id"])
+                    project_id = str(request["project_id"])
+                    workspace_id = str(request["workspace_id"])
+                    epoch = int(request["authorization_epoch"])
+                    if epoch < 0:
+                        raise ValueError("authorization epoch is invalid")
+                    for grant_id, grant in tuple(grants.items()):
+                        if (
+                            grant["principal_id"] == principal_id
+                            and grant["project_id"] == project_id
+                            and grant["workspace_id"] == workspace_id
+                            and grant["authorization_epoch"] < epoch
+                        ):
+                            grants.pop(grant_id, None)
+                    connection.send({"ok": True})
+                except (KeyError, TypeError, ValueError) as exc:
+                    connection.send({"ok": False, "error": str(exc)})
+                continue
             if operation == "issue":
                 try:
+                    parent = request.get("parent")
+                    if parent is not None:
+                        if not isinstance(parent, dict):
+                            raise ValueError("capability parent is invalid")
+                        parent_error = _validate_record(
+                            records, grants, secret, parent
+                        )
+                        if parent_error is not None:
+                            raise ValueError(parent_error)
+                        parent_record = records.get(str(parent.get("token")))
+                        if parent_record is None or parent_record.get("grant_id") != request.get("grant_id"):
+                            raise ValueError("capability parent grant does not match")
+                        grant_error = _validate_grant(
+                            grants, request, record=parent_record
+                        )
+                    else:
+                        grant_error = _validate_grant(grants, request)
+                    if grant_error is not None:
+                        raise ValueError(grant_error)
                     now = time.time()
                     ttl = float(request["ttl_seconds"])
                     if not 0 < ttl <= _MAX_TTL_SECONDS:
@@ -277,6 +377,8 @@ def _broker_main(connection: Connection) -> None:
                         "resource_digest": str(request["resource_digest"]),
                         "generation": int(request["generation"]),
                         "authorization_epoch": int(request["authorization_epoch"]),
+                        "grant_id": str(request["grant_id"]),
+                        "operation_class": str(request["operation_class"]),
                         "issued_at": now,
                         "expires_at": now + ttl,
                         "nonce": secrets.token_hex(16),
@@ -284,7 +386,18 @@ def _broker_main(connection: Connection) -> None:
                     }
                     seal = hmac.new(
                         secret,
-                        _canonical_record(**fields),
+                        _canonical_record(
+                            context_digest=fields["context_digest"],
+                            allowed_operation=fields["allowed_operation"],
+                            resource_digest=fields["resource_digest"],
+                            generation=fields["generation"],
+                            authorization_epoch=fields["authorization_epoch"],
+                            issued_at=fields["issued_at"],
+                            expires_at=fields["expires_at"],
+                            nonce=fields["nonce"],
+                            token=fields["token"],
+                            grant_id=fields["grant_id"],
+                        ),
                         hashlib.sha256,
                     ).hexdigest()
                     fields["seal"] = seal
@@ -302,17 +415,19 @@ def _broker_main(connection: Connection) -> None:
                     connection.send({"ok": True})
                 continue
             if operation == "claim":
-                result = _validate_record(records, secret, request)
+                result = _validate_record(records, grants, secret, request)
                 connection.send({"ok": result is None, **({} if result is None else {"error": result})})
                 continue
             if operation == "complete":
-                result = _validate_record(records, secret, request, allow_expired=True)
+                result = _validate_record(
+                    records, grants, secret, request, allow_expired=True
+                )
                 if result is None:
                     records.pop(str(request.get("token")), None)
                 connection.send({"ok": result is None, **({} if result is None else {"error": result})})
                 continue
             if operation == "validate":
-                result = _validate_record(records, secret, request)
+                result = _validate_record(records, grants, secret, request)
                 connection.send({"ok": result is None, **({} if result is None else {"error": result})})
                 continue
             connection.send({"ok": False, "error": "unknown broker operation"})
@@ -322,6 +437,7 @@ def _broker_main(connection: Connection) -> None:
 
 def _validate_record(
     records: dict[str, dict[str, Any]],
+    grants: dict[str, dict[str, Any]],
     secret: bytes,
     request: dict[str, Any],
     *,
@@ -333,6 +449,10 @@ def _validate_record(
     record = records.get(token)
     if record is None:
         return "capability is unknown or revoked"
+    if not allow_expired:
+        grant_error = _validate_grant(grants, request, record=record)
+        if grant_error is not None:
+            return grant_error
     if not allow_expired and time.time() >= float(record["expires_at"]):
         records.pop(token, None)
         return "capability has expired"
@@ -346,6 +466,7 @@ def _validate_record(
         "expires_at",
         "nonce",
         "seal",
+        "grant_id",
     ):
         if request.get(field) != record[field]:
             return f"capability {field} does not match broker record"
@@ -361,6 +482,7 @@ def _validate_record(
             expires_at=record["expires_at"],
             nonce=record["nonce"],
             token=record["token"],
+            grant_id=record["grant_id"],
         ),
         hashlib.sha256,
     ).hexdigest()
@@ -377,9 +499,57 @@ def _validate_record(
     return None
 
 
+def _validate_grant(
+    grants: dict[str, dict[str, Any]],
+    request: dict[str, Any],
+    *,
+    record: dict[str, Any] | None = None,
+) -> str | None:
+    grant_id = request.get("grant_id")
+    if not isinstance(grant_id, str):
+        return "authority grant id is invalid"
+    grant = grants.get(grant_id)
+    if grant is None:
+        return "authority grant is unknown or revoked"
+    if time.time() >= float(grant["expires_at"]):
+        grants.pop(grant_id, None)
+        return "authority grant has expired"
+    operation = request.get("operation_class")
+    if (
+        not isinstance(operation, str)
+        or operation.split(".", 1)[0] != grant["operation_family"]
+    ):
+        return "authority grant operation family cannot be escalated"
+    expected = record or request
+    if record is None and expected.get("resource_digest") != grant["resource_digest"]:
+        return "authority grant resource is outside its live scope"
+    for field in (
+        "context_digest",
+        "generation",
+        "authorization_epoch",
+        "operation_family",
+    ):
+        if field == "operation_family":
+            operation = expected.get("operation_class")
+            if not isinstance(operation, str) or operation.split(".", 1)[0] != grant[field]:
+                return f"authority grant {field} does not match live grant"
+            continue
+        if expected.get(field) != grant[field]:
+            return f"authority grant {field} does not match live grant"
+    return None
+
+
 def _operation_allowed(allowed: str, operation: str) -> bool:
+    if allowed == "*":
+        return False
     if allowed.endswith("*"):
-        return operation.startswith(allowed[:-1])
+        prefix = allowed[:-1]
+        return (
+            bool(prefix)
+            and operation.startswith(prefix)
+            and prefix.rstrip(".").split(".", 1)[0]
+            == operation.split(".", 1)[0]
+        )
     return hmac.compare_digest(allowed, operation)
 
 
@@ -472,6 +642,7 @@ class AuthorityBroker:
         allowed_operation: str | None = None,
         resource_digest: str | None = None,
         ttl_seconds: float = _DEFAULT_TTL_SECONDS,
+        _parent_capability: EffectCapability | None = None,
     ) -> EffectCapability:
         """Issue a capability after binding all authority context fields."""
         if not isinstance(authority, AuthorityEnvelope):
@@ -486,17 +657,38 @@ class AuthorityBroker:
             raise AuthorityBrokerError("invalid capability operation authority")
         if resource != authority.resource_digest:
             raise AuthorityBrokerError("capability resource must match authority context")
-        response = self._call(
-            {
-                "operation": "issue",
-                "context_digest": authority.context_digest(),
-                "allowed_operation": operation,
-                "resource_digest": resource,
-                "generation": authority.workspace_generation,
-                "authorization_epoch": authority.authorization_epoch,
-                "ttl_seconds": ttl_seconds,
+        request: dict[str, Any] = {
+            "operation": "issue",
+            "context_digest": authority.context_digest(),
+            "grant_id": authority.grant_id,
+            "operation_class": authority.operation_class,
+            "allowed_operation": operation,
+            "resource_digest": resource,
+            "generation": authority.workspace_generation,
+            "authorization_epoch": authority.authorization_epoch,
+            "ttl_seconds": ttl_seconds,
+        }
+        if _parent_capability is not None:
+            if _parent_capability.authority._broker is not self:
+                raise AuthorityBrokerError(
+                    "capability parent was not created by this AuthorityBroker"
+                )
+            request["parent"] = {
+                "token": _parent_capability.token,
+                "context_digest": _parent_capability.context_digest,
+                "grant_id": _parent_capability.authority.grant_id,
+                "allowed_operation": _parent_capability.allowed_operation,
+                "resource_digest": _parent_capability.resource_digest,
+                "generation": _parent_capability.generation,
+                "authorization_epoch": _parent_capability.authorization_epoch,
+                "issued_at": _parent_capability.issued_at,
+                "expires_at": _parent_capability.expires_at,
+                "nonce": _parent_capability.nonce,
+                "seal": _parent_capability.seal,
+                "operation_class": _parent_capability.authority.operation_class,
+                "expected_resource_digest": _parent_capability.resource_digest,
             }
-        )
+        response = self._call(request)
         fields = response.get("capability")
         if not isinstance(fields, dict):
             raise AuthorityBrokerError("authority broker returned no capability")
@@ -550,6 +742,7 @@ class AuthorityBroker:
             allowed_operation=operation_class,
             resource_digest=resource_digest,
             ttl_seconds=ttl_seconds,
+            _parent_capability=capability,
         )
 
     def envelope(
@@ -569,6 +762,43 @@ class AuthorityBroker:
     ) -> AuthorityEnvelope:
         """Create one broker-owned context for a later capability issue."""
         try:
+            context = {
+                "principal_id": principal_id,
+                "project_id": project_id,
+                "runtime_id": runtime_id,
+                "task_id": task_id,
+                "workspace_id": workspace_id,
+                "workspace_generation": workspace_generation,
+                "policy_digest": policy_digest,
+                "operation_class": operation_class,
+                "resource_digest": resource_digest,
+                "authorization_epoch": authorization_epoch,
+            }
+            # The broker process, rather than the Python object, generates
+            # and owns the opaque live grant id.
+            provisional = AuthorityEnvelope._from_broker(
+                broker=self,
+                grant_id="provisional-grant",
+                grant_expires_at=time.time() + _DEFAULT_GRANT_TTL_SECONDS,
+                **context,
+            )
+            response = self._call(
+                {
+                    "operation": "grant",
+                    "context_digest": provisional.context_digest(),
+                    "principal_id": principal_id,
+                    "project_id": project_id,
+                    "runtime_id": runtime_id,
+                    "task_id": task_id,
+                    "workspace_id": workspace_id,
+                    "generation": workspace_generation,
+                    "policy_digest": policy_digest,
+                    "operation_class": operation_class,
+                    "resource_digest": resource_digest,
+                    "authorization_epoch": authorization_epoch,
+                    "ttl_seconds": _DEFAULT_GRANT_TTL_SECONDS,
+                }
+            )
             return AuthorityEnvelope._from_broker(
                 broker=self,
                 principal_id=principal_id,
@@ -582,9 +812,37 @@ class AuthorityBroker:
                 resource_digest=resource_digest,
                 authorization_epoch=authorization_epoch,
                 schema_version=schema_version,
+                grant_id=str(response["grant_id"]),
+                grant_expires_at=float(response["expires_at"]),
             )
-        except (TypeError, ValueError) as exc:
+        except (KeyError, TypeError, ValueError, AuthorityBrokerError) as exc:
             raise AuthorityBrokerError("authority envelope is invalid") from exc
+
+    def revoke_grant(self, authority: AuthorityEnvelope) -> None:
+        """Revoke the live grant so stale envelope objects cannot mint again."""
+        if not isinstance(authority, AuthorityEnvelope) or authority._broker is not self:
+            raise AuthorityBrokerError("authority grant was not created by this broker")
+        self._call({"operation": "revoke_grant", "grant_id": authority.grant_id})
+
+    def rotate_authorization_epoch(
+        self,
+        *,
+        principal_id: str,
+        project_id: str,
+        workspace_id: str,
+        authorization_epoch: int,
+    ) -> None:
+        if authorization_epoch < 0:
+            raise AuthorityBrokerError("authorization epoch is invalid")
+        self._call(
+            {
+                "operation": "rotate_authorization_epoch",
+                "principal_id": principal_id,
+                "project_id": project_id,
+                "workspace_id": workspace_id,
+                "authorization_epoch": authorization_epoch,
+            }
+        )
 
     def validate(
         self,
@@ -605,6 +863,7 @@ class AuthorityBroker:
                 "operation": "validate",
                 "token": capability.token,
                 "context_digest": capability.context_digest,
+                "grant_id": capability.authority.grant_id,
                 "allowed_operation": capability.allowed_operation,
                 "resource_digest": capability.resource_digest,
                 "generation": capability.generation,
@@ -650,6 +909,7 @@ class AuthorityBroker:
                 "expires_at": capability.expires_at,
                 "nonce": capability.nonce,
                 "seal": capability.seal,
+                "grant_id": capability.authority.grant_id,
                 "operation_class": capability.authority.operation_class,
             }
         )
@@ -706,6 +966,97 @@ class AuthorityDaemonBroker(AuthorityBroker):
     def closed(self) -> bool:
         return self._closed
 
+    def envelope(
+        self,
+        *,
+        principal_id: str,
+        project_id: str,
+        runtime_id: str,
+        task_id: str,
+        workspace_id: str,
+        workspace_generation: int,
+        policy_digest: str,
+        operation_class: str,
+        resource_digest: str,
+        authorization_epoch: int = 0,
+        schema_version: int = 1,
+    ) -> AuthorityEnvelope:
+        grant = getattr(self._authorityd, "grant", None)
+        if callable(grant):
+            grant_id, grant_expires_at = grant(
+                principal_id=principal_id,
+                project_id=project_id,
+                runtime_id=runtime_id,
+                task_id=task_id,
+                workspace_id=workspace_id,
+                workspace_generation=workspace_generation,
+                policy_digest=policy_digest,
+                operation_class=operation_class,
+                resource_digest=resource_digest,
+                authorization_epoch=authorization_epoch,
+            )
+        else:
+            # Protocol test doubles predating live grants remain usable only
+            # outside the production authorityd client. Real authorityd
+            # clients always expose the grant registration operation.
+            grant_id = f"legacy-{secrets.token_hex(16)}"
+            grant_expires_at = time.time() + _DEFAULT_GRANT_TTL_SECONDS
+        try:
+            return AuthorityEnvelope._from_broker(
+                broker=self,
+                principal_id=principal_id,
+                project_id=project_id,
+                runtime_id=runtime_id,
+                task_id=task_id,
+                workspace_id=workspace_id,
+                workspace_generation=workspace_generation,
+                policy_digest=policy_digest,
+                operation_class=operation_class,
+                resource_digest=resource_digest,
+                authorization_epoch=authorization_epoch,
+                schema_version=schema_version,
+                grant_id=grant_id,
+                grant_expires_at=grant_expires_at,
+            )
+        except (TypeError, ValueError) as exc:
+            raise AuthorityBrokerError("authority envelope is invalid") from exc
+
+    def revoke_grant(self, authority: AuthorityEnvelope) -> None:
+        if not isinstance(authority, AuthorityEnvelope) or authority._broker is not self:
+            raise AuthorityBrokerError("authority grant was not created by this broker")
+        try:
+            revoke = getattr(self._authorityd, "revoke_grant", None)
+            if not callable(revoke):
+                raise AuthorityBrokerError(
+                    "production authorityd client does not support grant revocation"
+                )
+            revoke(authority.grant_id)
+        except AuthorityControlPlaneError as exc:
+            raise AuthorityBrokerError(str(exc)) from exc
+
+    def rotate_authorization_epoch(
+        self,
+        *,
+        principal_id: str,
+        project_id: str,
+        workspace_id: str,
+        authorization_epoch: int,
+    ) -> None:
+        try:
+            rotate = getattr(self._authorityd, "rotate_authorization_epoch", None)
+            if not callable(rotate):
+                raise AuthorityBrokerError(
+                    "production authorityd client does not support epoch rotation"
+                )
+            rotate(
+                principal_id=principal_id,
+                project_id=project_id,
+                workspace_id=workspace_id,
+                authorization_epoch=authorization_epoch,
+            )
+        except AuthorityControlPlaneError as exc:
+            raise AuthorityBrokerError(str(exc)) from exc
+
     def issue(
         self,
         authority: AuthorityEnvelope,
@@ -741,6 +1092,9 @@ class AuthorityDaemonBroker(AuthorityBroker):
             policy_digest=authority.policy_digest,
             nonce=secrets.token_hex(16),
             authorization_epoch=authority.authorization_epoch,
+            workspace_generation=authority.workspace_generation,
+            grant_id=authority.grant_id,
+            grant_context_digest=authority.context_digest(),
         )
         try:
             receipt = self._authorityd.prepare(intent)
@@ -875,6 +1229,7 @@ def _valid_operation(operation: str) -> bool:
     return (
         isinstance(operation, str)
         and 1 <= len(operation) <= 256
+        and "." in operation
         and all(character.isalnum() or character in "._:-*" for character in operation)
         and operation.count("*") <= 1
         and ("*" not in operation or operation.endswith("*"))

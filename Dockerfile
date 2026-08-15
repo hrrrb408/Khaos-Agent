@@ -39,6 +39,12 @@ COPY python/ python/
 COPY prompts/ prompts/
 COPY AGENTS.md KHAOS.md config.yaml ./
 COPY --from=rust-tcb-builder /build/rust/khaos-core/target/release/khaos-sandbox-launcher /usr/local/bin/khaos-sandbox-launcher
+# The browser authority launcher carries CAP_SYS_ADMIN for its authenticated
+# helper-owned setns transition.  Coding execution must use a separate,
+# capability-free inode: Docker/systemd intentionally remove SYS_ADMIN from
+# the Agent capability bounding set, and Linux rejects executing a filecap
+# binary when that capability is unavailable in the bounding set.
+COPY --from=rust-tcb-builder /build/rust/khaos-core/target/release/khaos-sandbox-launcher /usr/local/bin/khaos-execution-sandbox-launcher
 COPY --from=rust-tcb-builder /build/rust/khaos-core/target/release/khaos-exec-launcher /usr/local/bin/khaos-exec-launcher
 COPY packaging/docker/agent-secret-init.py /usr/local/sbin/khaos-agent-secret-init.py
 COPY packaging/docker/authorityd-key-init.py /usr/local/sbin/khaos-authorityd-key-init.py
@@ -50,6 +56,8 @@ RUN useradd --system --uid 10001 --home-dir /nonexistent --shell /usr/sbin/nolog
     && chown root:root /usr/local/bin/khaos-sandbox-launcher \
     && chmod 0755 /usr/local/bin/khaos-sandbox-launcher \
     && setcap cap_sys_admin=ep /usr/local/bin/khaos-sandbox-launcher \
+    && chown root:root /usr/local/bin/khaos-execution-sandbox-launcher \
+    && chmod 0755 /usr/local/bin/khaos-execution-sandbox-launcher \
     && chown root:root /usr/local/bin/khaos-exec-launcher \
     && chmod 0755 /usr/local/bin/khaos-exec-launcher \
     && chown root:root /usr/local/sbin/khaos-agent-secret-init.py \
@@ -67,6 +75,7 @@ RUN useradd --system --uid 10001 --home-dir /nonexistent --shell /usr/sbin/nolog
 
 ENV KHAOS_DEV_MODE=0 \
     KHAOS_EXEC_LAUNCHER=/usr/local/bin/khaos-exec-launcher \
+    KHAOS_EXECUTION_SANDBOX_LAUNCHER=/usr/local/bin/khaos-execution-sandbox-launcher \
     KHAOS_SANDBOX_LAUNCHER=/usr/local/bin/khaos-sandbox-launcher \
     HOME=/var/lib/khaos \
     PYTHONPATH=/app/python

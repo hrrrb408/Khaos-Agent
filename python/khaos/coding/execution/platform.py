@@ -9,13 +9,14 @@ import json
 import logging
 import math
 import os
+import re
 import secrets
 import shutil
 import stat
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Literal, cast
@@ -73,6 +74,29 @@ class KernelResourceLease:
         return f"cgroup:{self.execution_id}:{self.path}"
 
 
+@dataclass
+class _WindowsOwnedProcess:
+    """Complete ownership record for one native Windows helper."""
+
+    process: asyncio.subprocess.Process
+    wait_task: asyncio.Task[int] | None = None
+    reaped_return_code: int | None = None
+    stdout_task: asyncio.Task[tuple[str, bool]] | None = None
+    stderr_task: asyncio.Task[tuple[str, bool]] | None = None
+    termination_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
+@dataclass
+class _WindowsPendingSpawn:
+    """Owner record published before the native helper spawn begins."""
+
+    spawn_task: asyncio.Task[asyncio.subprocess.Process] | None = None
+    process: _WindowsOwnedProcess | None = None
+    termination_requested: bool = False
+    error: BaseException | None = None
+    done: asyncio.Event = field(default_factory=asyncio.Event)
+
+
 class LinuxBubblewrapBackendState(str, Enum):
     """Lifecycle states for the Linux kernel-resource owner."""
 
@@ -120,8 +144,33 @@ class WindowsSandboxBackend:
     def __init__(self, supervisor=None) -> None:
         self.supervisor = supervisor
         self._capability_cache: _CapabilityCacheEntry | None = None
-        self._active: dict[str, asyncio.subprocess.Process] = {}
+        self._active: dict[str, _WindowsOwnedProcess] = {}
+        self._pending_spawns: dict[str, _WindowsPendingSpawn] = {}
+        self._orphans: dict[str, _WindowsOwnedProcess] = {}
+        self._registry_lock = asyncio.Lock()
+        self._state = "open"
+        self._close_task: asyncio.Task[None] | None = None
         self._quarantined = False
+
+    @property
+    def state(self) -> str:
+        return self._state
+
+    @property
+    def admission_closed(self) -> bool:
+        return self._state != "open"
+
+    @property
+    def generation_admission_closed(self) -> bool:
+        return self.admission_closed
+
+    @property
+    def child_admission_closed(self) -> bool:
+        return self.admission_closed
+
+    @property
+    def is_quarantined(self) -> bool:
+        return self._quarantined or bool(self._orphans)
 
     async def probe(self) -> BackendAvailability:
         return await asyncio.to_thread(self.probe_capability)
@@ -199,7 +248,7 @@ class WindowsSandboxBackend:
 
     async def execute(self, request):
         profile = _validated_profile(request)
-        if self._quarantined:
+        if self._state != "open" or self._quarantined:
             raise PermissionError(
                 "execution refused: Windows sandbox cleanup is unproven; backend quarantined"
             )
@@ -323,20 +372,36 @@ class WindowsSandboxBackend:
             try:
                 staged_runtime_root = await asyncio.shield(staging_task)
             except asyncio.CancelledError:
+                staging_error: BaseException | None = None
                 try:
-                    staged_runtime_root = await asyncio.shield(staging_task)
-                except BaseException as staging_error:  # noqa: BLE001 - preserve cancellation
+                    await self._await_cleanup(staging_task)
+                except asyncio.CancelledError:
+                    pass
+                except BaseException as error:  # noqa: BLE001 - preserve cancellation
+                    staging_error = error
                     logger.debug(
-                        "trusted Windows runtime staging produced no root: %s",
-                        type(staging_error).__name__,
+                        "trusted Windows runtime staging failed: %s",
+                        type(error).__name__,
                     )
+                if staging_error is None and not staging_task.cancelled():
+                    staged_runtime_root = staging_task.result()
                 if staged_runtime_root is not None:
-                    await asyncio.shield(
-                        asyncio.to_thread(
-                            _remove_windows_python_runtime,
-                            staged_runtime_root,
+                    try:
+                        await self._await_cleanup(
+                            asyncio.to_thread(
+                                _remove_windows_python_runtime,
+                                staged_runtime_root,
+                            )
                         )
-                    )
+                    except asyncio.CancelledError:
+                        # The removal task is complete; preserve the original
+                        # cancellation after its terminal cleanup.
+                        pass
+                    except BaseException as cleanup_error:
+                        self._quarantined = True
+                        raise PermissionError(
+                            "Windows sandbox runtime staging cleanup is unproven"
+                        ) from cleanup_error
                 raise
             except (OSError, shutil.Error) as exc:
                 raise PermissionError(
@@ -400,28 +465,102 @@ class WindowsSandboxBackend:
         helper_args.extend(("--", *command_argv))
         flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         process: asyncio.subprocess.Process | None = None
+        owner: _WindowsOwnedProcess | None = None
+        pending_spawn = await self._reserve_spawn(request.correlation_id)
+        spawn_task = asyncio.create_task(
+            asyncio.create_subprocess_exec(
+                *helper_args,
+                cwd=str(request.cwd),
+                env=environment,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                creationflags=flags,
+            ),
+            name=f"khaos-windows-helper-spawn:{request.correlation_id}",
+        )
+        pending_spawn.spawn_task = spawn_task
+        try:
+            process = await asyncio.shield(spawn_task)
+            owner = await self._publish_process(
+                request.correlation_id, pending_spawn, process
+            )
+        except asyncio.CancelledError:
+            # The spawn task is shielded and the pending owner remains
+            # published until it produces a process or a terminal error.
+            # Repeated cancellation only records the request; it cannot make
+            # the child disappear from the ownership graph.
+            try:
+                process = await self._await_spawn_result(pending_spawn)
+                if process is not None:
+                    owner = await self._publish_process(
+                        request.correlation_id, pending_spawn, process
+                    )
+                    await self._await_cleanup(
+                        self._terminate_process(request.correlation_id)
+                    )
+                else:
+                    await self._finish_pending_spawn(
+                        request.correlation_id,
+                        pending_spawn,
+                        error=RuntimeError("Windows helper spawn returned no process"),
+                    )
+            except BaseException as cleanup_error:  # noqa: BLE001 - retain owner
+                if owner is not None:
+                    async with self._registry_lock:
+                        still_owned = bool(
+                            request.correlation_id in self._active
+                            or request.correlation_id in self._orphans
+                            or request.correlation_id in self._pending_spawns
+                        )
+                    if still_owned:
+                        await self._retain_orphan(
+                            request.correlation_id, owner, error=cleanup_error
+                        )
+                elif not spawn_task.done():
+                    self._quarantined = True
+                else:
+                    await self._finish_pending_spawn(
+                        request.correlation_id,
+                        pending_spawn,
+                        error=cleanup_error,
+                    )
+            raise
+        except OSError as exc:
+            await self._finish_pending_spawn(
+                request.correlation_id, pending_spawn, error=exc
+            )
+            raise PermissionError("Windows sandbox helper could not start") from exc
+        except BaseException as exc:
+            await self._finish_pending_spawn(
+                request.correlation_id, pending_spawn, error=exc
+            )
+            raise
+        if process is None or owner is None:
+            await self._finish_pending_spawn(
+                request.correlation_id,
+                pending_spawn,
+                error=RuntimeError("Windows helper spawn did not publish a process"),
+            )
+            raise PermissionError("Windows sandbox helper ownership was not published")
+        started = asyncio.get_running_loop().time()
+        stdout_task = asyncio.create_task(
+            _read_windows_output(process.stdout, profile.resources.output_bytes // 2)
+        )
+        stderr_task = asyncio.create_task(
+            _read_windows_output(
+                process.stderr,
+                profile.resources.output_bytes - profile.resources.output_bytes // 2,
+            )
+        )
+        owner.stdout_task = stdout_task
+        owner.stderr_task = stderr_task
+        status = "failed"
+        timed_out = False
         try:
             try:
-                process = await asyncio.create_subprocess_exec(
-                    *helper_args,
-                    cwd=str(request.cwd),
-                    env=environment,
-                    stdin=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    creationflags=flags,
-                )
-            except OSError as exc:
-                raise PermissionError("Windows sandbox helper could not start") from exc
-            self._active[request.correlation_id] = process
-            started = asyncio.get_running_loop().time()
-            stdout_task = asyncio.create_task(_read_windows_output(process.stdout, profile.resources.output_bytes // 2))
-            stderr_task = asyncio.create_task(_read_windows_output(process.stderr, profile.resources.output_bytes - profile.resources.output_bytes // 2))
-            status = "failed"
-            timed_out = False
-            try:
                 await asyncio.wait_for(
-                    process.wait(),
+                    self._wait_for_process(owner),
                     timeout=(
                         profile.resources.timeout_seconds
                         + WINDOWS_HELPER_STARTUP_GRACE_SECONDS
@@ -429,13 +568,20 @@ class WindowsSandboxBackend:
                 )
             except TimeoutError:
                 timed_out = True
-                await self._terminate_process(request.correlation_id)
+                await self._await_cleanup(
+                    self._terminate_process(request.correlation_id)
+                )
             stdout, stdout_truncated = await stdout_task
             stderr, stderr_truncated = await stderr_task
+            return_code = (
+                owner.reaped_return_code
+                if owner.reaped_return_code is not None
+                else process.returncode
+            )
             status = (
                 "timed-out"
-                if timed_out or process.returncode == 124
-                else ("passed" if process.returncode == 0 else "failed")
+                if timed_out or return_code == 124
+                else ("passed" if return_code == 0 else "failed")
             )
             diagnostics = {
                 "backend": self.name,
@@ -457,61 +603,269 @@ class WindowsSandboxBackend:
             return ExecutionResult(
                 execution_id=request.correlation_id,
                 status=status,
-                return_code=process.returncode,
+                return_code=return_code,
                 stdout=stdout,
                 stderr=stderr,
                 duration_ms=int((asyncio.get_running_loop().time() - started) * 1000),
                 diagnostics=diagnostics,
             )
         finally:
-            if process is not None:
+            cleanup_cancelled = False
+            cleanup_error: BaseException | None = None
+            if owner is not None:
                 try:
-                    await asyncio.shield(
+                    await self._await_cleanup(
                         self._terminate_process(request.correlation_id)
                     )
-                finally:
-                    self._active.pop(request.correlation_id, None)
+                except asyncio.CancelledError:
+                    # _await_cleanup has already finished the owner operation;
+                    # preserve the caller's cancellation after the remaining
+                    # runtime cleanup rather than turning it into a false
+                    # helper-cleanup failure.
+                    cleanup_cancelled = True
+                except BaseException as error:  # noqa: BLE001 - retain owner
+                    cleanup_error = error
+                    self._quarantined = True
             if staged_runtime_root is not None:
                 try:
-                    await asyncio.shield(
+                    await self._await_cleanup(
                         asyncio.to_thread(
                             _remove_windows_python_runtime,
                             staged_runtime_root,
                         )
                     )
-                except Exception as cleanup_error:
+                except asyncio.CancelledError:
+                    cleanup_cancelled = True
+                except BaseException as error:  # noqa: BLE001 - retain quarantine
+                    cleanup_error = cleanup_error or error
                     self._quarantined = True
-                    raise PermissionError(
-                        "Windows sandbox runtime staging cleanup is unproven"
-                    ) from cleanup_error
+            if cleanup_error is not None:
+                raise PermissionError(
+                    "Windows sandbox helper cleanup is unproven"
+                ) from cleanup_error
+            if cleanup_cancelled:
+                raise asyncio.CancelledError()
 
     async def terminate(self, execution_id: str) -> None:
         await self._terminate_process(execution_id)
 
-    async def _terminate_process(self, execution_id: str) -> None:
-        process = self._active.get(execution_id)
-        if process is None or process.returncode is not None:
-            return
-        if process.stdin is not None:
+    async def _reserve_spawn(self, execution_id: str) -> _WindowsPendingSpawn:
+        async with self._registry_lock:
+            if self._state != "open":
+                raise PermissionError(
+                    f"Windows sandbox backend is {self._state}; spawn refused"
+                )
+            if (
+                execution_id in self._active
+                or execution_id in self._pending_spawns
+                or execution_id in self._orphans
+            ):
+                raise RuntimeError(f"duplicate Windows helper execution id: {execution_id}")
+            pending = _WindowsPendingSpawn()
+            self._pending_spawns[execution_id] = pending
+            return pending
+
+    async def _await_spawn_result(
+        self, pending: _WindowsPendingSpawn
+    ) -> asyncio.subprocess.Process | None:
+        task = pending.spawn_task
+        if task is None:
+            raise RuntimeError("Windows helper spawn task was not published")
+        while True:
             try:
-                process.stdin.write(b"\x01")
-                await process.stdin.drain()
-                process.stdin.close()
-            except (BrokenPipeError, ConnectionError, OSError):
+                return await asyncio.shield(task)
+            except asyncio.CancelledError:
+                pending.termination_requested = True
+                continue
+
+    async def _publish_process(
+        self,
+        execution_id: str,
+        pending: _WindowsPendingSpawn,
+        process: asyncio.subprocess.Process,
+    ) -> _WindowsOwnedProcess:
+        owner = _WindowsOwnedProcess(process)
+        async with self._registry_lock:
+            if self._pending_spawns.get(execution_id) is not pending:
+                self._orphans[execution_id] = owner
                 self._quarantined = True
-        try:
-            await asyncio.wait_for(process.wait(), timeout=5)
-        except TimeoutError:
+                raise RuntimeError(
+                    f"Windows helper pending owner disappeared: {execution_id}"
+                )
+            pending.process = owner
+            self._active[execution_id] = owner
+            self._pending_spawns.pop(execution_id, None)
+            pending.done.set()
+        return owner
+
+    async def _finish_pending_spawn(
+        self,
+        execution_id: str,
+        pending: _WindowsPendingSpawn,
+        *,
+        error: BaseException,
+    ) -> None:
+        pending.error = error
+        async with self._registry_lock:
+            if self._pending_spawns.get(execution_id) is pending:
+                self._pending_spawns.pop(execution_id, None)
+                pending.done.set()
+
+    async def _retain_orphan(
+        self,
+        execution_id: str,
+        owner: _WindowsOwnedProcess,
+        *,
+        error: BaseException,
+    ) -> None:
+        self._quarantined = True
+        async with self._registry_lock:
+            self._active.pop(execution_id, None)
+            self._orphans[execution_id] = owner
+            pending = self._pending_spawns.pop(execution_id, None)
+            if pending is not None:
+                pending.error = error
+                pending.done.set()
+
+    async def _wait_for_process(self, owner: _WindowsOwnedProcess) -> int:
+        if owner.reaped_return_code is not None:
+            return owner.reaped_return_code
+        if owner.wait_task is None:
+            owner.wait_task = asyncio.create_task(owner.process.wait())
+        return_code = await asyncio.shield(owner.wait_task)
+        owner.reaped_return_code = return_code
+        return return_code
+
+    async def _settle_output(self, owner: _WindowsOwnedProcess) -> None:
+        tasks = tuple(
+            task
+            for task in (owner.stdout_task, owner.stderr_task)
+            if task is not None
+        )
+        if not tasks:
+            return
+        done, pending = await asyncio.wait(tasks, timeout=5)
+        if pending:
+            raise RuntimeError("Windows helper output pipes did not reach terminal state")
+        await asyncio.gather(*done, return_exceptions=False)
+
+    async def _release_owner(
+        self, execution_id: str, owner: _WindowsOwnedProcess
+    ) -> None:
+        if owner.reaped_return_code is None and owner.process.returncode is None:
+            raise RuntimeError(
+                f"Windows helper {execution_id} lacks terminal process proof"
+            )
+        await self._settle_output(owner)
+        async with self._registry_lock:
+            if self._active.get(execution_id) is owner:
+                self._active.pop(execution_id, None)
+            elif self._orphans.get(execution_id) is owner:
+                self._orphans.pop(execution_id, None)
+
+    async def _terminate_process(self, execution_id: str) -> None:
+        async with self._registry_lock:
+            owner = self._active.get(execution_id) or self._orphans.get(execution_id)
+            pending = self._pending_spawns.get(execution_id)
+        if owner is None and pending is not None:
+            pending.termination_requested = True
+            process = await self._await_spawn_result(pending)
+            if process is None:
+                await self._finish_pending_spawn(
+                    execution_id,
+                    pending,
+                    error=RuntimeError("Windows helper spawn returned no process"),
+                )
+                return
+            owner = await self._publish_process(execution_id, pending, process)
+        if owner is None:
+            return
+        async with owner.termination_lock:
+            try:
+                owner_process = owner.process
+                if owner_process.returncode is None:
+                    if owner_process.stdin is not None:
+                        try:
+                            owner_process.stdin.write(b"\x01")
+                            await owner_process.stdin.drain()
+                            owner_process.stdin.close()
+                        except (BrokenPipeError, ConnectionError, OSError):
+                            self._quarantined = True
+                    if owner.wait_task is None:
+                        owner.wait_task = asyncio.create_task(owner_process.wait())
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(owner.wait_task), timeout=5
+                        )
+                    except TimeoutError:
+                        owner_process.kill()
+                        await asyncio.shield(owner.wait_task)
+                    owner.reaped_return_code = owner.wait_task.result()
+                elif owner.reaped_return_code is None:
+                    owner.reaped_return_code = owner_process.returncode
+                await self._release_owner(execution_id, owner)
+            except BaseException as exc:
+                await self._retain_orphan(execution_id, owner, error=exc)
+                raise
+
+    async def _await_cleanup(self, awaitable) -> None:
+        """Finish cleanup despite repeated caller cancellation."""
+        task = asyncio.ensure_future(awaitable)
+        cancelled = False
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                cancelled = True
+                continue
+        await task
+        if cancelled:
+            raise asyncio.CancelledError()
+
+    async def close(self) -> None:
+        if self._state == "closed" and self.terminal_closed:
+            return
+        if self._state == "open":
+            self._state = "closing"
+        if self._close_task is None or self._close_task.done():
+            self._close_task = asyncio.ensure_future(self._run_close())
+        await asyncio.shield(self._close_task)
+
+    async def _run_close(self) -> None:
+        errors: list[BaseException] = []
+        execution_ids = tuple(
+            sorted(set(self._active) | set(self._pending_spawns) | set(self._orphans))
+        )
+        for execution_id in execution_ids:
+            try:
+                await self._await_cleanup(self._terminate_process(execution_id))
+            except BaseException as exc:  # noqa: BLE001 - retain owner for retry
+                errors.append(exc)
+        if errors or self._active or self._pending_spawns or self._orphans:
+            self._state = "quarantined"
             self._quarantined = True
-            process.kill()
-            await process.wait()
+            cause = errors[0] if errors else None
+            raise RuntimeError("Windows sandbox backend cleanup is unproven") from cause
+        self._quarantined = False
+        self._state = "closed"
 
     def owned_resources(self) -> tuple[str, ...]:
-        return tuple(f"windows-helper:{key}" for key in sorted(self._active))
+        resources = [f"windows-helper:{key}" for key in sorted(self._active)]
+        resources.extend(
+            f"windows-helper-spawn:{key}" for key in sorted(self._pending_spawns)
+        )
+        resources.extend(f"windows-helper-orphan:{key}" for key in sorted(self._orphans))
+        return tuple(resources)
 
     @property
     def terminal_closed(self) -> bool:
-        return not self._active and not self._quarantined
+        return (
+            self._state == "closed"
+            and not self._active
+            and not self._pending_spawns
+            and not self._orphans
+            and not self._quarantined
+        )
 
     def terminal_postcondition(self) -> bool:
         return self.terminal_closed
@@ -1676,14 +2030,20 @@ def _resolve_bwrap_path() -> str:
 
 
 def _linux_sandbox_launcher() -> Path | None:
-    """Resolve the reviewed Rust inner TCB.
+    """Resolve the reviewed Rust execution inner TCB.
 
     P1-1 (round-13): secure production mode
     validates the launcher via ``_validate_tcb_binary`` (canonical path,
     owner/mode, parent chain) — the same checks the browser path uses.
-    Dev mode accepts any candidate that is a regular executable file.
+    Production Docker/systemd deployments must provide a dedicated
+    capability-free execution copy through
+    ``KHAOS_EXECUTION_SANDBOX_LAUNCHER``.  The browser launcher remains a
+    separate ``KHAOS_SANDBOX_LAUNCHER`` because only its authenticated helper
+    path needs the file capability for ``setns``; it is never a coding
+    execution fallback.  Dev mode accepts any candidate that is a regular
+    executable file, but still keeps the browser authority path separate.
     """
-    configured = os.environ.get("KHAOS_SANDBOX_LAUNCHER", "").strip()
+    configured = os.environ.get("KHAOS_EXECUTION_SANDBOX_LAUNCHER", "").strip()
     candidates: list[Path] = []
     if configured:
         candidates.append(Path(configured).expanduser())
@@ -1698,7 +2058,7 @@ def _linux_sandbox_launcher() -> Path | None:
             repository_root / "rust" / "khaos-core" / "target" / "debug"
             / "khaos-sandbox-launcher"
         )
-    located = shutil.which("khaos-sandbox-launcher")
+    located = shutil.which("khaos-execution-sandbox-launcher")
     if located:
         candidates.append(Path(located))
     require = not _development_mode()
@@ -1725,19 +2085,51 @@ def _development_mode() -> bool:
     return os.environ.get("KHAOS_DEV_MODE") == "1"
 
 
+def _mountinfo_has_cgroup_v2_path(path: Path, mountinfo: str) -> bool:
+    """Return whether ``path`` is on a mount whose filesystem is cgroup2."""
+    for line in mountinfo.splitlines():
+        before_separator, separator, after_separator = line.partition(" - ")
+        if not separator:
+            continue
+        fields = before_separator.split()
+        filesystem = after_separator.split()
+        if len(fields) < 5 or not filesystem or filesystem[0] != "cgroup2":
+            continue
+        mountpoint = Path(
+            re.sub(
+                r"\\([0-7]{3})",
+                lambda match: chr(int(match.group(1), 8)),
+                fields[4],
+            )
+        )
+        if path == mountpoint or mountpoint in path.parents:
+            return True
+    return False
+
+
+def _path_is_on_cgroup_v2_mount(path: Path) -> bool:
+    """Check the kernel mount table instead of trusting a directory marker."""
+    try:
+        mountinfo = Path("/proc/self/mountinfo").read_text(encoding="ascii")
+    except (OSError, UnicodeError):
+        return False
+    return _mountinfo_has_cgroup_v2_path(path, mountinfo)
+
+
 def _linux_cgroup_root() -> Path | None:
     """Return a writable delegated cgroup-v2 subtree, if available."""
     if not sys.platform.startswith("linux"):
         return None
-    unified = Path("/sys/fs/cgroup/cgroup.controllers")
-    if not unified.is_file():
-        return None
     configured = os.environ.get("KHAOS_CGROUP_ROOT", "").strip()
     root = Path(configured) if configured else Path("/sys/fs/cgroup/khaos")
     try:
+        if not root.is_absolute() or root.is_symlink():
+            return None
         root.mkdir(mode=0o700, parents=True, exist_ok=True)
         canonical = root.resolve()
-        if Path("/sys/fs/cgroup") not in (canonical, *canonical.parents):
+        if not (canonical / "cgroup.controllers").is_file():
+            return None
+        if not _path_is_on_cgroup_v2_mount(canonical):
             return None
         if not os.access(canonical, os.W_OK):
             return None

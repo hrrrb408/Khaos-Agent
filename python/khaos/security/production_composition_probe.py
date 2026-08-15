@@ -10,30 +10,38 @@ audit file.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
-import subprocess
 import tempfile
 import time
 from pathlib import Path
 
-from khaos.coding.execution.platform import LinuxBubblewrapBackend
-from khaos.security.authority_broker import (
-    AuthorityBrokerError,
-    AuthorityDaemonBroker,
+from khaos.agent.approval import StepExecutionAuthority
+from khaos.coding.execution import (
+    ExecutionRequest,
+    ExecutionResult,
+    ExecutionService,
+    FileSystemAccess,
+    LinuxBubblewrapBackend,
+    NetworkPolicy,
+    PermissionProfile,
+    ProcessSupervisor,
+    ResourceBudget,
 )
-from khaos.security.authorityd_protocol import AuthorityDaemonClient
+from khaos.coding.execution.authority import ExecutionAuthority
+from khaos.coding.execution.identity import executable_identity
+from khaos.coding.execution.models import ResolvedSpawnPlan
 from khaos.security.identity_isolation import (
     IdentityIsolationError,
     LinuxProcessIdentityEvidence,
     read_linux_process_identity,
 )
 
-_BWRAP_INFO_MAX_BYTES = 8192
-_BWRAP_ERROR_MAX_BYTES = 1024
-_IDENTITY_ORACLE_TIMEOUT_SECONDS = 2.0
+_IDENTITY_ORACLE_TIMEOUT_SECONDS = 15.0
 _IDENTITY_ORACLE_RETRY_SECONDS = 0.01
+_FAILURE_DETAIL_LIMIT = 512
 
 
 def _resource_digest(command: tuple[str, ...], workspace: Path) -> str:
@@ -63,95 +71,6 @@ def _mapping_contains_pair(mapping: str, namespace_id: int, host_id: int) -> boo
     return False
 
 
-def _read_bwrap_child_pid(info_fd: int) -> int:
-    try:
-        with os.fdopen(info_fd, "r", encoding="ascii", newline="") as stream:
-            raw_info = stream.read(_BWRAP_INFO_MAX_BYTES + 1)
-    except (OSError, UnicodeError) as exc:
-        raise SystemExit("bubblewrap child identity metadata is unavailable") from exc
-    if not raw_info:
-        raise SystemExit("bubblewrap child identity metadata is unavailable")
-    if len(raw_info) > _BWRAP_INFO_MAX_BYTES:
-        raise SystemExit("bubblewrap child identity metadata exceeds the size limit")
-
-    decoder = json.JSONDecoder()
-    offset = 0
-    child_pid: int | None = None
-    try:
-        while offset < len(raw_info):
-            while offset < len(raw_info) and raw_info[offset].isspace():
-                offset += 1
-            if offset == len(raw_info):
-                break
-            info, next_offset = decoder.raw_decode(raw_info, offset)
-            offset = next_offset
-            if not isinstance(info, dict) or "child-pid" not in info:
-                continue
-            candidate = info["child-pid"]
-            if isinstance(candidate, bool) or not isinstance(candidate, int) or candidate <= 0:
-                raise SystemExit(
-                    "bubblewrap child identity metadata has no valid PID"
-                )
-            if child_pid is not None and child_pid != candidate:
-                raise SystemExit("bubblewrap child identity metadata has conflicting PIDs")
-            child_pid = candidate
-    except json.JSONDecodeError as exc:
-        preview = raw_info[:256].replace("\n", "\\n")
-        raise SystemExit(
-            f"bubblewrap child identity metadata is malformed: {preview!r}"
-        ) from exc
-    if child_pid is None:
-        raise SystemExit("bubblewrap child identity metadata has no valid PID")
-    return child_pid
-
-
-def _spawn_probe_process(
-    prefix: tuple[str, ...],
-    command: tuple[str, ...],
-    workspace: Path,
-) -> tuple[subprocess.Popen, int]:
-    info_read_fd, info_write_fd = os.pipe()
-    try:
-        process = subprocess.Popen(
-            (*prefix, "--info-fd", str(info_write_fd), "--", *command),
-            cwd=workspace,
-            env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"},
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            pass_fds=(info_write_fd,),
-            text=True,
-        )
-    except BaseException:
-        os.close(info_read_fd)
-        raise
-    finally:
-        os.close(info_write_fd)
-    return process, info_read_fd
-
-
-def _terminate_probe_process(process: subprocess.Popen) -> str:
-    """Terminate a failed probe and retain a bounded launcher diagnostic."""
-    if process.poll() is None:
-        try:
-            process.kill()
-        except ProcessLookupError:
-            pass
-    try:
-        _stdout, stderr = process.communicate(timeout=15)
-    except subprocess.TimeoutExpired:
-        try:
-            process.kill()
-        except ProcessLookupError:
-            pass
-        try:
-            _stdout, stderr = process.communicate(timeout=1)
-        except (OSError, subprocess.TimeoutExpired):
-            return ""
-    except OSError:
-        return ""
-    return stderr.strip()[:_BWRAP_ERROR_MAX_BYTES]
-
-
 def _read_linux_process_identity_when_ready(
     pid: int,
 ) -> LinuxProcessIdentityEvidence:
@@ -166,150 +85,308 @@ def _read_linux_process_identity_when_ready(
             time.sleep(_IDENTITY_ORACLE_RETRY_SECONDS)
 
 
+def _digest_payload(value: object) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _supervisor_process_tree(supervisor: ProcessSupervisor, execution_id: str) -> tuple[int, ...]:
+    """Return the supervisor-owned process and its observable descendants."""
+    active = getattr(supervisor, "_active", {}).get(execution_id)
+    if active is None or active.process.pid is None:
+        return ()
+    pending = [int(active.process.pid)]
+    seen: set[int] = set()
+    while pending:
+        pid = pending.pop()
+        if pid in seen or pid <= 0:
+            continue
+        seen.add(pid)
+        try:
+            children = Path(f"/proc/{pid}/task/{pid}/children").read_text(
+                encoding="ascii"
+            )
+        except (OSError, UnicodeError):
+            continue
+        for raw_child in children.split():
+            try:
+                pending.append(int(raw_child, 10))
+            except ValueError:
+                continue
+    return tuple(sorted(seen))
+
+
+def _matches_job_identity(
+    evidence: LinuxProcessIdentityEvidence,
+    *,
+    job_uid: int,
+    agent_uid: int,
+    agent_gid: int,
+) -> bool:
+    return (
+        evidence.uid == agent_uid
+        and evidence.euid == agent_uid
+        and evidence.gid == agent_gid
+        and evidence.egid == agent_gid
+        and _mapping_contains_pair(evidence.uid_map, job_uid, agent_uid)
+        and _mapping_contains_pair(evidence.gid_map, job_uid, agent_gid)
+    )
+
+
+def _bounded_detail(value: object) -> str:
+    """Return compact diagnostic text without leaking an unbounded payload."""
+    message = " ".join(str(value).split())
+    if not message:
+        return "<no detail>"
+    if len(message) > _FAILURE_DETAIL_LIMIT:
+        return message[: _FAILURE_DETAIL_LIMIT - 3] + "..."
+    return message
+
+
+def _failure_detail(error: BaseException) -> str:
+    """Include the real exception type and bounded message in probe failures."""
+    return f"{type(error).__name__}: {_bounded_detail(error)}"
+
+
+async def _wait_for_supervisor_job_identity(
+    supervisor: ProcessSupervisor,
+    execution_id: str,
+    *,
+    job_uid: int,
+    execution: asyncio.Task[ExecutionResult] | None = None,
+) -> LinuxProcessIdentityEvidence:
+    """Use the external proc oracle while the exact production effect runs."""
+    deadline = time.monotonic() + _IDENTITY_ORACLE_TIMEOUT_SECONDS
+    agent_uid = os.getuid()
+    agent_gid = os.getgid()
+    while True:
+        for pid in _supervisor_process_tree(supervisor, execution_id):
+            try:
+                evidence = read_linux_process_identity(pid)
+            except (IdentityIsolationError, OSError):
+                continue
+            if _matches_job_identity(
+                evidence,
+                job_uid=job_uid,
+                agent_uid=agent_uid,
+                agent_gid=agent_gid,
+            ):
+                return evidence
+        if execution is not None and execution.done():
+            try:
+                result = execution.result()
+            except asyncio.CancelledError as error:
+                raise SystemExit(
+                    "production exact-effect task was cancelled before the "
+                    "external identity oracle observed it"
+                ) from error
+            except BaseException as error:
+                raise SystemExit(
+                    "production exact-effect task failed before the external "
+                    f"identity oracle observed it ({_failure_detail(error)})"
+                ) from error
+            raise SystemExit(
+                "production exact-effect task finished before the external "
+                f"identity oracle observed it: {getattr(result, 'status', 'unknown')} "
+                f"return_code={getattr(result, 'return_code', 'unknown')} "
+                f"stderr={_bounded_detail(getattr(result, 'stderr', ''))}"
+            )
+        if time.monotonic() >= deadline:
+            raise SystemExit(
+                "external /proc identity oracle did not observe the configured "
+                "job UID/GID mapping on the ProcessSupervisor-owned tree"
+            )
+        await asyncio.sleep(_IDENTITY_ORACLE_RETRY_SECONDS)
+
+
+def _probe_request(
+    *,
+    command: tuple[str, ...],
+    workspace: Path,
+    policy_digest: str,
+) -> ExecutionRequest:
+    """Build the same immutable authority pair used by approved execution."""
+    environment = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}
+    budget = ResourceBudget(timeout_seconds=15.0, output_bytes=32 * 1024)
+    profile = PermissionProfile(
+        filesystem=FileSystemAccess.READ_ONLY,
+        workspace_roots=(workspace,),
+        environment_keys=frozenset(environment),
+        resources=budget,
+    )
+    root_info = workspace.stat()
+    executable = executable_identity(command, environment)
+    sandbox_digest = _digest_payload({"backend": "linux-bwrap", "network": "isolated"})
+    plan = ResolvedSpawnPlan(
+        principal_id="agent",
+        project_id="compose",
+        session_id="compose-session",
+        task_id="authority-composition",
+        turn_id="compose-turn",
+        step_id="compose-exact-effect",
+        workspace_generation=1,
+        workspace_root_device=int(root_info.st_dev),
+        workspace_root_inode=int(root_info.st_ino),
+        workspace_cwd_device=int(root_info.st_dev),
+        workspace_cwd_inode=int(root_info.st_ino),
+        permission_profile_digest=profile.digest(),
+        sandbox_decision_digest=sandbox_digest,
+        network_authority="network:none",
+        environment=tuple(sorted(environment.items())),
+        executable_identity=executable,
+        argv=command,
+        budget_digest=budget.digest(),
+    )
+    step = StepExecutionAuthority(
+        principal_id="agent",
+        project_id="compose",
+        session_id="compose-session",
+        task_id="authority-composition",
+        turn_id="compose-turn",
+        step_id="compose-exact-effect",
+        tool_call_id="compose-exact-effect",
+        tool_name="production_composition_probe",
+        workspace_id="authority-composition",
+        workspace_generation=1,
+        cwd_identity=f"{root_info.st_dev}:{root_info.st_ino}",
+        permission_profile_digest=profile.digest(),
+        environment_keys=tuple(sorted(environment)),
+        environment_digest=_digest_payload(environment),
+        sandbox_backend="linux-bwrap",
+        sandbox_decision_digest=sandbox_digest,
+        executable_identity=executable,
+        network_authority="network:none",
+        target="production-composition",
+        approval_target="production-composition",
+        arguments_digest=_digest_payload({"argv": command}),
+        authorization_resource_digest=_resource_digest(command, workspace),
+        authorization_epoch=1,
+        policy_digest=policy_digest,
+        tool_schema_digest=_digest_payload("production-composition-probe-schema"),
+        tool_security_digest=_digest_payload("production-composition-probe-security"),
+        spawn_plan_digest=plan.digest(),
+        approval_receipt_digest=_digest_payload("production-composition-probe-approval"),
+    )
+    authority = ExecutionAuthority(step_authority=step, spawn_plan=plan)
+    return ExecutionRequest(
+        argv=command,
+        cwd=workspace,
+        environment=environment,
+        allowed_environment_keys=frozenset(environment),
+        network_policy=NetworkPolicy.NONE,
+        budget=budget,
+        permission_profile=profile,
+        correlation_id="authority-composition-exact",
+        workspace_root_identity=(int(root_info.st_dev), int(root_info.st_ino)),
+        workspace_cwd_identity=(int(root_info.st_dev), int(root_info.st_ino)),
+        executable_identity=executable,
+        execution_authority=authority,
+    )
+
+
+async def _run_exact_effect(
+    *,
+    request: ExecutionRequest,
+    job_uid: int,
+) -> tuple[LinuxProcessIdentityEvidence, ExecutionResult]:
+    """Run through ExecutionService -> backend -> supervisor -> native launcher."""
+    supervisor = ProcessSupervisor()
+    backend = LinuxBubblewrapBackend(supervisor)
+    service = ExecutionService(
+        backend=backend,
+        process_supervisor=supervisor,
+        principal_id="agent",
+        project_id="compose",
+        runtime_id="compose-agent",
+    )
+    execution_id = request.correlation_id
+    if execution_id is None:
+        raise SystemExit("production exact-effect request has no correlation id")
+    execution = asyncio.create_task(service.execute(request))
+    try:
+        evidence = await _wait_for_supervisor_job_identity(
+            supervisor,
+            execution_id,
+            job_uid=job_uid,
+            execution=execution,
+        )
+        result = await execution
+        if getattr(result, "status", None) != "passed":
+            raise SystemExit(
+                "production exact-effect execution did not pass: "
+                f"{getattr(result, 'status', 'unknown')} {getattr(result, 'stderr', '')}"
+            )
+        return evidence, result
+    finally:
+        if not execution.done():
+            execution.cancel()
+        await asyncio.gather(execution, return_exceptions=True)
+        await service.close()
+
+
 def main() -> int:
     if os.environ.get("KHAOS_DEV_MODE") == "1":
         raise SystemExit("production composition probe refuses KHAOS_DEV_MODE=1")
-    socket_value = os.environ.get("KHAOS_AUTHORITYD_SOCKET")
     policy_digest = os.environ.get("KHAOS_EFFECTIVE_POLICY_DIGEST")
     job_uid = os.environ.get("KHAOS_JOB_UID")
-    if not socket_value or not policy_digest or not job_uid:
+    if (
+        not os.environ.get("KHAOS_AUTHORITYD_SOCKET")
+        or not os.environ.get("KHAOS_AUTHORITYD_PUBLIC_KEY_PATH")
+        or not policy_digest
+        or not job_uid
+    ):
         raise SystemExit(
-            "production composition probe requires authority socket, policy digest, and job UID"
+            "production composition probe requires authority socket, public key, "
+            "policy digest, and job UID"
         )
-    workspace = Path(tempfile.mkdtemp(prefix="khaos-composition-"))
-    home = Path(tempfile.mkdtemp(prefix="khaos-composition-home-"))
+    # The cgroup-v2 io.max contract needs a real block-backed device. The
+    # production Compose profile mounts /app/data as a named volume; using
+    # /tmp here would make the probe depend on the container overlay device
+    # and could fail after all other isolation checks had already passed.
+    workspace_parent = Path("/app/data")
+    if not workspace_parent.is_dir():
+        raise SystemExit(
+            "production composition probe requires the mounted /app/data "
+            "workspace volume for cgroup io.max evidence"
+        )
+    workspace = Path(
+        tempfile.mkdtemp(prefix="khaos-composition-", dir=workspace_parent)
+    )
     command = (
         "/bin/sh",
         "-c",
-        "printf 'composition-probe\\n'; id -u; id -g; cat /proc/self/uid_map; cat /proc/self/gid_map; sleep 1",
+        "printf 'composition-probe\\n'; id -u; id -g; cat /proc/self/uid_map; cat /proc/self/gid_map; sleep 5",
     )
-    broker = AuthorityDaemonBroker(
-        AuthorityDaemonClient(
-            Path(socket_value),
-            expected_authority_uid=int(os.environ.get("KHAOS_AUTHORITYD_UID", "10003")),
-        )
-    )
-    capability = broker.issue(
-        broker.envelope(
-            principal_id="agent",
-            project_id="compose",
-            runtime_id="compose-agent",
-            task_id="authority-composition",
-            workspace_id="authority-composition",
-            workspace_generation=1,
-            policy_digest=policy_digest,
-            operation_class="exec.compose",
-            resource_digest=_resource_digest(command, workspace),
-        ),
-        allowed_operation="exec.*",
-    )
-    claimed = False
-    committed = False
     try:
-        broker.claim(capability)
-        claimed = True
-        prefix = LinuxBubblewrapBackend().argv_prefix(
-            workspace,
-            cwd=workspace,
-            synthetic_home=home,
-            command=("/bin/sh",),
-            environment={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"},
-            include_network_authority=False,
-            # This command only proves the authorityd -> WORM -> bwrap ->
-            # result chain. It never opens a network socket. Sharing the
-            # container network avoids requiring NET_ADMIN merely for bwrap's
-            # loopback setup; network isolation remains covered by the
-            # dedicated real-kernel Linux security gate.
-            network_mode="shared",
+        request = _probe_request(
+            command=command,
+            workspace=workspace,
+            policy_digest=policy_digest,
         )
-        process, info_fd = _spawn_probe_process(prefix, command, workspace)
-        try:
-            child_pid = _read_bwrap_child_pid(info_fd)
-            expected_job_uid = int(job_uid)
-            expected_agent_uid = os.getuid()
-            expected_agent_gid = os.getgid()
-            evidence = _read_linux_process_identity_when_ready(child_pid)
-            if (
-                evidence.uid != expected_agent_uid
-                or evidence.euid != expected_agent_uid
-                or evidence.gid != expected_agent_gid
-                or evidence.egid != expected_agent_gid
-                or not _mapping_contains_pair(
-                    evidence.uid_map, expected_job_uid, expected_agent_uid
-                )
-                or not _mapping_contains_pair(
-                    evidence.gid_map, expected_job_uid, expected_agent_gid
-                )
-            ):
-                raise SystemExit(
-                    "external /proc identity oracle did not observe the configured job UID/GID mapping"
-                )
-            stdout, stderr = process.communicate(timeout=15)
-        except BaseException as exc:
-            stderr = _terminate_probe_process(process)
-            if stderr and isinstance(exc, SystemExit) and isinstance(exc.code, str):
-                raise SystemExit(f"{exc.code}; bwrap stderr: {stderr}") from exc
-            if stderr and isinstance(exc, IdentityIsolationError):
-                raise IdentityIsolationError(f"{exc}; bwrap stderr: {stderr}") from exc
-            raise
-        completed = subprocess.CompletedProcess(
-            process.args,
-            process.returncode,
-            stdout,
-            stderr,
+        evidence, result = asyncio.run(
+            _run_exact_effect(request=request, job_uid=int(job_uid))
         )
-        if completed.returncode != 0:
-            broker.complete(
-                capability,
-                result="failed",
-                result_digest=hashlib.sha256(completed.stderr.encode()).hexdigest(),
-            )
-            committed = True
-            raise SystemExit(
-                f"production job namespace command failed: {completed.stderr.strip()}"
-            )
-        lines = completed.stdout.splitlines()
+        lines = result.stdout.splitlines()
         if len(lines) < 4 or lines[0] != "composition-probe":
             raise SystemExit("production composition probe output is malformed")
         if lines[1] != job_uid or lines[2] != job_uid or not lines[3].strip():
             raise SystemExit(
                 "production composition probe did not observe the configured job UID"
             )
-        broker.complete(
-            capability,
-            result="success",
-            result_digest=hashlib.sha256(completed.stdout.encode()).hexdigest(),
-        )
-        committed = True
-        try:
-            broker.claim(capability)
-        except AuthorityBrokerError:
-            pass
-        else:
-            raise SystemExit("completed authority receipt was reusable")
         print(
-            "production authority composition: prepare claim bwrap result success "
-            "(shared probe network; network isolation is a separate gate)"
+            "production exact-effect composition: "
+            "ExecutionService -> ProcessSupervisor -> exec.host receipt -> "
+            "native launcher -> bwrap -> child -> WORM success; "
+            f"observed job UID {evidence.uid_map.splitlines()[-1]}"
         )
         return 0
-    except BaseException:
-        if claimed and not committed:
-            try:
-                broker.complete(
-                    capability,
-                    result="unknown",
-                    result_digest=hashlib.sha256(b"composition-unknown").hexdigest(),
-                )
-            except (AuthorityBrokerError, OSError):
-                pass
-        raise
     finally:
-        for path in (workspace, home):
+        for path in (workspace,):
             try:
                 path.rmdir()
             except OSError:
                 pass
-        broker.close()
 
 
 if __name__ == "__main__":

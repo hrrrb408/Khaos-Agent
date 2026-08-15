@@ -26,6 +26,9 @@ def test_python_container_is_non_root_and_contains_no_kernel_cli() -> None:
 
     assert "USER 10001:10001" in python_stage
     assert "khaos-sandbox-launcher" in python_stage
+    assert "khaos-execution-sandbox-launcher" in python_stage
+    assert "setcap cap_sys_admin=ep /usr/local/bin/khaos-sandbox-launcher" in python_stage
+    assert "setcap cap_sys_admin=ep /usr/local/bin/khaos-execution-sandbox-launcher" not in python_stage
     assert "HOME=/var/lib/khaos" in python_stage
     assert 'CMD ["python", "-m", "khaos.cli", "start", "--socket", "/run/khaos/agent.sock", "--gateway-uid", "10002", "--gateway-gid", "0"]' in python_stage
     assert "chown khaos:root /run/khaos" in python_stage
@@ -172,6 +175,10 @@ def test_production_compose_has_independent_authorityd_sidecar() -> None:
     assert authority["environment"].count(
         "KHAOS_AUDIT_WORM_ENDPOINT=${KHAOS_AUDIT_WORM_ENDPOINT:?KHAOS_AUDIT_WORM_ENDPOINT must be an HTTPS WORM endpoint}"
     ) == 1
+    assert agent["cgroup"] == "host"
+    assert agent["cgroup_parent"] == (
+        "${KHAOS_EXECUTION_CGROUP_PARENT:?KHAOS_EXECUTION_CGROUP_PARENT must identify the delegated cgroup parent}"
+    )
     assert agent["depends_on"]["khaos-authorityd"]["condition"] == "service_healthy"
     assert "KHAOS_AUTHORITYD_SOCKET=/run/khaos-authorityd/authorityd.sock" in agent[
         "environment"
@@ -181,6 +188,18 @@ def test_production_compose_has_independent_authorityd_sidecar() -> None:
     ]
     assert "10003" in {str(value) for value in agent["group_add"]}
     assert "khaos-authority-runtime:/run/khaos-authorityd:ro" in agent["volumes"]
+    assert "${KHAOS_PRODUCTION_DATA_SOURCE:-khaos-data}:/app/data" in agent[
+        "volumes"
+    ]
+    assert (
+        "${KHAOS_EXECUTION_CGROUP_SOURCE:?KHAOS_EXECUTION_CGROUP_SOURCE must point to a delegated cgroup v2 subtree}:/run/khaos-execution-cgroup:rw"
+        in agent["volumes"]
+    )
+    assert "KHAOS_CGROUP_ROOT=/run/khaos-execution-cgroup" in agent["environment"]
+    assert (
+        "KHAOS_EXECUTION_SANDBOX_LAUNCHER=/usr/local/bin/khaos-execution-sandbox-launcher"
+        in agent["environment"]
+    )
     assert agent["security_opt"] == [
         "${KHAOS_DOCKER_SECCOMP_OPT:?KHAOS_DOCKER_SECCOMP_OPT must select an approved seccomp profile}",
         "${KHAOS_DOCKER_APPARMOR_OPT:?KHAOS_DOCKER_APPARMOR_OPT must select an approved AppArmor profile}",
@@ -192,9 +211,17 @@ def test_production_compose_has_independent_authorityd_sidecar() -> None:
 def test_compose_security_probe_supplies_only_disposable_outer_profiles() -> None:
     script = (ROOT / "scripts/compose-security-e2e.sh").read_text(encoding="utf-8")
 
+    assert "validate_docker_outer_profiles.py\" --disposable" in script
     assert 'KHAOS_DOCKER_SECCOMP_OPT:-seccomp=unconfined' in script
     assert 'KHAOS_DOCKER_APPARMOR_OPT:-apparmor=unconfined' in script
     assert 'KHAOS_DOCKER_SYSTEMPATHS_OPT:-systempaths=unconfined' in script
+    assert "KHAOS_EXECUTION_CGROUP_SOURCE" in script
+    assert "KHAOS_EXECUTION_CGROUP_PARENT" in script
+    assert "validate_agent_cgroup_parent" in script
+    assert "validate_execution_cgroup_source" in script
+    assert "KHAOS_PRODUCTION_DATA_SOURCE" in script
+    assert "validate_production_workspace_source" in script
+    assert "findmnt -T" in script
     assert "production deployment must provide host-reviewed" in script
     assert "seccomp:unconfined" not in script
     assert "apparmor:unconfined" not in script
@@ -237,10 +264,22 @@ def test_installer_never_grants_kernel_capabilities_to_python() -> None:
     installer = (ROOT / "scripts/install-native-tcb.sh").read_text(encoding="utf-8")
 
     assert "setcap cap_sys_admin=ep /usr/local/bin/khaos-sandbox-launcher" in installer
+    assert "/usr/local/bin/khaos-execution-sandbox-launcher" in installer
+    assert "setcap cap_sys_admin=ep /usr/local/bin/khaos-execution-sandbox-launcher" not in installer
     assert "khaos-browser-kernel-helper" in installer
     assert "khaos-browser-kernel-helper.sha256" in installer
     assert "setcap" not in "\n".join(
         line for line in installer.splitlines() if "python" in line.lower()
+    )
+
+
+def test_systemd_execution_launcher_is_capability_free() -> None:
+    agent = (ROOT / "packaging/systemd/khaos-agent.service").read_text(
+        encoding="utf-8"
+    )
+    assert (
+        "Environment=KHAOS_EXECUTION_SANDBOX_LAUNCHER=/usr/local/bin/"
+        "khaos-execution-sandbox-launcher" in agent
     )
 
 

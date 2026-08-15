@@ -57,5 +57,77 @@ jobs:
           if sysctl kernel.unprivileged_userns_clone >/dev/null 2>&1; then
             sudo sysctl -w kernel.unprivileged_userns_clone=1
           fi
+      - name: Delegate execution cgroup v2 subtree for production agent
+        run: |
+          set -euo pipefail
+          cgroup_driver="$(docker info --format '{{.CgroupDriver}}')"
+          case "$cgroup_driver" in
+            systemd)
+              # A hyphen-free slice name keeps the delegated parent at the
+              # host root instead of making systemd parse a nested slice path.
+              cgroup_parent="khaoscompose.slice"
+              cgroup_source="/sys/fs/cgroup/khaoscompose.slice"
+              ;;
+            cgroupfs)
+              cgroup_parent="/khaoscompose"
+              cgroup_source="/sys/fs/cgroup/khaoscompose"
+              ;;
+            *)
+              echo "unsupported Docker cgroup driver: $cgroup_driver" >&2
+              exit 1
+              ;;
+          esac
+          echo "Docker cgroup driver: $cgroup_driver"
+          echo "Delegated cgroup parent: $cgroup_parent"
+          echo "Delegated cgroup source: $cgroup_source"
+          test -f /sys/fs/cgroup/cgroup.controllers
+          for controller in cpu memory pids io; do
+            grep -qw "$controller" /sys/fs/cgroup/cgroup.controllers
+            echo "+$controller" | sudo tee /sys/fs/cgroup/cgroup.subtree_control >/dev/null
+          done
+          sudo mkdir -p "$cgroup_source"
+          for controller in cpu memory pids io; do
+            grep -qw "$controller" "$cgroup_source/cgroup.controllers"
+            echo "+$controller" | sudo tee "$cgroup_source/cgroup.subtree_control" >/dev/null
+          done
+          # The production image runs the Agent as UID 10001. Delegation must
+          # give that exact identity authority to create and configure leaves;
+          # the workflow runner itself does not receive this capability.
+          sudo chown -R 10001:10001 "$cgroup_source"
+          test -f "$cgroup_source/cgroup.controllers"
+          test -f "$cgroup_source/cgroup.procs"
+          test -f "$cgroup_source/cgroup.subtree_control"
+          for controller in cpu memory pids io; do
+            grep -qw "$controller" "$cgroup_source/cgroup.controllers"
+            grep -qw "$controller" "$cgroup_source/cgroup.subtree_control"
+          done
+          if [[ -n "$(sudo cat "$cgroup_source/cgroup.procs")" ]]; then
+            echo "execution cgroup delegation must start empty" >&2
+            exit 1
+          fi
+          echo "KHAOS_EXECUTION_CGROUP_PARENT=$cgroup_parent" >> "$GITHUB_ENV"
+          echo "KHAOS_EXECUTION_CGROUP_SOURCE=$cgroup_source" >> "$GITHUB_ENV"
+      - name: Prepare block-backed production workspace
+        run: |
+          set -euo pipefail
+          # Docker named volumes can expose an overlay/pseudo device inside
+          # the container. The exact-effect probe must exercise io.max against
+          # a real block-backed filesystem, just like the Linux kernel gate.
+          sudo truncate -s 2G /var/tmp/khaos-compose-workspace.img
+          sudo mkfs.ext4 -F -q /var/tmp/khaos-compose-workspace.img
+          sudo mkdir -p /mnt/khaos-compose-workspace
+          sudo mount -o loop,noatime /var/tmp/khaos-compose-workspace.img /mnt/khaos-compose-workspace
+          # The workflow runner validates the source before Compose starts,
+          # while the container Agent writes it as UID/GID 10001. Keep the
+          # runner as owner and grant only the Agent's exact group access.
+          sudo chown "$(id -u):10001" /mnt/khaos-compose-workspace
+          sudo chmod 0770 /mnt/khaos-compose-workspace
+          test -w /mnt/khaos-compose-workspace
+          echo "KHAOS_PRODUCTION_DATA_SOURCE=/mnt/khaos-compose-workspace" >> "$GITHUB_ENV"
       - name: Run Compose development and production E2E
         run: bash scripts/compose-security-e2e.sh
+      - name: Remove block-backed production workspace
+        if: always()
+        run: |
+          sudo umount /mnt/khaos-compose-workspace || true
+          sudo rm -f /var/tmp/khaos-compose-workspace.img

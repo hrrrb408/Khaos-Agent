@@ -29,6 +29,9 @@ install -o root -g root -m 0755 \
   rust/khaos-core/target/release/khaos-sandbox-launcher \
   /usr/local/bin/khaos-sandbox-launcher
 install -o root -g root -m 0755 \
+  rust/khaos-core/target/release/khaos-sandbox-launcher \
+  /usr/local/bin/khaos-execution-sandbox-launcher
+install -o root -g root -m 0755 \
   rust/khaos-core/target/release/khaos-exec-launcher \
   /usr/local/bin/khaos-exec-launcher
 install -o root -g root -m 0755 \

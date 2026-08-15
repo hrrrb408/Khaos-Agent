@@ -51,27 +51,62 @@ mode 0660 with an explicit Gateway UID/GID check, so group access cannot be
 turned into directory write access. The
 privileged browser kernel helper is a separate, narrowly scoped authority and
 is the only service that intentionally shares the Agent PID/network namespace.
-Compose deployments must provide an already delegated cgroup v2 subtree through
-`KHAOS_BROWSER_HELPER_CGROUP_SOURCE` (default
-`/sys/fs/cgroup/khaos-browser`). It is mounted only at the helper's
-`/run/khaos-helper/cgroup`; the helper rejects a normal directory, symlink, or
-missing cgroup controllers, so a Docker Desktop/host without that delegated
-subtree fails closed instead of silently running without process isolation.
-The production `khaos-agent` service requires three host-reviewed outer
+Compose deployments must provide two independent, already delegated cgroup v2
+subtrees. `KHAOS_EXECUTION_CGROUP_SOURCE` is required for the non-root Agent and
+is mounted only at `/run/khaos-execution-cgroup`; the Agent creates its
+per-execution leaves there with `KHAOS_CGROUP_ROOT` fixed to that mount. The
+required `KHAOS_EXECUTION_CGROUP_PARENT` must identify the same host cgroup
+parent, so the Docker service cgroup is created below the delegated boundary
+and cgroup v2 migration never crosses an undelegated common ancestor. The
+production Compose Agent uses the host cgroup namespace so the kernel accepts
+the migration into this host-delegated subtree; this does not grant the Agent
+write access to the rest of the cgroup hierarchy because only the explicit
+subtree bind mount is writable and the Agent has no `SYS_ADMIN` capability. The
+backend verifies through `/proc/self/mountinfo` that the destination is a real
+cgroup2 mount, rather than trusting a directory marker. The source must be a
+real non-symlink subtree with `cpu`, `memory`, `pids`, and `io` controllers
+enabled, and it must be delegated to the image's exact Agent UID 10001.
+The production exact-effect probe places its temporary workspace in
+`/app/data`, so `io.max` is checked against a real block-backed device rather
+than a container overlay filesystem. The Docker CI path sets
+`KHAOS_PRODUCTION_DATA_SOURCE` to a loop-backed ext4 host directory; a normal
+deployment may retain the Compose-managed volume only when its actual device
+supports the same cgroup write, otherwise the probe fails closed.
+`KHAOS_BROWSER_HELPER_CGROUP_SOURCE` (default `/sys/fs/cgroup/khaos-browser`)
+is separate and is mounted only at the privileged helper's
+`/run/khaos-helper/cgroup`. A Docker Desktop/host without both reviewed
+delegations fails closed instead of silently running without process isolation.
+The production `khaos-agent` service requires three host-reviewed, hash-pinned
 profiles through `KHAOS_DOCKER_SECCOMP_OPT`,
 `KHAOS_DOCKER_APPARMOR_OPT`, and `KHAOS_DOCKER_SYSTEMPATHS_OPT`; missing any
-variable makes Compose fail closed. Docker uses `name=value` syntax. Docker's
+variable makes Compose fail closed. Run
+`python scripts/validate_docker_outer_profiles.py --manifest <manifest>`
+before startup; it matches the exact options, hashes seccomp/AppArmor source
+files, and requires `systempaths=default`. Docker uses `name=value` syntax.
+Docker's
 default outer restrictions can block the unprivileged namespace and
 mount-propagation syscalls required by bwrap. These settings do not grant
 `SYS_ADMIN` to the Agent; they preserve the non-root outer identity while the
 Rust launcher, bwrap, Landlock, seccomp, cgroup, and authority receipt checks
 enforce the inner boundary. The disposable composition probe may explicitly
-use the three `*=unconfined` values on its temporary CI host only; they are not
-production defaults. Removing or replacing any setting requires an equivalent
-profile that passes the real composition probe; otherwise production execution
-must fail closed. The probe shares the container network for its non-network
-identity/result command and makes no network-isolation claim; that claim is
-owned by the real-kernel Linux security gate.
+use the three `*=unconfined` values on its temporary CI host only; the script
+validates that exception explicitly and they are not production defaults.
+Removing or replacing any setting requires an equivalent profile manifest that
+passes the real composition probe; otherwise production execution must fail
+closed. Khaos does not claim a universal Docker outer profile because the
+required nested-namespace compatibility is host-runtime-specific. The probe
+runs the exact `ExecutionService` ->
+`ProcessSupervisor` -> native launcher -> bwrap path with `network=none` and
+checks the supervisor-owned process tree through an external `/proc` identity
+oracle. The real-kernel Linux security gate owns the broader network-policy
+matrix.
+
+The Docker and systemd coding paths select the dedicated capability-free
+`khaos-execution-sandbox-launcher`. The separate
+`khaos-sandbox-launcher` is reserved for the browser authority transition and
+is the only launcher that may carry its narrowly scoped file capability.
+Missing or invalid execution-launcher packaging fails closed; coding execution
+does not fall back to the browser authority launcher.
 
 Long-lived state is bounded by maintenance policy: terminal chat streams,
 terminal turn journals, no-effect tool-operation claims, and approval events
