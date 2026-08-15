@@ -33,6 +33,9 @@ services:
     volumes:
       - khaos-authority-state:/var/lib/khaos-authorityd
       - khaos-authority-runtime:/run/khaos-authorityd
+      - ${KHAOS_AUDIT_WORM_CA_FILE:?KHAOS_AUDIT_WORM_CA_FILE must point to the WORM CA certificate}:/run/khaos-worm/ca.pem:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       - KHAOS_DEV_MODE=0
       - KHAOS_AUTHORITYD_SOCKET=/run/khaos-authorityd/authorityd.sock
@@ -45,6 +48,7 @@ services:
       - KHAOS_EFFECTIVE_POLICY_DIGEST=${KHAOS_EFFECTIVE_POLICY_DIGEST:?KHAOS_EFFECTIVE_POLICY_DIGEST must be compiled for production}
       - KHAOS_AUDIT_WORM_ENDPOINT=${KHAOS_AUDIT_WORM_ENDPOINT:?KHAOS_AUDIT_WORM_ENDPOINT must be an HTTPS WORM endpoint}
       - KHAOS_AUDIT_WORM_TOKEN=${KHAOS_AUDIT_WORM_TOKEN:-}
+      - SSL_CERT_FILE=/run/khaos-worm/ca.pem
     depends_on:
       khaos-authorityd-init:
         condition: service_completed_successfully
@@ -102,6 +106,14 @@ services:
         condition: service_healthy
     group_add:
       - "10003"
+    # The deployment must explicitly provide host-reviewed outer profiles.
+    # Docker security_opt uses name=value syntax. The production composition
+    # intentionally has no implicit unconfined default and fails closed when
+    # any profile is omitted. Do not add SYS_ADMIN here.
+    security_opt:
+      - "${KHAOS_DOCKER_SECCOMP_OPT:?KHAOS_DOCKER_SECCOMP_OPT must select an approved seccomp profile}"
+      - "${KHAOS_DOCKER_APPARMOR_OPT:?KHAOS_DOCKER_APPARMOR_OPT must select an approved AppArmor profile}"
+      - "${KHAOS_DOCKER_SYSTEMPATHS_OPT:?KHAOS_DOCKER_SYSTEMPATHS_OPT must select an approved system-path profile}"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import socket; s=socket.socket(socket.AF_UNIX); s.connect('/run/khaos/agent.sock'); s.close()"]

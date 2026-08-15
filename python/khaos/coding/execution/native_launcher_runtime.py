@@ -105,9 +105,14 @@ def main(argv: list[str]) -> int:
                 "interpreter",
                 staged_paths,
                 interpreter_argv0,
+                str(options.get("darwin_signature_mode") or "adhoc"),
             )
             script_path = _authority_path(
-                int(executable_fd), "script", staged_paths, command[0]
+                int(executable_fd),
+                "script",
+                staged_paths,
+                command[0],
+                str(options.get("darwin_signature_mode") or "adhoc"),
             )
             interpreter_args = tuple(
                 str(value) for value in options.get("interpreter_args", ())
@@ -125,7 +130,11 @@ def main(argv: list[str]) -> int:
             os.execve(interpreter_path, exec_argv, os.environ)
         elif executable_fd is not None:
             executable_path = _authority_path(
-                int(executable_fd), "executable", staged_paths, command[0]
+                int(executable_fd),
+                "executable",
+                staged_paths,
+                command[0],
+                str(options.get("darwin_signature_mode") or "adhoc"),
             )
             _set_limit("RLIMIT_FSIZE", options)
             _set_limit("RLIMIT_NOFILE", options)
@@ -202,6 +211,7 @@ def _parse(argv: list[str]) -> tuple[dict[str, object], list[str]]:
             "interpreter_arg",
             "authority_receipt_fd",
             "authority_public_key_fd",
+            "darwin_signature_mode",
         }:
             raise ValueError(f"unknown launcher option: {value}")
         if key == "interpreter_arg":
@@ -211,6 +221,12 @@ def _parse(argv: list[str]) -> tuple[dict[str, object], list[str]]:
         if key == "interpreter_argv0":
             if not argv[index + 1]:
                 raise ValueError("interpreter argv0 must not be empty")
+            options[key] = argv[index + 1]
+            index += 2
+            continue
+        if key == "darwin_signature_mode":
+            if argv[index + 1] not in {"preserve", "adhoc"}:
+                raise ValueError("invalid Darwin signature mode")
             options[key] = argv[index + 1]
             index += 2
             continue
@@ -337,7 +353,11 @@ def _fd_path(fd: int) -> str:
 
 
 def _authority_path(
-    fd: int, label: str, staged_paths: list[str], preferred_name: str
+    fd: int,
+    label: str,
+    staged_paths: list[str],
+    preferred_name: str,
+    darwin_signature_mode: str,
 ) -> str:
     """Return an executable-object path, staging only on macOS.
 
@@ -346,8 +366,9 @@ def _authority_path(
     descriptor was already hashed and retained across the final boundary, so
     copying it to a private, mode-0700 O_EXCL file with the original basename
     preserves the approved generation without reopening the mutable pathname.
-    macOS also requires an ad-hoc signature for copied Mach-O objects; a
-    signing failure is fail-closed.
+    macOS either preserves a validated platform CodeDirectory or applies an
+    ad-hoc signature, according to the parent process's host capability probe;
+    a signing failure is fail-closed.
     """
     if sys.platform != "darwin":
         return _fd_path(fd)
@@ -378,18 +399,17 @@ def _authority_path(
                 offset += len(chunk)
             stream.flush()
             os.fchmod(stream.fileno(), 0o700)
-        signature = subprocess.run(
-            ["/usr/bin/codesign", "-d", "--verbose=4", path],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-        if signature.returncode == 0:
-            # Preserve a valid embedded CodeDirectory from platform-signed
-            # binaries such as /bin/cat.  Replacing it with an ad-hoc
-            # signature can make macOS AMFI kill the staged process with
-            # SIGKILL even though the bytes and digest are unchanged.
-            return path
+        if darwin_signature_mode == "preserve":
+            signature = subprocess.run(
+                ["/usr/bin/codesign", "-d", "--verbose=4", path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            if signature.returncode == 0:
+                return path
+        elif darwin_signature_mode != "adhoc":
+            raise PermissionError("invalid macOS staged signature mode")
         completed = subprocess.run(
             ["/usr/bin/codesign", "--force", "--sign", "-", "--timestamp=none", path],
             stdout=subprocess.DEVNULL,

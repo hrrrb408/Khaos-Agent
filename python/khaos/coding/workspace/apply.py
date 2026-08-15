@@ -6,6 +6,7 @@ from enum import Enum
 
 from khaos.coding.workspace.manager import WorkspaceError, WorkspaceManager
 from khaos.coding.workspace.models import ChangeSet
+from khaos.security.authority import AuthorityEnvelope
 
 
 class OutputMode(str, Enum):
@@ -24,10 +25,17 @@ async def output_changeset(manager: WorkspaceManager, workspace_id: str, changes
     workspace = manager._workspaces.get(workspace_id)
     if workspace is None:
         raise WorkspaceError("workspace not found")
-    authority = workspace.authority_capability
+    authority = workspace.authority_envelope
     if authority is None:
-        raise WorkspaceError("TaskWorkspace authority capability is missing")
-    git_kwargs = {"authority": authority.derive(operation_class="git.apply")}
+        authority = workspace.authority_capability
+    if authority is None:
+        raise WorkspaceError("TaskWorkspace authority grant is missing")
+    if isinstance(authority, AuthorityEnvelope):
+        git_kwargs = {
+            "authority_grant": authority.derive(operation_class="git.apply")
+        }
+    else:
+        git_kwargs = {"authority": authority.derive(operation_class="git.apply")}
     clean = await manager._git(
         workspace.repository_root, "status", "--porcelain", **git_kwargs
     )

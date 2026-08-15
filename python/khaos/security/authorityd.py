@@ -19,6 +19,8 @@ import sys
 import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +33,7 @@ from khaos.security.authorityd_protocol import (
     AuthorityControlPlaneError,
     AuthorizationIntent,
     Ed25519KeyStore,
+    RemoteAuditUnavailableError,
     SignedAuthorizationReceipt,
     _canonical,
     _digest,
@@ -45,6 +48,21 @@ from khaos.security.identity_isolation import (
 
 logger = logging.getLogger(__name__)
 
+_RECEIPT_PREPARED = "prepared"
+_RECEIPT_PREPARING = "preparing"
+_RECEIPT_CLAIMED = "claimed"
+_RECEIPT_CLAIMING = "claiming"
+_RECEIPT_NARROWING = "narrowing"
+_RECEIPT_COMPLETING = "completing"
+_RECEIPT_REVOKING = "revoking"
+_RECEIPT_TERMINAL = "terminal"
+
+
+@dataclass
+class _ReceiptRecord:
+    receipt: SignedAuthorizationReceipt
+    state: str = _RECEIPT_PREPARED
+
 
 class AuthorityDaemon:
     """Policy-enforcing signer and two-phase audit coordinator."""
@@ -57,26 +75,106 @@ class AuthorityDaemon:
         audit_writer: AuditWriter | None,
         issuer_id: str,
         policy: Callable[[AuthorizationIntent], None],
+        max_pending_receipts: int = 1024,
+        max_pending_per_principal: int = 256,
+        terminal_tombstone_limit: int = 4096,
     ) -> None:
         if not socket_path.is_absolute() or audit_writer is None:
             raise AuthorityControlPlaneError(
                 "authorityd requires an absolute socket and independent audit writer"
             )
+        if (
+            max_pending_receipts <= 0
+            or max_pending_per_principal <= 0
+            or terminal_tombstone_limit <= 0
+        ):
+            raise ValueError("authorityd receipt quotas must be positive")
         self.socket_path = socket_path
         self.signing_key = signing_key
         self.audit_writer = audit_writer
         self.issuer_id = issuer_id
         self.policy = policy
         self._lock = threading.RLock()
+        self._audit_lock = threading.Lock()
         self._pending: dict[str, SignedAuthorizationReceipt] = {}
+        self._states: dict[str, _ReceiptRecord] = {}
+        self._terminal: dict[str, str] = {}
+        self.max_pending_receipts = max_pending_receipts
+        self.max_pending_per_principal = max_pending_per_principal
+        self.terminal_tombstone_limit = terminal_tombstone_limit
         self._closed = False
 
     @property
     def public_key_bytes(self) -> bytes:
         return self.signing_key.public_key().public_bytes_raw()
 
-    def prepare(self, intent: AuthorizationIntent) -> SignedAuthorizationReceipt:
+    @property
+    def pending_count(self) -> int:
+        self._expire_pending()
         with self._lock:
+            return len(self._pending)
+
+    def _remember_terminal_locked(self, nonce: str, state: str) -> None:
+        self._terminal[nonce] = state
+        while len(self._terminal) > self.terminal_tombstone_limit:
+            self._terminal.pop(next(iter(self._terminal)))
+
+    def _collect_expired_locked(self, *, now: float | None = None) -> list[dict[str, object]]:
+        current = time.time() if now is None else now
+        expired = [
+            nonce
+            for nonce, record in self._states.items()
+            if record.state == _RECEIPT_PREPARED and current >= record.receipt.expires_at
+        ]
+        events: list[dict[str, object]] = []
+        for nonce in expired:
+            record = self._states.pop(nonce)
+            self._pending.pop(nonce, None)
+            self._remember_terminal_locked(nonce, "expired")
+            events.append(
+                {
+                    "kind": "execution.expired",
+                    "receipt_digest": record.receipt.digest,
+                    "audit_intent_digest": record.receipt.audit_intent_digest,
+                    "issuer_id": self.issuer_id,
+                }
+            )
+        return events
+
+    def _expire_pending(self) -> None:
+        """Garbage-collect launchable receipts without holding the audit lock."""
+        with self._lock:
+            events = self._collect_expired_locked()
+        for event in events:
+            try:
+                self._append_audit(event)
+            except AuthorityControlPlaneError:
+                logger.exception("authorityd could not append receipt expiry evidence")
+
+    def _pending_for_principal_locked(self, principal_id: str) -> int:
+        return sum(
+            1
+            for record in self._states.values()
+            if record.receipt.principal_id == principal_id
+        )
+
+    def _record_locked(self, receipt: SignedAuthorizationReceipt) -> _ReceiptRecord:
+        record = self._states.get(receipt.nonce)
+        if record is None or self._pending.get(receipt.nonce) != receipt:
+            terminal = self._terminal.get(receipt.nonce)
+            suffix = f" ({terminal})" if terminal else ""
+            raise AuthorityControlPlaneError(f"receipt is unknown or revoked{suffix}")
+        return record
+
+    def prepare(self, intent: AuthorizationIntent) -> SignedAuthorizationReceipt:
+        self._expire_pending()
+        with self._lock:
+            if len(self._pending) >= self.max_pending_receipts:
+                raise AuthorityControlPlaneError("authorityd pending receipt quota is exhausted")
+            if self._pending_for_principal_locked(intent.principal_id) >= self.max_pending_per_principal:
+                raise AuthorityControlPlaneError(
+                    "authorityd pending receipt principal quota is exhausted"
+                )
             self.policy(intent)
             audit_intent = {
                 "kind": "execution.prepare",
@@ -84,7 +182,6 @@ class AuthorityDaemon:
                 "intent_digest": intent.digest,
                 "issuer_id": self.issuer_id,
             }
-            self._append_audit(audit_intent)
             issued_at = time.time()
             expires_at = issued_at + 300.0
             receipt_fields = {
@@ -111,7 +208,54 @@ class AuthorityDaemon:
                 signature=__import__("base64").b64encode(signature).decode("ascii"),
             )
             self._pending[receipt.nonce] = receipt
-            return receipt
+            self._states[receipt.nonce] = _ReceiptRecord(
+                receipt, state=_RECEIPT_PREPARING
+            )
+        try:
+            self._append_audit(audit_intent)
+        except BaseException:
+            with self._lock:
+                self._pending.pop(receipt.nonce, None)
+                self._states.pop(receipt.nonce, None)
+                self._remember_terminal_locked(receipt.nonce, "prepare-audit-failed")
+            raise
+        with self._lock:
+            record = self._record_locked(receipt)
+            if record.state != _RECEIPT_PREPARING:
+                raise AuthorityControlPlaneError("receipt preparation state changed")
+            record.state = _RECEIPT_PREPARED
+        return receipt
+
+    def claim(self, receipt: SignedAuthorizationReceipt) -> None:
+        """Move a receipt from prepared to launched before the effect starts."""
+        self._expire_pending()
+        with self._lock:
+            record = self._record_locked(receipt)
+            if record.state != _RECEIPT_PREPARED:
+                raise AuthorityControlPlaneError("receipt is not claimable")
+            receipt.verify(self.signing_key.public_key())
+            record.state = _RECEIPT_CLAIMING
+        try:
+            self._append_audit(
+                {
+                    "kind": "execution.claimed",
+                    "receipt_digest": receipt.digest,
+                    "audit_intent_digest": receipt.audit_intent_digest,
+                    "issuer_id": self.issuer_id,
+                }
+            )
+        except BaseException:
+            # A remote append may have succeeded before its response was lost;
+            # keep the receipt claimed so an uncertain launch can never be
+            # retried as a fresh effect.
+            with self._lock:
+                record = self._record_locked(receipt)
+                record.state = _RECEIPT_CLAIMED
+            raise
+        with self._lock:
+            record = self._record_locked(receipt)
+            record.state = _RECEIPT_CLAIMED
+            record.state = _RECEIPT_CLAIMED
 
     def complete(
         self,
@@ -120,17 +264,39 @@ class AuthorityDaemon:
         result: str,
         result_digest: str,
     ) -> None:
+        self._expire_pending()
+        if result not in {"success", "failed", "unknown"}:
+            raise AuthorityControlPlaneError("execution result is invalid")
+        if not result_digest:
+            raise AuthorityControlPlaneError("execution result digest is required")
+        expired_event: dict[str, object] | None = None
         with self._lock:
-            pending = self._pending.get(receipt.nonce)
-            if pending != receipt:
-                raise AuthorityControlPlaneError("receipt is unknown or already completed")
-            receipt.verify(self.signing_key.public_key())
-            if time.time() >= receipt.expires_at:
-                raise AuthorityControlPlaneError("receipt has expired")
-            if result not in {"success", "failed", "unknown"}:
-                raise AuthorityControlPlaneError("execution result is invalid")
-            if not result_digest:
-                raise AuthorityControlPlaneError("execution result digest is required")
+            record = self._record_locked(receipt)
+            receipt.verify_signature(self.signing_key.public_key())
+            if record.state == _RECEIPT_PREPARED:
+                # Preserve the old direct prepare -> complete protocol for
+                # callers that do not need a separate launch transition.
+                if time.time() >= receipt.expires_at:
+                    self._states.pop(receipt.nonce, None)
+                    self._pending.pop(receipt.nonce, None)
+                    self._remember_terminal_locked(receipt.nonce, "expired")
+                    expired_event = {
+                        "kind": "execution.expired",
+                        "receipt_digest": receipt.digest,
+                        "audit_intent_digest": receipt.audit_intent_digest,
+                        "issuer_id": self.issuer_id,
+                    }
+            elif record.state != _RECEIPT_CLAIMED:
+                raise AuthorityControlPlaneError("receipt is not completable")
+            if expired_event is None:
+                record.state = _RECEIPT_COMPLETING
+        if expired_event is not None:
+            try:
+                self._append_audit(expired_event)
+            except AuthorityControlPlaneError:
+                logger.exception("authorityd could not append receipt expiry evidence")
+            raise AuthorityControlPlaneError("receipt has expired")
+        try:
             self._append_audit(
                 {
                     "kind": f"execution.{result}",
@@ -140,7 +306,15 @@ class AuthorityDaemon:
                     "issuer_id": self.issuer_id,
                 }
             )
+        except BaseException:
+            with self._lock:
+                record = self._record_locked(receipt)
+                record.state = _RECEIPT_CLAIMED
+            raise
+        with self._lock:
             self._pending.pop(receipt.nonce, None)
+            self._states.pop(receipt.nonce, None)
+            self._remember_terminal_locked(receipt.nonce, result)
 
     def validate(
         self,
@@ -149,11 +323,17 @@ class AuthorityDaemon:
         expected_operation: str | None = None,
         expected_resource_digest: str | None = None,
     ) -> None:
+        self._expire_pending()
         with self._lock:
-            pending = self._pending.get(receipt.nonce)
-            if pending != receipt:
-                raise AuthorityControlPlaneError("receipt is unknown or revoked")
-            receipt.verify(self.signing_key.public_key())
+            record = self._record_locked(receipt)
+            if record.state == _RECEIPT_PREPARED:
+                receipt.verify(self.signing_key.public_key())
+            elif record.state == _RECEIPT_CLAIMED:
+                receipt.verify_signature(self.signing_key.public_key())
+            else:
+                raise AuthorityControlPlaneError(
+                    "receipt is in an uncommitted transition"
+                )
             if expected_operation is not None and receipt.operation != expected_operation:
                 raise AuthorityControlPlaneError("receipt operation is outside authority")
             if (
@@ -169,41 +349,78 @@ class AuthorityDaemon:
         operation: str,
         resource_digest: str,
     ) -> SignedAuthorizationReceipt:
-        self.validate(receipt)
-        if not resource_digest:
-            raise AuthorityControlPlaneError("narrowed resource scope is required")
-        intent = AuthorizationIntent(
-            principal_id=receipt.principal_id,
-            project_id=receipt.project_id,
-            runtime_id=receipt.runtime_id,
-            task_id=receipt.task_id,
-            workspace_id=receipt.workspace_id,
-            operation=operation,
-            resource_digest=(
-                receipt.resource_digest
-                if resource_digest == receipt.resource_digest
-                else derive_resource_digest(
-                    receipt.resource_digest, operation, resource_digest
-                )
-            ),
-            policy_digest=receipt.policy_digest,
-            nonce=secrets.token_hex(16),
-            authorization_epoch=receipt.authorization_epoch,
-        )
-        narrow_policy = getattr(self.policy, "check_narrow", None)
-        if callable(narrow_policy):
-            narrow_policy(receipt.operation, operation)
-        return self.prepare(intent)
+        self._expire_pending()
+        with self._lock:
+            record = self._record_locked(receipt)
+            if record.state != _RECEIPT_PREPARED:
+                raise AuthorityControlPlaneError("only a prepared receipt may be narrowed")
+            receipt.verify(self.signing_key.public_key())
+            if not resource_digest:
+                raise AuthorityControlPlaneError("narrowed resource scope is required")
+            record.state = _RECEIPT_NARROWING
+            intent = AuthorizationIntent(
+                principal_id=receipt.principal_id,
+                project_id=receipt.project_id,
+                runtime_id=receipt.runtime_id,
+                task_id=receipt.task_id,
+                workspace_id=receipt.workspace_id,
+                operation=operation,
+                resource_digest=(
+                    receipt.resource_digest
+                    if resource_digest == receipt.resource_digest
+                    else derive_resource_digest(
+                        receipt.resource_digest, operation, resource_digest
+                    )
+                ),
+                policy_digest=receipt.policy_digest,
+                nonce=secrets.token_hex(16),
+                authorization_epoch=receipt.authorization_epoch,
+            )
+            narrow_policy = getattr(self.policy, "check_narrow", None)
+            if callable(narrow_policy):
+                narrow_policy(receipt.operation, operation)
+        try:
+            return self.prepare(intent)
+        except BaseException:
+            with self._lock:
+                record = self._record_locked(receipt)
+                record.state = _RECEIPT_PREPARED
+            raise
 
     def revoke(self, receipt: SignedAuthorizationReceipt) -> None:
+        self._expire_pending()
         with self._lock:
-            self.validate(receipt)
+            record = self._record_locked(receipt)
+            if record.state != _RECEIPT_PREPARED:
+                raise AuthorityControlPlaneError(
+                    "only a prepared receipt may be revoked"
+                )
+            receipt.verify_signature(self.signing_key.public_key())
+            record.state = _RECEIPT_REVOKING
+        try:
+            self._append_audit(
+                {
+                    "kind": "execution.revoked",
+                    "receipt_digest": receipt.digest,
+                    "audit_intent_digest": receipt.audit_intent_digest,
+                    "issuer_id": self.issuer_id,
+                }
+            )
+        except BaseException:
+            with self._lock:
+                record = self._record_locked(receipt)
+                record.state = _RECEIPT_CLAIMED
+            raise
+        with self._lock:
             self._pending.pop(receipt.nonce, None)
+            self._states.pop(receipt.nonce, None)
+            self._remember_terminal_locked(receipt.nonce, "revoked")
 
     def _append_audit(self, record: dict[str, Any]) -> None:
         if self.audit_writer is None:
             raise AuthorityControlPlaneError("independent audit writer is unavailable")
-        self.audit_writer.append(record)
+        with self._audit_lock:
+            self.audit_writer.append(record)
 
 
 class JsonlAuditWriter:
@@ -370,14 +587,47 @@ def serve_unix(daemon: AuthorityDaemon, *, production: bool = True) -> None:
             validate_private_unix_socket(
                 daemon.socket_path, expected_uid=contract.authority_uid
             )
-        listener.listen(16)
-        while not daemon._closed:
-            connection, _ = listener.accept()
-            threading.Thread(
-                target=_serve_connection,
-                args=(daemon, connection, contract.agent_uid if production else None),
-                daemon=True,
-            ).start()
+        max_connections_value = os.environ.get("KHAOS_AUTHORITYD_MAX_CONNECTIONS", "32")
+        try:
+            max_connections = int(max_connections_value)
+        except ValueError as exc:
+            raise AuthorityControlPlaneError(
+                "KHAOS_AUTHORITYD_MAX_CONNECTIONS must be an integer"
+            ) from exc
+        if not 1 <= max_connections <= 128:
+            raise AuthorityControlPlaneError(
+                "KHAOS_AUTHORITYD_MAX_CONNECTIONS is outside the safe bound"
+            )
+        try:
+            connection_timeout = float(
+                os.environ.get("KHAOS_AUTHORITYD_CONNECTION_TIMEOUT", "5")
+            )
+        except ValueError as exc:
+            raise AuthorityControlPlaneError(
+                "KHAOS_AUTHORITYD_CONNECTION_TIMEOUT must be numeric"
+            ) from exc
+        if not 0 < connection_timeout <= 60:
+            raise AuthorityControlPlaneError(
+                "KHAOS_AUTHORITYD_CONNECTION_TIMEOUT is outside the safe bound"
+            )
+        listener.listen(max_connections)
+        slots = threading.BoundedSemaphore(max_connections)
+        with ThreadPoolExecutor(
+            max_workers=max_connections, thread_name_prefix="khaos-authorityd"
+        ) as executor:
+            while not daemon._closed:
+                connection, _ = listener.accept()
+                if not slots.acquire(blocking=False):
+                    connection.close()
+                    continue
+                executor.submit(
+                    _serve_connection,
+                    daemon,
+                    connection,
+                    contract.agent_uid if production else None,
+                    connection_timeout,
+                    slots,
+                )
     finally:
         listener.close()
         daemon.socket_path.unlink(missing_ok=True)
@@ -387,17 +637,33 @@ def _serve_connection(
     daemon: AuthorityDaemon,
     connection: socket.socket,
     expected_uid: int | None,
+    connection_timeout: float = 5.0,
+    slots: threading.BoundedSemaphore | None = None,
 ) -> None:
-    with connection:
-        try:
-            if expected_uid is not None and peer_uid(connection) != expected_uid:
-                raise IdentityIsolationError("authorityd peer UID is not the agent UID")
-            body = _recv_line(connection)
-            request = json.loads(body.decode("utf-8"))
-            response = _dispatch(daemon, request)
-        except (AuthorityControlPlaneError, OSError, ValueError, TypeError) as exc:
-            response = {"ok": False, "error": str(exc)}
-        connection.sendall(_canonical(response) + b"\n")
+    try:
+        with connection:
+            connection.settimeout(connection_timeout)
+            try:
+                if expected_uid is not None and peer_uid(connection) != expected_uid:
+                    raise IdentityIsolationError("authorityd peer UID is not the agent UID")
+                body = _recv_line(connection)
+                request = json.loads(body.decode("utf-8"))
+                response = _dispatch(daemon, request)
+            except RemoteAuditUnavailableError as exc:
+                response = {
+                    "ok": False,
+                    "error": str(exc),
+                    "error_code": "remote_audit_unavailable",
+                }
+            except (AuthorityControlPlaneError, OSError, ValueError, TypeError) as exc:
+                response = {"ok": False, "error": str(exc)}
+            try:
+                connection.sendall(_canonical(response) + b"\n")
+            except OSError:
+                logger.debug("authorityd client disconnected before response", exc_info=True)
+    finally:
+        if slots is not None:
+            slots.release()
 
 
 def _dispatch(daemon: AuthorityDaemon, request: object) -> dict[str, object]:
@@ -414,6 +680,10 @@ def _dispatch(daemon: AuthorityDaemon, request: object) -> dict[str, object]:
             result=str(request.get("result", "")),
             result_digest=str(request.get("result_digest", "")),
         )
+        return {"ok": True}
+    if operation == "claim":
+        receipt = SignedAuthorizationReceipt.from_dict(request.get("receipt"))
+        daemon.claim(receipt)
         return {"ok": True}
     if operation == "validate":
         receipt = SignedAuthorizationReceipt.from_dict(request.get("receipt"))

@@ -3,9 +3,10 @@
 The Windows job intentionally executes every test selected by its marker
 expression.  It is split into deterministic shards only to give each shard a
 fresh asyncio/Winsock/process state and to prevent one leaked native resource
-from starving the rest of the product suite.  Shards run serially: Winsock
-provider state is global to the hosted Windows runner, so concurrent pytest
-children can exhaust it even though each child has its own Python process.
+from starving the rest of the product suite.  Shards run serially because the
+global Winsock provider state on the hosted Windows runner is shared by
+concurrent pytest children, which can exhaust it even though each child has
+its own Python process.
 This is not a coverage filter: the parent collection is the source of truth
 and every collected node id is assigned to exactly one child process.
 """
@@ -30,7 +31,16 @@ DEFAULT_MARKER = (
     "not platform_sandbox_real and not posix_host"
 )
 TEST_ROOT = "python/tests/"
-DEDICATED_FIRST_SHARD_PREFIXES = ("python/tests/test_cli.py::",)
+# Keep tests that launch native child processes on the first fresh shard.
+# Hosted runners can accumulate process/resource state in a long-lived pytest
+# interpreter; isolating these lifecycle-sensitive files preserves the full
+# collected set while giving their HostExecutionBackend children a clean
+# parent process.
+DEDICATED_FIRST_SHARD_PREFIXES = (
+    "python/tests/test_cli.py::",
+    "python/tests/coding/test_runtime_approval_e2e.py::",
+    "python/tests/tools/test_terminal_tools.py::",
+)
 
 
 class _CollectionCapture:
@@ -148,10 +158,10 @@ def _run_parent(shards: int, marker: str) -> int:
         if nodeid.startswith(DEDICATED_FIRST_SHARD_PREFIXES)
     ]
     remaining = [nodeid for nodeid in nodeids if nodeid not in dedicated]
-    # CLI tests launch fresh Python interpreters and import asyncio.  Run them
-    # first in a clean child before any test can perturb the hosted runner's
-    # global Winsock provider state.  They remain part of the exact collected
-    # set; this is only an ordering/isolation rule, not a coverage exclusion.
+    # Native-process lifecycle tests run first in a clean child before other
+    # tests can perturb the hosted runner's process/resource state.  They
+    # remain part of the exact collected set; this is only an
+    # ordering/isolation rule, not a coverage exclusion.
     buckets[0].extend(sorted(dedicated))
     # Stable hashing keeps the same node in the same shard across retries,
     # while distributing parametrized and directory-grouped tests.

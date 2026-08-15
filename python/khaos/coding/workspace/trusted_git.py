@@ -13,15 +13,21 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import os
 import signal
 import stat
 import subprocess
+import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import Enum
+from functools import wraps
 from pathlib import Path, PurePosixPath
+from typing import Any, TypeVar
 
 from khaos.coding.execution.environment import scrub_spawn_environment
+from khaos.security.authority import AuthorityEnvelope
 from khaos.security.authority_broker import (
     AuthorityBroker,
     AuthorityBrokerError,
@@ -54,6 +60,7 @@ _ALLOWED_COMMANDS = frozenset(
 )
 _ALLOWED_WORKTREE_COMMANDS = frozenset({"add", "move", "remove"})
 _DIFF_COMMANDS = frozenset({"diff", "diff-files", "diff-index", "diff-tree"})
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -459,6 +466,169 @@ def _verify_identity(
         raise TrustedGitError(f"{label} trust policy failed")
 
 
+AuthorityInput = EffectCapability | AuthorityEnvelope
+_AsyncMethod = TypeVar("_AsyncMethod", bound=Callable[..., Awaitable[Any]])
+_SyncMethod = TypeVar("_SyncMethod", bound=Callable[..., Any])
+
+
+def _effect_result_digest(capability: EffectCapability, result: str) -> str:
+    return hashlib.sha256(f"{capability.digest}:{result}".encode("ascii")).hexdigest()
+
+
+def _finalize_effect(
+    runner: Any, capability: EffectCapability, *, result: str
+) -> None:
+    broker = runner.authority_broker
+    if broker is None:
+        raise TrustedGitError("TrustedGitRunner has no authority broker")
+    complete = getattr(broker, "complete", None)
+    if not callable(complete):
+        broker.revoke(capability)
+        return
+    try:
+        complete(
+            capability,
+            result=result,
+            result_digest=_effect_result_digest(capability, result),
+        )
+    except AuthorityBrokerError as exc:
+        # A result append can fail after the effect has run. Keep the exact
+        # claimed handle for close-time reconciliation and try the conservative
+        # terminal state immediately. The runner stays quarantined even if the
+        # retry succeeds, because another host effect must not follow ambiguity.
+        runner._authority_quarantined = True
+        pending = runner._authority_pending_effects
+        if len(pending) >= 64 and capability.nonce not in pending:
+            raise TrustedGitError(
+                "Git effect result could not be committed and quarantine quota is exhausted"
+            ) from exc
+        pending[capability.nonce] = capability
+        if result != "unknown":
+            try:
+                complete(
+                    capability,
+                    result="unknown",
+                    result_digest=_effect_result_digest(capability, "unknown"),
+                )
+            except AuthorityBrokerError:
+                logger.exception(
+                    "Git effect remains uncommitted after unknown reconciliation",
+                )
+            else:
+                pending.pop(capability.nonce, None)
+        raise TrustedGitError(
+            f"Git effect result could not be committed as {result}; runner quarantined"
+        ) from exc
+    else:
+        runner._authority_pending_effects.pop(capability.nonce, None)
+
+
+def _claim_effect(runner: Any, capability: EffectCapability) -> None:
+    broker = runner.authority_broker
+    if broker is None:
+        raise TrustedGitError("TrustedGitRunner has no authority broker")
+    claim = getattr(broker, "claim", None)
+    if callable(claim):
+        claim(capability)
+
+
+def _revoke_effect(runner: Any, capability: EffectCapability) -> None:
+    broker = runner.authority_broker
+    if broker is None:
+        return
+    try:
+        broker.revoke(capability)
+    except AuthorityBrokerError:
+        runner._authority_quarantined = True
+        pending = runner._authority_pending_effects
+        if len(pending) < 64 or capability.nonce in pending:
+            pending[capability.nonce] = capability
+        complete = getattr(broker, "complete", None)
+        if callable(complete):
+            try:
+                complete(
+                    capability,
+                    result="unknown",
+                    result_digest=_effect_result_digest(capability, "unknown"),
+                )
+            except AuthorityBrokerError:
+                logger.exception(
+                    "Git effect receipt could not be revoked or reconciled",
+                )
+            else:
+                pending.pop(capability.nonce, None)
+        else:
+            logger.exception("Git effect receipt could not be revoked")
+
+
+def _authorize_async(method: _AsyncMethod) -> _AsyncMethod:
+    @wraps(method)
+    async def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
+        # ``status`` is a composite read-only query; its nested direct Git
+        # effects obtain and finish their own receipts.
+        if len(args) > 1 and args[1] == "status":
+            return await method(self, *args, **kwargs)
+        authority = kwargs.get("authority")
+        if self._authority_quarantined:
+            raise TrustedGitError(
+                "TrustedGitRunner is quarantined because an authority result is unresolved"
+            )
+        capability = self._authority_or_fail(authority)
+        try:
+            _claim_effect(self, capability)
+        except BaseException:
+            _revoke_effect(self, capability)
+            raise
+        try:
+            result = await method(self, *args, **{**kwargs, "authority": capability})
+        except asyncio.CancelledError:
+            try:
+                _finalize_effect(self, capability, result="unknown")
+            except TrustedGitError:
+                pass
+            raise
+        except BaseException:
+            try:
+                _finalize_effect(self, capability, result="failed")
+            except TrustedGitError:
+                pass
+            raise
+        _finalize_effect(self, capability, result="success")
+        return result
+
+    return wrapped  # type: ignore[return-value]
+
+
+def _authorize_sync(method: _SyncMethod) -> _SyncMethod:
+    @wraps(method)
+    def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
+        if len(args) > 1 and args[1] == "status":
+            return method(self, *args, **kwargs)
+        authority = kwargs.get("authority")
+        if self._authority_quarantined:
+            raise TrustedGitError(
+                "TrustedGitRunner is quarantined because an authority result is unresolved"
+            )
+        capability = self._authority_or_fail(authority)
+        try:
+            _claim_effect(self, capability)
+        except BaseException:
+            _revoke_effect(self, capability)
+            raise
+        try:
+            result = method(self, *args, **{**kwargs, "authority": capability})
+        except BaseException:
+            try:
+                _finalize_effect(self, capability, result="failed")
+            except TrustedGitError:
+                pass
+            raise
+        _finalize_effect(self, capability, result="success")
+        return result
+
+    return wrapped  # type: ignore[return-value]
+
+
 @dataclass
 class TrustedGitRunner:
     """Run bounded Git operations under a broker-issued capability."""
@@ -470,6 +640,10 @@ class TrustedGitRunner:
     authority_root_identity: FileIdentity
     authority_broker: AuthorityBroker | None = None
     _owners: dict[str, TrustedGitProcessOwner] = field(default_factory=dict, init=False, repr=False)
+    _authority_pending_effects: dict[str, EffectCapability] = field(
+        default_factory=dict, init=False, repr=False
+    )
+    _authority_quarantined: bool = field(default=False, init=False, repr=False)
 
     @classmethod
     def for_authority_root(
@@ -511,14 +685,19 @@ class TrustedGitRunner:
             resources.append(key)
             if owner._late_spawn_task is not None and not owner._late_spawn_task.done():
                 resources.append(f"{key}:late-spawn")
+        if self._authority_pending_effects:
+            resources.append(f"authority-results:{len(self._authority_pending_effects)}")
         return tuple(sorted(resources))
 
     @property
     def is_quarantined(self) -> bool:
-        return any(owner.state is TrustedGitProcessState.QUARANTINED for owner in self._owners.values())
+        return self._authority_quarantined or any(
+            owner.state is TrustedGitProcessState.QUARANTINED
+            for owner in self._owners.values()
+        )
 
     def terminal_postcondition(self) -> bool:
-        return not self._owners
+        return not self._owners and not self._authority_pending_effects
 
     async def close(self) -> None:
         """Retry every retained owner and never manufacture an empty registry."""
@@ -530,10 +709,26 @@ class TrustedGitRunner:
                 errors.append(exc)
                 continue
             self._release_owner(owner)
-        if errors or self._owners:
+        broker = self.authority_broker
+        complete = getattr(broker, "complete", None) if broker is not None else None
+        if callable(complete):
+            for nonce, capability in tuple(self._authority_pending_effects.items()):
+                try:
+                    complete(
+                        capability,
+                        result="unknown",
+                        result_digest=_effect_result_digest(capability, "unknown"),
+                    )
+                except AuthorityBrokerError as exc:
+                    errors.append(exc)
+                else:
+                    self._authority_pending_effects.pop(nonce, None)
+        if errors or self._owners or self._authority_pending_effects:
             raise TrustedGitError(
                 "TrustedGitRunner close retained owned resources: "
-                + "; ".join(type(error).__name__ for error in errors)
+                + "; ".join(
+                    type(error).__name__ for error in errors
+                )
             ) from (errors[0] if errors else None)
 
     def _verify(self) -> None:
@@ -660,27 +855,51 @@ class TrustedGitRunner:
         return ("--no-optional-locks", *safe_config, *self._validate_args(args))
 
     def _authority_or_fail(
-        self, authority: EffectCapability | None
+        self, authority: AuthorityInput | None
     ) -> EffectCapability:
-        if not isinstance(authority, EffectCapability):
+        if isinstance(authority, AuthorityEnvelope):
+            operation = authority.operation_class
+            capability = self._issue_from_grant(authority)
+        elif isinstance(authority, EffectCapability):
+            operation = authority.authority.operation_class
+            capability = authority
+        else:
             raise TrustedGitError(
-                "TrustedGitRunner requires a broker-issued effect capability"
+                "TrustedGitRunner requires a broker-issued authority grant or effect capability"
             )
-        if not authority.authority.operation_class.startswith("git."):
+        if not operation.startswith("git."):
             raise TrustedGitError("Git operation authority class is invalid")
         broker = self.authority_broker
         if broker is None:
             raise TrustedGitError("TrustedGitRunner has no authority broker")
         try:
+            if capability.expires_at <= time.time():
+                capability = self._issue_from_grant(
+                    capability.authority,
+                )
             broker.validate(
-                authority,
-                expected_operation=authority.authority.operation_class,
-                expected_resource_digest=authority.resource_digest,
+                capability,
+                expected_operation=capability.authority.operation_class,
+                expected_resource_digest=capability.resource_digest,
             )
         except AuthorityBrokerError as exc:
             raise TrustedGitError(f"Git effect capability rejected: {exc}") from exc
-        return authority
+        return capability
 
+    def _issue_from_grant(self, authority: AuthorityEnvelope) -> EffectCapability:
+        broker = self.authority_broker
+        if broker is None:
+            raise TrustedGitError("TrustedGitRunner has no authority broker")
+        try:
+            return broker.issue(
+                authority,
+                allowed_operation=authority.operation_class,
+                resource_digest=authority.resource_digest,
+            )
+        except AuthorityBrokerError as exc:
+            raise TrustedGitError(f"Git authority grant could not issue an effect: {exc}") from exc
+
+    @_authorize_async
     async def run(
         self,
         repository: Path,
@@ -715,6 +934,7 @@ class TrustedGitRunner:
         output = stdout.decode("utf-8", errors="replace")
         return output if preserve_output else output.strip()
 
+    @_authorize_async
     async def run_bytes(
         self,
         repository: Path,
@@ -744,6 +964,7 @@ class TrustedGitRunner:
             raise TrustedGitError(message or "trusted Git command failed")
         return stdout
 
+    @_authorize_async
     async def run_with_input(
         self,
         repository: Path,
@@ -782,6 +1003,7 @@ class TrustedGitRunner:
             raise TrustedGitError(message or "trusted Git command failed")
         return stdout.decode("utf-8", errors="replace").strip()
 
+    @_authorize_async
     async def hash_fd(
         self,
         repository: Path,
@@ -887,6 +1109,7 @@ class TrustedGitRunner:
                 await asyncio.shield(owner.abort(cancelled=False))
             self._release_owner(owner)
 
+    @_authorize_async
     async def stream_to_file(
         self,
         repository: Path,
@@ -988,6 +1211,7 @@ class TrustedGitRunner:
                 destination.unlink(missing_ok=True)
             self._release_owner(owner)
 
+    @_authorize_async
     async def run_bytes_limited(
         self,
         repository: Path,
@@ -1107,6 +1331,7 @@ class TrustedGitRunner:
         except TimeoutError as exc:
             raise TrustedGitError("Git workspace bootstrap exceeded its time limit") from exc
 
+    @_authorize_async
     async def _materialize_blobs(
         self,
         repository: Path,
@@ -1290,6 +1515,7 @@ class TrustedGitRunner:
         )
         return not _working_tree_matches_index(listing, repository, object_id_length)
 
+    @_authorize_sync
     def run_sync(
         self,
         repository: Path,
@@ -1368,6 +1594,7 @@ class TrustedGitRunner:
         )
         return _object_id_length(object_format)
 
+    @_authorize_sync
     def run_sync_bytes(
         self,
         repository: Path,

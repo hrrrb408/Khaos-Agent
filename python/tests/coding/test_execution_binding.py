@@ -121,7 +121,10 @@ def test_native_launcher_is_required_outside_explicit_development(
         budget=ResourceBudget(),
         enforce_resource_limits=True,
     )
-    assert launch.argv[2] == "khaos.coding.execution.native_launcher_runtime"
+    assert launch.argv[:2] == (sys.executable, "-c")
+    assert launch.argv[4].endswith(
+        "/python/khaos/coding/execution/native_launcher_runtime.py"
+    )
     assert launch.start_new_session is False
 
 

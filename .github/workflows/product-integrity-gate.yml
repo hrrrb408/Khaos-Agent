@@ -74,7 +74,20 @@ jobs:
           # without it, so the browser extra is not installed here.
           uv sync --frozen --extra test --extra tui --extra tree-sitter
           echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+      - name: Run FULL Python product suite in isolated macOS shards
+        if: matrix.os == 'macos-14'
+        # Hosted macOS runs have reproduced late-process failures in the
+        # HostExecutionBackend tests after thousands of tests pass in one
+        # interpreter.  The deterministic runner collects the complete
+        # marker-filtered node set first, then runs every node exactly once in
+        # fresh serial child processes.  Its historical filename is retained
+        # for the Windows job, but its collection/sharding behavior is
+        # platform-neutral.
+        run: >-
+          uv run python scripts/run_windows_product_suite.py --shards 4
+          --marker "not browser_real and not docker_sandbox_real and not production_sandbox_real and not kernel_real and not platform_sandbox_real"
       - name: Run FULL Python product suite
+        if: matrix.os == 'ubuntu-24.04'
         # Deselect tests that need real infrastructure only the dedicated
         # Security Closure Gate jobs provide: a real Docker daemon + pulled
         # images (docker_sandbox_real / production_sandbox_real), a real

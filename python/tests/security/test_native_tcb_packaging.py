@@ -181,6 +181,24 @@ def test_production_compose_has_independent_authorityd_sidecar() -> None:
     ]
     assert "10003" in {str(value) for value in agent["group_add"]}
     assert "khaos-authority-runtime:/run/khaos-authorityd:ro" in agent["volumes"]
+    assert agent["security_opt"] == [
+        "${KHAOS_DOCKER_SECCOMP_OPT:?KHAOS_DOCKER_SECCOMP_OPT must select an approved seccomp profile}",
+        "${KHAOS_DOCKER_APPARMOR_OPT:?KHAOS_DOCKER_APPARMOR_OPT must select an approved AppArmor profile}",
+        "${KHAOS_DOCKER_SYSTEMPATHS_OPT:?KHAOS_DOCKER_SYSTEMPATHS_OPT must select an approved system-path profile}",
+    ]
+    assert "SYS_ADMIN" not in agent.get("cap_add", [])
+
+
+def test_compose_security_probe_supplies_only_disposable_outer_profiles() -> None:
+    script = (ROOT / "scripts/compose-security-e2e.sh").read_text(encoding="utf-8")
+
+    assert 'KHAOS_DOCKER_SECCOMP_OPT:-seccomp=unconfined' in script
+    assert 'KHAOS_DOCKER_APPARMOR_OPT:-apparmor=unconfined' in script
+    assert 'KHAOS_DOCKER_SYSTEMPATHS_OPT:-systempaths=unconfined' in script
+    assert "production deployment must provide host-reviewed" in script
+    assert "seccomp:unconfined" not in script
+    assert "apparmor:unconfined" not in script
+    assert "systempaths:unconfined" not in script
 
 
 def test_systemd_units_deprivilege_python_and_pin_helper_client_pid() -> None:

@@ -41,6 +41,30 @@ def test_platform_profiles_are_network_denying(tmp_path: Path):
     assert "--unshare-net" in LinuxBubblewrapBackend().argv_prefix(tmp_path)
 
 
+def test_shared_linux_network_mode_is_explicit_and_does_not_change_default(
+    tmp_path: Path,
+):
+    argv = LinuxBubblewrapBackend().argv_prefix(tmp_path, network_mode="shared")
+
+    assert "--share-net" in argv
+    assert "--unshare-net" not in argv
+
+
+def test_linux_profile_uses_minimal_device_tmpfs_without_devpts_mapping(
+    tmp_path: Path,
+):
+    argv = LinuxBubblewrapBackend().argv_prefix(tmp_path)
+
+    pairs = tuple(argv[index:index + 2] for index in range(len(argv) - 1))
+    assert ("--tmpfs", "/dev") in pairs
+    assert ("--dev", "/dev") not in tuple(
+        argv[index:index + 2] for index in range(len(argv) - 1)
+    )
+    bindings = tuple(argv[index:index + 3] for index in range(len(argv) - 2))
+    for device in ("null", "zero", "random", "urandom"):
+        assert ("--dev-bind", f"/dev/{device}", f"/dev/{device}") in bindings
+
+
 @pytest.mark.asyncio
 async def test_windows_output_reader_drains_after_first_chunk():
     class ChunkedStream:
@@ -180,6 +204,9 @@ def test_linux_profile_isolates_proc_ipc_uts_and_parent_lifetime(tmp_path: Path)
         argv.index("--proc"):argv.index("--proc") + 2
     ]
     assert "--unshare-pid" in argv
+    assert "--unshare-user" in argv
+    assert argv[argv.index("--uid") + 1] == "65534"
+    assert argv[argv.index("--gid") + 1] == "65534"
     assert "--unshare-ipc" in argv
     assert "--unshare-uts" in argv
     assert "--unshare-net" in argv
@@ -892,6 +919,11 @@ async def test_real_macos_home_metadata_and_profile_boundaries(tmp_path: Path):
     _require_or_skip("sandbox-exec")
     backend = MacOSSandboxBackend()
     availability = backend.probe_capability()
+    if (
+        not availability.available
+        and os.environ.get("KHAOS_DEV_MODE") == "1"
+    ):
+        pytest.skip(availability.reason)
     assert availability.available, availability.reason
     workspace = tmp_path / "workspace"
     workspace.mkdir()

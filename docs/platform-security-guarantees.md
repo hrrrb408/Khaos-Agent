@@ -90,9 +90,31 @@ because it would not actually reach the broker.
 
 | Platform | Production guarantee | Unsupported behavior |
 |---|---|---|
-| Linux | non-root, zero-capability Python; bwrap filesystem isolation; cgroup v2 budgets; root Rust helper as the sole netns/veth/nft/cgroup authority; default-deny browser egress | missing launcher/helper/cgroup delegation rejects execution; no Host, `ip`, `nft`, or proxy-only fallback |
+| Linux | non-root, zero-capability Python; bwrap filesystem isolation with a dedicated job user namespace UID/GID; cgroup v2 budgets; root Rust helper as the sole netns/veth/nft/cgroup authority; default-deny browser egress | missing launcher/helper/cgroup delegation/user namespace rejects execution; no Host, `ip`, `nft`, or proxy-only fallback |
 | macOS | `sandbox-exec` Seatbelt profile restricts content, metadata, directory listing, credential roots, Mach services, network and writable workspace boundaries | no browser kernel namespace claim; a failed probe or invalid launcher rejects execution |
 | Windows | native helper after a passing probe: native commands and trusted Python under `network=none` use an OS-issued AppContainer low-box; trusted Python stages the resolved base executable and grants exact temporary ACLs only to the disposable runtime tree; brokered mode uses a restricted primary token and exact loopback-only WFP rules; all paths use child-process policy, a one-process Job Object, and transactional workspace ACL | missing helper/probe evidence, non-native command, ACL/firewall/token/AppContainer failure, or unsupported network endpoint rejects execution; never falls back to Host |
+
+For the production Docker composition, `khaos-agent` requires three
+host-reviewed outer profiles supplied through
+`KHAOS_DOCKER_SECCOMP_OPT`, `KHAOS_DOCKER_APPARMOR_OPT`, and
+`KHAOS_DOCKER_SYSTEMPATHS_OPT`; `compose.prod.yaml` fails closed if any is
+missing. Docker uses `name=value` syntax. Docker's default outer restrictions
+can block the unprivileged namespace and mount-propagation syscalls needed to
+create the bwrap boundary. These profiles are container-composition
+compatibility controls, not payload authorization: the Agent remains UID
+10001, receives no `SYS_ADMIN` capability through Compose, and the Rust
+launcher, bwrap mount boundary, Landlock, seccomp, cgroup, and authority receipt
+checks remain mandatory. The disposable composition probe may explicitly use
+`seccomp=unconfined`, `apparmor=unconfined`, and `systempaths=unconfined` on its
+temporary CI host only; those values are not production defaults. Deployments
+that cannot preserve an equivalent passing composition must refuse production
+execution; they must not grant `SYS_ADMIN` to Python or fall back to Host
+execution.
+
+The composition probe itself uses the container's existing network namespace
+for its non-network identity/result command, so it does not claim network
+isolation. The real-kernel Linux security gate remains the authority for the
+`--unshare-net` proof.
 
 `KHAOS_DEV_MODE=1` is an explicit development-only mode. It is not a weaker
 production profile and must never generate production security evidence.

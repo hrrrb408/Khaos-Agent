@@ -57,6 +57,21 @@ Compose deployments must provide an already delegated cgroup v2 subtree through
 `/run/khaos-helper/cgroup`; the helper rejects a normal directory, symlink, or
 missing cgroup controllers, so a Docker Desktop/host without that delegated
 subtree fails closed instead of silently running without process isolation.
+The production `khaos-agent` service requires three host-reviewed outer
+profiles through `KHAOS_DOCKER_SECCOMP_OPT`,
+`KHAOS_DOCKER_APPARMOR_OPT`, and `KHAOS_DOCKER_SYSTEMPATHS_OPT`; missing any
+variable makes Compose fail closed. Docker uses `name=value` syntax. Docker's
+default outer restrictions can block the unprivileged namespace and
+mount-propagation syscalls required by bwrap. These settings do not grant
+`SYS_ADMIN` to the Agent; they preserve the non-root outer identity while the
+Rust launcher, bwrap, Landlock, seccomp, cgroup, and authority receipt checks
+enforce the inner boundary. The disposable composition probe may explicitly
+use the three `*=unconfined` values on its temporary CI host only; they are not
+production defaults. Removing or replacing any setting requires an equivalent
+profile that passes the real composition probe; otherwise production execution
+must fail closed. The probe shares the container network for its non-network
+identity/result command and makes no network-isolation claim; that claim is
+owned by the real-kernel Linux security gate.
 
 Long-lived state is bounded by maintenance policy: terminal chat streams,
 terminal turn journals, no-effect tool-operation claims, and approval events
@@ -68,5 +83,7 @@ an operator performs the signed gzip archive/tombstone workflow. Operators
 must export/archive before shortening a retention window. The SQLite audit
 chain also has an explicit signed gzip export; it never deletes rows, so
 database rotation remains a separately approved administrative action. The
-SQLite audit hash chain and independent anchor remain the authoritative
-tamper-evidence record; these controls are not a remote WORM service.
+SQLite audit hash chain and independent anchor remain local diagnostic and
+forensic tamper-evidence records; they are not an independent effect authority
+or remote WORM service.  Remote WORM evidence is a separate production
+prerequisite for authorityd receipt prepare/claim/result events.

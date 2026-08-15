@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import math
 import os
 import socket
 import stat
@@ -115,6 +116,7 @@ class AuthorizationIntent:
     policy_digest: str
     nonce: str
     authorization_epoch: int
+    schema_version: int = 1
 
     def __post_init__(self) -> None:
         for name in (
@@ -129,12 +131,16 @@ class AuthorizationIntent:
             "nonce",
         ):
             _required_text(name, getattr(self, name))
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            raise AuthorityControlPlaneError(
+                "unsupported authorization intent schema"
+            )
         if self.authorization_epoch < 0:
             raise AuthorityControlPlaneError("authorization_epoch is invalid")
 
     def payload(self) -> dict[str, object]:
         return {
-            "schema_version": 1,
+            "schema_version": self.schema_version,
             "principal_id": self.principal_id,
             "project_id": self.project_id,
             "runtime_id": self.runtime_id,
@@ -194,6 +200,8 @@ class SignedAuthorizationReceipt:
             raise AuthorityControlPlaneError("unsupported authorization receipt")
         if self.expires_at <= self.issued_at:
             raise AuthorityControlPlaneError("authorization receipt expiry is invalid")
+        if not math.isfinite(self.issued_at) or not math.isfinite(self.expires_at):
+            raise AuthorityControlPlaneError("authorization receipt timestamps are invalid")
         if self.expires_at - self.issued_at > MAX_TTL_SECONDS:
             raise AuthorityControlPlaneError("authorization receipt TTL is too long")
         if self.authorization_epoch < 0:
@@ -255,17 +263,22 @@ class SignedAuthorizationReceipt:
                 "authorization receipt fields are malformed"
             ) from exc
 
-    def verify(
-        self, public_key: Ed25519PublicKey, *, now: float | None = None
-    ) -> None:
-        current = time.time() if now is None else now
-        if current >= self.expires_at:
-            raise AuthorityControlPlaneError("authorization receipt has expired")
+    def verify_signature(self, public_key: Ed25519PublicKey) -> None:
+        """Verify authenticity without applying the launch-time expiry gate."""
         try:
             signature = base64.b64decode(self.signature.encode("ascii"), validate=True)
             public_key.verify(signature, _canonical(self.unsigned_payload()))
         except (InvalidSignature, ValueError, UnicodeError) as exc:
             raise AuthorityControlPlaneError("authorization receipt signature is invalid") from exc
+
+    def verify(
+        self, public_key: Ed25519PublicKey, *, now: float | None = None
+    ) -> None:
+        """Verify a receipt that is still eligible to start a new effect."""
+        current = time.time() if now is None else now
+        if current >= self.expires_at:
+            raise AuthorityControlPlaneError("authorization receipt has expired")
+        self.verify_signature(public_key)
 
 
 class Ed25519KeyStore:
@@ -392,11 +405,12 @@ class AuthorityDaemonClient:
         except (UnicodeError, json.JSONDecodeError) as exc:
             raise AuthorityControlPlaneError("authorityd returned malformed data") from exc
         if not isinstance(decoded, dict) or decoded.get("ok") is not True:
-            raise AuthorityControlPlaneError(
-                str(decoded.get("error", "authorityd rejected request"))
-                if isinstance(decoded, dict)
-                else "authorityd returned an invalid response"
-            )
+            if isinstance(decoded, dict):
+                message = str(decoded.get("error", "authorityd rejected request"))
+                if decoded.get("error_code") == "remote_audit_unavailable":
+                    raise RemoteAuditUnavailableError(message)
+                raise AuthorityControlPlaneError(message)
+            raise AuthorityControlPlaneError("authorityd returned an invalid response")
         return decoded
 
     def prepare(self, intent: AuthorizationIntent) -> SignedAuthorizationReceipt:
@@ -425,6 +439,10 @@ class AuthorityDaemonClient:
             raise UnknownExecutionError(
                 "execution result could not be committed to authorityd"
             ) from exc
+
+    def claim(self, receipt: SignedAuthorizationReceipt) -> None:
+        """Claim a prepared receipt immediately before starting an effect."""
+        self.request({"operation": "claim", "receipt": receipt.to_dict()})
 
     def validate(
         self,
@@ -513,6 +531,10 @@ class ExecutionAuditControlPlane:
 
     def prepare(self, intent: AuthorizationIntent) -> SignedAuthorizationReceipt:
         return self.client.prepare(intent)
+
+    def claim(self, receipt: SignedAuthorizationReceipt) -> None:
+        """Record the authorize-then-launch transition."""
+        self.client.claim(receipt)
 
     def complete(
         self,

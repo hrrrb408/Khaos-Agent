@@ -467,19 +467,12 @@ mod unix {
 
     #[cfg(target_os = "macos")]
     fn sign_staged_file(path: &std::path::Path) -> io::Result<()> {
-        // Preserve an embedded platform CodeDirectory when the source already
-        // has one.  Replacing the signature on a platform binary such as
-        // /bin/cat with an ad-hoc signature can make macOS AMFI terminate the
-        // staged process with SIGKILL even though its bytes and digest are
-        // unchanged.  Unsigned objects still receive an ad-hoc signature;
-        // failure remains hard failure rather than a pathname fallback.
-        let existing = Command::new("/usr/bin/codesign")
-            .args(["-d", "--verbose=4"])
-            .arg(path)
-            .output()?;
-        if existing.status.success() {
-            return Ok(());
-        }
+        // A copied platform binary can retain an embedded CodeDirectory while
+        // still being rejected by AMFI at its new path.  Re-sign the staged
+        // generation after the descriptor digest has been verified.  The
+        // executable code and all authority-relevant source bytes came from
+        // that verified descriptor; the new ad-hoc signature is relocation
+        // metadata required for the disposable staging path.
         let status = Command::new("/usr/bin/codesign")
             .args(["--force", "--sign", "-", "--timestamp=none"])
             .arg(path)

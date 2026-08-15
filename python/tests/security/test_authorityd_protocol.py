@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
+import threading
+import time
 from dataclasses import replace
 from pathlib import Path
+from socket import socketpair
 
+import khaos.security.authorityd as authorityd_module
+import khaos.security.authorityd_protocol as authorityd_protocol_module
 import pytest
 from khaos.coding.execution.identity import (
     executable_identity,
@@ -22,9 +28,11 @@ from khaos.security.authority_broker import (
 from khaos.security.authorityd import (
     AuthorityDaemon,
     AuthorityPolicyKernel,
+    _serve_connection,
     build_production_daemon,
 )
 from khaos.security.authorityd_protocol import (
+    AUTHORITYD_PROTOCOL,
     AuthorityControlPlaneError,
     AuthorizationIntent,
     Ed25519KeyStore,
@@ -39,6 +47,19 @@ class _MemoryWorm:
 
     def append(self, record: dict[str, object]) -> None:
         self.records.append(record)
+
+
+class _BlockingWorm(_MemoryWorm):
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def append(self, record: dict[str, object]) -> None:
+        self.entered.set()
+        if not self.release.wait(timeout=2):
+            raise TimeoutError("test WORM did not release")
+        super().append(record)
 
 
 def _intent() -> AuthorizationIntent:
@@ -78,6 +99,150 @@ def test_authorityd_prepare_and_complete_are_two_phase(tmp_path: Path) -> None:
     ]
     with pytest.raises(AuthorityControlPlaneError):
         daemon.complete(receipt, result="success", result_digest="again")
+
+
+def test_claimed_receipt_can_commit_after_launch_ttl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = [100.0]
+    monkeypatch.setattr(authorityd_module.time, "time", lambda: clock[0])
+    monkeypatch.setattr(authorityd_protocol_module.time, "time", lambda: clock[0])
+    worm = _MemoryWorm()
+    daemon = AuthorityDaemon(
+        socket_path=tmp_path / "authorityd.sock",
+        signing_key=Ed25519KeyStore.load_or_create(tmp_path / "key.pem", create=True),
+        audit_writer=worm,
+        issuer_id="test-authorityd",
+        policy=lambda _intent: None,
+    )
+    receipt = daemon.prepare(_intent())
+    daemon.claim(receipt)
+    clock[0] = 401.0
+    daemon.complete(receipt, result="success", result_digest="late-result")
+    assert daemon.pending_count == 0
+    assert [record["kind"] for record in worm.records] == [
+        "execution.prepare",
+        "execution.claimed",
+        "execution.success",
+    ]
+
+
+def test_expired_prepared_receipts_are_gc_bounded_and_cannot_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = [100.0]
+    monkeypatch.setattr(authorityd_module.time, "time", lambda: clock[0])
+    monkeypatch.setattr(authorityd_protocol_module.time, "time", lambda: clock[0])
+    daemon = AuthorityDaemon(
+        socket_path=tmp_path / "authorityd.sock",
+        signing_key=Ed25519KeyStore.load_or_create(tmp_path / "key.pem", create=True),
+        audit_writer=_MemoryWorm(),
+        issuer_id="test-authorityd",
+        policy=lambda _intent: None,
+        max_pending_receipts=4,
+        max_pending_per_principal=4,
+        terminal_tombstone_limit=2,
+    )
+    receipts = [
+        daemon.prepare(replace(_intent(), nonce=f"nonce-{index}"))
+        for index in range(4)
+    ]
+    with pytest.raises(AuthorityControlPlaneError, match="quota"):
+        daemon.prepare(replace(_intent(), nonce="nonce-over-quota"))
+    clock[0] = 401.0
+    assert daemon.pending_count == 0
+    with pytest.raises(AuthorityControlPlaneError, match="expired|unknown"):
+        daemon.validate(receipts[-1])
+    assert len(daemon._terminal) <= 2
+
+
+def test_slow_worm_does_not_hold_receipt_state_lock(tmp_path: Path) -> None:
+    worm = _BlockingWorm()
+    daemon = AuthorityDaemon(
+        socket_path=tmp_path / "authorityd.sock",
+        signing_key=Ed25519KeyStore.load_or_create(tmp_path / "key.pem", create=True),
+        audit_writer=worm,
+        issuer_id="test-authorityd",
+        policy=lambda _intent: None,
+    )
+    errors: list[BaseException] = []
+
+    def prepare() -> None:
+        try:
+            daemon.prepare(_intent())
+        except BaseException as exc:  # noqa: BLE001 - test thread transports failures
+            errors.append(exc)
+
+    worker = threading.Thread(target=prepare)
+    worker.start()
+    assert worm.entered.wait(timeout=1)
+    started = time.monotonic()
+    assert daemon.pending_count == 1
+    assert time.monotonic() - started < 0.5
+    worm.release.set()
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+    assert errors == []
+
+
+def test_incomplete_authorityd_connection_is_bounded(tmp_path: Path) -> None:
+    daemon = AuthorityDaemon(
+        socket_path=tmp_path / "authorityd.sock",
+        signing_key=Ed25519KeyStore.load_or_create(tmp_path / "key.pem", create=True),
+        audit_writer=_MemoryWorm(),
+        issuer_id="test-authorityd",
+        policy=lambda _intent: None,
+    )
+    client, server = socketpair()
+    worker = threading.Thread(
+        target=_serve_connection,
+        args=(daemon, server, None, 0.05),
+    )
+    worker.start()
+    try:
+        response = client.recv(4096)
+    finally:
+        client.close()
+        worker.join(timeout=1)
+    assert not worker.is_alive()
+    assert b'"ok":false' in response
+
+
+def test_authorityd_socket_round_trip_accepts_versioned_intent_payload(
+    tmp_path: Path,
+) -> None:
+    daemon = AuthorityDaemon(
+        socket_path=tmp_path / "authorityd.sock",
+        signing_key=Ed25519KeyStore.load_or_create(tmp_path / "key.pem", create=True),
+        audit_writer=_MemoryWorm(),
+        issuer_id="test-authorityd",
+        policy=lambda _intent: None,
+    )
+    client, server = socketpair()
+    worker = threading.Thread(
+        target=_serve_connection,
+        args=(daemon, server, None, 1.0),
+    )
+    worker.start()
+    try:
+        request = {
+            "protocol": AUTHORITYD_PROTOCOL,
+            "operation": "prepare",
+            "intent": _intent().payload(),
+        }
+        client.sendall((json.dumps(request, separators=(",", ":")) + "\n").encode())
+        response = json.loads(client.recv(4096).decode())
+    finally:
+        client.close()
+        worker.join(timeout=1)
+    assert not worker.is_alive()
+    assert response["ok"] is True
+    assert response["receipt"]["schema_version"] == 1
+
+
+def test_authorization_intent_rejects_unknown_schema_version() -> None:
+    with pytest.raises(AuthorityControlPlaneError, match="schema"):
+        replace(_intent(), schema_version=2)
 
 
 def test_production_daemon_requires_independent_audit_writer(tmp_path: Path) -> None:

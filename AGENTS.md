@@ -11,7 +11,7 @@
 
 - **办公模式**：通用 agent，对话式交互，多工具多模型
 - **Coding 模式**：agentic coding，对标 Claude Code + Codex
-- **架构**：Python（上层 Agent 逻辑）+ Go（中间层 API 网关）+ Rust（底层性能瓶颈）
+- **架构**：Python（上层 Agent 逻辑）+ Go（中间层 API 网关）+ Rust（安全关键 TCB launchers/helpers 与性能模块）
 - **协议**：MIT
 - **存储**：SQLite + FTS5
 
@@ -69,11 +69,13 @@ khaos/
 │       ├── rate/            # 限流
 │       └── platform/        # 平台接入
 │
-├── rust/                    # 底层：性能瓶颈
+├── rust/                    # 安全关键 TCB 与底层性能模块
 │   └── khaos-core/          # Phase 3：PyO3 cdylib _khaos_core
 │       ├── src/
 │       │   ├── token.rs     # Token 启发式计数
-│       │   └── executor.rs  # 并行执行器（tokio）
+│       │   ├── executor.rs  # 并行执行器（tokio）
+│       │   ├── authority_receipt.rs # Signed receipt verifier
+│       │   └── bin/         # sandbox/exec/browser kernel TCB binaries
 │       └── .cargo/config.toml # macOS dynamic_lookup 链接
 │
 ├── prompts/                 # System Prompt 文件
@@ -470,7 +472,8 @@ scope:
 **理由**：
 - Python：AI/ML 生态最丰富，prompt 工程和工具定义是 I/O 密集型，开发效率最高
 - Go：高并发低延迟，适合 API 网关、SSE 长连接、多平台接入
-- Rust：Token 解析和并行执行是 CPU 密集型高频操作，需要零开销抽象和内存安全
+- Rust：Token/并行执行是 CPU 密集型高频操作；sandbox launcher、exec launcher
+  和 browser kernel helper 同时属于安全关键 TCB，需要零开销抽象和内存安全
 
 **约束**：Python 和 Rust 通过 PyO3 FFI 通信；Go Gateway 与 Python Agent 使用
 受认证的 UDS JSON-lines RPC v2。envelope、HMAC、peer UID/PID 和 frame 限制

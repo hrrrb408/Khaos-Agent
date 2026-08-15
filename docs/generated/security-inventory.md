@@ -22,9 +22,9 @@
 - Docker base/service images found with immutable digests:
   - `Dockerfile:2`: `sha256:e51d0265072d2d9d5d320f6a44dde6b9ef13653b035098febd68cce8fa7c0bc4`
   - `Dockerfile:13`: `sha256:b18992999dbe963a45a8a4da40ac2b1975be1a776d939d098c647482bcad5cba`
-  - `Dockerfile:79`: `sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818`
-  - `Dockerfile:96`: `sha256:1699c10032ca2582ec89a24a1312d986a3f094aed3d5c1147b19880afe40e052`
-  - `Dockerfile:103`: `sha256:6baf43584bcb78f2e5847d1de515f23499913ac9f12bdf834811a3145eb11ca1`
+  - `Dockerfile:80`: `sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818`
+  - `Dockerfile:97`: `sha256:1699c10032ca2582ec89a24a1312d986a3f094aed3d5c1147b19880afe40e052`
+  - `Dockerfile:104`: `sha256:6baf43584bcb78f2e5847d1de515f23499913ac9f12bdf834811a3145eb11ca1`
 - Lockfile fingerprints:
   - `uv.lock`: `7291ab982371106b5fdcb7fe0b49d86e52e3ba3c7a2efc823b8d8395ef19dae9`
   - `python/bootstrap-requirements.txt`: `72082c05288cd1b6f61b0304a4f90f01bbcae2ec6d6262d56de5a9ff03dc5acd`
@@ -54,22 +54,22 @@
 - `python/khaos/coding/execution/authority.py`: `abce06886df49008a109a1a89391ea0ca0f8b029f79e764c8ae29aeec5d82ae5`
 - `python/khaos/coding/execution/identity.py`: `5f159cf59788242902e0010bd59a05a2f7c14dd2f8251f62cafa2a1c3cc5e265`
 - `python/khaos/coding/execution/models.py`: `8f165d586928c0cd95823b9008777b4b35281c4202c9847c9994c3d2258f6579`
-- `python/khaos/coding/execution/native_launcher.py`: `d9b9f5c66bcfad5d9f9afc918edcc9508469f268f0e2d0b3e7e5701e53966b32`
-- `python/khaos/coding/execution/platform.py`: `e950b1ab69fcc4b32d92555cfbf9b494102a7aa2801b755b35364ee860d2df0b`
+- `python/khaos/coding/execution/native_launcher.py`: `1721401d920f9cf8ebec100db58e5f6bb0f43a9dd1fd1784e83ea8d4a2da2e0b`
+- `python/khaos/coding/execution/platform.py`: `cdfd3f9fd982d4f660e41b3b0440f746496ff5b7d10afdf8d5a4f9775814451b`
 - `python/khaos/coding/execution/service.py`: `2f0ac90a3ee9955d911e53b63e3a8e4f8725315a483e8419439a2abf290b9736`
 - `python/khaos/coding/execution/binding.py`: `99f3d8eb14d80a837ecf0f0d076d556ccdb366b8798c9e0fde6c69d0bb1a5501`
-- `python/khaos/coding/execution/supervisor.py`: `bf3df250cdc175b46831a03d7a600217a057745060c478267ee7400ab76fe1b1`
-- `python/khaos/coding/workspace/manager.py`: `73ac1f0b7090a8a820189988381b89426a5d514ec79d7eb4acfa1283d1d87d68`
-- `python/khaos/coding/workspace/trusted_git.py`: `12222ce5793196472e1210c1489bbc31987e642b1ae3fbc5c21fdc2af9aee9ea`
-- `python/khaos/security/authority.py`: `512b1af6ac43568352f58f4aa8bca0d490f102aabcbf54bd366ad56b55129495`
-- `python/khaos/security/authority_broker.py`: `69c170bc5fa85e7888291a0ab2baf2f50c65ffb87a1ad2ceb5a5471d0d6140ed`
-- `python/khaos/security/authorityd.py`: `aced791d81cee978eba5610f4453ca2badae818e5dbfd6549b6d2c868dc0ef2a`
-- `python/khaos/security/authorityd_protocol.py`: `3f8e915ed325ace28ae5d8fc60ea91c6cbfbfc3f9aca28d9bcc0072495657410`
-- `python/khaos/security/identity_isolation.py`: `1be872be6bb17c50a1855058c2149d4fd2699bb39aceb74a6561c49a802296be`
+- `python/khaos/coding/execution/supervisor.py`: `0cb9e6512c9a5e0c59b88042b91a0c2973189f0ae62f36b81be019bc7c4de6a3`
+- `python/khaos/coding/workspace/manager.py`: `de189a6b91bc74096f0bfc81d37e8408979da68f7eec870bf04d6dc7fbe1ebb1`
+- `python/khaos/coding/workspace/trusted_git.py`: `4453e3f953bac05d034991c349767b40126324cb1842d7991bfba2d32e243891`
+- `python/khaos/security/authority.py`: `3155400ebab4197fe2a2d2f1b5c96f23003ee6ea81deaec299d607891f29c23d`
+- `python/khaos/security/authority_broker.py`: `10ce6036028707c7ed452ca386223157730622b648d7422823d12315566ddb23`
+- `python/khaos/security/authorityd.py`: `c50ffddb502e0216a369e72bf4ae656c9c033c55f218398aa1f7bb9a12d817ae`
+- `python/khaos/security/authorityd_protocol.py`: `fc4136f6e8c57f89d38137456198a8bbbaa7063110689cd3233c3415d4767703`
+- `python/khaos/security/identity_isolation.py`: `3c05a709c80742243604b913669af33b6addb3ab57cc7307b18a040a910cc37b`
 - `python/khaos/security/remote_audit.py`: `58a5d9a35c8446304a17e99ab6d3b20b52d9197e47a53372ac567867794207b2`
-- `python/khaos/security/network_broker.py`: `5dc51bf1257252d5ba9347573ccf3501c32a0658c03e7cf6bd1c49dff2ed48f9`
+- `python/khaos/security/network_broker.py`: `f7153d2953de77f79a5c06646f6472a527baee2e17ad671f3c2b65ef4eb30c8f`
 - `python/khaos/coding/workspace/boundary.py`: `e1a310f3bfe2b1ca085f02be14b11f35dd1b52e923c7a2893bb5a68b9a3ff91e`
-- `rust/khaos-core/src/bin/khaos-exec-launcher.rs`: `75cb64c139a99486431333cb13b1e48d75f7765a97926b1602e5cc425f47fdd5`
+- `rust/khaos-core/src/bin/khaos-exec-launcher.rs`: `c5eb7343002ecb7f74e1ca10df5d5edaf4de39f90ecc68064cb355b56b2fda71`
 - `rust/khaos-core/src/bin/khaos-sandbox-launcher.rs`: `523e5dafa9037093d624bda6ebc2c56a5b4b7ab4d8c4cfd353834928b34ad6cb`
 - `python/khaos/grpc_server.py`: `0841b23878452be967eca270b03ffc23b1f7248916a1af6570810fe4dbab8fc0`
 - `go/internal/api/handler.go`: `119a049cdc45ea2c949f558a179752edaa30409a744f3f352e888e7e829343f3`

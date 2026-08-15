@@ -18,7 +18,7 @@ import tempfile
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
 from khaos.coding.execution.binding import (
     ExecutionDirectoryBinding,
@@ -38,6 +38,7 @@ from khaos.coding.execution.environment import scrub_spawn_environment
 from khaos.coding.execution.identity import executable_identity
 from khaos.coding.execution.models import ExecutionResult, NetworkPolicy, ResourceBudget
 from khaos.coding.execution.supervisor import ProcessSupervisor
+from khaos.security.identity_isolation import linux_job_namespace_args
 
 logger = logging.getLogger(__name__)
 
@@ -1317,6 +1318,7 @@ class LinuxBubblewrapBackend:
         workspace_source: str | None = None,
         network_broker=None,
         include_network_authority: bool = True,
+        network_mode: Literal["isolated", "shared"] = "isolated",
     ) -> tuple[str, ...]:
         canonical_worktree = worktree.expanduser().absolute()
         canonical_cwd = (cwd or canonical_worktree).expanduser().absolute()
@@ -1336,7 +1338,20 @@ class LinuxBubblewrapBackend:
             "--tmpfs", "/",
             "--dir", "/home",
             "--dir", "/etc",
-            "--dev", "/dev",
+            # A full bwrap --dev also creates devpts and can require a
+            # privileged root/overflow UID mapping.  That mapping is not
+            # available to the non-root Agent inside the production Docker
+            # composition.  Keep the device namespace minimal and explicit;
+            # no host device tree or PTY namespace is needed for piped tool
+            # execution.
+            "--tmpfs", "/dev",
+            # --dev-bind is required for device access under the tmpfs's
+            # default nodev mount.  These are the only four device nodes
+            # exposed; /dev/null is needed for ordinary output redirection.
+            "--dev-bind", "/dev/null", "/dev/null",
+            "--dev-bind", "/dev/zero", "/dev/zero",
+            "--dev-bind", "/dev/random", "/dev/random",
+            "--dev-bind", "/dev/urandom", "/dev/urandom",
             "--proc", "/proc",
             "--size", str(budget.tmpfs_bytes),
             "--tmpfs", "/home/khaos",
@@ -1415,13 +1430,21 @@ class LinuxBubblewrapBackend:
         # deny-default mount construction makes unreadable roots absent.  They
         # must never be mounted merely to cover them with another mount.
         _ = unreadable_roots
+        if network_mode not in {"isolated", "shared"}:
+            raise ValueError(f"unsupported Linux bubblewrap network mode: {network_mode}")
         network_namespace = bool(
             network_broker is not None
             and getattr(network_broker, "uses_network_namespace", False)
         )
-        network_option = "--share-net" if network_namespace else "--unshare-net"
+        network_option = (
+            "--share-net"
+            if network_mode == "shared" or network_namespace
+            else "--unshare-net"
+        )
         prefix.extend((
-            network_option, "--unshare-pid", "--unshare-ipc", "--unshare-uts",
+            network_option,
+            *linux_job_namespace_args(),
+            "--unshare-pid", "--unshare-ipc", "--unshare-uts",
             "--new-session", "--die-with-parent",
             "--chdir", str(sandbox_cwd),
         ))

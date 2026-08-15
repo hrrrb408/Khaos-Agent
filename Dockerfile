@@ -46,6 +46,7 @@ COPY packaging/docker/authorityd-key-init.py /usr/local/sbin/khaos-authorityd-ke
 # Data directories.
 RUN useradd --system --uid 10001 --home-dir /nonexistent --shell /usr/sbin/nologin khaos \
     && useradd --system --uid 10003 --home-dir /nonexistent --shell /usr/sbin/nologin khaos-authority \
+    && useradd --system --uid 10004 --home-dir /nonexistent --shell /usr/sbin/nologin khaos-job \
     && chown root:root /usr/local/bin/khaos-sandbox-launcher \
     && chmod 0755 /usr/local/bin/khaos-sandbox-launcher \
     && setcap cap_sys_admin=ep /usr/local/bin/khaos-sandbox-launcher \

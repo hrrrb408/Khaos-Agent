@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from typing import TypedDict
 from urllib.parse import quote, urlsplit, urlunsplit
 
+from khaos.security.authority import AuthorityEnvelope
 from khaos.security.authority_broker import (
     AuthorityBroker,
     AuthorityBrokerError,
@@ -82,6 +83,9 @@ class NetworkLease:
     _authority_broker: AuthorityBroker | None = field(
         default=None, init=False, repr=False, compare=False
     )
+    _authority_grant: AuthorityEnvelope | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
 
     def __init__(
         self,
@@ -115,6 +119,7 @@ class NetworkLease:
             object.__setattr__(self, name, value)
         object.__setattr__(self, "_capability", None)
         object.__setattr__(self, "_authority_broker", None)
+        object.__setattr__(self, "_authority_grant", None)
 
     @classmethod
     def _from_broker(
@@ -147,6 +152,7 @@ class NetworkLease:
         )
         object.__setattr__(lease, "_capability", capability)
         object.__setattr__(lease, "_authority_broker", authority_broker)
+        object.__setattr__(lease, "_authority_grant", capability.authority)
         lease.validate()
         return lease
 
@@ -189,13 +195,29 @@ class NetworkLease:
         authority_broker = self._authority_broker
         if capability is None or authority_broker is None:
             raise NetworkBrokerError("network lease was not broker-issued by NetworkBroker")
+        if capability.expires_at <= time.time():
+            grant = self._authority_grant
+            if grant is None:
+                raise NetworkBrokerError("network lease renewal grant is missing")
+            try:
+                capability = authority_broker.issue(
+                    grant,
+                    allowed_operation=grant.operation_class,
+                    resource_digest=grant.resource_digest,
+                )
+            except AuthorityBrokerError as exc:
+                raise NetworkBrokerError(
+                    f"network lease renewal was rejected: {exc}"
+                ) from exc
+            object.__setattr__(self, "_capability", capability)
+            object.__setattr__(self, "capability_digest", capability.digest)
         if capability.digest != self.capability_digest:
             raise NetworkBrokerError("network lease capability digest does not match")
         try:
             authority_broker.validate(
                 capability,
                 expected_operation="network.connect",
-                expected_resource_digest=self.configuration_digest,
+                expected_resource_digest=capability.resource_digest,
             )
         except AuthorityBrokerError as exc:
             raise NetworkBrokerError(f"network lease attestation rejected: {exc}") from exc
@@ -442,6 +464,12 @@ class NetworkBroker:
         if self._state != "new":
             raise NetworkBrokerError(f"network broker cannot start in state {self._state}")
         try:
+            if self._capability.expires_at <= time.time():
+                self._capability = self._authority_broker.issue(
+                    self._capability.authority,
+                    allowed_operation=self._capability.authority.operation_class,
+                    resource_digest=self._capability.authority.resource_digest,
+                )
             self._authority_broker.validate(
                 self._capability,
                 expected_operation="network.connect",

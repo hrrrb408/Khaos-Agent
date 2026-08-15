@@ -124,6 +124,7 @@ class ProcessSupervisor:
         # graph.  It lives here until a later shutdown/terminate retry proves
         # that the kernel child and its watchdog are terminal.
         self._orphans: dict[str, _ActiveProcess] = {}
+        self._authority_pending_results: dict[str, EffectCapability] = {}
         self._registry_lock = asyncio.Lock()
         self._state = _SupervisorState.OPEN
         # Round-17 review §四: shared shutdown task so concurrent shutdown()
@@ -185,12 +186,15 @@ class ProcessSupervisor:
             and not self._active
             and not self._pending_spawns
             and not self._orphans
+            and not self._authority_pending_results
         )
 
     @property
     def is_quarantined(self) -> bool:
         """Round-17: True when QUARANTINED (resources may still be alive)."""
-        return self._state is _SupervisorState.QUARANTINED
+        return self._state is _SupervisorState.QUARANTINED or bool(
+            self._authority_pending_results
+        )
 
     def owned_resources(self) -> tuple[str, ...]:
         """Round-17 review §十四: descriptors of currently-held processes.
@@ -216,6 +220,10 @@ class ProcessSupervisor:
             active = self._orphans.get(execution_id)
             if active is not None and active.watchdog_task is not None and not active.watchdog_task.done():
                 resources.append(f"watchdog:{execution_id}")
+        if self._authority_pending_results:
+            resources.append(
+                f"authority-results:{len(self._authority_pending_results)}"
+            )
         return tuple(resources)
 
     def terminal_postcondition(self) -> bool:
@@ -240,6 +248,7 @@ class ProcessSupervisor:
             len(self._active) == 0
             and len(self._pending_spawns) == 0
             and len(self._orphans) == 0
+            and len(self._authority_pending_results) == 0
         )
 
     async def close(self) -> None:
@@ -247,6 +256,18 @@ class ProcessSupervisor:
         :meth:`shutdown`.  Concurrent callers observe the same result
         via the shared ``_shutdown_task``."""
         await self.shutdown()
+
+    def _retain_authority_result(self, capability: EffectCapability) -> None:
+        """Retain an unresolved claimed receipt as a supervisor resource."""
+        if capability.nonce not in self._authority_pending_results:
+            if len(self._authority_pending_results) >= 64:
+                logger.error(
+                    "execution authority quarantine quota exhausted; retaining supervisor quarantine"
+                )
+                self._state = _SupervisorState.QUARANTINED
+                return
+            self._authority_pending_results[capability.nonce] = capability
+        self._state = _SupervisorState.QUARANTINED
 
     async def run(
         self,
@@ -290,6 +311,10 @@ class ProcessSupervisor:
             raise SupervisorClosedError(
                 f"ProcessSupervisor is {self._state.value}, "
                 f"not accepting new executions"
+            )
+        if self._authority_pending_results:
+            raise SupervisorQuarantinedError(
+                "ProcessSupervisor has unresolved authority results"
             )
         watchdog_enabled = (
             enforce_resource_limits
@@ -344,6 +369,7 @@ class ProcessSupervisor:
                 directory_binding.close()
             raise PermissionError("executable identity changed before native spawn")
         authority_capability: EffectCapability | None = None
+        authority_claimed = False
         authority = None
         if use_native_launcher:
             try:
@@ -396,7 +422,10 @@ class ProcessSupervisor:
                 )
             except BaseException:
                 if authority_capability is not None:
-                    _revoke_execution_capability(authority_capability)
+                    _revoke_execution_capability(
+                        authority_capability,
+                        on_unresolved=self._retain_authority_result,
+                    )
                 if authority is not None:
                     authority.close()
                 if directory_binding is not None:
@@ -409,6 +438,27 @@ class ProcessSupervisor:
                 directory_binding.close()
             if launch is not None:
                 launch.close_owned_fds()
+            raise
+        try:
+            if authority_capability is not None:
+                _claim_execution_capability(authority_capability)
+                authority_claimed = True
+        except BaseException:
+            if authority_capability is not None:
+                _revoke_execution_capability(
+                    authority_capability,
+                    claimed=authority_claimed,
+                    on_unresolved=self._retain_authority_result,
+                )
+            if directory_binding is not None:
+                directory_binding.close()
+            if launch is not None:
+                launch.close_owned_fds()
+            await self._finish_pending_spawn(
+                execution_id,
+                pending_spawn,
+                error=RuntimeError("execution authority claim failed"),
+            )
             raise
         process: asyncio.subprocess.Process | None = None
         spawn_task = asyncio.create_task(
@@ -466,7 +516,11 @@ class ProcessSupervisor:
             raise
         except BaseException as spawn_error:
             if authority_capability is not None:
-                _revoke_execution_capability(authority_capability)
+                _revoke_execution_capability(
+                    authority_capability,
+                    claimed=authority_claimed,
+                    on_unresolved=self._retain_authority_result,
+                )
             await self._finish_pending_spawn(
                 execution_id, pending_spawn, error=spawn_error
             )
@@ -527,7 +581,11 @@ class ProcessSupervisor:
                 )
             finally:
                 if authority_capability is not None:
-                    _revoke_execution_capability(authority_capability)
+                    _revoke_execution_capability(
+                        authority_capability,
+                        claimed=authority_claimed,
+                        on_unresolved=self._retain_authority_result,
+                    )
                 if cleanup_error is None:
                     watchdog_task.cancel()
                     await asyncio.gather(watchdog_task, return_exceptions=True)
@@ -654,6 +712,7 @@ class ProcessSupervisor:
                         )
                         authority_committed = True
                     except BaseException:
+                        self._retain_authority_result(authority_capability)
                         logger.exception(
                             "execution authority result could not be committed during cancellation"
                         )
@@ -735,6 +794,7 @@ class ProcessSupervisor:
                     )
                     authority_committed = True
                 except BaseException:
+                    self._retain_authority_result(authority_capability)
                     logger.exception(
                         "execution authority result could not be committed; execution remains unknown"
                     )
@@ -938,7 +998,12 @@ class ProcessSupervisor:
         # QUARANTINED is retryable — transition back to CLOSING so we
         # attempt to terminate any remaining active processes.
         if self._state is _SupervisorState.QUARANTINED:
-            if not self._active and not self._orphans and not self._pending_spawns:
+            if (
+                not self._active
+                and not self._orphans
+                and not self._pending_spawns
+                and not self._authority_pending_results
+            ):
                 self._state = _SupervisorState.CLOSED
                 return
             self._state = _SupervisorState.CLOSING
@@ -1003,6 +1068,26 @@ class ProcessSupervisor:
                     "ProcessSupervisor shutdown: terminate(%s) failed",
                     execution_id, exc_info=True,
                 )
+        for nonce, capability in tuple(self._authority_pending_results.items()):
+            try:
+                await asyncio.shield(
+                    _commit_execution_capability(
+                        capability,
+                        result="unknown",
+                        result_digest=_execution_result_digest(
+                            "unknown", None, b"", b""
+                        ),
+                    )
+                )
+            except BaseException as exc:
+                errors.append(exc if isinstance(exc, Exception) else RuntimeError(str(exc)))
+                logger.debug(
+                    "ProcessSupervisor authority result reconciliation failed for %s",
+                    nonce,
+                    exc_info=True,
+                )
+            else:
+                self._authority_pending_results.pop(nonce, None)
         if errors:
             self._state = _SupervisorState.QUARANTINED
             raise SupervisorClosedError(
@@ -1622,15 +1707,45 @@ def _issue_execution_capability(
     return capability
 
 
-def _revoke_execution_capability(capability: EffectCapability) -> None:
+def _claim_execution_capability(capability: EffectCapability) -> None:
+    """Claim the signed receipt at the final authorize-then-spawn boundary."""
     broker = capability.authority._broker
-    revoke = getattr(broker, "revoke", None)
-    if not callable(revoke):
+    claim = getattr(broker, "claim", None)
+    if not callable(claim):
+        raise AuthorityBrokerError("execution authority has no claim operation")
+    claim(capability)
+
+
+def _revoke_execution_capability(
+    capability: EffectCapability,
+    *,
+    claimed: bool = False,
+    on_unresolved: Callable[[EffectCapability], None] | None = None,
+) -> None:
+    broker = capability.authority._broker
+    if broker is None:
         return
     try:
+        if claimed:
+            complete = getattr(broker, "complete", None)
+            if not callable(complete):
+                raise AuthorityBrokerError(
+                    "claimed execution authority has no result commit operation"
+                )
+            complete(
+                capability,
+                result="unknown",
+                result_digest=_execution_result_digest("unknown", None, b"", b""),
+            )
+            return
+        revoke = getattr(broker, "revoke", None)
+        if not callable(revoke):
+            raise AuthorityBrokerError("execution authority has no revoke operation")
         revoke(capability)
     except (AuthorityBrokerError, OSError):
         logger.exception("execution authority revoke could not be committed")
+        if on_unresolved is not None:
+            on_unresolved(capability)
 
 
 async def _commit_execution_capability(

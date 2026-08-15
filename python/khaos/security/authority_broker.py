@@ -174,11 +174,28 @@ class EffectCapability:
         if self.receipt is not None and broker is not None:
             narrow = getattr(broker, "reissue", None)
             if callable(narrow):
-                return narrow(
-                    self,
+                narrowed_resource = resource_digest or self.resource_digest
+                if self.expires_at > time.time():
+                    return narrow(
+                        self,
+                        operation_class=operation_class,
+                        resource_digest=narrowed_resource,
+                    )
+                # A receipt is a one-shot, short-lived effect handle.  The
+                # broker-owned context is the renewable authority grant; an
+                # expired handle must never be revived or narrowed through
+                # the old receipt.
+                authority = self.authority.derive(
                     operation_class=operation_class,
-                    resource_digest=resource_digest or self.resource_digest,
+                    resource_digest=narrowed_resource,
                 )
+                issue = getattr(broker, "issue", None)
+                if callable(issue):
+                    return issue(
+                        authority,
+                        allowed_operation=operation_class,
+                        resource_digest=narrowed_resource,
+                    )
         if resource_digest is not None and resource_digest != self.resource_digest:
             raise ValueError(
                 "effect capability resources can only be narrowed by a broker reissue"
@@ -284,6 +301,16 @@ def _broker_main(connection: Connection) -> None:
                     records.pop(token, None)
                     connection.send({"ok": True})
                 continue
+            if operation == "claim":
+                result = _validate_record(records, secret, request)
+                connection.send({"ok": result is None, **({} if result is None else {"error": result})})
+                continue
+            if operation == "complete":
+                result = _validate_record(records, secret, request, allow_expired=True)
+                if result is None:
+                    records.pop(str(request.get("token")), None)
+                connection.send({"ok": result is None, **({} if result is None else {"error": result})})
+                continue
             if operation == "validate":
                 result = _validate_record(records, secret, request)
                 connection.send({"ok": result is None, **({} if result is None else {"error": result})})
@@ -297,6 +324,8 @@ def _validate_record(
     records: dict[str, dict[str, Any]],
     secret: bytes,
     request: dict[str, Any],
+    *,
+    allow_expired: bool = False,
 ) -> str | None:
     token = request.get("token")
     if not isinstance(token, str):
@@ -304,7 +333,7 @@ def _validate_record(
     record = records.get(token)
     if record is None:
         return "capability is unknown or revoked"
-    if time.time() >= float(record["expires_at"]):
+    if not allow_expired and time.time() >= float(record["expires_at"]):
         records.pop(token, None)
         return "capability has expired"
     for field in (
@@ -591,6 +620,40 @@ class AuthorityBroker:
         if not response.get("ok"):
             raise AuthorityBrokerError(str(response.get("error") or "capability rejected"))
 
+    def claim(self, capability: EffectCapability) -> None:
+        """Reserve a local effect immediately before it starts."""
+        self.validate(
+            capability,
+            expected_operation=capability.authority.operation_class,
+            expected_resource_digest=capability.resource_digest,
+        )
+
+    def complete(
+        self,
+        capability: EffectCapability,
+        *,
+        result: str,
+        result_digest: str,
+    ) -> None:
+        if result not in {"success", "failed", "unknown"} or not result_digest:
+            raise AuthorityBrokerError("invalid local effect result")
+        self._call(
+            {
+                "operation": "complete",
+                "token": capability.token,
+                "context_digest": capability.context_digest,
+                "allowed_operation": capability.allowed_operation,
+                "resource_digest": capability.resource_digest,
+                "generation": capability.generation,
+                "authorization_epoch": capability.authorization_epoch,
+                "issued_at": capability.issued_at,
+                "expires_at": capability.expires_at,
+                "nonce": capability.nonce,
+                "seal": capability.seal,
+                "operation_class": capability.authority.operation_class,
+            }
+        )
+
     def revoke(self, capability: EffectCapability) -> None:
         """Revoke a capability before its expiry."""
         if not isinstance(capability, EffectCapability):
@@ -756,6 +819,24 @@ class AuthorityDaemonBroker(AuthorityBroker):
                 expected_operation=expected_operation or capability.authority.operation_class,
                 expected_resource_digest=expected_resource_digest,
             )
+        except (AuthorityControlPlaneError, TypeError, ValueError) as exc:
+            raise AuthorityBrokerError(str(exc)) from exc
+
+    def claim(self, capability: EffectCapability) -> None:
+        if not isinstance(capability, EffectCapability) or capability.receipt is None:
+            raise AuthorityBrokerError("effect claim requires a signed receipt")
+        try:
+            claim = getattr(self._authorityd, "claim", None)
+            if callable(claim):
+                claim(capability.receipt)
+            else:
+                # Compatibility for protocol test doubles from before the
+                # explicit claim transition existed.
+                self._authorityd.validate(
+                    capability.receipt,
+                    expected_operation=capability.receipt.operation,
+                    expected_resource_digest=capability.resource_digest,
+                )
         except (AuthorityControlPlaneError, TypeError, ValueError) as exc:
             raise AuthorityBrokerError(str(exc)) from exc
 
