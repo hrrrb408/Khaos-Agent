@@ -24,8 +24,9 @@ The disposable production composition probe now runs the exact
 `network=none`; its external `/proc` oracle proves the configured job mapping.
 The production Agent also requires a separate, host-reviewed delegated cgroup
 v2 subtree through `KHAOS_EXECUTION_CGROUP_SOURCE`, mounted only at
-`/sys/fs/cgroup/khaos` and fixed as `KHAOS_CGROUP_ROOT`; the browser helper's
-cgroup subtree is independent. Missing or incomplete execution delegation
-fails closed.
+`/run/khaos-execution-cgroup` and fixed as `KHAOS_CGROUP_ROOT`; the backend
+confirms the destination is a real cgroup2 mount. The browser helper's cgroup
+subtree is independent. Missing or incomplete execution delegation fails
+closed.
 The independent real-kernel network gate remains the authority for broader
 network-isolation coverage.

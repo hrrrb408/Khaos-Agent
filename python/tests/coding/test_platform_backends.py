@@ -21,6 +21,7 @@ from khaos.coding.execution.platform import (
     MacOSSandboxBackend,
     UnsupportedBackend,
     _create_linux_cgroup,
+    _mountinfo_has_cgroup_v2_path,
     _read_windows_output,
     _remove_windows_python_runtime,
     _runtime_read_roots,
@@ -268,6 +269,21 @@ def test_linux_cgroup_v2_leaf_has_hard_limits(tmp_path: Path, monkeypatch):
     assert (group / "memory.swap.max").read_text() == "0"
     assert (group / "cpu.max").read_text() == "50000 100000"
     assert "rbps=" in (group / "io.max").read_text()
+
+
+def test_cgroup_root_requires_a_real_cgroup2_mount(tmp_path: Path) -> None:
+    mountpoint = tmp_path / "execution-cgroup"
+    mountinfo = (
+        f"42 1 0:42 / {mountpoint} rw,relatime - cgroup2 cgroup rw\n"
+    )
+
+    assert _mountinfo_has_cgroup_v2_path(mountpoint / "exec-1", mountinfo)
+    assert not _mountinfo_has_cgroup_v2_path(
+        tmp_path / "ordinary-directory", mountinfo
+    )
+
+    fake_mountinfo = mountinfo.replace("cgroup2 cgroup", "tmpfs tmpfs")
+    assert not _mountinfo_has_cgroup_v2_path(mountpoint, fake_mountinfo)
 
 
 def test_linux_cgroup_cleanup_failure_is_not_downgraded_to_warning(tmp_path: Path):

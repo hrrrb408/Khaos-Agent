@@ -9,6 +9,7 @@ import json
 import logging
 import math
 import os
+import re
 import secrets
 import shutil
 import stat
@@ -2078,19 +2079,51 @@ def _development_mode() -> bool:
     return os.environ.get("KHAOS_DEV_MODE") == "1"
 
 
+def _mountinfo_has_cgroup_v2_path(path: Path, mountinfo: str) -> bool:
+    """Return whether ``path`` is on a mount whose filesystem is cgroup2."""
+    for line in mountinfo.splitlines():
+        before_separator, separator, after_separator = line.partition(" - ")
+        if not separator:
+            continue
+        fields = before_separator.split()
+        filesystem = after_separator.split()
+        if len(fields) < 5 or not filesystem or filesystem[0] != "cgroup2":
+            continue
+        mountpoint = Path(
+            re.sub(
+                r"\\([0-7]{3})",
+                lambda match: chr(int(match.group(1), 8)),
+                fields[4],
+            )
+        )
+        if path == mountpoint or mountpoint in path.parents:
+            return True
+    return False
+
+
+def _path_is_on_cgroup_v2_mount(path: Path) -> bool:
+    """Check the kernel mount table instead of trusting a directory marker."""
+    try:
+        mountinfo = Path("/proc/self/mountinfo").read_text(encoding="ascii")
+    except (OSError, UnicodeError):
+        return False
+    return _mountinfo_has_cgroup_v2_path(path, mountinfo)
+
+
 def _linux_cgroup_root() -> Path | None:
     """Return a writable delegated cgroup-v2 subtree, if available."""
     if not sys.platform.startswith("linux"):
         return None
-    unified = Path("/sys/fs/cgroup/cgroup.controllers")
-    if not unified.is_file():
-        return None
     configured = os.environ.get("KHAOS_CGROUP_ROOT", "").strip()
     root = Path(configured) if configured else Path("/sys/fs/cgroup/khaos")
     try:
+        if not root.is_absolute() or root.is_symlink():
+            return None
         root.mkdir(mode=0o700, parents=True, exist_ok=True)
         canonical = root.resolve()
-        if Path("/sys/fs/cgroup") not in (canonical, *canonical.parents):
+        if not (canonical / "cgroup.controllers").is_file():
+            return None
+        if not _path_is_on_cgroup_v2_mount(canonical):
             return None
         if not os.access(canonical, os.W_OK):
             return None

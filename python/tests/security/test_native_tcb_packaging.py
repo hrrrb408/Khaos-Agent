@@ -182,10 +182,10 @@ def test_production_compose_has_independent_authorityd_sidecar() -> None:
     assert "10003" in {str(value) for value in agent["group_add"]}
     assert "khaos-authority-runtime:/run/khaos-authorityd:ro" in agent["volumes"]
     assert (
-        "${KHAOS_EXECUTION_CGROUP_SOURCE:?KHAOS_EXECUTION_CGROUP_SOURCE must point to a delegated cgroup v2 subtree}:/sys/fs/cgroup/khaos:rw"
+        "${KHAOS_EXECUTION_CGROUP_SOURCE:?KHAOS_EXECUTION_CGROUP_SOURCE must point to a delegated cgroup v2 subtree}:/run/khaos-execution-cgroup:rw"
         in agent["volumes"]
     )
-    assert "KHAOS_CGROUP_ROOT=/sys/fs/cgroup/khaos" in agent["environment"]
+    assert "KHAOS_CGROUP_ROOT=/run/khaos-execution-cgroup" in agent["environment"]
     assert agent["security_opt"] == [
         "${KHAOS_DOCKER_SECCOMP_OPT:?KHAOS_DOCKER_SECCOMP_OPT must select an approved seccomp profile}",
         "${KHAOS_DOCKER_APPARMOR_OPT:?KHAOS_DOCKER_APPARMOR_OPT must select an approved AppArmor profile}",

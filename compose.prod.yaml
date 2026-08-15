@@ -88,7 +88,7 @@ services:
       # The agent may create execution leaves only inside a host-reviewed,
       # delegated cgroup-v2 subtree. There is deliberately no default: a
       # production composition without real resource enforcement fails closed.
-      - "${KHAOS_EXECUTION_CGROUP_SOURCE:?KHAOS_EXECUTION_CGROUP_SOURCE must point to a delegated cgroup v2 subtree}:/sys/fs/cgroup/khaos:rw"
+      - "${KHAOS_EXECUTION_CGROUP_SOURCE:?KHAOS_EXECUTION_CGROUP_SOURCE must point to a delegated cgroup v2 subtree}:/run/khaos-execution-cgroup:rw"
       - ./config.yaml:/app/config.yaml:ro
     environment:
       - KHAOS_MODE=office
@@ -102,7 +102,7 @@ services:
       - KHAOS_AUTHORITYD_UID=10003
       - KHAOS_AGENT_UID=10001
       - KHAOS_JOB_UID=10004
-      - KHAOS_CGROUP_ROOT=/sys/fs/cgroup/khaos
+      - KHAOS_CGROUP_ROOT=/run/khaos-execution-cgroup
       - KHAOS_EFFECTIVE_POLICY_DIGEST=${KHAOS_EFFECTIVE_POLICY_DIGEST:?KHAOS_EFFECTIVE_POLICY_DIGEST must be compiled for production}
     depends_on:
       khaos-agent-init:

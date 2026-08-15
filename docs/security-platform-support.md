@@ -53,8 +53,10 @@ privileged browser kernel helper is a separate, narrowly scoped authority and
 is the only service that intentionally shares the Agent PID/network namespace.
 Compose deployments must provide two independent, already delegated cgroup v2
 subtrees. `KHAOS_EXECUTION_CGROUP_SOURCE` is required for the non-root Agent and
-is mounted only at `/sys/fs/cgroup/khaos`; the Agent creates its per-execution
-leaves there with `KHAOS_CGROUP_ROOT` fixed to that mount. The source must be a
+is mounted only at `/run/khaos-execution-cgroup`; the Agent creates its
+per-execution leaves there with `KHAOS_CGROUP_ROOT` fixed to that mount. The
+backend verifies through `/proc/self/mountinfo` that the destination is a real
+cgroup2 mount, rather than trusting a directory marker. The source must be a
 real non-symlink subtree with `cpu`, `memory`, `pids`, and `io` controllers
 enabled, and it must be delegated to the image's exact Agent UID 10001.
 The production exact-effect probe places its temporary workspace in the

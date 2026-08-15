@@ -61,7 +61,8 @@ class for each invariant remains explicit below.
     host runtimes; the manifest is the deployment-specific pin.
 11. Production Docker execution also requires a separate, host-reviewed
     delegated cgroup v2 subtree through `KHAOS_EXECUTION_CGROUP_SOURCE`; it is
-    mounted only at the non-root Agent's `/sys/fs/cgroup/khaos`, requires the
+    mounted only at the non-root Agent's `/run/khaos-execution-cgroup`; the
+    backend verifies that destination is a real cgroup2 mount, requires the
     `cpu`, `memory`, `pids`, and `io` controllers, and is distinct from the
     privileged browser helper's cgroup subtree. Missing or incomplete
     delegation fails closed.
