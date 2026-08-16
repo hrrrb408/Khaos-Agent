@@ -77,6 +77,15 @@ Deployments that use this mode pass the same policy snapshot to
 `build_production_daemon`; an absent catalog does not silently claim typed
 coverage.
 
+Agent orchestration phase snapshots are a separate evidence layer. The
+immutable `TurnPhaseSnapshot` and `ToolPhaseSnapshot` bind phase transitions to
+the admitted turn/tool identity and canonical evidence digests; they reject
+skipped edges and post-admission call drift. A phase digest is not an
+`AuthorityGrant`, `EffectCapability`, approval binding, or external effect
+result. The vertical slice currently covers the existing AgentLoop and
+ToolScheduler boundaries; full physical decomposition into independent phase
+objects and an effect ledger remains staged M5.4 work.
+
 Python callers use `AuthorityDaemonClient` through `AuthorityDaemonBroker` in
 production.  `AuthorityBroker()` remains a test-only in-process broker; the
 default production factory only permits it under the explicit development

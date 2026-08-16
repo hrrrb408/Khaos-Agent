@@ -14,6 +14,13 @@ from khaos.security.network_broker import (
     NetworkBrokerFactory,
     NetworkLease,
 )
+from khaos.security.orchestration_phases import (
+    OrchestrationPhaseError,
+    ToolPhase,
+    ToolPhaseSnapshot,
+    TurnPhase,
+    TurnPhaseSnapshot,
+)
 from khaos.security.path_guard import PathCheckResult, PathGuard
 from khaos.security.secret_scanner import ScanResult, SecretMatch, SecretScanner
 
@@ -28,6 +35,7 @@ __all__ = [
     "NetworkBrokerError",
     "NetworkBrokerFactory",
     "NetworkLease",
+    "OrchestrationPhaseError",
     "PathCheckResult",
     "PathGuard",
     "ScanResult",
@@ -35,4 +43,8 @@ __all__ = [
     "SecretScanner",
     "SecurityCheckResult",
     "SecurityMiddleware",
+    "ToolPhase",
+    "ToolPhaseSnapshot",
+    "TurnPhase",
+    "TurnPhaseSnapshot",
 ]
