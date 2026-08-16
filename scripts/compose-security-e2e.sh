@@ -107,10 +107,15 @@ export KHAOS_EFFECTIVE_POLICY_DIGEST
 
 if [[ -z "${KHAOS_TYPED_RESOURCE_CATALOG_FILE:-}" ]]; then
     KHAOS_TYPED_RESOURCE_CATALOG_FILE="$secret_dir/typed-resource-catalog.json"
+    # The production authority daemon runs as UID 10003 and only trusts a
+    # root-owned or authority-owned catalog. Generate this disposable
+    # host-reviewed artifact as root, then expose it read-only to both
+    # production services; do not weaken the runtime trust check to accept
+    # the invoking CI runner's UID.
     docker run --rm \
         --read-only \
         --tmpfs /tmp \
-        --user "$(id -u):$(id -g)" \
+        --user 0:0 \
         --env HOME=/tmp \
         --volume "$repo_root/khaos_policy.yaml:/app/khaos_policy.yaml:ro" \
         --volume "$repo_root/scripts:/src/scripts:ro" \
