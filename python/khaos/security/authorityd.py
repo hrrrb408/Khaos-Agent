@@ -55,6 +55,9 @@ from khaos.security.resource_scope import (
 
 logger = logging.getLogger(__name__)
 
+_NATIVE_EXECUTION_OPERATION = "exec.host"
+_HEX_DIGITS = frozenset("0123456789abcdef")
+
 _RECEIPT_PREPARED = "prepared"
 _RECEIPT_PREPARING = "preparing"
 _RECEIPT_CLAIMED = "claimed"
@@ -156,6 +159,14 @@ class AuthorityDaemon:
         self._terminal: dict[str, str] = {}
         self._grants: dict[str, _GrantRecord] = {}
         self._grant_terminal: dict[str, str] = {}
+        # A live grant may issue typed descendants through one-shot
+        # narrowing receipts.  Keep the issued (resource, operation) pairs
+        # independently from receipt state so a short-lived child can be
+        # renewed after its receipt TTL, while an arbitrary scope/action can
+        # never be smuggled in through a direct prepare.  Reservations close
+        # the small gap while a child prepare is in flight.
+        self._grant_descendants: dict[str, set[tuple[str, str]]] = {}
+        self._grant_descendant_reservations: dict[str, set[tuple[str, str]]] = {}
         self.max_pending_receipts = max_pending_receipts
         self.max_pending_per_principal = max_pending_per_principal
         self.terminal_tombstone_limit = terminal_tombstone_limit
@@ -178,6 +189,61 @@ class AuthorityDaemon:
         self._grant_terminal[grant_id] = state
         while len(self._grant_terminal) > self.terminal_tombstone_limit:
             self._grant_terminal.pop(next(iter(self._grant_terminal)))
+
+    def _reserve_grant_descendant_locked(
+        self,
+        grant_id: str,
+        resource_digest: str,
+        operation: str,
+    ) -> tuple[str, str] | None:
+        """Reserve one issued child scope before its receipt is prepared."""
+        key = (resource_digest, operation)
+        descendants = self._grant_descendants.setdefault(grant_id, set())
+        reservations = self._grant_descendant_reservations.setdefault(
+            grant_id, set()
+        )
+        if key in descendants:
+            return None
+        if key in reservations:
+            raise AuthorityControlPlaneError(
+                "authority grant descendant scope is already being issued"
+            )
+        if len(descendants) + len(reservations) >= self.max_pending_receipts:
+            raise AuthorityControlPlaneError(
+                "authority grant descendant scope quota is exhausted"
+            )
+        reservations.add(key)
+        return key
+
+    def _commit_grant_descendant_locked(
+        self, grant_id: str, key: tuple[str, str]
+    ) -> None:
+        """Make a successfully prepared child scope renewable."""
+        reservations = self._grant_descendant_reservations.get(grant_id)
+        if reservations is None or key not in reservations:
+            raise AuthorityControlPlaneError(
+                "authority grant descendant reservation disappeared"
+            )
+        reservations.remove(key)
+        self._grant_descendants.setdefault(grant_id, set()).add(key)
+        if not reservations:
+            self._grant_descendant_reservations.pop(grant_id, None)
+
+    def _release_grant_descendant_reservation_locked(
+        self, grant_id: str, key: tuple[str, str]
+    ) -> None:
+        """Release a child reservation when its prepare did not commit."""
+        reservations = self._grant_descendant_reservations.get(grant_id)
+        if reservations is None:
+            return
+        reservations.discard(key)
+        if not reservations:
+            self._grant_descendant_reservations.pop(grant_id, None)
+
+    def _forget_grant_descendants_locked(self, grant_id: str) -> None:
+        """Drop descendant authority together with a terminal grant."""
+        self._grant_descendants.pop(grant_id, None)
+        self._grant_descendant_reservations.pop(grant_id, None)
 
     def _grant_revocation_events_locked(
         self,
@@ -304,6 +370,7 @@ class AuthorityDaemon:
             self._reserve_audit_event_locked(event)
         for grant_id, _grant_events, revoked_nonces in plans:
             self._grants.pop(grant_id, None)
+            self._forget_grant_descendants_locked(grant_id)
             self._remember_grant_terminal_locked(grant_id, "revoked")
             for nonce in revoked_nonces:
                 self._pending.pop(nonce, None)
@@ -359,6 +426,7 @@ class AuthorityDaemon:
                 for event in grant_events:
                     self._reserve_audit_event_locked(event)
                 self._grants.pop(grant_id, None)
+                self._forget_grant_descendants_locked(grant_id)
                 self._remember_grant_terminal_locked(grant_id, "expired")
                 for nonce in revoked_nonces:
                     self._pending.pop(nonce, None)
@@ -541,10 +609,15 @@ class AuthorityDaemon:
             authorization_epoch=authorization_epoch,
             workspace_generation=workspace_generation,
         )
-        # The grant is an authority context, but its initial operation family
-        # is still an independent daemon decision.  Every later intent is
-        # checked against this family before a short-lived receipt is signed.
-        self.policy(grant_intent)
+        # The grant is an authority context, but its initial operation and
+        # typed resource action are still an independent daemon decision.
+        # Every later intent is checked against this family and scope before
+        # a short-lived receipt is signed.
+        grant_policy = getattr(self.policy, "check_prepare", None)
+        if callable(grant_policy):
+            grant_policy(grant_intent)
+        else:
+            self.policy(grant_intent)
         grant_id = secrets.token_hex(24)
         issued_at = time.time()
         expires_at = issued_at + ttl_seconds
@@ -729,7 +802,6 @@ class AuthorityDaemon:
         *,
         parent_receipt: SignedAuthorizationReceipt | None = None,
         requested_resource_scope: str | None = None,
-        allow_issued_descendant_resource: bool = False,
     ) -> None:
         if intent.grant_id is None:
             if self.require_live_grants:
@@ -759,6 +831,7 @@ class AuthorityDaemon:
             )
             self._reserve_audit_event_locked(event)
             self._grants.pop(intent.grant_id, None)
+            self._forget_grant_descendants_locked(intent.grant_id)
             self._grant_terminal[intent.grant_id] = "expired"
             while len(self._grant_terminal) > self.terminal_tombstone_limit:
                 self._grant_terminal.pop(next(iter(self._grant_terminal)))
@@ -785,9 +858,11 @@ class AuthorityDaemon:
                 "authority grant owner, workspace, or epoch is stale"
             )
         if parent_receipt is None:
-            if (
-                not allow_issued_descendant_resource
-                and intent.resource_digest != record.resource_digest
+            if intent.resource_digest == record.resource_digest:
+                return
+            descendant_key = (intent.resource_digest, intent.operation)
+            if descendant_key not in self._grant_descendants.get(
+                intent.grant_id, set()
             ):
                 raise AuthorityControlPlaneError(
                     "authority grant resource is outside its live scope"
@@ -808,13 +883,18 @@ class AuthorityDaemon:
             raise AuthorityControlPlaneError(
                 "authority grant narrowing scope is missing"
             )
+        typed_order = _typed_resource_order(self.policy)
         expected_resource = (
             parent_receipt.resource_digest
             if requested_resource_scope == parent_receipt.resource_digest
-            else derive_resource_digest(
-                parent_receipt.resource_digest,
-                intent.operation,
-                requested_resource_scope,
+            else (
+                requested_resource_scope
+                if typed_order is not None
+                else derive_resource_digest(
+                    parent_receipt.resource_digest,
+                    intent.operation,
+                    requested_resource_scope,
+                )
             )
         )
         if intent.resource_digest != expected_resource:
@@ -1053,13 +1133,12 @@ class AuthorityDaemon:
         # operation-family, epoch, generation, and context checks stay in one
         # authority gate.  CLAIMED receipts never call this method: revoking a
         # grant cannot retroactively invalidate an effect already admitted.
-        # A child receipt has a daemon-derived resource digest rather than the
-        # grant's initial digest.  Its presence in the daemon-owned pending
-        # registry plus its Ed25519 signature proves that the narrowing path
-        # issued it; owner/context/epoch/generation checks still run here.
+        # A child receipt has a daemon-derived or typed resource digest rather
+        # than the grant's initial digest.  Its issued (resource, operation)
+        # pair is retained in the daemon-owned descendant registry, while
+        # owner/context/epoch/generation checks still run here.
         self._validate_grant_locked(
             self._receipt_grant_intent(receipt),
-            allow_issued_descendant_resource=True,
         )
 
     def claim(self, receipt: SignedAuthorizationReceipt) -> None:
@@ -1234,6 +1313,18 @@ class AuthorityDaemon:
                 raise AuthorityControlPlaneError(
                     "authorityd narrowing cannot cross issuer families"
                 )
+            child_resource_digest = (
+                receipt.resource_digest
+                if resource_digest == receipt.resource_digest
+                else (
+                    resource_digest
+                    if _typed_resource_order(self.policy) is not None
+                    else derive_resource_digest(
+                        receipt.resource_digest, operation, resource_digest
+                    )
+                )
+            )
+            descendant_key: tuple[str, str] | None = None
             intent = AuthorizationIntent(
                 principal_id=receipt.principal_id,
                 project_id=receipt.project_id,
@@ -1241,13 +1332,7 @@ class AuthorityDaemon:
                 task_id=receipt.task_id,
                 workspace_id=receipt.workspace_id,
                 operation=operation,
-                resource_digest=(
-                    receipt.resource_digest
-                    if resource_digest == receipt.resource_digest
-                    else derive_resource_digest(
-                        receipt.resource_digest, operation, resource_digest
-                    )
-                ),
+                resource_digest=child_resource_digest,
                 policy_digest=receipt.policy_digest,
                 nonce=secrets.token_hex(16),
                 authorization_epoch=receipt.authorization_epoch,
@@ -1285,6 +1370,19 @@ class AuthorityDaemon:
                 )
             narrow_token = f"narrow:{receipt.nonce}:{secrets.token_hex(8)}"
             self._reserve_audit_token_locked(narrow_token)
+            if (
+                receipt.grant_id is not None
+                and child_resource_digest != receipt.resource_digest
+            ):
+                try:
+                    descendant_key = self._reserve_grant_descendant_locked(
+                        receipt.grant_id,
+                        child_resource_digest,
+                        operation,
+                    )
+                except BaseException:
+                    self._audit_reservations.discard(narrow_token)
+                    raise
             record.state = _RECEIPT_NARROWING
         try:
             child = self.prepare(
@@ -1295,6 +1393,10 @@ class AuthorityDaemon:
         except BaseException:
             self._release_audit_reservation(narrow_token)
             with self._lock:
+                if descendant_key is not None and receipt.grant_id is not None:
+                    self._release_grant_descendant_reservation_locked(
+                        receipt.grant_id, descendant_key
+                    )
                 record = self._states.get(receipt.nonce)
                 if record is not None and _same_receipt(record.receipt, receipt):
                     if record.state != _RECEIPT_NARROWING:
@@ -1321,6 +1423,10 @@ class AuthorityDaemon:
             }
         )
         with self._lock:
+            if descendant_key is not None and receipt.grant_id is not None:
+                self._commit_grant_descendant_locked(
+                    receipt.grant_id, descendant_key
+                )
             self._bind_audit_reservation_locked(narrow_token, narrowed_event)
             record = self._states.get(receipt.nonce)
             if record is None or not _same_receipt(record.receipt, receipt):
@@ -1415,6 +1521,17 @@ class JsonlAuditWriter:
                 os.close(descriptor)
 
 
+def _typed_resource_order(
+    policy: Callable[[AuthorizationIntent], None],
+) -> TypedResourcePartialOrder | None:
+    """Return the immutable catalog owned by a built-in policy wrapper."""
+    if isinstance(policy, AuthorityPolicyKernel):
+        return policy.resource_order
+    if isinstance(policy, _ComposedAuthorityPolicy):
+        return policy.kernel.resource_order
+    return None
+
+
 def build_production_daemon(
     *,
     socket_path: Path,
@@ -1424,7 +1541,7 @@ def build_production_daemon(
     policy: Callable[[AuthorizationIntent], None] | None = None,
     resource_order: TypedResourcePartialOrder | None = None,
 ) -> AuthorityDaemon:
-    """Construct authorityd only when an independent writer is supplied."""
+    """Construct authorityd only with a policy-bound typed resource catalog."""
     if audit_writer is None:
         raise AuthorityControlPlaneError(
             "production authorityd requires an independent remote/WORM audit writer"
@@ -1433,6 +1550,14 @@ def build_production_daemon(
     if not expected_policy_digest:
         raise AuthorityControlPlaneError(
             "production authorityd requires KHAOS_EFFECTIVE_POLICY_DIGEST"
+        )
+    if resource_order is None:
+        raise AuthorityControlPlaneError(
+            "production authorityd requires a typed resource catalog"
+        )
+    if resource_order.policy_digest != expected_policy_digest:
+        raise AuthorityControlPlaneError(
+            "production typed resource catalog is not bound to the effective policy"
         )
     key = Ed25519KeyStore.load_or_create(key_path, create=False)
     kernel = AuthorityPolicyKernel(
@@ -1505,7 +1630,7 @@ class _ComposedAuthorityPolicy:
 class AuthorityPolicyKernel:
     """Closed operation/resource policy owned by authorityd, not its client."""
 
-    _FAMILIES = frozenset({"exec", "git", "network", "workspace"})
+    _FAMILIES = frozenset({"credential", "exec", "git", "network", "workspace"})
 
     def __init__(
         self,
@@ -1523,6 +1648,14 @@ class AuthorityPolicyKernel:
                 "authorityd effective policy digest is invalid"
             )
         self.expected_policy_digest = expected_policy_digest
+        if (
+            resource_order is not None
+            and expected_policy_digest is not None
+            and resource_order.policy_digest != expected_policy_digest
+        ):
+            raise AuthorityControlPlaneError(
+                "typed resource catalog is not bound to the effective policy"
+            )
         self.resource_order = resource_order
 
     def __call__(self, intent: AuthorizationIntent) -> None:
@@ -1564,8 +1697,21 @@ class AuthorityPolicyKernel:
         if self.resource_order is None:
             return
         try:
+            if intent.operation == _NATIVE_EXECUTION_OPERATION:
+                _require_native_execution_binding(
+                    intent.resource_digest,
+                    parent_digest=(
+                        parent_receipt.resource_digest
+                        if parent_receipt is not None
+                        else None
+                    ),
+                    requested_digest=requested_resource_scope,
+                )
+                return
             if parent_receipt is None:
-                self.resource_order.resolve(intent.resource_digest)
+                self.resource_order.require_operation(
+                    intent.resource_digest, intent.operation
+                )
                 return
             if requested_resource_scope is None:
                 raise ResourceScopeError(
@@ -1603,6 +1749,20 @@ class AuthorityPolicyKernel:
                 "typed resource narrowing requires parent and requested scopes"
             )
         try:
+            if (
+                source_operation == _NATIVE_EXECUTION_OPERATION
+                or target_operation == _NATIVE_EXECUTION_OPERATION
+            ):
+                _require_native_execution_binding(
+                    requested_resource_scope,
+                    parent_digest=parent_resource_digest,
+                    requested_digest=requested_resource_scope,
+                )
+                if source_operation != target_operation:
+                    raise ResourceScopeError(
+                        "native execution narrowing cannot change operation"
+                    )
+                return
             self.resource_order.require_transition(
                 parent_digest=parent_resource_digest,
                 requested_scope=requested_resource_scope,
@@ -1613,6 +1773,44 @@ class AuthorityPolicyKernel:
             raise AuthorityControlPlaneError(
                 f"typed resource narrowing rejected: {exc}"
             ) from exc
+
+
+def _require_native_execution_binding(
+    resource_digest: str,
+    *,
+    parent_digest: str | None,
+    requested_digest: str | None,
+) -> None:
+    """Validate the TCB-owned exact launch binding outside the static catalog.
+
+    Native execution binds a receipt to command, executable identity, directory
+    identities, limits, environment and launcher options.  That digest is
+    intentionally per-launch and cannot be enumerated in the startup catalog;
+    the native launcher recomputes it at the final effect boundary.  The
+    authority kernel still admits only the concrete ``exec.host`` action, a
+    canonical SHA-256 digest, and exact reuse during renewal/narrowing.
+    """
+    if (
+        type(resource_digest) is not str
+        or len(resource_digest) != 64
+        or resource_digest != resource_digest.lower()
+        or any(character not in _HEX_DIGITS for character in resource_digest)
+    ):
+        raise ResourceScopeError(
+            "native execution requires an exact launch binding digest"
+        )
+    if parent_digest is not None and requested_digest is None:
+        raise ResourceScopeError(
+            "native execution narrowing requires the requested binding"
+        )
+    if requested_digest is not None and requested_digest != resource_digest:
+        raise ResourceScopeError(
+            "native execution binding cannot change during narrowing"
+        )
+    if parent_digest is not None and parent_digest != resource_digest:
+        raise ResourceScopeError(
+            "native execution binding cannot change during renewal"
+        )
 
 
 def serve_unix(daemon: AuthorityDaemon, *, production: bool = True) -> None:

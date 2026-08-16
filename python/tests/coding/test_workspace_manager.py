@@ -13,6 +13,11 @@ from khaos.coding.workspace.manager import WorkspaceError, WorkspaceManager
 from khaos.coding.workspace.models import WorkspaceState, WorkspaceTransition
 from khaos.coding.workspace.trusted_git import WorkspaceBootstrapLimits
 from khaos.security.authority_broker import AuthorityBrokerError
+from khaos.security.resource_scope import (
+    GIT_SCOPE_OPERATIONS,
+    GitRefScope,
+    TypedResourcePartialOrder,
+)
 
 
 def _repo(path: Path) -> Path:
@@ -24,6 +29,27 @@ def _repo(path: Path) -> Path:
     subprocess.run(["git", "add", "."], cwd=path, check=True)
     subprocess.run(["git", "commit", "-qm", "base"], cwd=path, check=True)
     return path
+
+
+def test_typed_catalog_replaces_repository_path_hash(tmp_path: Path) -> None:
+    repository = _repo(tmp_path / "repo")
+    scope = GitRefScope(
+        repository=str(repository.resolve()),
+        refs=frozenset({"HEAD"}),
+        operations=GIT_SCOPE_OPERATIONS,
+    )
+    order = TypedResourcePartialOrder(
+        {scope.digest(): scope},
+        policy_digest="policy",
+    )
+    manager = WorkspaceManager(
+        tmp_path / "worktrees",
+        policy_digest="policy",
+        resource_order=order,
+    )
+    assert manager._git_resource_digest(repository) == scope.digest()
+    with pytest.raises(WorkspaceError, match="typed authority catalog"):
+        manager._git_resource_digest(tmp_path / "missing-repository")
 
 
 @pytest.mark.asyncio

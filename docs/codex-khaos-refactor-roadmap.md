@@ -247,8 +247,13 @@ receipt、execution、lease 和 effect；它们保持现有 wire representation�
 缺失属性、非布尔终态、非字符串资源和 quarantine 全部 fail closed，ExecutionService 的
 显式 legacy test/embedding adapter 单独标注兼容边界。新增不可变
 `TypedResourcePartialOrder`，为 filesystem/network/git-ref/execution/credential 建立 concrete
-scope、canonical digest、same-kind containment 和 same-family transition；AuthorityPolicyKernel
-配置了 policy catalog 后，direct prepare 的未知资源和 narrowing 的未知/越权 subset 都拒绝。
+scope、canonical digest、same-kind containment、same-family transition 和 exact action binding；
+production AuthorityDaemon/runtime 必须加载与 effective policy digest 绑定的 catalog，direct
+prepare、grant、narrowing 和 expired-receipt renewal 的未知资源、跨 kind、越权 subset 或 action
+widening 都拒绝。EffectiveSecurityPolicy 会编译 baseline catalog，Agent 还会校验部署 manifest
+的 catalog digest 与该编译结果一致；显式 development/test adapter 才允许省略 catalog。Workspace/Git
+和 NetworkBroker 已切换到 typed scope digest；native execution 仍以独立 exact launch-binding digest
+保护内核启动，credential-specific owner wiring 继续单独收敛，不把这两条边界伪装成已完成。
 
 M5.4 已开始首个可审计垂直切片：`TurnPhaseSnapshot` 和 `ToolPhaseSnapshot` 是冻结的、
 带 digest 的 phase evidence；AgentLoop 在 admission/context/model/tool/verification/finalization

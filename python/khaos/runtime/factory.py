@@ -34,8 +34,11 @@ from khaos.routing.router import create_default_router
 from khaos.runtime.authority import RuntimeAuthoritySeal, is_production_mode
 from khaos.runtime.lifecycle import CloseState
 from khaos.rust_bridge import get_token_engine
+from khaos.security.effective_policy import EffectiveSecurityPolicy
 from khaos.security.middleware import SecurityMiddleware
+from khaos.security.network_broker import NetworkBrokerFactory
 from khaos.security.network_guard import NetworkGuard
+from khaos.security.resource_scope import ResourceScopeError, TypedResourcePartialOrder
 from khaos.security.sandbox import Sandbox
 from khaos.skills import SkillGenerator, SkillManager
 from khaos.tools import create_runtime_registry
@@ -819,6 +822,34 @@ def _enforce_borrowed_authority_match(
             )
 
 
+def _load_production_resource_order(
+    effective_policy: EffectiveSecurityPolicy,
+) -> TypedResourcePartialOrder | None:
+    """Load the host-reviewed typed catalog used by production authorities."""
+    if not is_production_mode():
+        return None
+    catalog_path = os.environ.get("KHAOS_TYPED_RESOURCE_CATALOG_PATH")
+    if not catalog_path:
+        raise PermissionError(
+            "production runtime requires KHAOS_TYPED_RESOURCE_CATALOG_PATH"
+        )
+    try:
+        loaded = TypedResourcePartialOrder.from_json_file(
+            Path(catalog_path),
+            expected_policy_digest=effective_policy.digest,
+        )
+    except ResourceScopeError as exc:
+        raise PermissionError(
+            f"production typed resource catalog is invalid: {exc}"
+        ) from exc
+    compiled = effective_policy.resource_order
+    if compiled is None or loaded.catalog_digest != compiled.catalog_digest:
+        raise PermissionError(
+            "production typed resource catalog does not match the effective policy"
+        )
+    return loaded
+
+
 async def build_runtime(
     cfg: RuntimeConfig | ProductionRuntimeConfig,
 ) -> RuntimeResult:
@@ -878,6 +909,7 @@ async def build_runtime(
     from khaos.security.effective_policy import load_effective_policy
     effective_policy = load_effective_policy(root)
     logger.info("effective security policy digest: %s", effective_policy.digest)
+    typed_resource_order = _load_production_resource_order(effective_policy)
     # A2-3: bind the PermissionEngine to (principal_id, project_id,
     # policy_digest, runtime_id).  Rules loaded, granted, or revoked
     # through this engine are scoped to that triple — a different
@@ -976,6 +1008,7 @@ async def build_runtime(
     workspace_manager = cfg.workspace_manager or WorkspaceManager(
         policy_digest=effective_policy.digest,
         authorization_epoch=await permission_engine.authorization_snapshot(),
+        resource_order=typed_resource_order,
     )
     injected_workspace_policy = getattr(workspace_manager, "policy_digest", None)
     if (
@@ -1083,7 +1116,25 @@ async def build_runtime(
             # it (together with session_id + principal_id) to key the
             # per-session context.
             runtime_id=cfg.runtime_id,
+            network_broker_factory=NetworkBrokerFactory(
+                resource_order=typed_resource_order,
+            ),
         )
+    if production_mode:
+        scheduler_resource_order = getattr(
+            getattr(scheduler, "network_broker_factory", None),
+            "resource_order",
+            None,
+        )
+        if (
+            typed_resource_order is None
+            or scheduler_resource_order is None
+            or scheduler_resource_order.catalog_digest
+            != typed_resource_order.catalog_digest
+        ):
+            raise PermissionError(
+                "production ToolScheduler must use the effective typed resource catalog"
+            )
     scheduler.set_office_authority(office_authority)
     if cfg.browser_manager is None:
         from khaos.tools.browser_tools import BrowserManager

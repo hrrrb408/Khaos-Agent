@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -88,6 +89,24 @@ def test_filesystem_scope_is_workspace_bound_and_path_narrowing() -> None:
     assert parent.contains(child)
     assert not parent.contains(sibling)
     assert not parent.contains(other_workspace)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows path semantics")
+def test_filesystem_scope_accepts_windows_absolute_paths(tmp_path: Path) -> None:
+    child_root = tmp_path / "src"
+    child_root.mkdir()
+    parent = FilesystemScope(
+        workspace_id=CanonicalWorkspaceId(str(tmp_path.resolve())),
+        root=str(tmp_path.resolve()),
+        operations=frozenset({"read", "write"}),
+    )
+    child = FilesystemScope(
+        workspace_id=CanonicalWorkspaceId(str(tmp_path.resolve())),
+        root=str(child_root.resolve()),
+        operations=frozenset({"read"}),
+    )
+
+    assert parent.contains(child)
 
 
 def test_network_scope_requires_explicit_origin_and_path_subset() -> None:
@@ -185,6 +204,13 @@ def test_partial_order_catalog_is_immutable_and_fails_closed() -> None:
         source_operation="workspace.write",
         target_operation="workspace.read",
     )
+    with pytest.raises(ResourceScopeError, match="action"):
+        order.require_transition(
+            parent_digest=parent.digest(),
+            requested_scope=child.digest(),
+            source_operation="workspace.write",
+            target_operation="workspace.write",
+        )
     with pytest.raises(ResourceScopeError, match="not a typed subset"):
         order.require_subset(child.digest(), parent.digest())
     with pytest.raises(ResourceScopeError, match="operation families"):
@@ -198,13 +224,39 @@ def test_partial_order_catalog_is_immutable_and_fails_closed() -> None:
         TypedResourcePartialOrder({"0" * 64: parent})
 
 
+def test_catalog_manifest_binds_policy_and_round_trips() -> None:
+    scope = GitRefScope(
+        repository="/repo",
+        refs=frozenset({"HEAD"}),
+        operations=frozenset({"status", "hash"}),
+    )
+    order = TypedResourcePartialOrder(
+        {scope.digest(): scope},
+        policy_digest="policy-digest",
+    )
+    restored = TypedResourcePartialOrder.from_manifest(
+        order.manifest(),
+        expected_policy_digest="policy-digest",
+    )
+    assert restored.catalog_digest == order.catalog_digest
+    assert restored.policy_digest == "policy-digest"
+    assert restored.require_scope(scope) == scope.digest()
+    restored.require_operation(scope.digest(), "git.hash")
+    with pytest.raises(ResourceScopeError, match="action"):
+        restored.require_operation(scope.digest(), "git.apply")
+    with pytest.raises(ResourceScopeError, match="not bound"):
+        TypedResourcePartialOrder.from_manifest(
+            order.manifest(), expected_policy_digest="other-policy"
+        )
+
+
 def test_authority_kernel_enforces_typed_narrowing_when_configured(
     tmp_path: Path,
 ) -> None:
     parent_scope = GitRefScope(
         repository="khaos",
         refs=frozenset({"refs/heads/main", "refs/heads/release"}),
-        operations=frozenset({"read", "hash"}),
+        operations=frozenset({"read", "hash", "workspace"}),
     )
     child_scope = GitRefScope(
         repository="khaos",
@@ -268,7 +320,7 @@ def test_authority_kernel_enforces_typed_narrowing_when_configured(
         resource_digest=child_scope.digest(),
     )
     assert child.operation == "git.hash"
-    assert child.resource_digest != child_scope.digest()
+    assert child.resource_digest == child_scope.digest()
 
     with pytest.raises(AuthorityControlPlaneError, match="typed resource"):
         daemon.narrow(

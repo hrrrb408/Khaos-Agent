@@ -118,8 +118,14 @@ class EffectCapability:
     def _validate_shape(self) -> None:
         if self.schema_version != 1:
             raise ValueError("unsupported effect capability schema")
-        if not self.allowed_operation or len(self.allowed_operation) > 256:
+        if not _valid_operation(self.allowed_operation):
             raise ValueError("effect capability operation is invalid")
+        if not _valid_operation(self.authority.operation_class):
+            raise ValueError("effect capability authority operation is invalid")
+        if not _operation_allowed(
+            self.allowed_operation, self.authority.operation_class
+        ):
+            raise ValueError("effect capability operation is outside authority")
         if self.resource_digest != self.authority.resource_digest:
             raise ValueError("effect capability resource does not match authority")
         if self.generation != self.authority.workspace_generation:
@@ -132,6 +138,14 @@ class EffectCapability:
             if not isinstance(value, str) or not value or len(value) > 512:
                 raise ValueError(f"effect capability {label} is invalid")
         if self.receipt is not None:
+            if self.receipt.operation != self.authority.operation_class:
+                raise ValueError(
+                    "effect capability receipt operation does not match authority"
+                )
+            if not _operation_allowed(self.allowed_operation, self.receipt.operation):
+                raise ValueError(
+                    "effect capability receipt operation is outside authority"
+                )
             if self.receipt.nonce != self.nonce or self.receipt.signature != self.seal:
                 raise ValueError("effect capability receipt does not match its handles")
             if self.receipt.resource_digest != self.resource_digest:
@@ -208,23 +222,28 @@ class EffectCapability:
                 "effect capability resources can only be narrowed by a broker reissue"
             )
         narrowed_resource = resource_digest or self.resource_digest
-        return self._from_broker(
-            authority=self.authority.derive(
-                operation_class=operation_class,
+        try:
+            return self._from_broker(
+                authority=self.authority.derive(
+                    operation_class=operation_class,
+                    resource_digest=narrowed_resource,
+                ),
+                allowed_operation=self.allowed_operation,
                 resource_digest=narrowed_resource,
-            ),
-            allowed_operation=self.allowed_operation,
-            resource_digest=narrowed_resource,
-            generation=self.generation,
-            authorization_epoch=self.authorization_epoch,
-            issued_at=self.issued_at,
-            expires_at=self.expires_at,
-            nonce=self.nonce,
-            token=self.token,
-            seal=self.seal,
-            schema_version=self.schema_version,
-            receipt=self.receipt,
-        )
+                generation=self.generation,
+                authorization_epoch=self.authorization_epoch,
+                issued_at=self.issued_at,
+                expires_at=self.expires_at,
+                nonce=self.nonce,
+                token=self.token,
+                seal=self.seal,
+                schema_version=self.schema_version,
+                receipt=self.receipt,
+            )
+        except (TypeError, ValueError) as exc:
+            raise AuthorityBrokerError(
+                "effect capability operation is outside its authority"
+            ) from exc
 
 
 def _canonical_record(

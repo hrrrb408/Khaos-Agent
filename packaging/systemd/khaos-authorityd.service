@@ -13,6 +13,7 @@ Environment=KHAOS_DEV_MODE=0
 Environment=KHAOS_AUTHORITYD_SOCKET=/run/khaos-authorityd/authorityd.sock
 Environment=KHAOS_AUTHORITYD_KEY_PATH=/var/lib/khaos-authorityd/authorityd.pem
 Environment=KHAOS_AUTHORITYD_PUBLIC_KEY_PATH=/run/khaos-authorityd/authorityd.pub
+Environment=KHAOS_TYPED_RESOURCE_CATALOG_PATH=/etc/khaos/typed-resource-catalog.json
 Environment=KHAOS_AUTHORITYD_SOCKET_MODE=0660
 Environment=KHAOS_AGENT_UID=10001
 Environment=KHAOS_AUTHORITYD_UID=10003
@@ -31,6 +32,7 @@ PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/run/khaos-authorityd /var/lib/khaos-authorityd
+ReadOnlyPaths=/etc/khaos/typed-resource-catalog.json
 
 [Install]
 WantedBy=multi-user.target

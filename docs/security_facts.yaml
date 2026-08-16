@@ -16,7 +16,7 @@ authority:
   pending_receipt_gc: bounded_with_per_principal_and_global_quotas
   local_audit_role: diagnostic_forensics_only
   remote_worm_role: independent_effect_authorization_evidence
-  authorityd_policy_scope: issuer_policy_digest_and_operation_family_gate
+  authorityd_policy_scope: issuer_policy_digest_typed_resource_and_operation_action_gate
   full_effect_policy_scope: agent_runtime_and_workspace_authorities
 linux:
   sandbox_backend: bubblewrap_plus_native_launcher_and_cgroup

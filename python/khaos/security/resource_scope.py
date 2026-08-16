@@ -18,13 +18,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import posixpath
+import stat
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from types import MappingProxyType
-from typing import Final
+from typing import Final, cast
 
 from khaos.coding.planning.security_identities import CanonicalWorkspaceId
 
@@ -46,6 +49,23 @@ class ResourceScopeKind(str, Enum):
 _SCHEMA_VERSION: Final = 1
 _HEX_DIGITS: Final = frozenset("0123456789abcdef")
 _WILDCARD_CHARS: Final = frozenset("*?[]")
+GIT_SCOPE_OPERATIONS: Final = frozenset(
+    {
+        "apply",
+        "blob",
+        "bootstrap",
+        "cleanup",
+        "cleanup-ref",
+        "host",
+        "index",
+        "materialize",
+        "object-format",
+        "recovery",
+        "status",
+        "tree",
+        "workspace",
+    }
+)
 
 
 def _require_text(field: str, value: object) -> str:
@@ -74,6 +94,16 @@ def _require_tokens(field: str, values: Iterable[str]) -> frozenset[str]:
     return frozenset(normalized)
 
 
+def _require_actions(field: str, values: Iterable[str]) -> frozenset[str]:
+    """Validate operation actions stored inside a typed resource scope."""
+    actions = _require_tokens(field, values)
+    if any("." in action for action in actions):
+        raise ResourceScopeError(
+            f"{field} must contain action names, not family-qualified operations"
+        )
+    return actions
+
+
 def _canonical_path(field: str, value: object) -> str:
     raw = _require_concrete(field, value)
     if not raw.startswith("/"):
@@ -87,10 +117,32 @@ def _canonical_path(field: str, value: object) -> str:
     return normalized
 
 
+def _canonical_filesystem_path(field: str, value: object) -> str:
+    """Canonicalize an absolute host filesystem path on POSIX or Windows."""
+    raw = _require_concrete(field, value)
+    if not os.path.isabs(raw):
+        raise ResourceScopeError(f"{field} must be absolute")
+    path_parts = raw.replace("\\", "/").split("/")
+    if ".." in path_parts:
+        raise ResourceScopeError(f"{field} must not contain parent traversal")
+    normalized = os.path.normpath(raw).replace("\\", "/")
+    windows_drive_absolute = (
+        len(normalized) >= 3
+        and normalized[1] == ":"
+        and normalized[2] == "/"
+        and normalized[0].isalpha()
+    )
+    if normalized == "." or not normalized.startswith("/") and not windows_drive_absolute:
+        raise ResourceScopeError(f"{field} is not canonical")
+    return normalized
+
+
 def _path_contains(parent: str, child: str) -> bool:
     if parent == "/":
         return child.startswith("/")
-    return child == parent or child.startswith(parent.rstrip("/") + "/")
+    parent_key = parent.casefold() if os.name == "nt" else parent
+    child_key = child.casefold() if os.name == "nt" else child
+    return child_key == parent_key or child_key.startswith(parent_key.rstrip("/") + "/")
 
 
 def _canonical_scheme_set(field: str, values: Iterable[str]) -> frozenset[str]:
@@ -143,6 +195,13 @@ class ResourceScope(ABC):
         ).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 
+    def manifest(self) -> dict[str, object]:
+        """Return the canonical, JSON-safe catalog entry for this scope."""
+        return {
+            "kind": self.kind.value,
+            "scope": self.canonical(),
+        }
+
 
 @dataclass(frozen=True, slots=True)
 class FilesystemScope(ResourceScope):
@@ -158,8 +217,8 @@ class FilesystemScope(ResourceScope):
         object.__setattr__(self, "workspace_id", CanonicalWorkspaceId(
             _require_text("workspace_id", self.workspace_id)
         ))
-        object.__setattr__(self, "root", _canonical_path("root", self.root))
-        object.__setattr__(self, "operations", _require_tokens("operations", self.operations))
+        object.__setattr__(self, "root", _canonical_filesystem_path("root", self.root))
+        object.__setattr__(self, "operations", _require_actions("operations", self.operations))
 
     def contains(self, child: ResourceScope) -> bool:
         return (
@@ -186,12 +245,20 @@ class NetworkScope(ResourceScope):
     ports: frozenset[int]
     path_prefixes: frozenset[str]
     operations: frozenset[str]
+    blocked_hosts: frozenset[str] = frozenset()
     kind: ResourceScopeKind = ResourceScopeKind.NETWORK
 
     def __post_init__(self) -> None:
         _require_kind(self.kind, ResourceScopeKind.NETWORK)
         object.__setattr__(self, "schemes", _canonical_scheme_set("schemes", self.schemes))
         object.__setattr__(self, "hosts", _canonical_host_set("hosts", self.hosts))
+        object.__setattr__(
+            self,
+            "blocked_hosts",
+            _canonical_host_set("blocked_hosts", self.blocked_hosts)
+            if self.blocked_hosts
+            else frozenset(),
+        )
         if not self.ports or any(
             type(port) is not int or not 1 <= port <= 65535 for port in self.ports
         ):
@@ -203,7 +270,7 @@ class NetworkScope(ResourceScope):
         if not prefixes:
             raise ResourceScopeError("path_prefixes must not be empty")
         object.__setattr__(self, "path_prefixes", prefixes)
-        object.__setattr__(self, "operations", _require_tokens("operations", self.operations))
+        object.__setattr__(self, "operations", _require_actions("operations", self.operations))
 
     def contains(self, child: ResourceScope) -> bool:
         if not isinstance(child, NetworkScope):
@@ -213,6 +280,7 @@ class NetworkScope(ResourceScope):
             and self.hosts.issuperset(child.hosts)
             and self.ports.issuperset(child.ports)
             and self.operations.issuperset(child.operations)
+            and self.blocked_hosts.issubset(child.blocked_hosts)
             and all(
                 any(_path_contains(parent, requested) for parent in self.path_prefixes)
                 for requested in child.path_prefixes
@@ -226,6 +294,7 @@ class NetworkScope(ResourceScope):
             "ports": sorted(self.ports),
             "path_prefixes": sorted(self.path_prefixes),
             "operations": sorted(self.operations),
+            "blocked_hosts": sorted(self.blocked_hosts),
         }
 
 
@@ -242,7 +311,7 @@ class GitRefScope(ResourceScope):
         _require_kind(self.kind, ResourceScopeKind.GIT_REF)
         object.__setattr__(self, "repository", _require_concrete("repository", self.repository))
         object.__setattr__(self, "refs", _require_tokens("refs", self.refs))
-        object.__setattr__(self, "operations", _require_tokens("operations", self.operations))
+        object.__setattr__(self, "operations", _require_actions("operations", self.operations))
 
     def contains(self, child: ResourceScope) -> bool:
         return (
@@ -283,7 +352,7 @@ class ExecutionScope(ResourceScope):
         argv = tuple(_require_concrete("argv_prefix", value) for value in self.argv_prefix)
         object.__setattr__(self, "argv_prefix", argv)
         object.__setattr__(self, "cwd", _canonical_path("cwd", self.cwd))
-        object.__setattr__(self, "operations", _require_tokens("operations", self.operations))
+        object.__setattr__(self, "operations", _require_actions("operations", self.operations))
         if type(self.argv_exact) is not bool:
             raise ResourceScopeError("argv_exact must be boolean")
 
@@ -327,7 +396,7 @@ class CredentialScope(ResourceScope):
         _require_kind(self.kind, ResourceScopeKind.CREDENTIAL)
         object.__setattr__(self, "provider", _require_concrete("provider", self.provider))
         object.__setattr__(self, "names", _require_tokens("names", self.names))
-        object.__setattr__(self, "operations", _require_tokens("operations", self.operations))
+        object.__setattr__(self, "operations", _require_actions("operations", self.operations))
 
     def contains(self, child: ResourceScope) -> bool:
         return (
@@ -348,7 +417,16 @@ class CredentialScope(ResourceScope):
 class TypedResourcePartialOrder:
     """Immutable semantic subset checker for authority resource digests."""
 
-    def __init__(self, scopes: Mapping[str, ResourceScope]) -> None:
+    _CATALOG_SCHEMA_VERSION: Final = 1
+
+    def __init__(
+        self,
+        scopes: Mapping[str, ResourceScope],
+        *,
+        policy_digest: str | None = None,
+    ) -> None:
+        if policy_digest is not None:
+            _require_text("policy_digest", policy_digest)
         validated: dict[str, ResourceScope] = {}
         for digest, scope in scopes.items():
             if type(digest) is not str or len(digest) != 64:
@@ -362,11 +440,127 @@ class TypedResourcePartialOrder:
                 raise ResourceScopeError("resource catalog digest does not match scope")
             validated[digest.lower()] = scope
         self._scopes: Mapping[str, ResourceScope] = MappingProxyType(validated)
+        self._policy_digest = policy_digest
+        self._catalog_digest = _catalog_digest(
+            validated, policy_digest=policy_digest
+        )
+
+    @property
+    def policy_digest(self) -> str | None:
+        """Return the effective-policy digest this catalog is bound to."""
+        return self._policy_digest
+
+    @property
+    def catalog_digest(self) -> str:
+        """Return the stable digest of the immutable catalog snapshot."""
+        return self._catalog_digest
 
     @property
     def scopes(self) -> Mapping[str, ResourceScope]:
         """Return the read-only policy snapshot."""
         return self._scopes
+
+    def manifest(self) -> dict[str, object]:
+        """Return a canonical manifest suitable for host-reviewed storage."""
+        entries = [
+            {
+                "digest": digest,
+                **scope.manifest(),
+            }
+            for digest, scope in sorted(self._scopes.items())
+        ]
+        return {
+            "schema_version": self._CATALOG_SCHEMA_VERSION,
+            "policy_digest": self._policy_digest,
+            "catalog_digest": self._catalog_digest,
+            "scopes": entries,
+        }
+
+    @classmethod
+    def from_manifest(
+        cls,
+        value: object,
+        *,
+        expected_policy_digest: str | None = None,
+    ) -> TypedResourcePartialOrder:
+        """Load and verify a host-reviewed JSON catalog manifest."""
+        if not isinstance(value, Mapping):
+            raise ResourceScopeError("resource catalog manifest is not a mapping")
+        _reject_unknown_fields(
+            value,
+            {
+                "schema_version",
+                "policy_digest",
+                "catalog_digest",
+                "scopes",
+            },
+            "resource catalog manifest",
+        )
+        if value.get("schema_version") != cls._CATALOG_SCHEMA_VERSION:
+            raise ResourceScopeError("unsupported resource catalog schema")
+        policy_digest = value.get("policy_digest")
+        if policy_digest is not None and not isinstance(policy_digest, str):
+            raise ResourceScopeError("resource catalog policy digest is invalid")
+        if (
+            expected_policy_digest is not None
+            and policy_digest != expected_policy_digest
+        ):
+            raise ResourceScopeError(
+                "resource catalog is not bound to the effective policy"
+            )
+        entries = value.get("scopes")
+        if not isinstance(entries, list):
+            raise ResourceScopeError("resource catalog scopes must be a list")
+        scopes: dict[str, ResourceScope] = {}
+        for entry in entries:
+            if not isinstance(entry, Mapping):
+                raise ResourceScopeError("resource catalog entry is invalid")
+            digest = entry.get("digest")
+            kind = entry.get("kind")
+            body = entry.get("scope")
+            if not isinstance(digest, str) or not isinstance(kind, str):
+                raise ResourceScopeError("resource catalog entry identity is invalid")
+            if digest in scopes:
+                raise ResourceScopeError("resource catalog contains a duplicate digest")
+            scope = _scope_from_manifest(kind, body)
+            scopes[digest] = scope
+        order = cls(scopes, policy_digest=policy_digest)
+        catalog_digest = value.get("catalog_digest")
+        if catalog_digest != order.catalog_digest:
+            raise ResourceScopeError("resource catalog digest does not match manifest")
+        return order
+
+    @classmethod
+    def from_json_file(
+        cls,
+        path: Path,
+        *,
+        expected_policy_digest: str | None = None,
+    ) -> TypedResourcePartialOrder:
+        """Load a catalog from a JSON file and fail closed on any mismatch."""
+        descriptor = -1
+        try:
+            descriptor = os.open(
+                path.expanduser().absolute(),
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            )
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise ResourceScopeError("resource catalog must be a regular file")
+            with os.fdopen(descriptor, "r", encoding="utf-8") as stream:
+                descriptor = -1
+                payload = json.load(stream)
+        except ResourceScopeError:
+            raise
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ResourceScopeError("resource catalog cannot be read") from exc
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        return cls.from_manifest(
+            payload,
+            expected_policy_digest=expected_policy_digest,
+        )
 
     def resolve(self, digest: str) -> ResourceScope:
         """Resolve a digest or reject an unknown semantic resource."""
@@ -393,6 +587,30 @@ class TypedResourcePartialOrder:
         if not parent.contains(child):
             raise ResourceScopeError("requested resource is not a typed subset")
 
+    def require_scope(self, scope: ResourceScope) -> str:
+        """Require an exact scope entry and return its canonical digest."""
+        if not isinstance(scope, ResourceScope):
+            raise ResourceScopeError("resource scope is invalid")
+        digest = scope.digest()
+        registered = self.resolve(digest)
+        if registered != scope:
+            raise ResourceScopeError("resource scope does not match catalog entry")
+        return digest
+
+    def require_operation(self, resource_digest: str, operation: str) -> None:
+        """Require that an exact action is allowed by a typed scope."""
+        scope = self.resolve(resource_digest)
+        family, action = _operation_parts(operation)
+        if family != _scope_family(scope):
+            raise ResourceScopeError(
+                "operation family does not match typed resource kind"
+            )
+        operations = getattr(scope, "operations", None)
+        if not isinstance(operations, frozenset) or action not in operations:
+            raise ResourceScopeError(
+                "operation action is not allowed by the typed resource scope"
+            )
+
     def require_transition(
         self,
         *,
@@ -402,23 +620,241 @@ class TypedResourcePartialOrder:
         target_operation: str,
     ) -> None:
         """Validate one same-family operation/resource transition."""
-        source_family = _operation_family(source_operation)
-        target_family = _operation_family(target_operation)
+        source_family, _source_action = _operation_parts(source_operation)
+        target_family, _target_action = _operation_parts(target_operation)
         if source_family != target_family:
             raise ResourceScopeError("typed resource transition crosses operation families")
+        self.require_operation(parent_digest, source_operation)
         self.require_subset(parent_digest, requested_scope)
+        self.require_operation(requested_scope, target_operation)
 
 
-def _operation_family(operation: str) -> str:
+def _operation_parts(operation: str) -> tuple[str, str]:
     if type(operation) is not str or "." not in operation:
         raise ResourceScopeError("operation must contain a family separator")
     family, action = operation.split(".", 1)
     if not family or not action:
         raise ResourceScopeError("operation family is invalid")
-    return family
+    return family, action
+
+
+def _scope_family(scope: ResourceScope) -> str:
+    families = {
+        ResourceScopeKind.FILESYSTEM: "workspace",
+        ResourceScopeKind.NETWORK: "network",
+        ResourceScopeKind.GIT_REF: "git",
+        ResourceScopeKind.EXECUTION: "exec",
+        ResourceScopeKind.CREDENTIAL: "credential",
+    }
+    try:
+        return families[scope.kind]
+    except KeyError as exc:
+        raise ResourceScopeError("resource kind has no operation family") from exc
+
+
+def _scope_from_manifest(kind: str, body: object) -> ResourceScope:
+    if not isinstance(body, Mapping):
+        raise ResourceScopeError("resource catalog scope body is invalid")
+    try:
+        scope_kind = ResourceScopeKind(kind)
+    except ValueError as exc:
+        raise ResourceScopeError("resource catalog scope kind is invalid") from exc
+    try:
+        if scope_kind is ResourceScopeKind.FILESYSTEM:
+            _reject_unknown_fields(
+                body,
+                {"workspace_id", "root", "operations"},
+                "filesystem scope",
+            )
+            return FilesystemScope(
+                workspace_id=cast(CanonicalWorkspaceId, body["workspace_id"]),
+                root=cast(str, body["root"]),
+                operations=frozenset(_manifest_text_list(body, "operations")),
+            )
+        if scope_kind is ResourceScopeKind.NETWORK:
+            _reject_unknown_fields(
+                body,
+                {
+                    "schemes",
+                    "hosts",
+                    "ports",
+                    "path_prefixes",
+                    "operations",
+                    "blocked_hosts",
+                },
+                "network scope",
+            )
+            return NetworkScope(
+                schemes=frozenset(_manifest_text_list(body, "schemes")),
+                hosts=frozenset(_manifest_text_list(body, "hosts")),
+                ports=frozenset(_manifest_int_list(body, "ports")),
+                path_prefixes=frozenset(
+                    _manifest_text_list(body, "path_prefixes")
+                ),
+                operations=frozenset(_manifest_text_list(body, "operations")),
+                blocked_hosts=frozenset(
+                    _manifest_text_list(body, "blocked_hosts")
+                ),
+            )
+        if scope_kind is ResourceScopeKind.GIT_REF:
+            _reject_unknown_fields(
+                body,
+                {"repository", "refs", "operations"},
+                "git-ref scope",
+            )
+            return GitRefScope(
+                repository=cast(str, body["repository"]),
+                refs=frozenset(_manifest_text_list(body, "refs")),
+                operations=frozenset(_manifest_text_list(body, "operations")),
+            )
+        if scope_kind is ResourceScopeKind.EXECUTION:
+            _reject_unknown_fields(
+                body,
+                {
+                    "workspace_id",
+                    "executable",
+                    "argv_prefix",
+                    "argv_exact",
+                    "cwd",
+                    "operations",
+                },
+                "execution scope",
+            )
+            argv_exact = body["argv_exact"]
+            if type(argv_exact) is not bool:
+                raise ResourceScopeError("resource catalog argv_exact is invalid")
+            return ExecutionScope(
+                workspace_id=cast(CanonicalWorkspaceId, body["workspace_id"]),
+                executable=cast(str, body["executable"]),
+                argv_prefix=tuple(_manifest_text_list(body, "argv_prefix")),
+                argv_exact=argv_exact,
+                cwd=cast(str, body["cwd"]),
+                operations=frozenset(_manifest_text_list(body, "operations")),
+            )
+        _reject_unknown_fields(
+            body,
+            {"provider", "names", "operations"},
+            "credential scope",
+        )
+        return CredentialScope(
+            provider=cast(str, body["provider"]),
+            names=frozenset(_manifest_text_list(body, "names")),
+            operations=frozenset(_manifest_text_list(body, "operations")),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ResourceScopeError("resource catalog scope body is malformed") from exc
+
+
+def _manifest_list(body: Mapping[str, object], field: str) -> list[object]:
+    value = body.get(field)
+    if not isinstance(value, list):
+        raise ResourceScopeError(f"resource catalog {field} must be a list")
+    return value
+
+
+def _manifest_text_list(body: Mapping[str, object], field: str) -> list[str]:
+    values = _manifest_list(body, field)
+    if any(type(value) is not str for value in values):
+        raise ResourceScopeError(f"resource catalog {field} must contain text")
+    return cast(list[str], values)
+
+
+def _manifest_int_list(body: Mapping[str, object], field: str) -> list[int]:
+    values = _manifest_list(body, field)
+    if any(type(value) is not int for value in values):
+        raise ResourceScopeError(f"resource catalog {field} must contain integers")
+    return cast(list[int], values)
+
+
+def _reject_unknown_fields(
+    value: Mapping[object, object], allowed: set[str], label: str
+) -> None:
+    if any(type(key) is not str for key in value):
+        raise ResourceScopeError(f"{label} contains a non-text field")
+    unknown = set(value) - allowed
+    if unknown:
+        raise ResourceScopeError(f"{label} contains unknown fields")
+
+
+def _catalog_digest(
+    scopes: Mapping[str, ResourceScope], *, policy_digest: str | None
+) -> str:
+    payload = {
+        "schema_version": TypedResourcePartialOrder._CATALOG_SCHEMA_VERSION,
+        "policy_digest": policy_digest,
+        "scopes": [
+            {
+                "digest": digest,
+                **scope.manifest(),
+            }
+            for digest, scope in sorted(scopes.items())
+        ],
+    }
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def compile_typed_resource_catalog(
+    workspace_root: Path,
+    *,
+    policy_digest: str,
+    filesystem_roots: Iterable[Path],
+    filesystem_operations: Iterable[str],
+    network_allowed_domains: frozenset[str] | None,
+    network_blocked_domains: Iterable[str],
+) -> TypedResourcePartialOrder:
+    """Compile the immutable baseline catalog from one effective policy.
+
+    The same deterministic compiler is used by the runtime and the
+    deployment-time catalog generator.  Dynamic authority owners must still
+    resolve their concrete scope through this catalog; no owner may silently
+    substitute an opaque hash when the production catalog is present.
+    """
+    root = workspace_root.expanduser().resolve()
+    workspace_id = CanonicalWorkspaceId(str(root))
+    scopes: dict[str, ResourceScope] = {}
+    operations = frozenset(filesystem_operations)
+    for filesystem_root in filesystem_roots:
+        candidate = Path(filesystem_root).expanduser().resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError:
+            raise ResourceScopeError(
+                "filesystem resource catalog root escapes the workspace"
+            )
+        scope = FilesystemScope(
+            workspace_id=workspace_id,
+            root=str(candidate),
+            operations=operations,
+        )
+        scopes[scope.digest()] = scope
+
+    if (root / ".git").exists():
+        git_scope = GitRefScope(
+            repository=str(root),
+            refs=frozenset({"HEAD"}),
+            operations=GIT_SCOPE_OPERATIONS,
+        )
+        scopes[git_scope.digest()] = git_scope
+
+    if network_allowed_domains is not None and network_allowed_domains:
+        network_scope = NetworkScope(
+            schemes=frozenset({"http", "https"}),
+            hosts=network_allowed_domains,
+            ports=frozenset({80, 443}),
+            path_prefixes=frozenset({"/"}),
+            operations=frozenset({"connect"}),
+            blocked_hosts=frozenset(network_blocked_domains),
+        )
+        scopes[network_scope.digest()] = network_scope
+
+    return TypedResourcePartialOrder(scopes, policy_digest=policy_digest)
 
 
 __all__ = [
+    "GIT_SCOPE_OPERATIONS",
     "CredentialScope",
     "ExecutionScope",
     "FilesystemScope",
@@ -428,4 +864,5 @@ __all__ = [
     "ResourceScopeError",
     "ResourceScopeKind",
     "TypedResourcePartialOrder",
+    "compile_typed_resource_catalog",
 ]

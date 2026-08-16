@@ -55,6 +55,12 @@ from khaos.security.authority_broker import (
     AuthorityBrokerError,
     EffectCapability,
 )
+from khaos.security.resource_scope import (
+    GIT_SCOPE_OPERATIONS,
+    GitRefScope,
+    ResourceScopeError,
+    TypedResourcePartialOrder,
+)
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -338,6 +344,7 @@ class WorkspaceManager:
         bootstrap_limits: WorkspaceBootstrapLimits | None = None,
         policy_digest: str = "legacy-unbound",
         authorization_epoch: int = 1,
+        resource_order: TypedResourcePartialOrder | None = None,
     ) -> None:
         configured_root = (
             root or Path(tempfile.gettempdir()) / "khaos" / "worktrees"
@@ -358,6 +365,15 @@ class WorkspaceManager:
         self._git_identity = self._git_runner.git_identity
         self._git_digest = self._git_runner.git_digest
         self.policy_digest = policy_digest
+        if (
+            resource_order is not None
+            and resource_order.policy_digest is not None
+            and resource_order.policy_digest != policy_digest
+        ):
+            raise WorkspaceError(
+                "WorkspaceManager typed resource catalog does not match policy"
+            )
+        self.resource_order = resource_order
         if authorization_epoch <= 0:
             raise ValueError("workspace authorization epoch must be positive")
         self.authorization_epoch = authorization_epoch
@@ -528,10 +544,27 @@ class WorkspaceManager:
             policy_digest=self.policy_digest,
             operation_class="git.host",
             authorization_epoch=self.authorization_epoch,
-            resource_digest=hashlib.sha256(
-                str(repository.resolve()).encode("utf-8")
-            ).hexdigest(),
+            resource_digest=self._git_resource_digest(repository),
         )
+
+    def _git_resource_digest(self, repository: Path) -> str:
+        """Return the catalog-bound Git scope for one canonical repository."""
+        canonical_repository = repository.resolve()
+        if self.resource_order is None:
+            return hashlib.sha256(
+                str(canonical_repository).encode("utf-8")
+            ).hexdigest()
+        scope = GitRefScope(
+            repository=str(canonical_repository),
+            refs=frozenset({"HEAD"}),
+            operations=GIT_SCOPE_OPERATIONS,
+        )
+        try:
+            return self.resource_order.require_scope(scope)
+        except ResourceScopeError as exc:
+            raise WorkspaceError(
+                "repository is not represented by the typed authority catalog"
+            ) from exc
 
     @staticmethod
     def _workspace_authority(
@@ -1004,9 +1037,7 @@ class WorkspaceManager:
                 policy_digest=self.policy_digest,
                 operation_class="git.bootstrap",
                 authorization_epoch=self.authorization_epoch,
-                resource_digest=hashlib.sha256(
-                    str(repository).encode("utf-8")
-                ).hexdigest(),
+                resource_digest=self._git_resource_digest(repository),
             )
             branch = f"khaos/task/{task_id}"
             path = (self.root / workspace_id).resolve()

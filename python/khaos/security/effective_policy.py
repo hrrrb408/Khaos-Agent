@@ -39,6 +39,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from khaos.security.policy import SandboxPolicy, load_policy
+from khaos.security.resource_scope import (
+    ResourceScopeError,
+    TypedResourcePartialOrder,
+    compile_typed_resource_catalog,
+)
 from khaos.security.sandbox import SandboxMode
 
 logger = logging.getLogger(__name__)
@@ -131,6 +136,11 @@ class EffectiveSecurityPolicy:
     # This is a host-side grant, so only the trusted user layer contributes.
     channel_admins: frozenset[str] = field(default_factory=frozenset)
     digest: str = ""
+    resource_order: TypedResourcePartialOrder | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         if not self.digest:
@@ -303,7 +313,7 @@ def compile_effective_policy(
         )
     channel_admins = _frozen(user.channel_admins) if user is not None else frozenset()
 
-    return EffectiveSecurityPolicy(
+    effective = EffectiveSecurityPolicy(
         mode=mode,
         network_enabled=network_enabled,
         network_allowed_domains=network_allowed_domains,
@@ -320,6 +330,28 @@ def compile_effective_policy(
         secrets_block_env_dump=secrets_block_env_dump,
         channel_admins=channel_admins,
     )
+    try:
+        object.__setattr__(
+            effective,
+            "resource_order",
+            compile_typed_resource_catalog(
+                workspace_root,
+                policy_digest=effective.digest,
+                filesystem_roots=effective.root_capabilities,
+                filesystem_operations=(
+                    frozenset({"read"})
+                    if mode is SandboxMode.READ_ONLY
+                    else frozenset({"read", "write"})
+                ),
+                network_allowed_domains=effective.network_allowed_domains,
+                network_blocked_domains=effective.network_blocked_domains,
+            ),
+        )
+    except ResourceScopeError as exc:
+        raise PolicyCompilationError(
+            f"effective typed resource catalog is invalid: {exc}"
+        ) from exc
+    return effective
 
 
 def default_user_policy() -> SandboxPolicy:
