@@ -238,6 +238,24 @@ H3 的跨进程恢复状态展示与 H5 的全尺寸 Textual snapshot matrix 继
 
 不会删除 TaskManager、ApprovalBroker 的领域语义、ChangeSet、Trusted Verification、Approval Snapshot、CleanupProof、Verification Recovery、Scheduler、多 Agent 或 durable audit；被替换的是重复执行权威和不安全 transport/adapter。
 
+## 11.5. M5：Security identity and capability-kernel convergence
+
+实施进度（2026-08-16）：M5.1–M5.3 已完成首个可回归批次。安全身份别名覆盖
+principal/project/runtime/task/workspace-generation、session、approval、authorization、grant、
+receipt、execution、lease 和 effect；它们保持现有 wire representation，不把运行时字符串
+伪装成不同的权限对象。`ResourceOwner` 现在有共享的不可变 proof snapshot；默认读取器对
+缺失属性、非布尔终态、非字符串资源和 quarantine 全部 fail closed，ExecutionService 的
+显式 legacy test/embedding adapter 单独标注兼容边界。新增不可变
+`TypedResourcePartialOrder`，为 filesystem/network/git-ref/execution/credential 建立 concrete
+scope、canonical digest、same-kind containment 和 same-family transition；AuthorityPolicyKernel
+配置了 policy catalog 后，direct prepare 的未知资源和 narrowing 的未知/越权 subset 都拒绝。
+
+M5.4（AgentLoop/ToolScheduler 的完整 immutable phase-object 迁移）仍需单独按
+`RawToolCall → ValidatedToolCall → ResolvedResource → PermissionDecision → ApprovalBinding →
+AuthorizedEffect → EffectTransaction → DispatchResult` 分阶段切换，不能用未接线的类型壳
+冒充完成。M5.5 的第二 maintainer、CODEOWNERS 和 independent assurance 是组织治理前置条件，
+由 issue #169 跟踪；没有第二个有权限维护者时不把 ruleset 强行改成无人可合并。
+
 ## 12. 交付和基线升级规则
 
 - 每个 batch 从 `feature/m4-agent-planning` 的已接受新基线创建独立 `codex/<batch>-...` 分支；不修改历史。

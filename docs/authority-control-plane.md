@@ -65,6 +65,18 @@ receipt and records a `narrowed` terminal tombstone. Both the child prepare
 event and parent terminal event reserve bounded audit capacity before either
 authority transition can become irreversible.
 
+The typed policy authority can be supplied to `AuthorityPolicyKernel` as an
+immutable `TypedResourcePartialOrder`. Its catalog contains canonical digests
+for concrete `FilesystemScope`, `NetworkScope`, `GitRefScope`,
+`ExecutionScope`, and `CredentialScope` values. When configured, a narrowing
+must resolve both the parent digest and requested child scope and prove the
+child is contained by the parent; unknown, malformed, cross-kind, and
+cross-family transitions fail closed. The signed receipt remains opaque on the
+wire, while the semantic decision is explicit and independently testable.
+Deployments that use this mode pass the same policy snapshot to
+`build_production_daemon`; an absent catalog does not silently claim typed
+coverage.
+
 Python callers use `AuthorityDaemonClient` through `AuthorityDaemonBroker` in
 production.  `AuthorityBroker()` remains a test-only in-process broker; the
 default production factory only permits it under the explicit development

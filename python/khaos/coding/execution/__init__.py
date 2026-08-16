@@ -22,7 +22,42 @@ from khaos.coding.execution.platform import (
     UnsupportedBackend,
     WindowsSandboxBackend,
 )
+from khaos.coding.execution.resource_owner import (
+    ResourceOwner,
+    ResourceOwnerInvariantError,
+    ResourceOwnerSnapshot,
+    inspect_resource_owner,
+    require_terminal_resource_owner,
+)
 from khaos.coding.execution.service import ExecutionService
 from khaos.coding.execution.supervisor import ProcessSupervisor, SupervisorClosedError
 
-__all__ = ["BackendSelector", "DockerBackend", "DockerSandboxDecision", "ExecutionAuthority", "ExecutionRequest", "ExecutionResult", "ExecutionService", "FileSystemAccess", "HostExecutionBackend", "LinuxBubblewrapBackend", "MacOSSandboxBackend", "ManagedProcessHandle", "NetworkPolicy", "PermissionProfile", "ProcessSupervisor", "ResolvedExecutionContext", "ResolvedSpawnPlan", "ResourceBudget", "SandboxDecision", "SupervisorClosedError", "UnsupportedBackend", "WindowsSandboxBackend"]
+__all__ = [
+    "BackendSelector",
+    "DockerBackend",
+    "DockerSandboxDecision",
+    "ExecutionAuthority",
+    "ExecutionRequest",
+    "ExecutionResult",
+    "ExecutionService",
+    "FileSystemAccess",
+    "HostExecutionBackend",
+    "LinuxBubblewrapBackend",
+    "MacOSSandboxBackend",
+    "ManagedProcessHandle",
+    "NetworkPolicy",
+    "PermissionProfile",
+    "ProcessSupervisor",
+    "ResolvedExecutionContext",
+    "ResolvedSpawnPlan",
+    "ResourceBudget",
+    "ResourceOwner",
+    "ResourceOwnerInvariantError",
+    "ResourceOwnerSnapshot",
+    "SandboxDecision",
+    "SupervisorClosedError",
+    "UnsupportedBackend",
+    "WindowsSandboxBackend",
+    "inspect_resource_owner",
+    "require_terminal_resource_owner",
+]

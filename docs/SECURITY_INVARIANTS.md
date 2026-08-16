@@ -28,9 +28,11 @@ class for each invariant remains explicit below.
    dropping evidence.
 5. Resource narrowing is cryptographically linked to the parent digest,
    target operation, and requested scope by `derive_resource_digest`. The
-   daemon enforces the operation-family transition. Semantic interpretation of
-   a resource scope remains the higher-level policy/typed-resource authority;
-   the daemon does not claim to be a complete PDP.
+   daemon enforces the operation-family transition. When the effective policy
+   supplies `TypedResourcePartialOrder`, the authority kernel also resolves
+   both typed catalog entries and requires the requested scope to be contained
+   by the parent; missing or malformed entries fail closed. The daemon still
+   does not claim to be a complete PDP when that semantic catalog is absent.
 
 ## Process and workspace ownership invariants
 
@@ -39,13 +41,18 @@ class for each invariant remains explicit below.
    A late process is adopted or retained as an orphan; kill/wait/output proof
    must complete before the owner is released. Cleanup failure never produces a
    false `closed` postcondition.
-7. The Docker verification backend publishes every CLI child through a
+7. Every lifecycle owner exposes the shared `ResourceOwner` proof surface.
+   `inspect_resource_owner()` reads admission fences, quarantine state,
+   terminal postcondition, and the independent owned-resource oracle as one
+   immutable snapshot; callers must not treat an unreadable or quarantined
+   owner as closed.
+8. The Docker verification backend publishes every CLI child through a
    pending/active owner registry backed by `ProcessSupervisor`. Cancellation
    must reap the CLI owner, then prove the daemon-side container is absent by
    deterministic name plus exact Khaos-label ownership; an inspect/daemon
    error is unknown, not absence. A disposable verification workspace cannot
    reach terminal release until that container-absence proof succeeds.
-8. Workspace bootstrap records own the authority grant and every Git resource
+9. Workspace bootstrap records own the authority grant and every Git resource
    from admission through controlled publish or rollback. Preflight failure,
    cancellation, grant-revocation failure, and worktree cleanup failure stay
    retryable/quarantined until both Git ownership and the grant are terminal.
@@ -53,7 +60,7 @@ class for each invariant remains explicit below.
    identity; `VerificationRunId` and disposable verification-workspace IDs may
    appear only in poison-owner metadata. Missing or ambiguous identity
    resolution fails closed instead of creating a phantom workspace fence.
-9. A workspace authority uses the permission engine's current authorization
+10. A workspace authority uses the permission engine's current authorization
    epoch. The positive epoch default is only a library safety floor; production
    runtime construction supplies the database-backed snapshot.
 

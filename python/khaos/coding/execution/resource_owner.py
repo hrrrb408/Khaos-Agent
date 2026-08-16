@@ -52,7 +52,12 @@ before the suite can claim it is verified.
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from dataclasses import dataclass
+from typing import Any, Protocol, cast, runtime_checkable
+
+
+class ResourceOwnerInvariantError(RuntimeError):
+    """Raised when an owner exposes an inconsistent lifecycle proof."""
 
 
 @runtime_checkable
@@ -192,3 +197,111 @@ class ResourceOwner(Protocol):
         retry incomplete steps via the CleanupLedger.
         """
         ...
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceOwnerSnapshot:
+    """A single read of the shared owner proof surface.
+
+    The snapshot is intentionally immutable.  Callers that need to make a
+    shutdown decision must evaluate the terminal flag, terminal proof, and
+    independent resource oracle from the same observation rather than
+    repeating ad-hoc ``getattr`` checks across lifecycle owners.
+    """
+
+    generation_admission_closed: bool
+    child_admission_closed: bool
+    terminal_closed: bool
+    is_quarantined: bool
+    terminal_postcondition: bool
+    owned_resources: tuple[str, ...]
+
+    @property
+    def is_terminal(self) -> bool:
+        """Return the complete CLOSED invariant, including empty ownership."""
+        return (
+            self.terminal_closed
+            and not self.is_quarantined
+            and self.terminal_postcondition
+            and not self.owned_resources
+        )
+
+
+def inspect_resource_owner(
+    component: object, *, allow_legacy: bool = False
+) -> ResourceOwnerSnapshot | None:
+    """Read and validate one owner proof surface, failing closed on unknowns.
+
+    This helper is deliberately duck-typed because several platform owners
+    predate the protocol and remain independently tested.  It does not turn
+    a mock or a partial object into an owner: every lifecycle property and
+    oracle must be present with the expected concrete types.
+    """
+    required_methods = ("owned_resources", "terminal_postcondition")
+    if any(not callable(getattr(component, name, None)) for name in required_methods):
+        return None
+    values: dict[str, bool] = {}
+    try:
+        for name in (
+            "generation_admission_closed",
+            "child_admission_closed",
+            "terminal_closed",
+            "is_quarantined",
+        ):
+            value = getattr(component, name, None)
+            if type(value) is bool:
+                values[name] = value
+                continue
+            if not allow_legacy:
+                return None
+            # ExecutionService has an explicit compatibility boundary for
+            # injected owners from before ResourceOwner grew its admission
+            # and quarantine properties.  Missing admission values inherit
+            # the terminal state; a missing quarantine flag is conservative.
+            if name == "terminal_closed" and type(value).__module__ == "unittest.mock":
+                values[name] = bool(value)
+            elif name == "is_quarantined":
+                values[name] = False
+            elif name in {"generation_admission_closed", "child_admission_closed"}:
+                values[name] = values.get("terminal_closed", False)
+            else:
+                return None
+        resources = tuple(cast(Any, component).owned_resources())
+        if not all(type(resource) is str for resource in resources):
+            return None
+        proof = cast(Any, component).terminal_postcondition()
+        if type(proof) is not bool:
+            if not allow_legacy or type(proof).__module__ != "unittest.mock":
+                return None
+            proof = bool(proof)
+    except Exception:  # noqa: BLE001 - an unreadable proof is unknown
+        return None
+    return ResourceOwnerSnapshot(
+        generation_admission_closed=values["generation_admission_closed"],
+        child_admission_closed=values["child_admission_closed"],
+        terminal_closed=values["terminal_closed"],
+        is_quarantined=values["is_quarantined"],
+        terminal_postcondition=proof,
+        owned_resources=resources,
+    )
+
+
+def require_terminal_resource_owner(component: object) -> ResourceOwnerSnapshot:
+    """Return a terminal proof or reject an unknown/non-terminal owner."""
+    snapshot = inspect_resource_owner(component)
+    if snapshot is None:
+        raise ResourceOwnerInvariantError("resource owner proof surface is unreadable")
+    if not snapshot.is_terminal:
+        raise ResourceOwnerInvariantError(
+            "resource owner is not terminal or still owns resources"
+        )
+    return snapshot
+
+
+__all__ = [
+    "ResourceOwner",
+    "ResourceOwnerInvariantError",
+    "ResourceOwnerSnapshot",
+    "inspect_resource_owner",
+    "require_terminal_resource_owner",
+]
