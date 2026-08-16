@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -148,11 +149,17 @@ def test_git_execution_and_credential_scopes_are_same_kind_only() -> None:
     git_parent = GitRefScope(
         repository="khaos",
         refs=frozenset({"refs/heads/main", "refs/heads/release"}),
+        ref_namespaces=frozenset({"refs/heads/khaos/task/"}),
         operations=frozenset({"read", "hash"}),
     )
     git_child = GitRefScope(
         repository="khaos",
         refs=frozenset({"refs/heads/main"}),
+        operations=frozenset({"hash"}),
+    )
+    task_child = GitRefScope(
+        repository="khaos",
+        refs=frozenset({"refs/heads/khaos/task/task-1"}),
         operations=frozenset({"hash"}),
     )
     execution_parent = ExecutionScope(
@@ -176,6 +183,9 @@ def test_git_execution_and_credential_scopes_are_same_kind_only() -> None:
     )
 
     assert git_parent.contains(git_child)
+    assert git_parent.contains(task_child)
+    assert git_parent.allows_ref("refs/heads/khaos/task/task-1")
+    assert not git_parent.allows_ref("refs/heads/khaos/other")
     assert execution_parent.contains(execution_child)
     assert not git_parent.contains(execution_child)
     assert credential.contains(credential)
@@ -248,6 +258,40 @@ def test_catalog_manifest_binds_policy_and_round_trips() -> None:
         TypedResourcePartialOrder.from_manifest(
             order.manifest(), expected_policy_digest="other-policy"
         )
+
+
+@pytest.mark.posix_host
+def test_catalog_file_loader_rejects_symlink_and_writable_file(
+    tmp_path: Path,
+) -> None:
+    scope = GitRefScope(
+        repository=str(tmp_path.resolve()),
+        refs=frozenset({"HEAD"}),
+        operations=frozenset({"status"}),
+    )
+    order = TypedResourcePartialOrder(
+        {scope.digest(): scope},
+        policy_digest="policy-digest",
+    )
+    catalog = tmp_path / "catalog.json"
+    catalog.write_text(json.dumps(order.manifest()), encoding="utf-8")
+    assert (
+        TypedResourcePartialOrder.from_json_file(
+            catalog,
+            expected_policy_digest="policy-digest",
+        ).catalog_digest
+        == order.catalog_digest
+    )
+
+    os.chmod(catalog, 0o666)
+    with pytest.raises(ResourceScopeError, match="non-writable"):
+        TypedResourcePartialOrder.from_json_file(catalog)
+    os.chmod(catalog, 0o600)
+
+    link = tmp_path / "catalog-link.json"
+    link.symlink_to(catalog)
+    with pytest.raises(ResourceScopeError, match="symlink"):
+        TypedResourcePartialOrder.from_json_file(link)
 
 
 def test_authority_kernel_enforces_typed_narrowing_when_configured(
