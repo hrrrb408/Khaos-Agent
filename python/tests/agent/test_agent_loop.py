@@ -57,6 +57,8 @@ async def test_agent_loop_streams_and_persists_messages(tmp_path):
     assert [message.role for message in persisted] == ["user", "assistant"]
     assert persisted[0].content == "hello"
     assert persisted[1].content == "Khaos mock response."
+    assert chunks[-1].metadata["orchestration_phase"] == "finalized"
+    assert chunks[-1].metadata["orchestration_phase_digest"]
     await db.close()
 
 
@@ -235,6 +237,8 @@ async def test_agent_loop_reports_error_after_repeated_empty_model_response(tmp_
 
     assert chunks[-1].event == "error"
     assert chunks[-1].metadata["code"] == "EMPTY_MODEL_RESPONSE"
+    assert chunks[-1].metadata["orchestration_phase"] == "finalized"
+    assert chunks[-1].metadata["orchestration_phase_digest"]
     assert [message.role for message in persisted] == ["user"]
     await db.close()
 

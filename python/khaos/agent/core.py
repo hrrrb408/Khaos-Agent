@@ -12,7 +12,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
     from khaos.coding.cost_tracker import CostTracker
@@ -22,6 +22,12 @@ if TYPE_CHECKING:
     from khaos.project_context import ProjectContextLoader
 
 from khaos.exceptions import CompressionCircuitOpenError
+from khaos.security.orchestration_phases import (
+    OrchestrationPhaseError,
+    TurnPhase,
+    TurnPhaseSnapshot,
+    digest_phase_payload,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -231,6 +237,52 @@ class AgentLoop:
             # to an unrestricted host subprocess.
             self.execution_service = ExecutionService(UnsupportedBackend())
 
+    @staticmethod
+    def _turn_context_digest(messages: list[Message]) -> str:
+        """Digest the immutable message facts crossing the context boundary."""
+        return digest_phase_payload(
+            [
+                {
+                    "role": message.role,
+                    "content": message.content,
+                    "tool_call_id": message.tool_call_id or "",
+                    "event": message.event or "",
+                }
+                for message in messages
+            ]
+        )
+
+    @staticmethod
+    def _tool_batch_phase_digest(tool_calls: list[dict]) -> str:
+        """Digest the model-produced tool batch before scheduler admission."""
+        return digest_phase_payload(
+            [
+                {
+                    "id": str(call.get("id") or ""),
+                    "name": str(call.get("name") or ""),
+                    "arguments": call.get("arguments", {}),
+                }
+                for call in tool_calls
+            ]
+        )
+
+    @staticmethod
+    def _finish_turn_phase(
+        phase: TurnPhaseSnapshot,
+        *,
+        terminal_status: str,
+    ) -> TurnPhaseSnapshot:
+        """Close a turn through the explicit finalization boundary."""
+        if phase.phase is not TurnPhase.FINALIZING:
+            phase = phase.transition(
+                TurnPhase.FINALIZING,
+                terminal_status=terminal_status,
+            )
+        return phase.transition(
+            TurnPhase.FINALIZED,
+            terminal_status=terminal_status,
+        )
+
     async def run(
         self,
         user_input: str,
@@ -296,6 +348,12 @@ class AgentLoop:
         self._active_context_facts = await self._build_durable_task_facts(
             active_task_id
         )
+        orchestration_phase = TurnPhaseSnapshot.admitted(
+            session_id=session_id,
+            turn_id=turn.turn_id,
+            attempt_id=turn.attempt_id,
+            task_id=active_task_id or "",
+        )
         total_tokens = 0
         budget_exhausted = False
         stop_reason: str | None = None
@@ -310,10 +368,18 @@ class AgentLoop:
             await self._persist_message(session_id, user_msg)
             messages.append(user_msg)
             total_tokens += user_msg.token_count
+            orchestration_phase = orchestration_phase.transition(
+                TurnPhase.CONTEXT_ASSEMBLED,
+                context_digest=self._turn_context_digest(messages),
+            )
 
             turn_count = 0
 
             while turn_count < self.config.max_turns:
+                if orchestration_phase.phase is not TurnPhase.MODEL_EXECUTING:
+                    orchestration_phase = orchestration_phase.transition(
+                        TurnPhase.MODEL_EXECUTING,
+                    )
                 if self._budget_exceeded(total_tokens):
                     budget_exhausted = True
                     stop_reason = StopReason.MAX_BUDGET.value
@@ -360,6 +426,8 @@ class AgentLoop:
                             chunk.metadata.update({
                                 "turn_id": turn.turn_id,
                                 "attempt_id": turn.attempt_id,
+                                "orchestration_phase": orchestration_phase.phase.value,
+                                "orchestration_phase_digest": orchestration_phase.digest(),
                             })
                             chunk.token_count = self.token_engine.count_tokens(chunk.content)
                             chunk.created_at = time.time()
@@ -374,25 +442,30 @@ class AgentLoop:
                                 break
                         if chunk.tool_calls:
                             for raw_tool_call in chunk.tool_calls:
-                                tool_call = dict(raw_tool_call)
+                                tool_call: dict[str, Any] = cast(
+                                    dict[str, Any], dict(raw_tool_call)
+                                )
                                 bind_operation = getattr(
                                     self.tool_scheduler,
                                     "bind_server_operation_key",
                                     None,
                                 )
                                 if callable(bind_operation):
-                                    tool_call = bind_operation(
-                                        tool_call,
-                                        session_id=session_id,
-                                        turn_id=turn.turn_id,
-                                        attempt_id=turn.attempt_id,
-                                        tool_context={
-                                            "principal_id": self.principal_id,
-                                            "project_id": self.project_id,
-                                            "workspace_id": getattr(
-                                                self.active_workspace, "id", None
-                                            ),
-                                        },
+                                    tool_call = cast(
+                                        dict[str, Any],
+                                        bind_operation(
+                                            tool_call,
+                                            session_id=session_id,
+                                            turn_id=turn.turn_id,
+                                            attempt_id=turn.attempt_id,
+                                            tool_context={
+                                                "principal_id": self.principal_id,
+                                                "project_id": self.project_id,
+                                                "workspace_id": getattr(
+                                                    self.active_workspace, "id", None
+                                                ),
+                                            },
+                                        ),
                                     )
                                 tool_calls.append(tool_call)
                                 turn_event = await turn.emit(
@@ -426,6 +499,10 @@ class AgentLoop:
                     if assistant_content.strip() or tool_calls or stop_reason == StopReason.TOOL_USE.value:
                         break
                     if empty_response_retries >= 1:
+                        orchestration_phase = self._finish_turn_phase(
+                            orchestration_phase,
+                            terminal_status="failed",
+                        )
                         terminal = await turn.terminal(
                             "failed",
                             reason="empty-model-response",
@@ -442,6 +519,8 @@ class AgentLoop:
                                 "turn_id": turn.turn_id,
                                 "attempt_id": turn.attempt_id,
                                 "event_sequence": terminal.sequence,
+                                "orchestration_phase": orchestration_phase.phase.value,
+                                "orchestration_phase_digest": orchestration_phase.digest(),
                             },
                             created_at=time.time(),
                         )
@@ -471,6 +550,10 @@ class AgentLoop:
                     break
 
                 if self.tool_scheduler is None:
+                    orchestration_phase = self._finish_turn_phase(
+                        orchestration_phase,
+                        terminal_status="failed",
+                    )
                     terminal = await turn.terminal(
                         "failed",
                         reason="tool-scheduler-unavailable",
@@ -485,6 +568,8 @@ class AgentLoop:
                             "turn_id": turn.turn_id,
                             "attempt_id": turn.attempt_id,
                             "event_sequence": terminal.sequence,
+                            "orchestration_phase": orchestration_phase.phase.value,
+                            "orchestration_phase_digest": orchestration_phase.digest(),
                         },
                     )
                     return
@@ -617,9 +702,14 @@ class AgentLoop:
                         ),
                     },
                 }
+                orchestration_phase = orchestration_phase.transition(
+                    TurnPhase.TOOL_EXECUTING,
+                    tool_batch_digest=self._tool_batch_phase_digest(tool_calls),
+                )
                 if "tool_context" not in inspect.signature(self.tool_scheduler.stream_batch).parameters:
                     stream_args.pop("tool_context")
                 event_stream = self.tool_scheduler.stream_batch(tool_calls, self.mode_manager.current_mode.value, **stream_args)
+                verification_phase_entered = False
                 async for event in event_stream:
                     if event.permission_request is not None:
                         request = event.permission_request
@@ -682,6 +772,7 @@ class AgentLoop:
                                 "delivery_status": result.delivery_status,
                                 "warning": result.warning,
                                 "effect_id": result.effect_id,
+                                "phase_digest": result.phase_digest,
                                 "retry_safe": result.retry_safe,
                             },
                             ensure_ascii=False,
@@ -705,6 +796,7 @@ class AgentLoop:
                                 "delivery_status": result.delivery_status,
                                 "warning": result.warning,
                                 "effect_id": result.effect_id,
+                                "phase_digest": result.phase_digest,
                                 "reconciliation_hint": result.reconciliation_hint,
                                 "retry_safe": result.retry_safe,
                             },
@@ -721,6 +813,7 @@ class AgentLoop:
                                 "effect_status": result.effect_status,
                                 "delivery_status": result.delivery_status,
                                 "effect_id": result.effect_id,
+                                "phase_digest": result.phase_digest,
                                 "reconciliation_hint": result.reconciliation_hint,
                                 "retry_safe": result.retry_safe,
                             },
@@ -762,6 +855,14 @@ class AgentLoop:
                                     )
                                 )
                                 if failure_context:
+                                    if not verification_phase_entered:
+                                        orchestration_phase = orchestration_phase.transition(
+                                            TurnPhase.VERIFYING,
+                                            verification_digest=digest_phase_payload(
+                                                result_dict
+                                            ),
+                                        )
+                                        verification_phase_entered = True
                                     fix_msg = Message(
                                         role="system",
                                         content=failure_context,
@@ -820,6 +921,10 @@ class AgentLoop:
                 and turn.active_tool_calls
                 else "completed"
             )
+            orchestration_phase = self._finish_turn_phase(
+                orchestration_phase,
+                terminal_status=terminal_status,
+            )
             terminal = await turn.terminal(
                 terminal_status,
                 reason=stop_reason or StopReason.END_TURN.value,
@@ -842,6 +947,8 @@ class AgentLoop:
                         "turn_id": turn.turn_id,
                         "attempt_id": turn.attempt_id,
                         "event_sequence": terminal.sequence,
+                        "orchestration_phase": orchestration_phase.phase.value,
+                        "orchestration_phase_digest": orchestration_phase.digest(),
                     },
                     created_at=time.time(),
                 )
@@ -856,12 +963,21 @@ class AgentLoop:
                         "turn_id": turn.turn_id,
                         "attempt_id": turn.attempt_id,
                         "event_sequence": terminal.sequence,
+                        "orchestration_phase": orchestration_phase.phase.value,
+                        "orchestration_phase_digest": orchestration_phase.digest(),
                     },
                     created_at=time.time(),
                 )
         except asyncio.CancelledError:
             if self.task_manager is not None and active_task_id:
                 await self.task_manager.update_status(active_task_id, "cancelled", error="task cancelled")
+            try:
+                orchestration_phase = self._finish_turn_phase(
+                    orchestration_phase,
+                    terminal_status="interrupted",
+                )
+            except OrchestrationPhaseError:
+                logger.exception("failed to finalize orchestration phase")
             if not turn.is_terminal:
                 await turn.terminal(
                     "interrupted", reason="user-cancelled", error_code="USER_ABORT"
@@ -871,10 +987,19 @@ class AgentLoop:
             logger.exception("Agent loop error")
             if self.task_manager is not None and active_task_id:
                 await self.task_manager.update_status(active_task_id, "failed", error=str(exc))
+            try:
+                orchestration_phase = self._finish_turn_phase(
+                    orchestration_phase,
+                    terminal_status="failed",
+                )
+            except OrchestrationPhaseError:
+                logger.exception("failed to finalize orchestration phase")
             terminal = None
             error_code = (
                 "COMPRESSION_CIRCUIT_OPEN"
                 if isinstance(exc, CompressionCircuitOpenError)
+                else "ORCHESTRATION_PHASE_ERROR"
+                if isinstance(exc, OrchestrationPhaseError)
                 else "INTERNAL_ERROR"
             )
             if not turn.is_terminal:
@@ -889,6 +1014,8 @@ class AgentLoop:
                         "turn_id": turn.turn_id,
                         "attempt_id": turn.attempt_id,
                         "event_sequence": terminal.sequence,
+                        "orchestration_phase": orchestration_phase.phase.value,
+                        "orchestration_phase_digest": orchestration_phase.digest(),
                     })
                 yield message
             else:
@@ -905,11 +1032,17 @@ class AgentLoop:
                         "event_sequence": (
                             terminal.sequence if terminal is not None else turn.sequence
                         ),
+                        "orchestration_phase": orchestration_phase.phase.value,
+                        "orchestration_phase_digest": orchestration_phase.digest(),
                     },
                 )
         finally:
             if not turn.is_terminal:
                 try:
+                    orchestration_phase = self._finish_turn_phase(
+                        orchestration_phase,
+                        terminal_status="interrupted",
+                    )
                     await turn.terminal(
                         "interrupted",
                         reason="consumer-disconnected",

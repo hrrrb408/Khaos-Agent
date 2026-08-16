@@ -34,6 +34,23 @@ class for each invariant remains explicit below.
    by the parent; missing or malformed entries fail closed. The daemon still
    does not claim to be a complete PDP when that semantic catalog is absent.
 
+## Orchestration phase evidence
+
+The Agent turn and tool dispatch pipelines expose immutable phase snapshots,
+not mutable status labels. A snapshot records the admitted identity,
+phase-specific evidence digests, and only an allowed transition edge; the
+phase digest is evidence of orchestration state, not an authority grant,
+approval, or proof that an external effect succeeded.
+
+`AgentLoop` must not skip its admission, context, model, tool, verification,
+and finalization boundaries. A tool call admitted to dispatch must cross raw-call
+validation, resource resolution, permission, approval, authorization, dispatch,
+and terminal-result boundaries. A call whose identity or arguments change
+after admission, or a transition outside the phase graph, fails closed. A
+rejected call may terminate before dispatch and therefore does not receive a
+false terminal-effect claim; the absence of a dispatch terminal snapshot is
+not evidence that an effect occurred.
+
 ## Process and workspace ownership invariants
 
 6. The Windows native backend publishes a pending spawn owner before invoking

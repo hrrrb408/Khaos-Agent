@@ -123,6 +123,7 @@ async def test_scheduler_executes_parallel_and_serial(tmp_path):
         {"value": "a"},
         {"value": "b"},
     ]
+    assert all(result.phase_digest for result in results)
     await db.close()
 
 

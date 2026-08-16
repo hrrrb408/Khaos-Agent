@@ -50,6 +50,12 @@ from khaos.security.network_broker import (
     NetworkBrokerFactory,
     NetworkLease,
 )
+from khaos.security.orchestration_phases import (
+    OrchestrationPhaseError,
+    ToolPhase,
+    ToolPhaseSnapshot,
+    digest_phase_payload,
+)
 from khaos.tools.registry import ToolInvocationBroker, ToolRegistry
 from khaos.tools.terminal_tools import (
     BackgroundProcessAuthority,
@@ -243,6 +249,9 @@ class ToolResult:
     effect_id: str = ""
     reconciliation_hint: str = ""
     retry_safe: bool = True
+    # Immutable ToolScheduler phase evidence.  Empty is retained only for
+    # direct legacy helper calls that bypass ``stream_batch``.
+    phase_digest: str = ""
 
 
 @dataclass
@@ -596,6 +605,60 @@ class ToolScheduler:
                 results.append(event.result)
         return results
 
+    @staticmethod
+    def _advance_tool_phase(
+        call: dict[str, Any],
+        next_phase: ToolPhase,
+        **evidence: Any,
+    ) -> ToolPhaseSnapshot:
+        """Advance the immutable phase evidence attached to one call."""
+        snapshot = call.get("_phase_snapshot")
+        if not isinstance(snapshot, ToolPhaseSnapshot):
+            raise PermissionDeniedError(
+                "tool phase evidence is missing at the scheduler boundary"
+            )
+        try:
+            snapshot.assert_call(call)
+            next_snapshot = snapshot.transition(next_phase, **evidence)
+        except OrchestrationPhaseError as exc:
+            raise PermissionDeniedError(str(exc)) from exc
+        call["_phase_snapshot"] = next_snapshot
+        call["_phase_digest"] = next_snapshot.digest()
+        return next_snapshot
+
+    @staticmethod
+    def _terminalize_tool_phase(
+        call: dict[str, Any],
+        result: ToolResult,
+    ) -> ToolResult:
+        """Close a dispatched call and expose its immutable phase digest."""
+        snapshot = call.get("_phase_snapshot")
+        if not isinstance(snapshot, ToolPhaseSnapshot):
+            return result
+        try:
+            snapshot.assert_call(call)
+            terminal = snapshot.transition(
+                ToolPhase.TERMINAL,
+                effect_digest=digest_phase_payload(
+                    {
+                        "effect_id": result.effect_id,
+                        "effect_status": result.effect_status,
+                    }
+                ),
+                result_digest=digest_phase_payload(
+                    {
+                        "success": result.success,
+                        "error_code": result.error_code,
+                        "delivery_status": result.delivery_status,
+                    }
+                ),
+            )
+        except OrchestrationPhaseError as exc:
+            raise PermissionDeniedError(str(exc)) from exc
+        call["_phase_snapshot"] = terminal
+        call["_phase_digest"] = terminal.digest()
+        return replace(result, phase_digest=terminal.digest())
+
     async def stream_batch(
         self,
         tool_calls: list[dict],
@@ -682,6 +745,22 @@ class ToolScheduler:
         approved_calls: list[dict] = []
         for call in tool_calls:
             normalized = self._normalize_call(call)
+            try:
+                raw_phase = ToolPhaseSnapshot.raw(normalized)
+            except OrchestrationPhaseError as exc:
+                yield SchedulerEvent(
+                    event="tool_result",
+                    result=ToolResult(
+                        tool_call_id=normalized["id"],
+                        name=normalized["name"],
+                        success=False,
+                        error=f"Tool phase admission rejected: {exc}",
+                        arguments=normalized["arguments"],
+                    ),
+                )
+                continue
+            normalized["_phase_snapshot"] = raw_phase
+            normalized["_phase_digest"] = raw_phase.digest()
             tool = self.registry.get(normalized["name"])
             # Production AgentLoop calls are already bound to a server key.
             # Generate one here as a defense-in-depth boundary for direct
@@ -715,6 +794,7 @@ class ToolScheduler:
                     ),
                 )
                 continue
+            self._advance_tool_phase(normalized, ToolPhase.VALIDATED)
 
             resource: AuthorizationResource | None = None
             if tool_context.get("coding_workspace_enforced"):
@@ -743,6 +823,11 @@ class ToolScheduler:
                     )
                     continue
                 normalized["_authorization_resource"] = resource
+            self._advance_tool_phase(
+                normalized,
+                ToolPhase.RESOURCE_RESOLVED,
+                resource_digest=resource.digest() if resource is not None else "",
+            )
 
             execution_error = self._execution_preflight_error(
                 tool, mode, tool_context
@@ -798,6 +883,18 @@ class ToolScheduler:
                 session_id=str(tool_context.get("session_id") or session_id or ""),
                 task_id=str(tool_context.get("task_id") or ""),
                 workspace_id=str(tool_context.get("workspace_id") or ""),
+            )
+            self._advance_tool_phase(
+                normalized,
+                ToolPhase.PERMISSION_DECIDED,
+                permission_digest=digest_phase_payload(
+                    {
+                        "approved": decision.approved.value,
+                        "requires_user_confirm": decision.requires_user_confirm,
+                        "target": decision.target,
+                        "reason": decision.reason,
+                    }
+                ),
             )
             if decision.approved == ApprovalMode.DENY:
                 await self._audit_best_effort(
@@ -1010,6 +1107,7 @@ class ToolScheduler:
                 normalized["_approval_id"] = getattr(
                     approval_handle, "approval_id", ""
                 )
+                normalized["_approval_binding_digest"] = binding_digest
                 normalized["_approval_schema_digest"] = binding.tool_schema_digest
                 normalized["_approval_security_digest"] = binding.tool_security_digest
                 normalized["_approval_policy_digest"] = binding.policy_digest
@@ -1138,6 +1236,20 @@ class ToolScheduler:
                         "remember request ignored for unattended or unknown "
                         "transport"
                     )
+            self._advance_tool_phase(
+                normalized,
+                ToolPhase.APPROVAL_BOUND,
+                approval_digest=str(
+                    normalized.get("_approval_binding_digest") or ""
+                ),
+            )
+            self._advance_tool_phase(
+                normalized,
+                ToolPhase.AUTHORIZED_EFFECT,
+                authority_digest=str(
+                    normalized.get("_step_execution_digest") or ""
+                ),
+            )
             approved_calls.append(normalized)
 
         # Bind this dispatch batch to the latest database-authoritative epoch
@@ -1180,6 +1292,7 @@ class ToolScheduler:
                         ),
                     )
                     continue
+                self._advance_tool_phase(call, ToolPhase.DISPATCHING)
                 tasks.append(
                     self._execute_one(
                         call, session_id, mode, tool_context or {}, reservation
@@ -1229,6 +1342,7 @@ class ToolScheduler:
                     ),
                 )
                 continue
+            self._advance_tool_phase(call, ToolPhase.DISPATCHING)
             yield SchedulerEvent(
                 event="tool_result",
                 result=await self._execute_one(
@@ -1245,9 +1359,10 @@ class ToolScheduler:
         reservation: ToolBudgetReservation,
     ) -> ToolResult:
         try:
-            return await self._execute_one_impl(
+            result = await self._execute_one_impl(
                 call, session_id, mode, tool_context, reservation
             )
+            return self._terminalize_tool_phase(call, result)
         finally:
             await self._close_network_broker(call)
 

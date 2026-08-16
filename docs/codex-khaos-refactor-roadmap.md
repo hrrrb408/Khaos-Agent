@@ -250,11 +250,14 @@ receipt、execution、lease 和 effect；它们保持现有 wire representation�
 scope、canonical digest、same-kind containment 和 same-family transition；AuthorityPolicyKernel
 配置了 policy catalog 后，direct prepare 的未知资源和 narrowing 的未知/越权 subset 都拒绝。
 
-M5.4（AgentLoop/ToolScheduler 的完整 immutable phase-object 迁移）仍需单独按
-`RawToolCall → ValidatedToolCall → ResolvedResource → PermissionDecision → ApprovalBinding →
-AuthorizedEffect → EffectTransaction → DispatchResult` 分阶段切换，不能用未接线的类型壳
-冒充完成。M5.5 的第二 maintainer、CODEOWNERS 和 independent assurance 是组织治理前置条件，
-由 issue #169 跟踪；没有第二个有权限维护者时不把 ruleset 强行改成无人可合并。
+M5.4 已开始首个可审计垂直切片：`TurnPhaseSnapshot` 和 `ToolPhaseSnapshot` 是冻结的、
+带 digest 的 phase evidence；AgentLoop 在 admission/context/model/tool/verification/finalization
+边界推进 turn phase，ToolScheduler 在 raw/validated/resource/permission/approval/authorized/
+dispatch/terminal 边界推进 tool phase，并在调用身份或参数漂移时 fail closed。这个切片证明了
+不可变阶段边界可以接入现有运行路径，但不把完整的物理拆分冒充完成；后续仍需把每个阶段的
+输入输出对象和 effect ledger 分别抽成独立组件，并继续覆盖拒绝、恢复、取消和持久化路径。
+M5.5 的第二 maintainer、CODEOWNERS 和 independent assurance 是组织治理前置条件，由 issue
+#169 跟踪；没有第二个有权限维护者时不把 ruleset 强行改成无人可合并。
 
 ## 12. 交付和基线升级规则
 
