@@ -15,6 +15,12 @@ from typing import Any
 from khaos.coding.planning.approval.models import compute_verification_digest
 from khaos.coding.planning.execution_models import ExecutionRunStatus
 from khaos.coding.planning.git_state import GitStateInspector
+from khaos.coding.planning.security_identities import (
+    CanonicalWorkspaceId,
+    DisposableWorkspaceId,
+    SandboxInstanceId,
+    VerificationRunId,
+)
 from khaos.coding.planning.trusted_verification import (
     ArtifactRootCapability,
     DisposableStorageRootCapability,
@@ -300,6 +306,45 @@ class TrustedVerificationRunner:
     # Batch 3.1.2 §8: Disposable workspace reconciliation
     # ------------------------------------------------------------------
 
+    def _canonical_workspace_id_for_run(
+        self, verification_run_id: VerificationRunId,
+    ) -> CanonicalWorkspaceId:
+        """Resolve a verification run to its bound canonical workspace.
+
+        Verification and disposable workspace IDs are lifecycle metadata, not
+        mutation-fence keys.  Missing bindings fail closed instead of writing
+        a poison scope for a phantom identity.
+        """
+        run = self._store.get_run(str(verification_run_id))
+        if run is None or not run.workspace_id:
+            raise RuntimeError(
+                "canonical workspace missing for verification cleanup"
+            )
+        return CanonicalWorkspaceId(run.workspace_id)
+
+    def _poison_verification_workspace(
+        self, verification_run_id: VerificationRunId, *, owner: str, reason: str,
+    ) -> CanonicalWorkspaceId:
+        """Write verification quarantine against the canonical workspace ID."""
+        canonical_workspace_id = self._canonical_workspace_id_for_run(
+            verification_run_id,
+        )
+        self._approval_store.add_workspace_poison_scope(
+            canonical_workspace_id, owner=owner, reason=reason,
+        )
+        return canonical_workspace_id
+
+    @staticmethod
+    def _verification_cleanup_owner(
+        verification_run_id: VerificationRunId,
+        disposable_workspace_id: DisposableWorkspaceId,
+    ) -> str:
+        """Return an exact, auditable owner for a disposable cleanup scope."""
+        return (
+            f"verification-cleanup:{verification_run_id}:"
+            f"{disposable_workspace_id}"
+        )
+
     def _reconcile_disposable_workspaces(self) -> None:
         """Reconcile non-terminal disposable workspaces from previous boots.
 
@@ -326,21 +371,27 @@ class TrustedVerificationRunner:
         )
         factory_root = self._workspace_factory._root
         for record in self._store.list_active_disposable_workspaces():
+            disposable_workspace_id = DisposableWorkspaceId(record.workspace_id)
+            verification_run_id = VerificationRunId(record.verification_run_id)
             root = factory_root / record.instance_id
             if not root.exists():
-                self._store.mark_disposable_workspace_cleaned(record.workspace_id)
+                self._store.mark_disposable_workspace_cleaned(disposable_workspace_id)
                 continue
             if record.state == DisposableWorkspaceState.PREPARED:
                 try:
                     self._safe_destroy_prepared(root)
-                    self._store.mark_disposable_workspace_cleaned(record.workspace_id)
+                    self._store.mark_disposable_workspace_cleaned(
+                        disposable_workspace_id,
+                    )
                 except Exception:  # noqa: BLE001 - cleanup failure is persisted for reconciliation
                     self._store.mark_disposable_workspace_cleanup_failed(
-                        record.workspace_id, failure_code="prepared-cleanup-failed",
+                        disposable_workspace_id, failure_code="prepared-cleanup-failed",
                     )
-                    self._approval_store.add_workspace_poison_scope(
-                        record.verification_run_id,
-                        owner=f"verification-cleanup:{record.workspace_id}",
+                    self._poison_verification_workspace(
+                        verification_run_id,
+                        owner=self._verification_cleanup_owner(
+                            verification_run_id, disposable_workspace_id,
+                        ),
                         reason="disposable-workspace-cleanup-failed",
                     )
                 continue
@@ -355,11 +406,13 @@ class TrustedVerificationRunner:
                 )
             except (json.JSONDecodeError, KeyError, TypeError):
                 self._store.mark_disposable_workspace_cleanup_failed(
-                    record.workspace_id, failure_code="manifest-invalid",
+                    disposable_workspace_id, failure_code="manifest-invalid",
                 )
-                self._approval_store.add_workspace_poison_scope(
-                    record.verification_run_id,
-                    owner=f"verification-cleanup:{record.workspace_id}",
+                self._poison_verification_workspace(
+                    verification_run_id,
+                    owner=self._verification_cleanup_owner(
+                        verification_run_id, disposable_workspace_id,
+                    ),
                     reason="disposable-workspace-manifest-invalid",
                 )
                 continue
@@ -375,23 +428,29 @@ class TrustedVerificationRunner:
                 self._workspace_factory.destroy(workspace)
             except Exception:  # noqa: BLE001 - cleanup failure poisons the workspace
                 self._store.mark_disposable_workspace_cleanup_failed(
-                    record.workspace_id, failure_code="reconcile-cleanup-failed",
+                    disposable_workspace_id, failure_code="reconcile-cleanup-failed",
                 )
-                self._approval_store.add_workspace_poison_scope(
-                    record.verification_run_id,
-                    owner=f"verification-cleanup:{record.workspace_id}",
+                self._poison_verification_workspace(
+                    verification_run_id,
+                    owner=self._verification_cleanup_owner(
+                        verification_run_id, disposable_workspace_id,
+                    ),
                     reason="disposable-workspace-cleanup-failed",
                 )
             else:
-                self._store.mark_disposable_workspace_cleaned(record.workspace_id)
+                self._store.mark_disposable_workspace_cleaned(disposable_workspace_id)
 
     def _cleanup_disposable_or_raise(
-        self, *, verification_run_id: str, workspace_id: str,
+        self, *, verification_run_id: VerificationRunId,
+        workspace_id: DisposableWorkspaceId,
         disposable: Any,
     ) -> None:
         """Durably CLEANUP_PENDING→physical destroy→CLEANED without swallowing."""
         if not workspace_id or disposable is None:
             raise RuntimeError("production cleanup requires a disposable workspace")
+        canonical_workspace_id = self._canonical_workspace_id_for_run(
+            verification_run_id,
+        )
         self._store.transition_disposable_workspace(
             workspace_id,
             expected=(DisposableWorkspaceState.MOUNTED,
@@ -406,8 +465,10 @@ class TrustedVerificationRunner:
                 workspace_id, failure_code="cleanup-failed",
             )
             self._approval_store.add_workspace_poison_scope(
-                verification_run_id,
-                owner=f"verification-cleanup:{workspace_id}",
+                canonical_workspace_id,
+                owner=self._verification_cleanup_owner(
+                    verification_run_id, workspace_id,
+                ),
                 reason="disposable-workspace-cleanup-failed",
             )
             raise RuntimeError("disposable workspace cleanup failed") from exc
@@ -681,9 +742,10 @@ class TrustedVerificationRunner:
             # poisoning every active verification run.  The root is not
             # safe to use until an operator inspects it.
             for row in all_rows:
-                self._approval_store.add_workspace_poison_scope(
-                    row["verification_run_id"],
-                    owner="verification-cleanup:artifact-root",
+                verification_run_id = VerificationRunId(row["verification_run_id"])
+                self._poison_verification_workspace(
+                    verification_run_id,
+                    owner=f"verification-cleanup:artifact-root:{verification_run_id}",
                     reason="artifact-root-non-regular-file",
                 )
             raise
@@ -768,15 +830,15 @@ class TrustedVerificationRunner:
                     cleanup_failures.append(artifact_id)
         # Poison verification runs that own artifacts we could not clean up.
         if cleanup_failures:
-            failed_runs: set[str] = set()
+            failed_runs: set[VerificationRunId] = set()
             for artifact_id in cleanup_failures:
                 row = rows_by_id.get(artifact_id)
                 if row is not None:
-                    failed_runs.add(row["verification_run_id"])
+                    failed_runs.add(VerificationRunId(row["verification_run_id"]))
             for verification_run_id in failed_runs:
-                self._approval_store.add_workspace_poison_scope(
+                self._poison_verification_workspace(
                     verification_run_id,
-                    owner="verification-cleanup:artifact-root",
+                    owner=f"verification-cleanup:artifact-root:{verification_run_id}",
                     reason="artifact-reconcile-cleanup-failed",
                 )
 
@@ -857,7 +919,7 @@ class TrustedVerificationRunner:
             target=VerificationRunStatus.VALIDATING,
         )
         disposable = None
-        workspace_id = ""
+        workspace_id = DisposableWorkspaceId("")
         # Batch 3.1.3 §8: track cleanup state so the terminal transition
         # is deferred until cleanup succeeds.  ``cleanup_done`` prevents
         # double-cleanup in the ``finally`` block when the success path
@@ -865,7 +927,7 @@ class TrustedVerificationRunner:
         cleanup_failed = False
         cleanup_done = False
         sandbox_cleanup_terminal = True
-        active_sandbox_instance_id = ""
+        active_sandbox_instance_id = SandboxInstanceId("")
         active_container_id_or_name = ""
         active_sandbox_labels: dict[str, str] = {}
         try:
@@ -902,7 +964,7 @@ class TrustedVerificationRunner:
             # (symlink swap, remount, chmod) since the capability was opened
             # at runner startup.
             self._disposable_root_capability.verify_identity()
-            workspace_id = f"dvw_{uuid.uuid4().hex}"
+            workspace_id = DisposableWorkspaceId(f"dvw_{uuid.uuid4().hex}")
             instance_id = f"verify_{secrets.token_hex(16)}"
             self._store.create_disposable_workspace(DisposableWorkspaceRecord(
                 workspace_id=workspace_id,
@@ -1023,7 +1085,9 @@ class TrustedVerificationRunner:
                         )
                 # §1 steps 1-2: persist PREPARED sandbox instance BEFORE
                 # creating the container, so a crash leaves a durable trail.
-                sandbox_instance_id = f"vsi_{secrets.token_hex(12)}"
+                sandbox_instance_id = SandboxInstanceId(
+                    f"vsi_{secrets.token_hex(12)}"
+                )
                 instance_name = self._backend.generate_instance_name()
                 instance = VerificationSandboxInstance(
                     sandbox_instance_id=sandbox_instance_id,
@@ -1124,7 +1188,7 @@ class TrustedVerificationRunner:
                         verification_run_id=run.verification_run_id,
                         failure_code="cancelled",
                     )
-                    active_sandbox_instance_id = ""
+                    active_sandbox_instance_id = SandboxInstanceId("")
                     active_container_id_or_name = ""
                     active_sandbox_labels = {}
                     raise
@@ -1140,7 +1204,7 @@ class TrustedVerificationRunner:
                         == SandboxInstanceState.TERMINATED
                     )
                     cleanup_failed = not sandbox_cleanup_terminal
-                    active_sandbox_instance_id = ""
+                    active_sandbox_instance_id = SandboxInstanceId("")
                     active_container_id_or_name = ""
                     active_sandbox_labels = {}
                     self._store.abort_step_and_run(
@@ -1214,7 +1278,7 @@ class TrustedVerificationRunner:
                     and current_sandbox.state == SandboxInstanceState.TERMINATED
                 )
                 cleanup_failed = cleanup_failed or not sandbox_cleanup_terminal
-                active_sandbox_instance_id = ""
+                active_sandbox_instance_id = SandboxInstanceId("")
                 active_container_id_or_name = ""
                 active_sandbox_labels = {}
                 # §3: write artifact with RESERVED→SEALED protocol.
@@ -1313,7 +1377,8 @@ class TrustedVerificationRunner:
                 terminal = VerificationRunStatus.POISONED
                 failure_code = "canonical-workspace-drift"
                 self._approval_store.add_workspace_poison_scope(
-                    workspace.id, owner=f"verification:{run.verification_run_id}",
+                    CanonicalWorkspaceId(workspace.id),
+                    owner=f"verification:{run.verification_run_id}",
                     reason="canonical-workspace-drift",
                 )
                 raise RuntimeError("canonical workspace drifted during verification") from exc
@@ -1325,7 +1390,7 @@ class TrustedVerificationRunner:
             if disposable is not None:
                 cleanup_done = True
                 self._cleanup_disposable_or_raise(
-                    verification_run_id=run.verification_run_id,
+                    verification_run_id=VerificationRunId(run.verification_run_id),
                     workspace_id=workspace_id, disposable=disposable,
                 )
             # §8: if any cleanup (sandbox instance or disposable workspace)
@@ -1391,7 +1456,7 @@ class TrustedVerificationRunner:
                 )
                 sandbox_cleanup_terminal = bool(cleanup_ok)
                 cleanup_failed = not sandbox_cleanup_terminal
-                active_sandbox_instance_id = ""
+                active_sandbox_instance_id = SandboxInstanceId("")
                 active_container_id_or_name = ""
                 active_sandbox_labels = {}
             current = self._store.get_run_by_execution(execution.execution_run_id)
@@ -1449,7 +1514,7 @@ class TrustedVerificationRunner:
                     and sandbox_cleanup_terminal):
                 try:
                     self._cleanup_disposable_or_raise(
-                        verification_run_id=run.verification_run_id,
+                        verification_run_id=VerificationRunId(run.verification_run_id),
                         workspace_id=workspace_id, disposable=disposable,
                     )
                 except Exception as cleanup_exc:
@@ -1474,9 +1539,12 @@ class TrustedVerificationRunner:
                     workspace_id,
                     failure_code="sandbox-cleanup-unproven",
                 )
-                self._approval_store.add_workspace_poison_scope(
-                    run.verification_run_id,
-                    owner=f"verification-cleanup:{workspace_id}",
+                verification_run_id = VerificationRunId(run.verification_run_id)
+                self._poison_verification_workspace(
+                    verification_run_id,
+                    owner=self._verification_cleanup_owner(
+                        verification_run_id, workspace_id,
+                    ),
                     reason="sandbox-cleanup-unproven",
                 )
                 cleanup_done = True

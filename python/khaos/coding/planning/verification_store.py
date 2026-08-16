@@ -2373,7 +2373,7 @@ class VerificationExecutionStore:
             cur = self._conn.execute(
                 "UPDATE disposable_verification_workspaces SET state='cleaned',"
                 "cleaned_at=? WHERE workspace_id=? AND state IN "
-                "('cleanup-pending','prepared','sealed','mounted')",
+                "('cleanup-pending','prepared','sealed','mounted','cleanup-failed')",
                 (now, workspace_id),
             )
             if cur.rowcount != 1:
