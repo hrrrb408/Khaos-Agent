@@ -46,6 +46,7 @@ def main() -> int:
         json.dumps(catalog.manifest(), ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+    args.output.chmod(0o444)
     print(catalog.catalog_digest)
     return 0
 

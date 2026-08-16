@@ -125,7 +125,6 @@ if [[ -z "${KHAOS_TYPED_RESOURCE_CATALOG_FILE:-}" ]]; then
         --workspace-root /app \
         --policy-digest "$KHAOS_EFFECTIVE_POLICY_DIGEST" \
         --output /run/khaos-catalog/typed-resource-catalog.json
-    chmod 0444 "$KHAOS_TYPED_RESOURCE_CATALOG_FILE"
 fi
 if [[ "$KHAOS_TYPED_RESOURCE_CATALOG_FILE" != /* || -L "$KHAOS_TYPED_RESOURCE_CATALOG_FILE" || ! -s "$KHAOS_TYPED_RESOURCE_CATALOG_FILE" ]]; then
     printf '%s\n' "KHAOS_TYPED_RESOURCE_CATALOG_FILE must be an absolute, non-symlink, non-empty catalog" >&2
