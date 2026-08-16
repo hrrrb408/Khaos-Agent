@@ -118,6 +118,96 @@ def _intent() -> AuthorizationIntent:
     )
 
 
+def _live_grant_parent(
+    daemon: AuthorityDaemon,
+    *,
+    grant_ttl_seconds: float = 900.0,
+    nonce: str = "narrow-race-parent",
+) -> tuple[str, SignedAuthorizationReceipt]:
+    """Issue one live grant and a prepared parent for narrow race tests."""
+    grant_id, _expires_at = daemon.grant(
+        principal_id="agent",
+        project_id="project",
+        runtime_id="runtime",
+        task_id="task",
+        workspace_id="workspace",
+        workspace_generation=1,
+        policy_digest="policy-digest",
+        operation_class="git.workspace",
+        resource_digest="workspace-digest",
+        authorization_epoch=2,
+        ttl_seconds=grant_ttl_seconds,
+    )
+    context_digest = authorityd_module._digest(
+        {
+            "schema_version": 1,
+            "principal_id": "agent",
+            "project_id": "project",
+            "runtime_id": "runtime",
+            "task_id": "task",
+            "workspace_id": "workspace",
+            "workspace_generation": 1,
+            "policy_digest": "policy-digest",
+            "authorization_epoch": 2,
+        }
+    )
+    parent = daemon.prepare(
+        replace(
+            _intent(),
+            nonce=nonce,
+            grant_id=grant_id,
+            grant_context_digest=context_digest,
+            workspace_generation=1,
+        )
+    )
+    return grant_id, parent
+
+
+def _start_gated_narrow(
+    daemon: AuthorityDaemon,
+    parent: SignedAuthorizationReceipt,
+    *,
+    block_phase: str,
+) -> tuple[threading.Thread, threading.Event, dict[str, BaseException | object]]:
+    """Pause child preparation either before or after it enters authorityd."""
+    entered = threading.Event()
+    release = threading.Event()
+    outcome: dict[str, BaseException | object] = {}
+    original_prepare = daemon.prepare
+
+    def gated_prepare(
+        intent: AuthorizationIntent,
+        **kwargs: object,
+    ) -> SignedAuthorizationReceipt:
+        if kwargs.get("_parent_receipt") is None:
+            return original_prepare(intent, **kwargs)  # type: ignore[arg-type]
+        if block_phase == "before-child":
+            entered.set()
+            assert release.wait(timeout=2)
+            return original_prepare(intent, **kwargs)  # type: ignore[arg-type]
+        child = original_prepare(intent, **kwargs)  # type: ignore[arg-type]
+        entered.set()
+        assert release.wait(timeout=2)
+        return child
+
+    daemon.prepare = gated_prepare  # type: ignore[method-assign]
+
+    def run() -> None:
+        try:
+            outcome["child"] = daemon.narrow(
+                parent,
+                operation="git.hash",
+                resource_digest="narrow-race-scope",
+            )
+        except BaseException as exc:  # noqa: BLE001 - test captures the boundary
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    assert entered.wait(timeout=2)
+    return thread, release, outcome
+
+
 def test_typed_kernel_keeps_native_execution_binding_exact() -> None:
     order, _parent_scope, _child_scope = _typed_git_order()
     kernel = AuthorityPolicyKernel(
@@ -1210,6 +1300,129 @@ def test_narrow_child_prepare_failure_rolls_parent_back_without_narrowing_state(
 
     worm.fail = False
     assert daemon.reconcile_audit_obligations() == 0
+
+
+@pytest.mark.parametrize("block_phase", ["before-child", "after-child"])
+@pytest.mark.parametrize(
+    "invalidation",
+    ["revoke", "epoch", "generation", "expiry"],
+)
+def test_narrow_transaction_aborts_without_leaking_audit_or_descendant_slots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    block_phase: str,
+    invalidation: str,
+) -> None:
+    """Every grant invalidation path must close an in-flight narrow exactly once."""
+    clock = [100.0]
+    if invalidation == "expiry":
+        monkeypatch.setattr(authorityd_module.time, "time", lambda: clock[0])
+    daemon = AuthorityDaemon(
+        socket_path=tmp_path / "authorityd.sock",
+        signing_key=Ed25519KeyStore.load_or_create(tmp_path / "key.pem", create=True),
+        audit_writer=_MemoryWorm(),
+        issuer_id="test-authorityd",
+        policy=lambda _intent: None,
+        require_live_grants=True,
+        max_audit_obligations=32,
+    )
+    grant_id, parent = _live_grant_parent(
+        daemon,
+        grant_ttl_seconds=1.0 if invalidation == "expiry" else 900.0,
+        nonce=f"{invalidation}-{block_phase}-parent",
+    )
+    thread, release, outcome = _start_gated_narrow(
+        daemon,
+        parent,
+        block_phase=block_phase,
+    )
+
+    invalidation_error: BaseException | None = None
+    try:
+        if invalidation == "revoke":
+            daemon.revoke_grant(grant_id)
+        elif invalidation == "epoch":
+            daemon.rotate_authorization_epoch(
+                principal_id="agent",
+                project_id="project",
+                workspace_id="workspace",
+                authorization_epoch=3,
+            )
+        elif invalidation == "generation":
+            daemon.rotate_workspace_generation(
+                principal_id="agent",
+                project_id="project",
+                workspace_id="workspace",
+                workspace_generation=2,
+            )
+        else:
+            clock[0] = 102.0
+            daemon._expire_grants()
+    except BaseException as exc:  # noqa: BLE001 - audit append may be uncertain
+        invalidation_error = exc
+    finally:
+        release.set()
+        thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert isinstance(outcome.get("error"), AuthorityControlPlaneError)
+    assert invalidation_error is None
+    assert daemon._audit_reservations == set()
+    assert daemon._grant_descendant_reservations == {}
+    assert daemon._narrow_transactions == {}
+    assert daemon.pending_count == 0
+    assert any(
+        record["kind"] == "execution.narrow-aborted-by-grant"
+        for record in daemon.audit_writer.records  # type: ignore[union-attr]
+    )
+
+
+def test_aborted_narrow_audit_failure_is_reconciled_and_second_revoke_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    """An uncertain abort append retains evidence, not an anonymous token."""
+    worm = _SelectiveWorm("execution.narrow-aborted-by-grant")
+    daemon = AuthorityDaemon(
+        socket_path=tmp_path / "authorityd.sock",
+        signing_key=Ed25519KeyStore.load_or_create(tmp_path / "key.pem", create=True),
+        audit_writer=worm,
+        issuer_id="test-authorityd",
+        policy=lambda _intent: None,
+        require_live_grants=True,
+        max_audit_obligations=8,
+    )
+    grant_id, parent = _live_grant_parent(daemon, nonce="audit-failure-parent")
+    thread, release, outcome = _start_gated_narrow(
+        daemon,
+        parent,
+        block_phase="after-child",
+    )
+
+    with pytest.raises(RemoteAuditUnavailableError):
+        daemon.revoke_grant(grant_id)
+    assert daemon._audit_reservations == set()
+    assert daemon.audit_obligation_count == 1
+
+    # A repeated revoke sees the terminal grant and cannot create another
+    # reservation or duplicate abort ownership while reconciliation is active.
+    daemon.revoke_grant(grant_id)
+    release.set()
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+    assert isinstance(outcome.get("error"), AuthorityControlPlaneError)
+    assert daemon._narrow_transactions == {}
+
+    worm.fail = False
+    assert daemon.reconcile_audit_obligations() == 0
+    assert daemon._audit_reservations == set()
+
+    # The bounded quota is reusable after the evidence owner is reconciled.
+    next_grant, next_parent = _live_grant_parent(
+        daemon,
+        nonce="audit-failure-reusable-parent",
+    )
+    daemon.revoke(next_parent)
+    daemon.revoke_grant(next_grant)
 
 
 @pytest.mark.posix_host
