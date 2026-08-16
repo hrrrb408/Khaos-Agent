@@ -44,6 +44,7 @@ from khaos.coding.workspace.storage import (
 )
 from khaos.coding.workspace.trusted_git import (
     AuthorityInput,
+    GitEffect,
     TrustedGitError,
     TrustedGitRunner,
     WorkspaceBootstrapLimits,
@@ -358,6 +359,7 @@ class WorkspaceManager:
                 self.root,
                 self._root_identity,
                 authority_broker=self._authority_broker,
+                resource_order=resource_order,
             )
         except TrustedGitError as exc:
             raise WorkspaceError(str(exc)) from exc
@@ -557,6 +559,7 @@ class WorkspaceManager:
         scope = GitRefScope(
             repository=str(canonical_repository),
             refs=frozenset({"HEAD"}),
+            ref_namespaces=frozenset({"refs/heads/khaos/task/"}),
             operations=GIT_SCOPE_OPERATIONS,
         )
         try:
@@ -588,6 +591,7 @@ class WorkspaceManager:
         authority: EffectCapability | None = None,
         authority_grant: AuthorityEnvelope | None = None,
         preserve_output: bool = False,
+        effect: GitEffect | None = None,
     ) -> str:
         try:
             # Keep one manager-owned runner so every Git process owner is
@@ -610,9 +614,20 @@ class WorkspaceManager:
                     "trusted Git requires a broker-issued capability; "
                     "AuthorityEnvelope is context only"
                 )
-            return await runner.run(
+            if effect is not None and tuple(args) != effect.args:
+                raise WorkspaceError(
+                    "structured Git effect does not match the requested argv"
+                )
+            if effect is None:
+                return await runner.run(
+                    repository,
+                    *args,
+                    authority=effect_authority,
+                    preserve_output=preserve_output,
+                )
+            return await runner.run_effect(
                 repository,
-                *args,
+                effect,
                 authority=effect_authority,
                 preserve_output=preserve_output,
             )
@@ -648,6 +663,7 @@ class WorkspaceManager:
         *args: str,
         preserve_output: bool = False,
         index_file: Path | None = None,
+        effect: GitEffect | None = None,
     ) -> str:
         """Run Git only against the pinned admin dir and worktree."""
         identity = workspace.git_identity
@@ -657,13 +673,36 @@ class WorkspaceManager:
             await asyncio.to_thread(verify_git_worktree_identity, identity)
         except GitIdentityError as exc:
             raise WorkspaceError(str(exc)) from exc
-        authority = self._workspace_authority(workspace, "git.workspace")
+        authority = self._workspace_authority(
+            workspace,
+            f"git.{effect.required_operation}"
+            if effect is not None and effect.required_operation is not None
+            else "git.workspace",
+        )
         try:
-            return await self._git_runner.run(
+            if effect is not None and tuple(args) != effect.args:
+                raise WorkspaceError(
+                    "structured Git effect does not match the requested argv"
+                )
+            if effect is None:
+                return await self._git_runner.run(
+                    workspace.worktree_path,
+                    f"--git-dir={identity.admin_dir}",
+                    f"--work-tree={workspace.worktree_path}",
+                    *args,
+                    authority=authority,
+                    preserve_output=preserve_output,
+                    index_file=index_file,
+                )
+            effect = effect.with_prefix(
+                (
+                    f"--git-dir={identity.admin_dir}",
+                    f"--work-tree={workspace.worktree_path}",
+                )
+            )
+            return await self._git_runner.run_effect(
                 workspace.worktree_path,
-                f"--git-dir={identity.admin_dir}",
-                f"--work-tree={workspace.worktree_path}",
-                *args,
+                effect,
                 authority=authority,
                 preserve_output=preserve_output,
                 index_file=index_file,
@@ -678,19 +717,44 @@ class WorkspaceManager:
         input_bytes: bytes,
         max_input_bytes: int = 64 * 1024,
         index_file: Path | None = None,
+        effect: GitEffect | None = None,
     ) -> str:
         """Run one audited Git plumbing operation with bounded stdin."""
         identity = workspace.git_identity
         if identity is None:
             raise WorkspaceError("TaskWorkspace Git identity is missing")
-        authority = self._workspace_authority(workspace, "git.workspace")
+        authority = self._workspace_authority(
+            workspace,
+            f"git.{effect.required_operation}"
+            if effect is not None and effect.required_operation is not None
+            else "git.workspace",
+        )
         try:
             await asyncio.to_thread(verify_git_worktree_identity, identity)
-            return await self._git_runner.run_with_input(
+            if effect is not None and tuple(args) != effect.args:
+                raise WorkspaceError(
+                    "structured Git effect does not match the requested argv"
+                )
+            if effect is None:
+                return await self._git_runner.run_with_input(
+                    workspace.worktree_path,
+                    f"--git-dir={identity.admin_dir}",
+                    f"--work-tree={workspace.worktree_path}",
+                    *args,
+                    input_bytes=input_bytes,
+                    max_input_bytes=max_input_bytes,
+                    authority=authority,
+                    index_file=index_file,
+                )
+            effect = effect.with_prefix(
+                (
+                    f"--git-dir={identity.admin_dir}",
+                    f"--work-tree={workspace.worktree_path}",
+                )
+            )
+            return await self._git_runner.run_effect_with_input(
                 workspace.worktree_path,
-                f"--git-dir={identity.admin_dir}",
-                f"--work-tree={workspace.worktree_path}",
-                *args,
+                effect,
                 input_bytes=input_bytes,
                 max_input_bytes=max_input_bytes,
                 authority=authority,
@@ -900,6 +964,11 @@ class WorkspaceManager:
             "read-tree",
             workspace.base_sha,
             index_file=index_file,
+            effect=GitEffect.read_tree(
+                repository_id=str(workspace.repository_root.resolve()),
+                treeish=workspace.base_sha,
+                required_operation="index",
+            ),
         )
         paths = {path for _, _, path in tracked}
         paths.update(untracked)
@@ -919,6 +988,11 @@ class WorkspaceManager:
                     "--",
                     safe_relative,
                     index_file=index_file,
+                    effect=GitEffect.update_index_remove(
+                        repository_id=str(workspace.repository_root.resolve()),
+                        path=safe_relative,
+                        required_operation="index",
+                    ),
                 )
                 continue
             except (OSError, SafePathError, WorkspaceBoundaryError) as exc:
@@ -931,6 +1005,11 @@ class WorkspaceManager:
                     "--",
                     safe_relative,
                     index_file=index_file,
+                    effect=GitEffect.update_index_remove(
+                        repository_id=str(workspace.repository_root.resolve()),
+                        path=safe_relative,
+                        required_operation="index",
+                    ),
                 )
                 continue
             object_id, mode = await self._hash_workspace_entry(
@@ -947,6 +1026,13 @@ class WorkspaceManager:
                 "--cacheinfo",
                 f"{mode},{object_id},{safe_relative}",
                 index_file=index_file,
+                effect=GitEffect.update_index_cacheinfo(
+                    repository_id=str(workspace.repository_root.resolve()),
+                    mode=mode,
+                    object_id=object_id,
+                    path=safe_relative,
+                    required_operation="index",
+                ),
             )
 
     async def _rollback_bootstrap(
@@ -971,7 +1057,15 @@ class WorkspaceManager:
                     "remove",
                     "--force",
                     str(candidate),
-                    authority_grant=transaction.authority_grant,
+                    authority_grant=transaction.authority_grant.derive(
+                        operation_class="git.cleanup"
+                    ),
+                    effect=GitEffect.worktree_remove(
+                        repository_id=str(transaction.repository.resolve()),
+                        path=str(candidate),
+                        force=True,
+                        required_operation="cleanup",
+                    ),
                 )
             except BaseException as exc:  # noqa: BLE001 - quarantine on proof failure
                 errors.append(exc)
@@ -990,7 +1084,17 @@ class WorkspaceManager:
                     "-d",
                     _safe_branch_ref(transaction.branch_name),
                     transaction.base_sha,
-                    authority_grant=transaction.authority_grant,
+                    authority_grant=transaction.authority_grant.derive(
+                        operation_class="git.cleanup-ref"
+                    ),
+                    effect=GitEffect.update_ref(
+                        repository_id=str(transaction.repository.resolve()),
+                        ref_name=_safe_branch_ref(transaction.branch_name),
+                        new_oid=None,
+                        expected_old_oid=transaction.base_sha,
+                        delete=True,
+                        required_operation="cleanup-ref",
+                    ),
                 )
             except BaseException as exc:  # noqa: BLE001 - retain branch ownership
                 errors.append(exc)
@@ -1088,7 +1192,16 @@ class WorkspaceManager:
                     branch,
                     str(pending_path),
                     base_sha,
-                    authority_grant=authority_context,
+                    authority_grant=authority_context.derive(
+                        operation_class="git.workspace"
+                    ),
+                    effect=GitEffect.worktree_add(
+                        repository_id=str(repository.resolve()),
+                        branch=branch,
+                        path=str(pending_path),
+                        base_oid=base_sha,
+                        required_operation="workspace",
+                    ),
                 )
                 transaction.branch_created = True
                 transaction.phase = "worktree-created"
@@ -1106,6 +1219,15 @@ class WorkspaceManager:
                     "read-tree",
                     base_sha,
                     authority_grant=authority_context.derive(operation_class="git.index"),
+                    effect=GitEffect.read_tree(
+                        repository_id=str(repository.resolve()),
+                        treeish=base_sha,
+                        prefix=(
+                            f"--git-dir={git_identity.admin_dir}",
+                            f"--work-tree={pending_path}",
+                        ),
+                        required_operation="index",
+                    ),
                 )
                 await self._materialize_git_tree(
                     repository,
@@ -1128,7 +1250,15 @@ class WorkspaceManager:
                     "move",
                     str(pending_path),
                     str(path),
-                    authority_grant=authority_context,
+                    authority_grant=authority_context.derive(
+                        operation_class="git.workspace"
+                    ),
+                    effect=GitEffect.worktree_move(
+                        repository_id=str(repository.resolve()),
+                        source=str(pending_path),
+                        destination=str(path),
+                        required_operation="workspace",
+                    ),
                 )
                 transaction.published = True
                 transaction.phase = "published"
@@ -1614,7 +1744,17 @@ class WorkspaceManager:
         if current_head != changeset.base_sha or current_digest != changeset.content_hash:
             raise WorkspaceError("changeset content changed; approval is stale")
 
-        await self._workspace_git(workspace, "read-tree", workspace.base_sha)
+        repository_id = str(workspace.repository_root.resolve())
+        await self._workspace_git(
+            workspace,
+            "read-tree",
+            workspace.base_sha,
+            effect=GitEffect.read_tree(
+                repository_id=repository_id,
+                treeish=workspace.base_sha,
+                required_operation="index",
+            ),
+        )
         for relative in changeset.changed_files:
             _target, safe_relative = _safe_workspace_target(workspace, relative)
             try:
@@ -1625,14 +1765,32 @@ class WorkspaceManager:
                     filesystem.close()
             except FileNotFoundError:
                 await self._workspace_git(
-                    workspace, "update-index", "--remove", "--", safe_relative
+                    workspace,
+                    "update-index",
+                    "--remove",
+                    "--",
+                    safe_relative,
+                    effect=GitEffect.update_index_remove(
+                        repository_id=repository_id,
+                        path=safe_relative,
+                        required_operation="index",
+                    ),
                 )
                 continue
             except (OSError, SafePathError, WorkspaceBoundaryError) as exc:
                 raise WorkspaceError(str(exc)) from exc
             if info is None:
                 await self._workspace_git(
-                    workspace, "update-index", "--remove", "--", safe_relative
+                    workspace,
+                    "update-index",
+                    "--remove",
+                    "--",
+                    safe_relative,
+                    effect=GitEffect.update_index_remove(
+                        repository_id=repository_id,
+                        path=safe_relative,
+                        required_operation="index",
+                    ),
                 )
                 continue
             object_id, mode = await self._hash_workspace_entry(
@@ -1648,9 +1806,23 @@ class WorkspaceManager:
                 "--add",
                 "--cacheinfo",
                 f"{mode},{object_id},{safe_relative}",
+                effect=GitEffect.update_index_cacheinfo(
+                    repository_id=repository_id,
+                    mode=mode,
+                    object_id=object_id,
+                    path=safe_relative,
+                    required_operation="index",
+                ),
             )
 
-        tree = await self._workspace_git(workspace, "write-tree")
+        tree = await self._workspace_git(
+            workspace,
+            "write-tree",
+            effect=GitEffect.write_tree(
+                repository_id=repository_id,
+                required_operation="workspace",
+            ),
+        )
         message_bytes = message.encode("utf-8")
         if not message_bytes or len(message_bytes) > 64 * 1024 or b"\0" in message_bytes:
             raise WorkspaceError("commit message is empty, too large, or contains NUL")
@@ -1661,9 +1833,29 @@ class WorkspaceManager:
             "-p",
             current_head,
             input_bytes=message_bytes,
+            effect=GitEffect.commit_tree(
+                repository_id=repository_id,
+                tree_oid=tree,
+                parent_oid=current_head,
+                stdin_sha256=hashlib.sha256(message_bytes).hexdigest(),
+                required_operation="workspace",
+            ),
         )
         ref = _safe_branch_ref(workspace.branch_name)
-        await self._workspace_git(workspace, "update-ref", ref, commit_id, current_head)
+        await self._workspace_git(
+            workspace,
+            "update-ref",
+            ref,
+            commit_id,
+            current_head,
+            effect=GitEffect.update_ref(
+                repository_id=repository_id,
+                ref_name=ref,
+                new_oid=commit_id,
+                expected_old_oid=current_head,
+                required_operation="workspace",
+            ),
+        )
         return await self._workspace_git(workspace, "rev-parse", "HEAD")
 
     async def cleanup(self, workspace_id: str, *, force: bool = False) -> WorkspaceTransition:
@@ -1752,6 +1944,12 @@ class WorkspaceManager:
                             "--force",
                             str(workspace.worktree_path),
                             authority_grant=authority,
+                            effect=GitEffect.worktree_remove(
+                                repository_id=str(workspace.repository_root.resolve()),
+                                path=str(workspace.worktree_path),
+                                force=True,
+                                required_operation="cleanup",
+                            ),
                         )
                     else:
                         await self._git(
@@ -1760,6 +1958,12 @@ class WorkspaceManager:
                             "remove",
                             str(workspace.worktree_path),
                             authority_grant=authority,
+                            effect=GitEffect.worktree_remove(
+                                repository_id=str(workspace.repository_root.resolve()),
+                                path=str(workspace.worktree_path),
+                                force=False,
+                                required_operation="cleanup",
+                            ),
                         )
                     # A successful worktree removal does not remove the local
                     # task ref.  Delete it with the last known commit as a CAS so
@@ -1772,6 +1976,14 @@ class WorkspaceManager:
                         _safe_branch_ref(workspace.branch_name),
                         workspace.base_sha,
                         authority_grant=self._workspace_authority(workspace, "git.cleanup-ref"),
+                        effect=GitEffect.update_ref(
+                            repository_id=str(workspace.repository_root.resolve()),
+                            ref_name=_safe_branch_ref(workspace.branch_name),
+                            new_oid=None,
+                            expected_old_oid=workspace.base_sha,
+                            delete=True,
+                            required_operation="cleanup-ref",
+                        ),
                     )
                     workspace.git_cleanup_complete = True
                 except Exception:  # noqa: BLE001 - worktree cleanup failure is persisted

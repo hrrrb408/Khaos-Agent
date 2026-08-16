@@ -12,10 +12,13 @@ import pytest
 pytestmark = pytest.mark.posix_host
 from khaos.coding.workspace.boundary import SafeWorkspaceFS
 from khaos.coding.workspace.trusted_git import (
+    GitEffect,
     TrustedGitError,
     TrustedGitProcessOwner,
     TrustedGitProcessState,
+    TrustedGitRunner,
 )
+from khaos.security.authority_broker import AuthorityBroker
 
 
 @pytest.mark.asyncio
@@ -100,3 +103,124 @@ def test_safe_workspace_file_descriptor_survives_leaf_replacement(
             assert (final.st_dev, final.st_ino) == (expected.st_dev, expected.st_ino)
         finally:
             os.close(descriptor)
+
+
+def test_git_update_ref_effect_binds_exact_cas_arguments(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    root_info = repository.stat()
+    broker = AuthorityBroker()
+    try:
+        authority = broker.envelope(
+            principal_id="agent",
+            project_id="project",
+            runtime_id="runtime",
+            task_id="task",
+            workspace_id="workspace",
+            workspace_generation=1,
+            policy_digest="policy",
+            operation_class="git.workspace",
+            resource_digest="resource",
+        )
+        capability = broker.issue(authority, allowed_operation="git.workspace")
+        runner = TrustedGitRunner(
+            executable=Path(sys.executable),
+            git_identity=(
+                int(root_info.st_dev),
+                int(root_info.st_ino),
+                int(root_info.st_uid),
+                int(root_info.st_mode),
+            ),
+            git_digest="unused-for-binding-test",
+            authority_root=repository,
+            authority_root_identity=(
+                int(root_info.st_dev),
+                int(root_info.st_ino),
+                int(root_info.st_uid),
+                int(root_info.st_mode),
+            ),
+            authority_broker=broker,
+        )
+        effect = GitEffect.update_ref(
+            repository_id=str(repository.resolve()),
+            ref_name="refs/heads/khaos/task/task-1",
+            new_oid="b" * 40,
+            expected_old_oid="a" * 40,
+        )
+        runner._validate_effect_binding(
+            repository,
+            effect.args,
+            effect,
+            capability,
+        )
+        with pytest.raises(TrustedGitError, match="argv changed"):
+            runner._validate_effect_binding(
+                repository,
+                (*effect.args[:-1], "c" * 40),
+                effect,
+                capability,
+            )
+    finally:
+        broker.close()
+
+
+@pytest.mark.asyncio
+async def test_all_binary_and_sync_entries_reject_unbound_state_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    root_info = repository.stat()
+    broker = AuthorityBroker()
+    try:
+        authority = broker.envelope(
+            principal_id="agent",
+            project_id="project",
+            runtime_id="runtime",
+            task_id="task",
+            workspace_id="workspace",
+            workspace_generation=1,
+            policy_digest="policy",
+            operation_class="git.workspace",
+            resource_digest="resource",
+        )
+        runner = TrustedGitRunner(
+            executable=Path(sys.executable),
+            git_identity=(
+                int(root_info.st_dev),
+                int(root_info.st_ino),
+                int(root_info.st_uid),
+                int(root_info.st_mode),
+            ),
+            git_digest="unused-for-binding-test",
+            authority_root=repository,
+            authority_root_identity=(
+                int(root_info.st_dev),
+                int(root_info.st_ino),
+                int(root_info.st_uid),
+                int(root_info.st_mode),
+            ),
+            authority_broker=broker,
+        )
+        monkeypatch.setattr(runner, "_verify", lambda: None)
+
+        def capability() -> object:
+            return broker.issue(authority, allowed_operation="git.workspace")
+
+        args = ("update-ref", "refs/heads/main", "b" * 40, "a" * 40)
+        with pytest.raises(TrustedGitError, match="structured exact effect"):
+            await runner.run_bytes(repository, *args, authority=capability())
+        with pytest.raises(TrustedGitError, match="structured exact effect"):
+            await runner.run_bytes_limited(
+                repository,
+                *args,
+                authority=capability(),
+                max_bytes=1024,
+            )
+        with pytest.raises(TrustedGitError, match="structured exact effect"):
+            runner.run_sync(repository, *args, authority=capability())
+        with pytest.raises(TrustedGitError, match="structured exact effect"):
+            runner.run_sync_bytes(repository, *args, authority=capability())
+    finally:
+        broker.close()

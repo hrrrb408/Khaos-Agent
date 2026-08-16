@@ -6,6 +6,7 @@ from enum import Enum
 
 from khaos.coding.workspace.manager import WorkspaceError, WorkspaceManager
 from khaos.coding.workspace.models import ChangeSet
+from khaos.coding.workspace.trusted_git import GitEffect
 from khaos.security.authority import AuthorityEnvelope
 
 
@@ -53,6 +54,11 @@ async def output_changeset(manager: WorkspaceManager, workspace_id: str, changes
             "--index",
             str(patch_file),
             **git_kwargs,
+            effect=GitEffect.apply_index_file(
+                repository_id=str(workspace.repository_root.resolve()),
+                patch_path=str(patch_file.resolve()),
+                required_operation="apply",
+            ),
         )
     finally:
         patch_file.unlink(missing_ok=True)
