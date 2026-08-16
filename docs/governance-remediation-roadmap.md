@@ -1,6 +1,6 @@
 # Governance Remediation Roadmap
 
-> Status reference: 2026-08-04 `main` branch.
+> Status reference: 2026-08-16 `main` branch and the current remediation branch.
 >
 > This roadmap tracks the review findings that **cannot be fixed by code
 > alone** — they require organizational, infrastructure, or third-party
@@ -10,6 +10,26 @@
 >
 > Each item records: **current state**, **risk**, **proposed resolution**, and
 > **prerequisite** (the condition that must hold before the item can close).
+
+---
+
+## Current review delta
+
+The latest code review's locally code-fixable findings are now represented in
+the implementation and security ledger: TrustedGit worktree effects are
+strictly below the private authority root, file-based Git apply effects bind
+patch length and SHA-256 before spawn, narrow aborts preserve the planned
+event/reason, credential use has a broker-owned short-lived lease path, and
+the first AgentLoop/ToolScheduler phase components are physically extracted.
+These are not independent deployment or governance evidence until the
+protected exact-SHA checks pass.
+
+Two review boundaries remain deliberately open and fail closed: macOS/Windows
+production authority transport still requires the native launchd/XPC or
+Named Pipe/Service SID adapters, and the repository still has no independent
+human approving maintainer. The Windows sandbox backend described below is a
+sandbox primitive, not proof that the independent authority transport is
+complete.
 
 ---
 
@@ -120,6 +140,10 @@ unsupported command fails closed.
 
 **Prerequisite.** A passing current-head Windows runner is required before
 release; private-desktop support remains outside this closure.
+
+This sandbox closure does not close the separate production AuthorityBroker
+transport item: without the native authority service/identity adapter,
+production authority-backed execution remains fail-closed on Windows.
 
 ---
 

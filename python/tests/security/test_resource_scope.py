@@ -191,6 +191,42 @@ def test_git_execution_and_credential_scopes_are_same_kind_only() -> None:
     assert credential.contains(credential)
 
 
+def test_git_worktree_scope_requires_a_strict_private_root_child(tmp_path: Path) -> None:
+    root = tmp_path / "worktrees"
+    root.mkdir()
+    parent = GitRefScope(
+        repository=str(tmp_path / "repo"),
+        refs=frozenset({"HEAD"}),
+        operations=frozenset({"workspace"}),
+        worktree_root=str(root),
+    )
+    child = GitRefScope(
+        repository=str(tmp_path / "repo"),
+        refs=frozenset({"HEAD"}),
+        operations=frozenset({"workspace"}),
+        worktree_root=str(root / "task-1"),
+    )
+    sibling = GitRefScope(
+        repository=str(tmp_path / "repo"),
+        refs=frozenset({"HEAD"}),
+        operations=frozenset({"workspace"}),
+        worktree_root=str(tmp_path / "other"),
+    )
+
+    assert parent.contains(child)
+    assert parent.allows_worktree_path(str(root / "task-1"))
+    assert not parent.allows_worktree_path(str(root))
+    assert not parent.allows_worktree_path(str(tmp_path / "repo"))
+    assert not parent.contains(sibling)
+
+    legacy = GitRefScope(
+        repository=str(tmp_path / "repo"),
+        refs=frozenset({"HEAD"}),
+        operations=frozenset({"workspace"}),
+    )
+    assert not legacy.allows_worktree_path(str(root / "task-1"))
+
+
 def test_partial_order_catalog_is_immutable_and_fails_closed() -> None:
     parent = FilesystemScope(
         workspace_id=CanonicalWorkspaceId("workspace-a"),

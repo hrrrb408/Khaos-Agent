@@ -13,12 +13,11 @@ import sys
 from pathlib import Path
 
 import pytest
-
 from khaos.coding.execution import ExecutionService
 from khaos.coding.workspace.office_authority import OfficeMutationAuthority
 from khaos.db import Database
 from khaos.runtime import RuntimeConfig, build_runtime
-
+from khaos.security.credential_broker import CredentialBroker
 
 pytestmark = pytest.mark.skipif(
     sys.platform == "win32",
@@ -82,6 +81,38 @@ async def test_factory_default_policy_still_builds(tmp_path):
         await db.close()
 
 
+async def test_factory_wires_borrowed_credential_broker_without_stealing_ownership(
+    tmp_path,
+):
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    await db.create_session("s1")
+    (tmp_path / "khaos_policy.yaml").write_text(
+        "sandbox:\n  mode: read-only\n", encoding="utf-8"
+    )
+    broker = CredentialBroker()
+    result = await build_runtime(
+        RuntimeConfig(
+            project_root=tmp_path,
+            db=db,
+            principal_id="local-uid:test",
+            credential_broker=broker,
+        )
+    )
+    try:
+        assert result.credential_broker is broker
+        assert result.tool_scheduler.credential_broker is broker
+        assert result.owns_credential_broker is False
+        assert broker.policy_digest
+        assert broker.principal_id == "local-uid:test"
+        await result.aclose()
+        assert broker.closed is False
+    finally:
+        broker.close()
+        await db.close()
+
+
 async def test_factory_aclose_actually_shuts_down_components(tmp_path):
     """B1 / CI gap: ``await result.aclose()`` must really close components.
 
@@ -93,8 +124,6 @@ async def test_factory_aclose_actually_shuts_down_components(tmp_path):
     policy = "sandbox:\n  mode: workspace-write\n"
     result, db = await _build(tmp_path, policy)
     office_authority = result.office_authority
-    execution_service = result.execution_service
-    memory_manager = result.memory_manager
     try:
         assert result._closed is False
         # Office authority is writable before close.

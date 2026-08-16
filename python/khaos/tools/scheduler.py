@@ -44,12 +44,14 @@ from khaos.permissions.resource import (
     resolve_authorization_resource,
 )
 from khaos.permissions.rules import typed_rule_from_authorization_resource
+from khaos.security.credential_broker import CredentialBroker
 from khaos.security.middleware import SecurityMiddleware
 from khaos.security.network_broker import (
     NetworkBroker,
     NetworkBrokerFactory,
     NetworkLease,
 )
+from khaos.security.orchestration_components import ToolPhaseCoordinator
 from khaos.security.orchestration_phases import (
     OrchestrationPhaseError,
     ToolPhase,
@@ -509,6 +511,7 @@ class ToolScheduler:
         # BrowserContexts (keyed by principal_id + session_id + runtime_id).
         runtime_id: str = "",
         network_broker_factory: NetworkBrokerFactory | None = None,
+        credential_broker: CredentialBroker | None = None,
     ):
         self.registry = registry
         self.permission_engine = permission_engine
@@ -520,6 +523,7 @@ class ToolScheduler:
         self.network_broker_factory: NetworkBrokerFactory = (
             network_broker_factory or NetworkBrokerFactory()
         )
+        self.credential_broker = credential_broker
         self._network_brokers: set[NetworkBroker] = set()
         # When True and the Rust bridge is importable, read-only file reads in
         # the parallel group are offloaded to the Rust executor for the bulk
@@ -612,19 +616,7 @@ class ToolScheduler:
         **evidence: Any,
     ) -> ToolPhaseSnapshot:
         """Advance the immutable phase evidence attached to one call."""
-        snapshot = call.get("_phase_snapshot")
-        if not isinstance(snapshot, ToolPhaseSnapshot):
-            raise PermissionDeniedError(
-                "tool phase evidence is missing at the scheduler boundary"
-            )
-        try:
-            snapshot.assert_call(call)
-            next_snapshot = snapshot.transition(next_phase, **evidence)
-        except OrchestrationPhaseError as exc:
-            raise PermissionDeniedError(str(exc)) from exc
-        call["_phase_snapshot"] = next_snapshot
-        call["_phase_digest"] = next_snapshot.digest()
-        return next_snapshot
+        return ToolPhaseCoordinator.advance(call, next_phase, **evidence)
 
     @staticmethod
     def _terminalize_tool_phase(
@@ -632,32 +624,7 @@ class ToolScheduler:
         result: ToolResult,
     ) -> ToolResult:
         """Close a dispatched call and expose its immutable phase digest."""
-        snapshot = call.get("_phase_snapshot")
-        if not isinstance(snapshot, ToolPhaseSnapshot):
-            return result
-        try:
-            snapshot.assert_call(call)
-            terminal = snapshot.transition(
-                ToolPhase.TERMINAL,
-                effect_digest=digest_phase_payload(
-                    {
-                        "effect_id": result.effect_id,
-                        "effect_status": result.effect_status,
-                    }
-                ),
-                result_digest=digest_phase_payload(
-                    {
-                        "success": result.success,
-                        "error_code": result.error_code,
-                        "delivery_status": result.delivery_status,
-                    }
-                ),
-            )
-        except OrchestrationPhaseError as exc:
-            raise PermissionDeniedError(str(exc)) from exc
-        call["_phase_snapshot"] = terminal
-        call["_phase_digest"] = terminal.digest()
-        return replace(result, phase_digest=terminal.digest())
+        return ToolPhaseCoordinator.terminalize(call, result)
 
     async def stream_batch(
         self,
@@ -706,6 +673,8 @@ class ToolScheduler:
         if self.budget.is_exhausted:
             return
         tool_context = dict(tool_context or {})
+        if "credential_broker" not in tool_context:
+            tool_context["credential_broker"] = self.credential_broker
         network_guard = getattr(self.security_middleware, "network_guard", None)
         tool_context["network_policy"] = (
             "unrestricted-with-approval"

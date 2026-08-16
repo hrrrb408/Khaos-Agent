@@ -14,6 +14,11 @@ from urllib.parse import urlparse
 
 from khaos.coding.execution.models import ExecutionRequest, NetworkPolicy
 from khaos.coding.workspace.models import WorkspaceState
+from khaos.security.credential_broker import (
+    CredentialBroker,
+    CredentialBrokerError,
+    CredentialLease,
+)
 
 _MAX_TITLE = 256
 _MAX_BODY = 65536
@@ -27,7 +32,11 @@ async def _gh(args: list[str], *, context: dict[str, Any], tool_name: str, paylo
         if context.get("network_policy") != NetworkPolicy.UNRESTRICTED_WITH_APPROVAL.value:
             raise PermissionError("GitHub operation requires server-authorized network policy")
         credential_scope, credential_environment = _credential_material(
-            context.get("credential_context"), host, repository, tool_name
+            context.get("credential_context"),
+            host,
+            repository,
+            tool_name,
+            credential_broker=context.get("credential_broker"),
         )
         if tool_name in _WRITE_TOOLS:
             await _consume_github_approval(
@@ -151,7 +160,13 @@ async def prepare_github_approval(
     workspace, _, host, repository = await _repository_context(
         {**tool_context, "cwd": str(arguments.get("cwd") or ".")}
     )
-    _credential_material(tool_context.get("credential_context"), host, repository, tool_name)
+    _credential_material(
+        tool_context.get("credential_context"),
+        host,
+        repository,
+        tool_name,
+        credential_broker=tool_context.get("credential_broker"),
+    )
     payload = _payload_for(tool_name, arguments)
     _validate_payload(tool_name, payload)
     if tool_name == "github_create_pr" and payload["head"] and payload["head"] != workspace.branch_name:
@@ -272,7 +287,60 @@ async def _execute_read(service: Any, task_id: str, workspace_id: str, cwd: Path
     ))
 
 
-def _credential_material(context: Any, host: str, repository: str, operation: str) -> tuple[str, dict[str, str]]:
+def _credential_material(
+    context: Any,
+    host: str,
+    repository: str,
+    operation: str,
+    *,
+    credential_broker: CredentialBroker | None = None,
+) -> tuple[str, dict[str, str]]:
+    binding = {"host": host, "repository": repository}
+    if isinstance(context, CredentialLease):
+        if credential_broker is None:
+            raise PermissionError("credential lease requires CredentialBroker")
+        if (
+            context.scope.provider != "github"
+            or "github-token" not in context.scope.names
+        ):
+            raise PermissionError("credential lease is not a GitHub token lease")
+        try:
+            environment = credential_broker.materialize(
+                context,
+                binding=binding,
+                operation=operation,
+            )
+        except CredentialBrokerError as exc:
+            raise PermissionError(str(exc)) from exc
+        return "github-token", environment
+    if credential_broker is not None:
+        try:
+            if context is None:
+                lease = credential_broker.issue_named(
+                    provider="github",
+                    name="github-token",
+                    operation=operation,
+                    binding=binding,
+                )
+            else:
+                lease = credential_broker.adopt_context(
+                    context,
+                    provider="github",
+                    name="github-token",
+                    operation=operation,
+                    binding=binding,
+                )
+            try:
+                environment = credential_broker.materialize(
+                    lease,
+                    binding=binding,
+                    operation=operation,
+                )
+            finally:
+                credential_broker.revoke(lease)
+            return "github-token", environment
+        except CredentialBrokerError as exc:
+            raise PermissionError(str(exc)) from exc
     if not isinstance(context, dict) or context.get("scope") != "github-token":
         raise PermissionError("credential authorization required: github-token")
     if context.get("host") != host or context.get("repository") != repository:

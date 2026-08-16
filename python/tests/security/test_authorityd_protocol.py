@@ -1371,10 +1371,18 @@ def test_narrow_transaction_aborts_without_leaking_audit_or_descendant_slots(
     assert daemon._grant_descendant_reservations == {}
     assert daemon._narrow_transactions == {}
     assert daemon.pending_count == 0
-    assert any(
-        record["kind"] == "execution.narrow-aborted-by-grant"
+    abort_events = [
+        record
         for record in daemon.audit_writer.records  # type: ignore[union-attr]
-    )
+        if record["kind"] == "execution.narrow-aborted-by-grant"
+    ]
+    assert abort_events
+    assert abort_events[-1]["reason"] == {
+        "revoke": "explicit-revoke",
+        "epoch": "authorization-epoch-rotated",
+        "generation": "workspace-generation-rotated",
+        "expiry": "expired",
+    }[invalidation]
 
 
 def test_aborted_narrow_audit_failure_is_reconciled_and_second_revoke_is_idempotent(

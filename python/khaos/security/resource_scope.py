@@ -312,6 +312,11 @@ class GitRefScope(ResourceScope):
     refs: frozenset[str]
     operations: frozenset[str]
     ref_namespaces: frozenset[str] = frozenset()
+    # A Git ref capability is not sufficient to authorize a host worktree
+    # pathname.  Production callers may bind the worktree effects to this
+    # independent private root; read/ref-only catalog entries can leave it
+    # unset, but a runner must reject worktree effects without the binding.
+    worktree_root: str | None = None
     kind: ResourceScopeKind = ResourceScopeKind.GIT_REF
 
     def __post_init__(self) -> None:
@@ -333,6 +338,12 @@ class GitRefScope(ResourceScope):
             )
         object.__setattr__(self, "refs", refs)
         object.__setattr__(self, "ref_namespaces", namespaces)
+        if self.worktree_root is not None:
+            object.__setattr__(
+                self,
+                "worktree_root",
+                _canonical_filesystem_path("worktree_root", self.worktree_root),
+            )
         object.__setattr__(self, "operations", _require_actions("operations", self.operations))
 
     def _contains_ref(self, ref: str) -> bool:
@@ -345,14 +356,34 @@ class GitRefScope(ResourceScope):
         """Return whether one concrete ref is covered by this scope."""
         return self._contains_ref(_require_concrete("ref", ref))
 
+    def allows_worktree_path(self, path: str) -> bool:
+        """Return whether a worktree path is a strict child of its root.
+
+        The root itself is intentionally not an allowed Git worktree target:
+        worktree effects must create, move, or remove a child allocation and
+        never operate on the authority root directory.
+        """
+        if self.worktree_root is None:
+            return False
+        candidate = _canonical_filesystem_path("worktree_path", path)
+        return candidate != self.worktree_root and _path_contains(
+            self.worktree_root, candidate
+        )
+
     def contains(self, child: ResourceScope) -> bool:
-        return (
-            isinstance(child, GitRefScope)
-            and self.repository == child.repository
-            and all(self._contains_ref(ref) for ref in child.refs)
+        if not isinstance(child, GitRefScope) or self.repository != child.repository:
+            return False
+        if not (
+            all(self._contains_ref(ref) for ref in child.refs)
             and all(self._contains_namespace(namespace) for namespace in child.ref_namespaces)
             and self.operations.issuperset(child.operations)
-        )
+        ):
+            return False
+        if self.worktree_root is None:
+            return child.worktree_root is None
+        if child.worktree_root is None:
+            return False
+        return _path_contains(self.worktree_root, child.worktree_root)
 
     def canonical(self) -> dict[str, object]:
         return {
@@ -360,6 +391,7 @@ class GitRefScope(ResourceScope):
             "refs": sorted(self.refs),
             "ref_namespaces": sorted(self.ref_namespaces),
             "operations": sorted(self.operations),
+            "worktree_root": self.worktree_root,
         }
 
 
@@ -734,7 +766,13 @@ def _scope_from_manifest(kind: str, body: object) -> ResourceScope:
         if scope_kind is ResourceScopeKind.GIT_REF:
             _reject_unknown_fields(
                 body,
-                {"repository", "refs", "ref_namespaces", "operations"},
+                {
+                    "repository",
+                    "refs",
+                    "ref_namespaces",
+                    "operations",
+                    "worktree_root",
+                },
                 "git-ref scope",
             )
             return GitRefScope(
@@ -746,6 +784,9 @@ def _scope_from_manifest(kind: str, body: object) -> ResourceScope:
                 )
                 if "ref_namespaces" in body
                 else frozenset(),
+                worktree_root=cast(str, body["worktree_root"])
+                if "worktree_root" in body and body["worktree_root"] is not None
+                else None,
             )
         if scope_kind is ResourceScopeKind.EXECUTION:
             _reject_unknown_fields(

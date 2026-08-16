@@ -311,12 +311,34 @@ class AuthorityDaemon:
         self,
         transaction: _NarrowTransaction,
         *,
-        reason: str,
+        planned_event: dict[str, Any] | None = None,
+        reason: str | None = None,
         evidence_owner: str,
     ) -> dict[str, Any]:
         """Atomically abort a narrow and bind its token to abort evidence."""
-        event = self._narrow_abort_event_locked(transaction, reason=reason)
+        if (planned_event is None) == (reason is None):
+            raise AuthorityControlPlaneError(
+                "narrow abort commit requires exactly one event plan or reason"
+            )
+        event = self._narrow_abort_event_locked(
+            transaction,
+            reason=(
+                str(planned_event.get("reason"))
+                if planned_event is not None
+                else str(reason)
+            ),
+        )
+        if planned_event is not None:
+            normalized_plan = self._audit_event(planned_event)
+            if event != normalized_plan:
+                raise AuthorityControlPlaneError(
+                    "narrow abort event changed between planning and commit"
+                )
         if transaction.state in {_NARROW_ABORTING, _NARROW_ABORTED}:
+            if transaction.abort_event is not None and transaction.abort_event != event:
+                raise AuthorityControlPlaneError(
+                    "terminal narrow abort evidence does not match its plan"
+                )
             return event
         if transaction.audit_token not in self._audit_reservations:
             raise AuthorityControlPlaneError(
@@ -528,10 +550,10 @@ class AuthorityDaemon:
             revoked_nonces,
             narrow_abort_plans,
         ) in plans:
-            for transaction, _event in narrow_abort_plans:
+            for transaction, planned_event in narrow_abort_plans:
                 self._commit_narrow_abort_locked(
                     transaction,
-                    reason="grant-revoked",
+                    planned_event=planned_event,
                     evidence_owner="grant-revocation",
                 )
             self._grants.pop(grant_id, None)
@@ -594,10 +616,10 @@ class AuthorityDaemon:
                     break
                 for event in grant_events:
                     self._reserve_audit_event_locked(event)
-                for transaction, _event in narrow_abort_plans:
+                for transaction, planned_event in narrow_abort_plans:
                     self._commit_narrow_abort_locked(
                         transaction,
-                        reason="grant-expired",
+                        planned_event=planned_event,
                         evidence_owner="grant-revocation",
                     )
                 self._grants.pop(grant_id, None)
@@ -1011,10 +1033,10 @@ class AuthorityDaemon:
             )
             for event in events:
                 self._reserve_audit_event_locked(event)
-            for transaction, _event in narrow_abort_plans:
+            for transaction, planned_event in narrow_abort_plans:
                 self._commit_narrow_abort_locked(
                     transaction,
-                    reason="grant-expired",
+                    planned_event=planned_event,
                     evidence_owner="grant-revocation",
                 )
             self._grants.pop(intent.grant_id, None)

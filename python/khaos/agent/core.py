@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from khaos.project_context import ProjectContextLoader
 
 from khaos.exceptions import CompressionCircuitOpenError
+from khaos.security.orchestration_components import TurnAdmission, TurnFinalizer
 from khaos.security.orchestration_phases import (
     OrchestrationPhaseError,
     TurnPhase,
@@ -137,6 +138,7 @@ class AgentLoop:
         cron_engine=None,
         browser_manager=None,
         subagent_spawner=None,
+        credential_broker=None,
         # M4 batch 3.1.16A-5-1b (CRITICAL): project identity stamp.
         # Bound at construction from ``RuntimeConfig.project_id`` (set by
         # ``AgentService`` from the verified RPC payload) — NOT recomputed
@@ -211,6 +213,7 @@ class AgentLoop:
         self.cron_engine = cron_engine
         self.browser_manager = browser_manager
         self.subagent_spawner = subagent_spawner
+        self.credential_broker = credential_broker
         self.channel_admins = (
             channel_admins if channel_admins is not None else frozenset()
         )
@@ -273,15 +276,7 @@ class AgentLoop:
         terminal_status: str,
     ) -> TurnPhaseSnapshot:
         """Close a turn through the explicit finalization boundary."""
-        if phase.phase is not TurnPhase.FINALIZING:
-            phase = phase.transition(
-                TurnPhase.FINALIZING,
-                terminal_status=terminal_status,
-            )
-        return phase.transition(
-            TurnPhase.FINALIZED,
-            terminal_status=terminal_status,
-        )
+        return TurnFinalizer.finalize(phase, terminal_status=terminal_status)
 
     async def run(
         self,
@@ -348,7 +343,7 @@ class AgentLoop:
         self._active_context_facts = await self._build_durable_task_facts(
             active_task_id
         )
-        orchestration_phase = TurnPhaseSnapshot.admitted(
+        orchestration_phase = TurnAdmission.admit(
             session_id=session_id,
             turn_id=turn.turn_id,
             attempt_id=turn.attempt_id,
@@ -625,6 +620,7 @@ class AgentLoop:
                         "coding_workspace_enforced": self.active_workspace is not None,
                         "production_runtime": os.environ.get("KHAOS_DEV_MODE") != "1",
                         "approval_broker": self.approval_broker,
+                        "credential_broker": self.credential_broker,
                         "requester": session_id,
                         "principal_id": self.principal_id,
                         "source_transport": self.source_transport,
