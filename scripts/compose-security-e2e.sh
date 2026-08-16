@@ -79,9 +79,11 @@ export KHAOS_ALLOWED_HOSTS="localhost,127.0.0.1"
 # the *compiled* effective policy.  Compute it inside the same Python image
 # that will run the agent, so this smoke test cannot drift from the runtime's
 # YAML parser or policy compiler.  An explicitly supplied digest is accepted
-# for deployment-driven runs, but is still format-checked below.
+# for deployment-driven runs, but is still format-checked below.  The typed
+# resource catalog is generated in that same image and uses /app as its
+# workspace root, matching the production container's runtime identity.
 policy_image="${project_name}-policy-digest"
-if [[ -z "${KHAOS_EFFECTIVE_POLICY_DIGEST:-}" ]]; then
+if [[ -z "${KHAOS_EFFECTIVE_POLICY_DIGEST:-}" || -z "${KHAOS_TYPED_RESOURCE_CATALOG_FILE:-}" ]]; then
     docker build \
         --quiet \
         --target python-agent \
@@ -102,6 +104,29 @@ if [[ ! "$KHAOS_EFFECTIVE_POLICY_DIGEST" =~ ^[0-9a-f]{64}$ ]]; then
     exit 1
 fi
 export KHAOS_EFFECTIVE_POLICY_DIGEST
+
+if [[ -z "${KHAOS_TYPED_RESOURCE_CATALOG_FILE:-}" ]]; then
+    KHAOS_TYPED_RESOURCE_CATALOG_FILE="$secret_dir/typed-resource-catalog.json"
+    docker run --rm \
+        --read-only \
+        --tmpfs /tmp \
+        --user "$(id -u):$(id -g)" \
+        --env HOME=/tmp \
+        --volume "$repo_root/khaos_policy.yaml:/app/khaos_policy.yaml:ro" \
+        --volume "$repo_root/scripts:/src/scripts:ro" \
+        --volume "$secret_dir:/run/khaos-catalog:rw" \
+        "$policy_image" \
+        python /src/scripts/generate_typed_resource_catalog.py \
+        --workspace-root /app \
+        --policy-digest "$KHAOS_EFFECTIVE_POLICY_DIGEST" \
+        --output /run/khaos-catalog/typed-resource-catalog.json
+    chmod 0444 "$KHAOS_TYPED_RESOURCE_CATALOG_FILE"
+fi
+if [[ "$KHAOS_TYPED_RESOURCE_CATALOG_FILE" != /* || -L "$KHAOS_TYPED_RESOURCE_CATALOG_FILE" || ! -s "$KHAOS_TYPED_RESOURCE_CATALOG_FILE" ]]; then
+    printf '%s\n' "KHAOS_TYPED_RESOURCE_CATALOG_FILE must be an absolute, non-symlink, non-empty catalog" >&2
+    exit 1
+fi
+export KHAOS_TYPED_RESOURCE_CATALOG_FILE
 
 # The production profile must reach an actual HTTPS append-only fixture.  This
 # is separate from the application health endpoint so authorityd cannot pass
