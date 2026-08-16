@@ -97,7 +97,9 @@ single-link regular-file type, and absence of group/other write permission;
 symlinked or writable catalog paths are rejected before JSON parsing. Linux
 systemd deployments should keep the catalog root-owned and read-only under
 `/etc/khaos`; non-Linux deployments must provide the equivalent native ACL or
-read-only mount guarantee.
+read-only mount guarantee. A root-owned sticky system temporary directory may
+occur above a private test/development directory; it does not relax the
+final-file or private-descendant checks used by production catalog paths.
 
 Narrowing is an owned transaction rather than an untracked lock gap. The
 daemon records the parent receipt, child intent, descendant reservation, and

@@ -864,7 +864,15 @@ def _trusted_catalog_path(path: Path) -> Path:
             raise ResourceScopeError("resource catalog path is unavailable") from exc
         if stat.S_ISLNK(info.st_mode):
             raise ResourceScopeError("resource catalog path contains a symlink")
-        if info.st_uid not in allowed_uids or info.st_mode & 0o022:
+        sticky_system_directory = (
+            stat.S_ISDIR(info.st_mode)
+            and info.st_uid == 0
+            and bool(info.st_mode & 0o1000)
+        )
+        if (
+            (info.st_uid not in allowed_uids or info.st_mode & 0o022)
+            and not sticky_system_directory
+        ):
             raise ResourceScopeError(
                 "resource catalog path is not owned by a trusted non-writable identity"
             )
