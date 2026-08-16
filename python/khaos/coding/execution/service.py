@@ -37,6 +37,7 @@ from khaos.coding.execution.models import (
     ResourceBudget,
 )
 from khaos.coding.execution.native_launcher import build_process_launch
+from khaos.coding.execution.resource_owner import inspect_resource_owner
 from khaos.coding.execution.supervisor import ProcessSupervisor
 from khaos.coding.workspace.models import WorkspaceState
 from khaos.coding.workspace.storage import (
@@ -1399,23 +1400,16 @@ def _is_concrete_resource_owner(component: object) -> bool:
     that value keeps the generic owner traversal fail-closed without changing
     the compatibility behavior of explicitly injected supervisor doubles.
     """
-    if not _has_resource_owner(component):
-        return False
-    return isinstance(getattr(component, "terminal_closed", None), bool)
+    snapshot = inspect_resource_owner(component, allow_legacy=True)
+    return snapshot is not None and isinstance(
+        getattr(component, "terminal_closed", None), bool
+    )
 
 
 def _resource_owner_terminal(component: object) -> bool:
     """Require both terminal proof and an empty independent resource oracle."""
-    if not _has_resource_owner(component):
-        return False
-    owner = cast("Any", component)
-    try:
-        terminal_closed = bool(owner.terminal_closed)
-        terminal_proof = bool(owner.terminal_postcondition())
-        resources = tuple(owner.owned_resources())
-    except Exception:  # noqa: BLE001 — an unknown owner is not terminal
-        return False
-    return terminal_closed and terminal_proof and not resources
+    snapshot = inspect_resource_owner(component, allow_legacy=True)
+    return snapshot is not None and snapshot.is_terminal
 
 
 def _resource_owner_released(component: object, execution_id: str) -> bool:

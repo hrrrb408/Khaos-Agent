@@ -48,6 +48,10 @@ from khaos.security.identity_isolation import (
     read_contract_from_environment,
     validate_private_unix_socket,
 )
+from khaos.security.resource_scope import (
+    ResourceScopeError,
+    TypedResourcePartialOrder,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -929,7 +933,14 @@ class AuthorityDaemon:
                     raise AuthorityControlPlaneError(
                         "authorityd pending receipt principal quota is exhausted"
                     )
-                self.policy(intent)
+                if isinstance(self.policy, (_ComposedAuthorityPolicy, AuthorityPolicyKernel)):
+                    self.policy.check_prepare(
+                        intent,
+                        parent_receipt=_parent_receipt,
+                        requested_resource_scope=_requested_resource_scope,
+                    )
+                else:
+                    self.policy(intent)
                 self._validate_grant_locked(
                     intent,
                     parent_receipt=_parent_receipt,
@@ -1246,7 +1257,18 @@ class AuthorityDaemon:
             )
             narrow_policy = getattr(self.policy, "check_narrow", None)
             if callable(narrow_policy):
-                narrow_policy(receipt.operation, operation)
+                if isinstance(self.policy, (_ComposedAuthorityPolicy, AuthorityPolicyKernel)):
+                    narrow_policy(
+                        receipt.operation,
+                        operation,
+                        parent_resource_digest=receipt.resource_digest,
+                        requested_resource_scope=resource_digest,
+                    )
+                else:
+                    # Compatibility for an injected policy callback from an
+                    # older embedding.  Only the built-in policy kernels are
+                    # allowed to opt into typed resource semantics.
+                    narrow_policy(receipt.operation, operation)
             # Child preparation and the parent terminal event are two
             # independent WORM records. Reserve the parent slot before the
             # child leaves the parent transaction so a full reconciliation
@@ -1400,6 +1422,7 @@ def build_production_daemon(
     audit_writer: AuditWriter | None,
     issuer_id: str = "khaos-authorityd",
     policy: Callable[[AuthorizationIntent], None] | None = None,
+    resource_order: TypedResourcePartialOrder | None = None,
 ) -> AuthorityDaemon:
     """Construct authorityd only when an independent writer is supplied."""
     if audit_writer is None:
@@ -1412,7 +1435,10 @@ def build_production_daemon(
             "production authorityd requires KHAOS_EFFECTIVE_POLICY_DIGEST"
         )
     key = Ed25519KeyStore.load_or_create(key_path, create=False)
-    kernel = AuthorityPolicyKernel(expected_policy_digest=expected_policy_digest)
+    kernel = AuthorityPolicyKernel(
+        expected_policy_digest=expected_policy_digest,
+        resource_order=resource_order,
+    )
     selected_policy: Callable[[AuthorizationIntent], None]
     if policy is None:
         selected_policy = kernel
@@ -1443,8 +1469,34 @@ class _ComposedAuthorityPolicy:
         self.kernel(intent)
         self.custom(intent)
 
-    def check_narrow(self, source_operation: str, target_operation: str) -> None:
-        self.kernel.check_narrow(source_operation, target_operation)
+    def check_prepare(
+        self,
+        intent: AuthorizationIntent,
+        *,
+        parent_receipt: SignedAuthorizationReceipt | None = None,
+        requested_resource_scope: str | None = None,
+    ) -> None:
+        self.kernel.check_prepare(
+            intent,
+            parent_receipt=parent_receipt,
+            requested_resource_scope=requested_resource_scope,
+        )
+        self.custom(intent)
+
+    def check_narrow(
+        self,
+        source_operation: str,
+        target_operation: str,
+        *,
+        parent_resource_digest: str | None = None,
+        requested_resource_scope: str | None = None,
+    ) -> None:
+        self.kernel.check_narrow(
+            source_operation,
+            target_operation,
+            parent_resource_digest=parent_resource_digest,
+            requested_resource_scope=requested_resource_scope,
+        )
         custom_narrow = getattr(self.custom, "check_narrow", None)
         if callable(custom_narrow):
             custom_narrow(source_operation, target_operation)
@@ -1455,7 +1507,12 @@ class AuthorityPolicyKernel:
 
     _FAMILIES = frozenset({"exec", "git", "network", "workspace"})
 
-    def __init__(self, *, expected_policy_digest: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        expected_policy_digest: str | None = None,
+        resource_order: TypedResourcePartialOrder | None = None,
+    ) -> None:
         if expected_policy_digest in {
             "",
             "legacy-unbound",
@@ -1466,8 +1523,12 @@ class AuthorityPolicyKernel:
                 "authorityd effective policy digest is invalid"
             )
         self.expected_policy_digest = expected_policy_digest
+        self.resource_order = resource_order
 
     def __call__(self, intent: AuthorizationIntent) -> None:
+        self._check_intent_shape(intent)
+
+    def _check_intent_shape(self, intent: AuthorizationIntent) -> None:
         family, separator, action = intent.operation.partition(".")
         if not separator or family not in self._FAMILIES or not action:
             raise AuthorityControlPlaneError(
@@ -1485,13 +1546,73 @@ class AuthorityPolicyKernel:
                 "authorityd policy digest does not match its compiled policy"
             )
 
-    def check_narrow(self, source_operation: str, target_operation: str) -> None:
+    def check_prepare(
+        self,
+        intent: AuthorizationIntent,
+        *,
+        parent_receipt: SignedAuthorizationReceipt | None = None,
+        requested_resource_scope: str | None = None,
+    ) -> None:
+        """Validate an intent and its semantic resource context.
+
+        A narrowed receipt carries a derived opaque digest, so its semantic
+        proof must be checked against the parent/requested scope pair before
+        the child is signed.  A direct prepare instead requires the resource
+        digest to be present in the immutable typed catalog.
+        """
+        self._check_intent_shape(intent)
+        if self.resource_order is None:
+            return
+        try:
+            if parent_receipt is None:
+                self.resource_order.resolve(intent.resource_digest)
+                return
+            if requested_resource_scope is None:
+                raise ResourceScopeError(
+                    "typed resource narrowing requires a requested scope"
+                )
+            self.resource_order.require_transition(
+                parent_digest=parent_receipt.resource_digest,
+                requested_scope=requested_resource_scope,
+                source_operation=parent_receipt.operation,
+                target_operation=intent.operation,
+            )
+        except ResourceScopeError as exc:
+            raise AuthorityControlPlaneError(
+                f"typed resource prepare rejected: {exc}"
+            ) from exc
+
+    def check_narrow(
+        self,
+        source_operation: str,
+        target_operation: str,
+        *,
+        parent_resource_digest: str | None = None,
+        requested_resource_scope: str | None = None,
+    ) -> None:
         source_family = source_operation.split(".", 1)[0]
         target_family = target_operation.split(".", 1)[0]
         if source_family != target_family:
             raise AuthorityControlPlaneError(
                 "authorityd narrowing cannot cross issuer families"
             )
+        if self.resource_order is None:
+            return
+        if parent_resource_digest is None or requested_resource_scope is None:
+            raise AuthorityControlPlaneError(
+                "typed resource narrowing requires parent and requested scopes"
+            )
+        try:
+            self.resource_order.require_transition(
+                parent_digest=parent_resource_digest,
+                requested_scope=requested_resource_scope,
+                source_operation=source_operation,
+                target_operation=target_operation,
+            )
+        except ResourceScopeError as exc:
+            raise AuthorityControlPlaneError(
+                f"typed resource narrowing rejected: {exc}"
+            ) from exc
 
 
 def serve_unix(daemon: AuthorityDaemon, *, production: bool = True) -> None:
