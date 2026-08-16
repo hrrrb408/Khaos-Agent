@@ -71,7 +71,7 @@
 - `python/khaos/security/production_composition_probe.py`: `538b6591f6b7193d9889a38a568dafa5f797071195fc3f555f941bfd2c0c121b`
 - `python/khaos/security/remote_audit.py`: `58a5d9a35c8446304a17e99ab6d3b20b52d9197e47a53372ac567867794207b2`
 - `python/khaos/security/network_broker.py`: `507f1470df8ea3f7cc855d574dd228cc54222b6c38b0cb4f75a0cbef7ceb2748`
-- `python/khaos/security/resource_scope.py`: `d6dccd47a3e3996eb7a9802e15091042f5b94807d3068328918ab4fdb46dba9c`
+- `python/khaos/security/resource_scope.py`: `71e60d2b119aef87e4e4134d99b809a0a7784a8fc439355d68094c5570570fae`
 - `python/khaos/coding/planning/security_identities.py`: `bcafd43a2920e087f4c064091d9faa04184739a4a8a6454aa654ffd134790a38`
 - `python/khaos/coding/workspace/boundary.py`: `e1a310f3bfe2b1ca085f02be14b11f35dd1b52e923c7a2893bb5a68b9a3ff91e`
 - `rust/khaos-core/src/bin/khaos-exec-launcher.rs`: `c5eb7343002ecb7f74e1ca10df5d5edaf4de39f90ecc68064cb355b56b2fda71`

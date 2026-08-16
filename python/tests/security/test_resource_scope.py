@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -88,6 +89,24 @@ def test_filesystem_scope_is_workspace_bound_and_path_narrowing() -> None:
     assert parent.contains(child)
     assert not parent.contains(sibling)
     assert not parent.contains(other_workspace)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows path semantics")
+def test_filesystem_scope_accepts_windows_absolute_paths(tmp_path: Path) -> None:
+    child_root = tmp_path / "src"
+    child_root.mkdir()
+    parent = FilesystemScope(
+        workspace_id=CanonicalWorkspaceId(str(tmp_path.resolve())),
+        root=str(tmp_path.resolve()),
+        operations=frozenset({"read", "write"}),
+    )
+    child = FilesystemScope(
+        workspace_id=CanonicalWorkspaceId(str(tmp_path.resolve())),
+        root=str(child_root.resolve()),
+        operations=frozenset({"read"}),
+    )
+
+    assert parent.contains(child)
 
 
 def test_network_scope_requires_explicit_origin_and_path_subset() -> None:

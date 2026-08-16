@@ -117,10 +117,32 @@ def _canonical_path(field: str, value: object) -> str:
     return normalized
 
 
+def _canonical_filesystem_path(field: str, value: object) -> str:
+    """Canonicalize an absolute host filesystem path on POSIX or Windows."""
+    raw = _require_concrete(field, value)
+    if not os.path.isabs(raw):
+        raise ResourceScopeError(f"{field} must be absolute")
+    path_parts = raw.replace("\\", "/").split("/")
+    if ".." in path_parts:
+        raise ResourceScopeError(f"{field} must not contain parent traversal")
+    normalized = os.path.normpath(raw).replace("\\", "/")
+    windows_drive_absolute = (
+        len(normalized) >= 3
+        and normalized[1] == ":"
+        and normalized[2] == "/"
+        and normalized[0].isalpha()
+    )
+    if normalized == "." or not normalized.startswith("/") and not windows_drive_absolute:
+        raise ResourceScopeError(f"{field} is not canonical")
+    return normalized
+
+
 def _path_contains(parent: str, child: str) -> bool:
     if parent == "/":
         return child.startswith("/")
-    return child == parent or child.startswith(parent.rstrip("/") + "/")
+    parent_key = parent.casefold() if os.name == "nt" else parent
+    child_key = child.casefold() if os.name == "nt" else child
+    return child_key == parent_key or child_key.startswith(parent_key.rstrip("/") + "/")
 
 
 def _canonical_scheme_set(field: str, values: Iterable[str]) -> frozenset[str]:
@@ -195,7 +217,7 @@ class FilesystemScope(ResourceScope):
         object.__setattr__(self, "workspace_id", CanonicalWorkspaceId(
             _require_text("workspace_id", self.workspace_id)
         ))
-        object.__setattr__(self, "root", _canonical_path("root", self.root))
+        object.__setattr__(self, "root", _canonical_filesystem_path("root", self.root))
         object.__setattr__(self, "operations", _require_actions("operations", self.operations))
 
     def contains(self, child: ResourceScope) -> bool:
@@ -796,7 +818,9 @@ def compile_typed_resource_catalog(
     operations = frozenset(filesystem_operations)
     for filesystem_root in filesystem_roots:
         candidate = Path(filesystem_root).expanduser().resolve()
-        if not _path_contains(str(root), str(candidate)):
+        try:
+            candidate.relative_to(root)
+        except ValueError:
             raise ResourceScopeError(
                 "filesystem resource catalog root escapes the workspace"
             )
