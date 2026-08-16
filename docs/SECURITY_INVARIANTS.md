@@ -9,7 +9,8 @@ class for each invariant remains explicit below.
 1. A production `AuthorityDaemon` only signs an intent that carries a live,
    non-expired grant registered by that daemon. The grant binds principal,
    project, runtime, task, workspace, workspace generation, policy digest,
-   authorization epoch, operation family, and an initial resource scope.
+   authorization epoch, operation family, and an initial resource scope from
+   the immutable policy-bound typed catalog.
    Direct effects must stay inside that scope; a resource transition is
    accepted only through a live parent narrow transaction. Revocation, epoch
    rotation, and workspace-generation rotation atomically remove the live
@@ -27,12 +28,16 @@ class for each invariant remains explicit below.
    leaves the authority state available for reconciliation rather than
    dropping evidence.
 5. Resource narrowing is cryptographically linked to the parent digest,
-   target operation, and requested scope by `derive_resource_digest`. The
-   daemon enforces the operation-family transition. When the effective policy
-   supplies `TypedResourcePartialOrder`, the authority kernel also resolves
-   both typed catalog entries and requires the requested scope to be contained
-   by the parent; missing or malformed entries fail closed. The daemon still
-   does not claim to be a complete PDP when that semantic catalog is absent.
+   target operation, and requested scope. Production authorityd requires a
+   `TypedResourcePartialOrder` whose catalog digest is bound to the effective
+   policy digest; the runtime compiles the baseline catalog from that policy
+   and rejects a host manifest whose catalog digest differs. It resolves both
+   typed catalog entries, requires the requested scope to be contained by the
+   parent, and requires the exact target action to be allowed by the requested
+   scope. Missing or malformed entries, policy mismatch, action widening, and
+   expired-receipt renewal widening fail closed. Opaque derived-resource
+   behavior is limited to the explicit development/test compatibility adapter;
+   native execution additionally retains its exact launch-binding digest.
 
 ## Orchestration phase evidence
 

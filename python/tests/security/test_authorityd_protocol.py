@@ -42,6 +42,7 @@ from khaos.security.authorityd_protocol import (
     derive_resource_digest,
 )
 from khaos.security.network_broker import NetworkBroker, NetworkBrokerError
+from khaos.security.resource_scope import GitRefScope, TypedResourcePartialOrder
 
 
 class _MemoryWorm:
@@ -79,6 +80,29 @@ class _SelectiveWorm(_MemoryWorm):
         super().append(record)
 
 
+def _typed_git_order(
+    policy_digest: str = "policy-digest",
+) -> tuple[TypedResourcePartialOrder, GitRefScope, GitRefScope]:
+    parent = GitRefScope(
+        repository="khaos",
+        refs=frozenset({"HEAD"}),
+        operations=frozenset({"hash", "workspace"}),
+    )
+    child = GitRefScope(
+        repository="khaos",
+        refs=frozenset({"HEAD"}),
+        operations=frozenset({"hash"}),
+    )
+    return (
+        TypedResourcePartialOrder(
+            {parent.digest(): parent, child.digest(): child},
+            policy_digest=policy_digest,
+        ),
+        parent,
+        child,
+    )
+
+
 def _intent() -> AuthorizationIntent:
     return AuthorizationIntent(
         principal_id="agent",
@@ -92,6 +116,51 @@ def _intent() -> AuthorizationIntent:
         nonce="nonce-1",
         authorization_epoch=2,
     )
+
+
+def test_typed_kernel_keeps_native_execution_binding_exact() -> None:
+    order, _parent_scope, _child_scope = _typed_git_order()
+    kernel = AuthorityPolicyKernel(
+        expected_policy_digest="policy-digest",
+        resource_order=order,
+    )
+    binding = "a" * 64
+    kernel.check_prepare(
+        replace(
+            _intent(),
+            operation="exec.host",
+            resource_digest=binding,
+        )
+    )
+    kernel.check_narrow(
+        "exec.host",
+        "exec.host",
+        parent_resource_digest=binding,
+        requested_resource_scope=binding,
+    )
+    with pytest.raises(AuthorityControlPlaneError, match="exact launch binding"):
+        kernel.check_prepare(
+            replace(
+                _intent(),
+                operation="exec.host",
+                resource_digest="not-a-binding",
+            )
+        )
+    with pytest.raises(AuthorityControlPlaneError, match="cannot change"):
+        kernel.check_narrow(
+            "exec.host",
+            "exec.host",
+            parent_resource_digest=binding,
+            requested_resource_scope="b" * 64,
+        )
+    with pytest.raises(AuthorityControlPlaneError, match="not in the typed catalog"):
+        kernel.check_prepare(
+            replace(
+                _intent(),
+                operation="exec.shell",
+                resource_digest=binding,
+            )
+        )
 
 
 @pytest.mark.posix_host
@@ -410,10 +479,12 @@ def test_production_daemon_requires_its_compiled_policy_digest(
             audit_writer=_MemoryWorm(),
         )
     monkeypatch.setenv("KHAOS_EFFECTIVE_POLICY_DIGEST", "policy-digest")
+    resource_order, _parent_scope, _child_scope = _typed_git_order()
     daemon = build_production_daemon(
         socket_path=tmp_path / "authorityd.sock",
         key_path=key_path,
         audit_writer=_MemoryWorm(),
+        resource_order=resource_order,
     )
     with pytest.raises(AuthorityControlPlaneError, match="compiled policy"):
         daemon.prepare(replace(_intent(), policy_digest="other-policy"))
@@ -427,10 +498,12 @@ def test_production_daemon_requires_live_grant_and_same_operation_family(
     Ed25519KeyStore.load_or_create(key_path, create=True)
     monkeypatch.setenv("KHAOS_EFFECTIVE_POLICY_DIGEST", "policy-digest")
     worm = _MemoryWorm()
+    resource_order, parent_scope, child_scope = _typed_git_order()
     daemon = build_production_daemon(
         socket_path=tmp_path / "authorityd.sock",
         key_path=key_path,
         audit_writer=worm,
+        resource_order=resource_order,
     )
     grant_id, _expires_at = daemon.grant(
         principal_id="agent",
@@ -441,7 +514,7 @@ def test_production_daemon_requires_live_grant_and_same_operation_family(
         workspace_generation=1,
         policy_digest="policy-digest",
         operation_class="git.workspace",
-        resource_digest="grant-resource",
+        resource_digest=parent_scope.digest(),
         authorization_epoch=2,
     )
     context_digest = authorityd_module._digest(
@@ -464,7 +537,7 @@ def test_production_daemon_requires_live_grant_and_same_operation_family(
         task_id="task",
         workspace_id="workspace",
         operation="git.hash",
-        resource_digest="grant-resource",
+        resource_digest=parent_scope.digest(),
         policy_digest="policy-digest",
         nonce="live-grant-nonce",
         authorization_epoch=2,
@@ -478,7 +551,7 @@ def test_production_daemon_requires_live_grant_and_same_operation_family(
     receipt = daemon.narrow(
         parent,
         operation="git.hash",
-        resource_digest="child-resource",
+        resource_digest=child_scope.digest(),
     )
     daemon.complete(receipt, result="success", result_digest="result")
 
@@ -488,6 +561,116 @@ def test_production_daemon_requires_live_grant_and_same_operation_family(
     daemon.revoke_grant(grant_id)
     with pytest.raises(AuthorityControlPlaneError, match="unknown|revoked"):
         daemon.prepare(replace(intent, nonce="revoked-grant"))
+
+
+@pytest.mark.posix_host
+def test_expired_typed_child_receipt_renews_only_issued_action_and_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = [100.0]
+    monkeypatch.setattr(authorityd_module.time, "time", lambda: clock[0])
+    monkeypatch.setattr(authorityd_protocol_module.time, "time", lambda: clock[0])
+    key_path = tmp_path / "authorityd.pem"
+    Ed25519KeyStore.load_or_create(key_path, create=True)
+    monkeypatch.setenv("KHAOS_EFFECTIVE_POLICY_DIGEST", "policy-digest")
+    resource_order, parent_scope, child_scope = _typed_git_order()
+    unrelated_scope = GitRefScope(
+        repository="other-repository",
+        refs=frozenset({"HEAD"}),
+        operations=frozenset({"hash"}),
+    )
+    resource_order = TypedResourcePartialOrder(
+        {
+            parent_scope.digest(): parent_scope,
+            child_scope.digest(): child_scope,
+            unrelated_scope.digest(): unrelated_scope,
+        },
+        policy_digest="policy-digest",
+    )
+    daemon = build_production_daemon(
+        socket_path=tmp_path / "authorityd.sock",
+        key_path=key_path,
+        audit_writer=_MemoryWorm(),
+        resource_order=resource_order,
+    )
+    grant_id, _expires_at = daemon.grant(
+        principal_id="agent",
+        project_id="project",
+        runtime_id="runtime",
+        task_id="task",
+        workspace_id="workspace",
+        workspace_generation=1,
+        policy_digest="policy-digest",
+        operation_class="git.workspace",
+        resource_digest=parent_scope.digest(),
+        authorization_epoch=2,
+        ttl_seconds=900.0,
+    )
+    context_digest = authorityd_module._digest(
+        {
+            "schema_version": 1,
+            "principal_id": "agent",
+            "project_id": "project",
+            "runtime_id": "runtime",
+            "task_id": "task",
+            "workspace_id": "workspace",
+            "workspace_generation": 1,
+            "policy_digest": "policy-digest",
+            "authorization_epoch": 2,
+        }
+    )
+    parent_intent = AuthorizationIntent(
+        principal_id="agent",
+        project_id="project",
+        runtime_id="runtime",
+        task_id="task",
+        workspace_id="workspace",
+        operation="git.workspace",
+        resource_digest=parent_scope.digest(),
+        policy_digest="policy-digest",
+        nonce="typed-parent",
+        authorization_epoch=2,
+        workspace_generation=1,
+        grant_id=grant_id,
+        grant_context_digest=context_digest,
+    )
+    parent_receipt = daemon.prepare(parent_intent)
+    child_receipt = daemon.narrow(
+        parent_receipt,
+        operation="git.hash",
+        resource_digest=child_scope.digest(),
+    )
+
+    clock[0] = 401.0
+    renewed = daemon.prepare(
+        replace(
+            parent_intent,
+            operation="git.hash",
+            resource_digest=child_scope.digest(),
+            nonce="typed-child-renewal",
+        )
+    )
+    assert renewed.resource_digest == child_receipt.resource_digest
+    daemon.complete(renewed, result="success", result_digest="renewed-result")
+
+    with pytest.raises(AuthorityControlPlaneError, match="typed resource prepare"):
+        daemon.prepare(
+            replace(
+                parent_intent,
+                operation="git.workspace",
+                resource_digest=child_scope.digest(),
+                nonce="forbidden-child-action",
+            )
+        )
+    with pytest.raises(AuthorityControlPlaneError, match="outside its live scope"):
+        daemon.prepare(
+            replace(
+                parent_intent,
+                operation="git.hash",
+                resource_digest=unrelated_scope.digest(),
+                nonce="unissued-scope",
+            )
+        )
 
 
 def test_expired_live_grant_is_terminally_audited_before_rejection(

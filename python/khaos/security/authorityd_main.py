@@ -8,6 +8,7 @@ from pathlib import Path
 from khaos.security.authorityd import build_production_daemon, serve_unix
 from khaos.security.identity_isolation import read_contract_from_environment
 from khaos.security.remote_audit import writer_from_environment
+from khaos.security.resource_scope import ResourceScopeError, TypedResourcePartialOrder
 
 
 def main() -> int:
@@ -21,10 +22,21 @@ def main() -> int:
         raise SystemExit(
             "KHAOS_AUTHORITYD_SOCKET and KHAOS_AUTHORITYD_KEY_PATH are required"
         )
+    catalog_value = os.environ.get("KHAOS_TYPED_RESOURCE_CATALOG_PATH")
+    if not catalog_value:
+        raise SystemExit("KHAOS_TYPED_RESOURCE_CATALOG_PATH is required")
+    try:
+        resource_order = TypedResourcePartialOrder.from_json_file(
+            Path(catalog_value),
+            expected_policy_digest=os.environ.get("KHAOS_EFFECTIVE_POLICY_DIGEST"),
+        )
+    except ResourceScopeError as exc:
+        raise SystemExit(f"typed resource catalog is invalid: {exc}") from exc
     daemon = build_production_daemon(
         socket_path=Path(socket_value),
         key_path=Path(key_value),
         audit_writer=writer_from_environment(),
+        resource_order=resource_order,
     )
     _publish_public_key(
         Path(os.environ.get(

@@ -15,6 +15,7 @@ from khaos.security.network_broker import (
     NetworkLease,
     _NetworkRelayLease,
 )
+from khaos.security.resource_scope import NetworkScope, TypedResourcePartialOrder
 
 
 def _authority(broker: AuthorityBroker) -> AuthorityEnvelope:
@@ -305,3 +306,27 @@ async def test_factory_binds_policy_to_lease_and_revokes_on_close() -> None:
         if broker is not None:
             await broker.close()
         authority_broker.close()
+
+
+def test_factory_uses_catalog_bound_network_scope_digest() -> None:
+    scope = NetworkScope(
+        schemes=frozenset({"http", "https"}),
+        hosts=frozenset({"allowed.example"}),
+        ports=frozenset({80, 443}),
+        path_prefixes=frozenset({"/"}),
+        operations=frozenset({"connect"}),
+        blocked_hosts=frozenset({"blocked.example"}),
+    )
+    order = TypedResourcePartialOrder({scope.digest(): scope})
+    factory = NetworkBrokerFactory(
+        authority_broker=AuthorityBroker(),
+        linux_namespace=False,
+        resource_order=order,
+    )
+    try:
+        assert factory._resource_digest(
+            frozenset({"allowed.example"}),
+            frozenset({"blocked.example"}),
+        ) == scope.digest()
+    finally:
+        factory.authority_broker.close()

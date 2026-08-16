@@ -52,18 +52,23 @@ growth.
 The lifecycle distinction is intentional: `PREPARED` is still a launch ticket
 and is retroactively denied by grant/epoch/generation invalidation, while
 `CLAIMED` has crossed the effect boundary and remains completable for terminal
-accounting. This daemon is still an issuer and family/context gate, not a full
-semantic resource PDP; typed resource subset policy remains a separate
-authority and the independent-review/governance work is tracked in issue #169.
+accounting. This daemon is an issuer, family gate, and production typed-resource
+PDP. Its production builder requires an immutable catalog whose `policy_digest`
+equals `KHAOS_EFFECTIVE_POLICY_DIGEST`; the catalog is loaded from
+`KHAOS_TYPED_RESOURCE_CATALOG_PATH` by both the Agent runtime and authorityd.
+Development/test adapters may omit the catalog, but they cannot be used as
+production evidence. Independent-review/governance work remains tracked in
+issue #169.
 
 Narrowing creates a child resource digest from the parent digest, target
-operation, and requested scope, and authorityd enforces same-family
-transitions. The daemon intentionally does not interpret arbitrary resource
-digests as a full policy decision; semantic subset rules belong to the typed
-resource/policy authority above it. A successful narrowing consumes the parent
-receipt and records a `narrowed` terminal tombstone. Both the child prepare
-event and parent terminal event reserve bounded audit capacity before either
-authority transition can become irreversible.
+operation, and requested scope in legacy adapters; with the production typed
+catalog the canonical child scope digest is signed directly. Authorityd
+enforces same-family transitions, verifies that the exact target action is in
+the requested scope, and re-runs that check when an expired receipt is renewed.
+A successful narrowing consumes the parent receipt and records a `narrowed`
+terminal tombstone. Both the child prepare event and parent terminal event
+reserve bounded audit capacity before either authority transition can become
+irreversible.
 
 The typed policy authority can be supplied to `AuthorityPolicyKernel` as an
 immutable `TypedResourcePartialOrder`. Its catalog contains canonical digests
@@ -73,9 +78,19 @@ must resolve both the parent digest and requested child scope and prove the
 child is contained by the parent; unknown, malformed, cross-kind, and
 cross-family transitions fail closed. The signed receipt remains opaque on the
 wire, while the semantic decision is explicit and independently testable.
-Deployments that use this mode pass the same policy snapshot to
-`build_production_daemon`; an absent catalog does not silently claim typed
-coverage.
+The manifest also carries a stable `catalog_digest`; malformed, unknown,
+cross-kind, cross-family, action-forbidden, or policy-mismatched entries fail
+closed. `EffectiveSecurityPolicy` deterministically compiles the baseline
+filesystem/Git/network catalog at startup, and
+`scripts/generate_typed_resource_catalog.py` persists that exact snapshot for
+the independent authorityd process. The Agent rejects a manifest whose
+`catalog_digest` differs from the locally compiled snapshot. Workspace/Git and
+NetworkBroker production owners resolve their canonical scope through this
+catalog; native execution still keeps its separate exact launch-binding digest,
+and credential-specific owners remain an explicit follow-up rather than being
+represented by an opaque fallback. Production deployments must pass the same
+policy-bound manifest to the Agent and `build_production_daemon`; an absent or
+divergent catalog refuses startup rather than silently claiming typed coverage.
 
 Agent orchestration phase snapshots are a separate evidence layer. The
 immutable `TurnPhaseSnapshot` and `ToolPhaseSnapshot` bind phase transitions to

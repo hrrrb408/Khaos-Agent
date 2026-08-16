@@ -33,6 +33,7 @@ services:
     volumes:
       - khaos-authority-state:/var/lib/khaos-authorityd
       - khaos-authority-runtime:/run/khaos-authorityd
+      - "${KHAOS_TYPED_RESOURCE_CATALOG_FILE:?KHAOS_TYPED_RESOURCE_CATALOG_FILE must point to the host-reviewed typed resource catalog}:/run/khaos-policy/typed-resource-catalog.json:ro"
       - ${KHAOS_AUDIT_WORM_CA_FILE:?KHAOS_AUDIT_WORM_CA_FILE must point to the WORM CA certificate}:/run/khaos-worm/ca.pem:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -46,6 +47,7 @@ services:
       - KHAOS_AUTHORITYD_UID=10003
       - KHAOS_JOB_UID=10004
       - KHAOS_EFFECTIVE_POLICY_DIGEST=${KHAOS_EFFECTIVE_POLICY_DIGEST:?KHAOS_EFFECTIVE_POLICY_DIGEST must be compiled for production}
+      - KHAOS_TYPED_RESOURCE_CATALOG_PATH=/run/khaos-policy/typed-resource-catalog.json
       - KHAOS_AUDIT_WORM_ENDPOINT=${KHAOS_AUDIT_WORM_ENDPOINT:?KHAOS_AUDIT_WORM_ENDPOINT must be an HTTPS WORM endpoint}
       - KHAOS_AUDIT_WORM_TOKEN=${KHAOS_AUDIT_WORM_TOKEN:-}
       - SSL_CERT_FILE=/run/khaos-worm/ca.pem
@@ -97,6 +99,7 @@ services:
       - khaos-runtime:/run/khaos
       - khaos-helper-runtime:/run/khaos-helper:ro
       - khaos-authority-runtime:/run/khaos-authorityd:ro
+      - "${KHAOS_TYPED_RESOURCE_CATALOG_FILE:?KHAOS_TYPED_RESOURCE_CATALOG_FILE must point to the host-reviewed typed resource catalog}:/run/khaos-policy/typed-resource-catalog.json:ro"
       # The agent may create execution leaves only inside a host-reviewed,
       # delegated cgroup-v2 subtree. There is deliberately no default: a
       # production composition without real resource enforcement fails closed.
@@ -117,6 +120,7 @@ services:
       - KHAOS_JOB_UID=10004
       - KHAOS_CGROUP_ROOT=/run/khaos-execution-cgroup
       - KHAOS_EFFECTIVE_POLICY_DIGEST=${KHAOS_EFFECTIVE_POLICY_DIGEST:?KHAOS_EFFECTIVE_POLICY_DIGEST must be compiled for production}
+      - KHAOS_TYPED_RESOURCE_CATALOG_PATH=/run/khaos-policy/typed-resource-catalog.json
     depends_on:
       khaos-agent-init:
         condition: service_completed_successfully

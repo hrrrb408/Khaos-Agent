@@ -15,6 +15,7 @@ Environment=KHAOS_EXECUTION_SANDBOX_LAUNCHER=/usr/local/bin/khaos-execution-sand
 Environment=KHAOS_BROWSER_KERNEL_HELPER_SOCKET=/run/khaos-helper/browser-kernel-helper.sock
 Environment=KHAOS_AUTHORITYD_SOCKET=/run/khaos-authorityd/authorityd.sock
 Environment=KHAOS_AUTHORITYD_PUBLIC_KEY_PATH=/run/khaos-authorityd/authorityd.pub
+Environment=KHAOS_TYPED_RESOURCE_CATALOG_PATH=/etc/khaos/typed-resource-catalog.json
 Environment=KHAOS_AGENT_UID=10001
 Environment=KHAOS_AUTHORITYD_UID=10003
 Environment=KHAOS_JOB_UID=10004
@@ -31,7 +32,7 @@ PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/run/khaos /var/lib/khaos /run/khaos-helper
-ReadOnlyPaths=/run/khaos-authorityd/authorityd.pub
+ReadOnlyPaths=/run/khaos-authorityd/authorityd.pub /etc/khaos/typed-resource-catalog.json
 
 [Install]
 WantedBy=multi-user.target

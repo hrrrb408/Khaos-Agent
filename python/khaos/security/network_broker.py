@@ -23,7 +23,7 @@ import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TypedDict
+from typing import TYPE_CHECKING, TypedDict
 from urllib.parse import quote, urlsplit, urlunsplit
 
 from khaos.security.authority import AuthorityEnvelope
@@ -32,6 +32,9 @@ from khaos.security.authority_broker import (
     AuthorityBrokerError,
     EffectCapability,
 )
+
+if TYPE_CHECKING:
+    from khaos.security.resource_scope import TypedResourcePartialOrder
 
 logger = logging.getLogger(__name__)
 _NETWORK_LEASE_ISSUER = object()
@@ -361,11 +364,16 @@ class NetworkBroker:
         max_download: int = _MAX_DOWNLOAD_BYTES,
         audit: Callable[[dict[str, object]], None] | None = None,
         linux_namespace: bool = False,
+        resource_digest: str | None = None,
     ) -> None:
         if not isinstance(capability, EffectCapability):
             raise NetworkBrokerError("network broker requires a broker-issued capability")
         if not capability.authority.operation_class.startswith("network."):
             raise NetworkBrokerError("capability is not a network authority")
+        if resource_digest is not None and resource_digest != capability.resource_digest:
+            raise NetworkBrokerError(
+                "network broker resource digest does not match its capability"
+            )
         if not _is_loopback(bind_host):
             raise NetworkBrokerError("network broker bind_host must be loopback")
         if linux_namespace and not sys.platform.startswith("linux"):
@@ -408,6 +416,7 @@ class NetworkBroker:
         self._lease: NetworkLease | None = None
         self._linux_namespace = linux_namespace
         self._network_sandbox = None
+        self._resource_digest = resource_digest
 
     @property
     def lease(self) -> NetworkLease:
@@ -589,8 +598,9 @@ class NetworkBroker:
             lease_capability = self._authority_broker.reissue(
                 self._capability,
                 operation_class="network.connect",
-                resource_digest=NetworkLease._configuration_digest_for_fields(
-                    lease_fields
+                resource_digest=(
+                    self._resource_digest
+                    or NetworkLease._configuration_digest_for_fields(lease_fields)
                 ),
             )
             lease_fields["capability_digest"] = lease_capability.digest
@@ -1066,8 +1076,10 @@ class NetworkBrokerFactory:
         authority_broker: AuthorityBroker | None = None,
         linux_namespace: bool | None = None,
         audit: Callable[[dict[str, object]], None] | None = None,
+        resource_order: TypedResourcePartialOrder | None = None,
     ) -> None:
         self.authority_broker = authority_broker or AuthorityBroker.default()
+        self.resource_order = resource_order
         self.linux_namespace = (
             sys.platform.startswith("linux")
             if linux_namespace is None
@@ -1098,16 +1110,7 @@ class NetworkBrokerFactory:
         broker_domains = (
             frozenset({"*"}) if allowed_domains is None else frozenset(allowed_domains)
         )
-        policy_resource = hashlib.sha256(
-            repr(
-                (
-                    tuple(sorted(broker_domains)),
-                    tuple(sorted(blocked_domains)),
-                    (80, 443),
-                    ("http", "https"),
-                )
-            ).encode("utf-8")
-        ).hexdigest()
+        policy_resource = self._resource_digest(broker_domains, blocked_domains)
         authority = self.authority_broker.envelope(
             principal_id=principal_id,
             project_id=project_id,
@@ -1132,6 +1135,7 @@ class NetworkBrokerFactory:
             blocked_domains=frozenset(blocked_domains),
             audit=self.audit,
             linux_namespace=self.linux_namespace,
+            resource_digest=policy_resource,
         )
         try:
             lease = await broker.start()
@@ -1160,6 +1164,44 @@ class NetworkBrokerFactory:
                 ) from cleanup_error
             raise
         return broker, lease
+
+    def _resource_digest(
+        self,
+        broker_domains: frozenset[str],
+        blocked_domains: frozenset[str],
+    ) -> str:
+        """Resolve the network authority through the typed catalog when bound."""
+        if self.resource_order is None:
+            return hashlib.sha256(
+                repr(
+                    (
+                        tuple(sorted(broker_domains)),
+                        tuple(sorted(blocked_domains)),
+                        (80, 443),
+                        ("http", "https"),
+                    )
+                ).encode("utf-8")
+            ).hexdigest()
+        if "*" in broker_domains:
+            raise NetworkBrokerError(
+                "typed network authority requires an explicit host allowlist"
+            )
+        from khaos.security.resource_scope import NetworkScope, ResourceScopeError
+
+        try:
+            scope = NetworkScope(
+                schemes=frozenset({"http", "https"}),
+                hosts=broker_domains,
+                ports=frozenset({80, 443}),
+                path_prefixes=frozenset({"/"}),
+                operations=frozenset({"connect"}),
+                blocked_hosts=frozenset(blocked_domains),
+            )
+            return self.resource_order.require_scope(scope)
+        except ResourceScopeError as exc:
+            raise NetworkBrokerError(
+                "network policy is not represented by the typed authority catalog"
+            ) from exc
 
     async def close(self) -> None:
         """Retry cleanup for brokers whose start transaction was unproven."""
