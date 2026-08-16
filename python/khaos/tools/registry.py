@@ -44,7 +44,7 @@ _INJECTED_CAPABILITY_FIELDS = frozenset({
     "execution_service", "workspace_manager", "approval_context",
     "principal_id", "project_id", "runtime_id", "network_guard",
     "network_lease",
-    "credential_context", "process_supervisor", "process_authority",
+    "credential_context", "credential_lease", "credential_broker", "process_supervisor", "process_authority",
     "browser_manager", "cron_engine",
 })
 
@@ -855,10 +855,17 @@ class ToolInvocationBroker:
             handler_params["requester"] = context.get("requester")
             handler_params["network_lease"] = context.get("network_lease")
             if name == "git_push":
-                handler_params["credential_context"] = context.get("credential_context")
+                handler_params["credential_context"] = context.get(
+                    "credential_lease", context.get("credential_context")
+                )
+                handler_params["credential_broker"] = context.get("credential_broker")
         if any(capability.name == "network.access" for capability in capabilities):
             handler_params["network_policy"] = context.get("network_policy", "none")
-            handler_params["credential_context"] = context.get("credential_context")
+            handler_params["credential_context"] = context.get(
+                "credential_lease", context.get("credential_context")
+            )
+            if name.startswith("github_"):
+                handler_params["credential_broker"] = context.get("credential_broker")
             handler_params["network_guard"] = context.get("network_guard")
             # H1: pass principal_id so browser tools can select a per-principal
             # BrowserContext (cookie / DOM isolation between principals).

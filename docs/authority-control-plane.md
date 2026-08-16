@@ -86,9 +86,15 @@ filesystem/Git/network catalog at startup, and
 the independent authorityd process. The Agent rejects a manifest whose
 `catalog_digest` differs from the locally compiled snapshot. Workspace/Git and
 NetworkBroker production owners resolve their canonical scope through this
-catalog; native execution still keeps its separate exact launch-binding digest,
-and credential-specific owners remain an explicit follow-up rather than being
-represented by an opaque fallback. Production deployments must pass the same
+catalog; native execution still keeps its separate exact launch-binding digest.
+Credential use now has a trusted `CredentialBroker` owner: a registered
+provider loader issues a short-lived lease bound to the typed scope, target,
+operation, policy digest, and principal, while secret material is materialized
+only for the final trusted execution environment and is absent from the
+lease/audit identity. Production deployments must still register a real
+provider adapter; an unregistered provider fails closed rather than falling
+back to ambient environment variables or model-visible secrets. Production
+deployments must pass the same
 policy-bound manifest to the Agent and `build_production_daemon`; an absent or
 divergent catalog refuses startup rather than silently claiming typed coverage.
 The standalone file loader also verifies the absolute path, every parent
@@ -110,15 +116,20 @@ in-flight transaction to an aborted state, terminalize its parent/child
 receipts, and bind the existing audit reservation to one
 `execution.narrow-aborted-by-grant` event. The abort event is therefore
 owned by the invalidation path, is idempotent, and cannot leave an anonymous
-quota reservation after the grant record is forgotten.
+quota reservation after the grant record is forgotten. The invalidation path
+commits the exact planned abort event/reason; it does not replace
+`explicit-revoke`, `authorization-epoch-rotated`,
+`workspace-generation-rotated`, or `expired` with a generic terminal label.
 
 Git state changes use a separate exact-effect kernel. `update-ref` binds the
 concrete ref and expected old/new object IDs; worktree add/move/remove binds
-the concrete paths and no-checkout shape; index/tree operations bind their
-exact arguments; and stdin-producing effects bind a SHA-256 digest of the
+the concrete paths and no-checkout shape; those paths must be strict
+descendants of the runner's private authority root and cannot be the root or
+escape through a symlink; index/tree operations bind their exact arguments;
+and stdin/file-producing effects bind a SHA-256 digest and length of the
 payload. The runner rechecks the argv, repository/admin-dir/work-tree, Git
-operation class, and typed `GitRefScope` (including approved task-ref
-namespaces) immediately before spawn. Every binary, bounded-output, and
+operation class, typed `GitRefScope` (including approved task-ref namespaces),
+and file digest immediately before spawn. Every binary, bounded-output, and
 synchronous runner entry point rejects these state-changing commands unless
 it goes through that same exact-effect path.
 
@@ -127,9 +138,11 @@ immutable `TurnPhaseSnapshot` and `ToolPhaseSnapshot` bind phase transitions to
 the admitted turn/tool identity and canonical evidence digests; they reject
 skipped edges and post-admission call drift. A phase digest is not an
 `AuthorityGrant`, `EffectCapability`, approval binding, or external effect
-result. The vertical slice currently covers the existing AgentLoop and
-ToolScheduler boundaries; full physical decomposition into independent phase
-objects and an effect ledger remains staged M5.4 work.
+result. The first physical extraction now includes `TurnAdmission`,
+`TurnFinalizer`, and `ToolPhaseCoordinator`, while preserving the existing
+AgentLoop and ToolScheduler APIs. Full decomposition into independent phase
+inputs/outputs and an effect ledger remains staged work; this is an incremental
+boundary, not a claim that either orchestration owner is already small.
 
 Python callers use `AuthorityDaemonClient` through `AuthorityDaemonBroker` in
 production.  `AuthorityBroker()` remains a test-only in-process broker; the
@@ -176,6 +189,11 @@ pretend to implement launchd/XPC or Windows Named Pipes; those are installed
 and owned by the platform service package.  The current repository deliberately
 refuses to use a Unix-socket substitute on macOS or Windows; until those native
 adapters are installed, production authority-backed execution is unavailable.
+This is an explicit open M5 boundary: the Windows sandbox backend does not by
+itself close the independent AuthorityBroker transport requirement, and the
+repository makes no cross-platform production-parity claim until Service SID /
+Named Pipe / ACL validation or launchd/XPC / audit-token / code-signing /
+Keychain validation is present and covered by a real platform gate.
 
 ## Independent audit prerequisite
 

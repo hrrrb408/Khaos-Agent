@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from enum import Enum
 
 from khaos.coding.workspace.manager import WorkspaceError, WorkspaceManager
@@ -47,6 +48,13 @@ async def output_changeset(manager: WorkspaceManager, workspace_id: str, changes
         raise WorkspaceError("主工作树不干净或 base SHA 已漂移")
     patch_file = workspace.worktree_path.parent / f"{changeset.id}.apply.patch"
     await manager.export_changeset_artifact(workspace_id, changeset, patch_file)
+    if changeset.artifact is not None:
+        patch_sha256 = changeset.artifact.sha256
+        patch_length = changeset.artifact.byte_length
+    else:
+        patch_bytes = changeset.patch.encode("utf-8")
+        patch_sha256 = hashlib.sha256(patch_bytes).hexdigest()
+        patch_length = len(patch_bytes)
     try:
         await manager._git(
             workspace.repository_root,
@@ -57,6 +65,8 @@ async def output_changeset(manager: WorkspaceManager, workspace_id: str, changes
             effect=GitEffect.apply_index_file(
                 repository_id=str(workspace.repository_root.resolve()),
                 patch_path=str(patch_file.resolve()),
+                patch_sha256=patch_sha256,
+                patch_length=patch_length,
                 required_operation="apply",
             ),
         )

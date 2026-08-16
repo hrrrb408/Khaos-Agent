@@ -11,7 +11,6 @@ wires the right component into the right field.
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-
 from khaos.runtime.factory import RuntimeResult
 
 
@@ -266,6 +265,8 @@ async def test_closed_field_is_not_bound_by_positional_construction():
         "cleanup_authority",
         "office_authority",
         "owns_office_authority",
+        "credential_broker",
+        "owns_credential_broker",
         "principal_id",
         "session_id",
             "runtime_id",
@@ -421,6 +422,7 @@ async def test_production_close_registers_failed_runtime_before_raising():
 async def test_production_close_delays_cancellation_until_terminal_or_quarantine():
     """H2: owner cancellation cannot escape before cleanup is retained."""
     import asyncio
+
     from khaos.runtime.factory import close_runtime_or_register
 
     started = asyncio.Event()
@@ -489,6 +491,7 @@ async def test_concurrent_aclose_callers_do_not_create_multiple_close_tasks():
     and run shutdown on the same components multiple times concurrently.
     """
     import asyncio
+
     from khaos.exceptions import RuntimeCloseError
 
     office = MagicMock()
@@ -628,4 +631,3 @@ async def test_quarantined_runtime_recovers_after_cleanup_authority_reset():
     assert result.close_state is CloseState.CLOSED
     assert not result.quarantined
     assert authority.count == 0
-

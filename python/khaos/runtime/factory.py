@@ -34,6 +34,7 @@ from khaos.routing.router import create_default_router
 from khaos.runtime.authority import RuntimeAuthoritySeal, is_production_mode
 from khaos.runtime.lifecycle import CloseState
 from khaos.rust_bridge import get_token_engine
+from khaos.security.credential_broker import CredentialBroker
 from khaos.security.effective_policy import EffectiveSecurityPolicy
 from khaos.security.middleware import SecurityMiddleware
 from khaos.security.network_broker import NetworkBrokerFactory
@@ -144,6 +145,7 @@ class RuntimeConfig:
     # turns (closing the cross-turn quota bypass) and the lifecycle is owned
     # by the caller — ``RuntimeResult.aclose`` will NOT shut it down.
     office_authority: OfficeMutationAuthority | None = None
+    credential_broker: CredentialBroker | None = None
     # C-1-5a: ``principal_id`` is REQUIRED — no implicit local-uid
     # fallback.  CLI/TUI callers explicitly pass
     # ``f"local-uid:{os.getuid()}"`` (the OS user identity is the
@@ -223,6 +225,7 @@ class ProductionRuntimeConfig:
     cleanup_authority: RuntimeCleanupAuthority | None = None
     approval_broker: Any = None
     office_authority: OfficeMutationAuthority | None = None
+    credential_broker: CredentialBroker | None = None
     principal_id: str = ""
     source_transport: str = "unknown"
     foreground_session: bool = False
@@ -253,6 +256,7 @@ class ProductionRuntimeConfig:
             cleanup_authority=self.cleanup_authority,
             approval_broker=self.approval_broker,
             office_authority=self.office_authority,
+            credential_broker=self.credential_broker,
             principal_id=self.principal_id,
             source_transport=self.source_transport,
             foreground_session=self.foreground_session,
@@ -289,6 +293,11 @@ class RuntimeResult:
     # must NOT shut it down — the owner (AgentService / SubAgentService)
     # manages its lifecycle.  Defaults to True for ad-hoc constructions.
     owns_office_authority: bool = True
+    # Credential leases are runtime-owned by default.  A server may share a
+    # preconfigured provider broker, in which case its lifecycle remains with
+    # that server rather than one chat runtime.
+    credential_broker: CredentialBroker | None = None
+    owns_credential_broker: bool = True
     # H1: the principal that owns this runtime.  ``aclose`` uses it to
     # release the principal's per-session ``BrowserContext`` so cookies /
     # DOM / page state cannot leak into a subsequent run by a different
@@ -404,6 +413,10 @@ class RuntimeResult:
             ("execution_service", self.execution_service),
             ("browser_manager", self.browser_manager),
             (
+                "credential_broker",
+                self.credential_broker if self.owns_credential_broker else None,
+            ),
+            (
                 "office_authority",
                 self.office_authority if self.owns_office_authority else None,
             ),
@@ -436,6 +449,10 @@ class RuntimeResult:
         for name, component in (
             ("execution_service", self.execution_service),
             ("browser_manager", self.browser_manager),
+            (
+                "credential_broker",
+                self.credential_broker if self.owns_credential_broker else None,
+            ),
             (
                 "office_authority",
                 self.office_authority if self.owns_office_authority else None,
@@ -706,6 +723,12 @@ class RuntimeResult:
                         self.runtime_id,
                         exc_info=True,
                     )
+            if self.credential_broker is not None and self.owns_credential_broker:
+                try:
+                    self.credential_broker.close()
+                except Exception:
+                    failed = True
+                    logger.debug("credential broker close failed", exc_info=True)
             # H2: close the AuditLogger LAST — audit logging may be needed
             # during component shutdown (e.g. to record the shutdown event
             # itself), so the file descriptor must remain open until every
@@ -938,6 +961,25 @@ async def build_runtime(
     )
     if production_mode:
         _enforce_borrowed_authority_match(cfg, authority_seal)
+    credential_broker = cfg.credential_broker
+    if credential_broker is None and cfg.tool_scheduler is not None:
+        shared_broker = getattr(cfg.tool_scheduler, "credential_broker", None)
+        if isinstance(shared_broker, CredentialBroker):
+            credential_broker = shared_broker
+    owns_credential_broker = credential_broker is None
+    if credential_broker is None:
+        credential_broker = CredentialBroker(
+            policy_digest=effective_policy.digest,
+            principal_id=cfg.principal_id,
+            # Production accepts only provider loaders registered by a trusted
+            # server adapter.  Development keeps the migration adapter available
+            # for existing tests, but it is never enabled by the production type.
+            allow_context_adoption=not production_mode,
+        )
+    credential_broker.bind_runtime(
+        policy_digest=effective_policy.digest,
+        principal_id=cfg.principal_id,
+    )
     # Round-14 §7: derive the exec-tool name set from the live registry so
     # the commands_require_approval gate covers every exec-style tool
     # (permission_level == "execute"), not a hard-coded literal.  Built once
@@ -1119,6 +1161,7 @@ async def build_runtime(
             network_broker_factory=NetworkBrokerFactory(
                 resource_order=typed_resource_order,
             ),
+            credential_broker=credential_broker,
         )
     if production_mode:
         scheduler_resource_order = getattr(
@@ -1136,6 +1179,7 @@ async def build_runtime(
                 "production ToolScheduler must use the effective typed resource catalog"
             )
     scheduler.set_office_authority(office_authority)
+    scheduler.credential_broker = credential_broker
     if cfg.browser_manager is None:
         from khaos.tools.browser_tools import BrowserManager
 
@@ -1201,6 +1245,7 @@ async def build_runtime(
         cron_engine=cfg.cron_engine,
         browser_manager=browser_manager,
         subagent_spawner=cfg.subagent_spawner,
+        credential_broker=credential_broker,
         # M4 batch 3.1.16A-5-1b (CRITICAL): carry the RPC-verified
         # project identity into the AgentLoop so every message / turn
         # write is stamped with it.  ``self._bound_project_id`` (set
@@ -1221,6 +1266,8 @@ async def build_runtime(
         execution_service=execution_service,
         office_authority=office_authority,
         owns_office_authority=owns_office_authority,
+        credential_broker=credential_broker,
+        owns_credential_broker=owns_credential_broker,
         principal_id=cfg.principal_id,
         # H5: carry session_id + runtime_id so ``aclose`` can release the
         # per-session BrowserContext keyed by (principal, session, runtime).

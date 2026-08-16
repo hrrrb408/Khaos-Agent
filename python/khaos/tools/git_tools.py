@@ -16,6 +16,11 @@ from urllib.parse import urlparse
 
 from khaos.coding.execution.models import ExecutionRequest, NetworkPolicy
 from khaos.coding.workspace.models import WorkspaceState
+from khaos.security.credential_broker import (
+    CredentialBroker,
+    CredentialBrokerError,
+    CredentialLease,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,14 +58,15 @@ class _GitExecutionContext:
     execution_service: Any
     approval_context: dict[str, Any] | None
     network_policy: str
-    credential_context: dict[str, Any] | None = None
+    credential_context: dict[str, Any] | CredentialLease | None = None
+    credential_broker: CredentialBroker | None = None
     principal_id: str | None = None
     requester: str | None = None
     network_lease: Any = None
 
 
-def _context(task_id: str | None, workspace_id: str | None, access_mode: str, execution_service: Any, approval_context: dict[str, Any] | None, network_policy: str, credential_context: dict[str, Any] | None = None, principal_id: str | None = None, requester: str | None = None, network_lease: Any = None) -> _GitExecutionContext:
-    return _GitExecutionContext(task_id, workspace_id, access_mode, execution_service, approval_context, network_policy, credential_context, principal_id, requester, network_lease)
+def _context(task_id: str | None, workspace_id: str | None, access_mode: str, execution_service: Any, approval_context: dict[str, Any] | None, network_policy: str, credential_context: dict[str, Any] | CredentialLease | None = None, credential_broker: CredentialBroker | None = None, principal_id: str | None = None, requester: str | None = None, network_lease: Any = None) -> _GitExecutionContext:
+    return _GitExecutionContext(task_id, workspace_id, access_mode, execution_service, approval_context, network_policy, credential_context, credential_broker, principal_id, requester, network_lease)
 
 
 async def git_diff(repo: str = ".", staged: bool = False, *, task_id: str | None = None, workspace_id: str | None = None, access_mode: str = "read-only", execution_service: Any = None, approval_context: dict[str, Any] | None = None, network_policy: str = "none") -> dict[str, Any]:
@@ -333,7 +339,7 @@ async def git_create_branch(
 
 
 async def git_push(
-    cwd: str = ".", remote: str = "origin", branch: str = "", *, task_id: str | None = None, workspace_id: str | None = None, access_mode: str = "vcs.remote-write", execution_service: Any = None, approval_context: dict[str, Any] | None = None, network_policy: str = "none", credential_context: dict[str, Any] | None = None, principal_id: str | None = None, requester: str | None = None, network_lease: Any = None
+    cwd: str = ".", remote: str = "origin", branch: str = "", *, task_id: str | None = None, workspace_id: str | None = None, access_mode: str = "vcs.remote-write", execution_service: Any = None, approval_context: dict[str, Any] | None = None, network_policy: str = "none", credential_context: dict[str, Any] | CredentialLease | None = None, credential_broker: CredentialBroker | None = None, principal_id: str | None = None, requester: str | None = None, network_lease: Any = None
 ) -> str:
     """Push the current (or named) branch to ``remote``.
 
@@ -346,7 +352,7 @@ async def git_push(
     """
     remote = remote or "origin"
     _validate_remote_name(remote)
-    ctx = _context(task_id, workspace_id, "vcs.remote-write", execution_service, approval_context, network_policy, credential_context, principal_id, requester, network_lease)
+    ctx = _context(task_id, workspace_id, "vcs.remote-write", execution_service, approval_context, network_policy, credential_context, credential_broker, principal_id, requester, network_lease)
     read_ctx = _context(task_id, workspace_id, "read-only", execution_service, approval_context, "none")
     branch_result = await _git(["git", *_GIT_SAFE_CONFIG, "branch", "--show-current"], cwd, read_ctx)
     current_branch = branch_result["stdout"].strip()
@@ -677,6 +683,7 @@ async def _git_remote_via_execution_service(
     credential_scope, credential_environment = _credential_material(
         approval.get("binding", {}).get("remote_url", ""),
         context.credential_context,
+        credential_broker=context.credential_broker,
     )
     if context.network_lease is None:
         raise PermissionError(
@@ -838,7 +845,9 @@ async def prepare_remote_git_approval(
     remote_url = remote_result["stdout"].strip()
     remote_host = _remote_host(remote_url)
     credential_scope, _ = _credential_material(
-        remote_url, tool_context.get("credential_context")
+        remote_url,
+        tool_context.get("credential_context"),
+        credential_broker=tool_context.get("credential_broker"),
     )
     head, diff_hash = await _git_state(cwd, context)
     refspec = f"{branch}:{branch}"
@@ -871,6 +880,7 @@ async def prepare_remote_git_approval(
         "approval_id": approval_id,
         "binding": binding,
         "credential_context": tool_context.get("credential_context"),
+        "credential_broker": tool_context.get("credential_broker"),
     }
 
 
@@ -971,7 +981,11 @@ async def _consume_remote_approval(
     if remote_result["returncode"] != 0:
         raise PermissionError("approved remote is no longer configured")
     remote_url = remote_result["stdout"].strip()
-    credential_scope, _ = _credential_material(remote_url, context.credential_context)
+    credential_scope, _ = _credential_material(
+        remote_url,
+        context.credential_context,
+        credential_broker=context.credential_broker,
+    )
     head, diff_hash = await _git_state(cwd, read_context)
     current = {
         "principal_id": context.principal_id or binding.get("principal_id"),
@@ -1184,7 +1198,10 @@ def _remote_host(remote_url: str) -> str:
 
 
 def _credential_material(
-    remote_url: str, credential_context: dict[str, Any] | None
+    remote_url: str,
+    credential_context: dict[str, Any] | CredentialLease | None,
+    *,
+    credential_broker: CredentialBroker | None = None,
 ) -> tuple[str, dict[str, str]]:
     host = _remote_host(remote_url)
     if host == "local":
@@ -1195,6 +1212,51 @@ def _credential_material(
     else:
         required_scope = "https-askpass"
         allowed_keys = {"GIT_ASKPASS", "GIT_USERNAME", "GIT_PASSWORD"}
+    binding = {"remote_url": remote_url, "host": host}
+    if isinstance(credential_context, CredentialLease):
+        if credential_broker is None:
+            raise PermissionError("credential lease requires CredentialBroker")
+        if (
+            credential_context.scope.provider != "git"
+            or required_scope not in credential_context.scope.names
+        ):
+            raise PermissionError("credential lease is not a matching Git lease")
+        try:
+            return required_scope, credential_broker.materialize(
+                credential_context,
+                binding=binding,
+                operation="git_push",
+            )
+        except CredentialBrokerError as exc:
+            raise PermissionError(str(exc)) from exc
+    if credential_broker is not None:
+        try:
+            if credential_context is None:
+                lease = credential_broker.issue_named(
+                    provider="git",
+                    name=required_scope,
+                    operation="git_push",
+                    binding=binding,
+                )
+            else:
+                lease = credential_broker.adopt_context(
+                    credential_context,
+                    provider="git",
+                    name=required_scope,
+                    operation="git_push",
+                    binding=binding,
+                )
+            try:
+                environment = credential_broker.materialize(
+                    lease,
+                    binding=binding,
+                    operation="git_push",
+                )
+            finally:
+                credential_broker.revoke(lease)
+            return required_scope, environment
+        except CredentialBrokerError as exc:
+            raise PermissionError(str(exc)) from exc
     if not isinstance(credential_context, dict) or credential_context.get("scope") != required_scope:
         raise PermissionError(f"credential authorization required: {required_scope}")
     environment = credential_context.get("environment")

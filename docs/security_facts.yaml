@@ -37,6 +37,18 @@ platform_boundaries:
   macos_authority_transport: native_launchd_or_xpc_adapter_required
   windows_authority_transport: native_named_pipe_service_sid_adapter_required
   unsupported_platform_behavior: fail_closed
+effect_boundaries:
+  git_worktree_paths: strict_descendant_of_trusted_git_runner_authority_root
+  git_apply_patch_binding: sha256_and_length_rechecked_before_spawn
+  narrow_abort_reason: exact_planned_event_reason_is_committed
+  credential_owner: short_lived_broker_lease_with_target_operation_policy_principal_binding
+  credential_secret_visibility: trusted_final_execution_environment_only
+orchestration_boundaries:
+  extracted_components:
+    - TurnAdmission
+    - TurnFinalizer
+    - ToolPhaseCoordinator
+  decomposition_status: incremental_in_progress
 evidence:
   local_platform_sandbox: diagnostic_only
   required_linux_proof: real_kernel_ci

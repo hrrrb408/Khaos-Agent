@@ -252,17 +252,35 @@ production AuthorityDaemon/runtime 必须加载与 effective policy digest 绑�
 prepare、grant、narrowing 和 expired-receipt renewal 的未知资源、跨 kind、越权 subset 或 action
 widening 都拒绝。EffectiveSecurityPolicy 会编译 baseline catalog，Agent 还会校验部署 manifest
 的 catalog digest 与该编译结果一致；显式 development/test adapter 才允许省略 catalog。Workspace/Git
-和 NetworkBroker 已切换到 typed scope digest；native execution 仍以独立 exact launch-binding digest
-保护内核启动，credential-specific owner wiring 继续单独收敛，不把这两条边界伪装成已完成。
+和 NetworkBroker 已切换到 typed scope digest；TrustedGit 的 worktree effect 现在还独立受
+private authority root 的 strict-descendant 检查保护，`apply_index_file` 在 spawn 前重新核对
+patch length/SHA-256，narrow abort commit 使用计划中的 exact event/reason。CredentialScope
+已经进入真实 `CredentialBroker` owner wiring：provider loader 注册、短期 target-bound lease、
+materialize/revoke/close proof 均存在；生产部署仍必须提供实际 provider adapter，不能把测试适配器
+当成 production credential evidence。native execution 仍以独立 exact launch-binding digest
+保护内核启动，macOS/Windows authority transport 仍保持 fail-closed 未完成，不把这些边界伪装成已完成。
 
 M5.4 已开始首个可审计垂直切片：`TurnPhaseSnapshot` 和 `ToolPhaseSnapshot` 是冻结的、
 带 digest 的 phase evidence；AgentLoop 在 admission/context/model/tool/verification/finalization
 边界推进 turn phase，ToolScheduler 在 raw/validated/resource/permission/approval/authorized/
 dispatch/terminal 边界推进 tool phase，并在调用身份或参数漂移时 fail closed。这个切片证明了
-不可变阶段边界可以接入现有运行路径，但不把完整的物理拆分冒充完成；后续仍需把每个阶段的
-输入输出对象和 effect ledger 分别抽成独立组件，并继续覆盖拒绝、恢复、取消和持久化路径。
-M5.5 的第二 maintainer、CODEOWNERS 和 independent assurance 是组织治理前置条件，由 issue
-#169 跟踪；没有第二个有权限维护者时不把 ruleset 强行改成无人可合并。
+不可变阶段边界可以接入现有运行路径；本批次进一步抽出 `TurnAdmission`、`TurnFinalizer` 和
+`ToolPhaseCoordinator`，但不把完整的物理拆分冒充完成。后续仍需把每个阶段的输入输出对象和
+effect ledger 分别抽成独立组件，并继续覆盖拒绝、恢复、取消和持久化路径。
+
+M5 closure ledger（本轮 review 对应状态）：
+
+| 边界 | 状态 | 仍需的外部/后续证据 |
+|---|---|---|
+| Git worktree path + apply bytes | CLOSED（代码/回归） | 受保护 PR exact-SHA CI |
+| Narrow abort event/reason canonicalization | CLOSED（代码/回归） | 受保护 PR exact-SHA CI |
+| Credential owner wiring | CODE CLOSED / DEPLOYMENT OPEN | 生产 provider adapter 与真实 secret-store owner |
+| Windows/macOS authority transport | OPEN / fail-closed | Named Pipe/Service SID 或 launchd/XPC 原生平台 gate |
+| AgentLoop/ToolScheduler TCB decomposition | IN PROGRESS | 后续小步拆分与 full regression |
+| Independent human assurance | OPEN / governance | 第二 maintainer、CODEOWNER approval、independent assurance |
+
+M5.5/M5.6 的第二 maintainer、CODEOWNERS 和 independent assurance 是组织治理前置条件，
+由 issue #169 跟踪；没有第二个有权限维护者时不把 ruleset 强行改成无人可合并。
 
 ## 12. 交付和基线升级规则
 

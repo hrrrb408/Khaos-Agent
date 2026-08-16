@@ -43,6 +43,7 @@ FileIdentity = tuple[int, int, int, int]
 _PROTECTED_GIT_NAME = ".git"
 _MAX_GIT_ERROR_BYTES = 64 * 1024
 _MAX_GIT_CHUNK_BYTES = 1024 * 1024
+_MAX_GIT_EFFECT_FILE_BYTES = 256 * 1024 * 1024
 _ALLOWED_COMMANDS = frozenset(
     {
         "apply",
@@ -131,6 +132,9 @@ class GitEffect:
     new_oid: str | None = None
     stdin_sha256: str | None = None
     required_operation: str | None = None
+    worktree_paths: tuple[str, ...] = ()
+    patch_sha256: str | None = None
+    patch_length: int | None = None
 
     def __post_init__(self) -> None:
         if self.kind not in _EXACT_EFFECT_COMMANDS:
@@ -157,6 +161,30 @@ class GitEffect:
             or any(character not in "0123456789abcdef" for character in self.stdin_sha256)
         ):
             raise ValueError("Git effect stdin digest is invalid")
+        if isinstance(self.worktree_paths, str):
+            raise TypeError("Git effect worktree paths must be a tuple")
+        canonical_worktree_paths = tuple(
+            _canonical_git_effect_path(value, field="worktree path")
+            for value in self.worktree_paths
+        )
+        object.__setattr__(self, "worktree_paths", canonical_worktree_paths)
+        if (self.patch_sha256 is None) != (self.patch_length is None):
+            raise ValueError("Git effect patch digest and length must be paired")
+        if self.patch_sha256 is not None and (
+            len(self.patch_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in self.patch_sha256)
+        ):
+            raise ValueError("Git effect patch digest is invalid")
+        if self.patch_length is not None and (
+            type(self.patch_length) is not int
+            or self.patch_length < 0
+            or self.patch_length > _MAX_GIT_EFFECT_FILE_BYTES
+        ):
+            raise ValueError("Git effect patch length is invalid")
+        if self.kind != "apply" and (
+            self.patch_sha256 is not None or self.patch_length is not None
+        ):
+            raise ValueError("patch binding is only valid for Git apply effects")
 
     def with_prefix(self, prefix: tuple[str, ...]) -> GitEffect:
         """Bind the fixed repository/worktree options without changing the effect."""
@@ -222,6 +250,7 @@ class GitEffect:
             expected_old_oid="0" * len(base_oid),
             new_oid=base_oid,
             required_operation=required_operation,
+            worktree_paths=(path,),
         )
 
     @classmethod
@@ -241,6 +270,7 @@ class GitEffect:
             args=(*prefix, "worktree", "move", source, destination),
             repository_id=repository_id,
             required_operation=required_operation,
+            worktree_paths=(source, destination),
         )
 
     @classmethod
@@ -260,6 +290,7 @@ class GitEffect:
             args=(*prefix, "worktree", "remove", *force_args, path),
             repository_id=repository_id,
             required_operation=required_operation,
+            worktree_paths=(path,),
         )
 
     @classmethod
@@ -379,6 +410,8 @@ class GitEffect:
         *,
         repository_id: str,
         patch_path: str,
+        patch_sha256: str,
+        patch_length: int,
         prefix: tuple[str, ...] = (),
         required_operation: str = "apply",
     ) -> GitEffect:
@@ -389,6 +422,8 @@ class GitEffect:
             args=(*prefix, "apply", "--index", patch_path),
             repository_id=repository_id,
             required_operation=required_operation,
+            patch_sha256=patch_sha256,
+            patch_length=patch_length,
         )
 
 
@@ -412,9 +447,14 @@ def _validate_git_effect_oid(value: str, *, allow_zero: bool = False) -> None:
 
 
 def _validate_git_effect_path(value: str) -> None:
+    _canonical_git_effect_path(value)
+
+
+def _canonical_git_effect_path(value: str, *, field: str = "Git effect path") -> str:
     path = Path(value)
     if not path.is_absolute() or path != path.resolve():
-        raise ValueError("Git effect path must be canonical and absolute")
+        raise ValueError(f"{field} must be canonical and absolute")
+    return str(path)
 
 
 def _validate_git_effect_relative_path(value: str) -> None:
@@ -1283,10 +1323,32 @@ class TrustedGitRunner:
                     "Git update-ref effect does not bind its expected old/new OIDs"
                 )
         elif effect.kind == "worktree":
-            if len(command_args) < 3 or command_args[1] not in _ALLOWED_WORKTREE_COMMANDS:
+            if len(command_args) < 2 or command_args[1] not in _ALLOWED_WORKTREE_COMMANDS:
                 raise TrustedGitError("Git worktree effect shape is invalid")
-            if command_args[1] == "add" and "--no-checkout" not in command_args:
-                raise TrustedGitError("Git worktree effect must disable checkout")
+            if command_args[1] == "add":
+                if (
+                    len(command_args) != 7
+                    or command_args[2] != "--no-checkout"
+                    or command_args[3] != "-b"
+                    or effect.worktree_paths != (command_args[5],)
+                ):
+                    raise TrustedGitError("Git worktree add effect shape is invalid")
+            elif command_args[1] == "move":
+                if (
+                    len(command_args) != 4
+                    or effect.worktree_paths != (command_args[2], command_args[3])
+                ):
+                    raise TrustedGitError("Git worktree move effect shape is invalid")
+            elif command_args[1] == "remove":
+                if len(command_args) == 3:
+                    paths = (command_args[2],)
+                elif len(command_args) == 4 and command_args[2] == "--force":
+                    paths = (command_args[3],)
+                else:
+                    raise TrustedGitError("Git worktree remove effect shape is invalid")
+                if effect.worktree_paths != paths:
+                    raise TrustedGitError("Git worktree remove path binding is invalid")
+            self._validate_worktree_paths(effect.worktree_paths)
         elif effect.kind == "update-index":
             if command_args[1:3] == ("--remove", "--"):
                 if len(command_args) != 4:
@@ -1303,12 +1365,18 @@ class TrustedGitRunner:
                 raise TrustedGitError("Git read-tree effect shape is invalid")
         elif effect.kind == "apply":
             if effect.stdin_sha256 is None:
-                if len(command_args) != 3 or command_args[1] != "--index":
+                if (
+                    len(command_args) != 3
+                    or command_args[1] != "--index"
+                    or effect.patch_sha256 is None
+                    or effect.patch_length is None
+                ):
                     raise TrustedGitError("Git apply effect shape is invalid")
                 try:
                     _validate_git_effect_path(command_args[2])
                 except ValueError as exc:
                     raise TrustedGitError("Git apply patch path is invalid") from exc
+                self._validate_private_effect_path(command_args[2])
             elif "--index" not in command_args:
                 raise TrustedGitError("Git apply effect must bind --index")
         elif effect.kind == "write-tree":
@@ -1379,6 +1447,82 @@ class TrustedGitRunner:
             raise TrustedGitError("Git effect action is outside its typed scope")
         if effect.ref_name is not None and not scope.allows_ref(effect.ref_name):
             raise TrustedGitError("Git effect ref is outside its typed scope")
+        if effect.kind == "worktree" and scope.worktree_root is not None and not all(
+            scope.allows_worktree_path(path) for path in effect.worktree_paths
+        ):
+            raise TrustedGitError("Git worktree path is outside its typed worktree scope")
+
+    def _validate_worktree_paths(self, paths: tuple[str, ...]) -> None:
+        """Require every Git worktree target to be a strict private-root child."""
+        if not paths:
+            raise TrustedGitError("Git worktree effect has no bound path")
+        root = self.authority_root.expanduser().resolve()
+        for value in paths:
+            candidate = Path(value).expanduser().resolve()
+            if candidate == root:
+                raise TrustedGitError("Git worktree effect cannot target the authority root")
+            try:
+                candidate.relative_to(root)
+            except ValueError as exc:
+                raise TrustedGitError(
+                    "Git worktree effect path is outside the authority root"
+                ) from exc
+            if candidate != Path(value):
+                raise TrustedGitError(
+                    "Git worktree effect path is not a canonical private path"
+                )
+
+    def _validate_private_effect_path(self, value: str) -> None:
+        """Keep Git file-backed effects inside the private authority root."""
+        candidate = Path(value).expanduser().resolve()
+        root = self.authority_root.expanduser().resolve()
+        if candidate == root:
+            raise TrustedGitError("Git file effect cannot target the authority root")
+        try:
+            candidate.relative_to(root)
+        except ValueError as exc:
+            raise TrustedGitError(
+                "Git file effect path is outside the authority root"
+            ) from exc
+        if candidate != Path(value):
+            raise TrustedGitError("Git file effect path is not canonical")
+
+    @staticmethod
+    def _verify_patch_file(effect: GitEffect) -> None:
+        """Recheck the exclusive patch artifact immediately before spawn."""
+        if effect.kind != "apply" or effect.stdin_sha256 is not None:
+            return
+        if effect.patch_sha256 is None or effect.patch_length is None:
+            raise TrustedGitError("Git apply effect is missing patch content binding")
+        command_index = _git_command_index(effect.args)
+        if command_index is None or len(effect.args) <= command_index + 2:
+            raise TrustedGitError("Git apply patch path is missing")
+        path = Path(effect.args[command_index + 2])
+        descriptor = -1
+        digest = hashlib.sha256()
+        total = 0
+        try:
+            descriptor = os.open(
+                path,
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise TrustedGitError("Git apply patch is not a single-link regular file")
+            while chunk := os.read(descriptor, _MAX_GIT_CHUNK_BYTES):
+                total += len(chunk)
+                if total > _MAX_GIT_EFFECT_FILE_BYTES:
+                    raise TrustedGitError("Git apply patch exceeds its configured bound")
+                digest.update(chunk)
+        except OSError as exc:
+            raise TrustedGitError("Git apply patch cannot be verified") from exc
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        if total != effect.patch_length or digest.hexdigest() != effect.patch_sha256:
+            raise TrustedGitError("Git apply patch digest or length does not match authorization")
 
     async def run_effect(
         self,
@@ -1447,6 +1591,7 @@ class TrustedGitRunner:
                     "state-changing Git commands require a structured exact effect"
                 )
             self._validate_effect_binding(repository, tuple(args), effect, capability)
+            self._verify_patch_file(effect)
         elif effect is not None:
             raise TrustedGitError("a Git effect cannot authorize a read-only command")
         owner = self._new_owner("git.run")
