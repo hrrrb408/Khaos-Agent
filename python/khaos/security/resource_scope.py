@@ -300,24 +300,57 @@ class NetworkScope(ResourceScope):
 
 @dataclass(frozen=True, slots=True)
 class GitRefScope(ResourceScope):
-    """Repository/ref capability with exact refs and operations."""
+    """Repository/ref capability with exact refs and approved namespaces.
+
+    ``refs`` remains exact.  ``ref_namespaces`` is the only supported dynamic
+    form and is prefix-based, so a workspace task ref can be authorized as
+    ``refs/heads/khaos/task/<task-id>`` without introducing wildcard syntax
+    into the catalog or confusing a ref name with an argv pattern.
+    """
 
     repository: str
     refs: frozenset[str]
     operations: frozenset[str]
+    ref_namespaces: frozenset[str] = frozenset()
     kind: ResourceScopeKind = ResourceScopeKind.GIT_REF
 
     def __post_init__(self) -> None:
         _require_kind(self.kind, ResourceScopeKind.GIT_REF)
         object.__setattr__(self, "repository", _require_concrete("repository", self.repository))
-        object.__setattr__(self, "refs", _require_tokens("refs", self.refs))
+        refs = frozenset(_require_concrete("refs", ref) for ref in self.refs)
+        namespaces = frozenset(
+            _require_concrete("ref_namespaces", namespace)
+            for namespace in self.ref_namespaces
+        )
+        if not refs and not namespaces:
+            raise ResourceScopeError("refs or ref_namespaces must not be empty")
+        if any(
+            not namespace.startswith("refs/") or not namespace.endswith("/")
+            for namespace in namespaces
+        ):
+            raise ResourceScopeError(
+                "ref_namespaces must be slash-terminated refs namespaces"
+            )
+        object.__setattr__(self, "refs", refs)
+        object.__setattr__(self, "ref_namespaces", namespaces)
         object.__setattr__(self, "operations", _require_actions("operations", self.operations))
+
+    def _contains_ref(self, ref: str) -> bool:
+        return ref in self.refs or any(ref.startswith(namespace) for namespace in self.ref_namespaces)
+
+    def _contains_namespace(self, namespace: str) -> bool:
+        return any(namespace.startswith(parent) for parent in self.ref_namespaces)
+
+    def allows_ref(self, ref: str) -> bool:
+        """Return whether one concrete ref is covered by this scope."""
+        return self._contains_ref(_require_concrete("ref", ref))
 
     def contains(self, child: ResourceScope) -> bool:
         return (
             isinstance(child, GitRefScope)
             and self.repository == child.repository
-            and self.refs.issuperset(child.refs)
+            and all(self._contains_ref(ref) for ref in child.refs)
+            and all(self._contains_namespace(namespace) for namespace in child.ref_namespaces)
             and self.operations.issuperset(child.operations)
         )
 
@@ -325,6 +358,7 @@ class GitRefScope(ResourceScope):
         return {
             "repository": self.repository,
             "refs": sorted(self.refs),
+            "ref_namespaces": sorted(self.ref_namespaces),
             "operations": sorted(self.operations),
         }
 
@@ -538,6 +572,7 @@ class TypedResourcePartialOrder:
         expected_policy_digest: str | None = None,
     ) -> TypedResourcePartialOrder:
         """Load a catalog from a JSON file and fail closed on any mismatch."""
+        path = _trusted_catalog_path(path)
         descriptor = -1
         try:
             descriptor = os.open(
@@ -699,13 +734,18 @@ def _scope_from_manifest(kind: str, body: object) -> ResourceScope:
         if scope_kind is ResourceScopeKind.GIT_REF:
             _reject_unknown_fields(
                 body,
-                {"repository", "refs", "operations"},
+                {"repository", "refs", "ref_namespaces", "operations"},
                 "git-ref scope",
             )
             return GitRefScope(
                 repository=cast(str, body["repository"]),
                 refs=frozenset(_manifest_text_list(body, "refs")),
                 operations=frozenset(_manifest_text_list(body, "operations")),
+                ref_namespaces=frozenset(
+                    _manifest_text_list(body, "ref_namespaces")
+                )
+                if "ref_namespaces" in body
+                else frozenset(),
             )
         if scope_kind is ResourceScopeKind.EXECUTION:
             _reject_unknown_fields(
@@ -796,6 +836,61 @@ def _catalog_digest(
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _trusted_catalog_path(path: Path) -> Path:
+    """Validate the standalone catalog file and every parent directory.
+
+    The JSON digest authenticates contents, not the pathname used to open the
+    file.  Production callers therefore also need a no-symlink parent chain,
+    a single-link regular file, and a non-writable owner boundary.  Root-owned
+    deployment files and a current-user-owned development file are both
+    supported; group/other-writable locations fail closed.
+    """
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        raise ResourceScopeError("resource catalog path must be absolute")
+    if any(part == ".." for part in candidate.parts):
+        raise ResourceScopeError("resource catalog path contains parent traversal")
+    if os.name == "nt":
+        # Windows production uses the native deployment ACL rather than POSIX
+        # uid/mode bits.  The final open still uses no-follow where available.
+        return candidate
+    allowed_uids = {0, os.getuid()}
+    current = Path(candidate.anchor)
+    for part in candidate.parts[1:]:
+        current /= part
+        try:
+            info = os.lstat(current)
+        except OSError as exc:
+            raise ResourceScopeError("resource catalog path is unavailable") from exc
+        if stat.S_ISLNK(info.st_mode):
+            raise ResourceScopeError("resource catalog path contains a symlink")
+        sticky_system_directory = (
+            stat.S_ISDIR(info.st_mode)
+            and info.st_uid == 0
+            and bool(info.st_mode & 0o1000)
+        )
+        if (
+            (info.st_uid not in allowed_uids or info.st_mode & 0o022)
+            and not sticky_system_directory
+        ):
+            raise ResourceScopeError(
+                "resource catalog path is not owned by a trusted non-writable identity"
+            )
+        if current != candidate and not stat.S_ISDIR(info.st_mode):
+            raise ResourceScopeError("resource catalog parent is not a directory")
+    try:
+        info = os.lstat(candidate)
+    except OSError as exc:
+        raise ResourceScopeError("resource catalog is unavailable") from exc
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise ResourceScopeError("resource catalog must be a single-link regular file")
+    if info.st_uid not in allowed_uids or info.st_mode & 0o022:
+        raise ResourceScopeError(
+            "resource catalog is not owned by a trusted non-writable identity"
+        )
+    return candidate
+
+
 def compile_typed_resource_catalog(
     workspace_root: Path,
     *,
@@ -835,6 +930,7 @@ def compile_typed_resource_catalog(
         git_scope = GitRefScope(
             repository=str(root),
             refs=frozenset({"HEAD"}),
+            ref_namespaces=frozenset({"refs/heads/khaos/task/"}),
             operations=GIT_SCOPE_OPERATIONS,
         )
         scopes[git_scope.digest()] = git_scope

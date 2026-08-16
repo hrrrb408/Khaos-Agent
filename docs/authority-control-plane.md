@@ -91,6 +91,36 @@ and credential-specific owners remain an explicit follow-up rather than being
 represented by an opaque fallback. Production deployments must pass the same
 policy-bound manifest to the Agent and `build_production_daemon`; an absent or
 divergent catalog refuses startup rather than silently claiming typed coverage.
+The standalone file loader also verifies the absolute path, every parent
+component, owner boundary (root or the current service identity),
+single-link regular-file type, and absence of group/other write permission;
+symlinked or writable catalog paths are rejected before JSON parsing. Linux
+systemd deployments should keep the catalog root-owned and read-only under
+`/etc/khaos`; non-Linux deployments must provide the equivalent native ACL or
+read-only mount guarantee. A root-owned sticky system temporary directory may
+occur above a private test/development directory; it does not relax the
+final-file or private-descendant checks used by production catalog paths.
+
+Narrowing is an owned transaction rather than an untracked lock gap. The
+daemon records the parent receipt, child intent, descendant reservation, and
+one audit reservation in a `NarrowTransaction`. It moves through child
+preparation and commit states under the authority lock; grant revoke, epoch
+rotation, workspace-generation rotation, and expiry atomically move any
+in-flight transaction to an aborted state, terminalize its parent/child
+receipts, and bind the existing audit reservation to one
+`execution.narrow-aborted-by-grant` event. The abort event is therefore
+owned by the invalidation path, is idempotent, and cannot leave an anonymous
+quota reservation after the grant record is forgotten.
+
+Git state changes use a separate exact-effect kernel. `update-ref` binds the
+concrete ref and expected old/new object IDs; worktree add/move/remove binds
+the concrete paths and no-checkout shape; index/tree operations bind their
+exact arguments; and stdin-producing effects bind a SHA-256 digest of the
+payload. The runner rechecks the argv, repository/admin-dir/work-tree, Git
+operation class, and typed `GitRefScope` (including approved task-ref
+namespaces) immediately before spawn. Every binary, bounded-output, and
+synchronous runner entry point rejects these state-changing commands unless
+it goes through that same exact-effect path.
 
 Agent orchestration phase snapshots are a separate evidence layer. The
 immutable `TurnPhaseSnapshot` and `ToolPhaseSnapshot` bind phase transitions to

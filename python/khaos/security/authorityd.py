@@ -68,6 +68,14 @@ _RECEIPT_REVOKING = "revoking"
 _RECEIPT_TERMINAL = "terminal"
 _RECEIPT_REVOKED_BY_GRANT = "revoked-by-grant"
 
+_NARROW_RESERVED = "reserved"
+_NARROW_CHILD_PREPARING = "child-preparing"
+_NARROW_CHILD_PREPARED = "child-prepared"
+_NARROW_COMMITTING = "committing"
+_NARROW_COMMITTED = "committed"
+_NARROW_ABORTING = "aborting"
+_NARROW_ABORTED = "aborted"
+
 
 @dataclass
 class _ReceiptRecord:
@@ -108,12 +116,36 @@ class _GrantRecord:
     expires_at: float
 
 
+@dataclass
+class _NarrowTransaction:
+    """Own every resource reserved by one parent-to-child transition.
+
+    Narrowing runs child preparation outside the daemon lock so the audit
+    writer cannot block unrelated authority decisions.  The transaction
+    record is the compensating owner for that interval: a grant invalidation
+    can atomically move it to ``ABORTED`` and transfer its anonymous audit
+    reservation to a stable abort event before the grant is forgotten.
+    """
+
+    transaction_id: str
+    parent_receipt: SignedAuthorizationReceipt
+    child_intent_nonce: str
+    grant_id: str | None
+    descendant_key: tuple[str, str] | None
+    audit_token: str
+    state: str = _NARROW_RESERVED
+    child_receipt: SignedAuthorizationReceipt | None = None
+    abort_event: dict[str, Any] | None = None
+    abort_evidence_owner: str | None = None
+
+
 class _ExpiredGrant(AuthorityControlPlaneError):
     """Internal rejection carrying the audit event for an expired grant."""
 
-    def __init__(self, event: dict[str, Any]) -> None:
+    def __init__(self, event: dict[str, Any], *, events: list[dict[str, Any]] | None = None) -> None:
         super().__init__("authority grant has expired")
         self.event = event
+        self.events = events or [event]
 
 
 class AuthorityDaemon:
@@ -167,6 +199,12 @@ class AuthorityDaemon:
         # the small gap while a child prepare is in flight.
         self._grant_descendants: dict[str, set[tuple[str, str]]] = {}
         self._grant_descendant_reservations: dict[str, set[tuple[str, str]]] = {}
+        # A narrow transaction owns the parent receipt, child preparation,
+        # descendant reservation, and audit reservation as one unit.  Grant
+        # revoke/expiry/rotation must abort these records before forgetting
+        # the grant, otherwise the in-flight caller would retain an anonymous
+        # audit reservation forever.
+        self._narrow_transactions: dict[str, _NarrowTransaction] = {}
         self.max_pending_receipts = max_pending_receipts
         self.max_pending_per_principal = max_pending_per_principal
         self.terminal_tombstone_limit = terminal_tombstone_limit
@@ -240,6 +278,105 @@ class AuthorityDaemon:
         if not reservations:
             self._grant_descendant_reservations.pop(grant_id, None)
 
+    def _narrow_abort_event_locked(
+        self,
+        transaction: _NarrowTransaction,
+        *,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Build the durable event that takes ownership of a narrow token."""
+        if transaction.abort_event is not None:
+            return transaction.abort_event
+        child = transaction.child_receipt
+        return self._audit_event(
+            {
+                # The token already owns one bounded audit slot.  Reusing it
+                # as the stable event id transfers ownership without briefly
+                # consuming a second slot or leaving an anonymous key behind.
+                "event_id": transaction.audit_token,
+                "kind": "execution.narrow-aborted-by-grant",
+                "transaction_id": transaction.transaction_id,
+                "grant_id": transaction.grant_id,
+                "parent_nonce": transaction.parent_receipt.nonce,
+                "parent_receipt_digest": transaction.parent_receipt.digest,
+                "child_nonce": child.nonce if child is not None else None,
+                "child_receipt_digest": child.digest if child is not None else None,
+                "child_intent_nonce": transaction.child_intent_nonce,
+                "reason": reason,
+                "issuer_id": self.issuer_id,
+            }
+        )
+
+    def _commit_narrow_abort_locked(
+        self,
+        transaction: _NarrowTransaction,
+        *,
+        reason: str,
+        evidence_owner: str,
+    ) -> dict[str, Any]:
+        """Atomically abort a narrow and bind its token to abort evidence."""
+        event = self._narrow_abort_event_locked(transaction, reason=reason)
+        if transaction.state in {_NARROW_ABORTING, _NARROW_ABORTED}:
+            return event
+        if transaction.audit_token not in self._audit_reservations:
+            raise AuthorityControlPlaneError(
+                "authorityd narrow audit reservation disappeared before abort"
+            )
+        transaction.state = _NARROW_ABORTING
+        transaction.abort_event = event
+        transaction.abort_evidence_owner = evidence_owner
+        if transaction.grant_id is not None and transaction.descendant_key is not None:
+            self._release_grant_descendant_reservation_locked(
+                transaction.grant_id,
+                transaction.descendant_key,
+            )
+        transaction.state = _NARROW_ABORTED
+        return event
+
+    def _remove_narrow_receipts_locked(
+        self,
+        transaction: _NarrowTransaction,
+        *,
+        terminal_state: str = _RECEIPT_REVOKED_BY_GRANT,
+    ) -> None:
+        """Remove any still-launchable parent/child records after an abort."""
+        receipts = [transaction.parent_receipt]
+        if transaction.child_receipt is not None:
+            receipts.append(transaction.child_receipt)
+        for receipt in receipts:
+            current = self._states.get(receipt.nonce)
+            if current is None or not _same_receipt(current.receipt, receipt):
+                continue
+            self._pending.pop(receipt.nonce, None)
+            self._states.pop(receipt.nonce, None)
+            self._remember_terminal_locked(receipt.nonce, terminal_state)
+
+    def _active_narrow_abort_plans_locked(
+        self,
+        grant_id: str,
+        *,
+        reason: str,
+    ) -> list[tuple[_NarrowTransaction, dict[str, Any]]]:
+        """Plan abort evidence without mutating transactions or quotas."""
+        plans: list[tuple[_NarrowTransaction, dict[str, Any]]] = []
+        for transaction in tuple(self._narrow_transactions.values()):
+            if transaction.grant_id != grant_id:
+                continue
+            if transaction.state in {
+                _NARROW_ABORTING,
+                _NARROW_ABORTED,
+                _NARROW_COMMITTING,
+                _NARROW_COMMITTED,
+            }:
+                continue
+            plans.append(
+                (
+                    transaction,
+                    self._narrow_abort_event_locked(transaction, reason=reason),
+                )
+            )
+        return plans
+
     def _forget_grant_descendants_locked(self, grant_id: str) -> None:
         """Drop descendant authority together with a terminal grant."""
         self._grant_descendants.pop(grant_id, None)
@@ -254,7 +391,11 @@ class AuthorityDaemon:
         authorization_epoch: int | None = None,
         workspace_generation: int | None = None,
         grant_event_kind: str = "authority.grant.revoked",
-    ) -> tuple[list[dict[str, Any]], list[str]]:
+    ) -> tuple[
+        list[dict[str, Any]],
+        list[str],
+        list[tuple[_NarrowTransaction, dict[str, Any]]],
+    ]:
         """Build grant and PREPARED-descendant terminal evidence."""
         events: list[dict[str, Any]] = [
             self._audit_event(
@@ -262,6 +403,7 @@ class AuthorityDaemon:
                     "kind": grant_event_kind,
                     "grant_id": grant_id,
                     "context_digest": record.context_digest,
+                    "operation_family": record.operation_family,
                     "reason": reason,
                     **(
                         {"authorization_epoch": authorization_epoch}
@@ -276,6 +418,11 @@ class AuthorityDaemon:
             )
         ]
         revoked_nonces: list[str] = []
+        narrow_abort_plans = self._active_narrow_abort_plans_locked(
+            grant_id,
+            reason=reason,
+        )
+        events.extend(event for _transaction, event in narrow_abort_plans)
         # PREPARING is included to close the window between receipt insertion
         # and the prepare audit append.  NARROWING is also non-claimable; it
         # must not roll back into a live PREPARED parent after revocation.
@@ -302,7 +449,7 @@ class AuthorityDaemon:
                     }
                 )
             )
-        return events, revoked_nonces
+        return events, revoked_nonces, narrow_abort_plans
 
     def _commit_grant_revocation_locked(
         self,
@@ -332,7 +479,14 @@ class AuthorityDaemon:
         ],
     ) -> list[dict[str, Any]]:
         """Commit several grant invalidations under one daemon lock."""
-        plans: list[tuple[str, list[dict[str, Any]], list[str]]] = []
+        plans: list[
+            tuple[
+                str,
+                list[dict[str, Any]],
+                list[str],
+                list[tuple[_NarrowTransaction, dict[str, Any]]],
+            ]
+        ] = []
         events: list[dict[str, Any]] = []
         for (
             grant_id,
@@ -341,14 +495,14 @@ class AuthorityDaemon:
             authorization_epoch,
             workspace_generation,
         ) in revocations:
-            grant_events, revoked_nonces = self._grant_revocation_events_locked(
+            grant_events, revoked_nonces, narrow_abort_plans = self._grant_revocation_events_locked(
                 grant_id,
                 record,
                 reason=reason,
                 authorization_epoch=authorization_epoch,
                 workspace_generation=workspace_generation,
             )
-            plans.append((grant_id, grant_events, revoked_nonces))
+            plans.append((grant_id, grant_events, revoked_nonces, narrow_abort_plans))
             events.extend(grant_events)
         new_event_ids = {
             str(event["event_id"])
@@ -368,7 +522,18 @@ class AuthorityDaemon:
             )
         for event in events:
             self._reserve_audit_event_locked(event)
-        for grant_id, _grant_events, revoked_nonces in plans:
+        for (
+            grant_id,
+            _grant_events,
+            revoked_nonces,
+            narrow_abort_plans,
+        ) in plans:
+            for transaction, _event in narrow_abort_plans:
+                self._commit_narrow_abort_locked(
+                    transaction,
+                    reason="grant-revoked",
+                    evidence_owner="grant-revocation",
+                )
             self._grants.pop(grant_id, None)
             self._forget_grant_descendants_locked(grant_id)
             self._remember_grant_terminal_locked(grant_id, "revoked")
@@ -403,7 +568,11 @@ class AuthorityDaemon:
             for grant_id, record in tuple(self._grants.items()):
                 if now < record.expires_at:
                     continue
-                grant_events, revoked_nonces = self._grant_revocation_events_locked(
+                (
+                    grant_events,
+                    revoked_nonces,
+                    narrow_abort_plans,
+                ) = self._grant_revocation_events_locked(
                     grant_id,
                     record,
                     reason="expired",
@@ -425,6 +594,12 @@ class AuthorityDaemon:
                     break
                 for event in grant_events:
                     self._reserve_audit_event_locked(event)
+                for transaction, _event in narrow_abort_plans:
+                    self._commit_narrow_abort_locked(
+                        transaction,
+                        reason="grant-expired",
+                        evidence_owner="grant-revocation",
+                    )
                 self._grants.pop(grant_id, None)
                 self._forget_grant_descendants_locked(grant_id)
                 self._remember_grant_terminal_locked(grant_id, "expired")
@@ -495,11 +670,15 @@ class AuthorityDaemon:
         self._audit_reservations.add(key)
         return key
 
+    def _release_audit_reservation_locked(self, key: str) -> None:
+        """Release a reservation while the authority state lock is held."""
+        self._audit_reservations.discard(key)
+        if not self._audit_obligations and not self._audit_reservations:
+            self._audit_quarantined = False
+
     def _release_audit_reservation(self, key: str) -> None:
         with self._lock:
-            self._audit_reservations.discard(key)
-            if not self._audit_obligations and not self._audit_reservations:
-                self._audit_quarantined = False
+            self._release_audit_reservation_locked(key)
 
     def _queue_audit_obligation(
         self, event: dict[str, Any], *, key: str | None = None
@@ -820,22 +999,32 @@ class AuthorityDaemon:
                 return
             raise AuthorityControlPlaneError("authority grant is unknown or revoked")
         if time.time() >= record.expires_at:
-            event = self._audit_event(
-                {
-                    "kind": "authority.grant.expired",
-                    "grant_id": intent.grant_id,
-                    "context_digest": record.context_digest,
-                    "operation_family": record.operation_family,
-                    "issuer_id": self.issuer_id,
-                }
+            (
+                events,
+                revoked_nonces,
+                narrow_abort_plans,
+            ) = self._grant_revocation_events_locked(
+                intent.grant_id,
+                record,
+                reason="expired",
+                grant_event_kind="authority.grant.expired",
             )
-            self._reserve_audit_event_locked(event)
+            for event in events:
+                self._reserve_audit_event_locked(event)
+            for transaction, _event in narrow_abort_plans:
+                self._commit_narrow_abort_locked(
+                    transaction,
+                    reason="grant-expired",
+                    evidence_owner="grant-revocation",
+                )
             self._grants.pop(intent.grant_id, None)
             self._forget_grant_descendants_locked(intent.grant_id)
-            self._grant_terminal[intent.grant_id] = "expired"
-            while len(self._grant_terminal) > self.terminal_tombstone_limit:
-                self._grant_terminal.pop(next(iter(self._grant_terminal)))
-            raise _ExpiredGrant(event)
+            self._remember_grant_terminal_locked(intent.grant_id, "expired")
+            for nonce in revoked_nonces:
+                self._pending.pop(nonce, None)
+                self._states.pop(nonce, None)
+                self._remember_terminal_locked(nonce, "expired-grant")
+            raise _ExpiredGrant(events[0], events=events)
         if intent.grant_context_digest != record.context_digest:
             raise AuthorityControlPlaneError("authority grant context does not match")
         family, separator, action = intent.operation.partition(".")
@@ -1080,12 +1269,16 @@ class AuthorityDaemon:
                     receipt, state=_RECEIPT_PREPARING
                 )
         except _ExpiredGrant as exc:
-            try:
-                self._append_or_queue_audit(exc.event)
-            except BaseException as audit_error:
+            first_error: BaseException | None = None
+            for event in exc.events:
+                try:
+                    self._append_or_queue_audit(event)
+                except BaseException as audit_error:  # noqa: BLE001 - preserve cancellation ownership
+                    first_error = first_error or audit_error
+            if first_error is not None:
                 raise AuthorityControlPlaneError(
                     "authority grant has expired and its terminal evidence is queued"
-                ) from audit_error
+                ) from first_error
             raise
         try:
             self._append_or_queue_audit(audit_intent)
@@ -1381,8 +1574,18 @@ class AuthorityDaemon:
                         operation,
                     )
                 except BaseException:
-                    self._audit_reservations.discard(narrow_token)
+                    self._release_audit_reservation_locked(narrow_token)
                     raise
+            narrow_transaction = _NarrowTransaction(
+                transaction_id=narrow_token,
+                parent_receipt=receipt,
+                child_intent_nonce=intent.nonce,
+                grant_id=receipt.grant_id,
+                descendant_key=descendant_key,
+                audit_token=narrow_token,
+                state=_NARROW_CHILD_PREPARING,
+            )
+            self._narrow_transactions[narrow_token] = narrow_transaction
             record.state = _RECEIPT_NARROWING
         try:
             child = self.prepare(
@@ -1391,20 +1594,49 @@ class AuthorityDaemon:
                 _requested_resource_scope=resource_digest,
             )
         except BaseException:
-            self._release_audit_reservation(narrow_token)
             with self._lock:
-                if descendant_key is not None and receipt.grant_id is not None:
-                    self._release_grant_descendant_reservation_locked(
-                        receipt.grant_id, descendant_key
-                    )
-                record = self._states.get(receipt.nonce)
-                if record is not None and _same_receipt(record.receipt, receipt):
-                    if record.state != _RECEIPT_NARROWING:
-                        raise AuthorityControlPlaneError(
-                            "receipt narrowing rollback state changed"
+                transaction = self._narrow_transactions.pop(narrow_token, None)
+                if transaction is not None and transaction.state in {
+                    _NARROW_ABORTING,
+                    _NARROW_ABORTED,
+                }:
+                    # Grant invalidation already transferred the token to
+                    # execution.narrow-aborted-by-grant and terminalized any
+                    # child that had become visible.  Never release that
+                    # stable event reservation a second time.
+                    pass
+                else:
+                    self._release_audit_reservation_locked(narrow_token)
+                    if descendant_key is not None and receipt.grant_id is not None:
+                        self._release_grant_descendant_reservation_locked(
+                            receipt.grant_id, descendant_key
                         )
-                    record.state = _RECEIPT_PREPARED
+                    record = self._states.get(receipt.nonce)
+                    if record is not None and _same_receipt(record.receipt, receipt):
+                        if record.state != _RECEIPT_NARROWING:
+                            raise AuthorityControlPlaneError(
+                                "receipt narrowing rollback state changed"
+                            )
+                        record.state = _RECEIPT_PREPARED
             raise
+
+        with self._lock:
+            transaction = self._narrow_transactions.get(narrow_token)
+            if transaction is None:
+                raise AuthorityControlPlaneError(
+                    "authorityd narrow transaction disappeared after child prepare"
+                )
+            if transaction.state in {_NARROW_ABORTING, _NARROW_ABORTED}:
+                self._narrow_transactions.pop(narrow_token, None)
+                raise AuthorityControlPlaneError(
+                    "narrowing was aborted by grant invalidation"
+                )
+            if transaction.state != _NARROW_CHILD_PREPARING:
+                raise AuthorityControlPlaneError(
+                    "authorityd narrow transaction changed during child prepare"
+                )
+            transaction.child_receipt = child
+            transaction.state = _NARROW_CHILD_PREPARED
 
         # Narrowing is one-shot. Once the child is prepared, the parent is
         # terminal and no longer consumes a pending quota slot.
@@ -1422,24 +1654,87 @@ class AuthorityDaemon:
                 "issuer_id": self.issuer_id,
             }
         )
+        aborted_event: dict[str, Any] | None = None
+        aborted_event_owner: str | None = None
+        terminal_error: AuthorityControlPlaneError | None = None
         with self._lock:
-            if descendant_key is not None and receipt.grant_id is not None:
-                self._commit_grant_descendant_locked(
-                    receipt.grant_id, descendant_key
+            transaction = self._narrow_transactions.get(narrow_token)
+            if transaction is None:
+                terminal_error = AuthorityControlPlaneError(
+                    "authorityd narrow transaction disappeared before terminalization"
                 )
-            self._bind_audit_reservation_locked(narrow_token, narrowed_event)
-            record = self._states.get(receipt.nonce)
-            if record is None or not _same_receipt(record.receipt, receipt):
-                raise AuthorityControlPlaneError(
-                    "receipt narrowing parent disappeared before terminalization"
+            elif transaction.state in {_NARROW_ABORTING, _NARROW_ABORTED}:
+                aborted_event = transaction.abort_event
+                aborted_event_owner = transaction.abort_evidence_owner
+                self._narrow_transactions.pop(narrow_token, None)
+                terminal_error = AuthorityControlPlaneError(
+                    "narrowing was aborted by grant invalidation"
                 )
-            if record.state != _RECEIPT_NARROWING:
-                raise AuthorityControlPlaneError(
-                    "receipt narrowing parent state changed"
+            elif transaction.state != _NARROW_CHILD_PREPARED:
+                terminal_error = AuthorityControlPlaneError(
+                    "authorityd narrow transaction is not ready to commit"
                 )
-            self._pending.pop(receipt.nonce, None)
-            self._states.pop(receipt.nonce, None)
-            self._remember_terminal_locked(receipt.nonce, "narrowed")
+            else:
+                parent_record = self._states.get(receipt.nonce)
+                grant_live = (
+                    receipt.grant_id is None
+                    or not self.require_live_grants
+                    or receipt.grant_id in self._grants
+                )
+                descendant_reserved = (
+                    receipt.grant_id is None
+                    or descendant_key is None
+                    or descendant_key
+                    in self._grant_descendant_reservations.get(
+                        receipt.grant_id,
+                        set(),
+                    )
+                )
+                parent_live = (
+                    parent_record is not None
+                    and _same_receipt(parent_record.receipt, receipt)
+                    and parent_record.state == _RECEIPT_NARROWING
+                )
+                if not grant_live or not descendant_reserved or not parent_live:
+                    aborted_event = self._commit_narrow_abort_locked(
+                        transaction,
+                        reason="grant-disappeared-before-narrow-commit",
+                        evidence_owner="narrow-commit",
+                    )
+                    aborted_event_owner = transaction.abort_evidence_owner
+                    self._remove_narrow_receipts_locked(transaction)
+                    self._narrow_transactions.pop(narrow_token, None)
+                    terminal_error = AuthorityControlPlaneError(
+                        "narrowing was aborted before terminalization"
+                    )
+                else:
+                    transaction.state = _NARROW_COMMITTING
+                    if descendant_key is not None and receipt.grant_id is not None:
+                        self._commit_grant_descendant_locked(
+                            receipt.grant_id,
+                            descendant_key,
+                        )
+                    self._bind_audit_reservation_locked(
+                        narrow_token,
+                        narrowed_event,
+                    )
+                    self._pending.pop(receipt.nonce, None)
+                    self._states.pop(receipt.nonce, None)
+                    self._remember_terminal_locked(receipt.nonce, "narrowed")
+                    transaction.state = _NARROW_COMMITTED
+                    self._narrow_transactions.pop(narrow_token, None)
+        if (
+            aborted_event is not None
+            and aborted_event_owner == "narrow-commit"
+        ):
+            try:
+                self._append_or_queue_audit(aborted_event)
+            except BaseException:
+                logger.exception(
+                    "authorityd narrow abort evidence is pending"
+                )
+        if terminal_error is not None:
+            raise terminal_error
         try:
             self._append_or_queue_audit(narrowed_event)
         except BaseException:

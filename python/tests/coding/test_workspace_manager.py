@@ -36,6 +36,7 @@ def test_typed_catalog_replaces_repository_path_hash(tmp_path: Path) -> None:
     scope = GitRefScope(
         repository=str(repository.resolve()),
         refs=frozenset({"HEAD"}),
+        ref_namespaces=frozenset({"refs/heads/khaos/task/"}),
         operations=GIT_SCOPE_OPERATIONS,
     )
     order = TypedResourcePartialOrder(

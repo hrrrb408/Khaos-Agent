@@ -20,7 +20,7 @@ import stat
 import subprocess
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from functools import wraps
 from pathlib import Path, PurePosixPath
@@ -32,6 +32,11 @@ from khaos.security.authority_broker import (
     AuthorityBroker,
     AuthorityBrokerError,
     EffectCapability,
+)
+from khaos.security.resource_scope import (
+    GitRefScope,
+    ResourceScopeError,
+    TypedResourcePartialOrder,
 )
 
 FileIdentity = tuple[int, int, int, int]
@@ -60,6 +65,9 @@ _ALLOWED_COMMANDS = frozenset(
 )
 _ALLOWED_WORKTREE_COMMANDS = frozenset({"add", "move", "remove"})
 _DIFF_COMMANDS = frozenset({"diff", "diff-files", "diff-index", "diff-tree"})
+_EXACT_EFFECT_COMMANDS = frozenset(
+    {"apply", "commit-tree", "read-tree", "update-index", "update-ref", "worktree", "write-tree"}
+)
 logger = logging.getLogger(__name__)
 
 
@@ -102,6 +110,339 @@ class GitStreamResult:
     byte_length: int
     sha256: str
     preview: str
+
+
+@dataclass(frozen=True, slots=True)
+class GitEffect:
+    """A fixed Git state transition with its expected old/new values.
+
+    Callers do not pass arbitrary argv for state-changing Git commands.  They
+    construct one of the factories below, and the runner checks the exact
+    tuple again immediately before spawn.  The typed resource catalog binds
+    the effect to the repository, ref/namespace, and approved Git action;
+    the effect itself binds the concrete CAS old/new OIDs and path arguments.
+    """
+
+    kind: str
+    args: tuple[str, ...]
+    repository_id: str
+    ref_name: str | None = None
+    expected_old_oid: str | None = None
+    new_oid: str | None = None
+    stdin_sha256: str | None = None
+    required_operation: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.kind not in _EXACT_EFFECT_COMMANDS:
+            raise ValueError("unsupported Git effect kind")
+        if not self.args or any(
+            not isinstance(value, str) or not value or "\x00" in value
+            for value in self.args
+        ):
+            raise ValueError("Git effect argv is invalid")
+        repository = Path(self.repository_id)
+        if not repository.is_absolute() or repository != repository.resolve():
+            raise ValueError("Git effect repository_id must be canonical and absolute")
+        if self.ref_name is not None and (
+            not self.ref_name.startswith("refs/")
+            or any(character in self.ref_name for character in "*?[]\x00")
+        ):
+            raise ValueError("Git effect ref_name is invalid")
+        if self.required_operation is not None and (
+            not self.required_operation or "." in self.required_operation
+        ):
+            raise ValueError("Git effect operation must be an action name")
+        if self.stdin_sha256 is not None and (
+            len(self.stdin_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in self.stdin_sha256)
+        ):
+            raise ValueError("Git effect stdin digest is invalid")
+
+    def with_prefix(self, prefix: tuple[str, ...]) -> GitEffect:
+        """Bind the fixed repository/worktree options without changing the effect."""
+        if self.args[: len(prefix)] == prefix:
+            return self
+        return replace(self, args=(*prefix, *self.args))
+
+    @classmethod
+    def update_ref(
+        cls,
+        *,
+        repository_id: str,
+        ref_name: str,
+        new_oid: str | None,
+        expected_old_oid: str,
+        delete: bool = False,
+        prefix: tuple[str, ...] = (),
+        required_operation: str = "workspace",
+    ) -> GitEffect:
+        """Create an exact CAS update-ref or delete-ref effect."""
+        _validate_git_effect_ref(ref_name)
+        _validate_git_effect_oid(expected_old_oid, allow_zero=True)
+        if delete:
+            if new_oid is not None:
+                raise ValueError("delete Git effect cannot carry a new OID")
+            args = (*prefix, "update-ref", "-d", ref_name, expected_old_oid)
+        else:
+            if new_oid is None:
+                raise ValueError("update Git effect requires a new OID")
+            _validate_git_effect_oid(new_oid)
+            args = (*prefix, "update-ref", ref_name, new_oid, expected_old_oid)
+        return cls(
+            kind="update-ref",
+            args=tuple(args),
+            repository_id=repository_id,
+            ref_name=ref_name,
+            expected_old_oid=expected_old_oid,
+            new_oid=new_oid,
+            required_operation=required_operation,
+        )
+
+    @classmethod
+    def worktree_add(
+        cls,
+        *,
+        repository_id: str,
+        branch: str,
+        path: str,
+        base_oid: str,
+        prefix: tuple[str, ...] = (),
+        required_operation: str = "workspace",
+    ) -> GitEffect:
+        """Create the exact no-checkout task worktree effect."""
+        if not branch or branch.startswith("/") or ".." in branch:
+            raise ValueError("Git worktree branch is invalid")
+        _validate_git_effect_oid(base_oid)
+        _validate_git_effect_path(path)
+        return cls(
+            kind="worktree",
+            args=(*prefix, "worktree", "add", "--no-checkout", "-b", branch, path, base_oid),
+            repository_id=repository_id,
+            ref_name=f"refs/heads/{branch}",
+            expected_old_oid="0" * len(base_oid),
+            new_oid=base_oid,
+            required_operation=required_operation,
+        )
+
+    @classmethod
+    def worktree_move(
+        cls,
+        *,
+        repository_id: str,
+        source: str,
+        destination: str,
+        prefix: tuple[str, ...] = (),
+        required_operation: str = "workspace",
+    ) -> GitEffect:
+        _validate_git_effect_path(source)
+        _validate_git_effect_path(destination)
+        return cls(
+            kind="worktree",
+            args=(*prefix, "worktree", "move", source, destination),
+            repository_id=repository_id,
+            required_operation=required_operation,
+        )
+
+    @classmethod
+    def worktree_remove(
+        cls,
+        *,
+        repository_id: str,
+        path: str,
+        force: bool = False,
+        prefix: tuple[str, ...] = (),
+        required_operation: str = "cleanup",
+    ) -> GitEffect:
+        _validate_git_effect_path(path)
+        force_args = ("--force",) if force else ()
+        return cls(
+            kind="worktree",
+            args=(*prefix, "worktree", "remove", *force_args, path),
+            repository_id=repository_id,
+            required_operation=required_operation,
+        )
+
+    @classmethod
+    def read_tree(
+        cls,
+        *,
+        repository_id: str,
+        treeish: str,
+        prefix: tuple[str, ...] = (),
+        required_operation: str = "index",
+    ) -> GitEffect:
+        _validate_git_effect_oid(treeish)
+        return cls(
+            kind="read-tree",
+            args=(*prefix, "read-tree", treeish),
+            repository_id=repository_id,
+            required_operation=required_operation,
+        )
+
+    @classmethod
+    def update_index_remove(
+        cls,
+        *,
+        repository_id: str,
+        path: str,
+        prefix: tuple[str, ...] = (),
+        required_operation: str = "index",
+    ) -> GitEffect:
+        _validate_git_effect_relative_path(path)
+        return cls(
+            kind="update-index",
+            args=(*prefix, "update-index", "--remove", "--", path),
+            repository_id=repository_id,
+            required_operation=required_operation,
+        )
+
+    @classmethod
+    def update_index_cacheinfo(
+        cls,
+        *,
+        repository_id: str,
+        mode: str,
+        object_id: str,
+        path: str,
+        prefix: tuple[str, ...] = (),
+        required_operation: str = "index",
+    ) -> GitEffect:
+        if mode not in {"100644", "100755", "120000", "160000"}:
+            raise ValueError("Git index mode is invalid")
+        _validate_git_effect_oid(object_id)
+        _validate_git_effect_relative_path(path)
+        return cls(
+            kind="update-index",
+            args=(*prefix, "update-index", "--add", "--cacheinfo", f"{mode},{object_id},{path}"),
+            repository_id=repository_id,
+            required_operation=required_operation,
+        )
+
+    @classmethod
+    def write_tree(
+        cls,
+        *,
+        repository_id: str,
+        prefix: tuple[str, ...] = (),
+        required_operation: str = "workspace",
+    ) -> GitEffect:
+        return cls(
+            kind="write-tree",
+            args=(*prefix, "write-tree"),
+            repository_id=repository_id,
+            required_operation=required_operation,
+        )
+
+    @classmethod
+    def commit_tree(
+        cls,
+        *,
+        repository_id: str,
+        tree_oid: str,
+        parent_oid: str,
+        stdin_sha256: str,
+        prefix: tuple[str, ...] = (),
+        required_operation: str = "workspace",
+    ) -> GitEffect:
+        _validate_git_effect_oid(tree_oid)
+        _validate_git_effect_oid(parent_oid)
+        return cls(
+            kind="commit-tree",
+            args=(*prefix, "commit-tree", tree_oid, "-p", parent_oid),
+            repository_id=repository_id,
+            stdin_sha256=stdin_sha256,
+            required_operation=required_operation,
+        )
+
+    @classmethod
+    def apply_index(
+        cls,
+        *,
+        repository_id: str,
+        stdin_sha256: str,
+        prefix: tuple[str, ...] = (),
+        extra_args: tuple[str, ...] = (),
+        required_operation: str = "apply",
+    ) -> GitEffect:
+        args = (*prefix, "apply", "--index", *extra_args)
+        return cls(
+            kind="apply",
+            args=tuple(args),
+            repository_id=repository_id,
+            stdin_sha256=stdin_sha256,
+            required_operation=required_operation,
+        )
+
+    @classmethod
+    def apply_index_file(
+        cls,
+        *,
+        repository_id: str,
+        patch_path: str,
+        prefix: tuple[str, ...] = (),
+        required_operation: str = "apply",
+    ) -> GitEffect:
+        """Create an exact ``apply --index`` effect for one patch path."""
+        _validate_git_effect_path(patch_path)
+        return cls(
+            kind="apply",
+            args=(*prefix, "apply", "--index", patch_path),
+            repository_id=repository_id,
+            required_operation=required_operation,
+        )
+
+
+def _validate_git_effect_ref(ref_name: str) -> None:
+    if (
+        not ref_name.startswith("refs/")
+        or any(character in ref_name for character in "*?[]\x00")
+        or ref_name.endswith("/")
+        or ".." in ref_name
+    ):
+        raise ValueError("Git effect ref is invalid")
+
+
+def _validate_git_effect_oid(value: str, *, allow_zero: bool = False) -> None:
+    if len(value) not in {40, 64} or any(
+        character not in "0123456789abcdef" for character in value
+    ):
+        raise ValueError("Git effect object id is invalid")
+    if not allow_zero and set(value) == {"0"}:
+        raise ValueError("Git effect new object id cannot be all zero")
+
+
+def _validate_git_effect_path(value: str) -> None:
+    path = Path(value)
+    if not path.is_absolute() or path != path.resolve():
+        raise ValueError("Git effect path must be canonical and absolute")
+
+
+def _validate_git_effect_relative_path(value: str) -> None:
+    if (
+        not value
+        or "\x00" in value
+        or Path(value).is_absolute()
+        or any(part in {"", ".", ".."} for part in value.replace("\\", "/").split("/"))
+    ):
+        raise ValueError("Git effect relative path is invalid")
+
+
+def _git_command_index(args: tuple[str, ...]) -> int | None:
+    return next(
+        (
+            index
+            for index, arg in enumerate(args)
+            if not arg.startswith("-")
+            and not arg.startswith("--git-dir=")
+            and not arg.startswith("--work-tree=")
+        ),
+        None,
+    )
+
+
+def _git_command(args: tuple[str, ...]) -> str | None:
+    index = _git_command_index(args)
+    return args[index] if index is not None else None
 
 
 class TrustedGitError(RuntimeError):
@@ -639,6 +980,7 @@ class TrustedGitRunner:
     authority_root: Path
     authority_root_identity: FileIdentity
     authority_broker: AuthorityBroker | None = None
+    resource_order: TypedResourcePartialOrder | None = None
     _owners: dict[str, TrustedGitProcessOwner] = field(default_factory=dict, init=False, repr=False)
     _authority_pending_effects: dict[str, EffectCapability] = field(
         default_factory=dict, init=False, repr=False
@@ -652,6 +994,7 @@ class TrustedGitRunner:
         root_identity: FileIdentity,
         *,
         authority_broker: AuthorityBroker | None = None,
+        resource_order: TypedResourcePartialOrder | None = None,
     ) -> TrustedGitRunner:
         executable, identity, digest = resolve_trusted_git()
         return cls(
@@ -661,6 +1004,7 @@ class TrustedGitRunner:
             root,
             root_identity,
             authority_broker or AuthorityBroker.default(),
+            resource_order,
         )
 
     def _new_owner(self, label: str) -> TrustedGitProcessOwner:
@@ -899,6 +1243,187 @@ class TrustedGitRunner:
         except AuthorityBrokerError as exc:
             raise TrustedGitError(f"Git authority grant could not issue an effect: {exc}") from exc
 
+    def _validate_effect_binding(
+        self,
+        repository: Path,
+        args: tuple[str, ...],
+        effect: GitEffect,
+        capability: EffectCapability,
+    ) -> None:
+        """Bind typed scope, repository identity, and exact Git argv."""
+        if args != effect.args:
+            raise TrustedGitError(
+                "Git effect argv changed after its exact authorization was built"
+            )
+        if _git_command(args) != effect.kind:
+            raise TrustedGitError("Git effect command does not match its authority")
+        command_index = _git_command_index(args)
+        if command_index is None:
+            raise TrustedGitError("Git effect command is missing")
+        command_args = args[command_index:]
+        if effect.kind == "update-ref":
+            if effect.ref_name is None or effect.expected_old_oid is None:
+                raise TrustedGitError("Git update-ref effect is incomplete")
+            if effect.new_oid is None:
+                expected = (
+                    "update-ref",
+                    "-d",
+                    effect.ref_name,
+                    effect.expected_old_oid,
+                )
+            else:
+                expected = (
+                    "update-ref",
+                    effect.ref_name,
+                    effect.new_oid,
+                    effect.expected_old_oid,
+                )
+            if command_args != expected:
+                raise TrustedGitError(
+                    "Git update-ref effect does not bind its expected old/new OIDs"
+                )
+        elif effect.kind == "worktree":
+            if len(command_args) < 3 or command_args[1] not in _ALLOWED_WORKTREE_COMMANDS:
+                raise TrustedGitError("Git worktree effect shape is invalid")
+            if command_args[1] == "add" and "--no-checkout" not in command_args:
+                raise TrustedGitError("Git worktree effect must disable checkout")
+        elif effect.kind == "update-index":
+            if command_args[1:3] == ("--remove", "--"):
+                if len(command_args) != 4:
+                    raise TrustedGitError("Git update-index remove effect shape is invalid")
+            elif command_args[1:3] == ("--add", "--cacheinfo"):
+                if len(command_args) != 4:
+                    raise TrustedGitError(
+                        "Git update-index cacheinfo effect shape is invalid"
+                    )
+            else:
+                raise TrustedGitError("Git update-index effect is not exact")
+        elif effect.kind == "read-tree":
+            if len(command_args) != 2:
+                raise TrustedGitError("Git read-tree effect shape is invalid")
+        elif effect.kind == "apply":
+            if effect.stdin_sha256 is None:
+                if len(command_args) != 3 or command_args[1] != "--index":
+                    raise TrustedGitError("Git apply effect shape is invalid")
+                try:
+                    _validate_git_effect_path(command_args[2])
+                except ValueError as exc:
+                    raise TrustedGitError("Git apply patch path is invalid") from exc
+            elif "--index" not in command_args:
+                raise TrustedGitError("Git apply effect must bind --index")
+        elif effect.kind == "write-tree":
+            if len(command_args) != 1:
+                raise TrustedGitError("Git write-tree effect shape is invalid")
+        elif effect.kind == "commit-tree":
+            if len(command_args) != 4 or command_args[2] != "-p":
+                raise TrustedGitError("Git commit-tree effect shape is invalid")
+            if effect.stdin_sha256 is None:
+                raise TrustedGitError("Git commit-tree effect must bind stdin")
+
+        canonical_repository = Path(effect.repository_id)
+        current_repository = repository.expanduser().resolve()
+        git_dir_value = next(
+            (arg[len("--git-dir="):] for arg in args if arg.startswith("--git-dir=")),
+            None,
+        )
+        if git_dir_value is None:
+            if current_repository != canonical_repository:
+                raise TrustedGitError(
+                    "Git effect repository does not match the process working directory"
+                )
+        else:
+            git_dir = Path(git_dir_value).expanduser()
+            if not git_dir.is_absolute() or git_dir.resolve() != git_dir:
+                raise TrustedGitError("Git effect git-dir is not canonical")
+            repository_git = canonical_repository / ".git"
+            try:
+                git_dir.relative_to(repository_git)
+            except ValueError as exc:
+                raise TrustedGitError(
+                    "Git effect git-dir is outside the authorized repository"
+                ) from exc
+            work_tree_value = next(
+                (
+                    arg[len("--work-tree=") :]
+                    for arg in args
+                    if arg.startswith("--work-tree=")
+                ),
+                None,
+            )
+            if work_tree_value is not None and (
+                not Path(work_tree_value).is_absolute()
+                or Path(work_tree_value).resolve() != current_repository
+            ):
+                raise TrustedGitError("Git effect work-tree does not match its cwd")
+
+        capability_action = capability.authority.operation_class.rsplit(".", 1)[-1]
+        if effect.required_operation is not None and capability_action != effect.required_operation:
+            raise TrustedGitError(
+                "Git effect operation does not match its exact authority class"
+            )
+        resource_order = self.resource_order
+        if resource_order is None:
+            return
+        try:
+            scope = resource_order.resolve(capability.resource_digest)
+        except ResourceScopeError as exc:
+            raise TrustedGitError(
+                "Git effect capability is not a typed catalog scope"
+            ) from exc
+        if not isinstance(scope, GitRefScope):
+            raise TrustedGitError("Git effect capability is not a Git scope")
+        if scope.repository != effect.repository_id:
+            raise TrustedGitError("Git effect repository is outside its typed scope")
+        action = effect.required_operation or effect.kind
+        if action not in scope.operations:
+            raise TrustedGitError("Git effect action is outside its typed scope")
+        if effect.ref_name is not None and not scope.allows_ref(effect.ref_name):
+            raise TrustedGitError("Git effect ref is outside its typed scope")
+
+    async def run_effect(
+        self,
+        repository: Path,
+        effect: GitEffect,
+        *,
+        authority: AuthorityInput,
+        preserve_output: bool = False,
+        index_file: Path | None = None,
+    ) -> str:
+        """Execute one exact state-changing effect through the normal receipt gate."""
+        return await self.run(
+            repository,
+            *effect.args,
+            authority=authority,
+            preserve_output=preserve_output,
+            index_file=index_file,
+            effect=effect,
+        )
+
+    async def run_effect_with_input(
+        self,
+        repository: Path,
+        effect: GitEffect,
+        *,
+        input_bytes: bytes,
+        authority: AuthorityInput,
+        max_input_bytes: int = 64 * 1024,
+        max_output_bytes: int = 64 * 1024,
+        index_file: Path | None = None,
+    ) -> str:
+        """Execute an exact stdin-bound effect with a digest-bound payload."""
+        if effect.stdin_sha256 is None or hashlib.sha256(input_bytes).hexdigest() != effect.stdin_sha256:
+            raise TrustedGitError("Git effect stdin does not match its authorization")
+        return await self.run_with_input(
+            repository,
+            *effect.args,
+            input_bytes=input_bytes,
+            authority=authority,
+            max_input_bytes=max_input_bytes,
+            max_output_bytes=max_output_bytes,
+            index_file=index_file,
+            effect=effect,
+        )
+
     @_authorize_async
     async def run(
         self,
@@ -907,13 +1432,23 @@ class TrustedGitRunner:
         authority: EffectCapability,
         preserve_output: bool = False,
         index_file: Path | None = None,
+        effect: GitEffect | None = None,
     ) -> str:
         """Run one text-producing Git command with fail-closed authority."""
         if args and args[0] == "status":
             dirty = await self.is_dirty(repository, authority=authority)
             return "dirty" if dirty else ""
         self._verify()
-        self._authority_or_fail(authority)
+        capability = self._authority_or_fail(authority)
+        command = _git_command(tuple(args))
+        if command in _EXACT_EFFECT_COMMANDS:
+            if effect is None:
+                raise TrustedGitError(
+                    "state-changing Git commands require a structured exact effect"
+                )
+            self._validate_effect_binding(repository, tuple(args), effect, capability)
+        elif effect is not None:
+            raise TrustedGitError("a Git effect cannot authorize a read-only command")
         owner = self._new_owner("git.run")
         try:
             stdout, stderr = await owner.communicate_after_spawn(
@@ -945,6 +1480,10 @@ class TrustedGitRunner:
         """Run one binary-producing Git command with the same authority gate."""
         self._verify()
         self._authority_or_fail(authority)
+        if _git_command(tuple(args)) in _EXACT_EFFECT_COMMANDS:
+            raise TrustedGitError(
+                "state-changing Git commands require a structured exact effect"
+            )
         owner = self._new_owner("git.run-bytes")
         try:
             stdout, stderr = await owner.communicate_after_spawn(
@@ -974,12 +1513,24 @@ class TrustedGitRunner:
         max_input_bytes: int = 64 * 1024,
         max_output_bytes: int = 64 * 1024,
         index_file: Path | None = None,
+        effect: GitEffect | None = None,
     ) -> str:
         """Run a plumbing command with bounded, caller-owned stdin only."""
         if len(input_bytes) > max_input_bytes:
             raise TrustedGitError("trusted Git input exceeds the configured bound")
         self._verify()
-        self._authority_or_fail(authority)
+        capability = self._authority_or_fail(authority)
+        command = _git_command(tuple(args))
+        if command in _EXACT_EFFECT_COMMANDS:
+            if effect is None:
+                raise TrustedGitError(
+                    "state-changing Git commands require a structured exact effect"
+                )
+            self._validate_effect_binding(repository, tuple(args), effect, capability)
+            if effect.stdin_sha256 is None or hashlib.sha256(input_bytes).hexdigest() != effect.stdin_sha256:
+                raise TrustedGitError("Git effect stdin does not match its authorization")
+        elif effect is not None:
+            raise TrustedGitError("a Git effect cannot authorize a read-only command")
         owner = self._new_owner("git.run-with-input")
         try:
             stdout, stderr = await owner.communicate_after_spawn(
@@ -1225,6 +1776,10 @@ class TrustedGitRunner:
             raise ValueError("max_bytes must be positive")
         self._verify()
         self._authority_or_fail(authority)
+        if _git_command(tuple(args)) in _EXACT_EFFECT_COMMANDS:
+            raise TrustedGitError(
+                "state-changing Git commands require a structured exact effect"
+            )
         process: asyncio.subprocess.Process | None = None
         owner = self._new_owner("git.run-bytes-limited")
         stderr_task: asyncio.Task[bytes] | None = None
@@ -1527,6 +2082,10 @@ class TrustedGitRunner:
             return "dirty" if self.is_dirty_sync(repository, authority=authority) else ""
         self._verify()
         self._authority_or_fail(authority)
+        if _git_command(tuple(args)) in _EXACT_EFFECT_COMMANDS:
+            raise TrustedGitError(
+                "state-changing Git commands require a structured exact effect"
+            )
         try:
             import subprocess
 
@@ -1604,6 +2163,10 @@ class TrustedGitRunner:
         """Synchronous binary variant used by recovery dirty checks."""
         self._verify()
         self._authority_or_fail(authority)
+        if _git_command(tuple(args)) in _EXACT_EFFECT_COMMANDS:
+            raise TrustedGitError(
+                "state-changing Git commands require a structured exact effect"
+            )
         try:
             import subprocess
 
@@ -1830,6 +2393,7 @@ def _safe_symlink_target(parts: tuple[str, ...], raw_target: bytes) -> str:
 
 __all__ = [
     "FileIdentity",
+    "GitEffect",
     "GitStreamResult",
     "TrustedGitError",
     "TrustedGitRunner",
