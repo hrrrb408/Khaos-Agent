@@ -87,6 +87,15 @@ the independent authorityd process. The Agent rejects a manifest whose
 `catalog_digest` differs from the locally compiled snapshot. Workspace/Git and
 NetworkBroker production owners resolve their canonical scope through this
 catalog; native execution still keeps its separate exact launch-binding digest.
+For deployments that want the typed catalog to bind Git path effects as well
+as refs, `KHAOS_WORKTREE_AUTHORITY_ROOT` must be set to the same absolute
+private root before both the effective-policy compiler and
+`WorkspaceManager` start. The compiler then emits that root in `GitRefScope`
+and the runner requires the exact matching root. If the variable is absent,
+the catalog deliberately makes no pathname claim; `TrustedGitRunner` still
+enforces its own private authority root as the final local TCB, so this
+compatibility mode must not be reported as independently reviewed
+cross-process path-binding evidence.
 Credential use now has a trusted `CredentialBroker` owner: a registered
 provider loader issues a short-lived lease bound to the typed scope, target,
 operation, policy digest, and principal, while secret material is materialized

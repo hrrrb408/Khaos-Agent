@@ -228,6 +228,26 @@ async def test_generic_rejects_missing_secret_stale_digest_and_signature():
 
 
 @pytest.mark.asyncio
+async def test_malformed_unicode_signature_returns_controlled_error():
+    body = b'{"id":"1","text":"run"}'
+    handler = WebhookHandler(
+        ChannelType.WEBHOOK_IN,
+        "0123456789abcdef0123456789abcdef",
+        now=lambda: 1_700_000_000,
+    )
+    result = await handler.handle(
+        {
+            "x-khaos-timestamp": "1700000000",
+            "x-khaos-message-id": "message-id-00001",
+            "x-khaos-content-sha256": "0" * 64,
+            "x-khaos-signature": "\ud800",
+        },
+        body,
+    )
+    assert result["status"] == "signature_error"
+
+
+@pytest.mark.asyncio
 async def test_generic_signature_is_bound_to_khaos_channel_id():
     now = 1_700_000_000
     secret = "0123456789abcdef0123456789abcdef"

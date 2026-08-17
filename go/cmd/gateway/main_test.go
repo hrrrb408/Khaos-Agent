@@ -32,6 +32,22 @@ func TestValidateTLSConfig(t *testing.T) {
 	}
 }
 
+func TestParseBrowserSessionConfig(t *testing.T) {
+	config, err := parseBrowserSessionConfig("127.0.0.1:8080", "auto", []string{"10.0.0.0/8"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(config.SecureMode) != "auto" || len(config.TrustedProxyCIDRs) != 1 {
+		t.Fatalf("unexpected browser session config: %#v", config)
+	}
+	if _, err := parseBrowserSessionConfig("0.0.0.0:8080", "auto", []string{"10.0.0.0/8"}); err == nil {
+		t.Fatal("non-loopback auto cookie policy unexpectedly accepted")
+	}
+	if _, err := parseBrowserSessionConfig("127.0.0.1:8080", "invalid", nil); err == nil {
+		t.Fatal("invalid cookie secure mode unexpectedly accepted")
+	}
+}
+
 func TestIsContainerSecretPath(t *testing.T) {
 	for _, tc := range []struct {
 		name string

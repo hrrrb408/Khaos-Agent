@@ -61,6 +61,7 @@ from khaos.security.resource_scope import (
     GitRefScope,
     ResourceScopeError,
     TypedResourcePartialOrder,
+    configured_git_worktree_authority_root,
 )
 
 logger = logging.getLogger(__name__)
@@ -347,9 +348,23 @@ class WorkspaceManager:
         authorization_epoch: int = 1,
         resource_order: TypedResourcePartialOrder | None = None,
     ) -> None:
-        configured_root = (
-            root or Path(tempfile.gettempdir()) / "khaos" / "worktrees"
-        ).expanduser().absolute()
+        if root is None:
+            try:
+                configured_root = configured_git_worktree_authority_root()
+            except ResourceScopeError as exc:
+                raise WorkspaceError(str(exc)) from exc
+            if configured_root is None:
+                configured_root = Path(tempfile.gettempdir()) / "khaos" / "worktrees"
+        else:
+            configured_root = root
+        configured_root = configured_root.expanduser().absolute()
+        self._typed_git_worktree_bound = bool(
+            resource_order is not None
+            and any(
+                isinstance(scope, GitRefScope) and scope.worktree_root is not None
+                for scope in resource_order.scopes.values()
+            )
+        )
         self.root, self._root_identity = _open_private_authority_root(
             configured_root
         )
@@ -561,6 +576,7 @@ class WorkspaceManager:
             refs=frozenset({"HEAD"}),
             ref_namespaces=frozenset({"refs/heads/khaos/task/"}),
             operations=GIT_SCOPE_OPERATIONS,
+            worktree_root=str(self.root) if self._typed_git_worktree_bound else None,
         )
         try:
             return self.resource_order.require_scope(scope)

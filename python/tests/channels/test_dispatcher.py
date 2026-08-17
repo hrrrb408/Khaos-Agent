@@ -91,6 +91,28 @@ async def test_dispatch_to_log_file(tmp_path: Path) -> None:
     assert "cron done" in log_file.read_text()
 
 
+async def test_log_file_target_rejects_traversal_and_nested_paths(tmp_path: Path) -> None:
+    channel = LogFileChannel(log_dir=str(tmp_path / "logs"))
+    for target in ("../../outside", "nested/name", r"nested\name", "..hidden"):
+        result = await channel.send(
+            Message(content="must-not-write", channel=ChannelType.LOG_FILE, target=target)
+        )
+        assert result.success is False
+    assert not (tmp_path / "outside.log").exists()
+
+
+async def test_log_file_target_rejects_symlink_without_following_it(tmp_path: Path) -> None:
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    outside = tmp_path / "outside.log"
+    (log_dir / "safe.log").symlink_to(outside)
+    result = await LogFileChannel(log_dir=str(log_dir)).send(
+        Message(content="must-not-write", channel=ChannelType.LOG_FILE, target="safe")
+    )
+    assert result.success is False
+    assert not outside.exists()
+
+
 def test_log_file_channel_creates_dir(tmp_path: Path) -> None:
     """The log dir is auto-created on channel init."""
     target = tmp_path / "deep" / "nested" / "logs"

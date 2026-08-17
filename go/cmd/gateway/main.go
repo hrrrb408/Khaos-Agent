@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"khaos/go/internal/api"
+	"khaos/go/internal/auth"
 	"khaos/go/internal/platform"
 	"khaos/go/internal/rate"
 )
@@ -67,6 +68,11 @@ func main() {
 	defaultConfigAdmins := os.Getenv("KHAOS_CONFIG_ADMIN_PRINCIPALS")
 	defaultTLSCert := os.Getenv("KHAOS_TLS_CERT")
 	defaultTLSKey := os.Getenv("KHAOS_TLS_KEY")
+	defaultCookieSecure := os.Getenv("KHAOS_COOKIE_SECURE")
+	if defaultCookieSecure == "" {
+		defaultCookieSecure = string(auth.CookieSecureAlways)
+	}
+	defaultTrustedProxyCIDRs := os.Getenv("KHAOS_TRUSTED_PROXY_CIDRS")
 	defaultPythonAgent := os.Getenv("KHAOS_PYTHON_AGENT")
 	if defaultPythonAgent == "" {
 		defaultPythonAgent = fmt.Sprintf("/tmp/khaos-%d/agent.sock", os.Getuid())
@@ -79,6 +85,8 @@ func main() {
 	configAdmins := flag.String("config-admin-principals", defaultConfigAdmins, "comma-separated principals allowed to read/write /api/config")
 	tlsCert := flag.String("tls-cert", defaultTLSCert, "TLS certificate PEM (required for non-loopback listen)")
 	tlsKey := flag.String("tls-key", defaultTLSKey, "TLS private key PEM (required for non-loopback listen)")
+	cookieSecure := flag.String("cookie-secure", defaultCookieSecure, "browser cookie Secure policy: always, auto, or never")
+	trustedProxyCIDRs := flag.String("trusted-proxy-cidrs", defaultTrustedProxyCIDRs, "comma-separated proxy CIDRs trusted for forwarded HTTPS in cookie-secure=auto")
 	pythonAddr := flag.String("python-agent", defaultPythonAgent, "Python AgentService Unix socket path")
 	projectRoot := flag.String("project-root", os.Getenv("KHAOS_PROJECT_ROOT"), "project root directory (used to compute project_id for drift detection; REQUIRED in production, rejected if empty)")
 	mockAgent := flag.Bool("mock-agent", false, "use in-process mock agent")
@@ -97,6 +105,10 @@ func main() {
 		log.Fatal(err)
 	}
 	if err := validateListenConfig(*addr, resolvedKey); err != nil {
+		log.Fatal(err)
+	}
+	browserSessionConfig, err := parseBrowserSessionConfig(*addr, *cookieSecure, splitCSV(*trustedProxyCIDRs))
+	if err != nil {
 		log.Fatal(err)
 	}
 	if err := validateTLSConfig(*addr, *tlsCert, *tlsKey); err != nil {
@@ -174,6 +186,7 @@ func main() {
 	handler = handler.WithAllowedOrigins(splitCSV(*allowedOrigins)...)
 	handler = handler.WithAllowedHosts(allowedHostnames(*addr, splitCSV(*allowedHosts))...)
 	handler = handler.WithConfigAdminPrincipals(splitCSV(*configAdmins)...)
+	handler = handler.WithBrowserSessionConfig(browserSessionConfig)
 	// When talking to a real Python agent, also forward audit queries. The mock
 	// agent path leaves audit unconfigured (GET /api/audit returns []).
 	// C-2-1: all interfaces receive the SAME pythonClient (which is also
@@ -299,6 +312,34 @@ func validateListenConfig(addr, apiKey string) error {
 		return errors.New("refusing gateway listen with an authentication token shorter than 32 characters")
 	}
 	return nil
+}
+
+func parseBrowserSessionConfig(addr, mode string, cidrValues []string) (auth.BrowserSessionConfig, error) {
+	normalizedMode := auth.CookieSecureMode(strings.ToLower(strings.TrimSpace(mode)))
+	if normalizedMode == "" {
+		normalizedMode = auth.CookieSecureAuto
+	}
+	config := auth.BrowserSessionConfig{SecureMode: normalizedMode}
+	for _, value := range cidrValues {
+		_, network, err := net.ParseCIDR(strings.TrimSpace(value))
+		if err != nil {
+			return auth.BrowserSessionConfig{}, fmt.Errorf("invalid trusted proxy CIDR %q: %w", value, err)
+		}
+		config.TrustedProxyCIDRs = append(config.TrustedProxyCIDRs, network)
+	}
+	if err := config.Validate(); err != nil {
+		return auth.BrowserSessionConfig{}, err
+	}
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return auth.BrowserSessionConfig{}, err
+	}
+	ip := net.ParseIP(host)
+	loopback := strings.EqualFold(host, "localhost") || (ip != nil && ip.IsLoopback())
+	if !loopback && normalizedMode != auth.CookieSecureAlways {
+		return auth.BrowserSessionConfig{}, errors.New("non-loopback gateway listen requires cookie-secure=always")
+	}
+	return config, nil
 }
 
 func validateTLSConfig(addr, certPath, keyPath string) error {

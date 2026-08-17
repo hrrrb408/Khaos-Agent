@@ -51,6 +51,10 @@ class for each invariant remains explicit below.
    create no Git process owner. Credential use is represented by a short-lived
    broker-owned lease whose target, operation, policy, and principal are
    bound; secret material is never part of the lease or audit identity.
+   When `KHAOS_WORKTREE_AUTHORITY_ROOT` is configured, the effective typed
+   `GitRefScope` and `WorkspaceManager` must bind the exact same private root;
+   without it, the runner's private root remains the final local TCB and the
+   catalog is not independent pathname evidence.
 
 ## Orchestration phase evidence
 

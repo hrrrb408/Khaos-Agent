@@ -190,7 +190,11 @@ class WebhookHandler:
         }
         if not self.secret:
             return {"status": "configuration_error", "error": "webhook secret required"}
-        verification = self._verify_signature(normalized, normalized_query, body)
+        try:
+            verification = self._verify_signature(normalized, normalized_query, body)
+        except (TypeError, ValueError, UnicodeError, OverflowError) as exc:
+            logger.warning("webhook signature verification failed for %s: %s", self.platform.value, exc)
+            return {"status": "signature_error"}
         if verification is None:
             return {"status": "signature_error"}
         try:
@@ -255,7 +259,7 @@ class WebhookHandler:
     ) -> _WebhookVerification | None:
         now = self._now()
         if self.platform == ChannelType.TELEGRAM:
-            if not hmac.compare_digest(
+            if not _constant_time_equal(
                 headers.get("x-telegram-bot-api-secret-token", ""), self.secret
             ):
                 return None
@@ -269,7 +273,7 @@ class WebhookHandler:
             try:
                 public_key = Ed25519PublicKey.from_public_bytes(bytes.fromhex(self.secret))
                 public_key.verify(bytes.fromhex(signature), timestamp.encode() + body)
-            except (ValueError, InvalidSignature):
+            except (TypeError, ValueError, UnicodeError, InvalidSignature):
                 return None
             return _WebhookVerification(
                 issued_at, issued_at + WEBHOOK_SIGNATURE_WINDOW_SECONDS
@@ -284,9 +288,7 @@ class WebhookHandler:
             expected = "v0=" + hmac.new(
                 self.secret.encode(), base, hashlib.sha256
             ).hexdigest()
-            if not signature or not hmac.compare_digest(
-                signature.encode(), expected.encode()
-            ):
+            if not signature or not _constant_time_equal(signature, expected):
                 return None
             return _WebhookVerification(
                 issued_at,
@@ -317,7 +319,7 @@ class WebhookHandler:
             expected = hashlib.sha1(
                 "".join(sorted((self.secret, timestamp, nonce, body_str))).encode("utf-8")
             ).hexdigest()
-            if not hmac.compare_digest(signature, expected):
+            if not _constant_time_equal(signature, expected):
                 return None
             return _WebhookVerification(
                 issued_at,
@@ -336,7 +338,7 @@ class WebhookHandler:
             if (
                 issued_at is None
                 or len(message_id) < 16
-                or not hmac.compare_digest(body_digest.encode(), actual_digest.encode())
+                or not _constant_time_equal(body_digest, actual_digest)
             ):
                 return None
             signed = (
@@ -346,7 +348,7 @@ class WebhookHandler:
             expected = "v2=" + hmac.new(
                 self.secret.encode("utf-8"), signed, hashlib.sha256
             ).hexdigest()
-            if not hmac.compare_digest(signature.encode(), expected.encode()):
+            if not _constant_time_equal(signature, expected):
                 return None
             return _WebhookVerification(
                 issued_at,
@@ -377,6 +379,16 @@ class WebhookHandler:
         ):
             return None
         return issued_at
+
+
+def _constant_time_equal(left: str, right: str) -> bool:
+    """Compare textual signatures without type or Unicode edge-case errors."""
+    if type(left) is not str or type(right) is not str:
+        return False
+    try:
+        return hmac.compare_digest(left.encode("utf-8"), right.encode("utf-8"))
+    except UnicodeError:
+        return False
 
 
 def _parse_telegram(raw: dict[str, Any]) -> PlatformMessage:

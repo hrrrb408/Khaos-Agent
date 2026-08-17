@@ -14,6 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const MAX_RECEIPT_BYTES: usize = 64 * 1024;
 const AUTHORITY_TIMESTAMP_SCALE: f64 = 1000.0;
 const MAX_WIRE_TIMESTAMP: u64 = (1_u64 << 53) - 1;
+const MAX_CLOCK_SKEW_SECONDS: f64 = 60.0;
 
 pub fn verify_from_fds_bound(
     receipt_fd: RawFd,
@@ -112,6 +113,9 @@ fn verify_json_bound(
             .map(|value| value.as_secs_f64())
             .unwrap_or(f64::INFINITY)
     });
+    if !current.is_finite() || issued_at > current + MAX_CLOCK_SKEW_SECONDS {
+        return Err(invalid("authorization receipt issued_at is in the future"));
+    }
     if current >= expires_at {
         return Err(invalid("authorization receipt has expired"));
     }
@@ -250,6 +254,40 @@ mod tests {
             None,
         )
         .is_ok());
+    }
+
+    #[test]
+    fn rejects_receipt_issued_too_far_in_the_future() {
+        let signing = SigningKey::from_bytes(&[10_u8; 32]);
+        let mut value = serde_json::json!({
+            "schema_version": 1,
+            "algorithm": "Ed25519",
+            "principal_id": "agent",
+            "project_id": "project",
+            "runtime_id": "runtime",
+            "task_id": "task",
+            "workspace_id": "workspace",
+            "operation": "exec.host",
+            "resource_digest": "resource",
+            "policy_digest": "policy",
+            "nonce": "nonce",
+            "authorization_epoch": 1,
+            "expires_at": 1_200_000,
+            "audit_intent_digest": "audit",
+            "issuer_id": "authorityd",
+            "issued_at": 1_100_000
+        });
+        let signature = signing.sign(canonical_json(&value).as_bytes());
+        value["signature"] =
+            Value::String(base64::engine::general_purpose::STANDARD.encode(signature.to_bytes()));
+        assert!(verify_json_bound(
+            value.to_string().as_bytes(),
+            &signing.verifying_key().to_bytes(),
+            Some(1_000.0),
+            None,
+            None,
+        )
+        .is_err());
     }
 
     #[test]

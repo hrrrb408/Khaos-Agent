@@ -725,7 +725,11 @@ class RuntimeResult:
                     )
             if self.credential_broker is not None and self.owns_credential_broker:
                 try:
-                    self.credential_broker.close()
+                    close = getattr(self.credential_broker, "aclose", None)
+                    if callable(close):
+                        await close()
+                    else:
+                        self.credential_broker.close()
                 except Exception:
                     failed = True
                     logger.debug("credential broker close failed", exc_info=True)

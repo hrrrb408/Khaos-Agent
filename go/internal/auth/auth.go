@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -20,6 +21,53 @@ type principalContextKey struct{}
 
 const browserSessionCookie = "khaos_browser_session"
 const browserSessionTTL = 15 * time.Minute
+
+// CookieSecureMode controls whether browser session cookies carry Secure.
+// Production deployments should use CookieSecureAlways; Auto is only for
+// explicitly trusted reverse-proxy setups and Never is for local HTTP-only
+// development.
+type CookieSecureMode string
+
+const (
+	CookieSecureAlways CookieSecureMode = "always"
+	CookieSecureAuto   CookieSecureMode = "auto"
+	CookieSecureNever  CookieSecureMode = "never"
+)
+
+// BrowserSessionConfig is the explicit cookie transport policy. Forwarded
+// HTTPS headers are considered only when the direct peer is in
+// TrustedProxyCIDRs; an arbitrary client cannot turn Secure on or off by
+// spoofing X-Forwarded-Proto.
+type BrowserSessionConfig struct {
+	SecureMode        CookieSecureMode
+	TrustedProxyCIDRs []*net.IPNet
+}
+
+// DefaultBrowserSessionConfig preserves the local direct-HTTP behavior of the
+// legacy helper while making proxy trust explicit.
+func DefaultBrowserSessionConfig() BrowserSessionConfig {
+	return BrowserSessionConfig{SecureMode: CookieSecureAuto}
+}
+
+// Validate checks the configured browser cookie policy before the server
+// starts accepting traffic.
+func (c BrowserSessionConfig) Validate() error {
+	mode := c.SecureMode
+	if mode == "" {
+		mode = CookieSecureAuto
+	}
+	switch mode {
+	case CookieSecureAlways, CookieSecureAuto, CookieSecureNever:
+	default:
+		return fmt.Errorf("unsupported browser cookie secure mode %q", c.SecureMode)
+	}
+	for _, network := range c.TrustedProxyCIDRs {
+		if network == nil || network.IP == nil {
+			return fmt.Errorf("trusted proxy CIDR is invalid")
+		}
+	}
+	return nil
+}
 
 // Batch 11.8 (round-11 §十五.2): session revocation via a server-side
 // epoch counter.  Each issued cookie embeds the current epoch; validating
@@ -82,8 +130,19 @@ func Middleware(apiKey string, next http.Handler) http.Handler {
 // The route calling this function is itself protected by Middleware, so the
 // master key is used only for bootstrap and is never returned to JavaScript.
 func SetBrowserSession(w http.ResponseWriter, r *http.Request, apiKey string) error {
+	return SetBrowserSessionWithConfig(w, r, apiKey, DefaultBrowserSessionConfig())
+}
+
+// SetBrowserSessionWithConfig issues a browser session using an explicit
+// transport policy. It is separate from SetBrowserSession so existing local
+// callers remain source-compatible while production startup can require
+// Secure cookies unconditionally.
+func SetBrowserSessionWithConfig(w http.ResponseWriter, r *http.Request, apiKey string, config BrowserSessionConfig) error {
 	if apiKey == "" {
 		return fmt.Errorf("gateway authentication unavailable")
+	}
+	if err := config.Validate(); err != nil {
+		return err
 	}
 	nonce := make([]byte, 24)
 	if _, err := rand.Read(nonce); err != nil {
@@ -104,10 +163,66 @@ func SetBrowserSession(w http.ResponseWriter, r *http.Request, apiKey string) er
 		MaxAge:   int(browserSessionTTL.Seconds()),
 		Expires:  expires,
 		HttpOnly: true,
-		Secure:   r.TLS != nil,
+		Secure:   config.secureForRequest(r),
 		SameSite: http.SameSiteStrictMode,
 	})
 	return nil
+}
+
+func (c BrowserSessionConfig) secureForRequest(r *http.Request) bool {
+	mode := c.SecureMode
+	if mode == "" {
+		mode = CookieSecureAuto
+	}
+	switch mode {
+	case CookieSecureAlways:
+		return true
+	case CookieSecureNever:
+		return false
+	case CookieSecureAuto:
+		return r.TLS != nil || c.trustedForwardedHTTPS(r)
+	default:
+		return true
+	}
+}
+
+func (c BrowserSessionConfig) trustedForwardedHTTPS(r *http.Request) bool {
+	remote := remoteIP(r.RemoteAddr)
+	if remote == nil {
+		return false
+	}
+	trusted := false
+	for _, network := range c.TrustedProxyCIDRs {
+		if network != nil && network.Contains(remote) {
+			trusted = true
+			break
+		}
+	}
+	if !trusted {
+		return false
+	}
+	if proto := strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-Proto"), ",")[0]); strings.EqualFold(proto, "https") {
+		return true
+	}
+	for _, element := range strings.Split(r.Header.Get("Forwarded"), ",") {
+		for _, parameter := range strings.Split(element, ";") {
+			key, value, ok := strings.Cut(strings.TrimSpace(parameter), "=")
+			if !ok || !strings.EqualFold(key, "proto") {
+				continue
+			}
+			value = strings.Trim(strings.TrimSpace(value), "\"")
+			return strings.EqualFold(value, "https")
+		}
+	}
+	return false
+}
+
+func remoteIP(remoteAddr string) net.IP {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(remoteAddr))
+	if err != nil {
+		host = strings.Trim(strings.TrimSpace(remoteAddr), "[]")
+	}
+	return net.ParseIP(host)
 }
 
 func validBrowserSession(r *http.Request, apiKey string, now time.Time) bool {

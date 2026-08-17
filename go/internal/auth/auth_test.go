@@ -1,6 +1,8 @@
 package auth
 
 import (
+	"crypto/tls"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -59,6 +61,51 @@ func TestBrowserSessionRejectsTampering(t *testing.T) {
 	handler.ServeHTTP(response, probe)
 	if called || response.Code != http.StatusUnauthorized {
 		t.Fatalf("called=%v status=%d", called, response.Code)
+	}
+}
+
+func TestBrowserSessionSecurePolicyIsExplicit(t *testing.T) {
+	_, trustedProxy, err := net.ParseCIDR("10.0.0.0/8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name       string
+		mode       CookieSecureMode
+		remoteAddr string
+		forwarded  string
+		tls        bool
+		wantSecure bool
+	}{
+		{name: "always on direct http", mode: CookieSecureAlways, remoteAddr: "127.0.0.1:1234", wantSecure: true},
+		{name: "never on tls", mode: CookieSecureNever, remoteAddr: "127.0.0.1:1234", tls: true, wantSecure: false},
+		{name: "auto trusted forwarded https", mode: CookieSecureAuto, remoteAddr: "10.1.2.3:443", forwarded: "https", wantSecure: true},
+		{name: "auto untrusted forwarded https", mode: CookieSecureAuto, remoteAddr: "192.0.2.10:443", forwarded: "https", wantSecure: false},
+		{name: "auto direct tls", mode: CookieSecureAuto, remoteAddr: "127.0.0.1:1234", tls: true, wantSecure: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodPost, "/", nil)
+			request.RemoteAddr = test.remoteAddr
+			if test.forwarded != "" {
+				request.Header.Set("X-Forwarded-Proto", test.forwarded)
+			}
+			if test.tls {
+				request.TLS = &tls.ConnectionState{}
+			}
+			config := BrowserSessionConfig{
+				SecureMode:        test.mode,
+				TrustedProxyCIDRs: []*net.IPNet{trustedProxy},
+			}
+			if err := SetBrowserSessionWithConfig(recorder, request, testMasterKey, config); err != nil {
+				t.Fatal(err)
+			}
+			cookie := recorder.Result().Cookies()[0]
+			if cookie.Secure != test.wantSecure {
+				t.Fatalf("Secure=%v want %v", cookie.Secure, test.wantSecure)
+			}
+		})
 	}
 }
 

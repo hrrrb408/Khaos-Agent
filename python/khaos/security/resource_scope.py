@@ -49,6 +49,7 @@ class ResourceScopeKind(str, Enum):
 _SCHEMA_VERSION: Final = 1
 _HEX_DIGITS: Final = frozenset("0123456789abcdef")
 _WILDCARD_CHARS: Final = frozenset("*?[]")
+GIT_WORKTREE_AUTHORITY_ROOT_ENV: Final = "KHAOS_WORKTREE_AUTHORITY_ROOT"
 GIT_SCOPE_OPERATIONS: Final = frozenset(
     {
         "apply",
@@ -66,6 +67,25 @@ GIT_SCOPE_OPERATIONS: Final = frozenset(
         "workspace",
     }
 )
+
+
+def configured_git_worktree_authority_root() -> Path | None:
+    """Return the host-reviewed private Git worktree root, when configured.
+
+    The value is an explicit deployment input shared by the effective-policy
+    compiler and ``WorkspaceManager``. If it is absent, TrustedGitRunner's
+    own private authority root remains the final local TCB and the generated
+    typed Git scope intentionally has no pathname claim.
+    """
+    raw = os.environ.get(GIT_WORKTREE_AUTHORITY_ROOT_ENV, "").strip()
+    if not raw:
+        return None
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        raise ResourceScopeError(
+            f"{GIT_WORKTREE_AUTHORITY_ROOT_ENV} must be an absolute path"
+        )
+    return candidate.resolve()
 
 
 def _require_text(field: str, value: object) -> str:
@@ -940,6 +960,7 @@ def compile_typed_resource_catalog(
     filesystem_operations: Iterable[str],
     network_allowed_domains: frozenset[str] | None,
     network_blocked_domains: Iterable[str],
+    git_worktree_root: Path | None = None,
 ) -> TypedResourcePartialOrder:
     """Compile the immutable baseline catalog from one effective policy.
 
@@ -973,6 +994,11 @@ def compile_typed_resource_catalog(
             refs=frozenset({"HEAD"}),
             ref_namespaces=frozenset({"refs/heads/khaos/task/"}),
             operations=GIT_SCOPE_OPERATIONS,
+            worktree_root=(
+                str(git_worktree_root.expanduser().resolve())
+                if git_worktree_root is not None
+                else None
+            ),
         )
         scopes[git_scope.digest()] = git_scope
 
@@ -992,6 +1018,7 @@ def compile_typed_resource_catalog(
 
 __all__ = [
     "GIT_SCOPE_OPERATIONS",
+    "GIT_WORKTREE_AUTHORITY_ROOT_ENV",
     "CredentialScope",
     "ExecutionScope",
     "FilesystemScope",
@@ -1002,4 +1029,5 @@ __all__ = [
     "ResourceScopeKind",
     "TypedResourcePartialOrder",
     "compile_typed_resource_catalog",
+    "configured_git_worktree_authority_root",
 ]
