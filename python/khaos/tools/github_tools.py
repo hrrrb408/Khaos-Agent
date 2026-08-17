@@ -39,7 +39,7 @@ async def _gh(args: list[str], *, context: dict[str, Any], tool_name: str, paylo
             await _consume_github_approval(
                 context, workspace, host, repository, tool_name, payload
             )
-        credential_scope, credential_environment = _credential_material(
+        credential_scope, credential_environment = await _credential_material_async(
             context.get("credential_context"),
             host,
             repository,
@@ -291,7 +291,7 @@ async def _execute_read(service: Any, task_id: str, workspace_id: str, cwd: Path
     ))
 
 
-def _credential_material(
+async def _credential_material_async(
     context: Any,
     host: str,
     repository: str,
@@ -299,6 +299,7 @@ def _credential_material(
     *,
     credential_broker: CredentialBroker | None = None,
 ) -> tuple[str, dict[str, str]]:
+    """Materialize the exact GitHub credential off the Agent event loop."""
     binding = {"host": host, "repository": repository}
     if isinstance(context, CredentialLease):
         if credential_broker is None:
@@ -309,7 +310,7 @@ def _credential_material(
         ):
             raise PermissionError("credential lease is not a GitHub token lease")
         try:
-            environment = credential_broker.materialize(
+            environment = await credential_broker.materialize_async(
                 context,
                 binding=binding,
                 operation=operation,
@@ -335,7 +336,7 @@ def _credential_material(
                     binding=binding,
                 )
             try:
-                environment = credential_broker.materialize(
+                environment = await credential_broker.materialize_async(
                     lease,
                     binding=binding,
                     operation=operation,
@@ -345,6 +346,15 @@ def _credential_material(
             return "github-token", environment
         except CredentialBrokerError as exc:
             raise PermissionError(str(exc)) from exc
+    return _credential_material_legacy(context, host, repository, operation)
+
+
+def _credential_material_legacy(
+    context: Any,
+    host: str,
+    repository: str,
+    operation: str,
+) -> tuple[str, dict[str, str]]:
     if not isinstance(context, dict) or context.get("scope") != "github-token":
         raise PermissionError("credential authorization required: github-token")
     if context.get("host") != host or context.get("repository") != repository:

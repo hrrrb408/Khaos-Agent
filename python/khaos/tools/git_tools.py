@@ -20,6 +20,7 @@ from khaos.security.credential_broker import (
     CredentialBroker,
     CredentialBrokerError,
     CredentialLease,
+    credential_binding_digest,
 )
 
 logger = logging.getLogger(__name__)
@@ -680,7 +681,9 @@ async def _git_remote_via_execution_service(
     approval = context.approval_context
     if not isinstance(approval, dict):
         raise PermissionError("git_push requires approval")
-    credential_scope, credential_environment = _credential_material(
+    # The approval above is the exact capability boundary: the provider
+    # loader (Keychain/Vault/askpass) runs only now, exactly once per push.
+    credential_scope, credential_environment = await _credential_material_async(
         approval.get("binding", {}).get("remote_url", ""),
         context.credential_context,
         credential_broker=context.credential_broker,
@@ -844,9 +847,15 @@ async def prepare_remote_git_approval(
         raise PermissionError("configured push remote does not exist")
     remote_url = remote_result["stdout"].strip()
     remote_host = _remote_host(remote_url)
-    credential_scope, _ = _credential_material(
+    # Approval preparation validates credential *metadata* only.  It never
+    # invokes the provider loader, so merely prompting the user cannot touch
+    # Keychain/Vault/askpass or consume a one-shot lease.
+    credential_identity = tool_context.get("credential_lease")
+    if credential_identity is None:
+        credential_identity = tool_context.get("credential_context")
+    credential_scope = _validate_credential_metadata(
         remote_url,
-        tool_context.get("credential_context"),
+        credential_identity,
         credential_broker=tool_context.get("credential_broker"),
     )
     head, diff_hash = await _git_state(cwd, context)
@@ -981,7 +990,9 @@ async def _consume_remote_approval(
     if remote_result["returncode"] != 0:
         raise PermissionError("approved remote is no longer configured")
     remote_url = remote_result["stdout"].strip()
-    credential_scope, _ = _credential_material(
+    # Rebuild the credential scope from metadata only; consuming the
+    # approval must not invoke the provider loader either.
+    credential_scope = _validate_credential_metadata(
         remote_url,
         context.credential_context,
         credential_broker=context.credential_broker,
@@ -1197,15 +1208,23 @@ def _remote_host(remote_url: str) -> str:
     return parsed.hostname.lower()
 
 
-def _credential_material(
+def _validate_credential_metadata(
     remote_url: str,
     credential_context: dict[str, Any] | CredentialLease | None,
     *,
     credential_broker: CredentialBroker | None = None,
-) -> tuple[str, dict[str, str]]:
+) -> str:
+    """Validate the approval-time credential shape without loading a secret.
+
+    Returns the credential scope name the approval binding must carry.
+    Preparation and consumption of a push approval only ever call this:
+    touching a Keychain/Vault/askpass provider before the exact approval is
+    consumed would make the approval prompt itself a credential-sensitive
+    effect and would burn a one-shot lease before the push exists.
+    """
     host = _remote_host(remote_url)
     if host == "local":
-        return "none", {}
+        return "none"
     if remote_url.startswith("ssh://") or re.match(r"^[^/@:]+@[^/:]+:", remote_url):
         required_scope = "ssh-agent"
         allowed_keys = {"SSH_AUTH_SOCK"}
@@ -1219,10 +1238,65 @@ def _credential_material(
         if (
             credential_context.scope.provider != "git"
             or required_scope not in credential_context.scope.names
+            or credential_context.authorized_operation != "git_push"
+            or credential_context.binding_digest
+            != credential_binding_digest(binding, "git_push")
+        ):
+            raise PermissionError(
+                "credential lease metadata does not match the exact Git push effect"
+            )
+        return required_scope
+    if credential_broker is not None and credential_context is None:
+        try:
+            credential_broker.validate_named_provider(
+                provider="git", name=required_scope, operation="git_push"
+            )
+        except CredentialBrokerError as exc:
+            raise PermissionError(str(exc)) from exc
+        return required_scope
+    if not isinstance(credential_context, dict) or credential_context.get("scope") != required_scope:
+        raise PermissionError(f"credential authorization required: {required_scope}")
+    environment = credential_context.get("environment")
+    if not isinstance(environment, dict) or not environment:
+        raise PermissionError("authorized credential environment is missing")
+    if not set(environment).issubset(allowed_keys):
+        raise PermissionError("credential environment contains unauthorized keys")
+    if required_scope == "ssh-agent" and not environment.get("SSH_AUTH_SOCK"):
+        raise PermissionError("authorized SSH agent socket is missing")
+    if required_scope == "https-askpass" and not environment.get("GIT_ASKPASS"):
+        raise PermissionError("authorized askpass helper is missing")
+    return required_scope
+
+
+async def _credential_material_async(
+    remote_url: str,
+    credential_context: dict[str, Any] | CredentialLease | None,
+    *,
+    credential_broker: CredentialBroker | None = None,
+) -> tuple[str, dict[str, str]]:
+    """Materialize the exact Git push credential without blocking the loop.
+
+    This runs only after the exact push approval has been consumed, so one
+    successful push triggers the provider loader exactly once.
+    """
+    host = _remote_host(remote_url)
+    if host == "local":
+        return "none", {}
+    if remote_url.startswith("ssh://") or re.match(r"^[^/@:]+@[^/:]+:", remote_url):
+        required_scope = "ssh-agent"
+    else:
+        required_scope = "https-askpass"
+    binding = {"remote_url": remote_url, "host": host}
+    if isinstance(credential_context, CredentialLease):
+        if credential_broker is None:
+            raise PermissionError("credential lease requires CredentialBroker")
+        if (
+            credential_context.scope.provider != "git"
+            or required_scope not in credential_context.scope.names
         ):
             raise PermissionError("credential lease is not a matching Git lease")
         try:
-            return required_scope, credential_broker.materialize(
+            return required_scope, await credential_broker.materialize_async(
                 credential_context,
                 binding=binding,
                 operation="git_push",
@@ -1247,7 +1321,7 @@ def _credential_material(
                     binding=binding,
                 )
             try:
-                environment = credential_broker.materialize(
+                environment = await credential_broker.materialize_async(
                     lease,
                     binding=binding,
                     operation="git_push",
@@ -1257,6 +1331,22 @@ def _credential_material(
             return required_scope, environment
         except CredentialBrokerError as exc:
             raise PermissionError(str(exc)) from exc
+    return _credential_material_legacy(
+        credential_context, required_scope, _allowed_keys_for(required_scope)
+    )
+
+
+def _allowed_keys_for(required_scope: str) -> set[str]:
+    if required_scope == "ssh-agent":
+        return {"SSH_AUTH_SOCK"}
+    return {"GIT_ASKPASS", "GIT_USERNAME", "GIT_PASSWORD"}
+
+
+def _credential_material_legacy(
+    credential_context: dict[str, Any] | CredentialLease | None,
+    required_scope: str,
+    allowed_keys: set[str],
+) -> tuple[str, dict[str, str]]:
     if not isinstance(credential_context, dict) or credential_context.get("scope") != required_scope:
         raise PermissionError(f"credential authorization required: {required_scope}")
     environment = credential_context.get("environment")
