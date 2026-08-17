@@ -36,6 +36,7 @@ type Handler struct {
 	healthLimiter        *rate.TokenBucket
 	metrics              *metrics.Collector
 	apiKey               string
+	browserSessionConfig auth.BrowserSessionConfig
 	allowedHosts         map[string]struct{}
 	allowedOrigins       map[string]struct{}
 	configAdmins         map[string]struct{}
@@ -92,6 +93,7 @@ func NewHandler(agent AgentClient, memory MemoryClient, config ConfigStore, apiK
 		healthLimiter:        limiter,
 		metrics:              metrics.NewCollector(),
 		apiKey:               apiKey,
+		browserSessionConfig: auth.DefaultBrowserSessionConfig(),
 		allowedHosts: map[string]struct{}{
 			"localhost": {}, "127.0.0.1": {}, "::1": {},
 		},
@@ -108,6 +110,13 @@ func NewHandler(agent AgentClient, memory MemoryClient, config ConfigStore, apiK
 		handler.chatEvents = events
 	}
 	return handler
+}
+
+// WithBrowserSessionConfig installs the validated browser cookie transport
+// policy selected by the host deployment.
+func (h *Handler) WithBrowserSessionConfig(config auth.BrowserSessionConfig) *Handler {
+	h.browserSessionConfig = config
+	return h
 }
 
 // WithConfigAdminPrincipals installs the immutable allowlist for the
@@ -630,7 +639,7 @@ func (h *Handler) handleBrowserSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "authenticated principal required")
 		return
 	}
-	if err := auth.SetBrowserSession(w, r, h.apiKey); err != nil {
+	if err := auth.SetBrowserSessionWithConfig(w, r, h.apiKey, h.browserSessionConfig); err != nil {
 		writeError(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}

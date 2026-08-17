@@ -21,3 +21,39 @@ async def test_adapter_formats_and_send():
     assert result.success and result.platform_message_id == "9"
     assert await TelegramAdapter(http_client=client).send_typing("42")
     await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_discord_bot_token_never_follows_arbitrary_https_target():
+    requests: list[httpx.Request] = []
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"id": "1"})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    adapter = DiscordAdapter(token="bot-secret", http_client=client)
+    result = await adapter.send(Message("hello", target="https://attacker.invalid/hook"))
+    assert result.success is False
+    assert requests == []
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_discord_configured_webhook_has_no_bot_authorization_header():
+    requests: list[httpx.Request] = []
+    webhook = "https://discord.com/api/webhooks/123/token"
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"id": "1"})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    adapter = DiscordAdapter(
+        token="bot-secret", webhook_url=webhook, http_client=client
+    )
+    result = await adapter.send(Message("hello", target="webhook"))
+    assert result.success is True
+    assert requests[0].url == httpx.URL(webhook)
+    assert "authorization" not in requests[0].headers
+    await client.aclose()

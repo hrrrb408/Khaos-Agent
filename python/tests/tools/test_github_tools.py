@@ -9,6 +9,8 @@ import pytest
 from khaos.agent.approval import ApprovalBroker
 from khaos.coding.execution.models import ExecutionResult, NetworkPolicy
 from khaos.coding.workspace.models import WorkspaceState
+from khaos.security.credential_broker import CredentialBroker
+from khaos.security.resource_scope import CredentialScope
 from khaos.tools.github_tools import (
     GITHUB_TOOL_SPECS,
     github_comment_issue,
@@ -139,6 +141,56 @@ async def test_github_write_requires_approval_network_and_credential(tmp_path):
     context["credential_context"] = None
     no_credential = json.loads(await github_read_issue(7, **context))
     assert "credential authorization" in no_credential["error"]
+
+
+async def test_github_prepare_does_not_materialize_before_approval(tmp_path):
+    service = _FakeGitHubExecutionService(tmp_path)
+    credential_broker = CredentialBroker()
+    loader_calls = 0
+
+    def load_token():
+        nonlocal loader_calls
+        loader_calls += 1
+        return {"GH_TOKEN": "test-token"}
+
+    credential_broker.register(
+        CredentialScope(
+            provider="github",
+            names=frozenset({"github-token"}),
+            operations=frozenset({"github_comment_issue"}),
+        ),
+        load_token,
+    )
+    context = _context(service, operations=["github_comment_issue"])
+    context["credential_context"] = None
+    context["credential_broker"] = credential_broker
+    approval_broker = ApprovalBroker()
+    arguments = {"issue_number": 7, "comment": "approved"}
+
+    approval = await prepare_github_approval(
+        "github_comment_issue",
+        arguments,
+        {**context, "approval_broker": approval_broker},
+        requester="session",
+        approval_id="approval",
+    )
+    assert approval is not None
+    assert loader_calls == 0
+
+    before_consume = json.loads(await github_comment_issue(7, "approved", **context))
+    assert before_consume["ok"] is False
+    assert loader_calls == 0
+
+    assert await approval_broker.approve_operation("approval", "session")
+    result = json.loads(
+        await github_comment_issue(
+            7,
+            "approved",
+            **{**context, "approval_context": approval},
+        )
+    )
+    assert result["ok"] is True
+    assert loader_calls == 1
 
 
 @pytest.mark.parametrize("mutation", ["requester", "operation", "repository", "payload", "head", "expiry"])

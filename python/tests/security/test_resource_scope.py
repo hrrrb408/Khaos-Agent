@@ -37,6 +37,7 @@ from khaos.security.resource_scope import (
     NetworkScope,
     ResourceScopeError,
     TypedResourcePartialOrder,
+    compile_typed_resource_catalog,
 )
 
 
@@ -46,6 +47,27 @@ class _MemoryWorm:
 
     def append(self, record: dict[str, object]) -> None:
         self.records.append(record)
+
+
+def test_compiled_git_catalog_binds_configured_worktree_root(tmp_path, monkeypatch) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    (repository / ".git").mkdir()
+    authority_root = tmp_path / "private-worktrees"
+    monkeypatch.setenv("KHAOS_WORKTREE_AUTHORITY_ROOT", str(authority_root))
+
+    order = compile_typed_resource_catalog(
+        repository,
+        policy_digest="policy",
+        filesystem_roots=(repository,),
+        filesystem_operations=("read",),
+        network_allowed_domains=None,
+        network_blocked_domains=(),
+        git_worktree_root=authority_root,
+    )
+    git_scopes = [scope for scope in order.scopes.values() if isinstance(scope, GitRefScope)]
+    assert len(git_scopes) == 1
+    assert git_scopes[0].worktree_root == str(authority_root.resolve())
 
 
 def test_security_identity_aliases_keep_distinct_static_names() -> None:

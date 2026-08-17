@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import re
+import stat
+from pathlib import Path
 
 from khaos.channels.models import ChannelType, DeliveryResult, Message
 from khaos.time_utils import utc_now_naive
 
 logger = logging.getLogger(__name__)
+_LOG_TARGET = re.compile(r"[A-Za-z0-9_.-]{1,64}\Z")
 
 
 class Channel:
@@ -58,15 +63,24 @@ class LogFileChannel(Channel):
     channel_type = ChannelType.LOG_FILE
 
     def __init__(self, log_dir: str = "~/.khaos/logs"):
-        from pathlib import Path
-
         self._log_dir = Path(log_dir).expanduser()
         self._log_dir.mkdir(parents=True, exist_ok=True)
 
     async def send(self, message: Message) -> DeliveryResult:
-        path = self._log_dir / f"{message.target or 'default'}.log"
         try:
-            await asyncio.to_thread(_append_log_line, path, message.content)
+            logical_name = _validate_log_target(message.target)
+        except ValueError as exc:
+            return DeliveryResult(
+                success=False,
+                channel="log_file",
+                target=message.target,
+                error=str(exc),
+            )
+        path = self._log_dir / f"{logical_name}.log"
+        try:
+            await asyncio.to_thread(
+                _append_log_line, self._log_dir, f"{logical_name}.log", message.content
+            )
             return DeliveryResult(
                 success=True,
                 channel="log_file",
@@ -81,10 +95,47 @@ class LogFileChannel(Channel):
             )
 
 
-def _append_log_line(path, content: str) -> None:
-    with path.open("a", encoding="utf-8") as file:
-        ts = utc_now_naive().isoformat()
-        file.write(f"[{ts}] {content}\n")
+def _validate_log_target(target: str) -> str:
+    """Validate a logical file name before it reaches the filesystem."""
+    logical_name = target or "default"
+    if (
+        type(logical_name) is not str
+        or not _LOG_TARGET.fullmatch(logical_name)
+        or logical_name in {".", ".."}
+        or ".." in logical_name
+    ):
+        raise ValueError("log target must be a simple logical name")
+    return logical_name
+
+
+def _append_log_line(log_dir: Path, file_name: str, content: str) -> None:
+    """Append through a directory fd so the logical name cannot escape it."""
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | no_follow
+    directory_fd = os.open(str(log_dir), directory_flags)
+    file_fd = -1
+    try:
+        if not no_follow or os.open not in getattr(os, "supports_dir_fd", set()):
+            # A path-only fallback cannot close the symlink-swap race between
+            # validation and open. Refuse delivery on platforms without the
+            # dirfd/no-follow primitive instead of becoming a filesystem
+            # deputy for the caller.
+            raise OSError("log target requires dirfd no-follow support")
+        file_fd = os.open(file_name, flags | no_follow, 0o600, dir_fd=directory_fd)
+        info = os.fstat(file_fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise OSError("log target is not a single regular file")
+        if hasattr(os, "fchmod"):
+            os.fchmod(file_fd, 0o600)
+        with os.fdopen(file_fd, "a", encoding="utf-8", closefd=True) as file:
+            file_fd = -1
+            ts = utc_now_naive().isoformat()
+            file.write(f"[{ts}] {content}\n")
+    finally:
+        if file_fd >= 0:
+            os.close(file_fd)
+        os.close(directory_fd)
 
 
 class MemoryChannel(Channel):

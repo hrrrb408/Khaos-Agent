@@ -18,6 +18,7 @@ from khaos.security.credential_broker import (
     CredentialBroker,
     CredentialBrokerError,
     CredentialLease,
+    credential_binding_digest,
 )
 
 _MAX_TITLE = 256
@@ -31,6 +32,13 @@ async def _gh(args: list[str], *, context: dict[str, Any], tool_name: str, paylo
         workspace, cwd, host, repository = await _repository_context(context)
         if context.get("network_policy") != NetworkPolicy.UNRESTRICTED_WITH_APPROVAL.value:
             raise PermissionError("GitHub operation requires server-authorized network policy")
+        if tool_name in _WRITE_TOOLS:
+            # The approval is the first irreversible capability boundary.
+            # Do not touch Keychain/Vault/Credential Manager before it is
+            # consumed; preparation only records non-secret metadata below.
+            await _consume_github_approval(
+                context, workspace, host, repository, tool_name, payload
+            )
         credential_scope, credential_environment = _credential_material(
             context.get("credential_context"),
             host,
@@ -38,10 +46,6 @@ async def _gh(args: list[str], *, context: dict[str, Any], tool_name: str, paylo
             tool_name,
             credential_broker=context.get("credential_broker"),
         )
-        if tool_name in _WRITE_TOOLS:
-            await _consume_github_approval(
-                context, workspace, host, repository, tool_name, payload
-            )
         with tempfile.TemporaryDirectory(prefix="khaos-gh-home-") as temporary_home:
             environment = {
                 "PATH": os.environ.get("PATH", ""),
@@ -160,7 +164,7 @@ async def prepare_github_approval(
     workspace, _, host, repository = await _repository_context(
         {**tool_context, "cwd": str(arguments.get("cwd") or ".")}
     )
-    _credential_material(
+    _validate_credential_metadata(
         tool_context.get("credential_context"),
         host,
         repository,
@@ -355,6 +359,44 @@ def _credential_material(
     if key not in {"GH_TOKEN", "GITHUB_TOKEN"} or not value:
         raise PermissionError("unauthorized GitHub credential key")
     return "github-token", {str(key): str(value)}
+
+
+def _validate_credential_metadata(
+    context: Any,
+    host: str,
+    repository: str,
+    operation: str,
+    *,
+    credential_broker: CredentialBroker | None = None,
+) -> None:
+    """Validate the approval-time credential shape without loading a secret."""
+    binding = {"host": host, "repository": repository}
+    if isinstance(context, CredentialLease):
+        if (
+            context.scope.provider != "github"
+            or "github-token" not in context.scope.names
+            or context.authorized_operation != operation
+            or context.binding_digest != credential_binding_digest(binding, operation)
+        ):
+            raise PermissionError("credential lease metadata does not match GitHub effect")
+        if credential_broker is None:
+            raise PermissionError("credential lease requires CredentialBroker")
+        return
+    if credential_broker is not None and context is None:
+        try:
+            credential_broker.validate_named_provider(
+                provider="github", name="github-token", operation=operation
+            )
+        except CredentialBrokerError as exc:
+            raise PermissionError(str(exc)) from exc
+        return
+    if not isinstance(context, dict) or context.get("scope") != "github-token":
+        raise PermissionError("credential authorization required: github-token")
+    if context.get("host") != host or context.get("repository") != repository:
+        raise PermissionError("credential authorization does not match repository")
+    operations = context.get("operations")
+    if not isinstance(operations, (list, tuple, set)) or operation not in operations:
+        raise PermissionError("credential authorization does not cover operation")
 
 
 def _parse_repository(remote_url: str) -> tuple[str, str]:

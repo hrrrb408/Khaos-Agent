@@ -1673,6 +1673,12 @@ mod linux {
                 ));
             }
             if let Ok(netns) = env::var("KHAOS_NETWORK_NETNS") {
+                if env::var_os("KHAOS_DEV_MODE").as_deref() != Some(std::ffi::OsStr::new("1")) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "legacy network netns contract is development-only",
+                    ));
+                }
                 join_netns(&netns)?;
             } else {
                 let principal_id = env::var("KHAOS_NETWORK_PRINCIPAL")
@@ -1703,6 +1709,7 @@ mod linux {
                 "KHAOS_NETWORK_TASK",
                 "KHAOS_NETWORK_SANDBOX",
                 "KHAOS_NETWORK_HELPER_SOCKET",
+                "KHAOS_DEV_MODE",
             ] {
                 env::remove_var(key);
             }

@@ -335,6 +335,13 @@ def discover() -> list[SpawnSite]:
     for path in files:
         if any(part in {"tests", "__pycache__", "target"} for part in path.parts):
             continue
+        # Finder-style copies such as ``module 2.py`` are not importable
+        # Python modules or Cargo source targets.  They can remain in a
+        # developer worktree without becoming part of the releasable runtime
+        # graph; do not let preserved local copies poison the generated
+        # release inventory.
+        if " " in path.name:
+            continue
         relative = path.relative_to(ROOT).as_posix()
         try:
             raw_sites = (

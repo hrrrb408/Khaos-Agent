@@ -6,25 +6,93 @@ runtime, while a lease exposed to a tool contains only opaque identity and
 expiry metadata.  Secret material is returned only for the final execution
 environment and is never part of a scope, approval binding, repr, or audit
 record.
+
+The broker also owns the materialization transaction.  A provider call is
+not an untracked callback outside the lifecycle theorem: it is registered as
+an owned resource before the loader runs, and the result is discarded unless
+the same lease, generation, target, operation, policy, principal, and broker
+are still live when the loader returns.
 """
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import re
 import secrets
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 
 from khaos.security.resource_scope import CredentialScope
 
 CredentialLoader = Callable[[], Mapping[str, str]]
 
+MAX_PROVIDER_ENTRIES = 8
+MAX_PROVIDER_VALUE_BYTES = 64 * 1024
+_ENVIRONMENT_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+
 
 class CredentialBrokerError(PermissionError):
     """Raised when a credential lease cannot be issued or materialized."""
+
+
+@dataclass(frozen=True, slots=True)
+class CredentialEnvironmentSchema:
+    """The only environment shape a registered provider may materialize."""
+
+    allowed_keys: frozenset[str]
+    max_entries: int
+    max_value_bytes: int = MAX_PROVIDER_VALUE_BYTES
+
+    def __post_init__(self) -> None:
+        if type(self.max_entries) is not int or type(self.max_value_bytes) is not int:
+            raise CredentialBrokerError(
+                "credential provider environment limits must be integers"
+            )
+        if not self.allowed_keys:
+            raise CredentialBrokerError(
+                "credential provider environment schema must allow at least one key"
+            )
+        if len(self.allowed_keys) > MAX_PROVIDER_ENTRIES:
+            raise CredentialBrokerError(
+                "credential provider environment schema allows too many keys"
+            )
+        if self.max_entries <= 0 or self.max_entries > MAX_PROVIDER_ENTRIES:
+            raise CredentialBrokerError(
+                "credential provider environment entry limit is invalid"
+            )
+        if self.max_entries > len(self.allowed_keys):
+            raise CredentialBrokerError(
+                "credential provider environment entry limit exceeds allowed keys"
+            )
+        if self.max_value_bytes <= 0 or self.max_value_bytes > MAX_PROVIDER_VALUE_BYTES:
+            raise CredentialBrokerError(
+                "credential provider environment value limit is invalid"
+            )
+        if any(
+            type(key) is not str
+            or not _ENVIRONMENT_KEY.fullmatch(key)
+            for key in self.allowed_keys
+        ):
+            raise CredentialBrokerError(
+                "credential provider environment key is invalid"
+            )
+
+    def digest(self) -> str:
+        """Return a non-secret digest for this immutable provider schema."""
+        payload = {
+            "allowed_keys": sorted(self.allowed_keys),
+            "max_entries": self.max_entries,
+            "max_value_bytes": self.max_value_bytes,
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
+                "utf-8"
+            )
+        ).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,9 +101,12 @@ class CredentialLease:
 
     lease_id: str
     scope: CredentialScope
+    authorized_operation: str
     binding_digest: str
     policy_digest: str
     principal_id: str
+    generation: int
+    environment_schema_digest: str
     issued_at: float
     expires_at: float
 
@@ -45,26 +116,49 @@ class CredentialLease:
             "lease_id": self.lease_id,
             "provider": self.scope.provider,
             "names": sorted(self.scope.names),
+            # ``operations`` describes the provider's maximum capability;
+            # ``authorized_operation`` is the one operation this lease may
+            # actually claim.
             "operations": sorted(self.scope.operations),
+            "authorized_operation": self.authorized_operation,
             "binding_digest": self.binding_digest,
             "policy_digest": self.policy_digest,
             "principal_id": self.principal_id,
+            "generation": self.generation,
+            "environment_schema_digest": self.environment_schema_digest,
             "expires_at": self.expires_at,
         }
 
 
 @dataclass(frozen=True, slots=True)
+class _ProviderRecord:
+    loader: CredentialLoader
+    schema: CredentialEnvironmentSchema
+
+
+@dataclass(frozen=True, slots=True)
 class _LeaseRecord:
     lease: CredentialLease
-    loader: CredentialLoader
+    provider: _ProviderRecord
 
 
-def credential_binding_digest(binding: Mapping[str, object] | str) -> str:
-    """Hash a non-secret target binding used by a credential lease."""
+@dataclass(frozen=True, slots=True)
+class _MaterializationRecord:
+    transaction_id: str
+    lease_id: str
+    generation: int
+
+
+def credential_binding_digest(
+    binding: Mapping[str, object] | str, operation: str | None = None
+) -> str:
+    """Hash a non-secret target binding and, when supplied, its exact action."""
     if isinstance(binding, str):
         payload: object = binding
     else:
         payload = dict(binding)
+    if operation is not None:
+        payload = {"binding": payload, "operation": operation}
     encoded = json.dumps(
         payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
@@ -72,7 +166,16 @@ def credential_binding_digest(binding: Mapping[str, object] | str) -> str:
 
 
 class CredentialBroker:
-    """Trusted owner for provider loaders and expiring credential leases."""
+    """Trusted owner for provider loaders and expiring credential leases.
+
+    The provider callable is synchronous because deployment adapters commonly
+    wrap platform keychains and credential managers with a synchronous API.
+    Its call is nevertheless lifecycle-owned.  ``close()`` closes admission
+    immediately, revokes all leases, and leaves an in-flight transaction
+    registered until its result has been checked and discarded.  This avoids
+    blocking runtime shutdown on an unavailable provider while making
+    ``terminal_closed`` false until the provider call settles.
+    """
 
     def __init__(
         self,
@@ -88,18 +191,43 @@ class CredentialBroker:
         self.principal_id = principal_id
         self.max_ttl_seconds = max_ttl_seconds
         self.allow_context_adoption = allow_context_adoption
-        self._loaders: dict[str, CredentialLoader] = {}
+        self._loaders: dict[str, _ProviderRecord] = {}
         self._leases: dict[str, _LeaseRecord] = {}
+        self._materializations: dict[str, _MaterializationRecord] = {}
+        self._materialization_by_lease: dict[str, str] = {}
         self._lock = threading.RLock()
+        self._generation = 0
+        self._closing = False
         self._closed = False
+        self._quarantined = False
 
-    def register(self, scope: CredentialScope, loader: CredentialLoader) -> None:
-        """Register a trusted provider loader for one exact typed scope."""
+    def register(
+        self,
+        scope: CredentialScope,
+        loader: CredentialLoader,
+        *,
+        allowed_environment_keys: Iterable[str] | None = None,
+        max_entries: int | None = None,
+        max_value_bytes: int = MAX_PROVIDER_VALUE_BYTES,
+    ) -> None:
+        """Register a trusted loader with an explicit output environment schema.
+
+        Known built-in providers retain narrow compatibility defaults
+        (GitHub token and Git/SSH helpers).  New provider families must pass
+        ``allowed_environment_keys`` explicitly; a provider cannot expand the
+        subprocess environment merely by returning additional mapping keys.
+        """
         if not isinstance(scope, CredentialScope) or not callable(loader):
             raise CredentialBrokerError("credential provider registration is invalid")
+        schema = self._schema_for_scope(
+            scope,
+            allowed_environment_keys=allowed_environment_keys,
+            max_entries=max_entries,
+            max_value_bytes=max_value_bytes,
+        )
         with self._lock:
             self._ensure_open()
-            self._loaders[scope.digest()] = loader
+            self._loaders[scope.digest()] = _ProviderRecord(loader, schema)
 
     def bind_runtime(self, *, policy_digest: str, principal_id: str) -> None:
         """Bind this broker to one immutable runtime identity."""
@@ -117,6 +245,8 @@ class CredentialBroker:
                 raise CredentialBrokerError(
                     "credential broker principal does not match the runtime"
                 )
+            if self._generation == 0:
+                self._generation = 1
             self.policy_digest = policy_digest
             self.principal_id = principal_id
 
@@ -131,18 +261,20 @@ class CredentialBroker:
         """Issue a lease only for a registered exact scope and operation."""
         if not isinstance(scope, CredentialScope):
             raise CredentialBrokerError("credential scope is invalid")
+        if type(operation) is not str or not operation:
+            raise CredentialBrokerError("credential operation is invalid")
         if operation not in scope.operations:
             raise CredentialBrokerError("credential operation is outside its scope")
         if ttl_seconds <= 0 or ttl_seconds > self.max_ttl_seconds:
             raise CredentialBrokerError("credential lease TTL is outside its bound")
         with self._lock:
             self._ensure_open()
-            loader = self._loaders.get(scope.digest())
-            if loader is None:
+            provider = self._loaders.get(scope.digest())
+            if provider is None:
                 raise CredentialBrokerError("credential provider is not registered")
-            return self._issue_with_loader(
+            return self._issue_with_provider(
                 scope,
-                loader,
+                provider,
                 binding=binding,
                 ttl_seconds=ttl_seconds,
                 operation=operation,
@@ -169,6 +301,22 @@ class CredentialBroker:
             operation=operation,
             ttl_seconds=ttl_seconds,
         )
+
+    def validate_named_provider(
+        self, *, provider: str, name: str, operation: str
+    ) -> None:
+        """Check provider availability without invoking its loader."""
+        scope = CredentialScope(
+            provider=provider,
+            names=frozenset({name}),
+            operations=frozenset({operation}),
+        )
+        with self._lock:
+            self._ensure_open()
+            if operation not in scope.operations:
+                raise CredentialBrokerError("credential operation is outside its scope")
+            if scope.digest() not in self._loaders:
+                raise CredentialBrokerError("credential provider is not registered")
 
     def adopt_context(
         self,
@@ -200,27 +348,18 @@ class CredentialBroker:
         environment = context.get("environment")
         if not isinstance(environment, Mapping) or not environment:
             raise CredentialBrokerError("credential context environment is missing")
-        if any(
-            type(key) is not str
-            or not key
-            or "\x00" in key
-            or type(value) is not str
-            or not value
-            or "\x00" in value
-            for key, value in environment.items()
-        ):
-            raise CredentialBrokerError("credential context environment is malformed")
         scope = CredentialScope(
             provider=provider,
             names=frozenset({name}),
             operations=frozenset({operation}),
         )
-        secret_environment = {str(key): str(value) for key, value in environment.items()}
+        schema = self._schema_for_scope(scope)
+        secret_environment = self._validate_environment(environment, schema)
         with self._lock:
             self._ensure_open()
-            return self._issue_with_loader(
+            return self._issue_with_provider(
                 scope,
-                lambda: dict(secret_environment),
+                _ProviderRecord(lambda: dict(secret_environment), schema),
                 binding=binding,
                 ttl_seconds=ttl_seconds,
                 operation=operation,
@@ -233,60 +372,139 @@ class CredentialBroker:
         binding: Mapping[str, object] | str,
         operation: str,
     ) -> dict[str, str]:
-        """Resolve one valid lease into a bounded execution environment."""
+        """Claim one lease and resolve it into a bounded execution environment."""
         if not isinstance(lease, CredentialLease):
             raise CredentialBrokerError("credential lease is invalid")
-        expected_binding = credential_binding_digest(binding)
+        if type(operation) is not str or not operation:
+            raise CredentialBrokerError("credential operation is invalid")
+        expected_binding = credential_binding_digest(binding, operation)
         with self._lock:
             self._ensure_open()
             record = self._leases.get(lease.lease_id)
             if record is None or record.lease != lease:
                 raise CredentialBrokerError("credential lease is unknown or revoked")
+            if lease.authorized_operation != operation:
+                raise CredentialBrokerError(
+                    "credential lease is bound to a different operation"
+                )
+            if lease.binding_digest != expected_binding:
+                raise CredentialBrokerError("credential lease target binding changed")
+            if (
+                lease.generation != self._generation
+                or lease.policy_digest != self.policy_digest
+                or lease.principal_id != self.principal_id
+            ):
+                raise CredentialBrokerError("credential lease runtime binding changed")
             if lease.expires_at <= time.time():
                 self._leases.pop(lease.lease_id, None)
                 raise CredentialBrokerError("credential lease is expired")
-            if lease.binding_digest != expected_binding:
-                raise CredentialBrokerError("credential lease target binding changed")
-            if operation not in lease.scope.operations:
-                raise CredentialBrokerError("credential lease operation is outside its scope")
-            loader = record.loader
+            if lease.lease_id in self._materialization_by_lease:
+                raise CredentialBrokerError("credential lease has already been claimed")
+            transaction_id = secrets.token_urlsafe(24)
+            transaction = _MaterializationRecord(
+                transaction_id=transaction_id,
+                lease_id=lease.lease_id,
+                generation=lease.generation,
+            )
+            self._materializations[transaction_id] = transaction
+            self._materialization_by_lease[lease.lease_id] = transaction_id
+            loader = record.provider.loader
+            schema = record.provider.schema
+
+        succeeded = False
         try:
-            environment = loader()
-        except Exception as exc:
-            raise CredentialBrokerError("credential provider failed") from exc
-        if not isinstance(environment, Mapping) or not environment:
-            raise CredentialBrokerError("credential provider returned no material")
-        if len(environment) > 8 or any(
-            type(key) is not str
-            or not key
-            or "\x00" in key
-            or type(value) is not str
-            or not value
-            or "\x00" in value
-            for key, value in environment.items()
-        ):
-            raise CredentialBrokerError("credential provider returned malformed material")
-        return {str(key): str(value) for key, value in environment.items()}
+            try:
+                environment = loader()
+            except Exception as exc:
+                raise CredentialBrokerError("credential provider failed") from exc
+            normalized = self._validate_environment(environment, schema)
+            with self._lock:
+                current = self._leases.get(lease.lease_id)
+                current_transaction = self._materializations.get(transaction_id)
+                if current is None or current.lease != lease or current_transaction is None:
+                    raise CredentialBrokerError(
+                        "credential lease was revoked during materialization"
+                    )
+                if self._closing or self._closed:
+                    raise CredentialBrokerError(
+                        "credential broker closed during materialization"
+                    )
+                if transaction.generation != self._generation:
+                    raise CredentialBrokerError(
+                        "credential lease generation changed during materialization"
+                    )
+                if lease.expires_at <= time.time():
+                    raise CredentialBrokerError(
+                        "credential lease expired during materialization"
+                    )
+                # The operation and target digest were checked before the
+                # provider call and the immutable lease still matches here.
+                self._finish_materialization_locked(transaction_id, lease.lease_id)
+                succeeded = True
+                return normalized
+        finally:
+            if not succeeded:
+                with self._lock:
+                    self._abort_materialization_locked(transaction_id, lease.lease_id)
 
     def revoke(self, lease: CredentialLease) -> None:
-        """Forget one lease and release the provider closure it owns."""
-        if isinstance(lease, CredentialLease):
-            with self._lock:
+        """Revoke one lease; any in-flight claim will fail its return fence."""
+        if not isinstance(lease, CredentialLease):
+            return
+        with self._lock:
+            record = self._leases.get(lease.lease_id)
+            if record is not None and record.lease == lease:
                 self._leases.pop(lease.lease_id, None)
+                self._maybe_complete_close_locked()
 
     def owned_resources(self) -> tuple[str, ...]:
+        """Return leases and provider calls still owned by this broker."""
         with self._lock:
-            return tuple(f"credential-lease:{lease_id}" for lease_id in self._leases)
+            resources = [
+                f"credential-lease:{lease_id}" for lease_id in self._leases
+            ]
+            resources.extend(
+                f"credential-materialization:{transaction_id}"
+                for transaction_id in self._materializations
+            )
+            return tuple(sorted(resources))
 
     def terminal_postcondition(self) -> bool:
+        """Prove that no lease or provider transaction remains owned."""
         with self._lock:
-            return not self._leases
+            return not self._leases and not self._materializations
 
     def close(self) -> None:
+        """Close admission without falsely claiming in-flight materialization is gone."""
         with self._lock:
+            if self._closed:
+                return
+            self._closing = True
             self._leases.clear()
-            self._loaders.clear()
+            if self._materializations:
+                self._quarantined = True
+                return
             self._closed = True
+            self._loaders.clear()
+            self._quarantined = False
+
+    async def aclose(self) -> None:
+        """Async ResourceOwner adapter for runtime shutdown."""
+        await asyncio.to_thread(self.close)
+
+    @property
+    def admission_closed(self) -> bool:
+        return self.generation_admission_closed
+
+    @property
+    def generation_admission_closed(self) -> bool:
+        with self._lock:
+            return self._closing or self._closed
+
+    @property
+    def child_admission_closed(self) -> bool:
+        with self._lock:
+            return self._closing or self._closed
 
     @property
     def closed(self) -> bool:
@@ -294,19 +512,24 @@ class CredentialBroker:
             return self._closed
 
     @property
-    def terminal_closed(self) -> bool:
-        """Return the lifecycle proof required by ``RuntimeResult``."""
+    def is_quarantined(self) -> bool:
         with self._lock:
-            return self._closed and not self._leases
+            return self._quarantined
+
+    @property
+    def terminal_closed(self) -> bool:
+        """Return true only after close and all owned transactions are terminal."""
+        with self._lock:
+            return self._closed and not self._leases and not self._materializations
 
     def _ensure_open(self) -> None:
-        if self._closed:
+        if self._closing or self._closed:
             raise CredentialBrokerError("credential broker is closed")
 
-    def _issue_with_loader(
+    def _issue_with_provider(
         self,
         scope: CredentialScope,
-        loader: CredentialLoader,
+        provider: _ProviderRecord,
         *,
         binding: Mapping[str, object] | str,
         operation: str,
@@ -316,19 +539,121 @@ class CredentialBroker:
         lease = CredentialLease(
             lease_id=secrets.token_urlsafe(24),
             scope=scope,
-            binding_digest=credential_binding_digest(binding),
+            authorized_operation=operation,
+            binding_digest=credential_binding_digest(binding, operation),
             policy_digest=self.policy_digest,
             principal_id=self.principal_id,
+            generation=self._generation,
+            environment_schema_digest=provider.schema.digest(),
             issued_at=now,
             expires_at=now + ttl_seconds,
         )
-        self._leases[lease.lease_id] = _LeaseRecord(lease=lease, loader=loader)
+        self._leases[lease.lease_id] = _LeaseRecord(lease=lease, provider=provider)
         return lease
+
+    def _finish_materialization_locked(
+        self, transaction_id: str, lease_id: str
+    ) -> None:
+        self._materializations.pop(transaction_id, None)
+        if self._materialization_by_lease.get(lease_id) == transaction_id:
+            self._materialization_by_lease.pop(lease_id, None)
+        self._leases.pop(lease_id, None)
+        self._maybe_complete_close_locked()
+
+    def _abort_materialization_locked(
+        self, transaction_id: str, lease_id: str
+    ) -> None:
+        self._materializations.pop(transaction_id, None)
+        if self._materialization_by_lease.get(lease_id) == transaction_id:
+            self._materialization_by_lease.pop(lease_id, None)
+        self._leases.pop(lease_id, None)
+        self._maybe_complete_close_locked()
+
+    def _maybe_complete_close_locked(self) -> None:
+        if self._closing and not self._materializations and not self._leases:
+            self._closed = True
+            self._loaders.clear()
+            self._quarantined = False
+
+    @staticmethod
+    def _validate_environment(
+        environment: object, schema: CredentialEnvironmentSchema
+    ) -> dict[str, str]:
+        if not isinstance(environment, Mapping) or not environment:
+            raise CredentialBrokerError("credential provider returned no material")
+        normalized: dict[str, str] = {}
+        for key, value in environment.items():
+            if (
+                type(key) is not str
+                or key not in schema.allowed_keys
+                or type(value) is not str
+                or not value
+                or "\x00" in key
+                or "\x00" in value
+            ):
+                raise CredentialBrokerError(
+                    "credential provider returned an environment key outside its schema"
+                )
+            try:
+                value_size = len(value.encode("utf-8"))
+            except UnicodeError as exc:
+                raise CredentialBrokerError(
+                    "credential provider returned invalid environment text"
+                ) from exc
+            if value_size > schema.max_value_bytes:
+                raise CredentialBrokerError(
+                    "credential provider returned an environment value over its bound"
+                )
+            normalized[key] = value
+        if len(normalized) > schema.max_entries:
+            raise CredentialBrokerError(
+                "credential provider returned too many environment entries"
+            )
+        return normalized
+
+    @staticmethod
+    def _schema_for_scope(
+        scope: CredentialScope,
+        *,
+        allowed_environment_keys: Iterable[str] | None = None,
+        max_entries: int | None = None,
+        max_value_bytes: int = MAX_PROVIDER_VALUE_BYTES,
+    ) -> CredentialEnvironmentSchema:
+        if allowed_environment_keys is not None:
+            if isinstance(allowed_environment_keys, (str, bytes)):
+                raise CredentialBrokerError(
+                    "credential provider environment keys must be an iterable of names"
+                )
+            keys = frozenset(allowed_environment_keys)
+            entries = len(keys) if max_entries is None else max_entries
+            return CredentialEnvironmentSchema(keys, entries, max_value_bytes)
+        if scope.provider == "github":
+            return CredentialEnvironmentSchema(
+                frozenset({"GH_TOKEN", "GITHUB_TOKEN"}),
+                1 if max_entries is None else max_entries,
+                max_value_bytes,
+            )
+        if scope.provider == "git" and scope.names == frozenset({"ssh-agent"}):
+            return CredentialEnvironmentSchema(
+                frozenset({"SSH_AUTH_SOCK"}),
+                1 if max_entries is None else max_entries,
+                max_value_bytes,
+            )
+        if scope.provider == "git" and scope.names == frozenset({"https-askpass"}):
+            return CredentialEnvironmentSchema(
+                frozenset({"GIT_ASKPASS", "GIT_USERNAME", "GIT_PASSWORD"}),
+                3 if max_entries is None else max_entries,
+                max_value_bytes,
+            )
+        raise CredentialBrokerError(
+            "credential provider environment schema is required for this provider"
+        )
 
 
 __all__ = [
     "CredentialBroker",
     "CredentialBrokerError",
+    "CredentialEnvironmentSchema",
     "CredentialLease",
     "credential_binding_digest",
 ]

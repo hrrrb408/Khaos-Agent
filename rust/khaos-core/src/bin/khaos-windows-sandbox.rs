@@ -2264,7 +2264,9 @@ mod windows_backend {
             let program = executable.to_string_lossy().to_string();
             let mut names = Vec::new();
             let result = if options.network == "brokered" {
-                let port = options.proxy_port.unwrap();
+                let port = options.proxy_port.ok_or_else(|| {
+                    "brokered Windows execution requires a proxy port".to_string()
+                })?;
                 // A broad block rule wins over an allow rule in Windows
                 // Firewall.  Therefore brokered mode blocks every address
                 // except the exact IPv4 loopback proxy port, then adds an

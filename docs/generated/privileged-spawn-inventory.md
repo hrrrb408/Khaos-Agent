@@ -47,4 +47,4 @@
 - `rust/khaos-core/src/bin/khaos-sandbox-launcher.rs:423` `execvp` in `rust::entrypoint` owner=`LinuxSandboxLauncher` threat-model=`seccomp-landlock-bwrap-boundary` boundary=`linux-sandbox`
 - `rust/khaos-core/src/bin/khaos-windows-sandbox.rs:1127` `Command::new` in `rust::entrypoint` owner=`WindowsSandboxTCB` threat-model=`restricted-token-job-acl-appcontainer-wfp` boundary=`windows-sandbox`
 - `rust/khaos-core/src/bin/khaos-windows-sandbox.rs:2241` `Command::new` in `rust::entrypoint` owner=`WindowsSandboxTCB` threat-model=`restricted-token-job-acl-appcontainer-wfp` boundary=`windows-sandbox`
-- `rust/khaos-core/src/bin/khaos-windows-sandbox.rs:2435` `Command::new` in `rust::entrypoint` owner=`WindowsSandboxTCB` threat-model=`restricted-token-job-acl-appcontainer-wfp` boundary=`windows-sandbox`
+- `rust/khaos-core/src/bin/khaos-windows-sandbox.rs:2437` `Command::new` in `rust::entrypoint` owner=`WindowsSandboxTCB` threat-model=`restricted-token-job-acl-appcontainer-wfp` boundary=`windows-sandbox`

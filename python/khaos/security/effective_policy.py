@@ -43,6 +43,7 @@ from khaos.security.resource_scope import (
     ResourceScopeError,
     TypedResourcePartialOrder,
     compile_typed_resource_catalog,
+    configured_git_worktree_authority_root,
 )
 from khaos.security.sandbox import SandboxMode
 
@@ -345,6 +346,7 @@ def compile_effective_policy(
                 ),
                 network_allowed_domains=effective.network_allowed_domains,
                 network_blocked_domains=effective.network_blocked_domains,
+                git_worktree_root=configured_git_worktree_authority_root(),
             ),
         )
     except ResourceScopeError as exc:
