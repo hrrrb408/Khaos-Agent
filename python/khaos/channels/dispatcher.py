@@ -187,7 +187,7 @@ def _append_log_line_windows(log_dir: Path, file_name: str, content: str) -> Non
     file_attribute_normal = 0x80
     file_flag_open_reparse_point = 0x00200000
     file_flag_backup_semantics = 0x02000000
-    invalid_handle = ctypes.c_void_p(-1).value
+    invalid_handles = {-1, ctypes.c_void_p(-1).value}
 
     def open_handle(path: Path, access: int, creation: int, flags: int):
         handle = create_file(
@@ -199,11 +199,11 @@ def _append_log_line_windows(log_dir: Path, file_name: str, content: str) -> Non
             flags,
             None,
         )
-        handle_value = handle.value
-        if handle_value in {None, invalid_handle}:
+        handle_value = int(getattr(handle, "value", handle))
+        if handle_value in invalid_handles:
             error = ctypes.get_last_error()
             raise OSError(error, ctypes.FormatError(error))
-        return handle
+        return handle_value
 
     def ensure_regular_not_reparse(handle, *, directory: bool = False) -> None:
         info = FileAttributeTagInfo()
@@ -241,7 +241,7 @@ def _append_log_line_windows(log_dir: Path, file_name: str, content: str) -> Non
     try:
         ensure_regular_not_reparse(file_handle)
         file_fd = msvcrt.open_osfhandle(
-            file_handle.value,
+            file_handle,
             os.O_WRONLY | os.O_APPEND | getattr(os, "O_BINARY", 0),
         )
         file_handle = None
