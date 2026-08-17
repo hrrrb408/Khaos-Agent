@@ -1245,17 +1245,8 @@ def _domain_matches(host: str, rule: str) -> bool:
     return rule == "*" or host == rule or host.endswith(f".{rule}")
 
 
-def preflight_network_lease(lease: object) -> None:
-    """Deterministically validate network authority before any secret load.
-
-    Implements *No Secret Materialization Before Deterministic Authority
-    Preflight*: if the network lease is missing, malformed, expired, or its
-    broker attestation no longer validates, the caller must fail closed
-    before touching a credential provider.  The check is read-only — it
-    renews an expired lease through the broker's own grant path exactly like
-    ``NetworkLease.validate`` does, but never claims or consumes the effect
-    capability reserved for the final operation.
-    """
+def _validate_network_lease_or_close(lease: object) -> None:
+    """Deterministically validate network authority or fail closed."""
     if lease is None:
         raise NetworkBrokerError(
             "managed network lease is required before credential materialization"
@@ -1275,10 +1266,98 @@ def preflight_network_lease(lease: object) -> None:
         ) from exc
 
 
+def preflight_network_lease(lease: object) -> None:
+    """Deterministically validate network authority before any secret load.
+
+    Implements *No Secret Materialization Before Deterministic Authority
+    Preflight*: if the network lease is missing, malformed, expired, or its
+    broker attestation no longer validates, the caller must fail closed
+    before touching a credential provider.  The check is read-only — it
+    renews an expired lease through the broker's own grant path exactly like
+    ``NetworkLease.validate`` does, but never claims or consumes the effect
+    capability reserved for the final operation.
+    """
+    _validate_network_lease_or_close(lease)
+
+
+class NetworkReservation:
+    """One-shot prerequisite claim over the exact network authority.
+
+    State machine: ``PREPARED → RESERVED → CLAIMED → TERMINAL``.
+
+    ``reserve_network_lease`` validates the lease (renewal semantics
+    identical to ``NetworkLease.validate``) and holds the reservation;
+    ``ensure_live`` re-validates without consuming so callers can prove
+    *prerequisite authority exists* immediately before claiming a
+    credential — if the authority was revoked, the secret provider is
+    never invoked; ``claim`` consumes the reservation one-shot right
+    before the effect executes.
+    """
+
+    _PREPARED = "prepared"
+    _RESERVED = "reserved"
+    _CLAIMED = "claimed"
+    _TERMINAL = "terminal"
+
+    def __init__(self, lease: object) -> None:
+        _validate_network_lease_or_close(lease)
+        self._lease = lease
+        self._state = self._RESERVED
+        self._reserved_at = time.time()
+
+    @property
+    def state(self) -> str:
+        return self._state
+
+    @property
+    def is_terminal(self) -> bool:
+        return self._state == self._TERMINAL
+
+    def ensure_live(self) -> None:
+        """Re-validate the reserved authority without consuming it.
+
+        Used as the prerequisite gate directly before credential
+        materialization: a revoked or expired lease raises here, so the
+        provider loader invocation count stays zero.
+        """
+        if self._state != self._RESERVED:
+            raise NetworkBrokerError(
+                f"network reservation is {self._state}, not live"
+            )
+        _validate_network_lease_or_close(self._lease)
+
+    def claim(self) -> None:
+        """Consume the reservation one-shot for the exact effect."""
+        if self._state != self._RESERVED:
+            raise NetworkBrokerError(
+                f"network reservation is {self._state} and cannot be claimed"
+            )
+        try:
+            _validate_network_lease_or_close(self._lease)
+        except NetworkBrokerError:
+            self._state = self._TERMINAL
+            raise
+        self._state = self._CLAIMED
+
+    def terminalize(self) -> None:
+        """Mark the reservation terminal; idempotent and always safe."""
+        self._state = self._TERMINAL
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostic only
+        return f"<NetworkReservation state={self._state}>"
+
+
+def reserve_network_lease(lease: object) -> NetworkReservation:
+    """Reserve the exact network authority as a claimable prerequisite."""
+    return NetworkReservation(lease)
+
+
 __all__ = [
     "NetworkBroker",
     "NetworkBrokerError",
     "NetworkBrokerFactory",
     "NetworkLease",
+    "NetworkReservation",
     "preflight_network_lease",
+    "reserve_network_lease",
 ]

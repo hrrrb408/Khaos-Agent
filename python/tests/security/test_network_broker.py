@@ -330,3 +330,75 @@ def test_factory_uses_catalog_bound_network_scope_digest() -> None:
         ) == scope.digest()
     finally:
         factory.authority_broker.close()
+
+
+class _ScriptedLease:
+    """Test double whose validation fails after a scripted number of calls."""
+
+    def __init__(self, allowed_validations: int):
+        self.allowed = allowed_validations
+        self.calls = 0
+
+    def validate(self) -> None:
+        self.calls += 1
+        if self.calls > self.allowed:
+            raise NetworkBrokerError("network lease attestation rejected")
+
+
+def test_reservation_lifecycle_is_one_shot():
+    from khaos.security.network_broker import reserve_network_lease
+
+    lease = _ScriptedLease(allowed_validations=10)
+    reservation = reserve_network_lease(lease)
+
+    assert reservation.state == "reserved"
+    reservation.ensure_live()
+    reservation.claim()
+    assert reservation.state == "claimed"
+    reservation.terminalize()
+    assert reservation.is_terminal
+    reservation.terminalize()
+    assert reservation.is_terminal
+
+
+def test_reservation_rejects_missing_or_malformed_lease():
+    from khaos.security.network_broker import reserve_network_lease
+
+    with pytest.raises(NetworkBrokerError, match="managed network lease"):
+        reserve_network_lease(None)
+    with pytest.raises(NetworkBrokerError, match="malformed"):
+        reserve_network_lease(object())
+
+
+def test_reservation_rejects_revoked_authority_upfront():
+    from khaos.security.network_broker import reserve_network_lease
+
+    with pytest.raises(NetworkBrokerError, match="attestation rejected"):
+        reserve_network_lease(_ScriptedLease(allowed_validations=0))
+
+
+def test_reservation_ensure_live_detects_revocation():
+    from khaos.security.network_broker import reserve_network_lease
+
+    # First validation happens at reservation; the second (ensure_live)
+    # observes the revocation.
+    reservation = reserve_network_lease(_ScriptedLease(allowed_validations=1))
+    with pytest.raises(NetworkBrokerError, match="attestation rejected"):
+        reservation.ensure_live()
+
+
+def test_reservation_claim_is_one_shot_and_terminalizes_on_failure():
+    from khaos.security.network_broker import reserve_network_lease
+
+    lease = _ScriptedLease(allowed_validations=1)
+    reservation = reserve_network_lease(lease)
+    with pytest.raises(NetworkBrokerError, match="attestation rejected"):
+        reservation.claim()
+    assert reservation.is_terminal
+
+    healthy = reserve_network_lease(_ScriptedLease(allowed_validations=10))
+    healthy.claim()
+    with pytest.raises(NetworkBrokerError, match="cannot be claimed"):
+        healthy.claim()
+    with pytest.raises(NetworkBrokerError, match="not live"):
+        healthy.ensure_live()

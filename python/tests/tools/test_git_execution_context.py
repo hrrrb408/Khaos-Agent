@@ -504,7 +504,13 @@ async def test_branch_checkout_and_create_branch_are_approved_workspace_operatio
 
 async def test_destructive_git_requires_approval_and_uses_temporary_home(tmp_path):
     head = "a" * 40
-    diff_hash = hashlib.sha256(b"\0").hexdigest()
+    from khaos.security.git_evidence import snapshot_untracked_files
+    from khaos.tools.git_tools import _git_evidence_digest
+
+    # Destructive bindings always carry the (here empty) untracked manifest.
+    diff_hash = _git_evidence_digest(
+        "", "", snapshot_untracked_files(tmp_path, [])
+    )
     workspace = SimpleNamespace(
         task_id="task-a",
         worktree_path=tmp_path,
@@ -715,6 +721,9 @@ async def test_git_push_network_policy_is_server_bound_and_backend_fails_closed(
 async def test_git_push_injects_only_single_use_authorized_credential_scope(tmp_path):
     head = "b" * 40
     remote_url = "git@example.com:org/repo.git"
+    from khaos.tools.git_tools import _git_evidence_digest
+
+    diff_hash = _git_evidence_digest("", "", None)
     workspace = SimpleNamespace(
         task_id="task-a",
         worktree_path=tmp_path,
@@ -739,7 +748,7 @@ async def test_git_push_injects_only_single_use_authorized_credential_scope(tmp_
         "local_branch": "task/test",
         "remote_branch": "task/test",
         "head": head,
-        "diff_hash": hashlib.sha256(b"\0").hexdigest(),
+        "diff_hash": diff_hash,
         "refspec": "task/test:task/test",
         "set_upstream": True,
         "network_policy": "unrestricted-with-approval",
@@ -1066,3 +1075,179 @@ def test_registry_exposes_only_git_push_as_remote_git_tool():
             remote_tools.append(tool.name)
             assert {"process.execute", "network.access", "credential.access"}.issubset(capability_names)
     assert remote_tools == ["git_push"]
+
+
+class _TruncatingReadBackend(HostExecutionBackend):
+    """Real backend that reports matched reads as truncated supervisor output.
+
+    ProcessSupervisor sets ``output_truncated`` when the output budget is
+    breached; this double injects the same diagnostic deterministically so
+    the evidence consumer's fail-closed path is exercised without a 20 MB
+    status payload.
+    """
+
+    def __init__(self, marker: str):
+        self.marker = marker
+
+    async def execute(self, request):
+        result = await super().execute(request)
+        if any(self.marker in str(part) for part in request.argv):
+            diagnostics = dict(result.diagnostics or {})
+            diagnostics["output_truncated"] = True
+            return replace(result, diagnostics=diagnostics)
+        return result
+
+
+async def _evidence_context(service):
+    return {
+        "task_id": "task",
+        "workspace_id": "workspace",
+        "execution_service": service,
+        "approval_broker": ApprovalBroker(),
+    }
+
+
+@pytest.mark.parametrize("marker", ["rev-parse", "diff", "status"])
+async def test_git_evidence_fails_closed_on_truncated_output(tmp_path, marker):
+    """Truncated status/diff/HEAD may never enter an approval digest."""
+    _, task, _, original_service = await _destructive_repo(tmp_path)
+    service = ExecutionService(
+        _TruncatingReadBackend(marker), original_service.workspace_manager
+    )
+
+    from khaos.security.git_evidence import GitEvidenceError
+
+    with pytest.raises(GitEvidenceError, match="must be complete"):
+        await prepare_destructive_git_approval(
+            "git_undo",
+            {"cwd": str(task)},
+            await _evidence_context(service),
+            requester="session",
+            approval_id="truncated",
+        )
+
+
+async def test_git_push_evidence_ignores_untracked_content(tmp_path):
+    """A push binds the remote effect only: untracked bytes are never read."""
+    _, task, _, _, service, _ = await _remote_repo(tmp_path)
+    huge = task / "huge.bin"
+    with open(huge, "wb") as handle:
+        handle.truncate(10 * 1024 * 1024 * 1024)  # 10 GiB sparse
+    assert huge.stat().st_size == 10 * 1024 * 1024 * 1024
+
+    context, _ = await _approve_remote(service, task, approval_id="untracked")
+    result = json.loads(await git_push(str(task), **context))
+
+    assert result["pushed"] is True
+    assert result["remote_host"] == "local"
+
+
+async def test_destructive_evidence_fails_closed_on_oversized_untracked(tmp_path):
+    """Destructive operations act on the worktree, so evidence stays full —
+    and a file beyond the evidence budget fails closed before any read."""
+    _, task, _, original_service = await _destructive_repo(tmp_path)
+    with open(task / "huge.bin", "wb") as handle:
+        handle.truncate(10 * 1024 * 1024 * 1024)
+    service = ExecutionService(
+        HostExecutionBackend(), original_service.workspace_manager
+    )
+
+    from khaos.security.git_evidence import GitEvidenceError
+
+    with pytest.raises(GitEvidenceError, match="per-file evidence budget"):
+        await prepare_destructive_git_approval(
+            "git_undo",
+            {"cwd": str(task)},
+            await _evidence_context(service),
+            requester="session",
+            approval_id="oversized",
+        )
+
+
+async def test_destructive_evidence_fails_closed_on_untracked_symlink(tmp_path):
+    _, task, _, original_service = await _destructive_repo(tmp_path)
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret\n", encoding="utf-8")
+    (task / "link").symlink_to(outside)
+    service = ExecutionService(
+        HostExecutionBackend(), original_service.workspace_manager
+    )
+
+    from khaos.security.git_evidence import GitEvidenceError
+
+    with pytest.raises(GitEvidenceError, match="could not be opened"):
+        await prepare_destructive_git_approval(
+            "git_undo",
+            {"cwd": str(task)},
+            await _evidence_context(service),
+            requester="session",
+            approval_id="symlink",
+        )
+
+
+async def test_supervisor_diagnostics_reach_git_read_consumers(tmp_path):
+    """The completeness bit survives the execution-service plumbing."""
+    workspace = SimpleNamespace(
+        task_id="task-a",
+        worktree_path=tmp_path,
+        repository_root=tmp_path.parent / "main-worktree",
+        branch_name="task/test",
+        state=WorkspaceState.RUNNING,
+    )
+    service = _RecordingExecutionService(workspace, outputs=["diff-out"])
+    output = ExecutionResult("exec", "passed", 0, "diff-out", "", 1)
+    service.execute = AsyncMock(
+        return_value=replace(output, diagnostics={"output_truncated": False})
+    )
+
+    result = await git_diff(".", task_id="task-a", workspace_id="w", execution_service=service)
+
+    assert result["diagnostics"] == {"output_truncated": False}
+
+
+class _RevokedAfterReservationLease:
+    """Network authority that dies between reservation and credential claim.
+
+    The first validation (reservation) succeeds; the second — the
+    ``ensure_live`` prerequisite gate directly before the credential
+    provider would run — observes the revocation deterministically,
+    without sleeps or racy timing.
+    """
+
+    def __init__(self):
+        self.calls = 0
+
+    def validate(self) -> None:
+        from khaos.security.network_broker import NetworkBrokerError
+
+        self.calls += 1
+        if self.calls >= 2:
+            raise NetworkBrokerError("network lease attestation rejected")
+
+
+async def test_git_push_revoked_reservation_never_invokes_provider(tmp_path):
+    """Network revoke before credential claim ⇒ provider count == 0."""
+    harness = _CountingCredentialHarness(tmp_path)
+    broker = ApprovalBroker()
+    approval = await harness.prepare(broker, "reserve-revoke")
+    assert await broker.approve_operation("reserve-revoke", "session")
+    lease = _RevokedAfterReservationLease()
+
+    result = json.loads(await git_push(
+        ".",
+        task_id="task-a",
+        workspace_id="w",
+        execution_service=harness.service(
+            ["task/test\n", "task/test\n", harness.remote_url, harness.head, "", "", ""]
+        ),
+        approval_context=approval,
+        network_policy="unrestricted-with-approval",
+        credential_context=harness.lease,
+        credential_broker=harness.broker,
+        network_lease=lease,
+    ))
+
+    assert result["pushed"] is False
+    assert "attestation rejected" in result["error"]
+    assert lease.calls == 2
+    assert harness.loader_calls == []

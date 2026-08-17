@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -22,7 +23,12 @@ from khaos.security.credential_broker import (
     CredentialLease,
     credential_binding_digest,
 )
-from khaos.security.network_broker import preflight_network_lease
+from khaos.security.git_evidence import (
+    GitEvidenceError,
+    require_complete_git_output,
+    snapshot_untracked_files,
+)
+from khaos.security.network_broker import reserve_network_lease
 
 logger = logging.getLogger(__name__)
 
@@ -612,12 +618,38 @@ async def _git_read_via_execution_service(
         access_mode="read-only",
     )
     result = await context.execution_service.execute(request)
-    return {
+    payload = {
         "command": args,
         "returncode": int(result.return_code) if result.return_code is not None else -1,
         "stdout": result.stdout,
         "stderr": result.stderr,
     }
+    # The completeness bit must reach every consumer: ProcessSupervisor
+    # records ``output_truncated`` when stdout/stderr exceeded the output
+    # budget, and security callers refuse to hash truncated evidence.
+    diagnostics = getattr(result, "diagnostics", None)
+    if isinstance(diagnostics, dict) and diagnostics:
+        payload["diagnostics"] = dict(diagnostics)
+    return payload
+
+
+async def _git_read_complete(
+    args: list[str],
+    repo: str,
+    context: _GitExecutionContext,
+    *,
+    source: str,
+) -> dict[str, Any]:
+    """Read Git output that feeds an approval decision, complete or fail.
+
+    Security Evidence Must Prove Completeness: a truncated status, diff, or
+    ref query must never be treated as the full workspace state the user
+    approved.  Ordinary display reads keep using the truncation-tolerant
+    ``_git_read_via_execution_service`` directly.
+    """
+    result = await _git_read_via_execution_service(args, repo, context)
+    require_complete_git_output(result, source=source)
+    return result
 
 
 async def _git_write_via_execution_service(
@@ -685,9 +717,12 @@ async def _git_remote_via_execution_service(
     # Deterministic non-secret validation happens before the provider loader:
     # a missing, expired, or malformed network lease fails closed without
     # touching Keychain/Vault/askpass (No Secret Materialization Before
-    # Deterministic Authority Preflight).  The preflight never claims the
-    # lease; the exact network capability is consumed only by the push.
-    preflight_network_lease(context.network_lease)
+    # Deterministic Authority Preflight).  The reservation holds the exact
+    # network prerequisite: ``ensure_live`` proves it still exists right
+    # before the credential claim (revocation keeps the provider invocation
+    # count at zero), and ``claim`` consumes it one-shot for the effect.
+    reservation = reserve_network_lease(context.network_lease)
+    reservation.ensure_live()
     # The approval above is the exact capability boundary: the provider
     # loader (Keychain/Vault/askpass) runs only now, exactly once per push.
     credential_scope, credential_environment = await _credential_material_async(
@@ -696,10 +731,12 @@ async def _git_remote_via_execution_service(
         credential_broker=context.credential_broker,
     )
     if credential_scope != approval.get("binding", {}).get("credential_scope"):
+        reservation.terminalize()
         raise PermissionError("credential scope changed after approval")
     with tempfile.TemporaryDirectory(prefix="khaos-git-remote-home-") as temporary_home:
         environment = _git_environment(temporary_home)
         environment.update(credential_environment)
+        reservation.claim()
         request = ExecutionRequest(
             argv=tuple(args),
             cwd=cwd,
@@ -713,6 +750,7 @@ async def _git_remote_via_execution_service(
             access_mode="workspace-write",
         )
         result = await context.execution_service.execute(request)
+    reservation.terminalize()
     return _legacy_git_result(args, result)
 
 
@@ -742,37 +780,52 @@ async def prepare_destructive_git_approval(
     repo = arguments.get("repo", arguments.get("cwd", "."))
     workspace, cwd = _resolve_git_workspace(repo, context, require_writable=True)
     operation, target_hint = operation_target
-    branch_result = await _git_read_via_execution_service(
-        ["git", "symbolic-ref", "--quiet", "--short", "HEAD"], str(cwd), context
+    branch_result = await _git_read_complete(
+        ["git", "symbolic-ref", "--quiet", "--short", "HEAD"],
+        str(cwd),
+        context,
+        source="git symbolic-ref",
     )
     if branch_result["returncode"] != 0 or not branch_result["stdout"].strip():
         raise PermissionError("detached HEAD is not allowed for destructive Git operations")
     if branch_result["stdout"].strip() != workspace.branch_name:
         raise PermissionError("current branch does not match the TaskWorkspace branch")
     if operation in {"git.create-and-switch", "git.create-branch-from-base"}:
-        status = await _git_read_via_execution_service(
-            ["git", "status", "--porcelain"], str(cwd), context
+        status = await _git_read_complete(
+            ["git", "status", "--porcelain"],
+            str(cwd),
+            context,
+            source="git status",
         )
         if status["stdout"].strip():
             raise PermissionError("branch switching requires a clean worktree")
         branch_name = target_hint.split("@", 1)[0]
-        existing = await _git_read_via_execution_service(
-            ["git", "rev-parse", "--verify", f"refs/heads/{branch_name}"], str(cwd), context
+        existing = await _git_read_complete(
+            ["git", "rev-parse", "--verify", f"refs/heads/{branch_name}"],
+            str(cwd),
+            context,
+            source="git rev-parse",
         )
         if existing["returncode"] == 0:
             raise PermissionError("target branch already exists")
     head, diff_hash = await _git_state(cwd, context)
     if operation == "git.undo":
-        parent = await _git_read_via_execution_service(
-            ["git", "rev-parse", "--verify", "HEAD~1^{commit}"], str(cwd), context
+        parent = await _git_read_complete(
+            ["git", "rev-parse", "--verify", "HEAD~1^{commit}"],
+            str(cwd),
+            context,
+            source="git rev-parse",
         )
         if parent["returncode"] != 0:
             raise PermissionError("no commit history to undo")
         target = parent["stdout"].strip()
     elif operation == "git.create-branch-from-base":
         branch, base = target_hint.split("@", 1)
-        base_result = await _git_read_via_execution_service(
-            ["git", "rev-parse", "--verify", f"{base}^{{commit}}"], str(cwd), context
+        base_result = await _git_read_complete(
+            ["git", "rev-parse", "--verify", f"{base}^{{commit}}"],
+            str(cwd),
+            context,
+            source="git rev-parse",
         )
         if base_result["returncode"] != 0:
             raise PermissionError("base revision does not exist")
@@ -827,8 +880,11 @@ async def prepare_remote_git_approval(
     )
     cwd_argument = str(arguments.get("cwd", "."))
     workspace, cwd = _resolve_git_workspace(cwd_argument, context, require_writable=True)
-    branch_result = await _git_read_via_execution_service(
-        ["git", "symbolic-ref", "--quiet", "--short", "HEAD"], str(cwd), context
+    branch_result = await _git_read_complete(
+        ["git", "symbolic-ref", "--quiet", "--short", "HEAD"],
+        str(cwd),
+        context,
+        source="git symbolic-ref",
     )
     branch = branch_result["stdout"].strip()
     if branch_result["returncode"] != 0 or not branch:
@@ -843,8 +899,11 @@ async def prepare_remote_git_approval(
     _validate_branch_name(branch)
     remote = str(arguments.get("remote") or "origin")
     _validate_remote_name(remote)
-    remote_result = await _git_read_via_execution_service(
-        ["git", "remote", "get-url", "--push", remote], str(cwd), context
+    remote_result = await _git_read_complete(
+        ["git", "remote", "get-url", "--push", remote],
+        str(cwd),
+        context,
+        source="git remote get-url",
     )
     if remote_result["returncode"] != 0 or not remote_result["stdout"].strip():
         raise PermissionError("configured push remote does not exist")
@@ -861,7 +920,10 @@ async def prepare_remote_git_approval(
         credential_identity,
         credential_broker=tool_context.get("credential_broker"),
     )
-    head, diff_hash = await _git_state(cwd, context)
+    # A push transmits the objects reachable from HEAD only; dirty and
+    # untracked worktree state cannot change the remote effect, so the
+    # approval must not read (or bind) untracked content at all.
+    head, diff_hash = await _git_state(cwd, context, include_untracked=False)
     refspec = f"{branch}:{branch}"
     expiry = time.time() + 120.0
     principal_id = str(tool_context.get("principal_id") or requester)
@@ -928,10 +990,11 @@ async def _consume_destructive_approval(
     head, diff_hash = await _git_state(cwd, _context(
         context.task_id, context.workspace_id, "read-only", context.execution_service, None, "none"
     ))
-    branch_result = await _git_read_via_execution_service(
+    branch_result = await _git_read_complete(
         ["git", "symbolic-ref", "--quiet", "--short", "HEAD"],
         str(cwd),
         _context(context.task_id, context.workspace_id, "read-only", context.execution_service, None, "none"),
+        source="git symbolic-ref",
     )
     if branch_result["returncode"] != 0 or not branch_result["stdout"].strip():
         raise PermissionError("detached HEAD is not allowed for destructive Git operations")
@@ -977,8 +1040,11 @@ async def _consume_remote_approval(
     read_context = _context(
         context.task_id, context.workspace_id, "read-only", context.execution_service, None, "none"
     )
-    branch_result = await _git_read_via_execution_service(
-        ["git", "symbolic-ref", "--quiet", "--short", "HEAD"], str(cwd), read_context
+    branch_result = await _git_read_complete(
+        ["git", "symbolic-ref", "--quiet", "--short", "HEAD"],
+        str(cwd),
+        read_context,
+        source="git symbolic-ref",
     )
     current_branch = branch_result["stdout"].strip()
     if branch_result["returncode"] != 0 or not current_branch:
@@ -987,8 +1053,11 @@ async def _consume_remote_approval(
         raise PermissionError("current branch does not match the approved TaskWorkspace branch")
     if current_branch in _PROTECTED_BRANCHES:
         raise PermissionError("protected branches cannot be pushed")
-    remote_result = await _git_read_via_execution_service(
-        ["git", "remote", "get-url", "--push", remote], str(cwd), read_context
+    remote_result = await _git_read_complete(
+        ["git", "remote", "get-url", "--push", remote],
+        str(cwd),
+        read_context,
+        source="git remote get-url",
     )
     if remote_result["returncode"] != 0:
         raise PermissionError("approved remote is no longer configured")
@@ -1000,7 +1069,7 @@ async def _consume_remote_approval(
         context.credential_context,
         credential_broker=context.credential_broker,
     )
-    head, diff_hash = await _git_state(cwd, read_context)
+    head, diff_hash = await _git_state(cwd, read_context, include_untracked=False)
     current = {
         "principal_id": context.principal_id or binding.get("principal_id"),
         "session_id": context.requester or binding.get("session_id"),
@@ -1027,35 +1096,83 @@ async def _consume_remote_approval(
         raise PermissionError("git_push approval is missing, stale, or replayed")
 
 
-async def _git_state(cwd: Path, context: _GitExecutionContext) -> tuple[str, str]:
-    head_result = await _git_read_via_execution_service(
-        ["git", "rev-parse", "--verify", "HEAD"], str(cwd), context
+async def _git_state(
+    cwd: Path, context: _GitExecutionContext, *, include_untracked: bool = True
+) -> tuple[str, str]:
+    """Capture the approval-bound Git state, complete or fail closed.
+
+    ``include_untracked=False`` binds only state that can change a remote
+    push effect (HEAD OID plus tracked diff): dirty and untracked worktree
+    content is not part of the objects a push transmits, so hashing it would
+    widen the evidence attack surface without changing the authorized
+    effect.  Destructive local operations keep the full snapshot because
+    they act on the worktree itself.
+    """
+    head_result = await _git_read_complete(
+        ["git", "rev-parse", "--verify", "HEAD"], str(cwd), context, source="git rev-parse"
     )
     if head_result["returncode"] != 0:
         raise PermissionError("unable to resolve current HEAD")
-    diff_result = await _git_read_via_execution_service(
-        ["git", "diff", "--no-ext-diff", "--binary", "HEAD", "--"], str(cwd), context
+    diff_result = await _git_read_complete(
+        ["git", "diff", "--no-ext-diff", "--binary", "HEAD", "--"],
+        str(cwd),
+        context,
+        source="git diff",
     )
     if diff_result["returncode"] != 0:
         raise PermissionError("unable to capture worktree diff")
-    status_result = await _git_read_via_execution_service(
-        ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"], str(cwd), context
+    status_result = await _git_read_complete(
+        ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        str(cwd),
+        context,
+        source="git status",
     )
     if status_result["returncode"] != 0:
         raise PermissionError("unable to capture worktree status")
+    untracked_manifest: str | None = None
+    if include_untracked:
+        entries = [
+            entry[3:]
+            for entry in status_result["stdout"].split("\0")
+            if entry.startswith("?? ")
+        ]
+        untracked_manifest = await asyncio.to_thread(
+            snapshot_untracked_files, cwd, entries
+        )
+    digest = _git_evidence_digest(
+        diff_result["stdout"], status_result["stdout"], untracked_manifest
+    )
+    return head_result["stdout"].strip(), digest
+
+
+def _git_evidence_digest(
+    diff_text: str,
+    status_text: str,
+    untracked_manifest: str | None,
+) -> str:
+    """Length-framed digest over the approval evidence parts.
+
+    ``untracked_manifest`` is the hex manifest digest from the bounded
+    snapshot for worktree-acting operations, or ``None`` for push
+    bindings that intentionally exclude non-remote-effect state.
+    """
     digest = hashlib.sha256()
-    digest.update(diff_result["stdout"].encode())
-    digest.update(b"\0")
-    digest.update(status_result["stdout"].encode())
-    for entry in status_result["stdout"].split("\0"):
-        if not entry.startswith("?? "):
-            continue
-        path = (cwd / entry[3:]).resolve()
-        if path != cwd and cwd not in path.parents:
-            raise PermissionError("untracked path escapes the TaskWorkspace")
-        if path.is_file() and not path.is_symlink():
-            digest.update(path.read_bytes())
-    return head_result["stdout"].strip(), digest.hexdigest()
+    digest.update(b"khaos-git-approval-evidence-v2\0")
+    _evidence_frame(digest, b"diff", diff_text.encode())
+    _evidence_frame(digest, b"status", status_text.encode())
+    if untracked_manifest is not None:
+        _evidence_frame(
+            digest, b"untracked-manifest", bytes.fromhex(untracked_manifest)
+        )
+    return digest.hexdigest()
+
+
+def _evidence_frame(digest: Any, tag: bytes, payload: bytes) -> None:
+    """Length-prefixed canonical framing for approval evidence parts."""
+    digest.update(len(tag).to_bytes(4, "big"))
+    digest.update(tag)
+    digest.update(len(payload).to_bytes(8, "big"))
+    digest.update(payload)
 
 
 def _validate_destructive_argv(args: list[str]) -> tuple[str, str]:
