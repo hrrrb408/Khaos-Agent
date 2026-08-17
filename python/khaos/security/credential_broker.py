@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import itertools
 import json
 import re
 import secrets
@@ -27,6 +28,14 @@ from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 
+from khaos.security.credential_provider_host import (
+    CredentialProviderHost,
+    CredentialProviderHostError,
+)
+from khaos.security.credential_provider_worker import (
+    ProviderSpecError,
+    validate_provider_spec,
+)
 from khaos.security.resource_scope import CredentialScope
 
 CredentialLoader = Callable[[], Mapping[str, str]]
@@ -35,6 +44,7 @@ MAX_PROVIDER_ENTRIES = 8
 MAX_PROVIDER_VALUE_BYTES = 64 * 1024
 DEFAULT_PROVIDER_WORKERS = 4
 DEFAULT_PENDING_PROVIDERS = 8
+DEFAULT_PROVIDER_DEADLINE_SECONDS = 60.0
 _ENVIRONMENT_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 
 
@@ -135,8 +145,12 @@ class CredentialLease:
 
 @dataclass(frozen=True, slots=True)
 class _ProviderRecord:
-    loader: CredentialLoader
+    loader: CredentialLoader | None
     schema: CredentialEnvironmentSchema
+    # Hosted providers execute a validated data spec in a killable child
+    # process instead of an in-process callable.
+    spec: Mapping[str, object] | None = None
+    deadline_seconds: float = DEFAULT_PROVIDER_DEADLINE_SECONDS
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,6 +193,13 @@ class CredentialBroker:
     registered until its result has been checked and discarded.  This avoids
     blocking runtime shutdown on an unavailable provider while making
     ``terminal_closed`` false until the provider call settles.
+
+    Providers classified as blocking or untrusted must be registered with
+    ``register_hosted`` instead: their loader is a validated data spec
+    executed by :class:`~khaos.security.credential_provider_host.
+    CredentialProviderHost` in a killable child process, so a permanently
+    hung provider is reclaimed by SIGTERM/SIGKILL within a bounded grace
+    instead of pinning a broker thread (and a clean shutdown) forever.
 
     ``materialize()`` runs the loader on the calling thread and is reserved
     for contexts that already execute off the Agent event loop (background
@@ -226,6 +247,8 @@ class CredentialBroker:
             thread_name_prefix="khaos-credential-provider",
         )
         self._async_provider_admission = 0
+        self._active_hosts: dict[int, CredentialProviderHost] = {}
+        self._host_tokens = itertools.count(1)
         self._lock = threading.RLock()
         self._generation = 0
         self._closing = False
@@ -259,6 +282,49 @@ class CredentialBroker:
         with self._lock:
             self._ensure_open()
             self._loaders[scope.digest()] = _ProviderRecord(loader, schema)
+
+    def register_hosted(
+        self,
+        scope: CredentialScope,
+        spec: Mapping[str, object],
+        *,
+        allowed_environment_keys: Iterable[str] | None = None,
+        max_entries: int | None = None,
+        max_value_bytes: int = MAX_PROVIDER_VALUE_BYTES,
+        deadline_seconds: float = DEFAULT_PROVIDER_DEADLINE_SECONDS,
+    ) -> None:
+        """Register a blocking/untrusted provider as a killable child spec.
+
+        Hosted containment is the classification boundary for providers
+        that may hang (keychain integrations, network-backed secret
+        stores, enterprise plugins): the spec is validated data, the
+        loader runs in a dedicated child process, and any deadline breach
+        or broker close escalates SIGTERM → SIGKILL → wait so physical
+        reclamation never requires exiting the trusted runtime.
+        """
+        if not isinstance(scope, CredentialScope):
+            raise CredentialBrokerError("credential provider registration is invalid")
+        try:
+            validate_provider_spec(spec)
+        except ProviderSpecError as exc:
+            raise CredentialBrokerError(f"credential provider spec is invalid: {exc}") from exc
+        if deadline_seconds <= 0:
+            raise CredentialBrokerError("credential provider deadline must be positive")
+        schema = self._schema_for_scope(
+            scope,
+            allowed_environment_keys=allowed_environment_keys,
+            max_entries=max_entries,
+            max_value_bytes=max_value_bytes,
+        )
+        record = _ProviderRecord(
+            None,
+            schema,
+            spec=dict(spec),
+            deadline_seconds=deadline_seconds,
+        )
+        with self._lock:
+            self._ensure_open()
+            self._loaders[scope.digest()] = record
 
     def bind_runtime(self, *, policy_digest: str, principal_id: str) -> None:
         """Bind this broker to one immutable runtime identity."""
@@ -413,6 +479,15 @@ class CredentialBroker:
             provider, transaction = self._reserve_materialization_locked(
                 lease, expected_binding, operation
             )
+        if provider.spec is not None:
+            with self._lock:
+                self._abort_materialization_locked(
+                    transaction.transaction_id, lease.lease_id
+                )
+            raise CredentialBrokerError(
+                "hosted credential providers require materialize_async "
+                "so the kill ladder can run on the event loop"
+            )
         succeeded = False
         try:
             try:
@@ -487,14 +562,23 @@ class CredentialBroker:
         async def _owned_worker() -> dict[str, str]:
             try:
                 try:
-                    environment = await loop.run_in_executor(
-                        provider_executor, provider.loader
-                    )
+                    if provider.spec is None:
+                        environment = await loop.run_in_executor(
+                            provider_executor, provider.loader
+                        )
+                    else:
+                        environment = await self._run_hosted_provider(provider)
                 finally:
                     # The provider call (running or queued) no longer holds an
                     # admission slot once the loader itself has settled.
                     with self._lock:
                         self._async_provider_admission -= 1
+            except CredentialBrokerError:
+                with self._lock:
+                    self._abort_materialization_locked(
+                        transaction.transaction_id, lease.lease_id
+                    )
+                raise
             except Exception as exc:
                 with self._lock:
                     self._abort_materialization_locked(
@@ -527,6 +611,31 @@ class CredentialBroker:
             self._cancel_materialization(transaction.transaction_id)
             raise
 
+    async def _run_hosted_provider(
+        self, provider: _ProviderRecord
+    ) -> dict[str, str]:
+        """Execute one hosted provider spec under tracked host ownership.
+
+        The host stays registered in ``_active_hosts`` for the entire child
+        lifetime so ``owned_resources()`` and ``close()`` can see — and
+        terminate — a provider that is hung.  Registration ends only after
+        the child has been proven terminal, so the broker never reports
+        CLOSED over a live provider host.
+        """
+        host = CredentialProviderHost()
+        token = next(self._host_tokens)
+        with self._lock:
+            self._active_hosts[token] = host
+        try:
+            return await host.materialize(
+                provider.spec or {}, deadline=provider.deadline_seconds
+            )
+        except CredentialProviderHostError as exc:
+            raise CredentialBrokerError(str(exc)) from exc
+        finally:
+            with self._lock:
+                self._active_hosts.pop(token, None)
+
     def revoke(self, lease: CredentialLease) -> None:
         """Revoke one lease; any in-flight claim will fail its return fence."""
         if not isinstance(lease, CredentialLease):
@@ -538,7 +647,7 @@ class CredentialBroker:
                 self._maybe_complete_close_locked()
 
     def owned_resources(self) -> tuple[str, ...]:
-        """Return leases and provider calls still owned by this broker."""
+        """Return leases, provider calls, and hosts still owned by this broker."""
         with self._lock:
             resources = [
                 f"credential-lease:{lease_id}" for lease_id in self._leases
@@ -546,6 +655,11 @@ class CredentialBroker:
             resources.extend(
                 f"credential-materialization:{transaction_id}"
                 for transaction_id in self._materializations
+            )
+            resources.extend(
+                f"credential-provider-host:{host.pid}"
+                for host in self._active_hosts.values()
+                if host.alive
             )
             return tuple(sorted(resources))
 
@@ -561,6 +675,12 @@ class CredentialBroker:
                 return
             self._closing = True
             self._leases.clear()
+            # Every owned provider host receives SIGTERM immediately; the
+            # hosted workers finish the kill ladder and abort their
+            # transactions, so a hung provider delays close by the bounded
+            # termination grace, not by its full materialization deadline.
+            for host in tuple(self._active_hosts.values()):
+                host.request_termination()
             if self._materializations:
                 self._quarantined = True
                 return
@@ -603,7 +723,12 @@ class CredentialBroker:
     def terminal_closed(self) -> bool:
         """Return true only after close and all owned transactions are terminal."""
         with self._lock:
-            return self._closed and not self._leases and not self._materializations
+            return (
+                self._closed
+                and not self._leases
+                and not self._materializations
+                and not any(host.alive for host in self._active_hosts.values())
+            )
 
     def _reserve_materialization_locked(
         self,
@@ -763,7 +888,13 @@ class CredentialBroker:
         self._maybe_complete_close_locked()
 
     def _maybe_complete_close_locked(self) -> None:
-        if self._closing and not self._materializations and not self._leases:
+        hosts_alive = any(host.alive for host in self._active_hosts.values())
+        if (
+            self._closing
+            and not self._materializations
+            and not self._leases
+            and not hosts_alive
+        ):
             self._closed = True
             self._loaders.clear()
             self._quarantined = False
