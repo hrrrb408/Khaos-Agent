@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import threading
 import time
 
@@ -12,6 +13,16 @@ from khaos.security.credential_broker import (
     CredentialEnvironmentSchema,
 )
 from khaos.security.resource_scope import CredentialScope
+
+
+async def _await_terminal(broker: CredentialBroker, budget: float = 5.0) -> bool:
+    """Poll until every owned lease/transaction settles."""
+    deadline = time.monotonic() + budget
+    while time.monotonic() < deadline:
+        if broker.terminal_postcondition():
+            return True
+        await asyncio.sleep(0.01)
+    return broker.terminal_postcondition()
 
 
 def _github_scope(*operations: str) -> CredentialScope:
@@ -451,3 +462,203 @@ def test_provider_rejects_unencodable_unicode_environment_value() -> None:
     lease = broker.issue(scope, binding="target", operation="read")
     with pytest.raises(CredentialBrokerError, match="invalid environment text"):
         broker.materialize(lease, binding="target", operation="read")
+
+
+async def test_materialize_async_keeps_event_loop_responsive_while_provider_blocks() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    broker = CredentialBroker()
+    scope = _github_scope("github_read_issue")
+
+    def loader() -> dict[str, str]:
+        entered.set()
+        assert release.wait(5.0)
+        return {"GH_TOKEN": "secret"}
+
+    broker.register(scope, loader)
+    lease = broker.issue(
+        scope,
+        binding={"host": "github.com", "repository": "owner/repo"},
+        operation="github_read_issue",
+    )
+    heartbeats = 0
+
+    async def heartbeat() -> None:
+        nonlocal heartbeats
+        while True:
+            heartbeats += 1
+            await asyncio.sleep(0)
+
+    ticker = asyncio.ensure_future(heartbeat())
+    material = asyncio.ensure_future(
+        broker.materialize_async(
+            lease,
+            binding={"host": "github.com", "repository": "owner/repo"},
+            operation="github_read_issue",
+        )
+    )
+    try:
+        assert await asyncio.to_thread(entered.wait, 2.0)
+        for _ in range(100):
+            if heartbeats >= 10:
+                break
+            await asyncio.sleep(0.01)
+        assert heartbeats >= 10
+        release.set()
+        environment = await material
+        assert environment == {"GH_TOKEN": "secret"}
+    finally:
+        release.set()
+        ticker.cancel()
+    assert broker.terminal_postcondition()
+
+
+async def test_cancel_materialize_async_while_provider_blocked_returns_no_secret() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    broker = CredentialBroker()
+    scope = _github_scope("github_read_issue")
+
+    def loader() -> dict[str, str]:
+        entered.set()
+        assert release.wait(5.0)
+        return {"GH_TOKEN": "must-not-return"}
+
+    broker.register(scope, loader)
+    lease = broker.issue(
+        scope,
+        binding={"host": "github.com", "repository": "owner/repo"},
+        operation="github_read_issue",
+    )
+    material = asyncio.ensure_future(
+        broker.materialize_async(
+            lease,
+            binding={"host": "github.com", "repository": "owner/repo"},
+            operation="github_read_issue",
+        )
+    )
+    assert await asyncio.to_thread(entered.wait, 2.0)
+    material.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await material
+    # The caller vanished, but the transaction stays owned until the
+    # provider worker settles; the secret is discarded, never returned.
+    assert any(
+        item.startswith("credential-materialization:")
+        for item in broker.owned_resources()
+    )
+    assert not broker.terminal_postcondition()
+    release.set()
+    assert await _await_terminal(broker)
+
+
+async def test_revoke_while_async_provider_blocked_returns_no_secret() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    broker = CredentialBroker()
+    scope = _github_scope("github_read_issue")
+
+    def loader() -> dict[str, str]:
+        entered.set()
+        assert release.wait(5.0)
+        return {"GH_TOKEN": "must-not-return"}
+
+    broker.register(scope, loader)
+    lease = broker.issue(
+        scope,
+        binding={"host": "github.com", "repository": "owner/repo"},
+        operation="github_read_issue",
+    )
+    material = asyncio.ensure_future(
+        broker.materialize_async(
+            lease,
+            binding={"host": "github.com", "repository": "owner/repo"},
+            operation="github_read_issue",
+        )
+    )
+    assert await asyncio.to_thread(entered.wait, 2.0)
+    broker.revoke(lease)
+    release.set()
+    with pytest.raises(CredentialBrokerError, match="revoked"):
+        await material
+    assert broker.terminal_postcondition()
+
+
+async def test_close_while_async_provider_blocked_never_claims_false_closed() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    broker = CredentialBroker()
+    scope = _github_scope("github_read_issue")
+
+    def loader() -> dict[str, str]:
+        entered.set()
+        assert release.wait(5.0)
+        return {"GH_TOKEN": "must-not-return"}
+
+    broker.register(scope, loader)
+    lease = broker.issue(
+        scope,
+        binding={"host": "github.com", "repository": "owner/repo"},
+        operation="github_read_issue",
+    )
+    material = asyncio.ensure_future(
+        broker.materialize_async(
+            lease,
+            binding={"host": "github.com", "repository": "owner/repo"},
+            operation="github_read_issue",
+        )
+    )
+    assert await asyncio.to_thread(entered.wait, 2.0)
+    broker.close()
+    assert broker.generation_admission_closed
+    assert broker.is_quarantined
+    assert not broker.terminal_closed
+    release.set()
+    with pytest.raises(CredentialBrokerError):
+        await material
+    assert broker.terminal_closed
+    assert not broker.is_quarantined
+
+
+async def test_materialize_async_timeout_fails_closed_and_settles_without_zombie() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    broker = CredentialBroker()
+    scope = _github_scope("github_read_issue")
+
+    def loader() -> dict[str, str]:
+        entered.set()
+        assert release.wait(5.0)
+        return {"GH_TOKEN": "must-not-return"}
+
+    broker.register(scope, loader)
+    lease = broker.issue(
+        scope,
+        binding={"host": "github.com", "repository": "owner/repo"},
+        operation="github_read_issue",
+    )
+    material = asyncio.ensure_future(
+        broker.materialize_async(
+            lease,
+            binding={"host": "github.com", "repository": "owner/repo"},
+            operation="github_read_issue",
+            timeout=0.05,
+        )
+    )
+    assert await asyncio.to_thread(entered.wait, 2.0)
+    with pytest.raises(CredentialBrokerError, match="timed out"):
+        await material
+    # Timed out but still owned: never an anonymous zombie transaction.
+    assert any(
+        item.startswith("credential-materialization:")
+        for item in broker.owned_resources()
+    )
+    assert not broker.terminal_postcondition()
+    release.set()
+    assert await _await_terminal(broker)
+    with pytest.raises(CredentialBrokerError, match="unknown or revoked"):
+        broker.materialize(
+            lease,
+            binding={"host": "github.com", "repository": "owner/repo"},
+            operation="github_read_issue",
+        )

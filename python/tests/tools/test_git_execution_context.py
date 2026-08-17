@@ -797,6 +797,199 @@ async def test_git_push_rejects_remote_and_refspec_injection(tmp_path, remote, b
         )
 
 
+class _CountingCredentialHarness:
+    """Recording push harness with a broker-backed counting Git provider."""
+
+    def __init__(self, tmp_path):
+        from khaos.security.credential_broker import CredentialBroker
+        from khaos.security.resource_scope import CredentialScope
+
+        self.remote_url = "git@example.com:org/repo.git"
+        self.head = "c" * 40
+        self.workspace = SimpleNamespace(
+            task_id="task-a",
+            worktree_path=tmp_path,
+            repository_root=tmp_path.parent / "main-worktree",
+            branch_name="task/test",
+            state=WorkspaceState.RUNNING,
+        )
+        self.loader_calls: list[int] = []
+        self.broker = CredentialBroker()
+        self.scope = CredentialScope(
+            provider="git",
+            names=frozenset({"ssh-agent"}),
+            operations=frozenset({"git_push"}),
+        )
+        self.broker.register(self.scope, self._loader)
+        self.lease = self.broker.issue_named(
+            provider="git",
+            name="ssh-agent",
+            operation="git_push",
+            binding={"remote_url": self.remote_url, "host": "example.com"},
+        )
+
+    def _loader(self):
+        self.loader_calls.append(1)
+        return {"SSH_AUTH_SOCK": "/private/tmp/test-agent.sock"}
+
+    def service(self, outputs):
+        return _RecordingExecutionService(self.workspace, outputs=outputs)
+
+    async def prepare(self, approval_broker, approval_id):
+        tool_context = {
+            "task_id": "task-a",
+            "workspace_id": "w",
+            "execution_service": self.service(
+                ["task/test\n", self.remote_url, self.head, "", ""]
+            ),
+            "approval_broker": approval_broker,
+            "network_policy": "unrestricted-with-approval",
+            "credential_lease": self.lease,
+            "credential_broker": self.broker,
+        }
+        return await prepare_remote_git_approval(
+            "git_push",
+            {"cwd": ".", "remote": "origin", "branch": ""},
+            tool_context,
+            requester="session",
+            approval_id=approval_id,
+        )
+
+
+async def test_git_push_provider_loader_runs_exactly_once_and_only_after_approval(tmp_path):
+    """Closure matrix: prepare/reject/consume keep the loader at zero."""
+    harness = _CountingCredentialHarness(tmp_path)
+    broker = ApprovalBroker()
+
+    # 1. Approval preparation touches credential metadata only.
+    approval = await harness.prepare(broker, "push-1")
+    assert approval is not None
+    assert harness.loader_calls == []
+    assert f"credential-lease:{harness.lease.lease_id}" in harness.broker.owned_resources()
+
+    # 2. User rejects: the approval is cancelled and can never reach a push.
+    await broker.cancel_operation("push-1")
+    assert harness.loader_calls == []
+    denied = json.loads(await git_push(
+        ".",
+        task_id="task-a",
+        workspace_id="w",
+        execution_service=harness.service(
+            ["task/test\n", "task/test\n", harness.remote_url, harness.head, "", ""]
+        ),
+        approval_context=approval,
+        network_policy="unrestricted-with-approval",
+        credential_context=harness.lease,
+        credential_broker=harness.broker,
+        network_lease=object(),
+    ))
+    assert denied["pushed"] is False
+    assert "replayed" in denied["error"] or "stale" in denied["error"]
+    assert harness.loader_calls == []
+    # The one-shot lease survived rejection untouched.
+    assert f"credential-lease:{harness.lease.lease_id}" in harness.broker.owned_resources()
+
+    # 3. Approval consumption also stays metadata-only; only the exact push
+    #    runs the provider loader, and it runs exactly once.
+    approval = await harness.prepare(broker, "push-2")
+    assert await broker.approve_operation("push-2", "session")
+    assert harness.loader_calls == []
+    result = json.loads(await git_push(
+        ".",
+        task_id="task-a",
+        workspace_id="w",
+        execution_service=harness.service(
+            ["task/test\n", "task/test\n", harness.remote_url, harness.head, "", "", ""]
+        ),
+        approval_context=approval,
+        network_policy="unrestricted-with-approval",
+        credential_context=harness.lease,
+        credential_broker=harness.broker,
+        network_lease=object(),
+    ))
+    assert result["pushed"] is True
+    assert result["credential_scope"] == "ssh-agent"
+    assert harness.loader_calls == [1]
+    assert harness.broker.terminal_postcondition()
+
+
+async def test_git_push_broker_issued_credential_also_loads_exactly_once(tmp_path):
+    """Without a pre-issued lease the broker issues and loads exactly once."""
+    harness = _CountingCredentialHarness(tmp_path)
+    broker = ApprovalBroker()
+    harness.broker.revoke(harness.lease)
+
+    tool_context = {
+        "task_id": "task-a",
+        "workspace_id": "w",
+        "execution_service": harness.service(
+            ["task/test\n", harness.remote_url, harness.head, "", ""]
+        ),
+        "approval_broker": broker,
+        "network_policy": "unrestricted-with-approval",
+        "credential_context": None,
+        "credential_broker": harness.broker,
+    }
+    approval = await prepare_remote_git_approval(
+        "git_push",
+        {"cwd": ".", "remote": "origin", "branch": ""},
+        tool_context,
+        requester="session",
+        approval_id="push",
+    )
+    assert approval is not None
+    assert await broker.approve_operation("push", "session")
+    assert harness.loader_calls == []
+    result = json.loads(await git_push(
+        ".",
+        task_id="task-a",
+        workspace_id="w",
+        execution_service=harness.service(
+            ["task/test\n", "task/test\n", harness.remote_url, harness.head, "", "", ""]
+        ),
+        approval_context=approval,
+        network_policy="unrestricted-with-approval",
+        credential_context=None,
+        credential_broker=harness.broker,
+        network_lease=object(),
+    ))
+    assert result["pushed"] is True
+    assert harness.loader_calls == [1]
+    assert harness.broker.terminal_postcondition()
+
+
+async def test_git_push_lease_with_wrong_effect_metadata_is_rejected_at_prepare(tmp_path):
+    """A lease bound to another effect cannot even enter the approval."""
+    harness = _CountingCredentialHarness(tmp_path)
+    wrong_lease = harness.broker.issue_named(
+        provider="git",
+        name="ssh-agent",
+        operation="git_push",
+        binding={"remote_url": harness.remote_url, "host": "other.example"},
+    )
+    broker = ApprovalBroker()
+    tool_context = {
+        "task_id": "task-a",
+        "workspace_id": "w",
+        "execution_service": harness.service(
+            ["task/test\n", harness.remote_url, harness.head, "", ""]
+        ),
+        "approval_broker": broker,
+        "network_policy": "unrestricted-with-approval",
+        "credential_lease": wrong_lease,
+        "credential_broker": harness.broker,
+    }
+    with pytest.raises(PermissionError, match="does not match"):
+        await prepare_remote_git_approval(
+            "git_push",
+            {"cwd": ".", "remote": "origin", "branch": ""},
+            tool_context,
+            requester="session",
+            approval_id="wrong",
+        )
+    assert harness.loader_calls == []
+
+
 def test_git_tools_has_no_direct_subprocess_path():
     import khaos.tools.git_tools as git_tools_module
 

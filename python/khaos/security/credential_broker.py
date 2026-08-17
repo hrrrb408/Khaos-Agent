@@ -24,7 +24,7 @@ import secrets
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from khaos.security.resource_scope import CredentialScope
 
@@ -147,6 +147,7 @@ class _MaterializationRecord:
     transaction_id: str
     lease_id: str
     generation: int
+    canceled: bool = False
 
 
 def credential_binding_digest(
@@ -175,6 +176,12 @@ class CredentialBroker:
     registered until its result has been checked and discarded.  This avoids
     blocking runtime shutdown on an unavailable provider while making
     ``terminal_closed`` false until the provider call settles.
+
+    ``materialize()`` runs the loader on the calling thread and is reserved
+    for contexts that already execute off the Agent event loop (background
+    workers, threads).  Async callers must use ``materialize_async()``, which
+    moves the same owned transaction onto an executor so a slow or hung
+    provider can never block cancellation, shutdown, or other sessions.
     """
 
     def __init__(
@@ -379,73 +386,96 @@ class CredentialBroker:
             raise CredentialBrokerError("credential operation is invalid")
         expected_binding = credential_binding_digest(binding, operation)
         with self._lock:
-            self._ensure_open()
-            record = self._leases.get(lease.lease_id)
-            if record is None or record.lease != lease:
-                raise CredentialBrokerError("credential lease is unknown or revoked")
-            if lease.authorized_operation != operation:
-                raise CredentialBrokerError(
-                    "credential lease is bound to a different operation"
-                )
-            if lease.binding_digest != expected_binding:
-                raise CredentialBrokerError("credential lease target binding changed")
-            if (
-                lease.generation != self._generation
-                or lease.policy_digest != self.policy_digest
-                or lease.principal_id != self.principal_id
-            ):
-                raise CredentialBrokerError("credential lease runtime binding changed")
-            if lease.expires_at <= time.time():
-                self._leases.pop(lease.lease_id, None)
-                raise CredentialBrokerError("credential lease is expired")
-            if lease.lease_id in self._materialization_by_lease:
-                raise CredentialBrokerError("credential lease has already been claimed")
-            transaction_id = secrets.token_urlsafe(24)
-            transaction = _MaterializationRecord(
-                transaction_id=transaction_id,
-                lease_id=lease.lease_id,
-                generation=lease.generation,
+            provider, transaction = self._reserve_materialization_locked(
+                lease, expected_binding, operation
             )
-            self._materializations[transaction_id] = transaction
-            self._materialization_by_lease[lease.lease_id] = transaction_id
-            loader = record.provider.loader
-            schema = record.provider.schema
-
         succeeded = False
         try:
             try:
-                environment = loader()
+                environment = provider.loader()
             except Exception as exc:
                 raise CredentialBrokerError("credential provider failed") from exc
-            normalized = self._validate_environment(environment, schema)
+            normalized = self._validate_environment(environment, provider.schema)
             with self._lock:
-                current = self._leases.get(lease.lease_id)
-                current_transaction = self._materializations.get(transaction_id)
-                if current is None or current.lease != lease or current_transaction is None:
-                    raise CredentialBrokerError(
-                        "credential lease was revoked during materialization"
-                    )
-                if self._closing or self._closed:
-                    raise CredentialBrokerError(
-                        "credential broker closed during materialization"
-                    )
-                if transaction.generation != self._generation:
-                    raise CredentialBrokerError(
-                        "credential lease generation changed during materialization"
-                    )
-                if lease.expires_at <= time.time():
-                    raise CredentialBrokerError(
-                        "credential lease expired during materialization"
-                    )
-                # The operation and target digest were checked before the
-                # provider call and the immutable lease still matches here.
-                self._finish_materialization_locked(transaction_id, lease.lease_id)
+                result = self._settle_materialization_locked(
+                    lease, transaction, normalized
+                )
                 succeeded = True
-                return normalized
+                return result
         finally:
             if not succeeded:
                 with self._lock:
-                    self._abort_materialization_locked(transaction_id, lease.lease_id)
+                    self._abort_materialization_locked(
+                        transaction.transaction_id, lease.lease_id
+                    )
+
+    async def materialize_async(
+        self,
+        lease: CredentialLease,
+        *,
+        binding: Mapping[str, object] | str,
+        operation: str,
+        timeout: float | None = None,
+        executor: object | None = None,
+    ) -> dict[str, str]:
+        """Claim one lease without letting a provider block the event loop.
+
+        The provider loader runs on an executor while this coroutine only
+        awaits its completion.  Caller cancellation and provider timeout mark
+        the materialization transaction canceled: any secret the worker still
+        produces is discarded by the return fence, and the transaction stays
+        owned until the worker settles, so ``close()`` never observes a false
+        terminal state while a provider call is still executing.
+        """
+        if not isinstance(lease, CredentialLease):
+            raise CredentialBrokerError("credential lease is invalid")
+        if type(operation) is not str or not operation:
+            raise CredentialBrokerError("credential operation is invalid")
+        if timeout is not None and (
+            type(timeout) not in (int, float) or timeout <= 0
+        ):
+            raise CredentialBrokerError("credential provider timeout is invalid")
+        expected_binding = credential_binding_digest(binding, operation)
+        with self._lock:
+            provider, transaction = self._reserve_materialization_locked(
+                lease, expected_binding, operation
+            )
+        loop = asyncio.get_running_loop()
+
+        async def _owned_worker() -> dict[str, str]:
+            try:
+                environment = await loop.run_in_executor(executor, provider.loader)
+            except Exception as exc:
+                with self._lock:
+                    self._abort_materialization_locked(
+                        transaction.transaction_id, lease.lease_id
+                    )
+                raise CredentialBrokerError("credential provider failed") from exc
+            try:
+                normalized = self._validate_environment(environment, provider.schema)
+            except CredentialBrokerError:
+                with self._lock:
+                    self._abort_materialization_locked(
+                        transaction.transaction_id, lease.lease_id
+                    )
+                raise
+            with self._lock:
+                return self._settle_materialization_locked(
+                    lease, transaction, normalized
+                )
+
+        worker = asyncio.ensure_future(_owned_worker())
+        worker.add_done_callback(self._reap_worker)
+        try:
+            if timeout is None:
+                return await asyncio.shield(worker)
+            return await asyncio.wait_for(asyncio.shield(worker), timeout)
+        except TimeoutError as exc:
+            self._cancel_materialization_locked(transaction.transaction_id)
+            raise CredentialBrokerError("credential provider timed out") from exc
+        except asyncio.CancelledError:
+            self._cancel_materialization_locked(transaction.transaction_id)
+            raise
 
     def revoke(self, lease: CredentialLease) -> None:
         """Revoke one lease; any in-flight claim will fail its return fence."""
@@ -521,6 +551,106 @@ class CredentialBroker:
         """Return true only after close and all owned transactions are terminal."""
         with self._lock:
             return self._closed and not self._leases and not self._materializations
+
+    def _reserve_materialization_locked(
+        self,
+        lease: CredentialLease,
+        expected_binding: str,
+        operation: str,
+    ) -> tuple[_ProviderRecord, _MaterializationRecord]:
+        """Validate a claim and register its transaction; caller holds the lock."""
+        self._ensure_open()
+        record = self._leases.get(lease.lease_id)
+        if record is None or record.lease != lease:
+            raise CredentialBrokerError("credential lease is unknown or revoked")
+        if lease.authorized_operation != operation:
+            raise CredentialBrokerError(
+                "credential lease is bound to a different operation"
+            )
+        if lease.binding_digest != expected_binding:
+            raise CredentialBrokerError("credential lease target binding changed")
+        if (
+            lease.generation != self._generation
+            or lease.policy_digest != self.policy_digest
+            or lease.principal_id != self.principal_id
+        ):
+            raise CredentialBrokerError("credential lease runtime binding changed")
+        if lease.expires_at <= time.time():
+            self._leases.pop(lease.lease_id, None)
+            raise CredentialBrokerError("credential lease is expired")
+        if lease.lease_id in self._materialization_by_lease:
+            raise CredentialBrokerError("credential lease has already been claimed")
+        transaction_id = secrets.token_urlsafe(24)
+        transaction = _MaterializationRecord(
+            transaction_id=transaction_id,
+            lease_id=lease.lease_id,
+            generation=lease.generation,
+        )
+        self._materializations[transaction_id] = transaction
+        self._materialization_by_lease[lease.lease_id] = transaction_id
+        return record.provider, transaction
+
+    def _settle_materialization_locked(
+        self,
+        lease: CredentialLease,
+        transaction: _MaterializationRecord,
+        normalized: dict[str, str],
+    ) -> dict[str, str]:
+        """Re-check every fence after the loader returns; finish or fail closed."""
+        current = self._leases.get(lease.lease_id)
+        current_transaction = self._materializations.get(transaction.transaction_id)
+        if current_transaction is not None and current_transaction.canceled:
+            self._abort_materialization_locked(
+                transaction.transaction_id, lease.lease_id
+            )
+            raise CredentialBrokerError(
+                "credential materialization was canceled while the provider ran"
+            )
+        if current is None or current.lease != lease or current_transaction is None:
+            self._abort_materialization_locked(
+                transaction.transaction_id, lease.lease_id
+            )
+            raise CredentialBrokerError(
+                "credential lease was revoked during materialization"
+            )
+        if self._closing or self._closed:
+            self._abort_materialization_locked(
+                transaction.transaction_id, lease.lease_id
+            )
+            raise CredentialBrokerError(
+                "credential broker closed during materialization"
+            )
+        if transaction.generation != self._generation:
+            self._abort_materialization_locked(
+                transaction.transaction_id, lease.lease_id
+            )
+            raise CredentialBrokerError(
+                "credential lease generation changed during materialization"
+            )
+        if lease.expires_at <= time.time():
+            self._abort_materialization_locked(
+                transaction.transaction_id, lease.lease_id
+            )
+            raise CredentialBrokerError(
+                "credential lease expired during materialization"
+            )
+        # The operation and target digest were checked before the provider
+        # call and the immutable lease still matches here.
+        self._finish_materialization_locked(transaction.transaction_id, lease.lease_id)
+        return normalized
+
+    def _cancel_materialization_locked(self, transaction_id: str) -> None:
+        """Mark a transaction canceled; it stays owned until the worker settles."""
+        transaction = self._materializations.get(transaction_id)
+        if transaction is None or transaction.canceled:
+            return
+        self._materializations[transaction_id] = replace(transaction, canceled=True)
+
+    @staticmethod
+    def _reap_worker(worker: asyncio.Future[dict[str, str]]) -> None:
+        """Retrieve worker exceptions so settled transactions never warn."""
+        if not worker.cancelled():
+            worker.exception()
 
     def _ensure_open(self) -> None:
         if self._closing or self._closed:
