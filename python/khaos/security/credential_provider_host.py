@@ -31,6 +31,7 @@ import os
 import signal
 import sys
 from collections.abc import Mapping
+from pathlib import Path
 
 from khaos.security.credential_provider_worker import (
     environment_passthrough_names,
@@ -162,8 +163,22 @@ class CredentialProviderHost:
             )
 
     def _worker_environment(self, spec: Mapping[str, object]) -> dict[str, str]:
-        """Give the worker only PATH plus the variables its spec reads."""
+        """Give the worker only PATH, the package root, and spec variables.
+
+        The worker itself depends on the standard library only, so pointing
+        ``PYTHONPATH`` at the directory that contains the ``khaos`` package
+        keeps the child importable from any spawn context (repo root,
+        installed venv, CI) without inheriting further environment state.
+        """
+        package_root = str(Path(__file__).resolve().parents[2])
         environment = {"PATH": os.environ.get("PATH", "")}
+        existing_pythonpath = os.environ.get("PYTHONPATH")
+        if existing_pythonpath:
+            environment["PYTHONPATH"] = os.pathsep.join(
+                (package_root, existing_pythonpath)
+            )
+        else:
+            environment["PYTHONPATH"] = package_root
         for name in sorted(environment_passthrough_names(spec)):
             value = os.environ.get(name)
             if value is not None:

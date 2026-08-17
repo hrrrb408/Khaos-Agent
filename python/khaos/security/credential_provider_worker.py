@@ -114,8 +114,14 @@ def run_provider_spec(spec: Mapping[str, object]) -> dict[str, str]:
             material[str(output_key)] = value
         return material
     if kind == "command":
-        argv = [str(part) for part in spec.get("argv", [])]
-        timeout = float(spec.get("timeout_seconds", _DEFAULT_COMMAND_TIMEOUT))
+        raw_argv = spec.get("argv")
+        if not isinstance(raw_argv, (list, tuple)) or not raw_argv:
+            raise ProviderSpecError("command provider requires an argv list")
+        argv = [str(part) for part in raw_argv]
+        raw_timeout = spec.get("timeout_seconds", _DEFAULT_COMMAND_TIMEOUT)
+        if not isinstance(raw_timeout, (int, float)):
+            raise ProviderSpecError("command provider timeout is invalid")
+        timeout = float(raw_timeout)
         try:
             completed = subprocess.run(
                 argv,
@@ -139,7 +145,10 @@ def run_provider_spec(spec: Mapping[str, object]) -> dict[str, str]:
             raise ProviderSpecError("provider command output is not JSON") from exc
         return _validate_environment_shape(payload)
     if kind == "sleep":
-        seconds = float(spec.get("seconds", 0))
+        raw_seconds = spec.get("seconds", 0)
+        if not isinstance(raw_seconds, (int, float)):
+            raise ProviderSpecError("sleep provider duration is invalid")
+        seconds = float(raw_seconds)
         time.sleep(seconds)
         return {"PROVIDER_SLEPT": f"{seconds:g}"}
     raise ProviderSpecError("credential provider spec type is not supported")
