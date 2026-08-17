@@ -525,6 +525,8 @@ scope:
 8. **file_search_content 使用线性时间正则**：用户提供的 pattern 通过 google-re2 编译（线性时间、拒绝灾难性回溯），绝不使用 Python `re`；pattern 长度 ≤ 256，单行 ≤ 64 KiB。
 9. **khaos_policy.yaml 是唯一安全权威**：启动时编译为不可变 `EffectiveSecurityPolicy`（user ∩ project ∩ platform，只能收紧）。`allowed_paths` 编译为 root capabilities；`commands_require_approval` 是 PermissionEngine 的前置闸门，覆盖持久 auto-approve rule；未知 mode / malformed YAML / 未知字段 → **fail closed**（启动失败或 read-only，绝不静默回退到 workspace-write）。审批绑定包含 effective policy digest。
 10. **Trusted Git、workspace bootstrap 与 ChangeSet artifact 必须独立限额并 fail closed**：Git 只允许审计过的 plumbing 操作；禁止 checkout/filter/textconv/external diff、porcelain add/commit 和 signing helper。bootstrap 在 pending worktree 中按 blob、条目、深度、symlink、时长和总字节限额 materialize，完整校验并 controlled publish 后才注册正式 workspace。每个 workspace 的 ChangeSet artifact 最多 64 个、总计 256 MiB，并在 workspace cleanup 或失败时回收。Git submodule/gitlink（mode `160000`）当前不 materialize，也不自动执行 `git submodule update`。
+11. **Approval Evidence 是 bounded TCB 输入且必须完整**（M5.5）：security approval snapshot 不得对 model-controlled workspace 数据做无界 host 侧读取（禁止 `Path.read_bytes()` 类调用）；untracked 内容 hashing 必须走 `python/khaos/security/git_evidence.py` 的 race-safe snapshotter——组件级 `O_NOFOLLOW` root-relative 打开、`fstat` regular-file 校验、per-file/total-byte/file-count/wall-clock 预算、symlink/FIFO/socket/device 一律 fail closed。被 supervisor 截断的 Git 输出（`output_truncated` diagnostics）绝不能进入 approval digest：security evidence 必须 Complete 或 Fail Closed。`git push` approval 只绑定能改变 remote effect 的状态（HEAD OID、tracked diff、remote/refspec identity），不读取 untracked 内容。
+12. **可阻塞 Credential provider 必须可物理回收，网络前置 authority 必须可预留**（M5.5）：blocking/untrusted provider 通过 `CredentialBroker.register_hosted` 注册为 data spec，由 `CredentialProviderHost` 在独立子进程执行；deadline breach 或 broker close 触发 SIGTERM → grace → SIGKILL → wait 的回收阶梯，broker 不得在任何 owned provider host 存活时报告 CLOSED。`git_push` 的前置网络 authority 以 `NetworkReservation`（PREPARED→RESERVED→CLAIMED→TERMINAL，one-shot）预留：credential claim 前必须 `ensure_live`，authority 在 secret 之前被 revoke 则 provider 调用数必须为 0。
 
 ---
 
@@ -579,5 +581,5 @@ khaos test --all
 
 ---
 
-*最后更新：2026-08-11*
+*最后更新：2026-08-18*
 *维护者：瑞邦 + Hermes Agent*
