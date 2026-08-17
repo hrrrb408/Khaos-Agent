@@ -662,3 +662,216 @@ async def test_materialize_async_timeout_fails_closed_and_settles_without_zombie
             binding={"host": "github.com", "repository": "owner/repo"},
             operation="github_read_issue",
         )
+
+
+def _assert_tables_consistent(broker: CredentialBroker) -> None:
+    """Materialization state tables must always agree under the lock."""
+    with broker._lock:
+        assert set(broker._materialization_by_lease.values()) == set(
+            broker._materializations
+        )
+        if not broker._materializations:
+            assert not broker._materialization_by_lease
+
+
+async def test_provider_admission_is_bounded_and_fails_closed() -> None:
+    """Workers + queued calls saturate; the next claim fails closed."""
+    release = threading.Event()
+    calls: list[int] = []
+    calls_lock = threading.Lock()
+
+    def loader() -> dict[str, str]:
+        with calls_lock:
+            calls.append(1)
+        assert release.wait(5.0)
+        return {"GH_TOKEN": "secret"}
+
+    broker = CredentialBroker(max_provider_workers=2, max_pending_providers=1)
+    scope = _github_scope("github_read_issue")
+    broker.register(scope, loader)
+    leases = [
+        broker.issue(scope, binding=f"github:{i}", operation="github_read_issue")
+        for i in range(4)
+    ]
+
+    tasks = [
+        asyncio.ensure_future(
+            broker.materialize_async(
+                lease,
+                binding=f"github:{i}",
+                operation="github_read_issue",
+            )
+        )
+        for i, lease in enumerate(leases[:3])
+    ]
+    # Both dedicated workers enter their loader; the third claim stays queued.
+    for _ in range(400):
+        with calls_lock:
+            if len(calls) == 2:
+                break
+        await asyncio.sleep(0.01)
+    assert len(calls) == 2
+    assert any(
+        item.startswith("credential-materialization:")
+        for item in broker.owned_resources()
+    )
+
+    with pytest.raises(CredentialBrokerError, match="admission is full"):
+        await broker.materialize_async(
+            leases[3],
+            binding="github:3",
+            operation="github_read_issue",
+        )
+    broker.revoke(leases[3])
+    assert len(calls) == 2
+
+    # Saturation only affects the dedicated credential executor: unrelated
+    # default-executor work and the event loop itself keep making progress.
+    assert await asyncio.to_thread(lambda: 42) == 42
+    heartbeats = 0
+
+    async def heartbeat() -> None:
+        nonlocal heartbeats
+        while True:
+            heartbeats += 1
+            await asyncio.sleep(0)
+
+    ticker = asyncio.ensure_future(heartbeat())
+    try:
+        for _ in range(100):
+            if heartbeats >= 10:
+                break
+            await asyncio.sleep(0.01)
+        assert heartbeats >= 10
+    finally:
+        ticker.cancel()
+        release.set()
+    results = await asyncio.gather(*tasks)
+    assert all(result == {"GH_TOKEN": "secret"} for result in results)
+    assert broker.terminal_postcondition()
+    assert broker._async_provider_admission == 0
+    _assert_tables_consistent(broker)
+
+
+async def test_cancel_then_close_keeps_worker_owned_until_settled() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    broker = CredentialBroker()
+    scope = _github_scope("github_read_issue")
+
+    def loader() -> dict[str, str]:
+        entered.set()
+        assert release.wait(5.0)
+        return {"GH_TOKEN": "must-not-return"}
+
+    broker.register(scope, loader)
+    lease = broker.issue(
+        scope,
+        binding={"host": "github.com", "repository": "owner/repo"},
+        operation="github_read_issue",
+    )
+    material = asyncio.ensure_future(
+        broker.materialize_async(
+            lease,
+            binding={"host": "github.com", "repository": "owner/repo"},
+            operation="github_read_issue",
+        )
+    )
+    assert await asyncio.to_thread(entered.wait, 2.0)
+    material.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await material
+    # Cancellation marked the transaction; closing now must not claim the
+    # worker is gone while the provider thread can still settle.
+    broker.close()
+    assert broker.generation_admission_closed
+    assert not broker.terminal_closed
+    _assert_tables_consistent(broker)
+    release.set()
+    for _ in range(400):
+        if broker.terminal_closed:
+            break
+        await asyncio.sleep(0.01)
+    assert broker.terminal_closed
+    assert not broker.is_quarantined
+    _assert_tables_consistent(broker)
+
+
+async def test_cancel_then_revoke_while_blocked_fails_closed_consistently() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    broker = CredentialBroker()
+    scope = _github_scope("github_read_issue")
+
+    def loader() -> dict[str, str]:
+        entered.set()
+        assert release.wait(5.0)
+        return {"GH_TOKEN": "must-not-return"}
+
+    broker.register(scope, loader)
+    lease = broker.issue(
+        scope,
+        binding={"host": "github.com", "repository": "owner/repo"},
+        operation="github_read_issue",
+    )
+    material = asyncio.ensure_future(
+        broker.materialize_async(
+            lease,
+            binding={"host": "github.com", "repository": "owner/repo"},
+            operation="github_read_issue",
+        )
+    )
+    assert await asyncio.to_thread(entered.wait, 2.0)
+    material.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await material
+    broker.revoke(lease)
+    release.set()
+    # The shielded worker still settles its owned transaction in the
+    # background even though the caller coroutine is already cancelled.
+    for _ in range(400):
+        if broker.terminal_postcondition():
+            break
+        await asyncio.sleep(0.01)
+    assert broker.terminal_postcondition()
+    _assert_tables_consistent(broker)
+
+
+async def test_timeout_then_settle_discards_secret_and_keeps_tables_consistent() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    broker = CredentialBroker()
+    scope = _github_scope("github_read_issue")
+
+    def loader() -> dict[str, str]:
+        entered.set()
+        assert release.wait(5.0)
+        return {"GH_TOKEN": "must-not-return"}
+
+    broker.register(scope, loader)
+    lease = broker.issue(
+        scope,
+        binding={"host": "github.com", "repository": "owner/repo"},
+        operation="github_read_issue",
+    )
+    material = asyncio.ensure_future(
+        broker.materialize_async(
+            lease,
+            binding={"host": "github.com", "repository": "owner/repo"},
+            operation="github_read_issue",
+            timeout=0.05,
+        )
+    )
+    assert await asyncio.to_thread(entered.wait, 2.0)
+    with pytest.raises(CredentialBrokerError, match="timed out"):
+        await material
+    _assert_tables_consistent(broker)
+    release.set()
+    assert await _await_terminal(broker)
+    with pytest.raises(CredentialBrokerError, match="unknown or revoked"):
+        broker.materialize(
+            lease,
+            binding={"host": "github.com", "repository": "owner/repo"},
+            operation="github_read_issue",
+        )
+    _assert_tables_consistent(broker)

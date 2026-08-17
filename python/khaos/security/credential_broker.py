@@ -24,6 +24,7 @@ import secrets
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 
 from khaos.security.resource_scope import CredentialScope
@@ -32,6 +33,8 @@ CredentialLoader = Callable[[], Mapping[str, str]]
 
 MAX_PROVIDER_ENTRIES = 8
 MAX_PROVIDER_VALUE_BYTES = 64 * 1024
+DEFAULT_PROVIDER_WORKERS = 4
+DEFAULT_PENDING_PROVIDERS = 8
 _ENVIRONMENT_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 
 
@@ -191,17 +194,38 @@ class CredentialBroker:
         principal_id: str = "",
         max_ttl_seconds: float = 300.0,
         allow_context_adoption: bool = False,
+        max_provider_workers: int = DEFAULT_PROVIDER_WORKERS,
+        max_pending_providers: int = DEFAULT_PENDING_PROVIDERS,
     ) -> None:
         if max_ttl_seconds <= 0:
             raise ValueError("credential broker max TTL must be positive")
+        if (
+            type(max_provider_workers) is not int
+            or max_provider_workers <= 0
+            or type(max_pending_providers) is not int
+            or max_pending_providers < 0
+        ):
+            raise ValueError("credential provider bounds must be non-negative")
         self.policy_digest = policy_digest
         self.principal_id = principal_id
         self.max_ttl_seconds = max_ttl_seconds
         self.allow_context_adoption = allow_context_adoption
+        self.max_provider_workers = max_provider_workers
+        self.max_pending_providers = max_pending_providers
         self._loaders: dict[str, _ProviderRecord] = {}
         self._leases: dict[str, _LeaseRecord] = {}
         self._materializations: dict[str, _MaterializationRecord] = {}
         self._materialization_by_lease: dict[str, str] = {}
+        # Credential providers run on a dedicated bounded executor so a hung
+        # Keychain/Vault/plugin can never occupy or starve the asyncio
+        # default executor shared by unrelated runtime work.  Admission is
+        # bounded separately: once workers + queued calls are exhausted the
+        # next materialization fails closed instead of queueing forever.
+        self._provider_executor = ThreadPoolExecutor(
+            max_workers=max_provider_workers,
+            thread_name_prefix="khaos-credential-provider",
+        )
+        self._async_provider_admission = 0
         self._lock = threading.RLock()
         self._generation = 0
         self._closing = False
@@ -420,12 +444,16 @@ class CredentialBroker:
     ) -> dict[str, str]:
         """Claim one lease without letting a provider block the event loop.
 
-        The provider loader runs on an executor while this coroutine only
-        awaits its completion.  Caller cancellation and provider timeout mark
-        the materialization transaction canceled: any secret the worker still
-        produces is discarded by the return fence, and the transaction stays
-        owned until the worker settles, so ``close()`` never observes a false
-        terminal state while a provider call is still executing.
+        The provider loader runs on this broker's dedicated bounded executor
+        (never the shared asyncio default executor) while this coroutine only
+        awaits its completion.  Admission is bounded: once all provider
+        workers and queue slots are owned by in-flight calls, the next
+        materialization fails closed instead of queueing without bound.
+        Caller cancellation and provider timeout mark the materialization
+        transaction canceled: any secret the worker still produces is
+        discarded by the return fence, and the transaction stays owned until
+        the worker settles, so ``close()`` never observes a false terminal
+        state while a provider call is still executing.
         """
         if not isinstance(lease, CredentialLease):
             raise CredentialBrokerError("credential lease is invalid")
@@ -437,14 +465,36 @@ class CredentialBroker:
             raise CredentialBrokerError("credential provider timeout is invalid")
         expected_binding = credential_binding_digest(binding, operation)
         with self._lock:
-            provider, transaction = self._reserve_materialization_locked(
-                lease, expected_binding, operation
-            )
+            self._ensure_open()
+            if (
+                self._async_provider_admission
+                >= self.max_provider_workers + self.max_pending_providers
+            ):
+                raise CredentialBrokerError(
+                    "credential provider admission is full"
+                )
+            self._async_provider_admission += 1
+            try:
+                provider, transaction = self._reserve_materialization_locked(
+                    lease, expected_binding, operation
+                )
+            except BaseException:
+                self._async_provider_admission -= 1
+                raise
         loop = asyncio.get_running_loop()
+        provider_executor = executor or self._provider_executor
 
         async def _owned_worker() -> dict[str, str]:
             try:
-                environment = await loop.run_in_executor(executor, provider.loader)
+                try:
+                    environment = await loop.run_in_executor(
+                        provider_executor, provider.loader
+                    )
+                finally:
+                    # The provider call (running or queued) no longer holds an
+                    # admission slot once the loader itself has settled.
+                    with self._lock:
+                        self._async_provider_admission -= 1
             except Exception as exc:
                 with self._lock:
                     self._abort_materialization_locked(
@@ -471,10 +521,10 @@ class CredentialBroker:
                 return await asyncio.shield(worker)
             return await asyncio.wait_for(asyncio.shield(worker), timeout)
         except TimeoutError as exc:
-            self._cancel_materialization_locked(transaction.transaction_id)
+            self._cancel_materialization(transaction.transaction_id)
             raise CredentialBrokerError("credential provider timed out") from exc
         except asyncio.CancelledError:
-            self._cancel_materialization_locked(transaction.transaction_id)
+            self._cancel_materialization(transaction.transaction_id)
             raise
 
     def revoke(self, lease: CredentialLease) -> None:
@@ -517,6 +567,9 @@ class CredentialBroker:
             self._closed = True
             self._loaders.clear()
             self._quarantined = False
+        # Already-submitted provider calls remain owned until they settle;
+        # shutdown only rejects new submissions on the dedicated executor.
+        self._provider_executor.shutdown(wait=False)
 
     async def aclose(self) -> None:
         """Async ResourceOwner adapter for runtime shutdown."""
@@ -639,6 +692,16 @@ class CredentialBroker:
         self._finish_materialization_locked(transaction.transaction_id, lease.lease_id)
         return normalized
 
+    def _cancel_materialization(self, transaction_id: str) -> None:
+        """Mark a transaction canceled under the broker lock.
+
+        Every mutation of the materialization state table must hold the same
+        broker mutex, including the cancel/timeout paths driven from async
+        callbacks; this wrapper keeps that discipline in one place.
+        """
+        with self._lock:
+            self._cancel_materialization_locked(transaction_id)
+
     def _cancel_materialization_locked(self, transaction_id: str) -> None:
         """Mark a transaction canceled; it stays owned until the worker settles."""
         transaction = self._materializations.get(transaction_id)
@@ -704,6 +767,9 @@ class CredentialBroker:
             self._closed = True
             self._loaders.clear()
             self._quarantined = False
+            # Terminal: no owned provider call remains, so the dedicated
+            # executor can stop accepting work without abandoning anything.
+            self._provider_executor.shutdown(wait=False)
 
     @staticmethod
     def _validate_environment(
