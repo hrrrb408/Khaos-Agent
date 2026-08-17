@@ -20,6 +20,7 @@ from khaos.security.credential_broker import (
     CredentialLease,
     credential_binding_digest,
 )
+from khaos.security.network_broker import preflight_network_lease
 
 _MAX_TITLE = 256
 _MAX_BODY = 65536
@@ -39,6 +40,14 @@ async def _gh(args: list[str], *, context: dict[str, Any], tool_name: str, paylo
             await _consume_github_approval(
                 context, workspace, host, repository, tool_name, payload
             )
+        # Deterministic non-secret validation comes before the provider
+        # loader: a missing, expired, or malformed network lease fails
+        # closed without touching Keychain/Vault/Credential Manager
+        # (No Secret Materialization Before Deterministic Authority
+        # Preflight).  The lease is validated read-only here and consumed
+        # only by the final ``gh`` execution below.
+        network_lease = context.get("network_lease")
+        preflight_network_lease(network_lease)
         credential_scope, credential_environment = await _credential_material_async(
             context.get("credential_context"),
             host,
@@ -55,11 +64,6 @@ async def _gh(args: list[str], *, context: dict[str, Any], tool_name: str, paylo
                 "NO_COLOR": "1",
                 **credential_environment,
             }
-            network_lease = context.get("network_lease")
-            if network_lease is None:
-                raise PermissionError(
-                    "GitHub operation requires a managed NetworkBroker lease"
-                )
             request = ExecutionRequest(
                 argv=("gh", *args),
                 cwd=cwd,

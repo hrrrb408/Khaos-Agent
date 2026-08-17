@@ -1245,9 +1245,40 @@ def _domain_matches(host: str, rule: str) -> bool:
     return rule == "*" or host == rule or host.endswith(f".{rule}")
 
 
+def preflight_network_lease(lease: object) -> None:
+    """Deterministically validate network authority before any secret load.
+
+    Implements *No Secret Materialization Before Deterministic Authority
+    Preflight*: if the network lease is missing, malformed, expired, or its
+    broker attestation no longer validates, the caller must fail closed
+    before touching a credential provider.  The check is read-only — it
+    renews an expired lease through the broker's own grant path exactly like
+    ``NetworkLease.validate`` does, but never claims or consumes the effect
+    capability reserved for the final operation.
+    """
+    if lease is None:
+        raise NetworkBrokerError(
+            "managed network lease is required before credential materialization"
+        )
+    validate = getattr(lease, "validate", None)
+    if not callable(validate):
+        raise NetworkBrokerError(
+            "network authority state is malformed and must fail closed"
+        )
+    try:
+        validate()
+    except NetworkBrokerError:
+        raise
+    except Exception as exc:
+        raise NetworkBrokerError(
+            f"network authority preflight rejected the lease: {exc}"
+        ) from exc
+
+
 __all__ = [
     "NetworkBroker",
     "NetworkBrokerError",
     "NetworkBrokerFactory",
     "NetworkLease",
+    "preflight_network_lease",
 ]
