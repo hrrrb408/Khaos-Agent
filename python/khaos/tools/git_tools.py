@@ -22,6 +22,7 @@ from khaos.security.credential_broker import (
     CredentialLease,
     credential_binding_digest,
 )
+from khaos.security.network_broker import preflight_network_lease
 
 logger = logging.getLogger(__name__)
 
@@ -681,6 +682,12 @@ async def _git_remote_via_execution_service(
     approval = context.approval_context
     if not isinstance(approval, dict):
         raise PermissionError("git_push requires approval")
+    # Deterministic non-secret validation happens before the provider loader:
+    # a missing, expired, or malformed network lease fails closed without
+    # touching Keychain/Vault/askpass (No Secret Materialization Before
+    # Deterministic Authority Preflight).  The preflight never claims the
+    # lease; the exact network capability is consumed only by the push.
+    preflight_network_lease(context.network_lease)
     # The approval above is the exact capability boundary: the provider
     # loader (Keychain/Vault/askpass) runs only now, exactly once per push.
     credential_scope, credential_environment = await _credential_material_async(
@@ -688,10 +695,6 @@ async def _git_remote_via_execution_service(
         context.credential_context,
         credential_broker=context.credential_broker,
     )
-    if context.network_lease is None:
-        raise PermissionError(
-            "git_push requires a managed NetworkBroker lease"
-        )
     if credential_scope != approval.get("binding", {}).get("credential_scope"):
         raise PermissionError("credential scope changed after approval")
     with tempfile.TemporaryDirectory(prefix="khaos-git-remote-home-") as temporary_home:

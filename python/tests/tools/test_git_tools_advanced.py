@@ -40,6 +40,13 @@ class _LocalRemoteBackend(HostExecutionBackend):
         )
 
 
+class _ValidNetworkLease:
+    """Test double that passes the deterministic network authority preflight."""
+
+    def validate(self) -> None:
+        return None
+
+
 def _ctx(repo, access_mode="vcs.destructive-write"):
     workspace = SimpleNamespace(
         task_id="task",
@@ -91,7 +98,7 @@ async def _approved_ctx(repo, tool_name, arguments):
     context["approval_context"] = approval
     context["network_policy"] = "unrestricted-with-approval"
     if tool_name == "git_push":
-        context["network_lease"] = object()
+        context["network_lease"] = _ValidNetworkLease()
     return context
 
 

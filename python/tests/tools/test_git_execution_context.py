@@ -181,6 +181,22 @@ def test_public_git_read_handlers_do_not_create_subprocess():
         assert "create_subprocess" not in inspect.getsource(handler)
 
 
+class _ValidNetworkLease:
+    """Test double that passes the deterministic network authority preflight."""
+
+    def validate(self) -> None:
+        return None
+
+
+class _InvalidNetworkLease:
+    """Test double whose broker attestation no longer validates."""
+
+    def validate(self) -> None:
+        from khaos.security.network_broker import NetworkBrokerError
+
+        raise NetworkBrokerError("network lease attestation rejected")
+
+
 async def _run_git(repo, *args):
     process = await asyncio.create_subprocess_exec(
         "git", *args, cwd=str(repo), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
@@ -262,7 +278,7 @@ async def _approve_remote(service, task, *, requester="session", approval_id="pu
         "approval_broker": broker,
         "network_policy": "unrestricted-with-approval",
         "credential_context": credential_context,
-        "network_lease": object(),
+        "network_lease": _ValidNetworkLease(),
     }
     approval = await prepare_remote_git_approval(
         "git_push",
@@ -280,7 +296,7 @@ async def _approve_remote(service, task, *, requester="session", approval_id="pu
         "approval_context": approval,
         "network_policy": "unrestricted-with-approval",
         "credential_context": credential_context,
-        "network_lease": object(),
+        "network_lease": _ValidNetworkLease(),
     }, broker
 
 
@@ -749,7 +765,7 @@ async def test_git_push_injects_only_single_use_authorized_credential_scope(tmp_
         },
         network_policy="unrestricted-with-approval",
         credential_context=credential_context,
-        network_lease=object(),
+        network_lease=_ValidNetworkLease(),
     ))
     assert result["pushed"] is True
     request = service.requests[-1]
@@ -881,7 +897,7 @@ async def test_git_push_provider_loader_runs_exactly_once_and_only_after_approva
         network_policy="unrestricted-with-approval",
         credential_context=harness.lease,
         credential_broker=harness.broker,
-        network_lease=object(),
+        network_lease=_ValidNetworkLease(),
     ))
     assert denied["pushed"] is False
     assert "replayed" in denied["error"] or "stale" in denied["error"]
@@ -905,7 +921,7 @@ async def test_git_push_provider_loader_runs_exactly_once_and_only_after_approva
         network_policy="unrestricted-with-approval",
         credential_context=harness.lease,
         credential_broker=harness.broker,
-        network_lease=object(),
+        network_lease=_ValidNetworkLease(),
     ))
     assert result["pushed"] is True
     assert result["credential_scope"] == "ssh-agent"
@@ -951,7 +967,7 @@ async def test_git_push_broker_issued_credential_also_loads_exactly_once(tmp_pat
         network_policy="unrestricted-with-approval",
         credential_context=None,
         credential_broker=harness.broker,
-        network_lease=object(),
+        network_lease=_ValidNetworkLease(),
     ))
     assert result["pushed"] is True
     assert harness.loader_calls == [1]
@@ -995,6 +1011,50 @@ def test_git_tools_has_no_direct_subprocess_path():
 
     assert "create_subprocess_exec" not in inspect.getsource(git_tools_module)
     assert "create_subprocess_shell" not in inspect.getsource(git_tools_module)
+
+
+async def test_git_push_network_preflight_prevents_provider_invocation(tmp_path):
+    """Deterministically-invalid network authority never loads a secret."""
+    harness = _CountingCredentialHarness(tmp_path)
+    broker = ApprovalBroker()
+
+    async def _push_with(approval_id: str, lease: object) -> dict:
+        approval = await harness.prepare(broker, approval_id)
+        assert await broker.approve_operation(approval_id, "session")
+        result = json.loads(await git_push(
+            ".",
+            task_id="task-a",
+            workspace_id="w",
+            execution_service=harness.service(
+                ["task/test\n", "task/test\n", harness.remote_url, harness.head, "", "", ""]
+            ),
+            approval_context=approval,
+            network_policy="unrestricted-with-approval",
+            credential_context=harness.lease,
+            credential_broker=harness.broker,
+            network_lease=lease,
+        ))
+        return result
+
+    missing = await _push_with("preflight-missing", None)
+    assert missing["pushed"] is False
+    assert "managed network lease" in missing["error"]
+    assert harness.loader_calls == []
+
+    malformed = await _push_with("preflight-malformed", object())
+    assert malformed["pushed"] is False
+    assert "malformed" in malformed["error"]
+    assert harness.loader_calls == []
+
+    invalid = await _push_with("preflight-invalid", _InvalidNetworkLease())
+    assert invalid["pushed"] is False
+    assert "attestation rejected" in invalid["error"]
+    assert harness.loader_calls == []
+
+    approved = await _push_with("preflight-valid", _ValidNetworkLease())
+    assert approved["pushed"] is True
+    assert harness.loader_calls == [1]
+    assert harness.broker.terminal_postcondition()
 
 
 def test_registry_exposes_only_git_push_as_remote_git_tool():

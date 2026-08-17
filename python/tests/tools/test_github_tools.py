@@ -53,7 +53,23 @@ class _FakeGitHubExecutionService:
         raise AssertionError(f"unexpected argv: {request.argv}")
 
 
-def _context(service, *, operations, network_policy="unrestricted-with-approval"):
+class _ValidNetworkLease:
+    """Test double that passes the deterministic network authority preflight."""
+
+    def validate(self) -> None:
+        return None
+
+
+class _InvalidNetworkLease:
+    """Test double whose broker attestation no longer validates."""
+
+    def validate(self) -> None:
+        from khaos.security.network_broker import NetworkBrokerError
+
+        raise NetworkBrokerError("network lease attestation rejected")
+
+
+def _context(service, *, operations, network_policy="unrestricted-with-approval", network_lease="valid"):
     context = {
         "task_id": "task",
         "workspace_id": "workspace",
@@ -68,7 +84,10 @@ def _context(service, *, operations, network_policy="unrestricted-with-approval"
         },
     }
     if network_policy == "unrestricted-with-approval":
-        context["network_lease"] = object()
+        if network_lease == "valid":
+            context["network_lease"] = _ValidNetworkLease()
+        else:
+            context["network_lease"] = network_lease
     return context
 
 
@@ -191,6 +210,62 @@ async def test_github_prepare_does_not_materialize_before_approval(tmp_path):
     )
     assert result["ok"] is True
     assert loader_calls == 1
+
+
+async def test_github_network_preflight_prevents_provider_invocation(tmp_path):
+    """A deterministically-invalid network lease never loads the token."""
+    service = _FakeGitHubExecutionService(tmp_path)
+    credential_broker = CredentialBroker()
+    loader_calls = 0
+
+    def load_token():
+        nonlocal loader_calls
+        loader_calls += 1
+        return {"GH_TOKEN": "test-token"}
+
+    credential_broker.register(
+        CredentialScope(
+            provider="github",
+            names=frozenset({"github-token"}),
+            operations=frozenset({"github_comment_issue"}),
+        ),
+        load_token,
+    )
+    context = _context(service, operations=["github_comment_issue"])
+    context["credential_context"] = None
+    context["credential_broker"] = credential_broker
+    approval_broker = ApprovalBroker()
+    arguments = {"issue_number": 7, "comment": "approved"}
+
+    async def _approved_write(lease: object):
+        write_context = dict(context)
+        write_context["network_lease"] = lease
+        approval = await prepare_github_approval(
+            "github_comment_issue",
+            arguments,
+            {**write_context, "approval_broker": approval_broker},
+            requester="session",
+            approval_id="approval",
+        )
+        assert approval is not None
+        assert await approval_broker.approve_operation("approval", "session")
+        write_context["approval_context"] = approval
+        return json.loads(await github_comment_issue(7, "approved", **write_context))
+
+    missing_lease = await _approved_write(None)
+    assert missing_lease["ok"] is False
+    assert "managed network lease" in missing_lease["error"]
+    assert loader_calls == 0
+
+    malformed_lease = await _approved_write(object())
+    assert malformed_lease["ok"] is False
+    assert "malformed" in malformed_lease["error"]
+    assert loader_calls == 0
+
+    invalid_lease = await _approved_write(_InvalidNetworkLease())
+    assert invalid_lease["ok"] is False
+    assert "attestation rejected" in invalid_lease["error"]
+    assert loader_calls == 0
 
 
 @pytest.mark.parametrize("mutation", ["requester", "operation", "repository", "payload", "head", "expiry"])
