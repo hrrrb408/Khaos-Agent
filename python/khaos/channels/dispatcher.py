@@ -110,6 +110,9 @@ def _validate_log_target(target: str) -> str:
 
 def _append_log_line(log_dir: Path, file_name: str, content: str) -> None:
     """Append through a directory fd so the logical name cannot escape it."""
+    if os.name == "nt":
+        _append_log_line_windows(log_dir, file_name, content)
+        return
     flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
     no_follow = getattr(os, "O_NOFOLLOW", 0)
     directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | no_follow
@@ -136,6 +139,124 @@ def _append_log_line(log_dir: Path, file_name: str, content: str) -> None:
         if file_fd >= 0:
             os.close(file_fd)
         os.close(directory_fd)
+
+
+def _append_log_line_windows(log_dir: Path, file_name: str, content: str) -> None:
+    """Append through Windows no-follow handles without a symlink deputy."""
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    create_file.restype = wintypes.HANDLE
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+    get_attribute_info = kernel32.GetFileInformationByHandleEx
+    get_attribute_info.argtypes = [
+        wintypes.HANDLE,
+        wintypes.INT,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    ]
+    get_attribute_info.restype = wintypes.BOOL
+
+    class FileAttributeTagInfo(ctypes.Structure):
+        _fields_ = [("file_attributes", wintypes.DWORD), ("reparse_tag", wintypes.DWORD)]
+
+    file_attribute_tag_info = 9
+    file_attribute_reparse_point = 0x400
+    file_attribute_directory = 0x10
+    file_read_attributes = 0x80
+    file_append_data = 0x04
+    file_share_read = 0x01
+    file_share_write = 0x02
+    file_share_delete = 0x04
+    open_existing = 3
+    open_always = 4
+    file_attribute_normal = 0x80
+    file_flag_open_reparse_point = 0x00200000
+    file_flag_backup_semantics = 0x02000000
+    invalid_handle = ctypes.c_void_p(-1).value
+
+    def open_handle(path: Path, access: int, creation: int, flags: int):
+        handle = create_file(
+            str(path),
+            access,
+            file_share_read | file_share_write | file_share_delete,
+            None,
+            creation,
+            flags,
+            None,
+        )
+        handle_value = handle.value
+        if handle_value in {None, invalid_handle}:
+            error = ctypes.get_last_error()
+            raise OSError(error, ctypes.FormatError(error))
+        return handle
+
+    def ensure_regular_not_reparse(handle, *, directory: bool = False) -> None:
+        info = FileAttributeTagInfo()
+        if not get_attribute_info(
+            handle,
+            file_attribute_tag_info,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+        ):
+            error = ctypes.get_last_error()
+            raise OSError(error, ctypes.FormatError(error))
+        if info.file_attributes & file_attribute_reparse_point:
+            raise OSError("log target is a reparse point")
+        if bool(info.file_attributes & file_attribute_directory) != directory:
+            raise OSError("log target has an unexpected file type")
+
+    directory_handle = open_handle(
+        log_dir,
+        file_read_attributes,
+        open_existing,
+        file_flag_open_reparse_point | file_flag_backup_semantics,
+    )
+    try:
+        ensure_regular_not_reparse(directory_handle, directory=True)
+    finally:
+        close_handle(directory_handle)
+
+    file_handle = open_handle(
+        log_dir / file_name,
+        file_append_data | file_read_attributes,
+        open_always,
+        file_attribute_normal | file_flag_open_reparse_point,
+    )
+    file_fd = -1
+    try:
+        ensure_regular_not_reparse(file_handle)
+        file_fd = msvcrt.open_osfhandle(
+            file_handle.value,
+            os.O_WRONLY | os.O_APPEND | getattr(os, "O_BINARY", 0),
+        )
+        file_handle = None
+        info = os.fstat(file_fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise OSError("log target is not a single regular file")
+        with os.fdopen(file_fd, "a", encoding="utf-8", closefd=True) as file:
+            file_fd = -1
+            ts = utc_now_naive().isoformat()
+            file.write(f"[{ts}] {content}\n")
+    finally:
+        if file_fd >= 0:
+            os.close(file_fd)
+        if file_handle is not None:
+            close_handle(file_handle)
 
 
 class MemoryChannel(Channel):

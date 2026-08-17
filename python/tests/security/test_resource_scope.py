@@ -67,7 +67,7 @@ def test_compiled_git_catalog_binds_configured_worktree_root(tmp_path, monkeypat
     )
     git_scopes = [scope for scope in order.scopes.values() if isinstance(scope, GitRefScope)]
     assert len(git_scopes) == 1
-    assert git_scopes[0].worktree_root == str(authority_root.resolve())
+    assert git_scopes[0].worktree_root == authority_root.resolve().as_posix()
 
 
 def test_security_identity_aliases_keep_distinct_static_names() -> None:
