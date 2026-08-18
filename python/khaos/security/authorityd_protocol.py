@@ -33,7 +33,7 @@ from khaos.security.identity_isolation import (
     IdentityIsolationError,
     validate_private_unix_socket,
 )
-from khaos.security.principals import PrincipalKind
+from khaos.security.principals import DelegationScope, PrincipalKind
 from khaos.security.protocol_boundary import canonical_json_bytes
 
 AUTHORITYD_PROTOCOL = 1
@@ -767,6 +767,52 @@ class AuthorityDaemonClient:
 
     def revoke(self, receipt: SignedAuthorizationReceipt) -> None:
         self.request({"operation": "revoke", "receipt": receipt.to_dict()})
+
+    def delegation_register_root(self, scope: DelegationScope) -> str:
+        """Register one ingress root delegation with the authority owner."""
+        response = self.request(
+            {"operation": "delegation_root", "scope": scope.canonical()}
+        )
+        return str(response["delegation_digest"])
+
+    def delegation_issue_child(
+        self,
+        parent: DelegationScope,
+        child_principal_id: str,
+        child_principal_kind: str,
+        *,
+        operation_family: str,
+        resource_scope: list[str],
+        expires_at: float,
+    ) -> DelegationScope:
+        """Issue one narrow child delegation from a live parent scope."""
+        response = self.request(
+            {
+                "operation": "delegation_child",
+                "parent": parent.canonical(),
+                "child_principal_id": child_principal_id,
+                "child_principal_kind": child_principal_kind,
+                "operation_family": operation_family,
+                "resource_scope": resource_scope,
+                "expires_at": expires_at,
+            }
+        )
+        return DelegationScope.from_payload(response.get("delegation"))
+
+    def delegation_consume(self, delegation: DelegationScope, **effect: str) -> None:
+        """Consume exactly one child delegation at the effect boundary."""
+        self.request(
+            {
+                "operation": "delegation_consume",
+                "delegation": delegation.canonical(),
+                **effect,
+            }
+        )
+
+    def delegation_revoke(self, delegation: DelegationScope) -> None:
+        self.request(
+            {"operation": "delegation_revoke", "delegation": delegation.canonical()}
+        )
 
 
 @dataclass

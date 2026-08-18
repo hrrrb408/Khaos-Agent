@@ -3559,7 +3559,34 @@ async def _build_subagent_service(
         runner=runner.run,
         registry=create_runtime_registry(),
     )
-    return SubAgentService(spawner, runner)
+    # M6.9 BATCH 4: production spawns receive authority-owned narrow child
+    # delegations when an authority daemon is deployed.  Without one the
+    # issuer stays absent and children run with a fresh transport-root
+    # commitment instead of the parent's digest — never a silent
+    # parent-digest reuse.
+    delegation_issuer = None
+    authority_socket = os.environ.get("KHAOS_AUTHORITYD_SOCKET") or os.environ.get(
+        "KHAOS_AUTHORITYD_BACKEND_SOCKET", ""
+    )
+    if authority_socket and os.environ.get("KHAOS_DEV_MODE") != "1":
+        try:
+            from khaos.security.authorityd_protocol import AuthorityDaemonClient
+            from khaos.security.delegation_issuer import AuthorityDelegationIssuer
+            from khaos.security.identity_isolation import (
+                read_contract_from_environment,
+            )
+
+            contract = read_contract_from_environment()
+            delegation_issuer = AuthorityDelegationIssuer(
+                AuthorityDaemonClient(
+                    Path(authority_socket),
+                    expected_authority_uid=contract.authority_uid,
+                )
+            )
+        except (OSError, PermissionError, ValueError) as exc:
+            logger.warning("subagent delegation issuer unavailable: %s", exc)
+            delegation_issuer = None
+    return SubAgentService(spawner, runner, delegation_issuer=delegation_issuer)
 
 
 async def _handle_optional_subagent(

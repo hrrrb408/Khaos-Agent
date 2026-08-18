@@ -51,6 +51,12 @@ from khaos.security.identity_isolation import (
     read_contract_from_environment,
     validate_private_unix_socket,
 )
+from khaos.security.principals import (
+    DelegationAuthority,
+    DelegationScope,
+    PrincipalDelegationError,
+    principal_from_kind,
+)
 from khaos.security.protocol_boundary import (
     ProtocolBoundaryError,
     require_receipt_transition,
@@ -242,6 +248,11 @@ class AuthorityDaemon:
         self._audit_quarantined = False
         self.require_live_grants = require_live_grants
         self.require_typed_principals = require_typed_principals
+        # Typed principal delegation state is owned by the authority daemon,
+        # never by the Python caller: roots are registered here, children are
+        # issued here (narrow-only, unique nonce), consumption is one-shot
+        # here, and revocation cascades to unclaimed descendants here.
+        self._delegations = DelegationAuthority()
         self._closed = False
 
     def _remember_grant_terminal_locked(self, grant_id: str, state: str) -> None:
@@ -1987,6 +1998,152 @@ class AuthorityDaemon:
             "attestation": {**payload, "signature": signature},
         }
 
+    def delegation_root(self, scope: DelegationScope) -> str:
+        """Register one ingress root delegation (idempotent by digest)."""
+        try:
+            digest = self._delegations.register_root(scope)
+        except PrincipalDelegationError as exc:
+            raise AuthorityControlPlaneError(str(exc)) from exc
+        if self._delegations.live_count > self.terminal_tombstone_limit:
+            raise AuthorityControlPlaneError(
+                "authority live delegation registry is full"
+            )
+        root_event = self._audit_event(
+            {
+                "kind": "delegation.root",
+                "delegation_digest": digest,
+                "subject": scope.subject.identity,
+                "project_id": scope.project_id,
+                "session_id": scope.session_id,
+                "workspace_id": scope.workspace_id,
+                "issuer_id": self.issuer_id,
+            }
+        )
+        with self._lock:
+            self._reserve_audit_event_locked(root_event)
+        try:
+            self._append_or_queue_audit(root_event)
+        except BaseException:
+            with self._lock:
+                self._live_delegation_remove(digest)
+            raise
+        return digest
+
+    def delegation_child(
+        self,
+        parent: DelegationScope,
+        child_principal_id: str,
+        child_principal_kind: str,
+        *,
+        operation_family: str,
+        resource_scope: list[str],
+        expires_at: float,
+    ) -> DelegationScope:
+        """Issue one narrow child delegation from a live parent scope."""
+        if self._delegations.live_count >= self.terminal_tombstone_limit:
+            raise AuthorityControlPlaneError(
+                "authority live delegation registry is full"
+            )
+        try:
+            child = principal_from_kind(child_principal_id, child_principal_kind)
+            scope = self._delegations.delegate(
+                parent,
+                child,
+                operation_family=operation_family,
+                resource_scope=resource_scope,
+                expires_at=expires_at,
+            )
+        except PrincipalDelegationError as exc:
+            raise AuthorityControlPlaneError(str(exc)) from exc
+        child_event = self._audit_event(
+            {
+                "kind": "delegation.child",
+                "delegation_digest": scope.digest,
+                "parent_digest": parent.digest,
+                "subject": scope.subject.identity,
+                "operation_family": scope.operation_family,
+                "resource_scope": sorted(scope.resource_scope),
+                "expires_at": scope.expires_at,
+                "issuer_id": self.issuer_id,
+            }
+        )
+        with self._lock:
+            self._reserve_audit_event_locked(child_event)
+        try:
+            self._append_or_queue_audit(child_event)
+        except BaseException:
+            with self._lock:
+                self._live_delegation_remove(scope.digest)
+            raise
+        return scope
+
+    def delegation_consume(
+        self,
+        delegation: DelegationScope,
+        *,
+        principal_id: str,
+        principal_kind: str,
+        project_id: str,
+        session_id: str,
+        runtime_id: str,
+        task_id: str,
+        workspace_id: str,
+        operation_family: str,
+        resource_scope: list[str],
+        policy_digest: str,
+    ) -> None:
+        """Consume exactly one child delegation at the effect boundary."""
+        try:
+            principal = principal_from_kind(principal_id, principal_kind)
+            self._delegations.consume(
+                delegation,
+                principal=principal,
+                project_id=project_id,
+                session_id=session_id,
+                runtime_id=runtime_id,
+                task_id=task_id,
+                workspace_id=workspace_id,
+                operation_family=operation_family,
+                resource_scope=resource_scope,
+                policy_digest=policy_digest,
+            )
+        except PrincipalDelegationError as exc:
+            raise AuthorityControlPlaneError(str(exc)) from exc
+        consume_event = self._audit_event(
+            {
+                "kind": "delegation.consumed",
+                "delegation_digest": delegation.digest,
+                "subject": delegation.subject.identity,
+                "issuer_id": self.issuer_id,
+            }
+        )
+        with self._lock:
+            self._reserve_audit_event_locked(consume_event)
+        # The scope is already consumed at this point; a lost audit event
+        # propagates but must never make the one-shot consumption reusable.
+        self._append_or_queue_audit(consume_event)
+
+    def delegation_revoke(self, delegation: DelegationScope) -> None:
+        """Revoke one delegation and cascade to unclaimed descendants."""
+        try:
+            self._delegations.revoke(delegation)
+        except PrincipalDelegationError as exc:
+            raise AuthorityControlPlaneError(str(exc)) from exc
+        revoke_event = self._audit_event(
+            {
+                "kind": "delegation.revoked",
+                "delegation_digest": delegation.digest,
+                "issuer_id": self.issuer_id,
+            }
+        )
+        with self._lock:
+            self._reserve_audit_event_locked(revoke_event)
+        self._append_or_queue_audit(revoke_event)
+
+    def _live_delegation_remove(self, digest: str) -> None:
+        """Compensate a failed audit append by revoking the fresh scope."""
+        self._delegations.revoke_digest(digest)
+
     def _append_audit(self, record: dict[str, Any]) -> None:
         if self.audit_writer is None:
             raise AuthorityControlPlaneError("independent audit writer is unavailable")
@@ -2566,6 +2723,41 @@ def _dispatch(daemon: AuthorityDaemon, request: object) -> dict[str, object]:
             request_raw_hex=str(request.get("request_raw_hex", "")),
             request_digest=str(request.get("request_digest", "")),
         )
+    if operation == "delegation_root":
+        scope = DelegationScope.from_payload(request.get("scope"))
+        digest = daemon.delegation_root(scope)
+        return {"ok": True, "delegation_digest": digest}
+    if operation == "delegation_child":
+        parent = DelegationScope.from_payload(request.get("parent"))
+        child = daemon.delegation_child(
+            parent,
+            str(request.get("child_principal_id", "")),
+            str(request.get("child_principal_kind", "")),
+            operation_family=str(request.get("operation_family", "")),
+            resource_scope=[str(item) for item in request.get("resource_scope", [])],
+            expires_at=float(request.get("expires_at", 0)),
+        )
+        return {"ok": True, "delegation": child.canonical()}
+    if operation == "delegation_consume":
+        delegation = DelegationScope.from_payload(request.get("delegation"))
+        daemon.delegation_consume(
+            delegation,
+            principal_id=str(request.get("principal_id", "")),
+            principal_kind=str(request.get("principal_kind", "")),
+            project_id=str(request.get("project_id", "")),
+            session_id=str(request.get("session_id", "")),
+            runtime_id=str(request.get("runtime_id", "")),
+            task_id=str(request.get("task_id", "")),
+            workspace_id=str(request.get("workspace_id", "")),
+            operation_family=str(request.get("operation_family", "")),
+            resource_scope=[str(item) for item in request.get("resource_scope", [])],
+            policy_digest=str(request.get("policy_digest", "")),
+        )
+        return {"ok": True}
+    if operation == "delegation_revoke":
+        delegation = DelegationScope.from_payload(request.get("delegation"))
+        daemon.delegation_revoke(delegation)
+        return {"ok": True}
     raise AuthorityControlPlaneError("unknown authorityd operation")
 
 

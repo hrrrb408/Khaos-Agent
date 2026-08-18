@@ -267,6 +267,62 @@ class DelegationScope:
             "nonce": self.nonce,
         }
 
+    @classmethod
+    def from_payload(cls, value: object) -> DelegationScope:
+        """Rebuild an immutable scope from its canonical wire payload."""
+        if not isinstance(value, dict):
+            raise PrincipalDelegationError("delegation scope payload is not a mapping")
+        expected = {
+            "subject",
+            "parent_principal",
+            "project_id",
+            "session_id",
+            "runtime_id",
+            "task_id",
+            "workspace_id",
+            "operation_family",
+            "resource_scope",
+            "policy_digest",
+            "expires_at",
+            "issued_at",
+            "nonce",
+        }
+        if set(value) != expected:
+            raise PrincipalDelegationError("delegation scope payload fields are incomplete")
+        try:
+            scope = cls(
+                subject=principal_from_kind(
+                    str(value["subject"]["principal_id"]),
+                    str(value["subject"]["kind"]),
+                ),
+                parent_principal=principal_from_kind(
+                    str(value["parent_principal"]["principal_id"]),
+                    str(value["parent_principal"]["kind"]),
+                ),
+                project_id=str(value["project_id"]),
+                session_id=str(value["session_id"]),
+                runtime_id=str(value["runtime_id"]),
+                task_id=str(value["task_id"]),
+                workspace_id=str(value["workspace_id"]),
+                operation_family=str(value["operation_family"]),
+                resource_scope=frozenset(
+                    str(item) for item in value["resource_scope"]
+                ),
+                policy_digest=str(value["policy_digest"]),
+                expires_at=float(value["expires_at"]),
+                nonce=str(value["nonce"]),
+                issued_at=float(value["issued_at"]),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise PrincipalDelegationError(
+                "delegation scope payload values are malformed"
+            ) from exc
+        if scope.canonical() != value:
+            raise PrincipalDelegationError(
+                "delegation scope payload is not canonical"
+            )
+        return scope
+
     @property
     def digest(self) -> str:
         return _digest(self.canonical())
@@ -295,17 +351,35 @@ class DelegationAuthority:
     the class itself deliberately has no transport or fallback behavior.
     """
 
+    # Only authenticated ingress principals may establish a root scope: an
+    # interactive human, the Gateway's API-key principal, a verified inbound
+    # channel, or a registered automation.  Subagents and browser helpers
+    # can never mint their own roots.
+    ROOT_KINDS = frozenset(
+        {
+            PrincipalKind.HUMAN,
+            PrincipalKind.GATEWAY,
+            PrincipalKind.CHANNEL,
+            PrincipalKind.AUTOMATION,
+        }
+    )
+
     def __init__(self) -> None:
         self._live: dict[str, DelegationScope] = {}
         self._consumed: set[str] = set()
+        self._parents: dict[str, str] = {}
         self._lock = threading.RLock()
 
     def register_root(self, root: DelegationScope) -> str:
-        if root.subject.kind is not PrincipalKind.HUMAN:
-            raise PrincipalDelegationError("only a human may establish a root scope")
+        if root.subject.kind not in self.ROOT_KINDS:
+            raise PrincipalDelegationError(
+                "only an authenticated ingress principal may establish a root scope"
+            )
         with self._lock:
-            if root.digest in self._live or root.digest in self._consumed:
-                raise PrincipalDelegationError("delegation scope already registered")
+            if root.digest in self._consumed:
+                raise PrincipalDelegationError("delegation scope already consumed")
+            if root.digest in self._live:
+                return root.digest
             self._live[root.digest] = root
         return root.digest
 
@@ -343,13 +417,17 @@ class DelegationAuthority:
             issued_at=current,
         )
         with self._lock:
-            if parent.digest not in self._live:
+            live_parent = self._live.get(parent.digest)
+            if live_parent is None or current >= live_parent.expires_at:
                 raise PrincipalDelegationError("parent delegation is not live")
+            if live_parent != parent:
+                raise PrincipalDelegationError("parent delegation does not match its record")
             if not parent.contains(child_scope):
                 raise PrincipalDelegationError("delegation would widen parent authority")
             if child_scope.digest in self._live or child_scope.digest in self._consumed:
                 raise PrincipalDelegationError("delegation nonce or scope was replayed")
             self._live[child_scope.digest] = child_scope
+            self._parents[child_scope.digest] = parent.digest
         return child_scope
 
     def consume(
@@ -392,15 +470,46 @@ class DelegationAuthority:
             if current >= live.expires_at:
                 self._live.pop(delegation.digest, None)
                 raise PrincipalDelegationError("delegation has expired")
+            parent_digest = self._parents.get(delegation.digest)
+            if parent_digest is not None:
+                # An expired or consumed parent invalidates its unclaimed
+                # children: a child can never outlive the authority that
+                # issued it.
+                parent = self._live.get(parent_digest)
+                if parent is None or current >= parent.expires_at:
+                    raise PrincipalDelegationError("parent delegation is no longer live")
             if live != delegation or not _same_effect_scope(live, requested):
                 raise PrincipalDelegationError("delegation context or effect is not exact")
             self._live.pop(delegation.digest, None)
+            self._parents.pop(delegation.digest, None)
             self._consumed.add(delegation.digest)
 
     def revoke(self, delegation: DelegationScope) -> None:
+        """Revoke one scope and cascade to its unclaimed descendants."""
         with self._lock:
-            self._live.pop(delegation.digest, None)
-            self._consumed.add(delegation.digest)
+            self._revoke_locked(delegation.digest)
+
+    def revoke_digest(self, digest: str) -> None:
+        """Revoke one live scope by digest (idempotent, no cascade)."""
+        with self._lock:
+            if digest in self._live:
+                self._live.pop(digest, None)
+                self._parents.pop(digest, None)
+                self._consumed.add(digest)
+
+    def _revoke_locked(self, digest: str) -> None:
+        self._live.pop(digest, None)
+        self._consumed.add(digest)
+        children = [
+            child for child, parent in self._parents.items() if parent == digest
+        ]
+        for child in children:
+            self._revoke_locked(child)
+
+    @property
+    def live_count(self) -> int:
+        with self._lock:
+            return len(self._live)
 
 
 def _operation_is_narrower(parent: str, child: str) -> bool:
