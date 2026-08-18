@@ -74,24 +74,36 @@ class EvidenceSnapshotBudgets:
 
 
 def require_complete_git_output(result: Mapping[str, object], *, source: str) -> None:
-    """Fail closed when subprocess evidence was truncated by its supervisor.
+    """Fail closed unless subprocess evidence positively proves completeness.
 
     ``ProcessSupervisor`` records ``output_truncated`` diagnostics whenever
     stdout/stderr exceed the output budget.  Ordinary display callers may
     show truncated output with a warning; security consumers must treat it
     as incomplete evidence and refuse to hash it.
+
+    Completeness must be *positively proven*: absent or malformed
+    diagnostics are not evidence of completeness, so they fail closed too.
     """
     diagnostics = result.get("diagnostics")
     if not isinstance(diagnostics, Mapping):
-        return
-    truncated = [
+        raise GitEvidenceError(
+            f"{source} completeness diagnostics are missing; approval "
+            "evidence must fail closed"
+        )
+    present = [
         key
         for key in ("output_truncated", "stdout_truncated", "stderr_truncated")
-        if diagnostics.get(key)
+        if key in diagnostics
     ]
+    if not present:
+        raise GitEvidenceError(
+            f"{source} completeness diagnostics are malformed; approval "
+            "evidence must fail closed"
+        )
+    truncated = sorted(key for key in present if diagnostics.get(key))
     if truncated:
         raise GitEvidenceError(
-            f"{source} output was truncated ({', '.join(sorted(truncated))}); "
+            f"{source} output was truncated ({', '.join(truncated)}); "
             "approval evidence must be complete or fail closed"
         )
 

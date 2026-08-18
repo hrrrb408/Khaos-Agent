@@ -1281,7 +1281,7 @@ def preflight_network_lease(lease: object) -> None:
 
 
 class NetworkReservation:
-    """One-shot prerequisite claim over the exact network authority.
+    """One-shot *prerequisite fence* over the exact network authority.
 
     State machine: ``PREPARED → RESERVED → CLAIMED → TERMINAL``.
 
@@ -1290,8 +1290,17 @@ class NetworkReservation:
     ``ensure_live`` re-validates without consuming so callers can prove
     *prerequisite authority exists* immediately before claiming a
     credential — if the authority was revoked, the secret provider is
-    never invoked; ``claim`` consumes the reservation one-shot right
-    before the effect executes.
+    never invoked; ``claim`` consumes the fence one-shot right before the
+    effect executes.
+
+    Scope (deliberate): this is a local prerequisite fence, **not** a
+    broker-owned one-shot authority token.  ``claimed`` is Python object
+    state — it does not consume the underlying network capability, and it
+    must never be presented as proof that the capability was used exactly
+    once.  The enforcement points remain ``NetworkLease.validate`` at
+    every brokered connection and the AuthorityBroker capability
+    lifecycle; this fence exists so that *secret materialization* cannot
+    happen after prerequisite authority has disappeared.
     """
 
     _PREPARED = "prepared"

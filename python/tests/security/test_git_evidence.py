@@ -71,8 +71,18 @@ def test_stream_level_truncation_flags_also_fail_closed(key):
         require_complete_git_output(result, source="git diff")
 
 
-def test_result_without_diagnostics_is_accepted():
-    require_complete_git_output({"stdout": "ok"}, source="git status")
+def test_result_without_diagnostics_fails_closed():
+    with pytest.raises(GitEvidenceError, match="diagnostics are missing"):
+        require_complete_git_output({"stdout": "ok"}, source="git status")
+
+
+def test_result_with_empty_diagnostics_fails_closed():
+    # Completeness must be positively proven: an empty diagnostics mapping
+    # carries no truncation bits, so it is malformed evidence, not proof.
+    with pytest.raises(GitEvidenceError, match="diagnostics are malformed"):
+        require_complete_git_output(
+            {"stdout": "ok", "diagnostics": {}}, source="git status"
+        )
 
 
 # ─── Bounded snapshot: happy path and determinism ─────────────────────────
