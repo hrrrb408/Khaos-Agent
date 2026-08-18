@@ -142,6 +142,16 @@ not evidence that an effect occurred.
     remote WORM evidence, and organization governance are reported as separate
     evidence classes. No local result is promoted to a Codex-equivalent or
     independently administered security claim.
+17. `terminal_argv` and `terminal_shell` are separate security contracts.
+    The argv contract binds the exact argv vector; the shell contract binds
+    the exact script digest plus the immutable semantic AST digest/status.
+    Only a complete literal executable graph covered by command-specific argv
+    policy may be `safe`/read-only. Brace, glob, tilde, parameter, command,
+    arithmetic, or process expansion; escape ambiguity; redirection,
+    here-doc/here-string, pipeline/compound/subshell, evaluator, assignment,
+    and callback semantics are `semantic-unknown` and require approval. A
+    literal or nested blocked executable is hard blocked. Syntax acceptance or
+    a first/base executable is never evidence of a safe effect.
 
 ## Verification map
 
@@ -165,6 +175,10 @@ not evidence that an effect occurred.
   `python/tests/security/test_native_tcb_packaging.py` and
   `python/tests/security/test_docker_outer_profiles.py`; deployment manifest
   format: `docs/docker-profile-manifest.md`.
+- Shell semantic authority and exact approval binding:
+  `python/tests/security/test_shell_semantics.py`,
+  `python/tests/tools/test_terminal_tools.py`, and
+  `python/tests/permissions/test_authorization_resource.py`.
 
 The opt-in real-platform jobs remain required for a release closure; skipped
 or unavailable jobs are not successful evidence.

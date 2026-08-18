@@ -328,7 +328,7 @@ class PermissionEngine:
                 )
         if (
             tool_name in {"terminal", "terminal_argv", "terminal_shell"}
-            and _is_read_only_terminal_call(params)
+            and _is_read_only_terminal_call(tool_name, params)
             # Round-15 B-2: the read-only auto-approve shortcut is a
             # CONVENIENCE for interactive sessions.  An unattended transport
             # (webhook / cron / rpc) must not auto-approve even read-only
@@ -978,9 +978,12 @@ def _append_segment(segments: list[str], chars: list[str]) -> None:
         segments.append(segment)
 
 
-def _is_read_only_terminal_call(params: dict) -> bool:
-    from khaos.tools.terminal_tools import is_read_only_command
+def _is_read_only_terminal_call(tool_name: str, params: dict) -> bool:
+    from khaos.tools.terminal_tools import is_read_only_argv, is_read_only_command
 
+    if tool_name == "terminal_argv":
+        argv = params.get("argv")
+        return isinstance(argv, list) and is_read_only_argv(argv)
     return is_read_only_command(_command_text(params))
 
 

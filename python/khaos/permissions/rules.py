@@ -124,6 +124,7 @@ def validate_typed_rule(
         PermissionResourceType.EXEC.value: {
             "operation", "tool", "executable", "argv_prefix", "argv_exact", "cwd",
             "workspace_root", "cwd_scope", "allow_shell", "shell", "script_digest",
+            "semantic_status", "semantic_digest",
         },
         PermissionResourceType.NETWORK.value: {
             "operation", "tool", "scheme", "host", "port", "path_prefix",
@@ -216,6 +217,24 @@ def validate_typed_rule(
             except ValueError as exc:
                 raise ValueError(f"{source}: script_digest must be hexadecimal") from exc
             spec["script_digest"] = digest.lower()
+        if "semantic_digest" in spec:
+            semantic_digest = _require_string(spec, "semantic_digest", source=source)
+            if len(semantic_digest) != hashlib.sha256().digest_size * 2:
+                raise ValueError(
+                    f"{source}: semantic_digest must be a SHA-256 hex digest"
+                )
+            try:
+                int(semantic_digest, 16)
+            except ValueError as exc:
+                raise ValueError(
+                    f"{source}: semantic_digest must be hexadecimal"
+                ) from exc
+            spec["semantic_digest"] = semantic_digest.lower()
+        if "semantic_status" in spec:
+            status = _require_string(spec, "semantic_status", source=source)
+            if status not in {"safe", "semantic-unknown", "blocked"}:
+                raise ValueError(f"{source}: semantic_status is invalid")
+            spec["semantic_status"] = status
         if relaxing and allow_shell and "script_digest" not in spec:
             raise ValueError(f"{source}: relaxing shell rules require script_digest")
 
@@ -341,6 +360,8 @@ def _typed_observation_from_resource(
             "is_shell": True,
             "shell": decoded.get("shell", ""),
             "script_digest": decoded.get("script_digest", ""),
+            "semantic_status": decoded.get("semantic_status", ""),
+            "semantic_digest": decoded.get("semantic_digest", ""),
         }
     if kind is AuthorizationResourceKind.PROCESS_CONTROL:
         return PermissionResourceType.PROCESS.value, {
@@ -378,6 +399,8 @@ def typed_rule_from_authorization_resource(
                 "allow_shell": True,
                 "shell": observation["shell"] or "/bin/sh",
                 "script_digest": observation["script_digest"],
+                "semantic_status": observation.get("semantic_status", ""),
+                "semantic_digest": observation.get("semantic_digest", ""),
                 "cwd": observation["cwd"],
                 "workspace_root": observation["workspace_root"],
             }
@@ -555,6 +578,28 @@ def request_observation(
             "path": target,
         }
     if tool_name in {"terminal", "terminal_argv", "terminal_shell", "test_run"}:
+        if tool_name in {"terminal", "terminal_shell"} and not isinstance(params.get("argv"), list):
+            from khaos.security.shell_semantics import analyze_shell_script
+
+            script = str(params.get("script") or params.get("command") or "")
+            semantic = analyze_shell_script(script)
+            executable = semantic.executables[0] if semantic.executables else ""
+            return PermissionResourceType.EXEC.value, {
+                "operation": operation,
+                "tool": tool_name,
+                "executable": executable,
+                "argv": [],
+                "cwd": os.path.realpath(str(params.get("cwd", "."))),
+                "workspace_root": (
+                    os.path.realpath(str(params["workspace_root"]))
+                    if params.get("workspace_root") else ""
+                ),
+                "is_shell": True,
+                "shell": str(params.get("shell") or "/bin/sh"),
+                "script_digest": hashlib.sha256(script.encode("utf-8")).hexdigest(),
+                "semantic_status": semantic.status.value,
+                "semantic_digest": semantic.semantic_digest,
+            }
         argv = params.get("argv")
         if not isinstance(argv, list):
             try:
@@ -661,7 +706,14 @@ def match_typed_rule(
                 return False
         if resource_spec.get("shell") and resource_spec["shell"] != observed.get("shell"):
             return False
-        return not (resource_spec.get("script_digest") and resource_spec["script_digest"] != observed.get("script_digest"))
+        if resource_spec.get("script_digest") and resource_spec["script_digest"] != observed.get("script_digest"):
+            return False
+        if resource_spec.get("semantic_status") and resource_spec["semantic_status"] != observed.get("semantic_status"):
+            return False
+        return not (
+            resource_spec.get("semantic_digest")
+            and resource_spec["semantic_digest"] != observed.get("semantic_digest")
+        )
     if resource_type == PermissionResourceType.NETWORK.value:
         for name in ("scheme", "host", "port"):
             if name in resource_spec and resource_spec[name] != observed.get(name):

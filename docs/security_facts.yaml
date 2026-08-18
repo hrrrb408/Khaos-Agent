@@ -43,6 +43,12 @@ effect_boundaries:
   narrow_abort_reason: exact_planned_event_reason_is_committed
   credential_owner: short_lived_broker_lease_with_target_operation_policy_principal_binding
   credential_secret_visibility: trusted_final_execution_environment_only
+shell_boundaries:
+  terminal_argv_contract: exact_argv_without_shell_expansion
+  terminal_shell_parser: python/khaos/security/shell_semantics.py
+  terminal_shell_safe_status: literal_ast_with_argv_semantic_policy_only
+  terminal_shell_unknown_status: semantic-unknown_requires_approval
+  terminal_shell_ast_binding: script_digest_plus_semantic_digest
 orchestration_boundaries:
   extracted_components:
     - TurnAdmission

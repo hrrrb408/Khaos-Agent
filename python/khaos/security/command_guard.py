@@ -8,6 +8,11 @@ import shlex
 from dataclasses import dataclass
 from pathlib import Path
 
+from khaos.security.shell_semantics import (
+    ShellSemanticStatus,
+    analyze_shell_script,
+)
+
 logger = logging.getLogger(__name__)
 
 DANGEROUS_COMMANDS = frozenset(
@@ -118,10 +123,25 @@ class CommandGuard:
         self._extra_blocked = extra_blocked or frozenset()
 
     def check(self, command: str) -> CommandCheckResult:
-        """检查命令是否安全。"""
+        """检查命令是否安全。
+
+        Shell strings are classified from the bounded semantic AST first.
+        ``shlex`` remains only a legacy compatibility helper for exact
+        command-pattern diagnostics; it is never the source of a shell
+        read-only decision.
+        """
         stripped = command.strip()
         if not stripped:
             return CommandCheckResult(safe=True, risk_level="safe", reason="empty command")
+
+        semantic = analyze_shell_script(stripped)
+        if semantic.status is ShellSemanticStatus.BLOCKED:
+            return CommandCheckResult(
+                safe=False,
+                risk_level="blocked",
+                reason=semantic.reason,
+                matched_pattern=semantic.blocked_executable,
+            )
 
         python_entry = _unsafe_python_entry(stripped)
         if python_entry:
@@ -167,6 +187,14 @@ class CommandGuard:
                 matched_pattern=match.group(0),
             )
 
+        if semantic.status is ShellSemanticStatus.SEMANTIC_UNKNOWN:
+            return CommandCheckResult(
+                safe=True,
+                risk_level=ShellSemanticStatus.SEMANTIC_UNKNOWN.value,
+                reason=semantic.reason,
+                matched_pattern=",".join(semantic.ast.features),
+            )
+
         return CommandCheckResult(safe=True, risk_level="safe", reason="no risk detected")
 
     def _check_for_injection(self, command: str) -> CommandCheckResult | None:
@@ -194,9 +222,14 @@ class CommandGuard:
         return None
 
     def _is_base_command_allowed(self, command: str) -> bool:
-        """检查基础命令是否在白名单中。"""
-        base = _base_command(command)
-        return bool(base and base in self._allowed_commands)
+        """Require every proven executable in a literal shell graph."""
+        semantic = analyze_shell_script(command)
+        if semantic.status is not ShellSemanticStatus.SAFE:
+            return False
+        executables = [node.executable for node in semantic.ast.commands if node.executable]
+        return bool(executables) and all(
+            executable in self._allowed_commands for executable in executables
+        )
 
 
 def _blocked_command_match(

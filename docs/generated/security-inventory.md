@@ -49,8 +49,8 @@
 
 - `python/khaos/audit/anchor.py`: `1109f9ab097bdd63ef9b7d2215fa4fcd636bd38d577469ac9c6dfb9bf133be5d`
 - `python/khaos/channels/webhook.py`: `dcb38668c0cf1a300d16ad5769670a51eaf6c6be24b9cc5be2315a0871a58c06`
-- `python/khaos/permissions/engine.py`: `4e6f03ed55584e11a240dca71be91d61556f11ce240a246627f75829a1af5939`
-- `python/khaos/permissions/rules.py`: `d0785434e0dafc42c146a8c07c068eab42f4b5a27cf87388bb217929372fa471`
+- `python/khaos/permissions/engine.py`: `59ad44abf72426352e8d77511392868ab45f243abbe64e6d3bb10ab15535f773`
+- `python/khaos/permissions/rules.py`: `19d02b4ea1427b7c4b5075b5bbcd641cefc680ac984d27e6fdbf95a5415eae7c`
 - `python/khaos/coding/execution/authority.py`: `abce06886df49008a109a1a89391ea0ca0f8b029f79e764c8ae29aeec5d82ae5`
 - `python/khaos/coding/execution/identity.py`: `5f159cf59788242902e0010bd59a05a2f7c14dd2f8251f62cafa2a1c3cc5e265`
 - `python/khaos/coding/execution/models.py`: `8f165d586928c0cd95823b9008777b4b35281c4202c9847c9994c3d2258f6579`

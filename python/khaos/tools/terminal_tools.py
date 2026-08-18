@@ -13,42 +13,18 @@ from typing import Any
 from khaos.coding.execution.environment import scrub_spawn_environment
 from khaos.permissions.engine import split_command_segments
 from khaos.security.command_guard import CommandGuard
+from khaos.security.shell_semantics import (
+    MUTATING_EXECUTABLES,
+    READ_ONLY_EXECUTABLES,
+    ShellSemanticStatus,
+    analyze_argv,
+    analyze_shell_script,
+)
 
-READ_ONLY_COMMANDS = {
-    "cat",
-    "date",
-    "echo",
-    "grep",
-    "head",
-    "ls",
-    "pwd",
-    "rg",
-    "tail",
-    "test",
-    "true",
-    "wc",
-    "which",
-}
-
-MUTATING_COMMANDS = {
-    "chmod",
-    "chown",
-    "cp",
-    "curl",
-    "dd",
-    "git",
-    "kill",
-    "mkdir",
-    "mv",
-    "npm",
-    "pip",
-    "python",
-    "python3",
-    "rm",
-    "rmdir",
-    "tee",
-    "touch",
-}
+# Compatibility exports for callers that used the old executable-name sets.
+# Security decisions use ``shell_semantics``' AST and argv policy instead.
+READ_ONLY_COMMANDS = set(READ_ONLY_EXECUTABLES)
+MUTATING_COMMANDS = set(MUTATING_EXECUTABLES)
 
 DANGEROUS_PATTERNS = {"rm -rf /", "rm -fr /", ":(){", "mkfs", "diskutil erase"}
 
@@ -158,15 +134,18 @@ async def terminal_argv(
     if not argv or not all(isinstance(item, str) and item for item in argv):
         raise ValueError("argv must contain non-empty strings")
     command = shlex.join(argv)
-    safety_command = _safety_command or command
-    command_check = check_command_safety(safety_command)
+    if _safety_command is None:
+        safety = evaluate_argv_safety(argv)
+        command_check = check_argv_safety(argv)
+    else:
+        safety = evaluate_command_safety(_safety_command)
+        command_check = check_command_safety(_safety_command)
     if not command_check["safe"]:
         return {
             "ok": False,
             "error": f"Command blocked: {command_check['reason']}",
             "risk_level": command_check["risk_level"],
         }
-    safety = evaluate_command_safety(safety_command)
     if safety["blocked"]:
         return {
             "ok": False,
@@ -269,6 +248,27 @@ def check_command_safety(command: str) -> dict[str, Any]:
         "risk_level": result.risk_level,
         "reason": result.reason,
         "matched_pattern": result.matched_pattern,
+    }
+
+
+def check_argv_safety(argv: list[str] | tuple[str, ...]) -> dict[str, Any]:
+    """Check an argv vector without treating its arguments as shell code."""
+    result = _COMMAND_GUARD.check(shlex.join(list(argv)))
+    semantic = analyze_argv(argv)
+    if semantic.status is ShellSemanticStatus.BLOCKED:
+        result = type(result)(
+            safe=False,
+            risk_level="blocked",
+            reason=semantic.reason,
+            matched_pattern=semantic.blocked_executable,
+        )
+    return {
+        "safe": result.safe,
+        "risk_level": result.risk_level,
+        "reason": result.reason,
+        "matched_pattern": result.matched_pattern,
+        "semantic_status": semantic.status.value,
+        "semantic_digest": semantic.semantic_digest,
     }
 
 
@@ -429,50 +429,56 @@ class BackgroundProcessAuthority:
 
 
 def evaluate_command_safety(command: str) -> dict[str, Any]:
-    """Evaluate shell segments for read-only, mutating, and blocked commands."""
+    """Evaluate a shell script from its semantic AST, never base names alone."""
+    semantic = analyze_shell_script(command)
     lowered = command.strip().lower()
-    for pattern in DANGEROUS_PATTERNS:
-        if pattern in lowered:
-            return {
-                "segments": split_command_segments(command),
-                "read_only": False,
-                "requires_confirmation": True,
-                "blocked": True,
-                "reason": pattern,
-            }
-
-    segments = split_command_segments(command)
-    bases: list[str] = []
-    read_only = True
-    for segment in segments:
-        try:
-            parts = shlex.split(segment)
-        except ValueError:
-            read_only = False
-            bases.append(segment)
-            continue
-        if not parts:
-            continue
-        base = Path(parts[0]).name
-        bases.append(base)
-        if base in MUTATING_COMMANDS or base not in READ_ONLY_COMMANDS:
-            read_only = False
-        if _segment_has_redirection(segment):
-            read_only = False
-
+    dangerous_pattern = next(
+        (pattern for pattern in DANGEROUS_PATTERNS if pattern in lowered),
+        "",
+    )
+    segments = [
+        shlex.join([word.text for word in node.words])
+        for node in semantic.ast.commands
+        if node.words
+    ]
     return {
         "segments": segments,
-        "base_commands": bases,
-        "read_only": read_only,
-        "requires_confirmation": not read_only,
-        "blocked": False,
-        "reason": "read-only" if read_only else "mutating or unknown command",
+        "base_commands": list(semantic.executables),
+        "read_only": semantic.read_only,
+        "requires_confirmation": semantic.requires_approval,
+        "blocked": semantic.status is ShellSemanticStatus.BLOCKED or bool(dangerous_pattern),
+        "reason": dangerous_pattern or semantic.reason,
+        "semantic_status": semantic.status.value,
+        "semantic_digest": semantic.semantic_digest,
+        "features": list(semantic.ast.features),
+    }
+
+
+def evaluate_argv_safety(argv: list[str] | tuple[str, ...]) -> dict[str, Any]:
+    """Evaluate direct argv semantics without parsing shell operators."""
+    semantic = analyze_argv(argv)
+    return {
+        "segments": [shlex.join(list(argv))] if argv else [],
+        "base_commands": list(semantic.executables),
+        "read_only": semantic.read_only,
+        "requires_confirmation": semantic.requires_approval,
+        "blocked": semantic.status is ShellSemanticStatus.BLOCKED,
+        "reason": semantic.reason,
+        "semantic_status": semantic.status.value,
+        "semantic_digest": semantic.semantic_digest,
+        "features": list(semantic.ast.features),
     }
 
 
 def is_read_only_command(command: str) -> bool:
-    """Return true when every command segment is read-only."""
+    """Return true only for a semantically proven literal shell graph."""
     safety = evaluate_command_safety(command)
+    return bool(safety["read_only"] and not safety["blocked"])
+
+
+def is_read_only_argv(argv: list[str] | tuple[str, ...]) -> bool:
+    """Return true only for a semantically proven direct argv vector."""
+    safety = evaluate_argv_safety(argv)
     return bool(safety["read_only"] and not safety["blocked"])
 
 
