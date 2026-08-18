@@ -49,6 +49,17 @@ shell_boundaries:
   terminal_shell_safe_status: literal_ast_with_argv_semantic_policy_only
   terminal_shell_unknown_status: semantic-unknown_requires_approval
   terminal_shell_ast_binding: script_digest_plus_semantic_digest
+principal_boundaries:
+  kinds:
+    - human
+    - gateway
+    - channel
+    - automation
+    - subagent
+    - browser
+  transport_derivation: RequestContext_derives_principal_kind_from_authenticated_source_transport
+  delegation: DelegationScope_is_narrow_only_and_binds_principal_parent_project_session_runtime_task_workspace_operation_resource_policy_expiry_nonce
+  replay: DelegationAuthority_consumes_each_child_scope_once_and_rejects_cross_principal_or_context_replay
 orchestration_boundaries:
   extracted_components:
     - TurnAdmission

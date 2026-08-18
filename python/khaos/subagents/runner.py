@@ -185,6 +185,7 @@ class SubAgentRunner:
             # B1: inherit the server-level approval broker / audit logger.
             "approval_broker": self.approval_broker,
             "principal_id": principal_id,
+            "principal_kind": "subagent",
             "source_transport": "subagent",
             "foreground_session": False,
             "audit_logger": self.audit_logger,

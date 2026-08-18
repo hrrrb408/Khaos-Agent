@@ -1612,14 +1612,17 @@ class AgentService:
         reservation was only cleaned up after a successful build).
         """
         if not ctx.project_id:
-            ctx = RequestContext(
-                principal_id=ctx.principal_id,
-                project_id=self._bound_project_id,
-                session_id=ctx.session_id,
-                runtime_id=ctx.runtime_id,
-                source_transport=ctx.source_transport,
-                policy_digest=ctx.policy_digest,
-            )
+                ctx = RequestContext(
+                    principal_id=ctx.principal_id,
+                    project_id=self._bound_project_id,
+                    session_id=ctx.session_id,
+                    runtime_id=ctx.runtime_id,
+                    source_transport=ctx.source_transport,
+                    policy_digest=ctx.policy_digest,
+                    principal_kind=ctx.principal_kind,
+                    parent_principal_id=ctx.parent_principal_id,
+                    delegation_digest=ctx.delegation_digest,
+                )
         owner_task = asyncio.current_task()
         runtime = None
         # F-07 (third-round review): track whether a terminal event has
@@ -1811,14 +1814,17 @@ class AgentService:
         future streams).
         """
         if not ctx.project_id:
-            ctx = RequestContext(
-                principal_id=ctx.principal_id,
-                project_id=self._bound_project_id,
-                session_id=ctx.session_id,
-                runtime_id=ctx.runtime_id,
-                source_transport=ctx.source_transport,
-                policy_digest=ctx.policy_digest,
-            )
+                ctx = RequestContext(
+                    principal_id=ctx.principal_id,
+                    project_id=self._bound_project_id,
+                    session_id=ctx.session_id,
+                    runtime_id=ctx.runtime_id,
+                    source_transport=ctx.source_transport,
+                    policy_digest=ctx.policy_digest,
+                    principal_kind=ctx.principal_kind,
+                    parent_principal_id=ctx.parent_principal_id,
+                    delegation_digest=ctx.delegation_digest,
+                )
         if stream_id:
             # Stream-specific tail: no need to verify session ownership
             # separately — the DB query filters by principal+project.
@@ -2064,6 +2070,7 @@ class AgentService:
             router=self._router,
             office_authority=self._office_authority,
             principal_id=ctx.principal_id,
+            principal_kind=ctx.principal_kind,
             source_transport=ctx.source_transport,
             foreground_session=False,
             session_id=session_id,

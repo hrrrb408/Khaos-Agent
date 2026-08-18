@@ -154,6 +154,7 @@ class RuntimeConfig:
     # a caller forgets to set it, ``build_runtime`` raises ValueError
     # (fail-closed) instead of silently running as the local OS user.
     principal_id: str = ""
+    principal_kind: str = ""
     source_transport: str = "unknown"
     foreground_session: bool = False
     # H5: session_id + runtime_id extend the per-session BrowserContext key
@@ -227,6 +228,7 @@ class ProductionRuntimeConfig:
     office_authority: OfficeMutationAuthority | None = None
     credential_broker: CredentialBroker | None = None
     principal_id: str = ""
+    principal_kind: str = ""
     source_transport: str = "unknown"
     foreground_session: bool = False
     session_id: str = ""
@@ -258,6 +260,7 @@ class ProductionRuntimeConfig:
             office_authority=self.office_authority,
             credential_broker=self.credential_broker,
             principal_id=self.principal_id,
+            principal_kind=self.principal_kind,
             source_transport=self.source_transport,
             foreground_session=self.foreground_session,
             session_id=self.session_id,
@@ -306,6 +309,7 @@ class RuntimeResult:
     # concurrent local sessions under the same UID get independent contexts
     # — closing one runtime's context does NOT close another's page.
     principal_id: str = ""
+    principal_kind: str = ""
     session_id: str = ""
     runtime_id: str = ""
     # H2: the AuditLogger is stored here so ``aclose()`` can close its file
@@ -881,6 +885,7 @@ async def build_runtime(
     cfg: RuntimeConfig | ProductionRuntimeConfig,
 ) -> RuntimeResult:
     """Build and initialize a complete runtime; this is the sole loop factory."""
+    structural_production_config = isinstance(cfg, ProductionRuntimeConfig)
     if isinstance(cfg, ProductionRuntimeConfig):
         cfg = cfg.as_runtime_config()
     if cfg.db is None:
@@ -895,6 +900,25 @@ async def build_runtime(
             "RuntimeConfig.principal_id is required (CLI/TUI pass "
             "f'local-uid:{os.getuid()}'; RPC paths pass ctx.principal_id)"
         )
+    # M6.4: a production runtime must carry a concrete principal kind.  The
+    # legacy ``unknown`` transport remains available only to explicit local
+    # fixtures; it is not a production identity proof.
+    from khaos.security.principals import (
+        PrincipalDelegationError,
+        principal_from_kind,
+        principal_for_transport,
+    )
+    try:
+        if cfg.principal_kind:
+            principal_from_kind(cfg.principal_id, cfg.principal_kind)
+        elif cfg.source_transport != "unknown":
+            principal_for_transport(cfg.principal_id, cfg.source_transport)
+        elif is_production_mode() and structural_production_config:
+            raise PrincipalDelegationError(
+                "production runtime requires a typed principal transport"
+            )
+    except (PrincipalDelegationError, ValueError) as exc:
+        raise ValueError("runtime principal identity is invalid") from exc
     # P1-1 (production Runtime injection): reject injected security-critical
     # components BEFORE touching any subsystem.  In production mode the five
     # components below must be constructed by the factory (they then carry
@@ -1273,6 +1297,7 @@ async def build_runtime(
         credential_broker=credential_broker,
         owns_credential_broker=owns_credential_broker,
         principal_id=cfg.principal_id,
+        principal_kind=cfg.principal_kind,
         # H5: carry session_id + runtime_id so ``aclose`` can release the
         # per-session BrowserContext keyed by (principal, session, runtime).
         session_id=cfg.session_id,

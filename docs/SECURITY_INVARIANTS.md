@@ -152,6 +152,17 @@ not evidence that an effect occurred.
     and callback semantics are `semantic-unknown` and require approval. A
     literal or nested blocked executable is hard blocked. Syntax acceptance or
     a first/base executable is never evidence of a safe effect.
+18. Principal kind is derived from the authenticated transport and is
+    immutable for the request. `HumanPrincipal`, `GatewayPrincipal`,
+    `ChannelPrincipal`, `AutomationPrincipal`, `SubagentPrincipal`, and
+    `BrowserPrincipal` cannot be interchanged by payload self-reporting.
+    Delegation is narrow-only and binds subject, parent, project, session,
+    runtime, task, workspace, operation family, resource scope, policy
+    digest, expiry, and nonce. A child scope cannot widen any parent field;
+    its nonce is consumed once, and cross-principal/context replay is
+    rejected. The typed foundation never replaces the signed authority or
+    exact-effect receipt, and missing production integration evidence remains
+    unclosed.
 
 ## Verification map
 
@@ -179,6 +190,9 @@ not evidence that an effect occurred.
   `python/tests/security/test_shell_semantics.py`,
   `python/tests/tools/test_terminal_tools.py`, and
   `python/tests/permissions/test_authorization_resource.py`.
+- Typed principal transport/delegation:
+  `python/tests/security/test_typed_principals.py` and
+  `python/tests/runtime/test_request_context_316a_4_1.py`.
 
 The opt-in real-platform jobs remain required for a release closure; skipped
 or unavailable jobs are not successful evidence.

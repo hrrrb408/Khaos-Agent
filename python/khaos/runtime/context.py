@@ -28,6 +28,14 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+from khaos.security.principals import (
+    Principal,
+    PrincipalDelegationError,
+    PrincipalKind,
+    principal_from_kind,
+    principal_for_transport,
+)
+
 
 def local_principal_id() -> str:
     """Return the local CLI principal without assuming POSIX ``getuid``.
@@ -76,6 +84,43 @@ class RequestContext:
     runtime_id: str = ""
     source_transport: str = "rpc"
     policy_digest: str = ""
+    # M6.4: the transport-derived principal kind is part of the immutable
+    # request identity.  Empty means "derive from source_transport"; callers
+    # cannot silently turn a channel/cron/subagent request into a human one.
+    principal_kind: str = ""
+    parent_principal_id: str = ""
+    delegation_digest: str = ""
+
+    def __post_init__(self) -> None:
+        try:
+            # Some service unit tests intentionally construct an empty
+            # context and verify that the service rejects it.  Preserve that
+            # fail-closed boundary while still assigning a typed kind; the
+            # public ``for_rpc``/``for_webhook`` constructors reject empty
+            # principals before a request can enter production.
+            identity = self.principal_id or "context-placeholder"
+            derived = principal_for_transport(identity, self.source_transport)
+            requested = (
+                PrincipalKind(self.principal_kind)
+                if self.principal_kind
+                else derived.kind
+            )
+        except (PrincipalDelegationError, ValueError) as exc:
+            raise ValueError("request context principal identity is invalid") from exc
+        if requested is not derived.kind:
+            raise ValueError(
+                "request context principal kind does not match its transport"
+            )
+        object.__setattr__(self, "principal_kind", requested.value)
+        if self.principal_id and self.parent_principal_id == self.principal_id:
+            raise ValueError("request context parent principal cannot equal subject")
+        if self.delegation_digest and len(self.delegation_digest) != 64:
+            raise ValueError("request context delegation digest is malformed")
+
+    @property
+    def principal(self) -> Principal:
+        """Return the concrete typed principal for this request."""
+        return principal_from_kind(self.principal_id, self.principal_kind)
 
     @classmethod
     def for_rpc(
@@ -100,6 +145,7 @@ class RequestContext:
             project_id=project_id,
             source_transport="rpc",
             policy_digest=policy_digest,
+            principal_kind=PrincipalKind.GATEWAY.value,
         )
 
     @classmethod
@@ -125,6 +171,7 @@ class RequestContext:
             project_id=project_id,
             source_transport="cli",
             policy_digest=policy_digest,
+            principal_kind=PrincipalKind.HUMAN.value,
         )
 
     @classmethod
@@ -147,6 +194,7 @@ class RequestContext:
             project_id=project_id,
             source_transport="webhook",
             policy_digest=policy_digest,
+            principal_kind=PrincipalKind.CHANNEL.value,
         )
 
     @classmethod
@@ -169,6 +217,7 @@ class RequestContext:
             project_id=project_id,
             source_transport="cron",
             policy_digest=policy_digest,
+            principal_kind=PrincipalKind.AUTOMATION.value,
         )
 
     def with_session(self, session_id: str) -> RequestContext:
@@ -184,6 +233,9 @@ class RequestContext:
             runtime_id=self.runtime_id,
             source_transport=self.source_transport,
             policy_digest=self.policy_digest,
+            principal_kind=self.principal_kind,
+            parent_principal_id=self.parent_principal_id,
+            delegation_digest=self.delegation_digest,
         )
 
     def with_runtime_id(self, runtime_id: str) -> RequestContext:
@@ -199,4 +251,7 @@ class RequestContext:
             runtime_id=runtime_id,
             source_transport=self.source_transport,
             policy_digest=self.policy_digest,
+            principal_kind=self.principal_kind,
+            parent_principal_id=self.parent_principal_id,
+            delegation_digest=self.delegation_digest,
         )
