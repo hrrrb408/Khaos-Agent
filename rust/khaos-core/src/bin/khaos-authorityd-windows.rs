@@ -32,8 +32,12 @@ mod windows_authority {
         GetTokenInformation, TokenGroups, TokenUser, TOKEN_GROUPS, TOKEN_QUERY, TOKEN_USER,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_FIRST_PIPE_INSTANCE,
-        FILE_GENERIC_READ, FILE_GENERIC_WRITE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
+        CreateFileW, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL,
+        FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, FILE_GENERIC_READ,
+        FILE_GENERIC_WRITE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
+    };
+    use windows_sys::Win32::System::IO::{
+        CancelIoEx, GetOverlappedResult, OVERLAPPED,
     };
     use windows_sys::Win32::System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
@@ -42,12 +46,12 @@ mod windows_authority {
     };
     use windows_sys::Win32::System::Services::{
         RegisterServiceCtrlHandlerExW, SetServiceStatus, StartServiceCtrlDispatcherW,
-        SERVICE_ACCEPT_STOP, SERVICE_CONTROL_STOP, SERVICE_ERROR_CRITICAL, SERVICE_RUNNING,
-        SERVICE_STATUS, SERVICE_STATUS_HANDLE, SERVICE_STOPPED, SERVICE_TABLE_ENTRYW,
-        SERVICE_WIN32_OWN_PROCESS,
+        SERVICE_ACCEPT_STOP, SERVICE_CONTROL_STOP, SERVICE_ERROR_CRITICAL, SERVICE_RUNNING, SERVICE_STATUS, SERVICE_STATUS_HANDLE,
+        SERVICE_STOPPED, SERVICE_STOP_PENDING, SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS,
     };
     use windows_sys::Win32::System::Threading::{
-        GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+        CreateEventW, GetCurrentProcess, OpenProcess, OpenProcessToken, SetEvent,
+        WaitForSingleObject, WaitForMultipleObjects, PROCESS_QUERY_LIMITED_INFORMATION,
     };
 
     const MAX_MESSAGE_BYTES: usize = 64 * 1024;
@@ -388,6 +392,9 @@ mod windows_authority {
                 return "{\"ok\":false,\"error_code\":\"authority_backend_unavailable\",\"error\":\"authority backend pipe is not configured\"}".to_string()
             }
         };
+        // Open the backend pipe overlapped so a wedged backend cannot
+        // block the authority frontend forever: every operation carries
+        // a hard deadline and is cancelled on expiry.
         let handle = unsafe {
             CreateFileW(
                 backend.as_ptr(),
@@ -395,7 +402,7 @@ mod windows_authority {
                 0,
                 null(),
                 OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
                 null_mut(),
             )
         };
@@ -433,35 +440,32 @@ mod windows_authority {
             return "{\"ok\":false,\"error_code\":\"authority_backend_unavailable\",\"error\":\"authority backend pipe identity is not the authority Service SID\"}".to_string();
         }
         let payload = serde_json::to_vec(&attest_request).unwrap_or_default();
-        let mut written = 0_u32;
-        let write_ok = payload.len() <= MAX_MESSAGE_BYTES
-            && unsafe {
-                WriteFile(
-                    handle,
-                    payload.as_ptr(),
-                    payload.len() as u32,
-                    &mut written,
-                    null_mut(),
-                )
-            } != 0;
-        let mut response = vec![0_u8; MAX_MESSAGE_BYTES];
-        let mut read = 0_u32;
-        let read_ok = write_ok
-            && unsafe {
-                ReadFile(
-                    handle,
-                    response.as_mut_ptr(),
-                    response.len() as u32,
-                    &mut read,
-                    null_mut(),
-                )
-            } != 0;
-        unsafe { CloseHandle(handle) };
-        if !read_ok || read == 0 || read as usize > MAX_MESSAGE_BYTES {
-            return "{\"ok\":false,\"error_code\":\"authority_backend_unavailable\",\"error\":\"authority backend returned no bounded response\"}".to_string();
+        if payload.len() > MAX_MESSAGE_BYTES {
+            unsafe { CloseHandle(handle) };
+            return "{\"ok\":false,\"error_code\":\"authority_backend_unavailable\",\"error\":\"authority backend request is out of bounds\"}".to_string();
         }
-        let backend_body: serde_json::Value = match serde_json::from_slice(&response[..read as usize])
-        {
+        let write_result =
+            unsafe { write_message_deadline(handle, &payload, BACKEND_IO_TIMEOUT_MS) };
+        let backend_bytes = match write_result {
+            Ok(()) => {
+                let mut response = vec![0_u8; MAX_MESSAGE_BYTES];
+                unsafe { read_message_deadline(handle, &mut response, BACKEND_IO_TIMEOUT_MS) }
+            }
+            Err(error) => Err(error),
+        };
+        unsafe { CloseHandle(handle) };
+        let backend_bytes = match backend_bytes {
+            Ok(bytes) if !bytes.is_empty() && bytes.len() <= MAX_MESSAGE_BYTES => bytes,
+            Ok(_) => {
+                return "{\"ok\":false,\"error_code\":\"authority_backend_unavailable\",\"error\":\"authority backend returned no bounded response\"}".to_string()
+            }
+            Err(error) => {
+                return format!(
+                    "{{\"ok\":false,\"error_code\":\"authority_backend_unavailable\",\"error\":\"authority backend IO deadline: {error}\"}}"
+                )
+            }
+        };
+        let backend_body: serde_json::Value = match serde_json::from_slice(&backend_bytes) {
             Ok(value) => value,
             Err(_) => {
                 return "{\"ok\":false,\"error\":\"authority backend returned malformed JSON\"}"
@@ -500,17 +504,148 @@ mod windows_authority {
         serde_json::Value::Object(wrapper).to_string()
     }
 
+    const CLIENT_IO_TIMEOUT_MS: u32 = 10_000;
+    const BACKEND_IO_TIMEOUT_MS: u32 = 15_000;
+    const ERROR_PIPE_CONNECTED: u32 = 0x0000_0217;
+    const ERROR_IO_PENDING: u32 = 0x0000_03E5;
+    const WAIT_OBJECT_0: u32 = 0;
+    const WAIT_TIMEOUT: u32 = 0x0000_0102;
+    const INFINITE: u32 = 0xFFFF_FFFF;
+
+    static mut STOP_EVENT: HANDLE = std::ptr::null_mut();
+    static mut STATUS_HANDLE: SERVICE_STATUS_HANDLE = std::ptr::null_mut();
+
+    unsafe fn set_service_state(state: u32, controls: u32, wait_hint: u32) {
+        let handle = STATUS_HANDLE;
+        if handle.is_null() {
+            return;
+        }
+        let status = SERVICE_STATUS {
+            dwServiceType: SERVICE_WIN32_OWN_PROCESS,
+            dwCurrentState: state,
+            dwControlsAccepted: controls,
+            dwWin32ExitCode: 0,
+            dwServiceSpecificExitCode: 0,
+            dwCheckPoint: 0,
+            dwWaitHint: wait_hint,
+        };
+        SetServiceStatus(handle, &status);
+    }
+
+    /// Overlapped read of one bounded message with a hard deadline.
+    /// Message-mode pipes deliver one complete message per read; a
+    /// timeout cancels the IO instead of blocking the service forever.
+    unsafe fn read_message_deadline(handle: HANDLE, buffer: &mut [u8], timeout_ms: u32) -> Result<Vec<u8>, String> {
+        let mut overlapped: OVERLAPPED = std::mem::zeroed();
+        let event = CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
+        if event.is_null() {
+            return Err("CreateEventW failed".to_string());
+        }
+        overlapped.hEvent = event;
+        let mut transferred = 0_u32;
+        let pending = ReadFile(
+            handle,
+            buffer.as_mut_ptr().cast(),
+            buffer.len() as u32,
+            &mut transferred,
+            &mut overlapped,
+        );
+        let last_error = GetLastError();
+        if pending == 0 && last_error != ERROR_IO_PENDING {
+            CloseHandle(event);
+            return Err(format!("ReadFile failed: {last_error}"));
+        }
+        if pending == 0 {
+            let wait = WaitForSingleObject(event, timeout_ms);
+            if wait == WAIT_TIMEOUT {
+                CancelIoEx(handle, &mut overlapped);
+                CloseHandle(event);
+                return Err("read deadline exceeded".to_string());
+            }
+            if wait != WAIT_OBJECT_0 {
+                CancelIoEx(handle, &mut overlapped);
+                CloseHandle(event);
+                return Err(format!("read wait failed: {wait}"));
+            }
+            // The overlapped result carries the byte count.
+            if GetOverlappedResult(handle, &mut overlapped, &mut transferred, 0) == 0 {
+                CloseHandle(event);
+                return Err("GetOverlappedResult failed".to_string());
+            }
+        }
+        CloseHandle(event);
+        if transferred == 0 || transferred as usize > buffer.len() {
+            return Err("empty or oversized message".to_string());
+        }
+        Ok(buffer[..transferred as usize].to_vec())
+    }
+
+    /// Overlapped write of one bounded message with a hard deadline.
+    unsafe fn write_message_deadline(handle: HANDLE, payload: &[u8], timeout_ms: u32) -> Result<(), String> {
+        let mut overlapped: OVERLAPPED = std::mem::zeroed();
+        let event = CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
+        if event.is_null() {
+            return Err("CreateEventW failed".to_string());
+        }
+        overlapped.hEvent = event;
+        let mut transferred = 0_u32;
+        let pending = WriteFile(
+            handle,
+            payload.as_ptr().cast(),
+            payload.len() as u32,
+            &mut transferred,
+            &mut overlapped,
+        );
+        let last_error = GetLastError();
+        if pending == 0 && last_error != ERROR_IO_PENDING {
+            CloseHandle(event);
+            return Err(format!("WriteFile failed: {last_error}"));
+        }
+        if pending == 0 {
+            let wait = WaitForSingleObject(event, timeout_ms);
+            if wait == WAIT_TIMEOUT {
+                CancelIoEx(handle, &mut overlapped);
+                CloseHandle(event);
+                return Err("write deadline exceeded".to_string());
+            }
+            if wait != WAIT_OBJECT_0 {
+                CancelIoEx(handle, &mut overlapped);
+                CloseHandle(event);
+                return Err(format!("write wait failed: {wait}"));
+            }
+            if GetOverlappedResult(handle, &mut overlapped, &mut transferred, 0) == 0 {
+                CloseHandle(event);
+                return Err("GetOverlappedResult failed".to_string());
+            }
+        }
+        CloseHandle(event);
+        if transferred as usize != payload.len() {
+            return Err("incomplete write".to_string());
+        }
+        Ok(())
+    }
+
     fn run_service_loop() -> Result<(), String> {
         let service_sid = service_sid_present()?;
         protected_key_marker()?;
         let pipe = pipe_name()?;
         let (_descriptor, attributes) = build_pipe_security()?;
         let pipe_w = wide(&pipe);
+        let stop_event = unsafe {
+            let event = CreateEventW(std::ptr::null(), 1, 0, std::ptr::null());
+            if event.is_null() {
+                return Err("CreateEventW failed for the stop event".to_string());
+            }
+            STOP_EVENT = event;
+            event
+        };
         loop {
+            // The pipe is opened overlapped so the blocking accept can be
+            // interrupted by SERVICE_CONTROL_STOP.
             let handle = unsafe {
                 CreateNamedPipeW(
                     pipe_w.as_ptr(),
-                    PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                    PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED,
                     PIPE_TYPE_MESSAGE
                         | PIPE_READMODE_MESSAGE
                         | PIPE_WAIT
@@ -527,52 +662,96 @@ mod windows_authority {
                     GetLastError()
                 }));
             }
-            let connected = unsafe { ConnectNamedPipe(handle, null_mut()) } != 0;
+            let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+            let connect_event = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
+            if connect_event.is_null() {
+                unsafe { CloseHandle(handle) };
+                return Err("CreateEventW failed for the connect event".to_string());
+            }
+            unsafe { overlapped.hEvent = connect_event };
+            let connect_result = unsafe { ConnectNamedPipe(handle, &mut overlapped) };
+            let connect_error = unsafe { GetLastError() };
+            let connected = if connect_result != 0 {
+                true
+            } else if connect_error == ERROR_PIPE_CONNECTED {
+                // The legal race: the client already connected between
+                // CreateNamedPipeW and ConnectNamedPipe.
+                true
+            } else if connect_error == ERROR_IO_PENDING {
+                // Wait for either a client connection or the stop signal.
+                let handles = [stop_event, connect_event];
+                let wait = unsafe {
+                    WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE)
+                };
+                if wait == WAIT_OBJECT_0 {
+                    // Stop requested: cancel the pending accept, drain, and
+                    // report STOP_PENDING before releasing resources.
+                    unsafe {
+                        CancelIoEx(handle, &mut overlapped);
+                        set_service_state(
+                            SERVICE_STOP_PENDING,
+                            0,
+                            10_000,
+                        );
+                        CloseHandle(connect_event);
+                        DisconnectNamedPipe(handle);
+                        CloseHandle(handle);
+                    }
+                    return Ok(());
+                }
+                if wait == WAIT_OBJECT_0 + 1 {
+                    let mut transferred = 0_u32;
+                    unsafe {
+                        GetOverlappedResult(handle, &mut overlapped, &mut transferred, 0) != 0
+                    }
+                } else {
+                    unsafe {
+                        CancelIoEx(handle, &mut overlapped);
+                        CloseHandle(connect_event);
+                        CloseHandle(handle);
+                    }
+                    continue;
+                }
+            } else {
+                false
+            };
             if connected {
-                let mut peer_pid = 0_u32;
-                let peer_ok = unsafe { GetNamedPipeClientProcessId(handle, &mut peer_pid) } != 0
-                    && peer_pid > 0;
-                let peer_identity = if peer_ok {
-                    peer_sid(peer_pid).ok()
-                } else {
-                    None
-                };
-                let expected_agent_sid = env::var("KHAOS_AGENT_SID").unwrap_or_default();
-                let peer_ok = peer_identity.as_deref() == Some(expected_agent_sid.as_str());
-                let mut input = vec![0_u8; MAX_MESSAGE_BYTES];
-                let mut read = 0_u32;
-                let read_ok = peer_ok
-                    && unsafe {
-                        ReadFile(
-                            handle,
-                            input.as_mut_ptr(),
-                            input.len() as u32,
-                            &mut read,
-                            null_mut(),
-                        )
-                    } != 0;
-                let response = if read_ok {
-                    service_request(
-                        &input[..read as usize],
-                        &service_sid,
-                        peer_identity.as_deref().unwrap_or("unknown"),
-                    )
-                } else {
-                    "{\"ok\":false,\"error\":\"Named Pipe peer proof failed\"}".to_string()
-                };
-                let mut written = 0_u32;
-                let _ = unsafe {
-                    WriteFile(
-                        handle,
-                        response.as_ptr(),
-                        response.len() as u32,
-                        &mut written,
-                        null_mut(),
-                    )
-                };
+                unsafe {
+                    let mut peer_pid = 0_u32;
+                    let peer_ok = GetNamedPipeClientProcessId(handle, &mut peer_pid) != 0
+                        && peer_pid > 0;
+                    let peer_identity = if peer_ok {
+                        peer_sid(peer_pid).ok()
+                    } else {
+                        None
+                    };
+                    let expected_agent_sid = env::var("KHAOS_AGENT_SID").unwrap_or_default();
+                    let peer_ok =
+                        peer_identity.as_deref() == Some(expected_agent_sid.as_str());
+                    let response = if peer_ok {
+                        let mut buffer = vec![0_u8; MAX_MESSAGE_BYTES];
+                        match read_message_deadline(handle, &mut buffer, CLIENT_IO_TIMEOUT_MS) {
+                            Ok(message) => service_request(
+                                &message,
+                                &service_sid,
+                                peer_identity.as_deref().unwrap_or("unknown"),
+                            ),
+                            Err(error) => format!(
+                                "{{\"ok\":false,\"error\":\"Named Pipe read failed: {error}\"}}"
+                            ),
+                        }
+                    } else {
+                        "{\"ok\":false,\"error\":\"Named Pipe peer proof failed\"}".to_string()
+                    };
+                    let _ = write_message_deadline(handle, response.as_bytes(), CLIENT_IO_TIMEOUT_MS);
+                    // A deterministic terminal state for the connection
+                    // even when stop arrives mid-request: the response is
+                    // flushed or the deadline fires before disconnect.
+                    DisconnectNamedPipe(handle);
+                }
             }
             unsafe {
-                DisconnectNamedPipe(handle);
+                CloseHandle(connect_event);
                 CloseHandle(handle);
             }
         }
@@ -661,6 +840,15 @@ mod windows_authority {
         _context: *mut c_void,
     ) -> u32 {
         if control == SERVICE_CONTROL_STOP {
+            // STOP_PENDING is reported immediately; the service loop
+            // observes the event, cancels its pending accept, drains the
+            // active connection within its IO deadline, and then reports
+            // STOPPED.  Stopping never leaves a wedged accept loop.
+            set_service_state(SERVICE_STOP_PENDING, 0, 10_000);
+            let event = STOP_EVENT;
+            if !event.is_null() {
+                SetEvent(event);
+            }
             return 0;
         }
         0
@@ -673,21 +861,27 @@ mod windows_authority {
         if status_handle.is_null() {
             return;
         }
-        let mut status = SERVICE_STATUS {
-            dwServiceType: SERVICE_WIN32_OWN_PROCESS,
-            dwCurrentState: SERVICE_RUNNING,
-            dwControlsAccepted: SERVICE_ACCEPT_STOP,
-            dwWin32ExitCode: 0,
-            dwServiceSpecificExitCode: 0,
-            dwCheckPoint: 0,
-            dwWaitHint: 0,
-        };
-        SetServiceStatus(status_handle, &status);
-        if run_service_loop().is_err() {
-            status.dwCurrentState = SERVICE_STOPPED;
-            status.dwControlsAccepted = 0;
-            status.dwWin32ExitCode = SERVICE_ERROR_CRITICAL;
-            SetServiceStatus(status_handle, &status);
+        STATUS_HANDLE = status_handle;
+        set_service_state(SERVICE_RUNNING, SERVICE_ACCEPT_STOP, 0);
+        match run_service_loop() {
+            Ok(()) => {
+                // Graceful stop: the loop already reported STOP_PENDING;
+                // every pipe and backend resource was closed inside it.
+                set_service_state(SERVICE_STOPPED, 0, 0);
+            }
+            Err(error) => {
+                eprintln!("khaos-authorityd-windows: service loop failed: {error}");
+                let status = SERVICE_STATUS {
+                    dwServiceType: SERVICE_WIN32_OWN_PROCESS,
+                    dwCurrentState: SERVICE_STOPPED,
+                    dwControlsAccepted: 0,
+                    dwWin32ExitCode: SERVICE_ERROR_CRITICAL,
+                    dwServiceSpecificExitCode: 0,
+                    dwCheckPoint: 0,
+                    dwWaitHint: 0,
+                };
+                SetServiceStatus(status_handle, &status);
+            }
         }
     }
 
