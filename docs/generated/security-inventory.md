@@ -75,7 +75,7 @@
 - `python/khaos/coding/planning/security_identities.py`: `bcafd43a2920e087f4c064091d9faa04184739a4a8a6454aa654ffd134790a38`
 - `python/khaos/coding/workspace/boundary.py`: `e1a310f3bfe2b1ca085f02be14b11f35dd1b52e923c7a2893bb5a68b9a3ff91e`
 - `rust/khaos-core/src/bin/khaos-exec-launcher.rs`: `c5eb7343002ecb7f74e1ca10df5d5edaf4de39f90ecc68064cb355b56b2fda71`
-- `rust/khaos-core/src/bin/khaos-sandbox-launcher.rs`: `0f3ac2101bb916724d9021400f19a4366c400fe663a46d27195d0268fa823d09`
+- `rust/khaos-core/src/bin/khaos-sandbox-launcher.rs`: `f8cc2645173e45bfb9c23a20baeaf32f0cc88aacce0a292b50e7f3405d6a1b37`
 - `python/khaos/grpc_server.py`: `0841b23878452be967eca270b03ffc23b1f7248916a1af6570810fe4dbab8fc0`
 - `go/internal/api/handler.go`: `9dc6af7572c331685a4fa28f8902d148da4338a19603f55aeaf2094fc38662a7`
 - `go/cmd/gateway/main.go`: `5c27479e8ef5ffa3c05008077e12e89e4f274d4255765606b3ee91d04df56481`
