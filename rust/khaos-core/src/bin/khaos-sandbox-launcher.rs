@@ -427,7 +427,7 @@ mod linux {
             libc::syscall(
                 libc::SYS_capget,
                 &mut header as *mut CapUserHeader,
-                data.as_mut_ptr() as *mut CapUserData,
+                data.as_mut_ptr(),
             )
         };
         if result != 0 {
@@ -1848,7 +1848,8 @@ mod linux {
     #[cfg(test)]
     mod tests {
         use super::{
-            ambient_capabilities_from_status, cap_sets_are_zero, CapUserData,
+            ambient_capabilities_from_status, cap_sets_are_zero, is_trusted_cgroup_procs_path,
+            CapUserData,
         };
         use std::path::Path;
 
