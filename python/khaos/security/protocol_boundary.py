@@ -213,6 +213,38 @@ class EffectBinding:
         )
 
 
+def read_bounded_line(
+    connection: object,
+    *,
+    max_bytes: int,
+    chunk_size: int = 64 * 1024,
+) -> bytes:
+    """Read one newline-terminated frame with a hard byte bound.
+
+    Pure transport framing for the authority control plane: the frame is
+    capped before parsing, an embedded newline terminates it, and an
+    oversized or unterminated frame fails closed instead of buffering
+    unbounded bytes.  Extracted from authorityd so the framing contract
+    is a single reviewable, testable boundary.
+    """
+    if max_bytes <= 0 or chunk_size <= 0:
+        raise ProtocolBoundaryError("bounded line limits must be positive")
+    data = bytearray()
+    recv = getattr(connection, "recv", None)
+    if not callable(recv):
+        raise ProtocolBoundaryError("connection does not expose recv()")
+    while len(data) < max_bytes:
+        chunk = recv(min(chunk_size, max_bytes - len(data)))
+        if not chunk:
+            break
+        marker = chunk.find(b"\n")
+        if marker >= 0:
+            data.extend(chunk[:marker])
+            return bytes(data)
+        data.extend(chunk)
+    raise ProtocolBoundaryError("bounded frame is too large or incomplete")
+
+
 __all__ = [
     "EffectBinding",
     "OwnerState",
@@ -221,6 +253,7 @@ __all__ = [
     "ReceiptState",
     "canonical_digest",
     "canonical_json_bytes",
+    "read_bounded_line",
     "require_owner_transition",
     "require_receipt_transition",
     "validate_object_schema",

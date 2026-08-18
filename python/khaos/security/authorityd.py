@@ -59,6 +59,7 @@ from khaos.security.principals import (
 )
 from khaos.security.protocol_boundary import (
     ProtocolBoundaryError,
+    read_bounded_line,
     require_receipt_transition,
 )
 from khaos.security.resource_scope import (
@@ -2609,7 +2610,9 @@ def _serve_connection(
                         raise IdentityIsolationError(
                             "authorityd peer UID is not the expected authority peer"
                         )
-                body = _recv_line(connection)
+                body = read_bounded_line(
+                    connection, max_bytes=MAX_MESSAGE_BYTES
+                )
                 request = json.loads(body.decode("utf-8"))
                 response = _dispatch(daemon, request)
             except RemoteAuditUnavailableError as exc:
@@ -2773,20 +2776,6 @@ def _is_hex(value: str, length: int) -> bool:
         and len(value) == length
         and all(character in _HEX_DIGITS for character in value)
     )
-
-
-def _recv_line(connection: socket.socket) -> bytes:
-    data = bytearray()
-    while len(data) < MAX_MESSAGE_BYTES:
-        chunk = connection.recv(min(64 * 1024, MAX_MESSAGE_BYTES - len(data)))
-        if not chunk:
-            break
-        marker = chunk.find(b"\n")
-        if marker >= 0:
-            data.extend(chunk[:marker])
-            return bytes(data)
-        data.extend(chunk)
-    raise AuthorityControlPlaneError("authorityd request is too large or incomplete")
 
 
 __all__ = [
