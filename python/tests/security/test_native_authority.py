@@ -23,6 +23,10 @@ def _proof_payload(**overrides: object) -> dict[str, object]:
         "service_pid": 1234,
         "service_identity": "com.khaos.authorityd",
         "peer_identity": "com.khaos.agent",
+        "peer_team_id": "TEAMID123",
+        "peer_cdhash": "b" * 40,
+        "designated_requirement_digest": "c" * 64,
+        "service_instance_id": "d" * 32,
         "protected_key_ref": "khaos-authority-signing-key",
         "challenge_digest": "a" * 64,
         "peer_verified": True,
@@ -85,9 +89,79 @@ def test_macos_adapter_requires_native_client_and_key_contract(monkeypatch: pyte
         code_signature="com.khaos.agent",
         keychain_access_group="TEAMID.com.khaos.authority",
         protected_key_ref="khaos-authority-signing-key",
+        agent_requirement_digest="c" * 64,
     )
     with pytest.raises(NativeAuthorityError, match="CLIENT is missing"):
         build_native_authority_adapter(production=True, contract=contract)
+
+
+def test_macos_adapter_requires_designated_requirement(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An identifier-only contract is no longer a usable trust model."""
+    monkeypatch.setattr(sys, "platform", "darwin")
+    contract = AuthorityIdentityContract(
+        501,
+        502,
+        503,
+        launchd_service="com.khaos.authorityd",
+        code_signature="com.khaos.agent",
+        keychain_access_group="TEAMID.com.khaos.authority",
+        protected_key_ref="khaos-authority-signing-key",
+    )
+    with pytest.raises(NativeAuthorityError, match="designated agent code requirement"):
+        build_native_authority_adapter(production=True, contract=contract)
+
+
+def test_native_proof_rejects_wrong_designated_requirement_digest() -> None:
+    """Same UID + same identifier + wrong signing identity must fail closed.
+
+    The designated requirement digest is the commitment to the Team-ID
+    anchored requirement the native service actually enforced.  A proof
+    produced under a different requirement (wrong Team ID, ad-hoc signing,
+    unsigned binary) carries a different digest and is rejected here even
+    before the transport compares identity strings.
+    """
+    with pytest.raises(NativeAuthorityError, match="requirement digest"):
+        NativeAuthorityProof.from_payload(
+            _proof_payload(designated_requirement_digest="f" * 64),
+            expected_platform="darwin",
+            expected_transport="xpc",
+            expected_service_id="com.khaos.authorityd",
+            expected_key_ref="khaos-authority-signing-key",
+            expected_requirement_digest="c" * 64,
+        )
+    proof = NativeAuthorityProof.from_payload(
+        _proof_payload(),
+        expected_platform="darwin",
+        expected_transport="xpc",
+        expected_service_id="com.khaos.authorityd",
+        expected_key_ref="khaos-authority-signing-key",
+        expected_requirement_digest="c" * 64,
+    )
+    assert proof.peer_team_id == "TEAMID123"
+
+
+def test_native_proof_requires_code_identity_fields() -> None:
+    """A proof without Team ID, cdhash, or instance id is incomplete."""
+    for missing in ("peer_team_id", "peer_cdhash", "designated_requirement_digest", "service_instance_id"):
+        payload = _proof_payload()
+        payload.pop(missing)
+        with pytest.raises(NativeAuthorityError, match="fields are incomplete"):
+            NativeAuthorityProof.from_payload(
+                payload,
+                expected_platform="darwin",
+                expected_transport="xpc",
+                expected_service_id="com.khaos.authorityd",
+                expected_key_ref="khaos-authority-signing-key",
+            )
+    # An empty Team ID is an unsigned or ad-hoc signed peer: fail closed.
+    with pytest.raises(NativeAuthorityError, match="does not match"):
+        NativeAuthorityProof.from_payload(
+            _proof_payload(peer_team_id=""),
+            expected_platform="darwin",
+            expected_transport="xpc",
+            expected_service_id="com.khaos.authorityd",
+            expected_key_ref="khaos-authority-signing-key",
+        )
 
 
 def test_authority_client_uses_injected_native_transport(monkeypatch: pytest.MonkeyPatch) -> None:

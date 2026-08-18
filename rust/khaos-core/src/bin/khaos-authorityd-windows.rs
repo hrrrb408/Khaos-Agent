@@ -284,21 +284,58 @@ mod windows_authority {
         Ok((descriptor_w, attributes))
     }
 
-    fn native_probe_json(service_sid: &str, peer_pid: u32, pipe_acl: bool) -> String {
+    fn service_instance_id() -> String {
+        // A per-run instance identity binds every proof to one service
+        // process lifetime.  It is derived from the pid and the monotonic
+        // wall clock so two consecutive service instances never share it.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or(0);
+        let mixed = format!("{}|{}", std::process::id(), nanos);
+        format!("{:x}", sha2::Sha256::digest(mixed.as_bytes()))[..32].to_string()
+    }
+
+    fn native_probe_json(
+        service_sid: &str,
+        peer_identity: &str,
+        pipe_acl: bool,
+        requirement_digest: &str,
+    ) -> String {
         let key_ref = env::var("KHAOS_AUTHORITYD_PROTECTED_KEY_REF").unwrap_or_default();
+        let instance = service_instance_id();
         let digest = format!(
             "{:x}",
-            sha2::Sha256::digest(format!("{SERVICE_NAME}|{service_sid}|{key_ref}").as_bytes())
+            sha2::Sha256::digest(
+                format!(
+                    "{SERVICE_NAME}|{service_sid}|{peer_identity}|{requirement_digest}|{instance}|{key_ref}|native-authority-proof-v2"
+                )
+                .as_bytes()
+            )
         );
         format!(
-            "{{\"platform\":\"win32\",\"transport\":\"named-pipe\",\"service_id\":\"{SERVICE_NAME}\",\"service_pid\":{},\"service_identity\":\"{service_sid}\",\"peer_identity\":\"pid:{peer_pid}\",\"protected_key_ref\":\"{key_ref}\",\"challenge_digest\":\"{digest}\",\"peer_verified\":true,\"transport_verified\":{},\"protected_key_verified\":true}}",
-            std::process::id(), pipe_acl
+            "{{\"platform\":\"win32\",\"transport\":\"named-pipe\",\"service_id\":\"{SERVICE_NAME}\",\"service_pid\":{},\"service_identity\":\"{service_sid}\",\"peer_identity\":\"{peer_identity}\",\"peer_team_id\":\"{peer_identity}\",\"peer_cdhash\":\"\",\"designated_requirement_digest\":\"{requirement_digest}\",\"service_instance_id\":\"{instance}\",\"protected_key_ref\":\"{key_ref}\",\"challenge_digest\":\"{digest}\",\"peer_verified\":true,\"transport_verified\":{},\"protected_key_verified\":true}}",
+            std::process::id(),
+            pipe_acl
+        )
+    }
+
+    fn agent_requirement_digest() -> String {
+        let agent_sid = env::var("KHAOS_AGENT_SID").unwrap_or_default();
+        format!(
+            "{:x}",
+            sha2::Sha256::digest(format!("windows-agent-sid:{agent_sid}").as_bytes())
         )
     }
 
     fn service_request(input: &[u8], service_sid: &str, peer_identity: &str) -> String {
         if input == b"{\"kind\":\"probe\"}" {
-            return native_probe_json(service_sid, 1, true).replace("pid:1", peer_identity);
+            return native_probe_json(
+                service_sid,
+                peer_identity,
+                true,
+                &agent_requirement_digest(),
+            );
         }
         let backend = match env::var("KHAOS_AUTHORITYD_BACKEND_PIPE") {
             Ok(value) if value.starts_with(r"\\.\pipe\") && value.len() <= 256 => wide(&value),

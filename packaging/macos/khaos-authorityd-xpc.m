@@ -55,9 +55,11 @@ static int load_configuration(void) {
             if (name[0] == 'K' && value[0] != '\0' &&
                 (strcmp(name, "KHAOS_AGENT_UID") == 0 ||
                  strcmp(name, "KHAOS_AUTHORITYD_AGENT_CODE_SIGNATURE") == 0 ||
+                 strcmp(name, "KHAOS_AUTHORITYD_AGENT_CODE_REQUIREMENT") == 0 ||
                  strcmp(name, "KHAOS_AUTHORITYD_KEYCHAIN_GROUP") == 0 ||
                  strcmp(name, "KHAOS_AUTHORITYD_PROTECTED_KEY_REF") == 0 ||
                  strcmp(name, "KHAOS_AUTHORITYD_SERVICE_CODE_SIGNATURE") == 0 ||
+                 strcmp(name, "KHAOS_AUTHORITYD_SERVICE_CODE_REQUIREMENT") == 0 ||
                  strcmp(name, "KHAOS_AUTHORITYD_BACKEND_SOCKET") == 0 ||
                  strcmp(name, "KHAOS_AUTHORITYD_XPC_SERVICE") == 0)) {
                 if (setenv(name, value, 1) != 0) return 0;
@@ -89,8 +91,41 @@ static int parse_uid(const char *value, uid_t *result) {
     return 1;
 }
 
-static int copy_code_identity(pid_t pid, char *buffer, size_t capacity) {
-    if (pid <= 0 || buffer == NULL || capacity == 0) {
+static int requirement_from_env(const char *name, SecRequirementRef *out) {
+    /* Build a designated code requirement from deployment configuration.
+     * The requirement expression (identifier + anchor + Team ID binding)
+     * is the only accepted peer identity; an identifier alone is not. */
+    const char *text = env_required(name);
+    if (text == NULL) return 0;
+    CFStringRef expression = CFStringCreateWithCString(
+        kCFAllocatorDefault, text, kCFStringEncodingUTF8);
+    if (expression == NULL) return 0;
+    OSStatus status = SecRequirementCreateWithString(expression, kSecCSDefaultFlags, out);
+    CFRelease(expression);
+    return status == errSecSuccess;
+}
+
+static void digest_hex(const char *text, char output[65]) {
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(text, (CC_LONG)strlen(text), digest);
+    for (size_t index = 0; index < sizeof(digest); ++index) {
+        snprintf(output + (index * 2), 3, "%02x", digest[index]);
+    }
+    output[64] = '\0';
+}
+
+static int copy_code_identity(
+    pid_t pid,
+    SecRequirementRef requirement,
+    char *identifier,
+    size_t identifier_capacity,
+    char *team_id,
+    size_t team_capacity,
+    char *cdhash_hex,
+    size_t cdhash_capacity
+) {
+    if (pid <= 0 || requirement == NULL || identifier == NULL || identifier_capacity == 0 ||
+        team_id == NULL || team_capacity == 0 || cdhash_hex == NULL || cdhash_capacity < 41) {
         return 0;
     }
     CFNumberRef pid_number = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &pid);
@@ -103,16 +138,41 @@ static int copy_code_identity(pid_t pid, char *buffer, size_t capacity) {
         kCFAllocatorDefault, keys, values, 1,
         &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
     SecCodeRef guest = NULL;
-    SecRequirementRef requirement = NULL;
     CFDictionaryRef signing = NULL;
     int valid = attributes != NULL &&
-        SecCodeCopyGuestWithAttributes(NULL, attributes, kSecCSDefaultFlags, &guest) == errSecSuccess &&
-        SecCodeCheckValidity(guest, kSecCSDefaultFlags, requirement) == errSecSuccess &&
-        SecCodeCopySigningInformation(guest, kSecCSSigningInformation, &signing) == errSecSuccess;
+        SecCodeCopyGuestWithAttributes(NULL, attributes, kSecCSDefaultFlags, &guest) == errSecSuccess;
+    /* The designated requirement is evaluated by the Security framework
+     * itself: same UID + identifier alone can never satisfy a Team-ID
+     * anchored requirement.  Unsigned, ad-hoc, or modified binaries fail
+     * this check. */
     if (valid) {
-        CFStringRef identifier = CFDictionaryGetValue(signing, kSecCodeInfoIdentifier);
-        valid = identifier != NULL && CFStringGetCString(
-            identifier, buffer, (CFIndex)capacity, kCFStringEncodingUTF8);
+        valid = SecCodeCheckValidity(guest, kSecCSDefaultFlags, requirement) == errSecSuccess;
+    }
+    if (valid) {
+        valid = SecCodeCopySigningInformation(guest, kSecCSSigningInformation, &signing) == errSecSuccess;
+    }
+    if (valid) {
+        CFStringRef code_identifier = CFDictionaryGetValue(signing, kSecCodeInfoIdentifier);
+        valid = code_identifier != NULL && CFStringGetCString(
+            code_identifier, identifier, (CFIndex)identifier_capacity, kCFStringEncodingUTF8);
+    }
+    if (valid) {
+        CFStringRef team = CFDictionaryGetValue(signing, kSecCodeInfoTeamIdentifier);
+        valid = team != NULL && CFStringGetCString(
+            team, team_id, (CFIndex)team_capacity, kCFStringEncodingUTF8);
+    }
+    if (valid) {
+        /* kSecCodeInfoUnique is the binary code-directory hash that
+         * uniquely identifies the exact signed code the peer runs. */
+        CFDataRef unique = CFDictionaryGetValue(signing, kSecCodeInfoUnique);
+        valid = unique != NULL && CFDataGetLength(unique) == 20;
+        if (valid) {
+            const unsigned char *bytes = CFDataGetBytePtr(unique);
+            for (size_t index = 0; index < 20; ++index) {
+                snprintf(cdhash_hex + (index * 2), 3, "%02x", bytes[index]);
+            }
+            cdhash_hex[40] = '\0';
+        }
     }
     if (signing != NULL) CFRelease(signing);
     if (guest != NULL) CFRelease(guest);
@@ -146,42 +206,115 @@ static int verify_keychain_item(const char *key_ref, const char *access_group) {
     return status == errSecSuccess;
 }
 
-static int verify_peer(xpc_connection_t peer, char *identity, size_t identity_capacity) {
+struct peer_identity {
+    char identifier[256];
+    char team_id[64];
+    char cdhash[41];
+    char requirement_digest[65];
+};
+
+static int verify_peer(xpc_connection_t peer, struct peer_identity *identity) {
     uid_t peer_uid = xpc_connection_get_euid(peer);
     pid_t peer_pid = xpc_connection_get_pid(peer);
     au_asid_t peer_asid = xpc_connection_get_asid(peer);
     uid_t agent_uid = 0;
     const char *configured_uid = env_required("KHAOS_AGENT_UID");
     const char *expected_identity = env_required("KHAOS_AUTHORITYD_AGENT_CODE_SIGNATURE");
+    const char *requirement_text = env_required("KHAOS_AUTHORITYD_AGENT_CODE_REQUIREMENT");
+    SecRequirementRef requirement = NULL;
     if (!parse_uid(configured_uid, &agent_uid) || expected_identity == NULL ||
+        requirement_text == NULL ||
         peer_uid != agent_uid || peer_uid == geteuid() || peer_pid <= 0 ||
         peer_asid == 0) {
         return 0;
     }
-    if (!copy_code_identity(peer_pid, identity, identity_capacity)) {
+    if (!requirement_from_env("KHAOS_AUTHORITYD_AGENT_CODE_REQUIREMENT", &requirement)) {
         return 0;
     }
-    return strcmp(identity, expected_identity) == 0;
-}
-
-static int copy_self_identity(char *identity, size_t capacity) {
-    SecCodeRef self = NULL;
-    CFDictionaryRef signing = NULL;
-    int valid = SecCodeCopySelf(kSecCSDefaultFlags, &self) == errSecSuccess &&
-        SecCodeCheckValidity(self, kSecCSDefaultFlags, NULL) == errSecSuccess &&
-        SecCodeCopySigningInformation(self, kSecCSSigningInformation, &signing) == errSecSuccess;
-    if (valid) {
-        CFStringRef identifier = CFDictionaryGetValue(signing, kSecCodeInfoIdentifier);
-        valid = identifier != NULL && CFStringGetCString(identifier, identity, (CFIndex)capacity, kCFStringEncodingUTF8);
+    int valid = copy_code_identity(
+        peer_pid,
+        requirement,
+        identity->identifier,
+        sizeof(identity->identifier),
+        identity->team_id,
+        sizeof(identity->team_id),
+        identity->cdhash,
+        sizeof(identity->cdhash));
+    CFRelease(requirement);
+    if (!valid) {
+        return 0;
     }
-    if (signing != NULL) CFRelease(signing);
-    if (self != NULL) CFRelease(self);
-    return valid;
+    digest_hex(requirement_text, identity->requirement_digest);
+    /* Defense in depth: the designated requirement already anchors the
+     * Team ID; the plain identifier comparison additionally rejects a
+     * requirement that accidentally matched a different bundle id. */
+    return strcmp(identity->identifier, expected_identity) == 0;
 }
 
-static void digest_for_peer(const char *service_id, const char *peer_identity, const char *key_ref, char output[65]) {
-    char input[1024];
-    int written = snprintf(input, sizeof(input), "%s|%s|%s", service_id, peer_identity, key_ref);
+static int verify_self_identity(struct peer_identity *identity) {
+    SecRequirementRef requirement = NULL;
+    const char *requirement_text = env_required("KHAOS_AUTHORITYD_SERVICE_CODE_REQUIREMENT");
+    const char *expected_identity = env_required("KHAOS_AUTHORITYD_SERVICE_CODE_SIGNATURE");
+    SecCodeRef self = NULL;
+    if (requirement_text == NULL || expected_identity == NULL ||
+        !requirement_from_env("KHAOS_AUTHORITYD_SERVICE_CODE_REQUIREMENT", &requirement)) {
+        return 0;
+    }
+    int valid = SecCodeCopySelf(kSecCSDefaultFlags, &self) == errSecSuccess &&
+        SecCodeCheckValidity(self, kSecCSDefaultFlags, requirement) == errSecSuccess;
+    CFRelease(requirement);
+    if (self != NULL) CFRelease(self);
+    if (!valid) {
+        return 0;
+    }
+    snprintf(identity->identifier, sizeof(identity->identifier), "%s", expected_identity);
+    snprintf(identity->team_id, sizeof(identity->team_id), "%s", requirement_text);
+    identity->cdhash[0] = '\0';
+    digest_hex(requirement_text, identity->requirement_digest);
+    return 1;
+}
+
+static void service_instance_id(char output[33]) {
+    static char instance[33] = {0};
+    if (instance[0] == '\0') {
+        unsigned char entropy[16] = {0};
+        if (SecRandomCopyBytes(kSecRandomDefault, sizeof(entropy), entropy) != errSecSuccess) {
+            /* A missing CSPRNG must never produce a constant instance id. */
+            exit(78);
+        }
+        for (size_t index = 0; index < sizeof(entropy); ++index) {
+            snprintf(instance + (index * 2), 3, "%02x", entropy[index]);
+        }
+        instance[32] = '\0';
+    }
+    snprintf(output, 33, "%s", instance);
+}
+
+static void digest_for_peer(
+    const char *service_id,
+    const struct peer_identity *peer,
+    const struct peer_identity *service,
+    const char *instance_id,
+    const char *key_ref,
+    char output[65]
+) {
+    /* The proof digest covers every identity field the transport proved:
+     * service, peer, Team ID, code-directory hash, requirement digests,
+     * the service instance, and the protected key reference. */
+    char input[2048];
+    int written = snprintf(
+        input, sizeof(input),
+        "%s|%s|%s|%s|%s|%s|%s|%s|%s|%s",
+        service_id,
+        service->identifier,
+        peer->identifier,
+        peer->team_id,
+        peer->cdhash,
+        peer->requirement_digest,
+        service->requirement_digest,
+        instance_id,
+        key_ref,
+        "native-authority-proof-v2");
     if (written < 0 || (size_t)written >= sizeof(input)) {
         output[0] = '\0';
         return;
@@ -253,20 +386,20 @@ static void reply_error(xpc_object_t reply, const char *message) {
 
 static void handle_message(xpc_connection_t peer, xpc_object_t event) {
     xpc_object_t reply = xpc_dictionary_create(NULL, NULL, 0);
-    char peer_identity[256] = {0};
     const char *service_id = env_required("KHAOS_AUTHORITYD_XPC_SERVICE");
     const char *key_ref = env_required("KHAOS_AUTHORITYD_PROTECTED_KEY_REF");
     const char *access_group = env_required("KHAOS_AUTHORITYD_KEYCHAIN_GROUP");
-    char service_identity[256] = {0};
-    int peer_ok = verify_peer(peer, peer_identity, sizeof(peer_identity));
+    struct peer_identity agent = {0};
+    struct peer_identity service = {0};
+    int peer_ok = verify_peer(peer, &agent);
     int service_ok = service_id != NULL && key_ref != NULL && access_group != NULL &&
-        copy_self_identity(service_identity, sizeof(service_identity));
-    const char *expected_service_identity = env_required("KHAOS_AUTHORITYD_SERVICE_CODE_SIGNATURE");
-    service_ok = service_ok && expected_service_identity != NULL && strcmp(service_identity, expected_service_identity) == 0;
+        verify_self_identity(&service);
     int key_ok = key_ref != NULL && access_group != NULL && verify_keychain_item(key_ref, access_group);
+    char instance_id[33] = {0};
+    service_instance_id(instance_id);
     char proof_digest[65] = {0};
-    if (service_id != NULL && peer_identity[0] != '\0' && key_ref != NULL) {
-        digest_for_peer(service_id, peer_identity, key_ref, proof_digest);
+    if (service_id != NULL && peer_ok && service_ok && key_ok) {
+        digest_for_peer(service_id, &agent, &service, instance_id, key_ref, proof_digest);
     }
     const char *kind = xpc_dictionary_get_string(event, "kind");
     if (kind == NULL || !peer_ok || !service_ok || !key_ok || proof_digest[0] == '\0') {
@@ -274,8 +407,21 @@ static void handle_message(xpc_connection_t peer, xpc_object_t event) {
     } else if (strcmp(kind, "probe") == 0) {
         char proof_json[MAX_MESSAGE_BYTES];
         snprintf(proof_json, sizeof(proof_json),
-            "{\"platform\":\"darwin\",\"transport\":\"xpc\",\"service_id\":\"%s\",\"service_pid\":%d,\"service_identity\":\"%s\",\"peer_identity\":\"%s\",\"protected_key_ref\":\"%s\",\"challenge_digest\":\"%s\",\"peer_verified\":true,\"transport_verified\":true,\"protected_key_verified\":true}",
-            service_id, getpid(), service_identity, peer_identity, key_ref, proof_digest);
+            "{\"platform\":\"darwin\",\"transport\":\"xpc\",\"service_id\":\"%s\",\"service_pid\":%d,"
+            "\"service_identity\":\"%s\",\"peer_identity\":\"%s\","
+            "\"peer_team_id\":\"%s\",\"peer_cdhash\":\"%s\","
+            "\"designated_requirement_digest\":\"%s\","
+            "\"service_instance_id\":\"%s\","
+            "\"protected_key_ref\":\"%s\",\"challenge_digest\":\"%s\","
+            "\"peer_verified\":true,\"transport_verified\":true,\"protected_key_verified\":true}",
+            service_id, getpid(),
+            service.identifier,
+            agent.identifier,
+            agent.team_id,
+            agent.cdhash,
+            agent.requirement_digest,
+            instance_id,
+            key_ref, proof_digest);
         xpc_dictionary_set_string(reply, "proof_json", proof_json);
     } else if (strcmp(kind, "request") == 0) {
         size_t request_length = 0;
@@ -317,6 +463,10 @@ static void service_connection(xpc_connection_t peer) {
     });
     xpc_connection_resume(peer);
 }
+
+/* NOTE: this translation unit is built without -fobjc-arc (see
+ * build-native-authority.sh) because the XPC C API is managed manually
+ * through xpc_release.  Do not add ARC-only Objective-C code here. */
 
 int main(void) {
     if (!load_configuration()) {

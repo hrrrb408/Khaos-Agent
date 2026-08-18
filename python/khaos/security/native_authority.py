@@ -35,7 +35,15 @@ class NativeAuthorityError(IdentityIsolationError):
 
 @dataclass(frozen=True, slots=True)
 class NativeAuthorityProof:
-    """Machine-produced proof returned by the native transport client."""
+    """Machine-produced proof returned by the native transport client.
+
+    The proof binds the full code identity the native transport enforced:
+    the peer's designated requirement digest (Team-ID anchored on macOS,
+    agent-SID anchored on Windows), the peer Team ID, the code-directory
+    hash where the platform exposes it, and the service instance id.  A
+    same-UID process with the right identifier but the wrong signing
+    identity cannot produce a matching requirement digest.
+    """
 
     platform: str
     transport: str
@@ -43,6 +51,10 @@ class NativeAuthorityProof:
     service_pid: int
     service_identity: str
     peer_identity: str
+    peer_team_id: str
+    peer_cdhash: str
+    designated_requirement_digest: str
+    service_instance_id: str
     protected_key_ref: str
     challenge_digest: str
     peer_verified: bool
@@ -58,6 +70,7 @@ class NativeAuthorityProof:
         expected_transport: str,
         expected_service_id: str,
         expected_key_ref: str,
+        expected_requirement_digest: str = "",
     ) -> NativeAuthorityProof:
         if not isinstance(value, dict):
             raise NativeAuthorityError("native authority proof is not an object")
@@ -68,6 +81,10 @@ class NativeAuthorityProof:
             "service_pid",
             "service_identity",
             "peer_identity",
+            "peer_team_id",
+            "peer_cdhash",
+            "designated_requirement_digest",
+            "service_instance_id",
             "protected_key_ref",
             "challenge_digest",
             "peer_verified",
@@ -84,6 +101,10 @@ class NativeAuthorityProof:
                 service_pid=int(value["service_pid"]),
                 service_identity=str(value["service_identity"]),
                 peer_identity=str(value["peer_identity"]),
+                peer_team_id=str(value["peer_team_id"]),
+                peer_cdhash=str(value["peer_cdhash"]),
+                designated_requirement_digest=str(value["designated_requirement_digest"]),
+                service_instance_id=str(value["service_instance_id"]),
                 protected_key_ref=str(value["protected_key_ref"]),
                 challenge_digest=str(value["challenge_digest"]),
                 peer_verified=value["peer_verified"] is True,
@@ -100,12 +121,22 @@ class NativeAuthorityProof:
             or proof.service_pid <= 0
             or not proof.service_identity
             or not proof.peer_identity
+            or not proof.peer_team_id
+            or not proof.designated_requirement_digest
+            or not proof.service_instance_id
             or not proof.challenge_digest
             or not proof.peer_verified
             or not proof.transport_verified
             or not proof.protected_key_verified
         ):
             raise NativeAuthorityError("native authority proof does not match the deployment contract")
+        if (
+            expected_requirement_digest
+            and proof.designated_requirement_digest != expected_requirement_digest
+        ):
+            raise NativeAuthorityError(
+                "native authority peer requirement digest does not match the deployment contract"
+            )
         return proof
 
 
@@ -190,6 +221,7 @@ class _SubprocessNativeAdapter:
     service_id: str
     protected_key_ref: str
     client: Path
+    expected_requirement_digest: str = ""
     proof: NativeAuthorityProof
 
     def _native_environment(self) -> dict[str, str]:
@@ -210,6 +242,7 @@ class _SubprocessNativeAdapter:
             expected_transport=self.expected_transport,
             expected_service_id=self.service_id,
             expected_key_ref=self.protected_key_ref,
+            expected_requirement_digest=self.expected_requirement_digest,
         )
 
     def request(self, payload: dict[str, object]) -> dict[str, object]:
@@ -253,6 +286,10 @@ class MacOSLaunchdXPCAdapter(_SubprocessNativeAdapter):
             raise NativeAuthorityError("macOS XPC authority used on a non-macOS platform")
         if not contract.launchd_service or not contract.protected_key_ref or not contract.code_signature:
             raise NativeAuthorityError("macOS XPC authority identity contract is incomplete")
+        if not contract.agent_requirement_digest:
+            raise NativeAuthorityError(
+                "macOS XPC authority requires the designated agent code requirement"
+            )
         client_value = os.environ.get("KHAOS_MACOS_AUTHORITY_XPC_CLIENT")
         if not client_value:
             raise NativeAuthorityError("KHAOS_MACOS_AUTHORITY_XPC_CLIENT is missing")
@@ -260,6 +297,7 @@ class MacOSLaunchdXPCAdapter(_SubprocessNativeAdapter):
             service_id=contract.launchd_service,
             protected_key_ref=contract.protected_key_ref,
             client=_required_absolute_executable(Path(client_value)),
+            expected_requirement_digest=contract.agent_requirement_digest,
         )
         object.__setattr__(adapter, "proof", adapter._probe())
         return adapter
@@ -289,6 +327,10 @@ class WindowsServiceNamedPipeAdapter(_SubprocessNativeAdapter):
             raise NativeAuthorityError("Windows Named Pipe authority used on a non-Windows platform")
         if not contract.service_sid or not contract.named_pipe or not contract.protected_key_ref:
             raise NativeAuthorityError("Windows Named Pipe authority identity contract is incomplete")
+        if not contract.agent_requirement_digest:
+            raise NativeAuthorityError(
+                "Windows Named Pipe authority requires the agent SID requirement"
+            )
         client_value = os.environ.get("KHAOS_WINDOWS_AUTHORITY_PIPE_CLIENT")
         if not client_value:
             raise NativeAuthorityError("KHAOS_WINDOWS_AUTHORITY_PIPE_CLIENT is missing")
@@ -298,6 +340,7 @@ class WindowsServiceNamedPipeAdapter(_SubprocessNativeAdapter):
             client=_required_absolute_executable(Path(client_value)),
             named_pipe=contract.named_pipe,
             agent_sid=contract.agent_sid or "",
+            expected_requirement_digest=contract.agent_requirement_digest,
         )
         object.__setattr__(adapter, "proof", adapter._probe())
         return adapter

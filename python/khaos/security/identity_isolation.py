@@ -33,6 +33,7 @@ class AuthorityIdentityContract:
     agent_sid: str | None = None
     named_pipe: str | None = None
     protected_key_ref: str | None = None
+    agent_requirement_digest: str | None = None
 
     def validate(self, *, production: bool) -> None:
         if not production:
@@ -43,6 +44,7 @@ class AuthorityIdentityContract:
                 "agent_sid": self.agent_sid,
                 "named_pipe": self.named_pipe,
                 "protected_key_ref": self.protected_key_ref,
+                "agent_requirement_digest": self.agent_requirement_digest,
             }
         elif sys_platform() == "darwin":
             required = {
@@ -50,6 +52,7 @@ class AuthorityIdentityContract:
                 "code_signature": self.code_signature,
                 "keychain_access_group": self.keychain_access_group,
                 "protected_key_ref": self.protected_key_ref,
+                "agent_requirement_digest": self.agent_requirement_digest,
             }
         else:
             required = {}
@@ -91,6 +94,29 @@ def read_contract_from_environment() -> AuthorityIdentityContract:
             raise IdentityIsolationError(f"{name} is negative")
         return parsed
 
+    def requirement_digest(*names: str) -> str | None:
+        """Digest the designated peer requirement the native transport enforces.
+
+        On macOS this is the full designated code requirement expression
+        (identifier + anchor + Team ID); on Windows it is the expected agent
+        SID binding (canonically prefixed, matching the Rust frontend's
+        ``agent_requirement_digest``).  The digest is compared against the
+        proof the native service returns, so a deployment cannot silently
+        fall back to an identifier-only trust model.
+        """
+        import hashlib
+
+        windows = os.name == "nt"
+        for name in names:
+            value = os.environ.get(name)
+            if not value:
+                continue
+            canonical = (
+                f"windows-agent-sid:{value}" if windows and name == "KHAOS_AGENT_SID" else value
+            )
+            return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        return None
+
     return AuthorityIdentityContract(
         agent_uid=integer("KHAOS_AGENT_UID"),
         authority_uid=integer("KHAOS_AUTHORITYD_UID"),
@@ -106,6 +132,10 @@ def read_contract_from_environment() -> AuthorityIdentityContract:
         agent_sid=os.environ.get("KHAOS_AGENT_SID"),
         named_pipe=os.environ.get("KHAOS_AUTHORITYD_NAMED_PIPE"),
         protected_key_ref=os.environ.get("KHAOS_AUTHORITYD_PROTECTED_KEY_REF"),
+        agent_requirement_digest=requirement_digest(
+            "KHAOS_AUTHORITYD_AGENT_CODE_REQUIREMENT",
+            "KHAOS_AGENT_SID",
+        ),
     )
 
 
