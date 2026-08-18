@@ -204,9 +204,24 @@ static int send_all(int descriptor, const unsigned char *buffer, size_t length) 
     return 1;
 }
 
+static int verify_backend_socket(const char *path) {
+    /* The backend socket must be a socket owned by this service's own
+     * authority identity with no group/other access.  A symlink, a regular
+     * file, or a socket owned by another UID (for example the agent user)
+     * is rejected before connect(). */
+    if (path == NULL || path[0] != '/') return 0;
+    struct stat metadata = {0};
+    if (lstat(path, &metadata) != 0) return 0;
+    if (!S_ISSOCK(metadata.st_mode)) return 0;
+    if (metadata.st_uid != geteuid()) return 0;
+    if ((metadata.st_mode & (S_IRWXG | S_IRWXO)) != 0) return 0;
+    return 1;
+}
+
 static int backend_request(const char *request, char *response, size_t capacity) {
     const char *path = env_required("KHAOS_AUTHORITYD_BACKEND_SOCKET");
     if (path == NULL || path[0] != '/' || strlen(path) >= sizeof(((struct sockaddr_un *)0)->sun_path)) return 0;
+    if (!verify_backend_socket(path)) return 0;
     int descriptor = socket(AF_UNIX, SOCK_STREAM, 0);
     if (descriptor < 0) return 0;
     struct sockaddr_un address = {0};

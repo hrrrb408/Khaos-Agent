@@ -45,6 +45,7 @@ from khaos.security.authorityd_protocol import (
 from khaos.security.identity_isolation import (
     IdentityIsolationError,
     peer_uid,
+    peer_uid_platform,
     read_contract_from_environment,
     validate_private_unix_socket,
 )
@@ -2199,17 +2200,40 @@ def _require_native_execution_binding(
 
 
 def serve_unix(daemon: AuthorityDaemon, *, production: bool = True) -> None:
-    """Serve requests on a private 0600 socket or agent-group 0660 socket."""
-    if os.name == "nt" or sys.platform == "darwin":
+    """Serve requests on a private 0600 socket or agent-group 0660 socket.
+
+    On darwin this function only runs in *backend mode*: it serves the
+    ``KHAOS_AUTHORITYD_BACKEND_SOCKET`` consumed by the native launchd/XPC
+    frontend, never a socket the agent could reach directly.  Every peer is
+    kernel-verified through ``LOCAL_PEERCRED`` and must hold the authority
+    UID (the frontend's identity).  There is no same-user agent fallback.
+    """
+    backend_mode = sys.platform == "darwin"
+    if os.name == "nt":
         raise AuthorityControlPlaneError(
             "native authorityd transport is required on this platform; use the "
-            "Windows Named Pipe or macOS launchd/XPC adapter"
+            "Windows Named Pipe backend service"
         )
     contract = read_contract_from_environment()
     if production:
         contract.validate(production=True)
         if contract.authority_uid is not None and os.geteuid() != contract.authority_uid:
             raise IdentityIsolationError("authorityd is not running as its dedicated UID")
+    if backend_mode:
+        # The backend socket must be the one the native frontend forwards to,
+        # and it must live under authority ownership.  Serving any other
+        # darwin socket would expose a direct agent -> authorityd path that
+        # bypasses the XPC identity checks.
+        expected_backend = os.environ.get("KHAOS_AUTHORITYD_BACKEND_SOCKET", "")
+        if (
+            not expected_backend
+            or not Path(expected_backend).is_absolute()
+            or Path(daemon.socket_path) != Path(expected_backend)
+        ):
+            raise AuthorityControlPlaneError(
+                "darwin authorityd may only serve the configured native "
+                "frontend backend socket"
+            )
     daemon.socket_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     if daemon.socket_path.exists():
         info = daemon.socket_path.lstat()
@@ -2260,6 +2284,15 @@ def serve_unix(daemon: AuthorityDaemon, *, production: bool = True) -> None:
             )
         listener.listen(max_connections)
         slots = threading.BoundedSemaphore(max_connections)
+        # Backend mode (darwin): the only legitimate peer is the native
+        # frontend, which runs as the authority UID.  Linux production keeps
+        # validating the agent UID directly.
+        if backend_mode:
+            expected_peer_uid: int | None = contract.authority_uid
+            if expected_peer_uid is None:
+                expected_peer_uid = os.geteuid()
+        else:
+            expected_peer_uid = contract.agent_uid if production else None
         with ThreadPoolExecutor(
             max_workers=max_connections, thread_name_prefix="khaos-authorityd"
         ) as executor:
@@ -2272,9 +2305,10 @@ def serve_unix(daemon: AuthorityDaemon, *, production: bool = True) -> None:
                     _serve_connection,
                     daemon,
                     connection,
-                    contract.agent_uid if production else None,
+                    expected_peer_uid,
                     connection_timeout,
                     slots,
+                    backend_mode,
                 )
     finally:
         listener.close()
@@ -2287,13 +2321,22 @@ def _serve_connection(
     expected_uid: int | None,
     connection_timeout: float = 5.0,
     slots: threading.BoundedSemaphore | None = None,
+    backend_mode: bool = False,
 ) -> None:
     try:
         with connection:
             connection.settimeout(connection_timeout)
             try:
-                if expected_uid is not None and peer_uid(connection) != expected_uid:
-                    raise IdentityIsolationError("authorityd peer UID is not the agent UID")
+                if expected_uid is not None:
+                    observed_uid = (
+                        peer_uid_platform(connection)
+                        if backend_mode
+                        else peer_uid(connection)
+                    )
+                    if observed_uid != expected_uid:
+                        raise IdentityIsolationError(
+                            "authorityd peer UID is not the expected authority peer"
+                        )
                 body = _recv_line(connection)
                 request = json.loads(body.decode("utf-8"))
                 response = _dispatch(daemon, request)

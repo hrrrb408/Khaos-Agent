@@ -45,6 +45,14 @@ def main() -> int:
         )),
         daemon.public_key_bytes,
     )
+    if os.name == "nt":
+        # Windows production: serve the Named-Pipe backend consumed by the
+        # native Service-SID frontend.  There is no agent-reachable Unix
+        # socket transport on this platform.
+        from khaos.security.authorityd_windows import serve_windows_backend
+
+        serve_windows_backend(daemon, production=True)
+        return 0
     serve_unix(daemon, production=True)
     return 0
 

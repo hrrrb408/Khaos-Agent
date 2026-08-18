@@ -66,7 +66,7 @@ jobs:
           KHAOS_MACOS_AUTHORITY_XPC_CLIENT: /usr/local/libexec/khaos-authorityd-xpc-client
         run: |
           mkdir -p native-evidence
-          PYTHONPATH=python uv run python scripts/run_native_authority_probe.py | tee native-evidence/macos-xpc-proof.json
+          PYTHONPATH=python uv run python scripts/run_native_authority_identity_probe.py | tee native-evidence/macos-xpc-proof.json
           test -s native-evidence/macos-xpc-proof.json
       - name: Upload native proof
         if: always()
@@ -116,7 +116,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force native-evidence | Out-Null
           $env:PYTHONPATH = "$env:GITHUB_WORKSPACE\python"
-          uv run python scripts/run_native_authority_probe.py | Tee-Object native-evidence\windows-named-pipe-proof.json
+          uv run python scripts/run_native_authority_identity_probe.py | Tee-Object native-evidence\windows-named-pipe-proof.json
           if (-not (Test-Path native-evidence\windows-named-pipe-proof.json)) { throw 'native proof artifact missing' }
       - name: Upload native proof
         if: always()

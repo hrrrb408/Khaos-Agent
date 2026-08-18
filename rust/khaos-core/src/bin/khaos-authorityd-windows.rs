@@ -37,7 +37,8 @@ mod windows_authority {
     };
     use windows_sys::Win32::System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
-        PIPE_READMODE_MESSAGE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_MESSAGE, PIPE_WAIT,
+        GetNamedPipeServerProcessId, PIPE_READMODE_MESSAGE, PIPE_REJECT_REMOTE_CLIENTS,
+        PIPE_TYPE_MESSAGE, PIPE_WAIT,
     };
     use windows_sys::Win32::System::Services::{
         RegisterServiceCtrlHandlerExW, SetServiceStatus, StartServiceCtrlDispatcherW,
@@ -295,9 +296,9 @@ mod windows_authority {
         )
     }
 
-    fn service_request(input: &[u8], service_sid: &str, peer_sid: &str) -> String {
+    fn service_request(input: &[u8], service_sid: &str, peer_identity: &str) -> String {
         if input == b"{\"kind\":\"probe\"}" {
-            return native_probe_json(service_sid, 1, true).replace("pid:1", peer_sid);
+            return native_probe_json(service_sid, 1, true).replace("pid:1", peer_identity);
         }
         let backend = match env::var("KHAOS_AUTHORITYD_BACKEND_PIPE") {
             Ok(value) if value.starts_with(r"\\.\pipe\") && value.len() <= 256 => wide(&value),
@@ -318,6 +319,24 @@ mod windows_authority {
         };
         if handle == INVALID_HANDLE_VALUE {
             return "{\"ok\":false,\"error_code\":\"authority_backend_unavailable\",\"error\":\"authority backend pipe is unavailable\"}".to_string();
+        }
+        // Verify the backend pipe really is served by the authority service
+        // identity before forwarding a request.  A pipe name alone is not
+        // identity: any process could create a pipe with the same name.
+        let backend_identity_ok = unsafe {
+            let mut server_pid = 0_u32;
+            if GetNamedPipeServerProcessId(handle, &mut server_pid) == 0 {
+                0
+            } else {
+                match peer_sid(server_pid) {
+                    Ok(observed) if observed == service_sid => 1,
+                    _ => 0,
+                }
+            }
+        };
+        if backend_identity_ok == 0 {
+            unsafe { CloseHandle(handle) };
+            return "{\"ok\":false,\"error_code\":\"authority_backend_unavailable\",\"error\":\"authority backend pipe identity is not the authority Service SID\"}".to_string();
         }
         let bounded = input.len() <= MAX_MESSAGE_BYTES;
         let mut written = 0_u32;

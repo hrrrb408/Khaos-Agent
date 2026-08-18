@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.khaos.authorityd.backend</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/khaos-authorityd-backend</string>
+    </array>
+    <key>UserName</key>
+    <string>khaos-authority</string>
+    <key>GroupName</key>
+    <string>khaos-authority</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>KHAOS_AUTHORITYD_SOCKET</key>
+        <string>/var/run/khaos-authorityd/backend.sock</string>
+        <key>KHAOS_AUTHORITYD_BACKEND_SOCKET</key>
+        <string>/var/run/khaos-authorityd/backend.sock</string>
+        <key>KHAOS_AUTHORITYD_KEY_PATH</key>
+        <string>/var/db/khaos-authorityd/authorityd.pem</string>
+        <key>KHAOS_AUTHORITYD_PUBLIC_KEY_PATH</key>
+        <string>/var/run/khaos-authorityd/authorityd.pub</string>
+        <key>KHAOS_TYPED_RESOURCE_CATALOG_PATH</key>
+        <string>/etc/khaos/native-resource-catalog.json</string>
+    </dict>
+    <key>KeepAlive</key>
+    <true/>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>SessionCreate</key>
+    <true/>
+    <key>POSIXSpawnType</key>
+    <string>Adaptive</string>
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+</dict>
+</plist>

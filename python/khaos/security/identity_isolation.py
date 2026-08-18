@@ -139,6 +139,46 @@ def peer_uid(connection: socket.socket) -> int:
     return int.from_bytes(raw[8:12], byteorder="little", signed=True)
 
 
+# darwin exposes peer credentials through the LOCAL_PEERCRED socket option
+# (struct xucred).  The constant is not in the Python socket module.
+_LOCAL_PEERCRED = 0x001
+_XUCRED_SIZE = 4 + 4 + 2 + 2 + 16 * 4  # version, uid, padding, ngroups, groups[16]
+
+
+def peer_uid_darwin(connection: socket.socket) -> int:
+    """Return the LOCAL_PEERCRED UID on darwin; fail closed elsewhere.
+
+    The kernel fills ``struct xucred`` for connected AF_UNIX sockets; a
+    successful getsockopt is itself the kernel validation.  ``cr_version``
+    is the structure-layout version (``XUCRED_VERSION`` is 0 on current
+    macOS) and is *not* a validation flag.  A short or out-of-range payload
+    fails closed rather than being interpreted optimistically.
+    """
+    if sys_platform() != "darwin":
+        raise IdentityIsolationError("LOCAL_PEERCRED is only available on darwin")
+    try:
+        raw = connection.getsockopt(
+            0, _LOCAL_PEERCRED, _XUCRED_SIZE
+        )  # SOL_LOCAL == 0 on darwin
+    except OSError as exc:
+        raise IdentityIsolationError(
+            "could not read authority peer credentials"
+        ) from exc
+    if len(raw) < 12:
+        raise IdentityIsolationError("authority peer credential payload is malformed")
+    uid = int.from_bytes(raw[4:8], byteorder="little", signed=True)
+    if uid < 0:
+        raise IdentityIsolationError("authority peer credential UID is invalid")
+    return uid
+
+
+def peer_uid_platform(connection: socket.socket) -> int:
+    """Return the kernel-verified peer UID for the current platform."""
+    if sys_platform() == "darwin":
+        return peer_uid_darwin(connection)
+    return peer_uid(connection)
+
+
 def require_distinct_linux_identities(
     *, agent_uid: int, authority_uid: int, job_uid: int
 ) -> None:
@@ -263,6 +303,8 @@ __all__ = [
     "LinuxProcessIdentityEvidence",
     "linux_job_namespace_args",
     "peer_uid",
+    "peer_uid_darwin",
+    "peer_uid_platform",
     "read_contract_from_environment",
     "read_linux_process_identity",
     "require_distinct_linux_identities",
