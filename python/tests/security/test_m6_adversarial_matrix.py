@@ -94,6 +94,7 @@ def test_effect_mutation_after_approval_is_rejected():
     )
 
 
+@pytest.mark.posix_host
 def test_workspace_symlink_and_hardlink_escape_has_no_external_effect(tmp_path: Path):
     outside = tmp_path.parent / f"{tmp_path.name}-outside"
     outside.mkdir()
