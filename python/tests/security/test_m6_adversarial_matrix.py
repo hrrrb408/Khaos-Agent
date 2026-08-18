@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import os
+import signal
 import socket
 import sys
 from pathlib import Path
@@ -130,6 +131,25 @@ def test_credential_provider_relative_and_malformed_specs_are_rejected():
         validate_provider_spec(
             {"type": "env", "variables": {"NOT A VARIABLE": "SOURCE"}}
         )
+
+
+def test_windows_domain_signal_does_not_require_killpg(monkeypatch):
+    """Windows termination uses direct PIDs because ``os.killpg`` is POSIX-only."""
+    import khaos.security.credential_provider_host as host_module
+
+    signals: list[tuple[int, signal.Signals]] = []
+    monkeypatch.setattr(host_module.os, "name", "nt")
+    monkeypatch.delattr(host_module.os, "killpg", raising=False)
+    monkeypatch.setattr(
+        host_module.os,
+        "kill",
+        lambda pid, sig: signals.append((pid, sig)),
+    )
+
+    host_module._signal_domain(101, {102}, signal.SIGTERM)
+
+    assert {pid for pid, _sig in signals} == {101, 102}
+    assert all(sig is signal.SIGTERM for _pid, sig in signals)
 
 
 @pytest.mark.asyncio
