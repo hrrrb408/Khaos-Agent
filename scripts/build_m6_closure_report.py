@@ -128,6 +128,18 @@ FINDINGS = (
         "evidence": "Local matrix and CI-only kernel/native evidence are kept separate.",
         "limitations": "No local report may claim CLOSED without the required native and exact-commit CI artifacts.",
     },
+    {
+        "id": "M6.9",
+        "name": "Real security closure",
+        "root_cause": "Native frontends forwarded to backends that did not exist on macOS/Windows; the transport probe stood in for an E2E; proofs were static digests; delegation digests were caller-supplied; closure was a CLI attestation; git branch argv matched by name; native CI assumed state runners do not have.",
+        "invariant": "Native authority proofs are signed challenge-responses bound to designated code requirements; delegations are authority-issued and one-shot; closure requires verified evidence manifests; SAFE argv semantics are proven, not name-matched.",
+        "files": "ADR-022/023; authorityd.py; authorityd_windows.py; native_authority.py; principals.py; delegation_issuer.py; security_evidence.py; shell_semantics.py; native-authority-production-e2e.yml; production_composition_manifest.py",
+        "before": "A transport probe, two local files, or a parent digest could all masquerade as security evidence.",
+        "after": "Real frontend/backend chains, signed attestations, authority-owned delegation registry, provenance-verified closure, per-command argv proofs, real CI provisioning.",
+        "tests": "test_native_authority_backend/attestation; test_delegation_authority_owned; test_security_evidence_provenance; test_argv_semantic_policy; test_windows_authority_lifecycle; test_production_composition_manifest; test_tcb_boundaries",
+        "evidence": "Local fail-closed tests green; hosted macOS/Windows real E2E remains CI evidence (UNKNOWN until artifacts exist).",
+        "limitations": "Native runners and release SHA evidence are external; this report stays NOT CLOSED without them.",
+    },
 )
 
 
