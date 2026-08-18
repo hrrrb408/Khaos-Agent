@@ -103,5 +103,8 @@ def test_authority_client_uses_injected_native_transport(monkeypatch: pytest.Mon
                 "value": "native",
             }
 
-    client = AuthorityDaemonClient(Path("/unused.sock"), native_adapter=FakeAdapter())
+    # Construct an absolute path using the host platform's pathlib semantics.
+    # On Windows, Path("/unused.sock") is drive-relative even though this test
+    # temporarily simulates the macOS transport selection.
+    client = AuthorityDaemonClient(Path.cwd() / "unused.sock", native_adapter=FakeAdapter())
     assert client.request({"operation": "probe"})["value"] == "native"
