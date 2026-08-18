@@ -366,6 +366,94 @@ mod linux {
         ]
     }
 
+    // M5.6: capability-verification constants kept local so the launcher
+    // does not depend on the libc crate tracking kernel header versions.
+    const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+    const PR_CAP_AMBIENT: libc::c_int = 38;
+    const PR_CAP_AMBIENT_CLEAR_ALL: libc::c_ulong = 4;
+
+    #[repr(C)]
+    #[derive(Default, Clone, Copy)]
+    struct CapUserHeader {
+        version: u32,
+        pid: libc::c_int,
+    }
+
+    #[repr(C)]
+    #[derive(Default, Clone, Copy)]
+    struct CapUserData {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+
+    fn cap_sets_are_zero(data: &[CapUserData]) -> bool {
+        data.iter()
+            .all(|set| set.effective == 0 && set.permitted == 0 && set.inheritable == 0)
+    }
+
+    fn clear_ambient_capabilities() {
+        // Best effort: kernels without ambient support legitimately error
+        // here; the verification below is the actual gate.
+        unsafe {
+            libc::prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0);
+        }
+    }
+
+    fn ambient_capabilities_from_status(status: &str) -> io::Result<u64> {
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("CapAmb:") {
+                let text = rest.trim();
+                return u64::from_str_radix(text, 16)
+                    .map_err(|_| io::Error::other("CapAmb line is malformed"));
+            }
+        }
+        Err(io::Error::other("CapAmb is missing from /proc/self/status"))
+    }
+
+    /// M5.6: refuse to exec any payload while the kernel still reports a
+    /// capability.  Effective, permitted, and inheritable sets are read
+    /// with ``capget`` and ambient capabilities with the kernel-reported
+    /// ``/proc/self/status`` — the postcondition is verified, never
+    /// inferred from bwrap's ``--cap-drop ALL`` construction.
+    fn require_zero_capabilities() -> io::Result<()> {
+        clear_ambient_capabilities();
+        let mut header = CapUserHeader {
+            version: LINUX_CAPABILITY_VERSION_3,
+            pid: 0,
+        };
+        let mut data = [CapUserData::default(); 2];
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_capget,
+                &mut header as *mut CapUserHeader,
+                data.as_mut_ptr(),
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::other(format!(
+                "capget failed: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        if !cap_sets_are_zero(&data) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "payload boundary retains Linux capabilities",
+            ));
+        }
+        let status = std::fs::read_to_string("/proc/self/status")
+            .map_err(|error| io::Error::other(format!("read /proc/self/status: {error}")))?;
+        let ambient = ambient_capabilities_from_status(&status)?;
+        if ambient != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "payload boundary retains ambient capabilities",
+            ));
+        }
+        Ok(())
+    }
+
     fn install_seccomp() -> io::Result<()> {
         let mut filter = vec![
             stmt(BPF_LD | BPF_W | BPF_ABS, 4),
@@ -1742,6 +1830,16 @@ mod linux {
         if args.first().is_some_and(|arg| arg == "--") {
             args.remove(0);
         }
+        // M5.6: the zero-capability postcondition is verified, not inferred
+        // from the bwrap construction (``--cap-drop ALL``).  The payload
+        // boundary must prove the kernel reports no residual capabilities
+        // before Landlock/seccomp are installed and exec runs.
+        require_zero_capabilities().map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("zero-capability postcondition failed: {error}"),
+            )
+        })?;
         install_landlock_if_required()?;
         install_seccomp()?;
         exec(&args)
@@ -1749,8 +1847,48 @@ mod linux {
 
     #[cfg(test)]
     mod tests {
-        use super::is_trusted_cgroup_procs_path;
+        use super::{
+            ambient_capabilities_from_status, cap_sets_are_zero, is_trusted_cgroup_procs_path,
+            CapUserData,
+        };
         use std::path::Path;
+
+        #[test]
+        fn zero_cap_sets_pass_the_postcondition() {
+            assert!(cap_sets_are_zero(&[CapUserData::default(); 2]));
+        }
+
+        #[test]
+        fn any_residual_capability_fails_the_postcondition() {
+            let mut sets = [CapUserData::default(); 2];
+            sets[0].effective = 1;
+            assert!(!cap_sets_are_zero(&sets));
+            let mut sets = [CapUserData::default(); 2];
+            sets[1].permitted = 1 << 21;
+            assert!(!cap_sets_are_zero(&sets));
+            let mut sets = [CapUserData::default(); 2];
+            sets[0].inheritable = 0xffffffff;
+            assert!(!cap_sets_are_zero(&sets));
+        }
+
+        #[test]
+        fn parses_zero_and_nonzero_ambient_capability_lines() {
+            let status = "Name:\tkhaos\nCapInh:\t0000000000000000\n\
+                          CapPrm:\t0000000000000000\nCapEff:\t0000000000000000\n\
+                          CapBnd:\t000001ffffffffff\nCapAmb:\t0000000000000000\n";
+            assert_eq!(ambient_capabilities_from_status(status).unwrap(), 0);
+            let nonzero = status.replace(
+                "CapAmb:\t0000000000000000",
+                "CapAmb:\t0000000000000004",
+            );
+            assert_eq!(ambient_capabilities_from_status(&nonzero).unwrap(), 4);
+        }
+
+        #[test]
+        fn rejects_missing_or_malformed_ambient_lines() {
+            assert!(ambient_capabilities_from_status("Name:\tkhaos\n").is_err());
+            assert!(ambient_capabilities_from_status("CapAmb:\tnot-hex\n").is_err());
+        }
 
         #[test]
         fn accepts_the_compose_execution_cgroup_mount() {

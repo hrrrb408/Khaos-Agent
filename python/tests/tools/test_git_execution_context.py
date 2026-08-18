@@ -64,7 +64,21 @@ class _RecordingExecutionService:
 
     async def execute(self, request):
         self.requests.append(request)
-        return ExecutionResult("exec", "passed", 0, next(self.outputs, ""), "", 1)
+        # Security evidence must positively prove completeness, so the
+        # test double mirrors the real supervisor's completeness bits.
+        return ExecutionResult(
+            "exec",
+            "passed",
+            0,
+            next(self.outputs, ""),
+            "",
+            1,
+            {
+                "output_truncated": False,
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+            },
+        )
 
 
 def _read_context(tmp_path, *, task_id="task-a", state=WorkspaceState.RUNNING, outputs=None):
@@ -647,7 +661,7 @@ async def test_git_push_uses_execution_service_and_approval_is_one_shot(tmp_path
     assert "replayed" in replay["error"]
 
 
-@pytest.mark.parametrize("drift", ["head", "diff", "remote"])
+@pytest.mark.parametrize("drift", ["head", "remote"])
 async def test_git_push_rejects_approval_drift(tmp_path, drift):
     _, task, _, _, service, _ = await _remote_repo(tmp_path)
     context, _ = await _approve_remote(service, task)
@@ -655,8 +669,6 @@ async def test_git_push_rejects_approval_drift(tmp_path, drift):
         (task / "head.txt").write_text("head\n", encoding="utf-8")
         await _run_git(task, "add", "head.txt")
         await _run_git(task, "commit", "-m", "head drift")
-    elif drift == "diff":
-        (task / "file.txt").write_text("diff drift\n", encoding="utf-8")
     else:
         replacement = tmp_path / "replacement.git"
         replacement.mkdir()
@@ -666,6 +678,19 @@ async def test_git_push_rejects_approval_drift(tmp_path, drift):
     result = json.loads(await git_push(str(task), **context))
     assert result["pushed"] is False
     assert "stale" in result["error"]
+
+
+async def test_git_push_exact_effect_binding_ignores_worktree_drift(tmp_path):
+    """M5.6 (SEC-08): dirty worktree content cannot change a push's remote
+    effect, so editing a tracked file (or adding untracked files) after
+    approval must NOT invalidate the exact-effect binding."""
+    _, task, _, _, service, _ = await _remote_repo(tmp_path)
+    context, _ = await _approve_remote(service, task)
+    (task / "file.txt").write_text("diff drift\n", encoding="utf-8")
+    (task / "untracked.bin").write_bytes(b"untracked bytes")
+
+    result = json.loads(await git_push(str(task), **context))
+    assert result["pushed"] is True
 
 
 async def test_git_push_requires_network_credential_and_approval(tmp_path):
@@ -721,9 +746,11 @@ async def test_git_push_network_policy_is_server_bound_and_backend_fails_closed(
 async def test_git_push_injects_only_single_use_authorized_credential_scope(tmp_path):
     head = "b" * 40
     remote_url = "git@example.com:org/repo.git"
-    from khaos.tools.git_tools import _git_evidence_digest
+    from khaos.tools.git_tools import _git_push_effect_digest
 
-    diff_hash = _git_evidence_digest("", "", None)
+    effect_hash = _git_push_effect_digest(
+        remote_url=remote_url, refspec="task/test:task/test", head=head
+    )
     workspace = SimpleNamespace(
         task_id="task-a",
         worktree_path=tmp_path,
@@ -733,7 +760,7 @@ async def test_git_push_injects_only_single_use_authorized_credential_scope(tmp_
     )
     service = _RecordingExecutionService(
         workspace,
-        outputs=["task/test\n", "task/test\n", remote_url, head, "", "", ""],
+        outputs=["task/test\n", "task/test\n", remote_url, head],
     )
     broker = ApprovalBroker()
     expiry = time.time() + 60
@@ -748,7 +775,7 @@ async def test_git_push_injects_only_single_use_authorized_credential_scope(tmp_
         "local_branch": "task/test",
         "remote_branch": "task/test",
         "head": head,
-        "diff_hash": diff_hash,
+        "effect_hash": effect_hash,
         "refspec": "task/test:task/test",
         "set_upstream": True,
         "network_policy": "unrestricted-with-approval",
@@ -900,7 +927,7 @@ async def test_git_push_provider_loader_runs_exactly_once_and_only_after_approva
         task_id="task-a",
         workspace_id="w",
         execution_service=harness.service(
-            ["task/test\n", "task/test\n", harness.remote_url, harness.head, "", ""]
+            ["task/test\n", "task/test\n", harness.remote_url, harness.head]
         ),
         approval_context=approval,
         network_policy="unrestricted-with-approval",
@@ -924,7 +951,7 @@ async def test_git_push_provider_loader_runs_exactly_once_and_only_after_approva
         task_id="task-a",
         workspace_id="w",
         execution_service=harness.service(
-            ["task/test\n", "task/test\n", harness.remote_url, harness.head, "", "", ""]
+            ["task/test\n", "task/test\n", harness.remote_url, harness.head]
         ),
         approval_context=approval,
         network_policy="unrestricted-with-approval",
@@ -948,7 +975,7 @@ async def test_git_push_broker_issued_credential_also_loads_exactly_once(tmp_pat
         "task_id": "task-a",
         "workspace_id": "w",
         "execution_service": harness.service(
-            ["task/test\n", harness.remote_url, harness.head, "", ""]
+            ["task/test\n", harness.remote_url, harness.head]
         ),
         "approval_broker": broker,
         "network_policy": "unrestricted-with-approval",
@@ -970,7 +997,7 @@ async def test_git_push_broker_issued_credential_also_loads_exactly_once(tmp_pat
         task_id="task-a",
         workspace_id="w",
         execution_service=harness.service(
-            ["task/test\n", "task/test\n", harness.remote_url, harness.head, "", "", ""]
+            ["task/test\n", "task/test\n", harness.remote_url, harness.head]
         ),
         approval_context=approval,
         network_policy="unrestricted-with-approval",
@@ -997,7 +1024,7 @@ async def test_git_push_lease_with_wrong_effect_metadata_is_rejected_at_prepare(
         "task_id": "task-a",
         "workspace_id": "w",
         "execution_service": harness.service(
-            ["task/test\n", harness.remote_url, harness.head, "", ""]
+            ["task/test\n", harness.remote_url, harness.head]
         ),
         "approval_broker": broker,
         "network_policy": "unrestricted-with-approval",
@@ -1035,7 +1062,7 @@ async def test_git_push_network_preflight_prevents_provider_invocation(tmp_path)
             task_id="task-a",
             workspace_id="w",
             execution_service=harness.service(
-                ["task/test\n", "task/test\n", harness.remote_url, harness.head, "", "", ""]
+                ["task/test\n", "task/test\n", harness.remote_url, harness.head]
             ),
             approval_context=approval,
             network_policy="unrestricted-with-approval",
@@ -1238,7 +1265,7 @@ async def test_git_push_revoked_reservation_never_invokes_provider(tmp_path):
         task_id="task-a",
         workspace_id="w",
         execution_service=harness.service(
-            ["task/test\n", "task/test\n", harness.remote_url, harness.head, "", "", ""]
+            ["task/test\n", "task/test\n", harness.remote_url, harness.head]
         ),
         approval_context=approval,
         network_policy="unrestricted-with-approval",

@@ -27,6 +27,7 @@ import time
 from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
+from pathlib import Path
 
 from khaos.security.credential_provider_host import (
     CredentialProviderHost,
@@ -217,6 +218,7 @@ class CredentialBroker:
         allow_context_adoption: bool = False,
         max_provider_workers: int = DEFAULT_PROVIDER_WORKERS,
         max_pending_providers: int = DEFAULT_PENDING_PROVIDERS,
+        untrusted_helper_roots: Iterable[Path] | None = None,
     ) -> None:
         if max_ttl_seconds <= 0:
             raise ValueError("credential broker max TTL must be positive")
@@ -233,6 +235,9 @@ class CredentialBroker:
         self.allow_context_adoption = allow_context_adoption
         self.max_provider_workers = max_provider_workers
         self.max_pending_providers = max_pending_providers
+        # Model-writable roots (task worktrees, untrusted checkouts) that a
+        # hosted command provider executable must never resolve beneath.
+        self._untrusted_helper_roots = tuple(untrusted_helper_roots or ())
         self._loaders: dict[str, _ProviderRecord] = {}
         self._leases: dict[str, _LeaseRecord] = {}
         self._materializations: dict[str, _MaterializationRecord] = {}
@@ -248,6 +253,7 @@ class CredentialBroker:
         )
         self._async_provider_admission = 0
         self._active_hosts: dict[int, CredentialProviderHost] = {}
+        self._retained_hosts: dict[int, CredentialProviderHost] = {}
         self._host_tokens = itertools.count(1)
         self._lock = threading.RLock()
         self._generation = 0
@@ -618,11 +624,14 @@ class CredentialBroker:
 
         The host stays registered in ``_active_hosts`` for the entire child
         lifetime so ``owned_resources()`` and ``close()`` can see — and
-        terminate — a provider that is hung.  Registration ends only after
-        the child has been proven terminal, so the broker never reports
-        CLOSED over a live provider host.
+        terminate — a provider that is hung.  A host whose execution domain
+        cannot be proven terminal (surviving descendants) is moved to
+        ``_retained_hosts`` instead of being dropped: the broker must never
+        report CLOSED over a live provider process.
         """
-        host = CredentialProviderHost()
+        host = CredentialProviderHost(
+            untrusted_roots=self._untrusted_helper_roots
+        )
         token = next(self._host_tokens)
         with self._lock:
             self._active_hosts[token] = host
@@ -635,6 +644,9 @@ class CredentialBroker:
         finally:
             with self._lock:
                 self._active_hosts.pop(token, None)
+                if host.alive:
+                    # Unproven termination: retain the host (quarantine).
+                    self._retained_hosts[token] = host
 
     def revoke(self, lease: CredentialLease) -> None:
         """Revoke one lease; any in-flight claim will fail its return fence."""
@@ -658,10 +670,16 @@ class CredentialBroker:
             )
             resources.extend(
                 f"credential-provider-host:{host.pid}"
-                for host in self._active_hosts.values()
+                for host in (*self._active_hosts.values(), *self._retained_hosts.values())
                 if host.alive
             )
             return tuple(sorted(resources))
+
+    def _any_host_alive_locked(self) -> bool:
+        return any(
+            host.alive
+            for host in (*self._active_hosts.values(), *self._retained_hosts.values())
+        )
 
     def terminal_postcondition(self) -> bool:
         """Prove that no lease or provider transaction remains owned."""
@@ -679,7 +697,11 @@ class CredentialBroker:
             # hosted workers finish the kill ladder and abort their
             # transactions, so a hung provider delays close by the bounded
             # termination grace, not by its full materialization deadline.
-            for host in tuple(self._active_hosts.values()):
+            # Retained (unproven-termination) hosts are re-signalled too.
+            for host in (
+                *self._active_hosts.values(),
+                *self._retained_hosts.values(),
+            ):
                 host.request_termination()
             if self._materializations:
                 self._quarantined = True
@@ -727,7 +749,7 @@ class CredentialBroker:
                 self._closed
                 and not self._leases
                 and not self._materializations
-                and not any(host.alive for host in self._active_hosts.values())
+                and not self._any_host_alive_locked()
             )
 
     def _reserve_materialization_locked(
@@ -888,16 +910,16 @@ class CredentialBroker:
         self._maybe_complete_close_locked()
 
     def _maybe_complete_close_locked(self) -> None:
-        hosts_alive = any(host.alive for host in self._active_hosts.values())
         if (
             self._closing
             and not self._materializations
             and not self._leases
-            and not hosts_alive
+            and not self._any_host_alive_locked()
         ):
             self._closed = True
             self._loaders.clear()
             self._quarantined = False
+            self._retained_hosts.clear()
             # Terminal: no owned provider call remains, so the dedicated
             # executor can stop accepting work without abandoning anything.
             self._provider_executor.shutdown(wait=False)

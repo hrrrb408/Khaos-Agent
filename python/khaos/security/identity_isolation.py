@@ -57,6 +57,10 @@ class AuthorityIdentityContract:
                 )
             if len({self.agent_uid, self.authority_uid, self.job_uid}) != 3:
                 raise IdentityIsolationError("agent, authority, and job UIDs must be distinct")
+            if self.job_uid == 0:
+                raise IdentityIsolationError(
+                    "Linux production job UID must be a non-root unprivileged UID"
+                )
         missing = [name for name, value in required.items() if not value]
         if missing:
             raise IdentityIsolationError(
@@ -150,7 +154,10 @@ def linux_job_namespace_args() -> tuple[str, ...]:
     The configured job UID is the UID visible inside the private user
     namespace.  Production additionally requires the deployment contract and
     distinct agent/authority/job identities; development uses the nobody-like
-    65534 default only under the explicit dev flag.
+    65534 default only under the explicit dev flag.  A job UID of 0 is
+    always rejected: the payload identity must never be root, and the
+    zero-capability postcondition (``--cap-drop ALL`` plus the launcher's
+    final capget assertion) must not depend on UID inference.
     """
     development = os.environ.get("KHAOS_DEV_MODE") == "1"
     contract = read_contract_from_environment()
@@ -176,7 +183,21 @@ def linux_job_namespace_args() -> tuple[str, ...]:
         job_uid = contract.job_uid
     if not 0 <= job_uid <= 2**32 - 1:
         raise IdentityIsolationError("Linux job UID is outside the namespace range")
-    return ("--unshare-user", "--uid", str(job_uid), "--gid", str(job_uid))
+    if job_uid == 0:
+        raise IdentityIsolationError(
+            "Linux job UID 0 is forbidden; payloads must run as an unprivileged UID"
+        )
+    # --cap-drop ALL is paired with the Rust final launcher's capget
+    # zero-capability assertion: construction alone is not proof.
+    return (
+        "--unshare-user",
+        "--uid",
+        str(job_uid),
+        "--gid",
+        str(job_uid),
+        "--cap-drop",
+        "ALL",
+    )
 
 
 @dataclass(frozen=True)

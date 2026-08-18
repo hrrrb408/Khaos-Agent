@@ -920,11 +920,13 @@ async def prepare_remote_git_approval(
         credential_identity,
         credential_broker=tool_context.get("credential_broker"),
     )
-    # A push transmits the objects reachable from HEAD only; dirty and
-    # untracked worktree state cannot change the remote effect, so the
-    # approval must not read (or bind) untracked content at all.
-    head, diff_hash = await _git_state(cwd, context, include_untracked=False)
+    # A push transmits only the objects reachable from HEAD; the approval
+    # binds the exact remote effect (remote identity, refspec, source OID,
+    # force mode) and never reads or hashes worktree content.
     refspec = f"{branch}:{branch}"
+    head, effect_hash = await _git_push_effect_state(
+        cwd, context, remote_url=remote_url, refspec=refspec
+    )
     expiry = time.time() + 120.0
     principal_id = str(tool_context.get("principal_id") or requester)
     binding = {
@@ -940,7 +942,7 @@ async def prepare_remote_git_approval(
         "local_branch": branch,
         "remote_branch": branch,
         "head": head,
-        "diff_hash": diff_hash,
+        "effect_hash": effect_hash,
         "refspec": refspec,
         "set_upstream": True,
         "network_policy": NetworkPolicy.UNRESTRICTED_WITH_APPROVAL.value,
@@ -1069,7 +1071,9 @@ async def _consume_remote_approval(
         context.credential_context,
         credential_broker=context.credential_broker,
     )
-    head, diff_hash = await _git_state(cwd, read_context, include_untracked=False)
+    head, effect_hash = await _git_push_effect_state(
+        cwd, read_context, remote_url=remote_url, refspec=refspec
+    )
     current = {
         "principal_id": context.principal_id or binding.get("principal_id"),
         "session_id": context.requester or binding.get("session_id"),
@@ -1083,7 +1087,7 @@ async def _consume_remote_approval(
         "local_branch": branch,
         "remote_branch": branch,
         "head": head,
-        "diff_hash": diff_hash,
+        "effect_hash": effect_hash,
         "refspec": refspec,
         "set_upstream": True,
         "network_policy": NetworkPolicy.UNRESTRICTED_WITH_APPROVAL.value,
@@ -1096,17 +1100,13 @@ async def _consume_remote_approval(
         raise PermissionError("git_push approval is missing, stale, or replayed")
 
 
-async def _git_state(
-    cwd: Path, context: _GitExecutionContext, *, include_untracked: bool = True
-) -> tuple[str, str]:
-    """Capture the approval-bound Git state, complete or fail closed.
+async def _git_state(cwd: Path, context: _GitExecutionContext) -> tuple[str, str]:
+    """Capture the full worktree approval state, complete or fail closed.
 
-    ``include_untracked=False`` binds only state that can change a remote
-    push effect (HEAD OID plus tracked diff): dirty and untracked worktree
-    content is not part of the objects a push transmits, so hashing it would
-    widen the evidence attack surface without changing the authorized
-    effect.  Destructive local operations keep the full snapshot because
-    they act on the worktree itself.
+    Used by destructive local operations that act on the worktree itself:
+    HEAD OID plus tracked diff plus a bounded, race-safe untracked-content
+    manifest.  Push approvals never call this — they bind only the remote
+    effect via :func:`_git_push_effect_state`.
     """
     head_result = await _git_read_complete(
         ["git", "rev-parse", "--verify", "HEAD"], str(cwd), context, source="git rev-parse"
@@ -1129,41 +1129,76 @@ async def _git_state(
     )
     if status_result["returncode"] != 0:
         raise PermissionError("unable to capture worktree status")
-    untracked_manifest: str | None = None
-    if include_untracked:
-        entries = [
-            entry[3:]
-            for entry in status_result["stdout"].split("\0")
-            if entry.startswith("?? ")
-        ]
-        untracked_manifest = await asyncio.to_thread(
-            snapshot_untracked_files, cwd, entries
-        )
+    entries = [
+        entry[3:]
+        for entry in status_result["stdout"].split("\0")
+        if entry.startswith("?? ")
+    ]
+    untracked_manifest = await asyncio.to_thread(
+        snapshot_untracked_files, cwd, entries
+    )
     digest = _git_evidence_digest(
         diff_result["stdout"], status_result["stdout"], untracked_manifest
     )
     return head_result["stdout"].strip(), digest
 
 
+async def _git_push_effect_state(
+    cwd: Path, context: _GitExecutionContext, *, remote_url: str, refspec: str
+) -> tuple[str, str]:
+    """Capture only the state that can change a push's remote effect.
+
+    A push transmits exactly the objects reachable from the local source
+    OID to the destination ref on one named remote — dirty worktree
+    content and untracked bytes cannot alter that effect, so the approval
+    binds (remote identity, refspec, source OID, force mode) and nothing
+    else.  This is Exact Effect Approval: binding less state than the
+    effect can change would be an authority gap; binding more state than
+    the effect can change needlessly invalidates approvals on unrelated
+    worktree edits.
+    """
+    head_result = await _git_read_complete(
+        ["git", "rev-parse", "--verify", "HEAD"], str(cwd), context, source="git rev-parse"
+    )
+    if head_result["returncode"] != 0:
+        raise PermissionError("unable to resolve current HEAD")
+    head = head_result["stdout"].strip()
+    return head, _git_push_effect_digest(
+        remote_url=remote_url, refspec=refspec, head=head
+    )
+
+
+def _git_push_effect_digest(*, remote_url: str, refspec: str, head: str) -> str:
+    """Digest the exact remote effect a push approval authorizes."""
+    digest = hashlib.sha256()
+    digest.update(b"khaos-git-push-effect-v1\0")
+    _evidence_frame(digest, b"remote-url", remote_url.encode())
+    _evidence_frame(digest, b"refspec", refspec.encode())
+    _evidence_frame(digest, b"head", head.encode())
+    # git_push never passes --force; the refspec maps one branch to itself.
+    _evidence_frame(digest, b"force", b"none")
+    return digest.hexdigest()
+
+
 def _git_evidence_digest(
     diff_text: str,
     status_text: str,
-    untracked_manifest: str | None,
+    untracked_manifest: str,
 ) -> str:
-    """Length-framed digest over the approval evidence parts.
+    """Length-framed digest over full worktree approval evidence.
 
     ``untracked_manifest`` is the hex manifest digest from the bounded
-    snapshot for worktree-acting operations, or ``None`` for push
-    bindings that intentionally exclude non-remote-effect state.
+    snapshot; this digest is used by destructive worktree-acting
+    operations.  Push approvals use :func:`_git_push_effect_state`
+    instead and bind only the remote effect.
     """
     digest = hashlib.sha256()
     digest.update(b"khaos-git-approval-evidence-v2\0")
     _evidence_frame(digest, b"diff", diff_text.encode())
     _evidence_frame(digest, b"status", status_text.encode())
-    if untracked_manifest is not None:
-        _evidence_frame(
-            digest, b"untracked-manifest", bytes.fromhex(untracked_manifest)
-        )
+    _evidence_frame(
+        digest, b"untracked-manifest", bytes.fromhex(untracked_manifest)
+    )
     return digest.hexdigest()
 
 
