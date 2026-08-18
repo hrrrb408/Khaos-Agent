@@ -33,6 +33,11 @@ def test_probe_request_binds_immutable_execution_authority(tmp_path: Path) -> No
 
     assert request.execution_authority is not None
     assert request.execution_authority.is_valid()
+    assert request.execution_authority.spawn_plan.principal_kind == "automation"
+    assert request.execution_authority.spawn_plan.parent_principal_id == (
+        "automation:compose-security-e2e"
+    )
+    assert len(request.execution_authority.spawn_plan.delegation_digest) == 64
     assert request.permission_profile is not None
     assert request.permission_profile.validate_resolved() is None
 

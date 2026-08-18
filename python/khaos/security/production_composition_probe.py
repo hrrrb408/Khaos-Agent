@@ -38,10 +38,16 @@ from khaos.security.identity_isolation import (
     LinuxProcessIdentityEvidence,
     read_linux_process_identity,
 )
+from khaos.security.principals import PrincipalKind
 
 _IDENTITY_ORACLE_TIMEOUT_SECONDS = 15.0
 _IDENTITY_ORACLE_RETRY_SECONDS = 0.01
 _FAILURE_DETAIL_LIMIT = 512
+_COMPOSE_PRINCIPAL_ID = "agent"
+_COMPOSE_PRINCIPAL_KIND = PrincipalKind.AUTOMATION.value
+_COMPOSE_PARENT_PRINCIPAL_ID = "automation:compose-security-e2e"
+_COMPOSE_SESSION_ID = "compose-session"
+_COMPOSE_RUNTIME_ID = "compose-agent"
 
 
 def _resource_digest(command: tuple[str, ...], workspace: Path) -> str:
@@ -218,10 +224,24 @@ def _probe_request(
     root_info = workspace.stat()
     executable = executable_identity(command, environment)
     sandbox_digest = _digest_payload({"backend": "linux-bwrap", "network": "isolated"})
+    delegation_digest = _digest_payload(
+        {
+            "schema_version": 1,
+            "kind": "transport-root-delegation",
+            "principal_id": _COMPOSE_PRINCIPAL_ID,
+            "principal_kind": _COMPOSE_PRINCIPAL_KIND,
+            "parent_principal_id": _COMPOSE_PARENT_PRINCIPAL_ID,
+            "project_id": "compose",
+            "session_id": _COMPOSE_SESSION_ID,
+            "runtime_id": _COMPOSE_RUNTIME_ID,
+            "source_transport": "cron",
+            "policy_digest": policy_digest,
+        }
+    )
     plan = ResolvedSpawnPlan(
-        principal_id="agent",
+        principal_id=_COMPOSE_PRINCIPAL_ID,
         project_id="compose",
-        session_id="compose-session",
+        session_id=_COMPOSE_SESSION_ID,
         task_id="authority-composition",
         turn_id="compose-turn",
         step_id="compose-exact-effect",
@@ -237,11 +257,14 @@ def _probe_request(
         executable_identity=executable,
         argv=command,
         budget_digest=budget.digest(),
+        principal_kind=_COMPOSE_PRINCIPAL_KIND,
+        parent_principal_id=_COMPOSE_PARENT_PRINCIPAL_ID,
+        delegation_digest=delegation_digest,
     )
     step = StepExecutionAuthority(
-        principal_id="agent",
+        principal_id=_COMPOSE_PRINCIPAL_ID,
         project_id="compose",
-        session_id="compose-session",
+        session_id=_COMPOSE_SESSION_ID,
         task_id="authority-composition",
         turn_id="compose-turn",
         step_id="compose-exact-effect",
@@ -267,6 +290,9 @@ def _probe_request(
         tool_security_digest=_digest_payload("production-composition-probe-security"),
         spawn_plan_digest=plan.digest(),
         approval_receipt_digest=_digest_payload("production-composition-probe-approval"),
+        principal_kind=_COMPOSE_PRINCIPAL_KIND,
+        parent_principal_id=_COMPOSE_PARENT_PRINCIPAL_ID,
+        delegation_digest=delegation_digest,
     )
     authority = ExecutionAuthority(step_authority=step, spawn_plan=plan)
     return ExecutionRequest(
@@ -296,9 +322,9 @@ async def _run_exact_effect(
     service = ExecutionService(
         backend=backend,
         process_supervisor=supervisor,
-        principal_id="agent",
+        principal_id=_COMPOSE_PRINCIPAL_ID,
         project_id="compose",
-        runtime_id="compose-agent",
+        runtime_id=_COMPOSE_RUNTIME_ID,
     )
     execution_id = request.correlation_id
     if execution_id is None:
