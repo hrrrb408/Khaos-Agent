@@ -28,7 +28,7 @@
 - Lockfile fingerprints:
   - `uv.lock`: `5ff3e1c42dfc336fa6724875cc2c34bcd770e2621e020a45d4b938c66475200a`
   - `python/bootstrap-requirements.txt`: `72082c05288cd1b6f61b0304a4f90f01bbcae2ec6d6262d56de5a9ff03dc5acd`
-  - `python/requirements-lock.txt`: `efb21d1af83d4b03de92ce0c3a188962363a092380b4df5731bc2ddec3b206f5`
+  - `python/requirements-lock.txt`: `0ea07ebdb6feb529c7dc8206d293baed0a52742ba5abc22a93b6a47b717eed4b`
 
 ## GitHub Actions governance
 
