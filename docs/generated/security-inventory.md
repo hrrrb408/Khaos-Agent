@@ -81,7 +81,7 @@
 - `python/khaos/security/network_broker.py`: `8ee48a91ddd55daf0f0b9e8459af210d82b64daca161f143d667fa6bfed4659f`
 - `python/khaos/security/resource_scope.py`: `9895685c9247caf037e6dfc98b9566ed93fc2c1f8a11ecf5f9477b32ab62f88b`
 - `python/khaos/security/principals.py`: `4a0143396877a948a9147614795bb44975a2b64fecfb8ad66592c742a1ed6bca`
-- `python/khaos/security/shell_semantics.py`: `b01ed860337f45808ed0547182423c027984e483fc1f80194fdca919ac4f2817`
+- `python/khaos/security/shell_semantics.py`: `9962f1fb3a227508011c13ee0e58a84d2361f23711df02ddf87a65d08eaaf49f`
 - `python/khaos/coding/planning/security_identities.py`: `bcafd43a2920e087f4c064091d9faa04184739a4a8a6454aa654ffd134790a38`
 - `python/khaos/coding/workspace/boundary.py`: `e1a310f3bfe2b1ca085f02be14b11f35dd1b52e923c7a2893bb5a68b9a3ff91e`
 - `rust/khaos-core/src/bin/khaos-exec-launcher.rs`: `c5eb7343002ecb7f74e1ca10df5d5edaf4de39f90ecc68064cb355b56b2fda71`
@@ -93,7 +93,7 @@
 - `scripts/generate_production_reachability.py`: `c081e0fee3666cd278c128f41068e4712ea148b3eb8b10332a5bfe43d7eab5c6`
 - `packaging/macos/khaos-authorityd-xpc.m`: `6b9d18f13fd280a8819e88a4cccc96fcda5e34f52b40cf2940d5264667200855`
 - `packaging/macos/khaos-authorityd-xpc-client.c`: `3c751b9936b8665140f68466af9b77138efd538cb3b41f3687b3135b595a9f8d`
-- `rust/khaos-core/src/bin/khaos-authorityd-windows.rs`: `80a651378c929b22fabd179510d65f18d491df47ca5edc05e2b2e9cef4916d07`
+- `rust/khaos-core/src/bin/khaos-authorityd-windows.rs`: `ece2e82c7f7a5fe884a02c5f747b46b7ba4eeb1774a84b1fe0523c1842b6f79b`
 - `scripts/build_m6_closure_report.py`: `9cf524026c9f2b433aa4f9c8df94617abc61f6907499eba31c4a9a0e4cb74411`
 - `scripts/validate_m6_governance.py`: `57d7f238a2201a5611c51a168758468244ce30beb55514a8b242b3270e01fd5c`
 - `scripts/watch_upstream_codex_security.py`: `9bc79e5afc851ce3f2e1a069aa917610489deadd0524f9b7a35f63c2aad45d2a`

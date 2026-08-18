@@ -124,6 +124,102 @@ CALLBACK_OPTIONS = frozenset(
     }
 )
 
+# M6.9 BATCH 9: SAFE is not "the subcommand name is allowed" — it is
+# "the complete argv semantics are proven side-effect-free under the
+# defined execution model".  These predicates encode the per-command
+# argument contracts; anything not explicitly proven stays SEMANTIC_UNKNOWN
+# and goes to approval.
+
+# Git global options that mediate execution or redirect effects:
+# -c/--config-env inject arbitrary configuration (external diff, textconv,
+# pager, aliases, core.editor); --exec-path relocates helper lookup;
+# --paginate spawns $PAGER.  None of these can appear in a SAFE argv.
+_GIT_FORBIDDEN_GLOBALS = frozenset(
+    {
+        "-c",
+        "--config-env",
+        "--exec-path",
+        "--paginate",
+        "-p",
+    }
+)
+
+# Git diff/log/show options that write files or execute external tools.
+# (--no-textconv/--no-ext-diff *disable* those paths and stay allowed.)
+_GIT_DIFF_FORBIDDEN = frozenset(
+    {
+        "--output",
+        "--ext-diff",
+        "--textconv",
+    }
+)
+
+# Only explicitly query-shaped ``git branch`` argv is read-only.  Bare
+# ``git branch <name>`` CREATES a branch; -d/-D/-m/-M/-c/-C mutate refs;
+# --set-upstream-to/--unset-upstream rewrite config.
+_GIT_BRANCH_MUTATING_FLAGS = frozenset(
+    {
+        "-d",
+        "-D",
+        "-m",
+        "-M",
+        "-c",
+        "-C",
+        "-f",
+        "--force",
+        "-u",
+        "--set-upstream-to",
+        "--unset-upstream",
+        "--edit-description",
+        "--delete",
+        "--move",
+        "--copy",
+    }
+)
+_GIT_BRANCH_QUERY_FLAGS = frozenset(
+    {
+        "-l",
+        "--list",
+        "-v",
+        "-vv",
+        "--verbose",
+        "-a",
+        "--all",
+        "-r",
+        "--remotes",
+        "-q",
+        "--quiet",
+        "--show-current",
+        "--contains",
+        "--no-contains",
+        "--merged",
+        "--no-merged",
+        "--points-at",
+        "--sort",
+        "--format",
+        "--column",
+        "--no-column",
+    }
+)
+# Single-letter cluster flags allowed when composed only of query letters.
+_GIT_BRANCH_SAFE_CLUSTER_LETTERS = frozenset("lavrq")
+
+# find(1) predicates that execute callbacks or write files.
+_FIND_FORBIDDEN = frozenset(
+    {
+        "-exec",
+        "-execdir",
+        "-ok",
+        "-okdir",
+        "-delete",
+        "-fprint",
+        "-fprint0",
+        "-fprintf",
+        "-fprintf0",
+        "-fls",
+    }
+)
+
 _ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _VARIABLE_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _MAX_SCRIPT_BYTES = 1024 * 1024
@@ -373,30 +469,109 @@ def analyze_argv(argv: list[str] | tuple[str, ...]) -> ShellAnalysis:
 
 
 def _command_is_literal_read_only(command: ShellCommandNode) -> bool:
-    """Apply command-specific argv policy after lexical proof."""
+    """Apply command-specific argv policy after lexical proof.
+
+    SAFE means the *complete argv semantics* are proven side-effect-free
+    under the defined execution model — never merely that the executable
+    or subcommand name looks read-only.
+    """
 
     executable = command.executable
-    if executable == "git":
-        args = [word.text for word in command.words[1:]]
-        return bool(args) and args[0] in {
-            "status",
-            "diff",
-            "log",
-            "show",
-            "rev-parse",
-            "ls-files",
-            "cat-file",
-            "branch",
-        } and not any(arg in {"-c", "--config-env"} for arg in args)
     if executable in MUTATING_EXECUTABLES or executable in SHELL_EVALUATORS:
+        if executable == "git":
+            return _git_argv_is_read_only(command)
         return False
     if executable == "find":
-        args = {word.text for word in command.words[1:]}
-        return not bool(args & {"-exec", "-execdir", "-delete", "-fprint", "-fprintf"})
+        return _find_argv_is_read_only(command)
     if executable not in READ_ONLY_EXECUTABLES:
         return False
     callback_args = {word.text.split("=", 1)[0] for word in command.words[1:]}
     return not bool(callback_args & CALLBACK_OPTIONS)
+
+
+def _git_argv_is_read_only(command: ShellCommandNode) -> bool:
+    """Prove a git argv is side-effect-free, subcommand by subcommand."""
+
+    args = [word.text for word in command.words[1:]]
+    if not args:
+        return False
+    # Global options precede the subcommand: everything before the first
+    # non-option word must itself be option-shaped and non-forbidden.
+    # (``-p``/``-c`` after the subcommand are subcommand options with
+    # different meanings, e.g. ``git cat-file -p``.)
+    subcommand_index = 0
+    while subcommand_index < len(args) and args[subcommand_index].startswith("-"):
+        option = args[subcommand_index].split("=", 1)[0]
+        if option in _GIT_FORBIDDEN_GLOBALS:
+            return False
+        subcommand_index += 1
+    if subcommand_index >= len(args):
+        # Only options and no subcommand: unproven.
+        return False
+    subcommand = args[subcommand_index]
+    rest = args[subcommand_index + 1 :]
+    if subcommand == "branch":
+        return _git_branch_argv_is_query_only(rest)
+    if subcommand in {"status", "rev-parse", "ls-files"}:
+        # Query commands with no forbidden globals and no output files.
+        return not any(arg.startswith("--output") for arg in rest)
+    if subcommand in {"diff", "log", "show"}:
+        for arg in rest:
+            option = arg.split("=", 1)[0]
+            if option in _GIT_DIFF_FORBIDDEN:
+                return False
+        return True
+    if subcommand == "cat-file":
+        # --batch-command reads subcommands from stdin; all current
+        # subcommands are reads, but stdin-driven command dispatch is a
+        # semantic surface we do not model: stay unknown.
+        return not any(arg.startswith("--batch-command") for arg in rest)
+    return False
+
+
+def _git_branch_argv_is_query_only(args: list[str]) -> bool:
+    """``git branch`` is SAFE only as an explicit query/list invocation."""
+
+    if not args:
+        # Bare ``git branch`` lists local branches.
+        return True
+    saw_query_flag = False
+    for arg in args:
+        if arg.startswith("--"):
+            option = arg.split("=", 1)[0]
+            if option in _GIT_BRANCH_MUTATING_FLAGS:
+                return False
+            if option not in _GIT_BRANCH_QUERY_FLAGS:
+                return False
+            if option != "--show-current":
+                saw_query_flag = True
+            continue
+        if arg.startswith("-") and len(arg) > 1:
+            if arg in _GIT_BRANCH_MUTATING_FLAGS:
+                return False
+            if arg in _GIT_BRANCH_QUERY_FLAGS:
+                saw_query_flag = True
+                continue
+            # Short-flag clusters like -av are fine when every letter is a
+            # query letter (a=all, l=list, v=verbose, r=remotes, q=quiet).
+            if len(arg) > 2 and all(
+                letter in _GIT_BRANCH_SAFE_CLUSTER_LETTERS for letter in arg[1:]
+            ):
+                saw_query_flag = True
+                continue
+            return False
+    # Positional arguments (branch names/patterns) are only a query when
+    # an explicit list/query flag appears anywhere in the argv; bare
+    # ``git branch foo`` creates a branch.
+    positionals = [arg for arg in args if not arg.startswith("-")]
+    return not (positionals and not saw_query_flag)
+
+
+def _find_argv_is_read_only(command: ShellCommandNode) -> bool:
+    """find(1) is SAFE only without executing or file-writing predicates."""
+
+    args = {word.text.split("=", 1)[0] for word in command.words[1:]}
+    return not bool(args & _FIND_FORBIDDEN)
 
 
 def _parse(script: str, depth: int) -> tuple[ShellAst, bool]:
