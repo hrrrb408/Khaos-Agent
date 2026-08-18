@@ -606,6 +606,10 @@ def test_production_daemon_requires_live_grant_and_same_operation_family(
         operation_class="git.workspace",
         resource_digest=parent_scope.digest(),
         authorization_epoch=2,
+        principal_kind="human",
+        parent_principal_id="human:agent",
+        session_id="session",
+        delegation_digest="a" * 64,
     )
     context_digest = authorityd_module._digest(
         {
@@ -618,6 +622,10 @@ def test_production_daemon_requires_live_grant_and_same_operation_family(
             "workspace_generation": 1,
             "policy_digest": "policy-digest",
             "authorization_epoch": 2,
+            "principal_kind": "human",
+            "parent_principal_id": "human:agent",
+            "session_id": "session",
+            "delegation_digest": "a" * 64,
         }
     )
     intent = AuthorizationIntent(
@@ -634,6 +642,10 @@ def test_production_daemon_requires_live_grant_and_same_operation_family(
         workspace_generation=1,
         grant_id=grant_id,
         grant_context_digest=context_digest,
+        principal_kind="human",
+        parent_principal_id="human:agent",
+        session_id="session",
+        delegation_digest="a" * 64,
     )
     with pytest.raises(AuthorityControlPlaneError, match="resource"):
         daemon.prepare(replace(intent, resource_digest="unrelated-resource"))
@@ -695,6 +707,10 @@ def test_expired_typed_child_receipt_renews_only_issued_action_and_scope(
         resource_digest=parent_scope.digest(),
         authorization_epoch=2,
         ttl_seconds=900.0,
+        principal_kind="human",
+        parent_principal_id="human:agent",
+        session_id="session",
+        delegation_digest="a" * 64,
     )
     context_digest = authorityd_module._digest(
         {
@@ -707,6 +723,10 @@ def test_expired_typed_child_receipt_renews_only_issued_action_and_scope(
             "workspace_generation": 1,
             "policy_digest": "policy-digest",
             "authorization_epoch": 2,
+            "principal_kind": "human",
+            "parent_principal_id": "human:agent",
+            "session_id": "session",
+            "delegation_digest": "a" * 64,
         }
     )
     parent_intent = AuthorizationIntent(
@@ -723,6 +743,10 @@ def test_expired_typed_child_receipt_renews_only_issued_action_and_scope(
         workspace_generation=1,
         grant_id=grant_id,
         grant_context_digest=context_digest,
+        principal_kind="human",
+        parent_principal_id="human:agent",
+        session_id="session",
+        delegation_digest="a" * 64,
     )
     parent_receipt = daemon.prepare(parent_intent)
     child_receipt = daemon.narrow(

@@ -1693,6 +1693,10 @@ def _issue_execution_capability(
         operation_class="exec.host",
         resource_digest=resource_digest,
         authorization_epoch=step.authorization_epoch,
+        principal_kind=step.principal_kind,
+        parent_principal_id=step.parent_principal_id,
+        session_id=step.session_id,
+        delegation_digest=step.delegation_digest,
     )
     capability = broker.issue(
         envelope,

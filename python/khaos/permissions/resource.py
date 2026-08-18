@@ -11,13 +11,18 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import shlex
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
+
+from khaos.security.shell_semantics import (
+    ShellSemanticStatus,
+    analyze_argv,
+    analyze_shell_script,
+)
 
 
 class AuthorizationResourceKind(str, Enum):
@@ -168,8 +173,19 @@ def resolve_terminal_argv(
     ):
         raise PermissionError("terminal argv is invalid")
     cwd = _resolve_workspace_path(root, arguments.get("cwd", "."))
+    semantic = analyze_argv(argv)
+    if semantic.status is ShellSemanticStatus.BLOCKED:
+        raise PermissionError(semantic.reason)
     return (
-        _canonical_json({"tool": tool_name, "argv": argv, "cwd": cwd}),
+        _canonical_json(
+            {
+                "tool": tool_name,
+                "argv": argv,
+                "cwd": cwd,
+                "semantic_status": semantic.status.value,
+                "semantic_digest": semantic.semantic_digest,
+            }
+        ),
         AuthorizationResourceKind.PROCESS_ARGV,
     )
 
@@ -182,13 +198,19 @@ def resolve_terminal_shell(
     if not isinstance(script, str) or not script.strip():
         raise PermissionError("shell script is empty")
     cwd = _resolve_workspace_path(root, arguments.get("cwd", "."))
-    tokens = _shell_tokens(script)
+    semantic = analyze_shell_script(script)
+    if semantic.status is ShellSemanticStatus.BLOCKED:
+        raise PermissionError(semantic.reason)
+    tokens = _semantic_tokens(semantic)
     return _canonical_json(
         {
             "tool": tool_name,
             "shell": arguments.get("shell", ""),
             "script_digest": hashlib.sha256(script.encode("utf-8")).hexdigest(),
             "tokens": tokens,
+            "semantic_status": semantic.status.value,
+            "semantic_digest": semantic.semantic_digest,
+            "semantic_ast": semantic.ast.canonical(),
             "cwd": cwd,
         }
     ), AuthorizationResourceKind.PROCESS_SHELL
@@ -257,12 +279,18 @@ def _resolve_workspace_path(root: Path, value: Any) -> str:
     return os.fspath(resolved)
 
 
-def _shell_tokens(script: str) -> list[str]:
-    lexer = shlex.shlex(script, posix=True, punctuation_chars="|&;<>")
-    lexer.whitespace_split = True
-    tokens = list(lexer)
-    if not any(token not in {"|", "||", "&", "&&", ";", "<", ">", "<<", ">>"} for token in tokens):
-        raise PermissionError("shell script has no executable segment")
+def _semantic_tokens(analysis: Any) -> list[str]:
+    """Flatten the semantic AST for legacy display/audit compatibility.
+
+    This is intentionally not a security decision path.  Approval and
+    read-only decisions consume ``semantic_status``/``semantic_digest`` and
+    the canonical AST emitted by ``shell_semantics``.
+    """
+    tokens: list[str] = []
+    for index, command in enumerate(analysis.ast.commands):
+        if index and command.operator_before:
+            tokens.append(command.operator_before)
+        tokens.extend(word.text for word in command.words)
     return tokens
 
 

@@ -262,6 +262,9 @@ class ResolvedSpawnPlan:
     argv: tuple[str, ...]
     budget_digest: str
     plan_digest: str = ""
+    principal_kind: str = ""
+    parent_principal_id: str = ""
+    delegation_digest: str = ""
 
     def __post_init__(self) -> None:
         required = (
@@ -281,6 +284,18 @@ class ResolvedSpawnPlan:
             raise ValueError("resolved spawn plan identity fields must not be empty")
         if self.workspace_generation < 0:
             raise ValueError("resolved spawn plan workspace generation must be non-negative")
+        typed = (self.principal_kind, self.parent_principal_id, self.delegation_digest)
+        if any(typed) and not all(typed):
+            raise ValueError("resolved spawn plan typed principal binding is incomplete")
+        if self.principal_kind and self.principal_kind not in {
+            "human", "gateway", "channel", "automation", "subagent", "browser"
+        }:
+            raise ValueError("resolved spawn plan principal kind is invalid")
+        if self.delegation_digest and (
+            len(self.delegation_digest) != 64
+            or any(c not in "0123456789abcdef" for c in self.delegation_digest)
+        ):
+            raise ValueError("resolved spawn plan delegation digest is invalid")
         if not self.argv or any(not isinstance(value, str) or not value for value in self.argv):
             raise ValueError("resolved spawn plan argv must contain non-empty strings")
         normalized_environment = tuple(
@@ -316,6 +331,9 @@ class ResolvedSpawnPlan:
             "executable_identity": self.executable_identity,
             "argv": self.argv,
             "budget_digest": self.budget_digest,
+            "principal_kind": self.principal_kind,
+            "parent_principal_id": self.parent_principal_id,
+            "delegation_digest": self.delegation_digest,
         }
 
     def digest(self) -> str:

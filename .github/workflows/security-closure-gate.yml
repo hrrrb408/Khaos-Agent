@@ -162,6 +162,49 @@ jobs:
           path: evidence/*.json
           if-no-files-found: error
 
+  m6-adversarial-matrix:
+    name: M6 Adversarial Closure Matrix
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install test dependencies
+        run: |
+          python -m pip install --require-hashes -r python/bootstrap-requirements.txt
+          uv sync --frozen --extra test
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+      - name: Validate M6 governance, reachability, and report contract
+        run: |
+          python scripts/validate_m6_governance.py
+          python scripts/generate_production_reachability.py --check
+          python scripts/build_m6_closure_report.py --check-template
+          python scripts/generate_security_inventory.py --check
+      - name: Run independent M6 postcondition matrix
+        run: |
+          python -m pytest python/tests/security/test_m6_adversarial_matrix.py \
+            python/tests/security/test_m6_closure_report.py \
+            python/tests/security/test_m6_governance.py \
+            python/tests/security/test_upstream_codex_security_watch.py -q -v
+      - name: Build evidence-bound M6 report
+        run: |
+          mkdir -p m6-evidence
+          python scripts/build_m6_closure_report.py \
+            --commit "$GITHUB_SHA" \
+            --ci-run "$GITHUB_RUN_ID" \
+            --test-counts "M6 matrix completed; native and product evidence remain separate" \
+            --output m6-evidence/m6-security-closure-report.md
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: m6-security-closure-report
+          path: m6-evidence/m6-security-closure-report.md
+          if-no-files-found: error
+
   security-closure-gate:
     name: Security Closure Gate
     if: always()
@@ -175,6 +218,7 @@ jobs:
       - type-check
       - ruleset-audit
       - closure-adversarial
+      - m6-adversarial-matrix
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -189,6 +233,7 @@ jobs:
           TYPE_CHECK: ${{ needs.type-check.result }}
           RULESET_AUDIT: ${{ needs.ruleset-audit.result }}
           CLOSURE_ADVERSARIAL: ${{ needs.closure-adversarial.result }}
+          M6_ADVERSARIAL_MATRIX: ${{ needs.m6-adversarial-matrix.result }}
         run: |
           for result in \
             "$CORE_SECURITY" "$STRICT_CONTRACTS" "$REAL_KERNEL" \
@@ -196,6 +241,7 @@ jobs:
             "$TYPE_CHECK" "$RULESET_AUDIT" "$CLOSURE_ADVERSARIAL"; do
             test "$result" = "success"
           done
+          test "$M6_ADVERSARIAL_MATRIX" = "success"
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false

@@ -64,6 +64,9 @@ class StepExecutionAuthority:
     tool_security_digest: str
     spawn_plan_digest: str = ""
     approval_receipt_digest: str = ""
+    principal_kind: str = ""
+    parent_principal_id: str = ""
+    delegation_digest: str = ""
 
     def __post_init__(self) -> None:
         required = (
@@ -100,6 +103,18 @@ class StepExecutionAuthority:
             raise ValueError("step execution environment keys must be sorted and unique")
         if self.spawn_plan_digest and not isinstance(self.spawn_plan_digest, str):
             raise ValueError("step execution spawn plan digest must be a string")
+        typed = (self.principal_kind, self.parent_principal_id, self.delegation_digest)
+        if any(typed) and not all(typed):
+            raise ValueError("step execution typed principal binding is incomplete")
+        if self.principal_kind and self.principal_kind not in {
+            "human", "gateway", "channel", "automation", "subagent", "browser"
+        }:
+            raise ValueError("step execution principal kind is invalid")
+        if self.delegation_digest and (
+            len(self.delegation_digest) != 64
+            or any(c not in "0123456789abcdef" for c in self.delegation_digest)
+        ):
+            raise ValueError("step execution delegation digest is invalid")
 
     def _payload(self, *, include_receipt: bool) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -130,6 +145,9 @@ class StepExecutionAuthority:
             "tool_schema_digest": self.tool_schema_digest,
             "tool_security_digest": self.tool_security_digest,
             "spawn_plan_digest": self.spawn_plan_digest,
+            "principal_kind": self.principal_kind,
+            "parent_principal_id": self.parent_principal_id,
+            "delegation_digest": self.delegation_digest,
         }
         if include_receipt:
             payload["approval_receipt_digest"] = self.approval_receipt_digest

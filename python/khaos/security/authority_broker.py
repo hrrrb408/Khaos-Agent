@@ -624,20 +624,25 @@ class AuthorityBroker:
                 if os.environ.get("KHAOS_DEV_MODE") == "1":
                     cls._default = cls()
                 else:
-                    socket_value = os.environ.get("KHAOS_AUTHORITYD_SOCKET")
-                    if not socket_value:
-                        raise AuthorityBrokerError(
-                            "production AuthorityBroker requires KHAOS_AUTHORITYD_SOCKET"
-                        )
                     try:
                         contract = read_contract_from_environment()
                         contract.validate(production=True)
+                        native_adapter = None
                         if os.name == "nt" or sys.platform == "darwin":
-                            raise AuthorityBrokerError(
-                                "production authorityd requires the native Windows Named Pipe "
-                                "or macOS launchd/XPC transport adapter"
+                            from khaos.security.native_authority import (
+                                build_native_authority_adapter,
                             )
-                        if os.name != "nt" and sys.platform != "darwin":
+
+                            native_adapter = build_native_authority_adapter(
+                                production=True,
+                                contract=contract,
+                            )
+                        else:
+                            socket_value = os.environ.get("KHAOS_AUTHORITYD_SOCKET")
+                            if not socket_value:
+                                raise AuthorityBrokerError(
+                                    "production AuthorityBroker requires KHAOS_AUTHORITYD_SOCKET"
+                                )
                             if (
                                 contract.agent_uid is None
                                 or contract.authority_uid is None
@@ -657,8 +662,9 @@ class AuthorityBroker:
                         ) from exc
                     cls._default = AuthorityDaemonBroker(
                         AuthorityDaemonClient(
-                            Path(socket_value),
+                            Path(os.environ.get("KHAOS_AUTHORITYD_SOCKET", "/")),
                             expected_authority_uid=contract.authority_uid,
+                            native_adapter=native_adapter,
                         )
                     )
                 atexit.register(cls._close_default)
@@ -798,6 +804,10 @@ class AuthorityBroker:
         resource_digest: str,
         authorization_epoch: int = 0,
         schema_version: int = 1,
+        principal_kind: str = "",
+        parent_principal_id: str = "",
+        session_id: str = "",
+        delegation_digest: str = "",
     ) -> AuthorityEnvelope:
         """Create one broker-owned context for a later capability issue."""
         try:
@@ -812,6 +822,10 @@ class AuthorityBroker:
                 "operation_class": operation_class,
                 "resource_digest": resource_digest,
                 "authorization_epoch": authorization_epoch,
+                "principal_kind": principal_kind,
+                "parent_principal_id": parent_principal_id,
+                "session_id": session_id,
+                "delegation_digest": delegation_digest,
             }
             # The broker process, rather than the Python object, generates
             # and owns the opaque live grant id.
@@ -835,6 +849,10 @@ class AuthorityBroker:
                     "operation_class": operation_class,
                     "resource_digest": resource_digest,
                     "authorization_epoch": authorization_epoch,
+                    "principal_kind": principal_kind,
+                    "parent_principal_id": parent_principal_id,
+                    "session_id": session_id,
+                    "delegation_digest": delegation_digest,
                     "ttl_seconds": _DEFAULT_GRANT_TTL_SECONDS,
                 }
             )
@@ -853,6 +871,10 @@ class AuthorityBroker:
                 schema_version=schema_version,
                 grant_id=str(response["grant_id"]),
                 grant_expires_at=float(response["expires_at"]),
+                principal_kind=principal_kind,
+                parent_principal_id=parent_principal_id,
+                session_id=session_id,
+                delegation_digest=delegation_digest,
             )
         except (KeyError, TypeError, ValueError, AuthorityBrokerError) as exc:
             raise AuthorityBrokerError("authority envelope is invalid") from exc
@@ -1039,6 +1061,10 @@ class AuthorityDaemonBroker(AuthorityBroker):
         resource_digest: str,
         authorization_epoch: int = 0,
         schema_version: int = 1,
+        principal_kind: str = "",
+        parent_principal_id: str = "",
+        session_id: str = "",
+        delegation_digest: str = "",
     ) -> AuthorityEnvelope:
         grant = getattr(self._authorityd, "grant", None)
         if callable(grant):
@@ -1053,6 +1079,10 @@ class AuthorityDaemonBroker(AuthorityBroker):
                 operation_class=operation_class,
                 resource_digest=resource_digest,
                 authorization_epoch=authorization_epoch,
+                principal_kind=principal_kind,
+                parent_principal_id=parent_principal_id,
+                session_id=session_id,
+                delegation_digest=delegation_digest,
             )
         else:
             # Protocol test doubles predating live grants remain usable only
@@ -1076,6 +1106,10 @@ class AuthorityDaemonBroker(AuthorityBroker):
                 schema_version=schema_version,
                 grant_id=grant_id,
                 grant_expires_at=grant_expires_at,
+                principal_kind=principal_kind,
+                parent_principal_id=parent_principal_id,
+                session_id=session_id,
+                delegation_digest=delegation_digest,
             )
         except (TypeError, ValueError) as exc:
             raise AuthorityBrokerError("authority envelope is invalid") from exc
@@ -1177,6 +1211,10 @@ class AuthorityDaemonBroker(AuthorityBroker):
             workspace_generation=authority.workspace_generation,
             grant_id=authority.grant_id,
             grant_context_digest=authority.context_digest(),
+            principal_kind=authority.principal_kind,
+            parent_principal_id=authority.parent_principal_id,
+            session_id=authority.session_id,
+            delegation_digest=authority.delegation_digest,
         )
         try:
             receipt = self._authorityd.prepare(intent)

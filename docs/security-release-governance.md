@@ -13,6 +13,11 @@ release-ready merely because the maintainer can approve it.
    covered by `.github/CODEOWNERS`. Until then, record the independent-review
    control as an explicit release prerequisite rather than claiming that the
    single-maintainer ruleset provides it.
+   The machine-readable preparation artifact is
+   `scripts/github-m6-hardened-ruleset.json`; it enables code-owner review,
+   last-push approval, stale-review dismissal, and one approving review, but
+   it is not the active repository ruleset while this repository has one
+   maintainer.
 4. Require GitHub-verified signed, annotated, non-retargetable release tags,
    successful `Security Closure
    Gate` and `Product Integrity Gate` runs for the exact tagged commit, a
@@ -63,3 +68,12 @@ Export/archive evidence before reducing any window.
   non-retargetable tag, and
   any CI-only skips are recorded together. Existing release assets are never
   overwritten.
+
+## M6 governance preparation
+
+`.github/CODEOWNERS` covers the security authority, permission, audit,
+verification, RPC, execution, native TCB, Docker, workflow, and release-gate
+paths. `scripts/validate_m6_governance.py` checks that coverage and the
+hardened ruleset template. A green local validation proves only that the
+preparation artifacts are internally consistent; it is not evidence of an
+independent human review.

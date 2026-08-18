@@ -33,6 +33,8 @@ from khaos.security.identity_isolation import (
     IdentityIsolationError,
     validate_private_unix_socket,
 )
+from khaos.security.principals import PrincipalKind
+from khaos.security.protocol_boundary import canonical_json_bytes
 
 AUTHORITYD_PROTOCOL = 1
 MAX_MESSAGE_BYTES = 1024 * 1024
@@ -66,9 +68,7 @@ class AuditWriter(Protocol):
 
 
 def _canonical(value: object) -> bytes:
-    return json.dumps(
-        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")
+    return canonical_json_bytes(value)
 
 
 def _digest(value: object) -> str:
@@ -134,6 +134,46 @@ def _required_text(name: str, value: object, *, max_length: int = 512) -> str:
     return value
 
 
+def _validate_typed_principal_binding(
+    *,
+    principal_kind: str,
+    parent_principal_id: str,
+    session_id: str,
+    delegation_digest: str,
+) -> bool:
+    """Validate the optional M6.4 identity binding as one atomic tuple.
+
+    Legacy protocol fixtures may omit the tuple.  Once any member is present,
+    accepting a partial tuple would make the omitted field an unbound replay
+    dimension, so the wire contract requires all four fields together.
+    Production ``AuthorityDaemon`` instances enable the stricter requirement.
+    """
+    values = (
+        principal_kind,
+        parent_principal_id,
+        session_id,
+        delegation_digest,
+    )
+    if not any(values):
+        return False
+    if not all(values):
+        raise AuthorityControlPlaneError(
+            "typed principal binding must include kind, parent, session, and delegation"
+        )
+    try:
+        PrincipalKind(principal_kind)
+    except ValueError as exc:
+        raise AuthorityControlPlaneError("principal_kind is invalid") from exc
+    _required_text("parent_principal_id", parent_principal_id)
+    _required_text("session_id", session_id)
+    if (
+        len(delegation_digest) != 64
+        or any(character not in "0123456789abcdef" for character in delegation_digest)
+    ):
+        raise AuthorityControlPlaneError("delegation_digest is invalid")
+    return True
+
+
 @dataclass(frozen=True, slots=True)
 class AuthorizationIntent:
     """Immutable, canonical prepare request sent to the authority daemon."""
@@ -152,6 +192,10 @@ class AuthorizationIntent:
     workspace_generation: int | None = None
     grant_id: str | None = None
     grant_context_digest: str | None = None
+    principal_kind: str = ""
+    parent_principal_id: str = ""
+    session_id: str = ""
+    delegation_digest: str = ""
 
     def __post_init__(self) -> None:
         for name in (
@@ -183,6 +227,12 @@ class AuthorizationIntent:
             _required_text(
                 "grant_context_digest", self.grant_context_digest, max_length=128
             )
+        _validate_typed_principal_binding(
+            principal_kind=self.principal_kind,
+            parent_principal_id=self.parent_principal_id,
+            session_id=self.session_id,
+            delegation_digest=self.delegation_digest,
+        )
 
     def payload(self) -> dict[str, object]:
         payload = {
@@ -203,6 +253,11 @@ class AuthorizationIntent:
             payload["grant_context_digest"] = self.grant_context_digest
         if self.workspace_generation is not None:
             payload["workspace_generation"] = self.workspace_generation
+        if self.principal_kind:
+            payload["principal_kind"] = self.principal_kind
+            payload["parent_principal_id"] = self.parent_principal_id
+            payload["session_id"] = self.session_id
+            payload["delegation_digest"] = self.delegation_digest
         return payload
 
     @property
@@ -234,6 +289,10 @@ class SignedAuthorizationReceipt:
     workspace_generation: int | None = None
     grant_id: str | None = None
     grant_context_digest: str | None = None
+    principal_kind: str = ""
+    parent_principal_id: str = ""
+    session_id: str = ""
+    delegation_digest: str = ""
 
     def __post_init__(self) -> None:
         for name in (
@@ -274,6 +333,12 @@ class SignedAuthorizationReceipt:
             _required_text(
                 "grant_context_digest", self.grant_context_digest, max_length=128
             )
+        _validate_typed_principal_binding(
+            principal_kind=self.principal_kind,
+            parent_principal_id=self.parent_principal_id,
+            session_id=self.session_id,
+            delegation_digest=self.delegation_digest,
+        )
 
     def unsigned_payload(self) -> dict[str, object]:
         payload = {
@@ -303,6 +368,11 @@ class SignedAuthorizationReceipt:
             payload["grant_context_digest"] = self.grant_context_digest
         if self.workspace_generation is not None:
             payload["workspace_generation"] = self.workspace_generation
+        if self.principal_kind:
+            payload["principal_kind"] = self.principal_kind
+            payload["parent_principal_id"] = self.parent_principal_id
+            payload["session_id"] = self.session_id
+            payload["delegation_digest"] = self.delegation_digest
         return payload
 
     @property
@@ -354,6 +424,10 @@ class SignedAuthorizationReceipt:
                     if value.get("grant_context_digest") is not None
                     else None
                 ),
+                principal_kind=str(value.get("principal_kind", "")),
+                parent_principal_id=str(value.get("parent_principal_id", "")),
+                session_id=str(value.get("session_id", "")),
+                delegation_digest=str(value.get("delegation_digest", "")),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise AuthorityControlPlaneError(
@@ -465,6 +539,7 @@ class AuthorityDaemonClient:
         *,
         timeout_seconds: float = 3.0,
         expected_authority_uid: int | None = None,
+        native_adapter: object | None = None,
     ) -> None:
         if not socket_path.is_absolute() or timeout_seconds <= 0:
             raise ValueError("authorityd socket and timeout are invalid")
@@ -473,11 +548,36 @@ class AuthorityDaemonClient:
         self.socket_path = socket_path
         self.timeout_seconds = timeout_seconds
         self.expected_authority_uid = expected_authority_uid
+        self.native_adapter = native_adapter
 
     def request(self, payload: dict[str, object]) -> dict[str, object]:
         body = _canonical({"protocol": AUTHORITYD_PROTOCOL, **payload}) + b"\n"
         if len(body) > MAX_MESSAGE_BYTES:
             raise AuthorityControlPlaneError("authorityd request is too large")
+        if os.name == "nt" or sys.platform == "darwin":
+            try:
+                adapter = self.native_adapter
+                if adapter is None:
+                    from khaos.security.native_authority import (
+                        build_native_authority_adapter,
+                    )
+
+                    adapter = build_native_authority_adapter(production=True)
+                response = adapter.request({"protocol": AUTHORITYD_PROTOCOL, **payload})
+            except IdentityIsolationError as exc:
+                raise AuthorityControlPlaneError(
+                    "native authority transport identity is invalid"
+                ) from exc
+            except OSError as exc:
+                raise RemoteAuditUnavailableError("native authorityd is unavailable") from exc
+            if not isinstance(response, dict) or response.get("ok") is not True:
+                if isinstance(response, dict):
+                    message = str(response.get("error", "native authorityd rejected request"))
+                    if response.get("error_code") == "remote_audit_unavailable":
+                        raise RemoteAuditUnavailableError(message)
+                    raise AuthorityControlPlaneError(message)
+                raise AuthorityControlPlaneError("native authorityd returned an invalid response")
+            return response
         try:
             if os.name == "nt" or sys.platform == "darwin":
                 raise IdentityIsolationError(
@@ -528,6 +628,10 @@ class AuthorityDaemonClient:
         resource_digest: str,
         authorization_epoch: int,
         ttl_seconds: float = 60 * 60.0,
+        principal_kind: str = "",
+        parent_principal_id: str = "",
+        session_id: str = "",
+        delegation_digest: str = "",
     ) -> tuple[str, float]:
         response = self.request(
             {
@@ -543,6 +647,10 @@ class AuthorityDaemonClient:
                 "resource_digest": _required_text("resource_digest", resource_digest),
                 "authorization_epoch": authorization_epoch,
                 "ttl_seconds": ttl_seconds,
+                "principal_kind": principal_kind,
+                "parent_principal_id": parent_principal_id,
+                "session_id": session_id,
+                "delegation_digest": delegation_digest,
             }
         )
         try:

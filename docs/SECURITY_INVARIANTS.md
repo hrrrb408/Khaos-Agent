@@ -142,6 +142,57 @@ not evidence that an effect occurred.
     remote WORM evidence, and organization governance are reported as separate
     evidence classes. No local result is promoted to a Codex-equivalent or
     independently administered security claim.
+17. `terminal_argv` and `terminal_shell` are separate security contracts.
+    The argv contract binds the exact argv vector; the shell contract binds
+    the exact script digest plus the immutable semantic AST digest/status.
+    Only a complete literal executable graph covered by command-specific argv
+    policy may be `safe`/read-only. Brace, glob, tilde, parameter, command,
+    arithmetic, or process expansion; escape ambiguity; redirection,
+    here-doc/here-string, pipeline/compound/subshell, evaluator, assignment,
+    and callback semantics are `semantic-unknown` and require approval. A
+    literal or nested blocked executable is hard blocked. Syntax acceptance or
+    a first/base executable is never evidence of a safe effect.
+18. Principal kind is derived from the authenticated transport and is
+    immutable for the request. `HumanPrincipal`, `GatewayPrincipal`,
+    `ChannelPrincipal`, `AutomationPrincipal`, `SubagentPrincipal`, and
+    `BrowserPrincipal` cannot be interchanged by payload self-reporting.
+    Delegation is narrow-only and binds subject, parent, project, session,
+    runtime, task, workspace, operation family, resource scope, policy
+    digest, expiry, and nonce. A child scope cannot widen any parent field;
+    its nonce is consumed once, and cross-principal/context replay is
+    rejected. The typed foundation never replaces the signed authority or
+    exact-effect receipt, and missing production integration evidence remains
+    unclosed.
+19. Production composition is machine-checked from explicit runtime roots.
+    The reachability inventory resolves repository imports and declared lazy
+    exports, rejects unresolved internal imports, and rejects development,
+    Host, and compatibility execution modules on the production graph.
+    Removing a call site is not sufficient if the forbidden implementation
+    remains reachable through a public compatibility hook. The generated
+    inventory is a commit-bound artifact and a stale or locally edited report
+    fails closed in CI.
+20. macOS and Windows production authority transport is native-only. macOS
+    requires a launchd Mach service/XPC audit-token and code-signature proof
+    plus a Keychain access-group protected key; Windows requires a Service-SID
+    process, an ACL-protected Named Pipe, and a protected-key proof. Missing,
+    stale, same-UID, or test-process evidence is unavailable evidence and
+    cannot authorize a receipt.
+21. Security-critical transport, serialization, schema, effect-binding,
+    receipt-state, and resource-owner transitions are pure typed boundaries.
+    The orchestration modules may own I/O and locks, but they must call the
+    pure transition/digest functions; an object reaching `CLOSED` without an
+    external terminal postcondition and an empty owner registry is invalid.
+22. The hardened M6 ruleset is a preparation template, not current evidence.
+    It requires an independent approving review, CODEOWNER review, last-push
+    approval, resolved threads, `Security Closure Gate`, and `Product Integrity
+    Gate`; the current single-maintainer ruleset must not claim those controls.
+23. The upstream Codex watch is metadata-only and review-only. It binds the
+    comparison to a fixed SHA, filters security-relevant paths/subjects, and
+    cannot copy, apply, or synchronize upstream source.
+24. The M6 closure report is evidence-bound. `CLOSED` requires exact CI
+    evidence, both real native authority proofs, explicit all-gates-success,
+    and independent resource oracles; missing evidence remains UNKNOWN,
+    QUARANTINED, or FAILED.
 
 ## Verification map
 
@@ -165,6 +216,30 @@ not evidence that an effect occurred.
   `python/tests/security/test_native_tcb_packaging.py` and
   `python/tests/security/test_docker_outer_profiles.py`; deployment manifest
   format: `docs/docker-profile-manifest.md`.
+- Shell semantic authority and exact approval binding:
+  `python/tests/security/test_shell_semantics.py`,
+  `python/tests/tools/test_terminal_tools.py`, and
+  `python/tests/permissions/test_authorization_resource.py`.
+- Typed principal transport/delegation:
+  `python/tests/security/test_typed_principals.py` and
+  `python/tests/runtime/test_request_context_316a_4_1.py`.
+- Production composition reachability and forbidden Host/dev edges:
+  `python/tests/security/test_production_reachability.py` and
+  `scripts/generate_production_reachability.py --check`.
+- Native authority transport admission:
+  `python/tests/security/test_native_authority.py`; native E2E evidence is
+  produced only by the macOS/Windows platform jobs when signed service
+  artifacts and platform identity proofs are present.
+- Pure TCB protocol/effect/state boundaries:
+  `python/tests/security/test_protocol_boundary.py`,
+  `python/khaos/security/protocol_boundary.py`, and the authorityd receipt
+  transition calls.
+- M6 governance, upstream watch, adversarial postconditions, and report
+  evidence:
+  `python/tests/security/test_m6_governance.py`,
+  `python/tests/security/test_upstream_codex_security_watch.py`,
+  `python/tests/security/test_m6_adversarial_matrix.py`, and
+  `python/tests/security/test_m6_closure_report.py`.
 
 The opt-in real-platform jobs remain required for a release closure; skipped
 or unavailable jobs are not successful evidence.

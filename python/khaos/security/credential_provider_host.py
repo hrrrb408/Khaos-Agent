@@ -160,7 +160,7 @@ class CredentialProviderHost:
                 raise
             except CredentialProviderHostError:
                 raise
-            except Exception as exc:  # noqa: BLE001 - the host boundary fails closed
+            except Exception as exc:
                 raise CredentialProviderHostError(
                     f"credential provider host failed: {type(exc).__name__}: {exc}"
                 ) from exc
@@ -180,21 +180,16 @@ class CredentialProviderHost:
     def request_termination(self) -> None:
         """Ask the domain to stop without waiting; thread-safe for close().
 
-        Signals the owned process group directly.  The pgid equals the
-        worker pid (session leader via ``start_new_session``) and cannot
-        be reused while the host still owns the un-reaped child.
+        Signals the owned process domain directly.  POSIX workers are
+        session leaders, so the process group is signalled first; Windows
+        has no ``os.killpg`` and therefore receives a direct PID signal.
+        The host still retains the domain PID set and requires terminal
+        proof before reporting closure.
         """
         process = self._process
         if process is None or process.returncode is not None:
             return
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError, OSError) as exc:
-            if isinstance(exc, ProcessLookupError):
-                return
-            logger.warning(
-                "credential provider host termination signal failed: %s", exc
-            )
+        _signal_domain(process.pid, self._domain_pids, signal.SIGTERM)
 
     # ─── spawn identity ─────────────────────────────────────────────────
 
@@ -324,7 +319,10 @@ class CredentialProviderHost:
                     _collect_descendants, process.pid
                 )
                 await asyncio.to_thread(
-                    _signal_domain, process.pid, self._domain_pids, signal.SIGKILL
+                    _signal_domain,
+                    process.pid,
+                    self._domain_pids,
+                    getattr(signal, "SIGKILL", signal.SIGTERM),
                 )
                 try:
                     await asyncio.wait_for(
@@ -347,7 +345,10 @@ class CredentialProviderHost:
             # (e.g. a SIGTERM-ignoring helper): escalate to SIGKILL over the
             # whole collected domain before declaring anything terminal.
             await asyncio.to_thread(
-                _signal_domain, process.pid, self._domain_pids, signal.SIGKILL
+                _signal_domain,
+                process.pid,
+                self._domain_pids,
+                getattr(signal, "SIGKILL", signal.SIGTERM),
             )
             try:
                 survivors = await asyncio.wait_for(
@@ -378,15 +379,28 @@ class CredentialProviderHost:
 def _signal_domain(
     worker_pid: int, domain_pids: set[int], sig: signal.Signals
 ) -> None:
-    """Signal the worker's process group and each enumerated descendant."""
-    try:
-        os.killpg(worker_pid, sig)
-    except (ProcessLookupError, PermissionError):
-        pass
-    except OSError as exc:
-        logger.debug("provider domain group signal failed: %s", exc)
-    for pid in domain_pids:
-        if pid == worker_pid:
+    """Signal the worker domain using the platform's available primitive.
+
+    POSIX uses the worker session/process group and then individually signals
+    descendants that escaped it via ``setsid``.  Windows does not expose
+    ``os.killpg``; direct PID signals are the supported primitive there.  The
+    caller's ``_wait_domain_gone`` proof remains mandatory on both paths.
+    """
+    group_signal_sent = False
+    if os.name == "posix":
+        try:
+            os.killpg(worker_pid, sig)
+            group_signal_sent = True
+        except (ProcessLookupError, PermissionError):
+            pass
+        except OSError as exc:
+            logger.debug("provider domain group signal failed: %s", exc)
+
+    pids = set(domain_pids)
+    if not group_signal_sent:
+        pids.add(worker_pid)
+    for pid in pids:
+        if pid == worker_pid and group_signal_sent:
             continue
         try:
             os.kill(pid, sig)

@@ -62,6 +62,9 @@ class SubAgentTask:
     # applied on this column yet) but distinguishable from rows stamped
     # by a project-bound runtime.
     project_id: str = ""
+    principal_kind: str = ""
+    parent_principal_id: str = ""
+    delegation_digest: str = ""
 
 
 Runner = Callable[[SubAgentTask], Awaitable[str]]

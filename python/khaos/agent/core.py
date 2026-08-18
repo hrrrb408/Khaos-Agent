@@ -118,6 +118,9 @@ class AgentLoop:
         execution_service=None,
         approval_broker=None,
         principal_id: str | None = None,
+        principal_kind: str = "",
+        parent_principal_id: str = "",
+        delegation_digest: str = "",
         source_transport: str = "unknown",
         foreground_session: bool = False,
         # H5: runtime_id + session_id extend the per-session BrowserContext
@@ -193,6 +196,9 @@ class AgentLoop:
         # through RuntimeConfig, which requires an explicit principal (CLI /
         # TUI provide local-uid; RPC provides ctx.principal_id).
         self.principal_id = principal_id or "legacy"
+        self.principal_kind = principal_kind
+        self.parent_principal_id = parent_principal_id
+        self.delegation_digest = delegation_digest
         self.source_transport = source_transport
         self.foreground_session = foreground_session
         # H5: per-runtime + per-session identifiers propagated to the
@@ -623,6 +629,9 @@ class AgentLoop:
                         "credential_broker": self.credential_broker,
                         "requester": session_id,
                         "principal_id": self.principal_id,
+                        "principal_kind": self.principal_kind,
+                        "parent_principal_id": self.parent_principal_id,
+                        "delegation_digest": self.delegation_digest,
                         "source_transport": self.source_transport,
                         "foreground_session": self.foreground_session,
                         # M4 batch 3.1.16A-5-1b: stamp the bound project

@@ -11,6 +11,7 @@ from khaos.permissions.resource import (
     resolve_copy_or_move,
     resolve_process_control,
     resolve_single_workspace_path,
+    resolve_terminal_argv,
     resolve_terminal_shell,
 )
 from khaos.coding.workspace.models import TaskWorkspace
@@ -171,6 +172,28 @@ def test_shell_resource_covers_every_command_segment(tmp_path: Path) -> None:
     target = json.loads(resource.canonical_target)
     assert target["tokens"] == ["printf", "ok", "|", "tee", "out", ";", "rm", "-f", "x"]
     assert target["script_digest"]
+    assert target["semantic_status"] == "semantic-unknown"
+    assert len(target["semantic_digest"]) == 64
+    assert target["semantic_ast"]["commands"]
+
+
+def test_argv_resource_binds_direct_argv_semantics_not_shell_text(tmp_path: Path) -> None:
+    resource = resolve_authorization_resource(
+        "terminal_argv",
+        {"argv": ["echo", "$(touch", "marker)"], "cwd": "."},
+        principal_id="principal-a",
+        project_id="project-a",
+        runtime_id="runtime-a",
+        task_id="task-a",
+        workspace_id="workspace-a",
+        workspace_manager=_Manager(_workspace(tmp_path)),
+        resource_resolver=resolve_terminal_argv,
+    )
+
+    target = json.loads(resource.canonical_target)
+    assert target["argv"] == ["echo", "$(touch", "marker)"]
+    assert target["semantic_status"] == "safe"
+    assert len(target["semantic_digest"]) == 64
 
 
 def test_copy_move_resource_uses_actual_schema_fields(tmp_path: Path) -> None:

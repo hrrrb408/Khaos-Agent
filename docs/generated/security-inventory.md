@@ -26,15 +26,15 @@
   - `Dockerfile:106`: `sha256:1699c10032ca2582ec89a24a1312d986a3f094aed3d5c1147b19880afe40e052`
   - `Dockerfile:113`: `sha256:6baf43584bcb78f2e5847d1de515f23499913ac9f12bdf834811a3145eb11ca1`
 - Lockfile fingerprints:
-  - `uv.lock`: `7291ab982371106b5fdcb7fe0b49d86e52e3ba3c7a2efc823b8d8395ef19dae9`
+  - `uv.lock`: `5ff3e1c42dfc336fa6724875cc2c34bcd770e2621e020a45d4b938c66475200a`
   - `python/bootstrap-requirements.txt`: `72082c05288cd1b6f61b0304a4f90f01bbcae2ec6d6262d56de5a9ff03dc5acd`
-  - `python/requirements-lock.txt`: `efb21d1af83d4b03de92ce0c3a188962363a092380b4df5731bc2ddec3b206f5`
+  - `python/requirements-lock.txt`: `0ea07ebdb6feb529c7dc8206d293baed0a52742ba5abc22a93b6a47b717eed4b`
 
 ## GitHub Actions governance
 
-- Workflow action references inspected: `79`; immutable SHA-pinned/local references: `79`.
+- Workflow action references inspected: `90`; immutable SHA-pinned/local references: `90`.
 - Unpinned third-party actions (must remain empty): none.
-- Security-sensitive paths are covered by `.github/CODEOWNERS`; the repository reference ruleset preserves sole-maintainer liveness, so independent approval remains an external release prerequisite and is not verified locally.
+- Security-sensitive paths are covered by `.github/CODEOWNERS`; the repository reference ruleset preserves sole-maintainer liveness, while `scripts/github-m6-hardened-ruleset.json` prepares independent approval for a second maintainer. Independent approval is not verified locally.
 
 ## Platform and evidence boundary
 
@@ -45,41 +45,59 @@
 | Windows | Native restricted-token/AppContainer/Job/ACL/WFP helper; native commands and trusted Python network=none use AppContainer, trusted Python stages the base executable and grants exact temporary ACLs only to the disposable runtime tree, brokered mode uses restricted-token + exact loopback WFP; missing probe evidence refuses Host fallback | Windows native CI gate |
 | Remote audit/WORM and independent human review | Not implemented by this repository | Unknown/external gate |
 
+## M6 closure evidence
+
+- `scripts/build_m6_closure_report.py` refuses `CLOSED` without exact CI, both native proof artifacts, and explicit all-gates-success evidence.
+- `scripts/watch_upstream_codex_security.py` emits review-only metadata and never copies or applies upstream source.
+- `test_m6_adversarial_matrix.py` asserts negative and terminal postconditions across the M6 attack surface.
+
 ## Source fingerprints
 
 - `python/khaos/audit/anchor.py`: `1109f9ab097bdd63ef9b7d2215fa4fcd636bd38d577469ac9c6dfb9bf133be5d`
 - `python/khaos/channels/webhook.py`: `dcb38668c0cf1a300d16ad5769670a51eaf6c6be24b9cc5be2315a0871a58c06`
-- `python/khaos/permissions/engine.py`: `4e6f03ed55584e11a240dca71be91d61556f11ce240a246627f75829a1af5939`
-- `python/khaos/permissions/rules.py`: `d0785434e0dafc42c146a8c07c068eab42f4b5a27cf87388bb217929372fa471`
-- `python/khaos/coding/execution/authority.py`: `abce06886df49008a109a1a89391ea0ca0f8b029f79e764c8ae29aeec5d82ae5`
+- `python/khaos/permissions/engine.py`: `59ad44abf72426352e8d77511392868ab45f243abbe64e6d3bb10ab15535f773`
+- `python/khaos/permissions/rules.py`: `19d02b4ea1427b7c4b5075b5bbcd641cefc680ac984d27e6fdbf95a5415eae7c`
+- `python/khaos/coding/execution/authority.py`: `eba0d52e43fc482b732e069c528aa2606fbc57fb8977389c9fe15c0b769785e8`
 - `python/khaos/coding/execution/identity.py`: `5f159cf59788242902e0010bd59a05a2f7c14dd2f8251f62cafa2a1c3cc5e265`
-- `python/khaos/coding/execution/models.py`: `8f165d586928c0cd95823b9008777b4b35281c4202c9847c9994c3d2258f6579`
+- `python/khaos/coding/execution/models.py`: `a3e7b046ab574ff42d12457d9ef4c2646806a4aea55f1e0d5e9f70644997ec2a`
 - `python/khaos/coding/execution/native_launcher.py`: `1721401d920f9cf8ebec100db58e5f6bb0f43a9dd1fd1784e83ea8d4a2da2e0b`
 - `python/khaos/coding/execution/platform.py`: `2749cd54298a06dacddb9309265d6883e568ca1d4c6d41450a7b109443182618`
 - `python/khaos/coding/execution/resource_owner.py`: `9304e64dda07b968159333fab1abae603ca19b43c972a2794c77b65dd06b52e8`
 - `python/khaos/coding/execution/service.py`: `bfce34ed38e3c77ab93ae68ab6a83e12c4de31ec6a3ed0dd8fc8b4d33c089ac6`
 - `python/khaos/coding/execution/binding.py`: `99f3d8eb14d80a837ecf0f0d076d556ccdb366b8798c9e0fde6c69d0bb1a5501`
-- `python/khaos/coding/execution/supervisor.py`: `0cb9e6512c9a5e0c59b88042b91a0c2973189f0ae62f36b81be019bc7c4de6a3`
+- `python/khaos/coding/execution/supervisor.py`: `2124018fefd961569b690d6412a38b7ce5497dbc30b5112fa1b2ef05114d835b`
 - `python/khaos/coding/workspace/manager.py`: `8d72fe0ac0ab49f852776f8c0612d67415e53d87eea57c928496575097c24011`
 - `python/khaos/coding/workspace/trusted_git.py`: `7b635d670e69e63c76521078fe0290630ccb18df7812d6b86bded6184bd0adc7`
-- `python/khaos/security/authority.py`: `0c520850cf5ca3c017d096871a3045da5b6884ab0ae04815109a9c3287c0ed25`
-- `python/khaos/security/authority_broker.py`: `0041ca7431e133151f4fdfedc4ae1378f8faad3225f60fb16b4022c27e9989e9`
-- `python/khaos/security/authorityd.py`: `5bdd0a07ca17cff1056c43c30579253ffe75173f37c79127eb72d00207a449b8`
-- `python/khaos/security/authorityd_protocol.py`: `8b35472b03cb9f19b98ca1f5401774377b0f47bd45d29567847cc25fffa275c5`
+- `python/khaos/security/authority.py`: `2dc3d8f06c30aaed7016d0dee8fa89c022ed0c9e99321b8a3ee394a0a51e57bc`
+- `python/khaos/security/authority_broker.py`: `4422525d03b517ff384a0f1ebaa11a20f97768988e1acc556e67a5345afb2c71`
+- `python/khaos/security/authorityd.py`: `d8ede802aadc1cf924f1f836178e47991c2590b4c12a013c692355ce8daf29c9`
+- `python/khaos/security/authorityd_protocol.py`: `bc940c7b6eb524dae16104cc6a8217250cc0e2ca392e1506d450411fde5eafc3`
 - `python/khaos/security/docker_profiles.py`: `2831d9e219f2070fa320e05ed7970392c1b9218c0a3247a30419dc4e700fd222`
-- `python/khaos/security/identity_isolation.py`: `9b4b32e7839748da5659a6144fbc6f7646ce9a8366f167504543d494501bd8ad`
-- `python/khaos/security/production_composition_probe.py`: `538b6591f6b7193d9889a38a568dafa5f797071195fc3f555f941bfd2c0c121b`
+- `python/khaos/security/identity_isolation.py`: `9faa4c47525b7eb35058cb04f7800bf4f2f37db63981abca9a0a7811a15d4709`
+- `python/khaos/security/native_authority.py`: `9f32253da1b98b93bd57871d39951fef9bd360fc96814644cd0ec19c1a31ce83`
+- `python/khaos/security/protocol_boundary.py`: `d3a33e2ac325eb501666da9dd46a08f1fbbacab7ae418541cffce528c15c56ec`
+- `python/khaos/security/production_composition_probe.py`: `c31de6d394e4b28aa5ec1944325c3a45c2a9209993a0cda8a88e11e43ed2ab55`
 - `python/khaos/security/remote_audit.py`: `58a5d9a35c8446304a17e99ab6d3b20b52d9197e47a53372ac567867794207b2`
 - `python/khaos/security/network_broker.py`: `8ee48a91ddd55daf0f0b9e8459af210d82b64daca161f143d667fa6bfed4659f`
 - `python/khaos/security/resource_scope.py`: `9895685c9247caf037e6dfc98b9566ed93fc2c1f8a11ecf5f9477b32ab62f88b`
+- `python/khaos/security/principals.py`: `cccad965bdc67973b8c282467988e5866b7832fd9e502f910a6733b54ab3e1ea`
+- `python/khaos/security/shell_semantics.py`: `b01ed860337f45808ed0547182423c027984e483fc1f80194fdca919ac4f2817`
 - `python/khaos/coding/planning/security_identities.py`: `bcafd43a2920e087f4c064091d9faa04184739a4a8a6454aa654ffd134790a38`
 - `python/khaos/coding/workspace/boundary.py`: `e1a310f3bfe2b1ca085f02be14b11f35dd1b52e923c7a2893bb5a68b9a3ff91e`
 - `rust/khaos-core/src/bin/khaos-exec-launcher.rs`: `c5eb7343002ecb7f74e1ca10df5d5edaf4de39f90ecc68064cb355b56b2fda71`
 - `rust/khaos-core/src/bin/khaos-sandbox-launcher.rs`: `f8cc2645173e45bfb9c23a20baeaf32f0cc88aacce0a292b50e7f3405d6a1b37`
-- `python/khaos/grpc_server.py`: `0841b23878452be967eca270b03ffc23b1f7248916a1af6570810fe4dbab8fc0`
+- `python/khaos/grpc_server.py`: `26c9891cf944370fbae7a88af6927def6ce84676000a3362318e4dd18f5772b2`
 - `go/internal/api/handler.go`: `9dc6af7572c331685a4fa28f8902d148da4338a19603f55aeaf2094fc38662a7`
 - `go/cmd/gateway/main.go`: `5c27479e8ef5ffa3c05008077e12e89e4f274d4255765606b3ee91d04df56481`
 - `go/internal/platform/python_client.go`: `c4e68301ae6f54999636c9924bc832e57c46173f69ad852df7963af9d6de9df6`
+- `scripts/generate_production_reachability.py`: `c081e0fee3666cd278c128f41068e4712ea148b3eb8b10332a5bfe43d7eab5c6`
+- `packaging/macos/khaos-authorityd-xpc.m`: `a82435eb6c1c8cdd846d4723d653d504fdff34d0c77234a140b15c941c4aa0e7`
+- `packaging/macos/khaos-authorityd-xpc-client.c`: `892ab512be3ee7a3c2bbbaf364b37ad57d9a2ea0e176058fc269f66664067945`
+- `rust/khaos-core/src/bin/khaos-authorityd-windows.rs`: `d7a25d525f31a061d41a65ce949c5b76e864b96b8dc9ac5eabf19199eea14c0e`
+- `scripts/build_m6_closure_report.py`: `cdff8add40342c96672d8dba31c498eb2b6976db182ecfee6fc14fca34a7811f`
+- `scripts/validate_m6_governance.py`: `57d7f238a2201a5611c51a168758468244ce30beb55514a8b242b3270e01fd5c`
+- `scripts/watch_upstream_codex_security.py`: `9bc79e5afc851ce3f2e1a069aa917610489deadd0524f9b7a35f63c2aad45d2a`
+- `scripts/github-m6-hardened-ruleset.json`: `a18c3a613c1f5c536d1c589d84177be4cd43bde69d9418efa513c8c3ff60989e`
 
 ## Required release gates
 

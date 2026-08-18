@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.khaos.authorityd</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/libexec/khaos-authorityd-xpc</string>
+    </array>
+    <key>MachServices</key>
+    <dict>
+        <key>com.khaos.authorityd</key>
+        <true/>
+    </dict>
+    <key>UserName</key>
+    <string>khaos-authority</string>
+    <key>GroupName</key>
+    <string>khaos-authority</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>KHAOS_AUTHORITYD_CONFIG_PATH</key>
+        <string>/etc/khaos/native-authority.env</string>
+    </dict>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+    <key>HardResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>256</integer>
+    </dict>
+</dict>
+</plist>

@@ -1,16 +1,16 @@
 # OpenAI Codex 固定上游基线与复用台账
 
-> 状态：首次架构对标基线（只读审查，不引入上游代码）
-> 审查日期：2026-07-15（Asia/Shanghai）
+> 状态：固定安全审查基线（只读审查，不引入上游代码）
+> 审查日期：2026-08-18（Asia/Shanghai）
 
 ## 1. 可复现基线
 
 | 对象 | 仓库 | 分支/来源 | 固定 commit | commit 时间 | 审查方式 |
 | --- | --- | --- | --- | --- | --- |
-| OpenAI Codex | `https://github.com/openai/codex` | 远端 `HEAD` | `3f74f00295dcb1346340686bb09c5bfd4f0237c4` | 2026-07-15 02:43:31 UTC | `git ls-remote` 固定后以 depth-1 clone 审查 |
+| OpenAI Codex | `https://github.com/openai/codex` | 远端 `HEAD` | `711a5f8b3a6eb40134146ae9ec22fdcdda5e3170` | 2026-08-18（远端 HEAD 读取日） | `git ls-remote` 固定后以 blobless mirror 审查 |
 | Khaos-Agent | `https://github.com/hrrrb408/Khaos-Agent` | `feature/m4-agent-planning` | `17f90ba0e63f7a43b7b062c9ae3e9b810b1f051d` | 2026-07-15 01:05:26 +08:00 | 从本地仓库复制为干净快照审查 |
 
-Codex 当前远端 `HEAD` 在审查时解析为 `3f74f00295dcb1346340686bb09c5bfd4f0237c4`。所有 Codex 文件、符号和测试结论均绑定该 SHA。后续同步必须先提出新的基线升级记录，不得把浮动 `main` 当作构建依赖或事实来源。
+Codex 当前远端 `HEAD` 在本轮审查时解析为 `711a5f8b3a6eb40134146ae9ec22fdcdda5e3170`。所有 Codex 文件、符号和测试结论均绑定该 SHA。后续同步必须先提出新的基线升级记录，不得把浮动 `main` 当作构建依赖或事实来源。
 
 Khaos commit SHA 固定为 `17f90ba0e63f7a43b7b062c9ae3e9b810b1f051d`。
 
@@ -90,7 +90,7 @@ Khaos 为 MIT。Apache-2.0 代码可以进入 MIT 项目，但被复制部分仍
 
 源代码引用使用如下永久格式：
 
-`https://github.com/openai/codex/blob/3f74f00295dcb1346340686bb09c5bfd4f0237c4/<path>#Lx-Ly`
+`https://github.com/openai/codex/blob/711a5f8b3a6eb40134146ae9ec22fdcdda5e3170/<path>#Lx-Ly`
 
 Khaos 引用使用：
 

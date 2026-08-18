@@ -33,6 +33,9 @@ class ExecutionAuthority:
             raise ValueError("execution authority plan digest does not match approval")
         pairs = (
             (self.step_authority.principal_id, self.spawn_plan.principal_id),
+            (self.step_authority.principal_kind, self.spawn_plan.principal_kind),
+            (self.step_authority.parent_principal_id, self.spawn_plan.parent_principal_id),
+            (self.step_authority.delegation_digest, self.spawn_plan.delegation_digest),
             (self.step_authority.project_id, self.spawn_plan.project_id),
             (self.step_authority.session_id, self.spawn_plan.session_id),
             (self.step_authority.task_id, self.spawn_plan.task_id),

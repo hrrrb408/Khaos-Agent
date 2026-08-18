@@ -25,8 +25,18 @@ place so the system keeps working).
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from dataclasses import dataclass
+
+from khaos.security.principals import (
+    Principal,
+    PrincipalDelegationError,
+    PrincipalKind,
+    principal_for_transport,
+    principal_from_kind,
+)
 
 
 def local_principal_id() -> str:
@@ -42,6 +52,40 @@ def local_principal_id() -> str:
     except AttributeError:
         uid = "windows"
     return f"local-uid:{uid}"
+
+
+def _transport_delegation_digest(
+    *,
+    principal_id: str,
+    principal_kind: str,
+    parent_principal_id: str,
+    project_id: str,
+    session_id: str,
+    runtime_id: str,
+    source_transport: str,
+    policy_digest: str,
+) -> str:
+    """Create the immutable transport-root delegation commitment.
+
+    The commitment is deliberately only an identity binding.  The
+    independent authority still decides whether this root may issue an
+    effect; it is not a Python-side permission grant or a fallback authority.
+    """
+    payload = {
+        "schema_version": 1,
+        "kind": "transport-root-delegation",
+        "principal_id": principal_id,
+        "principal_kind": principal_kind,
+        "parent_principal_id": parent_principal_id,
+        "project_id": project_id,
+        "session_id": session_id,
+        "runtime_id": runtime_id,
+        "source_transport": source_transport,
+        "policy_digest": policy_digest,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -76,6 +120,63 @@ class RequestContext:
     runtime_id: str = ""
     source_transport: str = "rpc"
     policy_digest: str = ""
+    # M6.4: the transport-derived principal kind is part of the immutable
+    # request identity.  Empty means "derive from source_transport"; callers
+    # cannot silently turn a channel/cron/subagent request into a human one.
+    principal_kind: str = ""
+    parent_principal_id: str = ""
+    delegation_digest: str = ""
+
+    def __post_init__(self) -> None:
+        try:
+            # Some service unit tests intentionally construct an empty
+            # context and verify that the service rejects it.  Preserve that
+            # fail-closed boundary while still assigning a typed kind; the
+            # public ``for_rpc``/``for_webhook`` constructors reject empty
+            # principals before a request can enter production.
+            identity = self.principal_id or "context-placeholder"
+            derived = principal_for_transport(identity, self.source_transport)
+            requested = (
+                PrincipalKind(self.principal_kind)
+                if self.principal_kind
+                else derived.kind
+            )
+        except (PrincipalDelegationError, ValueError) as exc:
+            raise ValueError("request context principal identity is invalid") from exc
+        if requested is not derived.kind:
+            raise ValueError(
+                "request context principal kind does not match its transport"
+            )
+        object.__setattr__(self, "principal_kind", requested.value)
+        parent = self.parent_principal_id
+        if self.principal_id and not parent:
+            parent = f"{requested.value}:{self.principal_id}"
+            object.__setattr__(self, "parent_principal_id", parent)
+        if self.principal_id and parent == self.principal_id:
+            raise ValueError("request context parent principal cannot equal subject")
+        delegation_digest = self.delegation_digest
+        if self.principal_id and not delegation_digest:
+            delegation_digest = _transport_delegation_digest(
+                principal_id=self.principal_id,
+                principal_kind=requested.value,
+                parent_principal_id=parent,
+                project_id=self.project_id,
+                session_id=self.session_id,
+                runtime_id=self.runtime_id,
+                source_transport=self.source_transport,
+                policy_digest=self.policy_digest,
+            )
+            object.__setattr__(self, "delegation_digest", delegation_digest)
+        if delegation_digest and (
+            len(delegation_digest) != 64
+            or any(character not in "0123456789abcdef" for character in delegation_digest)
+        ):
+            raise ValueError("request context delegation digest is malformed")
+
+    @property
+    def principal(self) -> Principal:
+        """Return the concrete typed principal for this request."""
+        return principal_from_kind(self.principal_id, self.principal_kind)
 
     @classmethod
     def for_rpc(
@@ -100,6 +201,7 @@ class RequestContext:
             project_id=project_id,
             source_transport="rpc",
             policy_digest=policy_digest,
+            principal_kind=PrincipalKind.GATEWAY.value,
         )
 
     @classmethod
@@ -125,6 +227,7 @@ class RequestContext:
             project_id=project_id,
             source_transport="cli",
             policy_digest=policy_digest,
+            principal_kind=PrincipalKind.HUMAN.value,
         )
 
     @classmethod
@@ -147,6 +250,7 @@ class RequestContext:
             project_id=project_id,
             source_transport="webhook",
             policy_digest=policy_digest,
+            principal_kind=PrincipalKind.CHANNEL.value,
         )
 
     @classmethod
@@ -169,6 +273,7 @@ class RequestContext:
             project_id=project_id,
             source_transport="cron",
             policy_digest=policy_digest,
+            principal_kind=PrincipalKind.AUTOMATION.value,
         )
 
     def with_session(self, session_id: str) -> RequestContext:
@@ -184,6 +289,9 @@ class RequestContext:
             runtime_id=self.runtime_id,
             source_transport=self.source_transport,
             policy_digest=self.policy_digest,
+            principal_kind=self.principal_kind,
+            parent_principal_id=self.parent_principal_id,
+            delegation_digest="",
         )
 
     def with_runtime_id(self, runtime_id: str) -> RequestContext:
@@ -199,4 +307,7 @@ class RequestContext:
             runtime_id=runtime_id,
             source_transport=self.source_transport,
             policy_digest=self.policy_digest,
+            principal_kind=self.principal_kind,
+            parent_principal_id=self.parent_principal_id,
+            delegation_digest="",
         )

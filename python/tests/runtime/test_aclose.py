@@ -268,11 +268,14 @@ async def test_closed_field_is_not_bound_by_positional_construction():
         "credential_broker",
         "owns_credential_broker",
         "principal_id",
+        "principal_kind",
+        "parent_principal_id",
+        "delegation_digest",
         "session_id",
-            "runtime_id",
-            "audit_logger",
-            "owns_audit_logger",
-        ]
+        "runtime_id",
+        "audit_logger",
+        "owns_audit_logger",
+    ]
 
 
 # ───────────────────────── H2: audit logger close ──────────────────────────
