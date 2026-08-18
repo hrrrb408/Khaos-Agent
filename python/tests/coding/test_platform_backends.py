@@ -634,6 +634,17 @@ async def test_real_bwrap_enforces_full_isolation_matrix(tmp_path: Path, request
         "from pathlib import Path",
         "status = Path('/proc/self/status').read_text()",
         "assert 'NoNewPrivs:\\t1' in status, status",
+        # M5.6: the kernel itself must report zero residual capabilities at
+        # the payload boundary (paired with bwrap --cap-drop ALL and the
+        # launcher's capget assertion — construction alone is not proof).
+        "cap_lines = dict(",
+        "    line.split(':', 1)",
+        "    for line in status.splitlines()",
+        "    if line.startswith(('CapEff:', 'CapPrm:', 'CapInh:', 'CapAmb:'))",
+        ")",
+        "for key, value in cap_lines.items():",
+        "    assert value.strip() == '0' * 16, (key, value)",
+        "assert len(cap_lines) == 4, cap_lines",
         "libc = ctypes.CDLL(None, use_errno=True)",
         "assert libc.ptrace(0, 0, 0, 0) == -1",
         "assert ctypes.get_errno() == errno.EPERM",
