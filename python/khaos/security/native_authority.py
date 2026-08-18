@@ -24,10 +24,11 @@ import os
 import secrets
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import IO, Protocol
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
@@ -194,15 +195,31 @@ def _bounded_native_call(
     timeout_seconds: float,
     extra_environment: dict[str, str] | None = None,
 ) -> bytes:
-    """Run a native probe with a bounded protocol and output budget."""
+    """Run a native probe with a bounded protocol, budget, and process tree.
+
+    M6.9 BATCH 7: the previous implementation buffered the entire child
+    output via ``communicate()`` and only checked the budget afterwards, so
+    an infinite-output or hung native client consumed unbounded memory and
+    time.  This version enforces the stdout, stderr, and combined budgets
+    *incrementally* (overflow terminates the child's whole process domain
+    immediately), covers spawn + IO + wait with one deadline, and terminates
+    the domain with SIGTERM -> grace -> SIGKILL (process group on POSIX, a
+    kill-on-close Job Object on Windows).  A cleanup failure is an error,
+    never a false success.
+    """
     environment = {
         "PATH": os.defpath,
         "LC_ALL": "C",
     }
     if extra_environment:
         environment.update(extra_environment)
+    job_handle: int | None = None
     process: subprocess.Popen[bytes] | None = None
+    overflow = threading.Event()
+    collected: dict[str, bytearray] = {"stdout": bytearray(), "stderr": bytearray()}
     try:
+        if os.name == "nt":
+            job_handle = _create_termination_job()
         process = subprocess.Popen(
             (str(executable), *arguments),
             stdin=subprocess.PIPE,
@@ -210,24 +227,271 @@ def _bounded_native_call(
             stderr=subprocess.PIPE,
             cwd=Path("/"),
             env=environment,
+            start_new_session=os.name == "posix",
         )
-        stdout, stderr = process.communicate(input=input_bytes, timeout=timeout_seconds)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        if process is not None:
-            try:
-                process.kill()
-                process.wait(timeout=2)
-            except (OSError, subprocess.TimeoutExpired):
-                pass
-        raise NativeAuthorityError("native authority client did not terminate") from exc
+        if job_handle is not None:
+            _assign_process_to_job(job_handle, process.pid)
+        readers = {
+            "stdout": _spawn_budget_reader(process.stdout, "stdout", collected, overflow),
+            "stderr": _spawn_budget_reader(process.stderr, "stderr", collected, overflow),
+        }
+        try:
+            if input_bytes:
+                assert process.stdin is not None
+                try:
+                    process.stdin.write(input_bytes)
+                except (BrokenPipeError, OSError):
+                    # The client may exit before consuming the input; the
+                    # output budget and deadline still bound the call.
+                    pass
+                finally:
+                    try:
+                        process.stdin.close()
+                    except OSError:
+                        pass
+            deadline = time.monotonic() + timeout_seconds
+            while True:
+                if overflow.is_set():
+                    raise NativeAuthorityError(
+                        "native authority client exceeded output budget"
+                    )
+                try:
+                    process.wait(timeout=0.05)
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+                if time.monotonic() >= deadline:
+                    raise NativeAuthorityError(
+                        "native authority client exceeded its deadline"
+                    )
+            for reader in readers.values():
+                reader.join(timeout=2.0)
+            if overflow.is_set():
+                raise NativeAuthorityError(
+                    "native authority client exceeded output budget"
+                )
+        except NativeAuthorityError:
+            # Budget/deadline violations (NativeAuthorityError is a
+            # PermissionError subclass): terminate the domain FIRST so the
+            # pipes reach EOF, then briefly drain the readers and re-raise.
+            _terminate_process_domain(process, job_handle)
+            for reader in readers.values():
+                reader.join(timeout=0.5)
+            raise
+        finally:
+            for reader in readers.values():
+                reader.join(timeout=0.5)
+    except NativeAuthorityError:
+        # Re-raised domain violations; termination already happened in the
+        # inner handler (or the process exited).
+        if process is not None and process.returncode is None:
+            _terminate_process_domain(process, job_handle)
+        raise
+    except (OSError, ValueError) as exc:
+        _terminate_process_domain(process, job_handle)
+        raise NativeAuthorityError(
+            "native authority client could not be executed"
+        ) from exc
+    finally:
+        if process is not None and process.returncode is None:
+            # Any exit path that leaves the child alive is a termination
+            # failure, never a success.
+            _terminate_process_domain(process, job_handle)
+        _close_job(job_handle)
+    if overflow.is_set():
+        raise NativeAuthorityError("native authority client exceeded output budget")
+    stdout = bytes(collected["stdout"])
+    stderr = bytes(collected["stderr"])
     if len(stdout) > MAX_NATIVE_OUTPUT_BYTES or len(stderr) > MAX_NATIVE_OUTPUT_BYTES:
         raise NativeAuthorityError("native authority client exceeded output budget")
+    if process is None or process.returncode is None:
+        raise NativeAuthorityError("native authority client termination is unproven")
     if process.returncode != 0:
         detail = stderr.decode("utf-8", errors="replace")[-512:]
         raise NativeAuthorityError(
             f"native authority client rejected request: rc={process.returncode} detail={detail}"
         )
     return stdout
+
+
+def _spawn_budget_reader(
+    stream: IO[bytes] | None,
+    name: str,
+    collected: dict[str, bytearray],
+    overflow: threading.Event,
+) -> threading.Thread:
+    """Read one stream incrementally, tripping the overflow event on cap."""
+
+    def _read() -> None:
+        assert stream is not None
+        try:
+            while True:
+                chunk = stream.read(4096)
+                if not chunk:
+                    break
+                buffer = collected[name]
+                buffer.extend(chunk)
+                total = len(collected["stdout"]) + len(collected["stderr"])
+                if (
+                    len(buffer) > MAX_NATIVE_OUTPUT_BYTES
+                    or total > MAX_NATIVE_OUTPUT_BYTES * 2
+                ):
+                    overflow.set()
+                    return
+        except (OSError, ValueError):
+            # A closed pipe after termination is expected; the budget
+            # decision is made from what was already read.
+            return
+        finally:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+    thread = threading.Thread(target=_read, daemon=True, name=f"native-{name}")
+    thread.start()
+    return thread
+
+
+def _terminate_process_domain(
+    process: subprocess.Popen[bytes] | None, job_handle: int | None
+) -> None:
+    """Terminate the child's whole execution domain, SIGTERM -> SIGKILL.
+
+    On POSIX the child is a session leader, so ``os.killpg`` reaches every
+    descendant.  On Windows the kill-on-close Job Object terminates the
+    whole job when the handle closes; the direct terminate covers the
+    window before job assignment.
+    """
+    if process is None:
+        return
+    if process.returncode is not None:
+        return
+    if os.name == "posix":
+        import signal as signal_module
+
+        try:
+            os.killpg(os.getpgid(process.pid), signal_module.SIGTERM)
+        except (OSError, PermissionError):
+            try:
+                process.terminate()
+            except OSError:
+                pass
+        try:
+            process.wait(timeout=2.0)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            os.killpg(os.getpgid(process.pid), signal_module.SIGKILL)
+        except (OSError, PermissionError):
+            pass
+        try:
+            process.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            raise NativeAuthorityError(
+                "native authority client process domain did not terminate"
+            )
+    else:
+        try:
+            process.terminate()
+            process.wait(timeout=2.0)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        if process.returncode is None:
+            # Closing the job handle kills everything in the job.
+            if job_handle is not None:
+                _close_job(job_handle)
+            try:
+                process.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                raise NativeAuthorityError(
+                    "native authority client process domain did not terminate"
+                )
+
+
+def _create_termination_job() -> int | None:
+    """Create a kill-on-close Job Object for the Windows process domain."""
+    if os.name != "nt":
+        return None
+    import ctypes
+
+    class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_int64),
+            ("PerJobUserTimeLimit", ctypes.c_int64),
+            ("LimitFlags", ctypes.c_uint32),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", ctypes.c_uint32),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", ctypes.c_uint32),
+            ("SchedulingClass", ctypes.c_uint32),
+        ]
+
+    class _IO_COUNTERS(ctypes.Structure):
+        _fields_ = [(name, ctypes.c_uint64) for name in (
+            "ReadOperationCount",
+            "WriteOperationCount",
+            "OtherOperationCount",
+            "ReadTransferCount",
+            "WriteTransferCount",
+            "OtherTransferCount",
+        )]
+
+    class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", _JOBOBJECT_BASIC_LIMIT_INFORMATION),
+            ("IoInfo", _IO_COUNTERS),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    job = kernel32.CreateJobObjectW(None, None)
+    if not job:
+        return None
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+    info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    if not kernel32.SetInformationJobObject(
+        job,
+        9,  # JobObjectExtendedLimitInformation
+        ctypes.byref(info),
+        ctypes.sizeof(info),
+    ):
+        kernel32.CloseHandle(job)
+        return None
+    return job
+
+
+def _assign_process_to_job(job_handle: int, pid: int) -> bool:
+    """Assign a process to the termination job (best effort before wait)."""
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    PROCESS_SET_QUOTA = 0x0100
+    PROCESS_TERMINATE = 0x0001
+    process = kernel32.OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, False, pid)
+    if not process:
+        return False
+    try:
+        return bool(kernel32.AssignProcessToJobObject(job_handle, process))
+    finally:
+        kernel32.CloseHandle(process)
+
+
+def _close_job(job_handle: int | None) -> None:
+    """Close the Job Object, terminating any remaining assigned processes."""
+    if job_handle is None:
+        return
+    import ctypes
+
+    ctypes.WinDLL("kernel32").CloseHandle(  # type: ignore[attr-defined]
+        ctypes.c_void_p(job_handle)
+    )
 
 
 def _decode_native_response(raw: bytes) -> dict[str, object]:
