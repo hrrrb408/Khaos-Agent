@@ -2,10 +2,17 @@
 """Build the evidence-bound M6 security closure report.
 
 The default result is ``NOT CLOSED``.  ``CLOSED`` is intentionally
-unreachable from a local run: it requires an explicit remote CI run id, both
-real native authority proof artifacts, and an explicit all-gates-success
-attestation.  Missing or unproven evidence remains ``UNKNOWN``/``QUARANTINED``
-in the report rather than becoming a green claim.
+unreachable from local inputs: it requires a VERIFIED evidence manifest
+bundle (``--evidence-manifest``) whose embedded manifests re-verify
+against the exact release commit and the release policy digest, and
+which contains every required proof type exactly once.  Arbitrary
+local files, a CI run id string, and an ``--all-gates-success`` boolean
+can no longer produce a closure claim — an unverified run id plus two
+local files was previously accepted as closure evidence, which is
+exactly the provenance gap M6.9 BATCH 5 closes.
+
+Missing or unproven evidence remains ``UNKNOWN``/``QUARANTINED`` in the
+report rather than becoming a green claim.
 """
 
 from __future__ import annotations
@@ -14,6 +21,12 @@ import argparse
 import subprocess
 import sys
 from pathlib import Path
+
+from khaos.security.security_evidence import (
+    SecurityEvidenceManifest,
+    load_verified_bundle,
+    verify_evidence_manifests,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 TEMPLATE = ROOT / "docs" / "m6-security-closure-report.md"
@@ -139,9 +152,35 @@ def render(
     test_counts: str = "not-provided",
     native_evidence: tuple[str, ...] = (),
     all_gates_success: bool = False,
+    evidence_bundle: dict | None = None,
+    policy_digest: str = "",
 ) -> str:
-    native_ok = len(native_evidence) >= 2 and all(Path(path).is_file() for path in native_evidence)
-    closed = bool(ci_run != "not-provided" and native_ok and all_gates_success)
+    # CLOSED is reachable ONLY through a verified evidence bundle whose
+    # embedded manifests re-verify against this exact commit and the
+    # release policy digest.  Local files, run id strings, and booleans
+    # are recorded but never treated as proof.
+    closed = False
+    evidence_status = "UNKNOWN (no verified evidence bundle provided)"
+    if evidence_bundle is not None:
+        try:
+            manifests = [
+                SecurityEvidenceManifest.from_payload(payload)
+                for payload in evidence_bundle["manifests"]
+            ]
+            verification = verify_evidence_manifests(
+                manifests,
+                expected_commit=commit,
+                expected_policy_digest=policy_digest,
+            )
+            if verification.ok:
+                closed = True
+                evidence_status = "VERIFIED CI evidence bundle"
+            else:
+                evidence_status = (
+                    "REJECTED: " + "; ".join(verification.errors[:5])
+                )
+        except Exception as exc:  # noqa: BLE001 - any bundle failure stays NOT CLOSED
+            evidence_status = f"REJECTED: {exc}"
     status = "CLOSED" if closed else "NOT CLOSED (evidence incomplete)"
     lines = [
         "# M6 Security Architecture Closure Report",
@@ -155,6 +194,7 @@ def render(
         f"- Full test counts: `{test_counts}`",
         f"- Native evidence: `{', '.join(native_evidence) if native_evidence else 'UNKNOWN'}`",
         f"- All required gates explicitly successful: `{all_gates_success}`",
+        f"- Verified evidence bundle: `{evidence_status}`",
         "",
         "## Finding closure matrix",
         "",
@@ -191,13 +231,23 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--native-evidence", nargs="*", default=[])
     parser.add_argument("--all-gates-success", action="store_true")
     parser.add_argument("--check-template", action="store_true")
+    parser.add_argument("--evidence-manifest", type=Path, default=None)
+    parser.add_argument("--policy-digest", default="")
     args = parser.parse_args(argv)
+    evidence_bundle = None
+    if args.evidence_manifest is not None:
+        try:
+            evidence_bundle = load_verified_bundle(args.evidence_manifest)
+        except Exception as exc:  # noqa: BLE001 - CLI reports rejection, not crash
+            print(f"evidence bundle rejected: {exc}", file=sys.stderr)
     rendered = render(
         commit=args.commit,
         ci_run=args.ci_run,
         test_counts=args.test_counts,
         native_evidence=tuple(args.native_evidence),
         all_gates_success=args.all_gates_success,
+        evidence_bundle=evidence_bundle,
+        policy_digest=args.policy_digest,
     )
     if args.check_template:
         if not TEMPLATE.is_file() or "Status: **NOT CLOSED" not in TEMPLATE.read_text(encoding="utf-8"):
@@ -211,6 +261,8 @@ def main(argv: list[str] | None = None) -> int:
         args.output.write_text(rendered, encoding="utf-8")
     else:
         sys.stdout.write(rendered)
+    if args.evidence_manifest is not None and evidence_bundle is None:
+        return 1
     return 0
 
 
