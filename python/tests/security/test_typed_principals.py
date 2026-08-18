@@ -1,8 +1,17 @@
 from __future__ import annotations
 
-import pytest
+from dataclasses import replace
+from pathlib import Path
 
+import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from khaos.runtime.context import RequestContext
+from khaos.security.authorityd import AuthorityDaemon
+from khaos.security.authorityd_protocol import (
+    AuthorityControlPlaneError,
+    AuthorizationIntent,
+    SignedAuthorizationReceipt,
+)
 from khaos.security.principals import (
     AutomationPrincipal,
     BrowserPrincipal,
@@ -15,7 +24,6 @@ from khaos.security.principals import (
     PrincipalKind,
     SubagentPrincipal,
 )
-
 
 POLICY = "a" * 64
 
@@ -246,3 +254,78 @@ def test_principal_kind_cannot_be_forged_for_a_transport() -> None:
             source_transport="webhook",
             principal_kind=PrincipalKind.HUMAN.value,
         )
+
+
+def _typed_intent(*, session_id: str = "session-a") -> AuthorizationIntent:
+    return AuthorizationIntent(
+        principal_id="gateway:alice",
+        project_id="project-a",
+        runtime_id="runtime-a",
+        task_id="task-a",
+        workspace_id="workspace-a",
+        operation="exec.host",
+        resource_digest="resource-a",
+        policy_digest=POLICY,
+        nonce="typed-intent",
+        authorization_epoch=1,
+        principal_kind=PrincipalKind.GATEWAY.value,
+        parent_principal_id="human:alice",
+        session_id=session_id,
+        delegation_digest="b" * 64,
+    )
+
+
+def test_typed_receipt_wire_round_trip_binds_every_delegation_dimension(
+    tmp_path: Path,
+) -> None:
+    key = Ed25519PrivateKey.generate()
+    daemon = AuthorityDaemon(
+        socket_path=tmp_path / "authorityd.sock",
+        signing_key=key,
+        audit_writer=type("Worm", (), {"append": lambda self, record: None})(),
+        issuer_id="test-authorityd",
+        policy=lambda _intent: None,
+    )
+    receipt = daemon.prepare(_typed_intent())
+    decoded = SignedAuthorizationReceipt.from_dict(receipt.to_dict())
+    decoded.verify(key.public_key())
+    assert decoded.principal_kind == PrincipalKind.GATEWAY.value
+    assert decoded.parent_principal_id == "human:alice"
+    assert decoded.session_id == "session-a"
+    assert decoded.delegation_digest == "b" * 64
+
+    with pytest.raises(AuthorityControlPlaneError, match="signature"):
+        replace(decoded, session_id="session-b").verify(key.public_key())
+
+
+def test_production_typed_authority_rejects_untyped_and_cross_session_replay(
+    tmp_path: Path,
+) -> None:
+    key = Ed25519PrivateKey.generate()
+    daemon = AuthorityDaemon(
+        socket_path=tmp_path / "authorityd.sock",
+        signing_key=key,
+        audit_writer=type("Worm", (), {"append": lambda self, record: None})(),
+        issuer_id="test-authorityd",
+        policy=lambda _intent: None,
+        require_typed_principals=True,
+    )
+    with pytest.raises(AuthorityControlPlaneError, match="typed principal"):
+        daemon.prepare(
+            AuthorizationIntent(
+                principal_id="gateway:alice",
+                project_id="project-a",
+                runtime_id="runtime-a",
+                task_id="task-a",
+                workspace_id="workspace-a",
+                operation="exec.host",
+                resource_digest="resource-a",
+                policy_digest=POLICY,
+                nonce="legacy-intent",
+                authorization_epoch=1,
+            )
+        )
+
+    receipt = daemon.prepare(_typed_intent())
+    with pytest.raises(AuthorityControlPlaneError, match="unknown|revoked|signature"):
+        daemon.claim(replace(receipt, session_id="session-b"))

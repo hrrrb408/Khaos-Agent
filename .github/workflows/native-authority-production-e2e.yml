@@ -1,0 +1,126 @@
+name: Native Authority Production E2E
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-authority-production-e2e
+  cancel-in-progress: false
+
+jobs:
+  macos-launchd-xpc:
+    name: macOS launchd/XPC authority
+    runs-on: macos-14
+    environment: security-native
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.11"
+      - name: Install contract dependencies
+        run: |
+          python -m pip install --require-hashes -r python/bootstrap-requirements.txt
+          uv sync --frozen --extra test
+      - name: Build and sign the XPC service and client
+        env:
+          KHAOS_CODESIGN_IDENTITY: ${{ secrets.KHAOS_MACOS_CODESIGN_IDENTITY }}
+          KHAOS_TEAM_ID: ${{ secrets.KHAOS_MACOS_TEAM_ID }}
+          KHAOS_AGENT_CODE_SIGNATURE: ${{ secrets.KHAOS_MACOS_AGENT_CODE_SIGNATURE }}
+          KHAOS_NATIVE_PREFIX: ${{ github.workspace }}/native-bin
+        run: packaging/macos/build-native-authority.sh
+      - name: Install launchd identity and protected-key configuration
+        env:
+          KHAOS_AGENT_UID: ${{ secrets.KHAOS_MACOS_AGENT_UID }}
+          KHAOS_AGENT_CODE_SIGNATURE: ${{ secrets.KHAOS_MACOS_AGENT_CODE_SIGNATURE }}
+          KHAOS_TEAM_ID: ${{ secrets.KHAOS_MACOS_TEAM_ID }}
+          KHAOS_CODESIGN_IDENTITY: ${{ secrets.KHAOS_MACOS_CODESIGN_IDENTITY }}
+        run: |
+          test -n "$KHAOS_AGENT_UID"
+          test -n "$KHAOS_AGENT_CODE_SIGNATURE"
+          test -n "$KHAOS_TEAM_ID"
+          sudo dscl . -create /Users/khaos-authority UniqueID 503
+          sudo dscl . -create /Users/khaos-authority PrimaryGroupID 503
+          sudo dscl . -create /Users/khaos-authority UserShell /usr/bin/false
+          sudo mkdir -p /var/run/khaos-authorityd /etc/khaos
+          sudo sh -c "printf '%s\\n' 'KHAOS_XPC_SERVICE=com.khaos.authorityd' 'KHAOS_AUTHORITYD_XPC_SERVICE=com.khaos.authorityd' 'KHAOS_AUTHORITYD_BACKEND_SOCKET=/var/run/khaos-authorityd/backend.sock' 'KHAOS_AUTHORITYD_KEYCHAIN_GROUP=${KHAOS_TEAM_ID}.com.khaos.authority' 'KHAOS_AUTHORITYD_PROTECTED_KEY_REF=khaos-authority-signing-key' 'KHAOS_AGENT_UID=${KHAOS_AGENT_UID}' 'KHAOS_AUTHORITYD_AGENT_CODE_SIGNATURE=${KHAOS_AGENT_CODE_SIGNATURE}' 'KHAOS_AUTHORITYD_SERVICE_CODE_SIGNATURE=com.khaos.authorityd' > /etc/khaos/native-authority.env"
+          sudo chmod 0600 /etc/khaos/native-authority.env
+          sudo mkdir -p /usr/local/libexec
+          sudo cp native-bin/khaos-authorityd-xpc /usr/local/libexec/khaos-authorityd-xpc
+          sudo cp native-bin/khaos-authorityd-xpc-client /usr/local/libexec/khaos-authorityd-xpc-client
+          sudo cp packaging/macos/com.khaos.authorityd.plist /Library/LaunchDaemons/com.khaos.authorityd.plist
+          sudo launchctl bootstrap system /Library/LaunchDaemons/com.khaos.authorityd.plist
+      - name: Run real XPC authority proof
+        env:
+          KHAOS_AGENT_UID: ${{ secrets.KHAOS_MACOS_AGENT_UID }}
+          KHAOS_AUTHORITYD_LAUNCHD_SERVICE: com.khaos.authorityd
+          KHAOS_AUTHORITYD_PROTECTED_KEY_REF: khaos-authority-signing-key
+          KHAOS_AUTHORITYD_KEYCHAIN_GROUP: ${{ secrets.KHAOS_MACOS_TEAM_ID }}.com.khaos.authority
+          KHAOS_AUTHORITYD_AGENT_CODE_SIGNATURE: ${{ secrets.KHAOS_MACOS_AGENT_CODE_SIGNATURE }}
+          KHAOS_AUTHORITYD_SERVICE_CODE_SIGNATURE: com.khaos.authorityd
+          KHAOS_MACOS_AUTHORITY_XPC_CLIENT: /usr/local/libexec/khaos-authorityd-xpc-client
+        run: |
+          mkdir -p native-evidence
+          PYTHONPATH=python uv run python scripts/run_native_authority_probe.py | tee native-evidence/macos-xpc-proof.json
+          test -s native-evidence/macos-xpc-proof.json
+      - name: Upload native proof
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: native-authority-macos-proof
+          path: native-evidence/
+
+  windows-service-named-pipe:
+    name: Windows Service-SID Named Pipe authority
+    runs-on: windows-2025
+    environment: security-native
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.11"
+      - name: Install contract dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --require-hashes -r python/bootstrap-requirements.txt
+          uv sync --frozen --extra test
+      - name: Build native authority service
+        run: cargo build --locked --release --no-default-features --bin khaos-authorityd-windows --manifest-path rust/khaos-core/Cargo.toml
+      - name: Install Service SID and protected-key deployment
+        shell: pwsh
+        env:
+          KHAOS_AGENT_SID: ${{ secrets.KHAOS_WINDOWS_AGENT_SID }}
+          KHAOS_WINDOWS_DPAPI_KEY_PATH: ${{ secrets.KHAOS_WINDOWS_DPAPI_KEY_PATH }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:KHAOS_AGENT_SID)) { throw 'KHAOS_WINDOWS_AGENT_SID is required' }
+          if ([string]::IsNullOrWhiteSpace($env:KHAOS_WINDOWS_DPAPI_KEY_PATH)) { throw 'KHAOS_WINDOWS_DPAPI_KEY_PATH is required' }
+          New-Item -ItemType Directory -Force C:\ProgramData\Khaos | Out-Null
+          if (-not (Test-Path -LiteralPath $env:KHAOS_WINDOWS_DPAPI_KEY_PATH -PathType Leaf)) { throw 'pre-provisioned DPAPI marker is required' }
+          .\packaging\windows\install-khaos-authorityd.ps1 -Binary "$env:GITHUB_WORKSPACE\rust\khaos-core\target\release\khaos-authorityd-windows.exe" -AgentSid $env:KHAOS_AGENT_SID -ProtectedKeyPath $env:KHAOS_WINDOWS_DPAPI_KEY_PATH
+      - name: Run real Named Pipe authority proof
+        shell: pwsh
+        env:
+          KHAOS_AGENT_SID: ${{ secrets.KHAOS_WINDOWS_AGENT_SID }}
+          KHAOS_AUTHORITYD_SERVICE_SID: ${{ secrets.KHAOS_WINDOWS_AUTHORITY_SERVICE_SID }}
+          KHAOS_AUTHORITYD_NAMED_PIPE: \\.\pipe\KhaosAuthorityD
+          KHAOS_AUTHORITYD_PROTECTED_KEY_REF: khaos-authority-signing-key
+          KHAOS_WINDOWS_AUTHORITY_PIPE_CLIENT: ${{ github.workspace }}\rust\khaos-core\target\release\khaos-authorityd-windows.exe
+        run: |
+          New-Item -ItemType Directory -Force native-evidence | Out-Null
+          $env:PYTHONPATH = "$env:GITHUB_WORKSPACE\python"
+          uv run python scripts/run_native_authority_probe.py | Tee-Object native-evidence\windows-named-pipe-proof.json
+          if (-not (Test-Path native-evidence\windows-named-pipe-proof.json)) { throw 'native proof artifact missing' }
+      - name: Upload native proof
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: native-authority-windows-proof
+          path: native-evidence/

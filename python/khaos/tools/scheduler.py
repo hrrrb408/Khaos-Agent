@@ -2518,6 +2518,15 @@ class ToolScheduler:
         before a scheduler can be exposed.
         """
         principal_id = str(tool_context.get("principal_id") or "legacy-principal")
+        principal_kind = str(tool_context.get("principal_kind") or "")
+        parent_principal_id = str(tool_context.get("parent_principal_id") or "")
+        delegation_digest = str(tool_context.get("delegation_digest") or "")
+        if tool_context.get("production_runtime") and not all(
+            (principal_kind, parent_principal_id, delegation_digest)
+        ):
+            raise PermissionDeniedError(
+                "production execution requires a complete typed principal delegation"
+            )
         project_id = str(tool_context.get("project_id") or "legacy-project")
         session_id = str(tool_context.get("session_id") or "legacy-session")
         task_id = str(tool_context.get("task_id") or f"session:{session_id}")
@@ -2701,6 +2710,9 @@ class ToolScheduler:
                 executable_scope=str(executable_scope),
                 argv=argv,
                 network_lease=network_lease,
+                principal_kind=principal_kind,
+                parent_principal_id=parent_principal_id,
+                delegation_digest=delegation_digest,
             )
             call["_spawn_plan"] = spawn_plan
         elif not isinstance(spawn_plan, ResolvedSpawnPlan):
@@ -2737,6 +2749,9 @@ class ToolScheduler:
             tool_security_digest=tool.security_digest,
             spawn_plan_digest=spawn_plan.digest(),
             approval_receipt_digest=str(approval_receipt_digest or ""),
+            principal_kind=principal_kind,
+            parent_principal_id=parent_principal_id,
+            delegation_digest=delegation_digest,
         )
 
     async def _prepare_sandbox_authority_inputs(
@@ -3425,6 +3440,9 @@ def _build_spawn_plan(
     executable_scope: str,
     argv: tuple[str, ...],
     network_lease: NetworkLease | None = None,
+    principal_kind: str = "",
+    parent_principal_id: str = "",
+    delegation_digest: str = "",
 ) -> ResolvedSpawnPlan:
     """Create one immutable, pre-approval spawn authority."""
     arguments = call.get("arguments", {})
@@ -3484,6 +3502,9 @@ def _build_spawn_plan(
         executable_identity=executable_scope,
         argv=plan_argv,
         budget_digest=budget.digest(),
+        principal_kind=principal_kind,
+        parent_principal_id=parent_principal_id,
+        delegation_digest=delegation_digest,
     )
 
 

@@ -1,0 +1,39 @@
+name: Upstream Codex Security Watch
+
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  review-candidate:
+    name: Review-only Codex security candidate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - name: Create blobless upstream mirror
+        run: git clone --filter=blob:none --no-checkout --no-tags https://github.com/openai/codex.git codex-mirror
+      - name: Generate review-only semantic candidate report
+        run: |
+          python scripts/watch_upstream_codex_security.py \
+            --mirror codex-mirror \
+            --baseline-sha 711a5f8b3a6eb40134146ae9ec22fdcdda5e3170 \
+            --output upstream-codex-security-watch.json
+      - name: Assert no synchronization behavior
+        run: |
+          python scripts/watch_upstream_codex_security.py \
+            --baseline-sha 711a5f8b3a6eb40134146ae9ec22fdcdda5e3170 \
+            --head-sha 711a5f8b3a6eb40134146ae9ec22fdcdda5e3170 \
+            --check
+          test "$(git status --porcelain)" = ""
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: upstream-codex-security-watch
+          path: upstream-codex-security-watch.json
+          if-no-files-found: error

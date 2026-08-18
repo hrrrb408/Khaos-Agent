@@ -73,6 +73,9 @@ class SubAgentService:
             parent_session_id=f"subagent:{principal_id}",
             depth=1,
             principal_id=principal_id,
+            principal_kind="subagent",
+            parent_principal_id=f"{ctx.principal_kind}:{principal_id}",
+            delegation_digest=ctx.delegation_digest,
             # M4 batch 3.1.16A-5-1b: inherit the RPC-verified project
             # identity so the subagent's create_session / AgentLoop
             # stamps the SAME project_id as the parent runtime.  The

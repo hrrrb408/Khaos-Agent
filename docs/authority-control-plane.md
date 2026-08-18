@@ -193,16 +193,21 @@ UID:
 - Windows production deployment must provide a service SID, Named Pipe ACL,
   and CNG/DPAPI-protected key reference.
 
-The Python admission module rejects missing platform handles.  It does not
-pretend to implement launchd/XPC or Windows Named Pipes; those are installed
-and owned by the platform service package.  The current repository deliberately
-refuses to use a Unix-socket substitute on macOS or Windows; until those native
-adapters are installed, production authority-backed execution is unavailable.
-This is an explicit open M5 boundary: the Windows sandbox backend does not by
-itself close the independent AuthorityBroker transport requirement, and the
-repository makes no cross-platform production-parity claim until Service SID /
-Named Pipe / ACL validation or launchd/XPC / audit-token / code-signing /
-Keychain validation is present and covered by a real platform gate.
+The repository now contains the native transport clients and service packages
+under `packaging/macos/` and
+`rust/khaos-core/src/bin/khaos-authorityd-windows.rs`. The Python
+`NativeAuthorityProof` adapter accepts a production request only after the
+native client has proved the launchd/XPC or Service-SID/Named-Pipe boundary.
+The native services are deliberately separate from the Agent and keep the
+authority backend/key boundary outside the Agent process. Missing signed
+artifacts, missing protected key, identity mismatch, stale proof, or an
+unavailable platform service still makes authority-backed execution
+unavailable; no Unix-socket, same-UID, TCP, or in-process fallback is used.
+
+The native source and manifests are implementation inputs, not runtime
+evidence by themselves. A real macOS or Windows runner must install the
+platform service and produce the native probe artifact before M6 can claim
+cross-platform production closure.
 
 ## Independent audit prerequisite
 

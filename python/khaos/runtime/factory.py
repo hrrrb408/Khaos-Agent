@@ -155,6 +155,8 @@ class RuntimeConfig:
     # (fail-closed) instead of silently running as the local OS user.
     principal_id: str = ""
     principal_kind: str = ""
+    parent_principal_id: str = ""
+    delegation_digest: str = ""
     source_transport: str = "unknown"
     foreground_session: bool = False
     # H5: session_id + runtime_id extend the per-session BrowserContext key
@@ -229,6 +231,8 @@ class ProductionRuntimeConfig:
     credential_broker: CredentialBroker | None = None
     principal_id: str = ""
     principal_kind: str = ""
+    parent_principal_id: str = ""
+    delegation_digest: str = ""
     source_transport: str = "unknown"
     foreground_session: bool = False
     session_id: str = ""
@@ -261,6 +265,8 @@ class ProductionRuntimeConfig:
             credential_broker=self.credential_broker,
             principal_id=self.principal_id,
             principal_kind=self.principal_kind,
+            parent_principal_id=self.parent_principal_id,
+            delegation_digest=self.delegation_digest,
             source_transport=self.source_transport,
             foreground_session=self.foreground_session,
             session_id=self.session_id,
@@ -310,6 +316,8 @@ class RuntimeResult:
     # — closing one runtime's context does NOT close another's page.
     principal_id: str = ""
     principal_kind: str = ""
+    parent_principal_id: str = ""
+    delegation_digest: str = ""
     session_id: str = ""
     runtime_id: str = ""
     # H2: the AuditLogger is stored here so ``aclose()`` can close its file
@@ -905,8 +913,8 @@ async def build_runtime(
     # fixtures; it is not a production identity proof.
     from khaos.security.principals import (
         PrincipalDelegationError,
-        principal_from_kind,
         principal_for_transport,
+        principal_from_kind,
     )
     try:
         if cfg.principal_kind:
@@ -1255,6 +1263,9 @@ async def build_runtime(
         execution_service=execution_service,
         approval_broker=cfg.approval_broker,
         principal_id=cfg.principal_id,
+        principal_kind=cfg.principal_kind,
+        parent_principal_id=cfg.parent_principal_id,
+        delegation_digest=cfg.delegation_digest,
         source_transport=cfg.source_transport,
         foreground_session=cfg.foreground_session,
         # H5: carry the runtime_id + session_id into the AgentLoop so the
@@ -1298,6 +1309,8 @@ async def build_runtime(
         owns_credential_broker=owns_credential_broker,
         principal_id=cfg.principal_id,
         principal_kind=cfg.principal_kind,
+        parent_principal_id=cfg.parent_principal_id,
+        delegation_digest=cfg.delegation_digest,
         # H5: carry session_id + runtime_id so ``aclose`` can release the
         # per-session BrowserContext keyed by (principal, session, runtime).
         session_id=cfg.session_id,

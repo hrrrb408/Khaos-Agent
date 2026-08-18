@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -186,6 +187,8 @@ class SubAgentRunner:
             "approval_broker": self.approval_broker,
             "principal_id": principal_id,
             "principal_kind": "subagent",
+            "parent_principal_id": task.parent_principal_id or principal_id,
+            "delegation_digest": task.delegation_digest,
             "source_transport": "subagent",
             "foreground_session": False,
             "audit_logger": self.audit_logger,
@@ -202,12 +205,19 @@ class SubAgentRunner:
             runtime_kwargs["memory_manager"] = (
                 self.memory_manager if self.inherit_memory else None
             )
-        if runtime_config_type is ProductionRuntimeConfig:
+        if runtime_config_type is ProductionRuntimeConfig and os.environ.get(
+            "KHAOS_DEV_MODE"
+        ) != "1":
             runtime = await build_production_runtime(
                 ProductionRuntimeConfig(**runtime_kwargs)
             )
         else:
-            runtime = await build_runtime(RuntimeConfig(**runtime_kwargs))
+            # Explicit development mode may use the ordinary factory for
+            # test adapters, but it still receives the structural production
+            # config when no injected scheduler/memory owner is present.  It
+            # never creates a host or same-UID authority fallback.
+            config_type = runtime_config_type
+            runtime = await build_runtime(config_type(**runtime_kwargs))
         try:
             logger.info(
                 "SubAgentRunner starting: task=%s session=%s goal=%r",

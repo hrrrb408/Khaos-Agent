@@ -30,6 +30,7 @@ class AuthorityIdentityContract:
     code_signature: str | None = None
     keychain_access_group: str | None = None
     service_sid: str | None = None
+    agent_sid: str | None = None
     named_pipe: str | None = None
     protected_key_ref: str | None = None
 
@@ -39,6 +40,7 @@ class AuthorityIdentityContract:
         if os.name == "nt":
             required = {
                 "service_sid": self.service_sid,
+                "agent_sid": self.agent_sid,
                 "named_pipe": self.named_pipe,
                 "protected_key_ref": self.protected_key_ref,
             }
@@ -94,9 +96,14 @@ def read_contract_from_environment() -> AuthorityIdentityContract:
         authority_uid=integer("KHAOS_AUTHORITYD_UID"),
         job_uid=integer("KHAOS_JOB_UID"),
         launchd_service=os.environ.get("KHAOS_AUTHORITYD_LAUNCHD_SERVICE"),
-        code_signature=os.environ.get("KHAOS_AUTHORITYD_CODE_SIGNATURE"),
+        # macOS names this field after the authenticated peer: the native
+        # service compares the XPC audit-token code signature against
+        # KHAOS_AUTHORITYD_AGENT_CODE_SIGNATURE.  Do not silently accept a
+        # service signature in its place.
+        code_signature=os.environ.get("KHAOS_AUTHORITYD_AGENT_CODE_SIGNATURE"),
         keychain_access_group=os.environ.get("KHAOS_AUTHORITYD_KEYCHAIN_GROUP"),
         service_sid=os.environ.get("KHAOS_AUTHORITYD_SERVICE_SID"),
+        agent_sid=os.environ.get("KHAOS_AGENT_SID"),
         named_pipe=os.environ.get("KHAOS_AUTHORITYD_NAMED_PIPE"),
         protected_key_ref=os.environ.get("KHAOS_AUTHORITYD_PROTECTED_KEY_REF"),
     )

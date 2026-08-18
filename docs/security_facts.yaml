@@ -36,6 +36,11 @@ linux:
 platform_boundaries:
   macos_authority_transport: native_launchd_or_xpc_adapter_required
   windows_authority_transport: native_named_pipe_service_sid_adapter_required
+  macos_native_client: packaging/macos/khaos-authorityd-xpc-client.c
+  macos_native_service: packaging/macos/khaos-authorityd-xpc.m
+  macos_key_boundary: launchd_authority_user_plus_keychain_access_group
+  windows_native_service: rust/khaos-core/src/bin/khaos-authorityd-windows.rs
+  windows_key_boundary: service_sid_plus_dpapi_protected_key
   unsupported_platform_behavior: fail_closed
 effect_boundaries:
   git_worktree_paths: strict_descendant_of_trusted_git_runner_authority_root
@@ -74,6 +79,39 @@ production_reachability:
   unresolved_internal_imports: fail_closed
   generated_artifact: docs/generated/production-reachability.md
   evidence_class: machine_checked_repository_graph_not_native_kernel_evidence
+tcb_boundaries:
+  pure_module: python/khaos/security/protocol_boundary.py
+  owns:
+    - canonical_serialization
+    - bounded_schema_validation
+    - protocol_negotiation
+    - exact_effect_digest
+    - authority_receipt_transitions
+    - resource_owner_transitions
+  closed_postcondition: terminal_proof_and_empty_owner_registry
+  property_tests: python/tests/security/test_protocol_boundary.py
+closure_report:
+  generator: scripts/build_m6_closure_report.py
+  checked_in_template: docs/m6-security-closure-report.md
+  closed_requires:
+    - exact_commit_ci_run
+    - security_closure_gate_success
+    - product_integrity_gate_success
+    - macos_native_authority_proof
+    - windows_native_authority_proof
+    - independent_resource_oracle
+  missing_evidence_state: unknown_or_quarantined
+upstream_security_watch:
+  generator: scripts/watch_upstream_codex_security.py
+  fixed_sha: 711a5f8b3a6eb40134146ae9ec22fdcdda5e3170
+  relevant_paths_only: true
+  auto_sync: false
+  source_copy_or_apply: false
+governance:
+  active_mode: single_maintainer_compatibility
+  hardened_template: scripts/github-m6-hardened-ruleset.json
+  independent_review_claimed: false
+  validator: scripts/validate_m6_governance.py
 orchestration_boundaries:
   extracted_components:
     - TurnAdmission

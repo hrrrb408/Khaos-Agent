@@ -18,6 +18,10 @@ from dataclasses import dataclass, field
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$")
 _DIGEST = re.compile(r"^[A-Za-z0-9_.:-]{1,256}$")
+_DELEGATION_DIGEST = re.compile(r"^[0-9a-f]{64}$")
+_PRINCIPAL_KINDS = frozenset(
+    {"human", "gateway", "channel", "automation", "subagent", "browser"}
+)
 _AUTHORITY_ISSUER = object()
 
 
@@ -42,6 +46,10 @@ class AuthorityEnvelope:
     schema_version: int = 1
     grant_id: str = ""
     grant_expires_at: float = 0.0
+    principal_kind: str = ""
+    parent_principal_id: str = ""
+    session_id: str = ""
+    delegation_digest: str = ""
     _broker: object | None = field(
         default=None, init=False, repr=False, compare=False
     )
@@ -62,6 +70,10 @@ class AuthorityEnvelope:
         schema_version: int = 1,
         grant_id: str = "",
         grant_expires_at: float = 0.0,
+        principal_kind: str = "",
+        parent_principal_id: str = "",
+        session_id: str = "",
+        delegation_digest: str = "",
         _issuer: object | None = None,
     ) -> None:
         if _issuer is not _AUTHORITY_ISSUER:
@@ -82,6 +94,10 @@ class AuthorityEnvelope:
             ("schema_version", schema_version),
             ("grant_id", grant_id),
             ("grant_expires_at", grant_expires_at),
+            ("principal_kind", principal_kind),
+            ("parent_principal_id", parent_principal_id),
+            ("session_id", session_id),
+            ("delegation_digest", delegation_digest),
         ):
             object.__setattr__(self, name, value)
         object.__setattr__(self, "_broker", None)
@@ -105,6 +121,10 @@ class AuthorityEnvelope:
         schema_version: int = 1,
         grant_id: str,
         grant_expires_at: float,
+        principal_kind: str = "",
+        parent_principal_id: str = "",
+        session_id: str = "",
+        delegation_digest: str = "",
     ) -> AuthorityEnvelope:
         """Construct an envelope owned by one trusted AuthorityBroker."""
         envelope = cls(
@@ -121,6 +141,10 @@ class AuthorityEnvelope:
             schema_version=schema_version,
             grant_id=grant_id,
             grant_expires_at=grant_expires_at,
+            principal_kind=principal_kind,
+            parent_principal_id=parent_principal_id,
+            session_id=session_id,
+            delegation_digest=delegation_digest,
             _issuer=_AUTHORITY_ISSUER,
         )
         object.__setattr__(envelope, "_broker", broker)
@@ -155,6 +179,27 @@ class AuthorityEnvelope:
             raise ValueError("authority envelope grant id is invalid")
         if not math.isfinite(self.grant_expires_at) or self.grant_expires_at <= 0:
             raise ValueError("authority envelope grant expiry is invalid")
+        typed = (
+            self.principal_kind,
+            self.parent_principal_id,
+            self.session_id,
+            self.delegation_digest,
+        )
+        if any(typed) and not all(typed):
+            raise ValueError("authority envelope typed principal binding is incomplete")
+        if self.principal_kind and self.principal_kind not in _PRINCIPAL_KINDS:
+            raise ValueError("authority envelope principal kind is invalid")
+        if self.parent_principal_id and _IDENTIFIER.fullmatch(self.parent_principal_id) is None:
+            raise ValueError("authority envelope parent principal is invalid")
+        if self.session_id and _IDENTIFIER.fullmatch(self.session_id) is None:
+            raise ValueError("authority envelope session id is invalid")
+        if self.delegation_digest and _DELEGATION_DIGEST.fullmatch(self.delegation_digest) is None:
+            raise ValueError("authority envelope delegation digest is invalid")
+
+    @property
+    def has_typed_principal_binding(self) -> bool:
+        """Return whether the envelope carries the complete M6.4 tuple."""
+        return bool(self.principal_kind)
 
     def payload(self) -> dict[str, object]:
         """Return the canonical, non-secret binding payload."""
@@ -172,6 +217,16 @@ class AuthorityEnvelope:
             "authorization_epoch": self.authorization_epoch,
             "grant_id": self.grant_id,
             "grant_expires_at": self.grant_expires_at,
+            **(
+                {
+                    "principal_kind": self.principal_kind,
+                    "parent_principal_id": self.parent_principal_id,
+                    "session_id": self.session_id,
+                    "delegation_digest": self.delegation_digest,
+                }
+                if self.has_typed_principal_binding
+                else {}
+            ),
         }
 
     def digest(self) -> str:
@@ -194,6 +249,16 @@ class AuthorityEnvelope:
                 "workspace_generation": self.workspace_generation,
                 "policy_digest": self.policy_digest,
                 "authorization_epoch": self.authorization_epoch,
+                **(
+                    {
+                        "principal_kind": self.principal_kind,
+                        "parent_principal_id": self.parent_principal_id,
+                        "session_id": self.session_id,
+                        "delegation_digest": self.delegation_digest,
+                    }
+                    if self.has_typed_principal_binding
+                    else {}
+                ),
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -224,6 +289,10 @@ class AuthorityEnvelope:
             schema_version=self.schema_version,
             grant_id=self.grant_id,
             grant_expires_at=self.grant_expires_at,
+            principal_kind=self.principal_kind,
+            parent_principal_id=self.parent_principal_id,
+            session_id=self.session_id,
+            delegation_digest=self.delegation_digest,
         )
 
     def matches_context(

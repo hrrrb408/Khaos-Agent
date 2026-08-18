@@ -19,6 +19,7 @@ dependencies = [
 test = [
     "pytest>=8",
     "pytest-asyncio>=0.23",
+    "hypothesis>=6.100",
 ]
 tui = [
     "textual>=0.47",

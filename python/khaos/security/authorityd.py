@@ -48,6 +48,10 @@ from khaos.security.identity_isolation import (
     read_contract_from_environment,
     validate_private_unix_socket,
 )
+from khaos.security.protocol_boundary import (
+    ProtocolBoundaryError,
+    require_receipt_transition,
+)
 from khaos.security.resource_scope import (
     ResourceScopeError,
     TypedResourcePartialOrder,
@@ -83,6 +87,15 @@ class _ReceiptRecord:
     state: str = _RECEIPT_PREPARED
 
 
+def _set_receipt_state(record: _ReceiptRecord, next_state: str) -> None:
+    """Apply one pure, auditable authority state-machine transition."""
+    try:
+        require_receipt_transition(record.state, next_state)
+    except ProtocolBoundaryError as exc:
+        raise AuthorityControlPlaneError(str(exc)) from exc
+    record.state = next_state
+
+
 def _same_receipt(
     left: SignedAuthorizationReceipt, right: SignedAuthorizationReceipt
 ) -> bool:
@@ -114,6 +127,10 @@ class _GrantRecord:
     context_digest: str
     issued_at: float
     expires_at: float
+    principal_kind: str = ""
+    parent_principal_id: str = ""
+    session_id: str = ""
+    delegation_digest: str = ""
 
 
 @dataclass
@@ -164,6 +181,7 @@ class AuthorityDaemon:
         terminal_tombstone_limit: int = 4096,
         max_audit_obligations: int | None = None,
         require_live_grants: bool = False,
+        require_typed_principals: bool = False,
     ) -> None:
         if not socket_path.is_absolute() or audit_writer is None:
             raise AuthorityControlPlaneError(
@@ -220,6 +238,7 @@ class AuthorityDaemon:
         self._audit_reservations: set[str] = set()
         self._audit_quarantined = False
         self.require_live_grants = require_live_grants
+        self.require_typed_principals = require_typed_principals
         self._closed = False
 
     def _remember_grant_terminal_locked(self, grant_id: str, state: str) -> None:
@@ -774,9 +793,17 @@ class AuthorityDaemon:
         resource_digest: str,
         authorization_epoch: int,
         ttl_seconds: float = 60 * 60.0,
+        principal_kind: str = "",
+        parent_principal_id: str = "",
+        session_id: str = "",
+        delegation_digest: str = "",
     ) -> tuple[str, float]:
         """Register a renewable grant in the independent authority owner."""
         self._expire_grants()
+        if self.require_typed_principals and not principal_kind:
+            raise AuthorityControlPlaneError(
+                "production authorityd requires a typed principal delegation"
+            )
         if not 0 < ttl_seconds <= MAX_GRANT_TTL_SECONDS:
             raise AuthorityControlPlaneError("authority grant TTL is outside the allowed range")
         if workspace_generation <= 0 or authorization_epoch < 0:
@@ -809,6 +836,10 @@ class AuthorityDaemon:
             nonce=secrets.token_hex(16),
             authorization_epoch=authorization_epoch,
             workspace_generation=workspace_generation,
+            principal_kind=principal_kind,
+            parent_principal_id=parent_principal_id,
+            session_id=session_id,
+            delegation_digest=delegation_digest,
         )
         # The grant is an authority context, but its initial operation and
         # typed resource action are still an independent daemon decision.
@@ -822,19 +853,27 @@ class AuthorityDaemon:
         grant_id = secrets.token_hex(24)
         issued_at = time.time()
         expires_at = issued_at + ttl_seconds
-        context_digest = _digest(
-            {
-                "schema_version": 1,
-                "principal_id": principal_id,
-                "project_id": project_id,
-                "runtime_id": runtime_id,
-                "task_id": task_id,
-                "workspace_id": workspace_id,
-                "workspace_generation": workspace_generation,
-                "policy_digest": policy_digest,
-                "authorization_epoch": authorization_epoch,
-            }
-        )
+        context_payload: dict[str, object] = {
+            "schema_version": 1,
+            "principal_id": principal_id,
+            "project_id": project_id,
+            "runtime_id": runtime_id,
+            "task_id": task_id,
+            "workspace_id": workspace_id,
+            "workspace_generation": workspace_generation,
+            "policy_digest": policy_digest,
+            "authorization_epoch": authorization_epoch,
+        }
+        if principal_kind:
+            context_payload.update(
+                {
+                    "principal_kind": principal_kind,
+                    "parent_principal_id": parent_principal_id,
+                    "session_id": session_id,
+                    "delegation_digest": delegation_digest,
+                }
+            )
+        context_digest = _digest(context_payload)
         record = _GrantRecord(
             principal_id=principal_id,
             project_id=project_id,
@@ -849,6 +888,10 @@ class AuthorityDaemon:
             context_digest=context_digest,
             issued_at=issued_at,
             expires_at=expires_at,
+            principal_kind=principal_kind,
+            parent_principal_id=parent_principal_id,
+            session_id=session_id,
+            delegation_digest=delegation_digest,
         )
         grant_event = self._audit_event(
             {
@@ -1004,6 +1047,10 @@ class AuthorityDaemon:
         parent_receipt: SignedAuthorizationReceipt | None = None,
         requested_resource_scope: str | None = None,
     ) -> None:
+        if self.require_typed_principals and not intent.principal_kind:
+            raise AuthorityControlPlaneError(
+                "production authorityd requires a typed principal delegation"
+            )
         if intent.grant_id is None:
             if self.require_live_grants:
                 raise AuthorityControlPlaneError(
@@ -1063,6 +1110,10 @@ class AuthorityDaemon:
             (intent.workspace_generation, record.workspace_generation),
             (intent.policy_digest, record.policy_digest),
             (intent.authorization_epoch, record.authorization_epoch),
+            (intent.principal_kind, record.principal_kind),
+            (intent.parent_principal_id, record.parent_principal_id),
+            (intent.session_id, record.session_id),
+            (intent.delegation_digest, record.delegation_digest),
         )
         if any(left != right for left, right in fields):
             raise AuthorityControlPlaneError(
@@ -1261,6 +1312,10 @@ class AuthorityDaemon:
                     "workspace_generation": intent.workspace_generation,
                     "grant_id": intent.grant_id,
                     "grant_context_digest": intent.grant_context_digest,
+                    "principal_kind": intent.principal_kind,
+                    "parent_principal_id": intent.parent_principal_id,
+                    "session_id": intent.session_id,
+                    "delegation_digest": intent.delegation_digest,
                     "expires_at": expires_at,
                     "audit_intent_digest": _digest(audit_intent),
                     "issuer_id": self.issuer_id,
@@ -1270,8 +1325,12 @@ class AuthorityDaemon:
                     "workspace_generation",
                     "grant_id",
                     "grant_context_digest",
+                    "principal_kind",
+                    "parent_principal_id",
+                    "session_id",
+                    "delegation_digest",
                 ):
-                    if receipt_fields[optional_field] is None:
+                    if receipt_fields[optional_field] is None or receipt_fields[optional_field] == "":
                         receipt_fields.pop(optional_field)
                 wire_receipt_fields = dict(receipt_fields)
                 wire_receipt_fields["expires_at"] = _encode_receipt_timestamp(
@@ -1314,7 +1373,7 @@ class AuthorityDaemon:
             record = self._record_locked(receipt)
             if record.state != _RECEIPT_PREPARING:
                 raise AuthorityControlPlaneError("receipt preparation state changed")
-            record.state = _RECEIPT_PREPARED
+            _set_receipt_state(record, _RECEIPT_PREPARED)
         return receipt
 
     @staticmethod
@@ -1336,6 +1395,10 @@ class AuthorityDaemon:
             workspace_generation=receipt.workspace_generation,
             grant_id=receipt.grant_id,
             grant_context_digest=receipt.grant_context_digest,
+            principal_kind=receipt.principal_kind,
+            parent_principal_id=receipt.parent_principal_id,
+            session_id=receipt.session_id,
+            delegation_digest=receipt.delegation_digest,
         )
 
     def _validate_receipt_grant_locked(
@@ -1379,7 +1442,7 @@ class AuthorityDaemon:
                 }
             )
             self._reserve_audit_event_locked(claimed_event)
-            record.state = _RECEIPT_CLAIMING
+            _set_receipt_state(record, _RECEIPT_CLAIMING)
         try:
             self._append_or_queue_audit(claimed_event)
         except BaseException:
@@ -1388,11 +1451,11 @@ class AuthorityDaemon:
             # retried as a fresh effect.
             with self._lock:
                 record = self._record_locked(receipt)
-                record.state = _RECEIPT_CLAIMED
+                _set_receipt_state(record, _RECEIPT_CLAIMED)
             raise
         with self._lock:
             record = self._record_locked(receipt)
-            record.state = _RECEIPT_CLAIMED
+            _set_receipt_state(record, _RECEIPT_CLAIMED)
 
     def complete(
         self,
@@ -1435,7 +1498,7 @@ class AuthorityDaemon:
                         "issuer_id": self.issuer_id,
                     }
                     self._reserve_audit_event_locked(result_event)
-                    record.state = _RECEIPT_COMPLETING
+                    _set_receipt_state(record, _RECEIPT_COMPLETING)
             elif record.state != _RECEIPT_CLAIMED:
                 raise AuthorityControlPlaneError("receipt is not completable")
             else:
@@ -1447,7 +1510,7 @@ class AuthorityDaemon:
                     "issuer_id": self.issuer_id,
                 }
                 self._reserve_audit_event_locked(result_event)
-                record.state = _RECEIPT_COMPLETING
+                _set_receipt_state(record, _RECEIPT_COMPLETING)
         if expired_event is not None:
             try:
                 self._append_or_queue_audit(expired_event)
@@ -1460,7 +1523,7 @@ class AuthorityDaemon:
         except BaseException:
             with self._lock:
                 record = self._record_locked(receipt)
-                record.state = _RECEIPT_CLAIMED
+                _set_receipt_state(record, _RECEIPT_CLAIMED)
             raise
         with self._lock:
             self._pending.pop(receipt.nonce, None)
@@ -1554,6 +1617,10 @@ class AuthorityDaemon:
                 workspace_generation=receipt.workspace_generation,
                 grant_id=receipt.grant_id,
                 grant_context_digest=receipt.grant_context_digest,
+                principal_kind=receipt.principal_kind,
+                parent_principal_id=receipt.parent_principal_id,
+                session_id=receipt.session_id,
+                delegation_digest=receipt.delegation_digest,
             )
             narrow_policy = getattr(self.policy, "check_narrow", None)
             if callable(narrow_policy):
@@ -1608,7 +1675,7 @@ class AuthorityDaemon:
                 state=_NARROW_CHILD_PREPARING,
             )
             self._narrow_transactions[narrow_token] = narrow_transaction
-            record.state = _RECEIPT_NARROWING
+            _set_receipt_state(record, _RECEIPT_NARROWING)
         try:
             child = self.prepare(
                 intent,
@@ -1639,7 +1706,7 @@ class AuthorityDaemon:
                             raise AuthorityControlPlaneError(
                                 "receipt narrowing rollback state changed"
                             )
-                        record.state = _RECEIPT_PREPARED
+                        _set_receipt_state(record, _RECEIPT_PREPARED)
             raise
 
         with self._lock:
@@ -1791,13 +1858,13 @@ class AuthorityDaemon:
                 }
             )
             self._reserve_audit_event_locked(revoked_event)
-            record.state = _RECEIPT_REVOKING
+            _set_receipt_state(record, _RECEIPT_REVOKING)
         try:
             self._append_or_queue_audit(revoked_event)
         except BaseException:
             with self._lock:
                 record = self._record_locked(receipt)
-                record.state = _RECEIPT_PREPARED
+                _set_receipt_state(record, _RECEIPT_PREPARED)
             raise
         with self._lock:
             self._pending.pop(receipt.nonce, None)
@@ -1893,6 +1960,7 @@ def build_production_daemon(
         issuer_id=issuer_id,
         policy=selected_policy,
         require_live_grants=True,
+        require_typed_principals=True,
     )
 
 
@@ -2263,6 +2331,10 @@ def _dispatch(daemon: AuthorityDaemon, request: object) -> dict[str, object]:
             resource_digest=str(request.get("resource_digest", "")),
             authorization_epoch=int(request.get("authorization_epoch", -1)),
             ttl_seconds=float(request.get("ttl_seconds", 0)),
+            principal_kind=str(request.get("principal_kind", "")),
+            parent_principal_id=str(request.get("parent_principal_id", "")),
+            session_id=str(request.get("session_id", "")),
+            delegation_digest=str(request.get("delegation_digest", "")),
         )
         return {"ok": True, "grant_id": grant_id, "expires_at": expires_at}
     if operation == "revoke_grant":

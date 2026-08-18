@@ -13,8 +13,8 @@
 
 ## Reachability result
 
-- Reachable repository modules: `157`.
-- Resolved import edges: `952`.
+- Reachable repository modules: `159`.
+- Resolved import edges: `960`.
 - Forbidden production edges: `0`.
 - Unresolved internal edges: `0`.
 
@@ -153,6 +153,7 @@
 - `khaos.security.identity_isolation`
 - `khaos.security.kernel_helper_client`
 - `khaos.security.middleware`
+- `khaos.security.native_authority`
 - `khaos.security.network_broker`
 - `khaos.security.network_guard`
 - `khaos.security.orchestration_components`
@@ -160,6 +161,7 @@
 - `khaos.security.path_guard`
 - `khaos.security.policy`
 - `khaos.security.principals`
+- `khaos.security.protocol_boundary`
 - `khaos.security.resource_scope`
 - `khaos.security.sandbox`
 - `khaos.security.secret_scanner`

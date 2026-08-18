@@ -25,6 +25,8 @@ place so the system keeps working).
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from dataclasses import dataclass
 
@@ -32,8 +34,8 @@ from khaos.security.principals import (
     Principal,
     PrincipalDelegationError,
     PrincipalKind,
-    principal_from_kind,
     principal_for_transport,
+    principal_from_kind,
 )
 
 
@@ -50,6 +52,40 @@ def local_principal_id() -> str:
     except AttributeError:
         uid = "windows"
     return f"local-uid:{uid}"
+
+
+def _transport_delegation_digest(
+    *,
+    principal_id: str,
+    principal_kind: str,
+    parent_principal_id: str,
+    project_id: str,
+    session_id: str,
+    runtime_id: str,
+    source_transport: str,
+    policy_digest: str,
+) -> str:
+    """Create the immutable transport-root delegation commitment.
+
+    The commitment is deliberately only an identity binding.  The
+    independent authority still decides whether this root may issue an
+    effect; it is not a Python-side permission grant or a fallback authority.
+    """
+    payload = {
+        "schema_version": 1,
+        "kind": "transport-root-delegation",
+        "principal_id": principal_id,
+        "principal_kind": principal_kind,
+        "parent_principal_id": parent_principal_id,
+        "project_id": project_id,
+        "session_id": session_id,
+        "runtime_id": runtime_id,
+        "source_transport": source_transport,
+        "policy_digest": policy_digest,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -112,9 +148,29 @@ class RequestContext:
                 "request context principal kind does not match its transport"
             )
         object.__setattr__(self, "principal_kind", requested.value)
-        if self.principal_id and self.parent_principal_id == self.principal_id:
+        parent = self.parent_principal_id
+        if self.principal_id and not parent:
+            parent = f"{requested.value}:{self.principal_id}"
+            object.__setattr__(self, "parent_principal_id", parent)
+        if self.principal_id and parent == self.principal_id:
             raise ValueError("request context parent principal cannot equal subject")
-        if self.delegation_digest and len(self.delegation_digest) != 64:
+        delegation_digest = self.delegation_digest
+        if self.principal_id and not delegation_digest:
+            delegation_digest = _transport_delegation_digest(
+                principal_id=self.principal_id,
+                principal_kind=requested.value,
+                parent_principal_id=parent,
+                project_id=self.project_id,
+                session_id=self.session_id,
+                runtime_id=self.runtime_id,
+                source_transport=self.source_transport,
+                policy_digest=self.policy_digest,
+            )
+            object.__setattr__(self, "delegation_digest", delegation_digest)
+        if delegation_digest and (
+            len(delegation_digest) != 64
+            or any(character not in "0123456789abcdef" for character in delegation_digest)
+        ):
             raise ValueError("request context delegation digest is malformed")
 
     @property
@@ -235,7 +291,7 @@ class RequestContext:
             policy_digest=self.policy_digest,
             principal_kind=self.principal_kind,
             parent_principal_id=self.parent_principal_id,
-            delegation_digest=self.delegation_digest,
+            delegation_digest="",
         )
 
     def with_runtime_id(self, runtime_id: str) -> RequestContext:
@@ -253,5 +309,5 @@ class RequestContext:
             policy_digest=self.policy_digest,
             principal_kind=self.principal_kind,
             parent_principal_id=self.parent_principal_id,
-            delegation_digest=self.delegation_digest,
+            delegation_digest="",
         )

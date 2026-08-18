@@ -222,11 +222,35 @@ class CommandGuard:
         return None
 
     def _is_base_command_allowed(self, command: str) -> bool:
-        """Require every proven executable in a literal shell graph."""
+        """Require every literal executable in the explicit policy allowlist.
+
+        An explicit ``commands_allowed`` policy is an execution allowlist,
+        not the read-only shortcut.  Therefore a command such as ``pytest``
+        may be explicitly allowed even though it is not in the conservative
+        default read-only set.  Shell expansion, callbacks, redirections,
+        assignments, and blocked executables still fail closed before this
+        allowlist can match them.
+        """
         semantic = analyze_shell_script(command)
-        if semantic.status is not ShellSemanticStatus.SAFE:
+        if semantic.status is ShellSemanticStatus.BLOCKED:
             return False
-        executables = [node.executable for node in semantic.ast.commands if node.executable]
+        if any(
+            feature != "comment" for feature in semantic.ast.features
+        ):
+            return False
+        if any(
+            command_node.redirection
+            or command_node.callback
+            or any(
+                not word.literal or word.assignment
+                for word in command_node.words
+            )
+            for command_node in semantic.ast.commands
+        ):
+            return False
+        executables = [
+            node.executable for node in semantic.ast.commands if node.executable
+        ]
         return bool(executables) and all(
             executable in self._allowed_commands for executable in executables
         )

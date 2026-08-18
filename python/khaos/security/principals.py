@@ -21,9 +21,9 @@ import re
 import secrets
 import threading
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Iterable
 
 
 class PrincipalKind(str, Enum):
@@ -226,7 +226,7 @@ class DelegationScope:
         expires_at: float,
         issued_at: float | None = None,
         nonce: str | None = None,
-    ) -> "DelegationScope":
+    ) -> DelegationScope:
         """Create an explicit human-owned root scope.
 
         Root scope creation is only an input to the independent authority;
@@ -271,7 +271,7 @@ class DelegationScope:
     def digest(self) -> str:
         return _digest(self.canonical())
 
-    def contains(self, child: "DelegationScope") -> bool:
+    def contains(self, child: DelegationScope) -> bool:
         """Return whether ``child`` is a strict non-widening subset."""
 
         return (

@@ -171,6 +171,28 @@ not evidence that an effect occurred.
     remains reachable through a public compatibility hook. The generated
     inventory is a commit-bound artifact and a stale or locally edited report
     fails closed in CI.
+20. macOS and Windows production authority transport is native-only. macOS
+    requires a launchd Mach service/XPC audit-token and code-signature proof
+    plus a Keychain access-group protected key; Windows requires a Service-SID
+    process, an ACL-protected Named Pipe, and a protected-key proof. Missing,
+    stale, same-UID, or test-process evidence is unavailable evidence and
+    cannot authorize a receipt.
+21. Security-critical transport, serialization, schema, effect-binding,
+    receipt-state, and resource-owner transitions are pure typed boundaries.
+    The orchestration modules may own I/O and locks, but they must call the
+    pure transition/digest functions; an object reaching `CLOSED` without an
+    external terminal postcondition and an empty owner registry is invalid.
+22. The hardened M6 ruleset is a preparation template, not current evidence.
+    It requires an independent approving review, CODEOWNER review, last-push
+    approval, resolved threads, `Security Closure Gate`, and `Product Integrity
+    Gate`; the current single-maintainer ruleset must not claim those controls.
+23. The upstream Codex watch is metadata-only and review-only. It binds the
+    comparison to a fixed SHA, filters security-relevant paths/subjects, and
+    cannot copy, apply, or synchronize upstream source.
+24. The M6 closure report is evidence-bound. `CLOSED` requires exact CI
+    evidence, both real native authority proofs, explicit all-gates-success,
+    and independent resource oracles; missing evidence remains UNKNOWN,
+    QUARANTINED, or FAILED.
 
 ## Verification map
 
@@ -204,6 +226,20 @@ not evidence that an effect occurred.
 - Production composition reachability and forbidden Host/dev edges:
   `python/tests/security/test_production_reachability.py` and
   `scripts/generate_production_reachability.py --check`.
+- Native authority transport admission:
+  `python/tests/security/test_native_authority.py`; native E2E evidence is
+  produced only by the macOS/Windows platform jobs when signed service
+  artifacts and platform identity proofs are present.
+- Pure TCB protocol/effect/state boundaries:
+  `python/tests/security/test_protocol_boundary.py`,
+  `python/khaos/security/protocol_boundary.py`, and the authorityd receipt
+  transition calls.
+- M6 governance, upstream watch, adversarial postconditions, and report
+  evidence:
+  `python/tests/security/test_m6_governance.py`,
+  `python/tests/security/test_upstream_codex_security_watch.py`,
+  `python/tests/security/test_m6_adversarial_matrix.py`, and
+  `python/tests/security/test_m6_closure_report.py`.
 
 The opt-in real-platform jobs remain required for a release closure; skipped
 or unavailable jobs are not successful evidence.

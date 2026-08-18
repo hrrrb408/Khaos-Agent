@@ -74,6 +74,7 @@ from khaos.runtime.context import local_principal_id
 from khaos.rust_bridge import get_token_engine
 from khaos.scheduler import CronEngine
 from khaos.security.middleware import SecurityMiddleware
+from khaos.security.protocol_boundary import canonical_json_bytes
 from khaos.skills import SkillManager
 from khaos.subagents import (
     SubAgentConfig,
@@ -838,9 +839,7 @@ class GatewayRPCAuthenticator:
             raise PermissionError("RPC capability has expired")
         if len(nonce) < 32 or nonce in self._used_nonces:
             raise PermissionError("RPC nonce is invalid or replayed")
-        canonical_payload = json.dumps(
-            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
-        ).encode("utf-8")
+        canonical_payload = canonical_json_bytes(payload)
         expected_digest = hashlib.sha256(canonical_payload).hexdigest()
         if not hmac.compare_digest(payload_digest, expected_digest):
             raise PermissionError("RPC payload digest mismatch")
@@ -937,9 +936,7 @@ class RPCProtocolError(PermissionError):
 
 def _rpc_feature_digest(features: list[str] | tuple[str, ...]) -> str:
     """Hash the canonical feature list that is bound into the HMAC."""
-    canonical = json.dumps(
-        sorted(features), ensure_ascii=False, separators=(",", ":"),
-    ).encode("utf-8")
+    canonical = canonical_json_bytes(sorted(features))
     return hashlib.sha256(canonical).hexdigest()
 
 
@@ -2071,6 +2068,8 @@ class AgentService:
             office_authority=self._office_authority,
             principal_id=ctx.principal_id,
             principal_kind=ctx.principal_kind,
+            parent_principal_id=ctx.parent_principal_id,
+            delegation_digest=ctx.delegation_digest,
             source_transport=ctx.source_transport,
             foreground_session=False,
             session_id=session_id,
