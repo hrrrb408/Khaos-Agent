@@ -13,8 +13,8 @@
 
 ## Reachability result
 
-- Reachable repository modules: `159`.
-- Resolved import edges: `960`.
+- Reachable repository modules: `160`.
+- Resolved import edges: `971`.
 - Forbidden production edges: `0`.
 - Unresolved internal edges: `0`.
 
@@ -147,6 +147,7 @@
 - `khaos.security.credential_broker`
 - `khaos.security.credential_provider_host`
 - `khaos.security.credential_provider_worker`
+- `khaos.security.delegation_issuer`
 - `khaos.security.effective_policy`
 - `khaos.security.git_evidence`
 - `khaos.security.host_network`

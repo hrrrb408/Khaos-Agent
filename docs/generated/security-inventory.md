@@ -93,7 +93,7 @@
 - `scripts/generate_production_reachability.py`: `c081e0fee3666cd278c128f41068e4712ea148b3eb8b10332a5bfe43d7eab5c6`
 - `packaging/macos/khaos-authorityd-xpc.m`: `6b9d18f13fd280a8819e88a4cccc96fcda5e34f52b40cf2940d5264667200855`
 - `packaging/macos/khaos-authorityd-xpc-client.c`: `3c751b9936b8665140f68466af9b77138efd538cb3b41f3687b3135b595a9f8d`
-- `rust/khaos-core/src/bin/khaos-authorityd-windows.rs`: `254cfb12deeb6c6371981f74d74d1d894706e8ee68384310dd41c5a5ffca3eb0`
+- `rust/khaos-core/src/bin/khaos-authorityd-windows.rs`: `80a651378c929b22fabd179510d65f18d491df47ca5edc05e2b2e9cef4916d07`
 - `scripts/build_m6_closure_report.py`: `9cf524026c9f2b433aa4f9c8df94617abc61f6907499eba31c4a9a0e4cb74411`
 - `scripts/validate_m6_governance.py`: `57d7f238a2201a5611c51a168758468244ce30beb55514a8b242b3270e01fd5c`
 - `scripts/watch_upstream_codex_security.py`: `9bc79e5afc851ce3f2e1a069aa917610489deadd0524f9b7a35f63c2aad45d2a`

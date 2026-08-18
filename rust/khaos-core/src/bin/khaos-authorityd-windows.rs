@@ -85,6 +85,7 @@ mod windows_authority {
                     | "KHAOS_AUTHORITYD_BACKEND_PIPE"
                     | "KHAOS_AGENT_SID"
                     | "KHAOS_AUTHORITYD_SERVICE_SID"
+                    | "KHAOS_AUTHORITYD_BACKEND_SERVICE_SID"
                     | "KHAOS_AUTHORITYD_DPAPI_KEY_PATH"
                     | "KHAOS_AUTHORITYD_PROTECTED_KEY_REF"
             ) {
@@ -401,16 +402,28 @@ mod windows_authority {
         if handle == INVALID_HANDLE_VALUE {
             return "{\"ok\":false,\"error_code\":\"authority_backend_unavailable\",\"error\":\"authority backend pipe is unavailable\"}".to_string();
         }
-        // Verify the backend pipe really is served by the authority service
+        // Verify the backend pipe really is served by a trusted authority
         // identity before forwarding a request.  A pipe name alone is not
         // identity: any process could create a pipe with the same name.
+        // The backend is trusted when its server process runs as the
+        // configured backend Service SID or as LocalSystem (the OS's own
+        // identity, which fronts the backend service in SCM deployments).
         let backend_identity_ok = unsafe {
             let mut server_pid = 0_u32;
             if GetNamedPipeServerProcessId(handle, &mut server_pid) == 0 {
                 0
             } else {
                 match peer_sid(server_pid) {
-                    Ok(observed) if observed == service_sid => 1,
+                    Ok(observed)
+                        if observed == service_sid
+                            || observed == "S-1-5-18"
+                            || Some(observed.as_str())
+                                == env::var("KHAOS_AUTHORITYD_BACKEND_SERVICE_SID")
+                                    .ok()
+                                    .as_deref() =>
+                    {
+                        1
+                    }
                     _ => 0,
                 }
             }

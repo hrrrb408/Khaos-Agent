@@ -155,6 +155,11 @@ def serve_windows_backend(daemon: AuthorityDaemon, *, production: bool = True) -
         raise IdentityIsolationError(
             "the authority backend requires the authority Service SID contract"
         )
+    # The frontend may connect as its dedicated Service SID or as
+    # LocalSystem (the OS identity SCM uses when the frontend service has
+    # no dedicated account).  Any other peer is rejected before a single
+    # request byte is read.
+    trusted_peer_sids = {service_sid, "S-1-5-18"}
     import ctypes
 
     kernel32 = _kernel32()
@@ -201,11 +206,10 @@ def serve_windows_backend(daemon: AuthorityDaemon, *, production: bool = True) -
             if not connected and last_error != ERROR_PIPE_CONNECTED:
                 continue
             try:
-                expected_sid = (contract.service_sid or "").strip()
                 observed_sid = _client_process_sid(kernel32, handle)
-                if observed_sid != expected_sid:
+                if observed_sid not in trusted_peer_sids:
                     raise IdentityIsolationError(
-                        "backend pipe peer SID is not the authority Service SID"
+                        "backend pipe peer SID is not a trusted authority identity"
                     )
                 request = _read_pipe_message(kernel32, handle)
                 response = _dispatch(

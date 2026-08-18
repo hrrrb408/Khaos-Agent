@@ -1,5 +1,17 @@
 name: Native Authority Production E2E
 
+# M6.9 BATCH 6: real provisioning, not assumed state.
+# - macOS: CI keychain + real codesign identity, a dedicated authority
+#   user/group, signed frontend/backend binaries, a launchd frontend AND a
+#   launchd authority backend, a real TLS WORM receiver, both the identity
+#   probe and the full transaction E2E, artifacts bound to GITHUB_SHA and
+#   GITHUB_RUN_ID.
+# - Windows: real SCM service with a Service SID, DPAPI marker provisioned
+#   under the SYSTEM identity, backend Named-Pipe service, both probes,
+#   bound artifacts.
+# If the required secrets or runners are unavailable the jobs FAIL; a
+# skipped native job can never satisfy closure evidence.
+
 on:
   workflow_dispatch:
 
@@ -15,7 +27,10 @@ jobs:
     name: macOS launchd/XPC authority
     runs-on: macos-14
     environment: security-native
-    timeout-minutes: 25
+    timeout-minutes: 40
+    env:
+      KHAOS_TEAM_ID: ${{ secrets.KHAOS_MACOS_TEAM_ID }}
+      KHAOS_AGENT_UID: "501"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
@@ -23,51 +38,214 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.11"
+      - name: Verify required signing secrets
+        run: |
+          test -n "$KHAOS_TEAM_ID" || { echo 'KHAOS_MACOS_TEAM_ID secret is required' >&2; exit 1; }
+          test -n "${{ secrets.KHAOS_MACOS_CODESIGN_CERTIFICATE }}" || { echo 'KHAOS_MACOS_CODESIGN_CERTIFICATE (base64 P12) secret is required' >&2; exit 1; }
       - name: Install contract dependencies
         run: |
           python -m pip install --require-hashes -r python/bootstrap-requirements.txt
           uv sync --frozen --extra test
-      - name: Build and sign the XPC service and client
+      - name: Provision CI keychain with the real signing identity
         env:
-          KHAOS_CODESIGN_IDENTITY: ${{ secrets.KHAOS_MACOS_CODESIGN_IDENTITY }}
-          KHAOS_TEAM_ID: ${{ secrets.KHAOS_MACOS_TEAM_ID }}
-          KHAOS_AGENT_CODE_SIGNATURE: ${{ secrets.KHAOS_MACOS_AGENT_CODE_SIGNATURE }}
+          KHAOS_CODESIGN_CERTIFICATE: ${{ secrets.KHAOS_MACOS_CODESIGN_CERTIFICATE }}
+          KHAOS_CODESIGN_CERTIFICATE_PASSWORD: ${{ secrets.KHAOS_MACOS_CODESIGN_CERTIFICATE_PASSWORD }}
+        run: |
+          set -eu
+          KEYCHAIN=khaos-ci.keychain-db
+          PASSWORD=$(uuidgen)
+          echo "$KHAOS_CODESIGN_CERTIFICATE" | base64 --decode > /tmp/khaos-ci-certificate.p12
+          security create-keychain -p "$PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$PASSWORD" "$KEYCHAIN"
+          security import /tmp/khaos-ci-certificate.p12 -k "$KEYCHAIN" \
+            -P "$KHAOS_CODESIGN_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$PASSWORD" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+          rm -f /tmp/khaos-ci-certificate.p12
+          IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN" | awk -F'"' '/valid identities/{print $2; exit}')
+          test -n "$IDENTITY" || { echo 'no valid codesigning identity in CI keychain' >&2; exit 1; }
+          echo "KHAOS_CODESIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+      - name: Create the dedicated authority user and group
+        run: |
+          set -eu
+          if ! dscl . -read /Users/khaos-authority UniqueID >/dev/null 2>&1; then
+            sudo dscl . -create /Users/khaos-authority UniqueID 505
+            sudo dscl . -create /Users/khaos-authority PrimaryGroupID 505
+            sudo dscl . -create /Users/khaos-authority UserShell /usr/bin/false
+            sudo dscl . -create /Users/khaos-authority NFSHomeDirectory /var/db/khaos-authorityd
+          fi
+          sudo mkdir -p /var/db/khaos-authorityd /var/run/khaos-authorityd /etc/khaos
+          sudo chown -R khaos-authority:khaos-authority /var/db/khaos-authorityd /var/run/khaos-authorityd
+      - name: Build and sign the XPC service, backend wrapper, and client
+        env:
+          KHAOS_AGENT_CODE_SIGNATURE: com.khaos.agent
           KHAOS_NATIVE_PREFIX: ${{ github.workspace }}/native-bin
         run: packaging/macos/build-native-authority.sh
-      - name: Install launchd identity and protected-key configuration
-        env:
-          KHAOS_AGENT_UID: ${{ secrets.KHAOS_MACOS_AGENT_UID }}
-          KHAOS_AGENT_CODE_SIGNATURE: ${{ secrets.KHAOS_MACOS_AGENT_CODE_SIGNATURE }}
-          KHAOS_TEAM_ID: ${{ secrets.KHAOS_MACOS_TEAM_ID }}
-          KHAOS_CODESIGN_IDENTITY: ${{ secrets.KHAOS_MACOS_CODESIGN_IDENTITY }}
+      - name: Provision the authority backend (key, catalog, WORM receiver)
         run: |
-          test -n "$KHAOS_AGENT_UID"
-          test -n "$KHAOS_AGENT_CODE_SIGNATURE"
-          test -n "$KHAOS_TEAM_ID"
-          sudo dscl . -create /Users/khaos-authority UniqueID 503
-          sudo dscl . -create /Users/khaos-authority PrimaryGroupID 503
-          sudo dscl . -create /Users/khaos-authority UserShell /usr/bin/false
-          sudo mkdir -p /var/run/khaos-authorityd /etc/khaos
-          sudo sh -c "printf '%s\\n' 'KHAOS_XPC_SERVICE=com.khaos.authorityd' 'KHAOS_AUTHORITYD_XPC_SERVICE=com.khaos.authorityd' 'KHAOS_AUTHORITYD_BACKEND_SOCKET=/var/run/khaos-authorityd/backend.sock' 'KHAOS_AUTHORITYD_KEYCHAIN_GROUP=${KHAOS_TEAM_ID}.com.khaos.authority' 'KHAOS_AUTHORITYD_PROTECTED_KEY_REF=khaos-authority-signing-key' 'KHAOS_AGENT_UID=${KHAOS_AGENT_UID}' 'KHAOS_AUTHORITYD_AGENT_CODE_SIGNATURE=${KHAOS_AGENT_CODE_SIGNATURE}' 'KHAOS_AUTHORITYD_SERVICE_CODE_SIGNATURE=com.khaos.authorityd' > /etc/khaos/native-authority.env"
-          sudo chmod 0600 /etc/khaos/native-authority.env
-          sudo mkdir -p /usr/local/libexec
+          set -eu
+          POLICY_DIGEST=$(PYTHONPATH=python uv run python -c "from khaos.security.effective_policy import load_effective_policy; print(load_effective_policy('.').digest)")
+          echo "KHAOS_EFFECTIVE_POLICY_DIGEST=$POLICY_DIGEST" >> "$GITHUB_ENV"
+          # Typed resource catalog bound to the effective policy, including
+          # the exact bounded ExecutionScope the E2E uses.
+          PYTHONPATH=python uv run python scripts/run_native_authority_e2e.py --emit-catalog > /tmp/e2e-catalog-entry.json
+          PYTHONPATH=python uv run python - <<'EOF'
+          import json, os
+          from pathlib import Path
+          entry = json.loads(Path("/tmp/e2e-catalog-entry.json").read_text())
+          policy = os.environ["KHAOS_EFFECTIVE_POLICY_DIGEST"]
+          manifest = {
+              "schema_version": 1,
+              "policy_digest": policy,
+              "scopes": [entry],
+          }
+          import hashlib
+          catalog = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+          manifest["catalog_digest"] = hashlib.sha256(catalog.encode()).hexdigest()
+          Path("/tmp/native-resource-catalog.json").write_text(json.dumps(manifest, sort_keys=True, indent=2))
+          EOF
+          sudo install -o khaos-authority -g khaos-authority -m 0400 /tmp/native-resource-catalog.json /etc/khaos/native-resource-catalog.json
+          # Create the Ed25519 authority key under the authority identity.
+          sudo -u khaos-authority env \
+            PYTHONPATH="$PWD/python" \
+            KHAOS_AUTHORITYD_KEY_PATH=/var/db/khaos-authorityd/authorityd.pem \
+            "$(command -v uv)" run --project . python -c \
+            "from pathlib import Path; from khaos.security.authorityd_protocol import Ed25519KeyStore; Ed25519KeyStore.load_or_create(Path('/var/db/khaos-authorityd/authorityd.pem'), create=True)"
+          # Publish the public key for the agent-side verifier.
+          sudo -u khaos-authority env \
+            PYTHONPATH="$PWD/python" \
+            "$(command -v uv)" run --project . python -c \
+            "from pathlib import Path; from khaos.security.authorityd_protocol import Ed25519KeyStore; k=Ed25519KeyStore.load_or_create(Path('/var/db/khaos-authorityd/authorityd.pem')); Path('/var/run/khaos-authorityd/authorityd.pub').write_bytes(k.public_key().public_bytes_raw())"
+          sudo chmod 0644 /var/run/khaos-authorityd/authorityd.pub
+      - name: Run a real TLS WORM audit receiver for the backend
+        run: |
+          set -eu
+          # The production authorityd refuses to start without a remote
+          # WORM endpoint.  CI runs a real HTTPS append-only receiver with
+          # a runner-local CA installed into the system trust store: the
+          # submission path is genuinely TLS-verified and fails closed.
+          sudo security delete-trusted-cert -d /tmp/khaos-worm-ca.pem >/dev/null 2>&1 || true
+          PYTHONPATH=python uv run python scripts/run_worm_audit_receiver.py --port 8443 --directory /tmp/khaos-worm-records --emit-ca /tmp/khaos-worm-ca.pem &
+          for _ in $(seq 1 40); do
+            test -f /tmp/khaos-worm-ca.pem && break
+            sleep 0.5
+          done
+          sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain /tmp/khaos-worm-ca.pem
+          echo "KHAOS_AUDIT_WORM_ENDPOINT=https://localhost:8443/append" >> "$GITHUB_ENV"
+      - name: Install the launchd frontend and authority backend
+        env:
+          KHAOS_AGENT_CODE_SIGNATURE: com.khaos.agent
+        run: |
+          set -eu
           sudo cp native-bin/khaos-authorityd-xpc /usr/local/libexec/khaos-authorityd-xpc
           sudo cp native-bin/khaos-authorityd-xpc-client /usr/local/libexec/khaos-authorityd-xpc-client
+          # Backend wrapper runs the Python authority daemon under the
+          # authority identity.
+          VENV_PY="$(uv run --project . which python)"
+          sudo sh -c "printf '%s\n' '#!/bin/sh' 'exec \"$VENV_PY\" -I -m khaos.security.authorityd_main' > /usr/local/bin/khaos-authorityd-backend"
+          sudo chmod 0555 /usr/local/bin/khaos-authorityd-backend
+          sudo sh -c "cat > /etc/khaos/native-authority.env" <<'ENVEOF'
+          KHAOS_XPC_SERVICE=com.khaos.authorityd
+          KHAOS_AUTHORITYD_XPC_SERVICE=com.khaos.authorityd
+          KHAOS_AUTHORITYD_BACKEND_SOCKET=/var/run/khaos-authorityd/backend.sock
+          KHAOS_AUTHORITYD_KEYCHAIN_GROUP=KHAOS_AUTHORITYD_KEYCHAIN_GROUP_PLACEHOLDER
+          KHAOS_AUTHORITYD_PROTECTED_KEY_REF=khaos-authority-signing-key
+          KHAOS_AGENT_UID=501
+          KHAOS_AUTHORITYD_AGENT_CODE_SIGNATURE=com.khaos.agent
+          KHAOS_AUTHORITYD_AGENT_CODE_REQUIREMENT=identifier "com.khaos.agent" and anchor apple generic and certificate leaf[subject.OU] = KHAOS_TEAM_ID_PLACEHOLDER
+          KHAOS_AUTHORITYD_SERVICE_CODE_SIGNATURE=khaos-authorityd-xpc
+          KHAOS_AUTHORITYD_SERVICE_CODE_REQUIREMENT=identifier "khaos-authorityd-xpc" and anchor apple generic and certificate leaf[subject.OU] = KHAOS_TEAM_ID_PLACEHOLDER
+          ENVEOF
+          sudo sed -i '' "s/KHAOS_AUTHORITYD_KEYCHAIN_GROUP_PLACEHOLDER/${KHAOS_TEAM_ID}.khaos.authority/" /etc/khaos/native-authority.env
+          sudo sed -i '' "s/KHAOS_TEAM_ID_PLACEHOLDER/${KHAOS_TEAM_ID}/g" /etc/khaos/native-authority.env
+          sudo chmod 0600 /etc/khaos/native-authority.env
+          sudo chown root:wheel /etc/khaos/native-authority.env
           sudo cp packaging/macos/com.khaos.authorityd.plist /Library/LaunchDaemons/com.khaos.authorityd.plist
+          sudo cp packaging/macos/com.khaos.authorityd.backend.plist /Library/LaunchDaemons/com.khaos.authorityd.backend.plist
+          sudo launchctl bootstrap system /Library/LaunchDaemons/com.khaos.authorityd.backend.plist
           sudo launchctl bootstrap system /Library/LaunchDaemons/com.khaos.authorityd.plist
-      - name: Run real XPC authority proof
+          sleep 5
+          sudo launchctl print system/com.khaos.authorityd.backend | grep -q 'state = running'
+          sudo launchctl print system/com.khaos.authorityd | grep -q 'state = running'
+          test -S /var/run/khaos-authorityd/backend.sock
+      - name: Run the native identity probe
         env:
-          KHAOS_AGENT_UID: ${{ secrets.KHAOS_MACOS_AGENT_UID }}
           KHAOS_AUTHORITYD_LAUNCHD_SERVICE: com.khaos.authorityd
           KHAOS_AUTHORITYD_PROTECTED_KEY_REF: khaos-authority-signing-key
-          KHAOS_AUTHORITYD_KEYCHAIN_GROUP: ${{ secrets.KHAOS_MACOS_TEAM_ID }}.com.khaos.authority
-          KHAOS_AUTHORITYD_AGENT_CODE_SIGNATURE: ${{ secrets.KHAOS_MACOS_AGENT_CODE_SIGNATURE }}
-          KHAOS_AUTHORITYD_SERVICE_CODE_SIGNATURE: com.khaos.authorityd
+          KHAOS_AUTHORITYD_KEYCHAIN_GROUP: ${{ secrets.KHAOS_MACOS_TEAM_ID }}.khaos.authority
+          KHAOS_AUTHORITYD_AGENT_CODE_SIGNATURE: com.khaos.agent
+          KHAOS_AUTHORITYD_AGENT_CODE_REQUIREMENT: identifier "com.khaos.agent" and anchor apple generic and certificate leaf[subject.OU] = ${{ secrets.KHAOS_MACOS_TEAM_ID }}
+          KHAOS_AUTHORITYD_PUBLIC_KEY_PATH: /var/run/khaos-authorityd/authorityd.pub
           KHAOS_MACOS_AUTHORITY_XPC_CLIENT: /usr/local/libexec/khaos-authorityd-xpc-client
         run: |
+          set -eu
           mkdir -p native-evidence
-          PYTHONPATH=python uv run python scripts/run_native_authority_identity_probe.py | tee native-evidence/macos-xpc-proof.json
+          PYTHONPATH=python uv run python scripts/run_native_authority_identity_probe.py > /tmp/identity-proof.json
+          test -s /tmp/identity-proof.json
+      - name: Run the full authority transaction E2E
+        env:
+          KHAOS_AUTHORITYD_LAUNCHD_SERVICE: com.khaos.authorityd
+          KHAOS_AUTHORITYD_PROTECTED_KEY_REF: khaos-authority-signing-key
+          KHAOS_AUTHORITYD_KEYCHAIN_GROUP: ${{ secrets.KHAOS_MACOS_TEAM_ID }}.khaos.authority
+          KHAOS_AUTHORITYD_AGENT_CODE_SIGNATURE: com.khaos.agent
+          KHAOS_AUTHORITYD_AGENT_CODE_REQUIREMENT: identifier "com.khaos.agent" and anchor apple generic and certificate leaf[subject.OU] = ${{ secrets.KHAOS_MACOS_TEAM_ID }}
+          KHAOS_AUTHORITYD_PUBLIC_KEY_PATH: /var/run/khaos-authorityd/authorityd.pub
+          KHAOS_MACOS_AUTHORITY_XPC_CLIENT: /usr/local/libexec/khaos-authorityd-xpc-client
+          KHAOS_NATIVE_E2E_EFFECT_ROOT: /tmp/khaos-native-e2e-effects
+        run: |
+          set -eu
+          PYTHONPATH=python uv run python scripts/run_native_authority_e2e.py --output /tmp/e2e-proof.json
+          test -s /tmp/e2e-proof.json
+      - name: Bind native evidence to this run
+        run: |
+          set -eu
+          mkdir -p native-evidence
+          PYTHONPATH=python uv run python - <<'EOF'
+          import json, os
+          from pathlib import Path
+          policy = os.environ["KHAOS_EFFECTIVE_POLICY_DIGEST"]
+          binding = {
+              "github_sha": os.environ["GITHUB_SHA"],
+              "github_run_id": os.environ["GITHUB_RUN_ID"],
+              "runner_os": "macOS",
+              "proof_type": "macos-native-authority",
+              "policy_digest": policy,
+          }
+          identity = json.loads(Path("/tmp/identity-proof.json").read_text())
+          identity.update(binding)
+          identity["platform"] = "darwin"
+          Path("native-evidence/macos-xpc-proof.json").write_text(
+              json.dumps(identity, sort_keys=True, separators=(",", ":"))
+          )
+          e2e = json.loads(Path("/tmp/e2e-proof.json").read_text())
+          e2e.update(binding)
+          Path("native-evidence/macos-xpc-e2e.json").write_text(
+              json.dumps(e2e, sort_keys=True, separators=(",", ":"))
+          )
+          EOF
           test -s native-evidence/macos-xpc-proof.json
+          test -s native-evidence/macos-xpc-e2e.json
+      - name: Verify the signed binaries still satisfy the Team ID requirement
+        run: |
+          codesign --verify --strict --verbose=2 \
+            -R="anchor apple generic and certificate leaf[subject.OU] = ${KHAOS_TEAM_ID}" \
+            /usr/local/libexec/khaos-authorityd-xpc
+          codesign --verify --strict --verbose=2 \
+            -R="anchor apple generic and certificate leaf[subject.OU] = ${KHAOS_TEAM_ID}" \
+            /usr/local/libexec/khaos-authorityd-xpc-client
+      - name: Teardown launchd services
+        if: always()
+        run: |
+          sudo launchctl bootout system/com.khaos.authorityd 2>/dev/null || true
+          sudo launchctl bootout system/com.khaos.authorityd.backend 2>/dev/null || true
+          sudo rm -f /Library/LaunchDaemons/com.khaos.authorityd.plist /Library/LaunchDaemons/com.khaos.authorityd.backend.plist
+      - name: Cleanup CI keychain and secrets
+        if: always()
+        run: |
+          security delete-keychain khaos-ci.keychain-db >/dev/null 2>&1 || true
+          security list-keychains -d user -s login.keychain-db >/dev/null 2>&1 || true
+          sudo security delete-trusted-cert -d /tmp/khaos-worm-ca.pem >/dev/null 2>&1 || true
       - name: Upload native proof
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
@@ -79,7 +257,7 @@ jobs:
     name: Windows Service-SID Named Pipe authority
     runs-on: windows-2025
     environment: security-native
-    timeout-minutes: 25
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
@@ -92,32 +270,141 @@ jobs:
         run: |
           python -m pip install --require-hashes -r python/bootstrap-requirements.txt
           uv sync --frozen --extra test
-      - name: Build native authority service
+      - name: Build native authority service and backend
         run: cargo build --locked --release --no-default-features --bin khaos-authorityd-windows --manifest-path rust/khaos-core/Cargo.toml
-      - name: Install Service SID and protected-key deployment
+      - name: Compute the effective policy digest
         shell: pwsh
-        env:
-          KHAOS_AGENT_SID: ${{ secrets.KHAOS_WINDOWS_AGENT_SID }}
-          KHAOS_WINDOWS_DPAPI_KEY_PATH: ${{ secrets.KHAOS_WINDOWS_DPAPI_KEY_PATH }}
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:KHAOS_AGENT_SID)) { throw 'KHAOS_WINDOWS_AGENT_SID is required' }
-          if ([string]::IsNullOrWhiteSpace($env:KHAOS_WINDOWS_DPAPI_KEY_PATH)) { throw 'KHAOS_WINDOWS_DPAPI_KEY_PATH is required' }
-          New-Item -ItemType Directory -Force C:\ProgramData\Khaos | Out-Null
-          if (-not (Test-Path -LiteralPath $env:KHAOS_WINDOWS_DPAPI_KEY_PATH -PathType Leaf)) { throw 'pre-provisioned DPAPI marker is required' }
-          .\packaging\windows\install-khaos-authorityd.ps1 -Binary "$env:GITHUB_WORKSPACE\rust\khaos-core\target\release\khaos-authorityd-windows.exe" -AgentSid $env:KHAOS_AGENT_SID -ProtectedKeyPath $env:KHAOS_WINDOWS_DPAPI_KEY_PATH
-      - name: Run real Named Pipe authority proof
+          $env:PYTHONPATH = "$env:GITHUB_WORKSPACE\python"
+          $digest = uv run python -c "from khaos.security.effective_policy import load_effective_policy; print(load_effective_policy('.').digest)"
+          if (-not $digest) { throw 'policy digest unavailable' }
+          "KHAOS_EFFECTIVE_POLICY_DIGEST=$digest" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Install the Service-SID authority (DPAPI key provisioned under SYSTEM)
+        shell: pwsh
+        run: |
+          $agentSid = ([System.Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
+          if ([string]::IsNullOrWhiteSpace($agentSid)) { throw 'agent SID unavailable' }
+          "KHAOS_AGENT_SID=$agentSid" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          .\packaging\windows\install-khaos-authorityd.ps1 `
+            -Binary "$env:GITHUB_WORKSPACE\rust\khaos-core\target\release\khaos-authorityd-windows.exe" `
+            -AgentSid $agentSid `
+            -ProtectedKeyPath 'C:\ProgramData\Khaos\authority-key.dpapi' `
+            -ProvisionDpapiKey
+          $authoritySid = (New-Object System.Security.Principal.NTAccount('NT SERVICE\KhaosAuthorityD')).Translate([System.Security.Principal.SecurityIdentifier]).Value
+          "KHAOS_AUTHORITYD_SERVICE_SID=$authoritySid" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Run a real TLS WORM audit receiver for the backend
+        shell: pwsh
+        run: |
+          $env:PYTHONPATH = "$env:GITHUB_WORKSPACE\python"
+          $caPath = 'C:\ProgramData\Khaos\worm-ca.pem'
+          $job = Start-Job -ScriptBlock {
+            param($workspace, $ca)
+            $env:PYTHONPATH = "$workspace\python"
+            Set-Location $workspace
+            uv run python scripts/run_worm_audit_receiver.py --port 8443 --directory C:\ProgramData\Khaos\worm-records --emit-ca $ca
+          } -ArgumentList $env:GITHUB_WORKSPACE, $caPath
+          $deadline = (Get-Date).AddSeconds(60)
+          while ((Get-Date) -lt $deadline -and -not (Test-Path $caPath)) { Start-Sleep -Milliseconds 500 }
+          if (-not (Test-Path $caPath)) { Receive-Job $job; throw 'WORM receiver did not start' }
+          # Trust the runner-local CA for the machine so the production
+          # WORM writer verifies the TLS connection with default settings.
+          Import-Certificate -FilePath $caPath -CertStoreLocation Cert:\LocalMachine\Root | Out-Null
+          "KHAOS_AUDIT_WORM_ENDPOINT=https://localhost:8443/append" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Install and start the authority backend service
+        shell: pwsh
+        run: |
+          $backendDir = 'C:\Program Files\Khaos'
+          New-Item -ItemType Directory -Force -Path $backendDir, C:\ProgramData\Khaos | Out-Null
+          # Typed resource catalog with the exact bounded scope the E2E uses.
+          $env:PYTHONPATH = "$env:GITHUB_WORKSPACE\python"
+          $entry = uv run python scripts/run_native_authority_e2e.py --emit-catalog
+          $manifest = @{
+              schema_version = 1
+              policy_digest = $env:KHAOS_EFFECTIVE_POLICY_DIGEST
+              scopes = @($entry | ConvertFrom-Json)
+          }
+          $canonical = $manifest | ConvertTo-Json -Depth 10 -Compress
+          $manifest.catalog_digest = [System.Security.Cryptography.SHA256]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes($canonical)) | ForEach-Object { $_.ToString('x2') } | Join-String
+          ($manifest | ConvertTo-Json -Depth 10) | Set-Content -Path C:\ProgramData\Khaos\native-resource-catalog.json -Encoding utf8
+          # Backend wrapper sets the authority-owned environment and runs
+          # the Python authority daemon as a real SCM service.
+          $venvPython = (uv run --project . which python)
+          $wrapper = @(
+              '@echo off'
+              "set KHAOS_AUTHORITYD_SOCKET=unused"
+              "set KHAOS_AUTHORITYD_BACKEND_PIPE=\\.\pipe\KhaosAuthorityDBackend"
+              'set KHAOS_AUTHORITYD_KEY_PATH=C:\ProgramData\Khaos\authorityd.pem'
+              'set KHAOS_AUTHORITYD_PUBLIC_KEY_PATH=C:\ProgramData\Khaos\authorityd.pub'
+              'set KHAOS_TYPED_RESOURCE_CATALOG_PATH=C:\ProgramData\Khaos\native-resource-catalog.json'
+              "set KHAOS_EFFECTIVE_POLICY_DIGEST=$env:KHAOS_EFFECTIVE_POLICY_DIGEST"
+              "set KHAOS_AUTHORITYD_SERVICE_SID=$env:KHAOS_AUTHORITYD_SERVICE_SID"
+              "set KHAOS_AGENT_SID=$env:KHAOS_AGENT_SID"
+              "set KHAOS_AUDIT_WORM_ENDPOINT=$env:KHAOS_AUDIT_WORM_ENDPOINT"
+              "set PYTHONPATH=$env:GITHUB_WORKSPACE\python"
+              "`"$venvPython`" -m khaos.security.authorityd_main"
+          )
+          $wrapper | Set-Content -Path "$backendDir\khaos-authorityd-backend.cmd" -Encoding ascii
+          # Create the Ed25519 authority key before the service starts
+          # (the production daemon never creates keys itself).
+          uv run python -c "from pathlib import Path; from khaos.security.authorityd_protocol import Ed25519KeyStore; k=Ed25519KeyStore.load_or_create(Path(r'C:\ProgramData\Khaos\authorityd.pem'), create=True); Path(r'C:\ProgramData\Khaos\authorityd.pub').write_bytes(k.public_key().public_bytes_raw())"
+          & "$env:SystemRoot\System32\sc.exe" create KhaosAuthorityDBackend binPath= "`"$backendDir\khaos-authorityd-backend.cmd`"" start= auto | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'failed to create the backend service' }
+          & "$env:SystemRoot\System32\sc.exe" start KhaosAuthorityDBackend | Out-Null
+          Start-Sleep -Seconds 8
+          $status = (Get-Service -Name KhaosAuthorityDBackend -ErrorAction SilentlyContinue).Status
+          if ($status -ne 'Running') { throw "authority backend service is '$status'" }
+      - name: Run the native identity probe
         shell: pwsh
         env:
-          KHAOS_AGENT_SID: ${{ secrets.KHAOS_WINDOWS_AGENT_SID }}
-          KHAOS_AUTHORITYD_SERVICE_SID: ${{ secrets.KHAOS_WINDOWS_AUTHORITY_SERVICE_SID }}
+          KHAOS_AUTHORITYD_SERVICE_SID: ${{ env.KHAOS_AUTHORITYD_SERVICE_SID }}
           KHAOS_AUTHORITYD_NAMED_PIPE: \\.\pipe\KhaosAuthorityD
           KHAOS_AUTHORITYD_PROTECTED_KEY_REF: khaos-authority-signing-key
+          KHAOS_AUTHORITYD_PUBLIC_KEY_PATH: C:\ProgramData\Khaos\authorityd.pub
           KHAOS_WINDOWS_AUTHORITY_PIPE_CLIENT: ${{ github.workspace }}\rust\khaos-core\target\release\khaos-authorityd-windows.exe
         run: |
           New-Item -ItemType Directory -Force native-evidence | Out-Null
           $env:PYTHONPATH = "$env:GITHUB_WORKSPACE\python"
-          uv run python scripts/run_native_authority_identity_probe.py | Tee-Object native-evidence\windows-named-pipe-proof.json
-          if (-not (Test-Path native-evidence\windows-named-pipe-proof.json)) { throw 'native proof artifact missing' }
+          uv run python scripts/run_native_authority_identity_probe.py | Tee-Object -Variable proof | Out-Null
+          if (-not $proof) { throw 'native identity probe failed' }
+          Set-Content -Path native-evidence\windows-named-pipe-proof.json.tmp -Value $proof
+      - name: Run the full authority transaction E2E
+        shell: pwsh
+        env:
+          KHAOS_AUTHORITYD_SERVICE_SID: ${{ env.KHAOS_AUTHORITYD_SERVICE_SID }}
+          KHAOS_AUTHORITYD_NAMED_PIPE: \\.\pipe\KhaosAuthorityD
+          KHAOS_AUTHORITYD_PROTECTED_KEY_REF: khaos-authority-signing-key
+          KHAOS_AUTHORITYD_PUBLIC_KEY_PATH: C:\ProgramData\Khaos\authorityd.pub
+          KHAOS_WINDOWS_AUTHORITY_PIPE_CLIENT: ${{ github.workspace }}\rust\khaos-core\target\release\khaos-authorityd-windows.exe
+          KHAOS_NATIVE_E2E_EFFECT_ROOT: C:\ProgramData\Khaos\e2e-effects
+          KHAOS_EFFECTIVE_POLICY_DIGEST: ${{ env.KHAOS_EFFECTIVE_POLICY_DIGEST }}
+        run: |
+          $env:PYTHONPATH = "$env:GITHUB_WORKSPACE\python"
+          uv run python scripts/run_native_authority_e2e.py --output native-evidence\windows-named-pipe-e2e.json
+          if (-not (Test-Path native-evidence\windows-named-pipe-e2e.json)) { throw 'native E2E artifact missing' }
+      - name: Bind native evidence to this run
+        shell: pwsh
+        run: |
+          $binding = @{
+              github_sha = $env:GITHUB_SHA
+              github_run_id = $env:GITHUB_RUN_ID
+              runner_os = 'Windows'
+              proof_type = 'windows-native-authority'
+              policy_digest = $env:KHAOS_EFFECTIVE_POLICY_DIGEST
+              platform = 'win32'
+          }
+          $proof = Get-Content native-evidence\windows-named-pipe-proof.json.tmp -Raw | ConvertFrom-Json
+          $merged = @{}
+          $proof.PSObject.Properties | ForEach-Object { $merged[$_.Name] = $_.Value }
+          foreach ($key in $binding.Keys) { $merged[$key] = $binding[$key] }
+          $merged | ConvertTo-Json -Depth 10 | Set-Content native-evidence\windows-named-pipe-proof.json
+          Remove-Item native-evidence\windows-named-pipe-proof.json.tmp -Force
+          if (-not (Test-Path native-evidence\windows-named-pipe-proof.json)) { throw 'bound proof missing' }
+      - name: Cleanup service
+        if: always()
+        shell: pwsh
+        run: |
+          Stop-Service -Name KhaosAuthorityD -ErrorAction SilentlyContinue
+          sc.exe delete KhaosAuthorityD | Out-Null
       - name: Upload native proof
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
