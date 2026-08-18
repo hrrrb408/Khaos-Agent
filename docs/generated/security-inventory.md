@@ -90,7 +90,7 @@
 - `go/internal/api/handler.go`: `9dc6af7572c331685a4fa28f8902d148da4338a19603f55aeaf2094fc38662a7`
 - `go/cmd/gateway/main.go`: `5c27479e8ef5ffa3c05008077e12e89e4f274d4255765606b3ee91d04df56481`
 - `go/internal/platform/python_client.go`: `c4e68301ae6f54999636c9924bc832e57c46173f69ad852df7963af9d6de9df6`
-- `scripts/generate_production_reachability.py`: `c081e0fee3666cd278c128f41068e4712ea148b3eb8b10332a5bfe43d7eab5c6`
+- `scripts/generate_production_reachability.py`: `673d4385bb5ebf3bbd8a5c59fb4dd0248264ebf2c569f6adb34845c222654350`
 - `packaging/macos/khaos-authorityd-xpc.m`: `6b9d18f13fd280a8819e88a4cccc96fcda5e34f52b40cf2940d5264667200855`
 - `packaging/macos/khaos-authorityd-xpc-client.c`: `3c751b9936b8665140f68466af9b77138efd538cb3b41f3687b3135b595a9f8d`
 - `rust/khaos-core/src/bin/khaos-authorityd-windows.rs`: `ece2e82c7f7a5fe884a02c5f747b46b7ba4eeb1774a84b1fe0523c1842b6f79b`
