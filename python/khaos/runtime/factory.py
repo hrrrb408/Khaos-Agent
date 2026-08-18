@@ -1323,14 +1323,11 @@ async def build_production_runtime(cfg: ProductionRuntimeConfig) -> RuntimeResul
     """
     if not isinstance(cfg, ProductionRuntimeConfig):
         raise TypeError("build_production_runtime requires ProductionRuntimeConfig")
-    # Resolve the public compatibility hook at call time.  Tests and trusted
-    # adapters historically monkeypatch ``khaos.runtime.build_runtime``; the
-    # structural production boundary must remain usable without making that
-    # hook an implicit security injection in normal operation.
-    import khaos.runtime as runtime_module
-
-    builder = getattr(runtime_module, "build_runtime", build_runtime)
-    return await builder(cfg)
+    # Production composition calls the factory defined in this module
+    # directly.  A public-package monkeypatch/compatibility hook would make a
+    # development builder reachable from the production root and would turn
+    # the structural config type into a cosmetic boundary.
+    return await build_runtime(cfg)
 
 
 async def close_runtime_or_register(runtime: RuntimeResult) -> None:

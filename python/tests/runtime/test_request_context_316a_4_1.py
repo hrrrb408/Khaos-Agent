@@ -265,7 +265,7 @@ async def test_build_runtime_propagates_session_id(tmp_path, monkeypatch):
     broke ModeManager's ``(principal, session)`` binding — the
     session_id lived on ``ctx`` but was never read."""
     from khaos.db import Database
-    import khaos.runtime as runtime_module
+    import khaos.runtime.factory as runtime_factory
     from khaos.runtime import RuntimeConfig
 
     (tmp_path / "prompts").mkdir()
@@ -287,11 +287,10 @@ async def test_build_runtime_propagates_session_id(tmp_path, monkeypatch):
         captured_configs.append(config)
         return _StubRuntime()
 
-    # ``_build_runtime`` does ``from khaos.runtime import build_runtime``
-    # INSIDE the function body, so we must patch the source module —
-    # patching ``khaos.grpc_server.build_runtime`` would not be visible
-    # to the lazy import.
-    monkeypatch.setattr(runtime_module, "build_runtime", spy_build)
+    # ``build_production_runtime`` resolves the production builder in its
+    # defining module.  Patch that explicit test seam; the public package
+    # compatibility hook is intentionally not part of production reachability.
+    monkeypatch.setattr(runtime_factory, "build_runtime", spy_build)
 
     await service._build_runtime(
         RequestContext.for_rpc("api:user-1").with_session("session-42"),

@@ -163,6 +163,14 @@ not evidence that an effect occurred.
     rejected. The typed foundation never replaces the signed authority or
     exact-effect receipt, and missing production integration evidence remains
     unclosed.
+19. Production composition is machine-checked from explicit runtime roots.
+    The reachability inventory resolves repository imports and declared lazy
+    exports, rejects unresolved internal imports, and rejects development,
+    Host, and compatibility execution modules on the production graph.
+    Removing a call site is not sufficient if the forbidden implementation
+    remains reachable through a public compatibility hook. The generated
+    inventory is a commit-bound artifact and a stale or locally edited report
+    fails closed in CI.
 
 ## Verification map
 
@@ -193,6 +201,9 @@ not evidence that an effect occurred.
 - Typed principal transport/delegation:
   `python/tests/security/test_typed_principals.py` and
   `python/tests/runtime/test_request_context_316a_4_1.py`.
+- Production composition reachability and forbidden Host/dev edges:
+  `python/tests/security/test_production_reachability.py` and
+  `scripts/generate_production_reachability.py --check`.
 
 The opt-in real-platform jobs remain required for a release closure; skipped
 or unavailable jobs are not successful evidence.

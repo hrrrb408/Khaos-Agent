@@ -60,6 +60,20 @@ principal_boundaries:
   transport_derivation: RequestContext_derives_principal_kind_from_authenticated_source_transport
   delegation: DelegationScope_is_narrow_only_and_binds_principal_parent_project_session_runtime_task_workspace_operation_resource_policy_expiry_nonce
   replay: DelegationAuthority_consumes_each_child_scope_once_and_rejects_cross_principal_or_context_replay
+production_reachability:
+  roots:
+    - khaos.grpc_server:AgentService
+    - khaos.grpc_server:_dispatch
+    - khaos.runtime.factory:build_production_runtime
+    - khaos.tools.scheduler:ToolScheduler
+    - khaos.coding.execution.service:ExecutionService
+  generator: scripts/generate_production_reachability.py
+  forbidden_modules:
+    - khaos.coding.execution.host
+    - khaos.coding.verification.pipeline
+  unresolved_internal_imports: fail_closed
+  generated_artifact: docs/generated/production-reachability.md
+  evidence_class: machine_checked_repository_graph_not_native_kernel_evidence
 orchestration_boundaries:
   extracted_components:
     - TurnAdmission

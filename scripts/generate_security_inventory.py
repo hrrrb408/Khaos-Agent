@@ -143,6 +143,8 @@ def render() -> str:
         ("python/khaos/security/remote_audit.py", sha256(ROOT / "python" / "khaos" / "security" / "remote_audit.py")),
         ("python/khaos/security/network_broker.py", sha256(ROOT / "python" / "khaos" / "security" / "network_broker.py")),
         ("python/khaos/security/resource_scope.py", sha256(ROOT / "python" / "khaos" / "security" / "resource_scope.py")),
+        ("python/khaos/security/principals.py", sha256(ROOT / "python" / "khaos" / "security" / "principals.py")),
+        ("python/khaos/security/shell_semantics.py", sha256(ROOT / "python" / "khaos" / "security" / "shell_semantics.py")),
         ("python/khaos/coding/planning/security_identities.py", sha256(ROOT / "python" / "khaos" / "coding" / "planning" / "security_identities.py")),
         ("python/khaos/coding/workspace/boundary.py", sha256(ROOT / "python" / "khaos" / "coding" / "workspace" / "boundary.py")),
         ("rust/khaos-core/src/bin/khaos-exec-launcher.rs", sha256(ROOT / "rust" / "khaos-core" / "src" / "bin" / "khaos-exec-launcher.rs")),
@@ -151,6 +153,7 @@ def render() -> str:
         ("go/internal/api/handler.go", sha256(ROOT / "go" / "internal" / "api" / "handler.go")),
         ("go/cmd/gateway/main.go", sha256(ROOT / "go" / "cmd" / "gateway" / "main.go")),
         ("go/internal/platform/python_client.go", sha256(ROOT / "go" / "internal" / "platform" / "python_client.go")),
+        ("scripts/generate_production_reachability.py", sha256(ROOT / "scripts" / "generate_production_reachability.py")),
     ]
     type_pairs = permission_types()
 
