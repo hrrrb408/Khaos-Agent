@@ -470,15 +470,27 @@ async def test_trusted_absolute_helper_executes_canonical_identity(tmp_path):
 # ─── M5.6-B: provider process-tree closure ────────────────────────────────
 
 
-async def _wait_for_file(path, timeout: float = 10.0) -> None:
+async def _wait_for_pid_file(path, timeout: float = 10.0) -> int:
+    """Wait until a pid sentinel carries parseable content, not mere existence.
+
+    The grandchild creates the file before its buffered write lands, so
+    existence is not readiness; the pid itself is the deterministic barrier.
+    """
     import asyncio as _asyncio
 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if path.exists():
-            return
+        try:
+            text = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            text = ""
+        if text:
+            try:
+                return int(text)
+            except ValueError:
+                pass
         await _asyncio.sleep(0.02)
-    raise AssertionError(f"sentinel {path} never appeared")
+    raise AssertionError(f"pid sentinel {path} never became readable")
 
 
 def _pid_is_gone(pid: int, timeout: float = 10.0) -> bool:
@@ -508,7 +520,9 @@ async def test_timeout_reclaims_worker_helper_and_grandchild(tmp_path):
         "import os, sys, time\n"
         "pid = os.fork()\n"
         "if pid == 0:\n"
-        f"    open({str(sentinel)!r}, 'w').write(str(os.getpid()))\n"
+        f"    with open({str(sentinel)!r}, 'w') as handle:\n"
+        "        handle.write(str(os.getpid()))\n"
+        "        handle.flush()\n"
         "    time.sleep(3600)\n"
         "time.sleep(3600)\n",
         encoding="utf-8",
@@ -525,8 +539,7 @@ async def test_timeout_reclaims_worker_helper_and_grandchild(tmp_path):
             deadline=1.5,
         )
     )
-    await _wait_for_file(sentinel)
-    grandchild_pid = int(sentinel.read_text(encoding="utf-8").strip())
+    grandchild_pid = await _wait_for_pid_file(sentinel)
     assert not _pid_is_gone(grandchild_pid, timeout=0.0)
 
     with pytest.raises(CredentialProviderHostError, match="deadline"):
@@ -546,7 +559,9 @@ async def test_setsid_daemonizing_grandchild_is_still_reclaimed(tmp_path):
         "pid = os.fork()\n"
         "if pid == 0:\n"
         "    os.setsid()\n"
-        f"    open({str(sentinel)!r}, 'w').write(str(os.getpid()))\n"
+        f"    with open({str(sentinel)!r}, 'w') as handle:\n"
+        "        handle.write(str(os.getpid()))\n"
+        "        handle.flush()\n"
         "    time.sleep(3600)\n"
         "time.sleep(3600)\n",
         encoding="utf-8",
@@ -563,8 +578,7 @@ async def test_setsid_daemonizing_grandchild_is_still_reclaimed(tmp_path):
             deadline=1.5,
         )
     )
-    await _wait_for_file(sentinel)
-    daemon_pid = int(sentinel.read_text(encoding="utf-8").strip())
+    daemon_pid = await _wait_for_pid_file(sentinel)
 
     with pytest.raises(CredentialProviderHostError, match="deadline"):
         await materialization
