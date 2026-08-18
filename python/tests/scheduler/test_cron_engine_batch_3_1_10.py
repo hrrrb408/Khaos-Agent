@@ -20,7 +20,6 @@ import asyncio
 from datetime import datetime, timedelta
 
 import pytest
-
 from khaos.db import Database
 from khaos.scheduler import CronEngine, ScheduleConfig, TaskStatus
 from khaos.time_utils import utc_now_naive
@@ -31,7 +30,6 @@ from khaos.tools.cron_tools import (
     cron_remove,
     cron_resume,
 )
-
 
 # ---------------------------------------------------------------------------
 # Test helpers
@@ -62,6 +60,31 @@ async def _make_db(path) -> Database:
     await db.connect()
     await db.run_migrations()
     return db
+
+
+async def _wait_for_completed_task(db: Database, task_id: str) -> dict:
+    """Wait for the scheduler's durable terminal state.
+
+    A fixed sleep is not a synchronization contract: the full product
+    suite can starve the event loop long enough for the executor to have
+    started while its terminal CAS is still pending.  Poll the state that
+    this acceptance test actually asserts, but keep the test bounded so a
+    real regression fails promptly.
+    """
+
+    async def poll() -> dict:
+        while True:
+            row = await db.get_scheduled_task(task_id)
+            if (
+                row is not None
+                and row["status"] == TaskStatus.COMPLETED.value
+                and row["execution_id"] is None
+                and row["lease_until"] is None
+            ):
+                return row
+            await asyncio.sleep(0.01)
+
+    return await asyncio.wait_for(poll(), timeout=5.0)
 
 
 # ---------------------------------------------------------------------------
@@ -402,13 +425,9 @@ async def test_acceptance_6_durable_lease_claimed_before_execution(tmp_path) -> 
             "lease-claim", "p", ScheduleConfig(iso_time=iso),
             principal_id="alice",
         )
-        await asyncio.sleep(0.2)
-        # After execution, the lease is cleared.
-        row = await db.get_scheduled_task(task.id)
-        assert row["execution_id"] is None, (
-            "execution_id was not cleared after successful execution"
-        )
-        assert row["lease_until"] is None
+        # Wait for the durable terminal CAS rather than assuming a fixed
+        # delay is enough on every CI runner.
+        row = await _wait_for_completed_task(db, task.id)
         assert row["status"] == "completed"
         await engine.stop()
     finally:
