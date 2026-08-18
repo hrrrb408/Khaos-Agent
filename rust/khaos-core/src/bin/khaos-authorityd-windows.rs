@@ -296,30 +296,6 @@ mod windows_authority {
         format!("{:x}", sha2::Sha256::digest(mixed.as_bytes()))[..32].to_string()
     }
 
-    fn native_probe_json(
-        service_sid: &str,
-        peer_identity: &str,
-        pipe_acl: bool,
-        requirement_digest: &str,
-    ) -> String {
-        let key_ref = env::var("KHAOS_AUTHORITYD_PROTECTED_KEY_REF").unwrap_or_default();
-        let instance = service_instance_id();
-        let digest = format!(
-            "{:x}",
-            sha2::Sha256::digest(
-                format!(
-                    "{SERVICE_NAME}|{service_sid}|{peer_identity}|{requirement_digest}|{instance}|{key_ref}|native-authority-proof-v2"
-                )
-                .as_bytes()
-            )
-        );
-        format!(
-            "{{\"platform\":\"win32\",\"transport\":\"named-pipe\",\"service_id\":\"{SERVICE_NAME}\",\"service_pid\":{},\"service_identity\":\"{service_sid}\",\"peer_identity\":\"{peer_identity}\",\"peer_team_id\":\"{peer_identity}\",\"peer_cdhash\":\"\",\"designated_requirement_digest\":\"{requirement_digest}\",\"service_instance_id\":\"{instance}\",\"protected_key_ref\":\"{key_ref}\",\"challenge_digest\":\"{digest}\",\"peer_verified\":true,\"transport_verified\":{},\"protected_key_verified\":true}}",
-            std::process::id(),
-            pipe_acl
-        )
-    }
-
     fn agent_requirement_digest() -> String {
         let agent_sid = env::var("KHAOS_AGENT_SID").unwrap_or_default();
         format!(
@@ -328,15 +304,83 @@ mod windows_authority {
         )
     }
 
-    fn service_request(input: &[u8], service_sid: &str, peer_identity: &str) -> String {
-        if input == b"{\"kind\":\"probe\"}" {
-            return native_probe_json(
-                service_sid,
-                peer_identity,
-                true,
-                &agent_requirement_digest(),
-            );
+    const PROBE_INNER_REQUEST: &str = "{\"operation\":\"ping\",\"protocol\":1}";
+
+    fn hex_encode(input: &[u8]) -> String {
+        let mut output = String::with_capacity(input.len() * 2);
+        for byte in input {
+            output.push_str(&format!("{byte:02x}"));
         }
+        output
+    }
+
+    fn sha256_hex(input: &[u8]) -> String {
+        format!("{:x}", sha2::Sha256::digest(input))
+    }
+
+    fn valid_challenge(value: &str) -> bool {
+        value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    }
+
+    /// Handle one client message: parse kind/challenge/request, wrap the
+    /// request into a backend `attest` envelope, forward it, and merge the
+    /// backend response with the transport binding for the client.
+    fn service_request(input: &[u8], service_sid: &str, peer_identity: &str) -> String {
+        let message: serde_json::Value = match serde_json::from_slice(input) {
+            Ok(value) => value,
+            Err(_) => {
+                return "{\"ok\":false,\"error\":\"native pipe message is malformed JSON\"}"
+                    .to_string()
+            }
+        };
+        let kind = message.get("kind").and_then(|value| value.as_str());
+        let challenge = message
+            .get("challenge_nonce")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let instance = service_instance_id();
+        let requirement_digest = agent_requirement_digest();
+        let key_ref = env::var("KHAOS_AUTHORITYD_PROTECTED_KEY_REF").unwrap_or_default();
+        let service_name =
+            env::var("KHAOS_AUTHORITYD_SERVICE_NAME").unwrap_or_else(|_| SERVICE_NAME.to_string());
+        if kind.is_none() || !valid_challenge(challenge) {
+            return "{\"ok\":false,\"error\":\"native pipe challenge is missing or malformed\"}"
+                .to_string();
+        }
+        let request_bytes: Vec<u8> = if kind == Some("probe") {
+            PROBE_INNER_REQUEST.as_bytes().to_vec()
+        } else {
+            match message.get("request_json").and_then(|value| value.as_str()) {
+                Some(request) => request.as_bytes().to_vec(),
+                None => {
+                    return "{\"ok\":false,\"error\":\"native pipe request body is missing\"}"
+                        .to_string()
+                }
+            }
+        };
+        if request_bytes.is_empty() || request_bytes.len() > MAX_MESSAGE_BYTES / 2 {
+            return "{\"ok\":false,\"error\":\"native pipe request is out of bounds\"}".to_string();
+        }
+        let attest_request = serde_json::json!({
+            "protocol": 1,
+            "operation": "attest",
+            "challenge_nonce": challenge,
+            "request_raw_hex": hex_encode(&request_bytes),
+            "request_digest": sha256_hex(&request_bytes),
+            "proof_fields": {
+                "platform": "win32",
+                "transport": "named-pipe",
+                "service_id": service_name,
+                "service_pid": std::process::id().to_string(),
+                "service_identity": service_sid,
+                "peer_identity": peer_identity,
+                "peer_team_id": peer_identity,
+                "peer_cdhash": "",
+                "designated_requirement_digest": requirement_digest,
+                "service_instance_id": instance,
+                "protected_key_ref": key_ref,
+            },
+        });
         let backend = match env::var("KHAOS_AUTHORITYD_BACKEND_PIPE") {
             Ok(value) if value.starts_with(r"\\.\pipe\") && value.len() <= 256 => wide(&value),
             _ => {
@@ -375,14 +419,14 @@ mod windows_authority {
             unsafe { CloseHandle(handle) };
             return "{\"ok\":false,\"error_code\":\"authority_backend_unavailable\",\"error\":\"authority backend pipe identity is not the authority Service SID\"}".to_string();
         }
-        let bounded = input.len() <= MAX_MESSAGE_BYTES;
+        let payload = serde_json::to_vec(&attest_request).unwrap_or_default();
         let mut written = 0_u32;
-        let write_ok = bounded
+        let write_ok = payload.len() <= MAX_MESSAGE_BYTES
             && unsafe {
                 WriteFile(
                     handle,
-                    input.as_ptr(),
-                    input.len() as u32,
+                    payload.as_ptr(),
+                    payload.len() as u32,
                     &mut written,
                     null_mut(),
                 )
@@ -403,9 +447,44 @@ mod windows_authority {
         if !read_ok || read == 0 || read as usize > MAX_MESSAGE_BYTES {
             return "{\"ok\":false,\"error_code\":\"authority_backend_unavailable\",\"error\":\"authority backend returned no bounded response\"}".to_string();
         }
-        String::from_utf8(response[..read as usize].to_vec()).unwrap_or_else(|_| {
-            "{\"ok\":false,\"error\":\"authority backend returned malformed UTF-8\"}".to_string()
-        })
+        let backend_body: serde_json::Value = match serde_json::from_slice(&response[..read as usize])
+        {
+            Ok(value) => value,
+            Err(_) => {
+                return "{\"ok\":false,\"error\":\"authority backend returned malformed JSON\"}"
+                    .to_string()
+            }
+        };
+        // Merge the transport binding into the backend response so the
+        // Python adapter can verify both the static instance digest and the
+        // signed challenge-response attestation.
+        let static_digest = format!(
+            "{:x}",
+            sha2::Sha256::digest(
+                format!(
+                    "{SERVICE_NAME}|{service_sid}|{peer_identity}|{requirement_digest}|{instance}|{key_ref}|native-authority-proof-v2"
+                )
+                .as_bytes()
+            )
+        );
+        let mut wrapper = serde_json::Map::new();
+        wrapper.insert(
+            "native_transport".to_string(),
+            serde_json::Value::String("named-pipe".to_string()),
+        );
+        wrapper.insert(
+            "proof_digest".to_string(),
+            serde_json::Value::String(static_digest),
+        );
+        if let serde_json::Value::Object(body) = backend_body {
+            for (key, value) in body {
+                wrapper.insert(key, value);
+            }
+        } else {
+            return "{\"ok\":false,\"error\":\"authority backend returned a non-object response\"}"
+                .to_string();
+        }
+        serde_json::Value::Object(wrapper).to_string()
     }
 
     fn run_service_loop() -> Result<(), String> {
@@ -486,7 +565,36 @@ mod windows_authority {
         }
     }
 
-    fn client_probe() -> Result<(), String> {
+    /// Client mode: send one probe or request (with the Agent-generated
+    /// challenge nonce) to the authority service pipe and print the reply.
+    /// The client never talks to the backend pipe directly.
+    fn client_request(kind: &str, challenge: Option<&str>) -> Result<(), String> {
+        let challenge_value = match challenge {
+            Some(value) if valid_challenge(value) => value.to_string(),
+            Some(_) => return Err("challenge nonce must be 64 lowercase hex characters".into()),
+            None => return Err("a challenge nonce is required".into()),
+        };
+        let mut message = serde_json::Map::new();
+        message.insert("kind".to_string(), serde_json::Value::String(kind.to_string()));
+        message.insert(
+            "challenge_nonce".to_string(),
+            serde_json::Value::String(challenge_value),
+        );
+        if kind == "request" {
+            let mut input = String::new();
+            use std::io::Read;
+            std::io::stdin()
+                .take(MAX_MESSAGE_BYTES as u64)
+                .read_to_string(&mut input)
+                .map_err(|_| "could not read the request payload".to_string())?;
+            if input.is_empty() || input.len() > MAX_MESSAGE_BYTES {
+                return Err("request payload is empty or oversized".into());
+            }
+            message.insert(
+                "request_json".to_string(),
+                serde_json::Value::String(input),
+            );
+        }
         let pipe = wide(&pipe_name()?);
         let handle = unsafe {
             CreateFileW(
@@ -502,7 +610,7 @@ mod windows_authority {
         if handle == INVALID_HANDLE_VALUE {
             return Err("authority Named Pipe is unavailable".to_string());
         }
-        let request = b"{\"kind\":\"probe\"}";
+        let request = serde_json::Value::Object(message).to_string();
         let mut written = 0_u32;
         let ok = unsafe {
             WriteFile(
@@ -527,7 +635,7 @@ mod windows_authority {
             } != 0;
         unsafe { CloseHandle(handle) };
         if !read_ok || read == 0 {
-            return Err("authority Named Pipe probe failed".to_string());
+            return Err("authority Named Pipe request failed".to_string());
         }
         println!("{}", String::from_utf8_lossy(&response[..read as usize]));
         Ok(())
@@ -580,8 +688,15 @@ mod windows_authority {
                 return 78;
             }
         }
-        if arguments.get(1).map(String::as_str) == Some("--probe") {
-            return client_probe().map(|_| 0).unwrap_or(78);
+        let kind = arguments.get(1).map(String::as_str);
+        if kind == Some("--probe") || kind == Some("--request") {
+            let mode = if kind == Some("--probe") { "probe" } else { "request" };
+            let challenge = arguments
+                .iter()
+                .position(|value| value == "--challenge")
+                .and_then(|index| arguments.get(index + 1))
+                .map(String::as_str);
+            return client_request(mode, challenge).map(|_| 0).unwrap_or(78);
         }
         let name = wide(SERVICE_NAME);
         let table = [

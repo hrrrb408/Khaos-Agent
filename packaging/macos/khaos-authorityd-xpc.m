@@ -351,6 +351,35 @@ static int verify_backend_socket(const char *path) {
     return 1;
 }
 
+static void hex_encode(const unsigned char *input, size_t length, char *output) {
+    static const char digits[] = "0123456789abcdef";
+    for (size_t index = 0; index < length; ++index) {
+        output[index * 2] = digits[(input[index] >> 4) & 0xF];
+        output[index * 2 + 1] = digits[input[index] & 0xF];
+    }
+    output[length * 2] = '\0';
+}
+
+static void sha256_hex(const char *input, size_t length, char output[65]) {
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(input, (CC_LONG)length, digest);
+    hex_encode(digest, sizeof(digest), output);
+}
+
+static int valid_challenge_nonce(const char *value) {
+    if (value == NULL || strlen(value) != 64) return 0;
+    for (const char *cursor = value; *cursor; ++cursor) {
+        if (!((*cursor >= '0' && *cursor <= '9') || (*cursor >= 'a' && *cursor <= 'f'))) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* The fixed inner request used for identity probes; its bytes must match
+ * the Python adapter's PROBE_INNER_REQUEST exactly. */
+static const char PROBE_INNER_REQUEST[] = "{\"operation\":\"ping\",\"protocol\":1}";
+
 static int backend_request(const char *request, char *response, size_t capacity) {
     const char *path = env_required("KHAOS_AUTHORITYD_BACKEND_SOCKET");
     if (path == NULL || path[0] != '/' || strlen(path) >= sizeof(((struct sockaddr_un *)0)->sun_path)) return 0;
@@ -380,6 +409,59 @@ static int backend_request(const char *request, char *response, size_t capacity)
     return response[0] == '{' && response[strlen(response) - 1] == '}';
 }
 
+/* Build the attest envelope the backend signs.  The request bytes are
+ * hex-encoded so the backend can digest the exact raw bytes without any
+ * canonicalization assumptions. */
+static int build_attest_request(
+    const char *challenge,
+    const char *request_bytes,
+    size_t request_length,
+    const struct peer_identity *agent,
+    const struct peer_identity *service,
+    const char *service_id,
+    const char *instance_id,
+    const char *key_ref,
+    char *output,
+    size_t capacity
+) {
+    if (request_length == 0 || request_length > MAX_MESSAGE_BYTES / 2) return 0;
+    char request_hex[MAX_MESSAGE_BYTES + 1] = {0};
+    hex_encode((const unsigned char *)request_bytes, request_length, request_hex);
+    char request_digest[65] = {0};
+    sha256_hex(request_bytes, request_length, request_digest);
+    int written = snprintf(
+        output, capacity,
+        "{\"protocol\":1,\"operation\":\"attest\","
+        "\"challenge_nonce\":\"%s\","
+        "\"request_raw_hex\":\"%s\","
+        "\"request_digest\":\"%s\","
+        "\"proof_fields\":{"
+        "\"platform\":\"darwin\","
+        "\"transport\":\"xpc\","
+        "\"service_id\":\"%s\","
+        "\"service_pid\":%d,"
+        "\"service_identity\":\"%s\","
+        "\"peer_identity\":\"%s\","
+        "\"peer_team_id\":\"%s\","
+        "\"peer_cdhash\":\"%s\","
+        "\"designated_requirement_digest\":\"%s\","
+        "\"service_instance_id\":\"%s\","
+        "\"protected_key_ref\":\"%s\"}}",
+        challenge,
+        request_hex,
+        request_digest,
+        service_id,
+        (int)getpid(),
+        service->identifier,
+        agent->identifier,
+        agent->team_id,
+        agent->cdhash,
+        agent->requirement_digest,
+        instance_id,
+        key_ref);
+    return written > 0 && (size_t)written < capacity;
+}
+
 static void reply_error(xpc_object_t reply, const char *message) {
     xpc_dictionary_set_string(reply, "error", message);
 }
@@ -402,48 +484,81 @@ static void handle_message(xpc_connection_t peer, xpc_object_t event) {
         digest_for_peer(service_id, &agent, &service, instance_id, key_ref, proof_digest);
     }
     const char *kind = xpc_dictionary_get_string(event, "kind");
+    const char *challenge = xpc_dictionary_get_string(event, "challenge_nonce");
     if (kind == NULL || !peer_ok || !service_ok || !key_ok || proof_digest[0] == '\0') {
         reply_error(reply, "native XPC identity proof failed");
     } else if (strcmp(kind, "probe") == 0) {
-        char proof_json[MAX_MESSAGE_BYTES];
-        snprintf(proof_json, sizeof(proof_json),
-            "{\"platform\":\"darwin\",\"transport\":\"xpc\",\"service_id\":\"%s\",\"service_pid\":%d,"
-            "\"service_identity\":\"%s\",\"peer_identity\":\"%s\","
-            "\"peer_team_id\":\"%s\",\"peer_cdhash\":\"%s\","
-            "\"designated_requirement_digest\":\"%s\","
-            "\"service_instance_id\":\"%s\","
-            "\"protected_key_ref\":\"%s\",\"challenge_digest\":\"%s\","
-            "\"peer_verified\":true,\"transport_verified\":true,\"protected_key_verified\":true}",
-            service_id, getpid(),
-            service.identifier,
-            agent.identifier,
-            agent.team_id,
-            agent.cdhash,
-            agent.requirement_digest,
-            instance_id,
-            key_ref, proof_digest);
-        xpc_dictionary_set_string(reply, "proof_json", proof_json);
+        /* A probe is a challenged ping through the full backend: the
+         * backend signs the attestation covering this nonce, proving the
+         * protected key actually participates in every proof. */
+        if (!valid_challenge_nonce(challenge)) {
+            reply_error(reply, "native XPC probe challenge is malformed");
+        } else {
+            char attest_request[MAX_MESSAGE_BYTES * 2];
+            char backend_response[MAX_MESSAGE_BYTES];
+            if (!build_attest_request(
+                    challenge,
+                    PROBE_INNER_REQUEST,
+                    sizeof(PROBE_INNER_REQUEST) - 1,
+                    &agent,
+                    &service,
+                    service_id,
+                    instance_id,
+                    key_ref,
+                    attest_request,
+                    sizeof(attest_request)) ||
+                !backend_request(attest_request, backend_response, sizeof(backend_response))) {
+                reply_error(reply, "authority backend is unavailable");
+            } else {
+                size_t body_length = strlen(backend_response);
+                if (body_length < 2 || backend_response[body_length - 1] != '}') {
+                    reply_error(reply, "authority backend returned malformed JSON");
+                } else {
+                    backend_response[body_length - 1] = '\0';
+                    char wrapped[MAX_MESSAGE_BYTES];
+                    snprintf(wrapped, sizeof(wrapped),
+                        "{\"native_transport\":\"xpc\",\"proof_digest\":\"%s\",%s",
+                        proof_digest, backend_response + 1);
+                    xpc_dictionary_set_string(reply, "response_json", wrapped);
+                }
+            }
+        }
     } else if (strcmp(kind, "request") == 0) {
         size_t request_length = 0;
         const void *request_data = xpc_dictionary_get_data(event, "request_json", &request_length);
         char request[MAX_MESSAGE_BYTES];
+        char attest_request[MAX_MESSAGE_BYTES * 2];
         char backend_response[MAX_MESSAGE_BYTES];
         if (request_data == NULL || request_length == 0 || request_length >= sizeof(request)) {
             reply_error(reply, "native XPC request is empty or oversized");
+        } else if (!valid_challenge_nonce(challenge)) {
+            reply_error(reply, "native XPC request challenge is malformed");
         } else {
             memcpy(request, request_data, request_length);
             request[request_length] = '\0';
-            if (!backend_request(request, backend_response, sizeof(backend_response))) {
+            if (!build_attest_request(
+                    challenge,
+                    request,
+                    request_length,
+                    &agent,
+                    &service,
+                    service_id,
+                    instance_id,
+                    key_ref,
+                    attest_request,
+                    sizeof(attest_request)) ||
+                !backend_request(attest_request, backend_response, sizeof(backend_response))) {
                 reply_error(reply, "authority backend is unavailable");
             } else {
-                char *body = backend_response + 1;
-                size_t body_length = strlen(body);
-                if (body_length == 0 || backend_response[strlen(backend_response) - 1] != '}') {
+                size_t body_length = strlen(backend_response);
+                if (body_length < 2 || backend_response[body_length - 1] != '}') {
                     reply_error(reply, "authority backend returned malformed JSON");
                 } else {
-                    backend_response[strlen(backend_response) - 1] = '\0';
+                    backend_response[body_length - 1] = '\0';
                     char wrapped[MAX_MESSAGE_BYTES];
-                    snprintf(wrapped, sizeof(wrapped), "{\"native_transport\":\"xpc\",\"proof_digest\":\"%s\",%s", proof_digest, body);
+                    snprintf(wrapped, sizeof(wrapped),
+                        "{\"native_transport\":\"xpc\",\"proof_digest\":\"%s\",%s",
+                        proof_digest, backend_response + 1);
                     xpc_dictionary_set_string(reply, "response_json", wrapped);
                 }
             }

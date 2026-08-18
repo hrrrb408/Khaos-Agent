@@ -6,27 +6,52 @@ The native client executable must prove the platform-owned service identity,
 the peer identity, the transport ACL, and the protected-key boundary before a
 request is accepted.  There is no same-UID Python, Unix-socket, or local
 broker fallback on either platform.
+
+Every probe and request is a signed challenge-response (ADR-023): the
+adapter generates a fresh 256-bit CSPRNG nonce, the authority backend signs
+a canonical attestation covering the nonce and the exact request digest
+with its protected Ed25519 key, and the adapter verifies the signature with
+the public verification key it owns.  A replayed proof carries a stale
+nonce and fails closed.
 """
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
+import secrets
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+from khaos.security.authorityd_protocol import Ed25519KeyStore
 from khaos.security.identity_isolation import (
     AuthorityIdentityContract,
     IdentityIsolationError,
     read_contract_from_environment,
 )
+from khaos.security.protocol_boundary import canonical_json_bytes
 
 MAX_NATIVE_OUTPUT_BYTES = 64 * 1024
+# The native client wraps the raw request into a JSON envelope (escaping
+# included) before the message-mode pipe transport; keep the raw request
+# well below the pipe frame budget.
+MAX_NATIVE_REQUEST_BYTES = 16 * 1024
 NATIVE_PROBE_TIMEOUT_SECONDS = 5.0
 NATIVE_REQUEST_TIMEOUT_SECONDS = 30.0
+# An attestation is produced synchronously inside one request round trip;
+# anything older than this window is stale, not fresh proof.
+ATTESTATION_MAX_AGE_SECONDS = 120.0
+# The fixed inner request the frontend sends for identity probes.
+PROBE_INNER_REQUEST = '{"operation":"ping","protocol":1}'
 
 
 class NativeAuthorityError(IdentityIsolationError):
@@ -222,22 +247,133 @@ class _SubprocessNativeAdapter:
     protected_key_ref: str
     client: Path
     expected_requirement_digest: str = ""
+    public_key_path: Path = Path("/")
     proof: NativeAuthorityProof
 
     def _native_environment(self) -> dict[str, str]:
         return {}
 
+    def _load_public_key(self) -> Ed25519PublicKey:
+        try:
+            return Ed25519KeyStore.load_public_key(self.public_key_path)
+        except Exception as exc:
+            raise NativeAuthorityError(
+                "authority public verification key is unavailable"
+            ) from exc
+
+    def _verify_attestation(
+        self,
+        response: dict[str, object],
+        *,
+        challenge_nonce: str,
+        request_bytes: bytes,
+        public_key: Ed25519PublicKey,
+        expected_instance_id: str | None = None,
+    ) -> dict[str, object]:
+        """Verify the signed challenge-response for one native round trip."""
+        if response.get("native_transport") != self.expected_transport:
+            raise NativeAuthorityError("native authority response transport is unbound")
+        attestation = response.get("attestation")
+        if not isinstance(attestation, dict):
+            raise NativeAuthorityError("native authority attestation is missing")
+        if attestation.get("challenge_nonce") != challenge_nonce:
+            raise NativeAuthorityError(
+                "native authority attestation nonce does not match the challenge"
+            )
+        expected_digest = hashlib.sha256(request_bytes).hexdigest()
+        if attestation.get("request_digest") != expected_digest:
+            raise NativeAuthorityError(
+                "native authority attestation does not cover this request"
+            )
+        if attestation.get("platform") != self.expected_platform:
+            raise NativeAuthorityError("native authority attestation platform mismatch")
+        if attestation.get("transport") != self.expected_transport:
+            raise NativeAuthorityError("native authority attestation transport mismatch")
+        if attestation.get("service_id") != self.service_id:
+            raise NativeAuthorityError("native authority attestation service mismatch")
+        if attestation.get("protected_key_ref") != self.protected_key_ref:
+            raise NativeAuthorityError(
+                "native authority attestation protected key mismatch"
+            )
+        if (
+            self.expected_requirement_digest
+            and attestation.get("designated_requirement_digest")
+            != self.expected_requirement_digest
+        ):
+            raise NativeAuthorityError(
+                "native authority attestation requirement digest mismatch"
+            )
+        if expected_instance_id is not None and attestation.get(
+            "service_instance_id"
+        ) != expected_instance_id:
+            raise NativeAuthorityError(
+                "native authority attestation service instance changed mid-session"
+            )
+        issued_at = attestation.get("issued_at")
+        if not isinstance(issued_at, int) or issued_at < 0:
+            raise NativeAuthorityError("native authority attestation timestamp invalid")
+        issued_seconds = issued_at / 1000.0
+        if abs(time.time() - issued_seconds) > ATTESTATION_MAX_AGE_SECONDS:
+            raise NativeAuthorityError("native authority attestation is stale")
+        signature = attestation.get("signature")
+        if not isinstance(signature, str) or not signature:
+            raise NativeAuthorityError("native authority attestation is unsigned")
+        unsigned = {key: value for key, value in attestation.items() if key != "signature"}
+        try:
+            public_key.verify(
+                base64.b64decode(signature.encode("ascii"), validate=True),
+                canonical_json_bytes(unsigned),
+            )
+        except (InvalidSignature, ValueError, UnicodeError) as exc:
+            raise NativeAuthorityError(
+                "native authority attestation signature is invalid"
+            ) from exc
+        return attestation
+
     def _probe(self) -> NativeAuthorityProof:
+        challenge = secrets.token_hex(32)
         payload = _decode_native_response(
             _bounded_native_call(
                 self.client,
-                ("--probe", "--service-id", self.service_id),
+                (
+                    "--probe",
+                    "--service-id",
+                    self.service_id,
+                    "--challenge",
+                    challenge,
+                ),
                 timeout_seconds=NATIVE_PROBE_TIMEOUT_SECONDS,
                 extra_environment=self._native_environment(),
             )
         )
-        return NativeAuthorityProof.from_payload(
+        attestation = self._verify_attestation(
             payload,
+            challenge_nonce=challenge,
+            request_bytes=PROBE_INNER_REQUEST.encode("utf-8"),
+            public_key=self._load_public_key(),
+        )
+        # The proof object carries the digest of the challenge nonce this
+        # attestation answered; freshness itself is the verified signature.
+        proof_payload = {
+            "platform": attestation["platform"],
+            "transport": attestation["transport"],
+            "service_id": attestation["service_id"],
+            "service_pid": attestation["service_pid"],
+            "service_identity": attestation["service_identity"],
+            "peer_identity": attestation["peer_identity"],
+            "peer_team_id": attestation["peer_team_id"],
+            "peer_cdhash": attestation["peer_cdhash"],
+            "designated_requirement_digest": attestation[
+                "designated_requirement_digest"
+            ],
+            "service_instance_id": attestation["service_instance_id"],
+            "protected_key_ref": attestation["protected_key_ref"],
+            "challenge_digest": hashlib.sha256(
+                challenge.encode("ascii")
+            ).hexdigest(),
+        }
+        return NativeAuthorityProof.from_payload(
+            proof_payload,
             expected_platform=self.expected_platform,
             expected_transport=self.expected_transport,
             expected_service_id=self.service_id,
@@ -246,28 +382,36 @@ class _SubprocessNativeAdapter:
         )
 
     def request(self, payload: dict[str, object]) -> dict[str, object]:
-        encoded = json.dumps(
-            payload,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        if len(encoded) > MAX_NATIVE_OUTPUT_BYTES:
+        encoded = canonical_json_bytes(payload)
+        if len(encoded) > MAX_NATIVE_REQUEST_BYTES:
             raise NativeAuthorityError("native authority request is too large")
+        challenge = secrets.token_hex(32)
         response = _decode_native_response(
             _bounded_native_call(
                 self.client,
-                ("--request", "--service-id", self.service_id),
+                (
+                    "--request",
+                    "--service-id",
+                    self.service_id,
+                    "--challenge",
+                    challenge,
+                ),
                 input_bytes=encoded,
                 timeout_seconds=NATIVE_REQUEST_TIMEOUT_SECONDS,
                 extra_environment=self._native_environment(),
             )
         )
-        if response.get("native_transport") != self.expected_transport:
-            raise NativeAuthorityError("native authority response transport is unbound")
-        if response.get("proof_digest") != self.proof.challenge_digest:
-            raise NativeAuthorityError("native authority response proof is stale")
-        return response
+        self._verify_attestation(
+            response,
+            challenge_nonce=challenge,
+            request_bytes=encoded,
+            public_key=self._load_public_key(),
+            expected_instance_id=self.proof.service_instance_id,
+        )
+        inner = response.get("response")
+        if not isinstance(inner, dict):
+            raise NativeAuthorityError("native authority response body is missing")
+        return inner
 
 
 @dataclass(frozen=True, slots=True)
@@ -293,11 +437,17 @@ class MacOSLaunchdXPCAdapter(_SubprocessNativeAdapter):
         client_value = os.environ.get("KHAOS_MACOS_AUTHORITY_XPC_CLIENT")
         if not client_value:
             raise NativeAuthorityError("KHAOS_MACOS_AUTHORITY_XPC_CLIENT is missing")
+        public_key_value = os.environ.get("KHAOS_AUTHORITYD_PUBLIC_KEY_PATH")
+        if not public_key_value:
+            raise NativeAuthorityError(
+                "KHAOS_AUTHORITYD_PUBLIC_KEY_PATH is required to verify attestations"
+            )
         adapter = cls(
             service_id=contract.launchd_service,
             protected_key_ref=contract.protected_key_ref,
             client=_required_absolute_executable(Path(client_value)),
             expected_requirement_digest=contract.agent_requirement_digest,
+            public_key_path=Path(public_key_value),
         )
         object.__setattr__(adapter, "proof", adapter._probe())
         return adapter
@@ -334,6 +484,11 @@ class WindowsServiceNamedPipeAdapter(_SubprocessNativeAdapter):
         client_value = os.environ.get("KHAOS_WINDOWS_AUTHORITY_PIPE_CLIENT")
         if not client_value:
             raise NativeAuthorityError("KHAOS_WINDOWS_AUTHORITY_PIPE_CLIENT is missing")
+        public_key_value = os.environ.get("KHAOS_AUTHORITYD_PUBLIC_KEY_PATH")
+        if not public_key_value:
+            raise NativeAuthorityError(
+                "KHAOS_AUTHORITYD_PUBLIC_KEY_PATH is required to verify attestations"
+            )
         adapter = cls(
             service_id=os.environ.get("KHAOS_AUTHORITYD_SERVICE_NAME", "KhaosAuthorityD"),
             protected_key_ref=contract.protected_key_ref,
@@ -341,6 +496,7 @@ class WindowsServiceNamedPipeAdapter(_SubprocessNativeAdapter):
             named_pipe=contract.named_pipe,
             agent_sid=contract.agent_sid or "",
             expected_requirement_digest=contract.agent_requirement_digest,
+            public_key_path=Path(public_key_value),
         )
         object.__setattr__(adapter, "proof", adapter._probe())
         return adapter

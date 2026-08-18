@@ -9,6 +9,8 @@ profile and is never a production fallback.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import logging
 import os
@@ -1872,6 +1874,119 @@ class AuthorityDaemon:
             self._states.pop(receipt.nonce, None)
             self._remember_terminal_locked(receipt.nonce, "revoked")
 
+    _ATTEST_PROOF_FIELDS = (
+        "platform",
+        "transport",
+        "service_id",
+        "service_pid",
+        "service_identity",
+        "peer_identity",
+        "peer_team_id",
+        "peer_cdhash",
+        "designated_requirement_digest",
+        "service_instance_id",
+        "protected_key_ref",
+    )
+    _ATTEST_HEX_FIELDS = frozenset(
+        {"designated_requirement_digest", "peer_cdhash"}
+    )
+
+    def attest(
+        self,
+        *,
+        proof_fields: dict[str, Any],
+        challenge_nonce: str,
+        request_raw_hex: str,
+        request_digest: str,
+    ) -> dict[str, Any]:
+        """Sign one challenge-response attestation for a native request.
+
+        The native frontend relays the Agent's fresh challenge and the raw
+        request bytes.  The backend is the only holder of the signing key:
+        it validates the challenge/digest binding, re-dispatches the inner
+        request, and returns a signed attestation covering the transport
+        identity fields, the challenge nonce, and the exact request
+        digest.  A replayed attestation fails at the Agent because the
+        nonce never repeats.
+        """
+        if not _is_hex(challenge_nonce, 64) or not _is_hex(request_digest, 64):
+            raise AuthorityControlPlaneError(
+                "authority attestation challenge or request digest is malformed"
+            )
+        try:
+            raw = bytes.fromhex(request_raw_hex)
+        except ValueError as exc:
+            raise AuthorityControlPlaneError(
+                "authority attestation request payload is malformed"
+            ) from exc
+        if not raw or len(raw) > MAX_MESSAGE_BYTES:
+            raise AuthorityControlPlaneError(
+                "authority attestation request payload is out of bounds"
+            )
+        if hashlib.sha256(raw).hexdigest() != request_digest:
+            raise AuthorityControlPlaneError(
+                "authority attestation request digest does not match the payload"
+            )
+        try:
+            inner = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise AuthorityControlPlaneError(
+                "authority attestation request is malformed JSON"
+            ) from exc
+        if not isinstance(inner, dict) or inner.get("protocol") != AUTHORITYD_PROTOCOL:
+            raise AuthorityControlPlaneError(
+                "authority attestation request is not an authorityd request"
+            )
+        if set(proof_fields) != set(self._ATTEST_PROOF_FIELDS):
+            raise AuthorityControlPlaneError(
+                "authority attestation proof fields are incomplete"
+            )
+        for name, value in proof_fields.items():
+            # peer_cdhash may be empty on platforms without a stable
+            # code-directory-hash API (Windows); every other field is
+            # required to be non-empty.
+            if not isinstance(value, str) or len(value) > 256:
+                raise AuthorityControlPlaneError(
+                    "authority attestation proof field is invalid"
+                )
+            if not value and name != "peer_cdhash":
+                raise AuthorityControlPlaneError(
+                    "authority attestation proof field is empty"
+                )
+            if name in self._ATTEST_HEX_FIELDS and value and not _is_hex(value, len(value)):
+                raise AuthorityControlPlaneError(
+                    "authority attestation proof digest field is malformed"
+                )
+        try:
+            service_pid = int(proof_fields["service_pid"])
+        except (TypeError, ValueError) as exc:
+            raise AuthorityControlPlaneError(
+                "authority attestation service pid is invalid"
+            ) from exc
+        if service_pid <= 0:
+            raise AuthorityControlPlaneError(
+                "authority attestation service pid is invalid"
+            )
+        payload: dict[str, Any] = {
+            "schema_version": 1,
+            **proof_fields,
+            "challenge_nonce": challenge_nonce,
+            "request_digest": request_digest,
+            "issuer_id": self.issuer_id,
+            "issued_at": _encode_receipt_timestamp(
+                time.time(), field="attestation issued_at"
+            ),
+        }
+        signature = base64.b64encode(
+            self.signing_key.sign(_canonical(payload))
+        ).decode("ascii")
+        response = _dispatch(self, inner)
+        return {
+            "ok": True,
+            "response": response,
+            "attestation": {**payload, "signature": signature},
+        }
+
     def _append_audit(self, record: dict[str, Any]) -> None:
         if self.audit_writer is None:
             raise AuthorityControlPlaneError("independent audit writer is unavailable")
@@ -2442,6 +2557,15 @@ def _dispatch(daemon: AuthorityDaemon, request: object) -> dict[str, object]:
         receipt = SignedAuthorizationReceipt.from_dict(request.get("receipt"))
         daemon.revoke(receipt)
         return {"ok": True}
+    if operation == "ping":
+        return {"ok": True, "issuer_id": daemon.issuer_id}
+    if operation == "attest":
+        return daemon.attest(
+            proof_fields=_mapping(request.get("proof_fields")),
+            challenge_nonce=str(request.get("challenge_nonce", "")),
+            request_raw_hex=str(request.get("request_raw_hex", "")),
+            request_digest=str(request.get("request_digest", "")),
+        )
     raise AuthorityControlPlaneError("unknown authorityd operation")
 
 
@@ -2449,6 +2573,14 @@ def _mapping(value: object) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise AuthorityControlPlaneError("authorityd payload is not a mapping")
     return value
+
+
+def _is_hex(value: str, length: int) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == length
+        and all(character in _HEX_DIGITS for character in value)
+    )
 
 
 def _recv_line(connection: socket.socket) -> bytes:
