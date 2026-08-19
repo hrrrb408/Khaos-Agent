@@ -1,3 +1,4 @@
+# KHAOS-PRIVILEGED-SPAWN owner=EvidenceProvenanceFetcher threat-model=untrusted-gh-cli-output boundary=evidence-provenance-lookup
 """GitHub-API provenance fetchers for closure evidence re-verification.
 
 The closure builder must not trust a local ``VERIFIED`` bundle: every
@@ -7,8 +8,7 @@ claim is possible.  Any HTTP error, missing object, or digest mismatch
 fails closed.
 """
 
-# KHAOS-PRIVILEGED-SPAWN owner=EvidenceProvenanceFetcher threat-model=untrusted-gh-cli-output boundary=evidence-provenance-lookup
-from __future__ import annotations__
+from __future__ import annotations
 
 import json
 import subprocess
