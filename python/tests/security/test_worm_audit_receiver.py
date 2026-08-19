@@ -127,3 +127,33 @@ def test_worm_health_and_audit_content_stay_local(worm_server) -> None:
     except urllib.error.HTTPError as exc:
         status = exc.code
     assert status == 404
+
+
+def test_generated_chain_passes_strict_openssl_verification(tmp_path: Path) -> None:
+    """Strict chain compliance must hold locally, not only on Python 3.13.
+
+    Python 3.13's OpenSSL rejects CAs missing an Authority Key Identifier
+    and CAs with a path length but no keyCertSign key usage.  Verify the
+    generated chain under ``openssl verify -x509_strict`` so these
+    regressions surface on every platform.
+    """
+    import shutil
+    import subprocess
+
+    openssl = shutil.which("openssl")
+    if openssl is None:
+        pytest.skip("openssl is unavailable")
+    module = _module()
+    ca_cert = tmp_path / "ca.pem"
+    ca_key = tmp_path / "ca-key.pem"
+    server_cert = tmp_path / "server.pem"
+    server_key = tmp_path / "server-key.pem"
+    module._generate_ca(ca_cert, ca_key)
+    module._generate_server_cert(ca_cert, ca_key, server_cert, server_key)
+    result = subprocess.run(
+        [openssl, "verify", "-x509_strict", "-CAfile", str(ca_cert), str(server_cert)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr

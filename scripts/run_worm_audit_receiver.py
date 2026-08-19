@@ -38,9 +38,12 @@ def _generate_ca(ca_cert: Path, ca_key: Path) -> None:
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "khaos-ci-worm-ca")])
     now = datetime.datetime.now(datetime.UTC)
-    # SKI/AKI are required by stricter OpenSSL verification (e.g. Python
-    # 3.13's): a CA without an Authority Key Identifier is rejected with
-    # "Missing Authority Key Identifier" at TLS handshake time.
+    # Strict OpenSSL chain verification (Python 3.13's, and
+    # `openssl verify -x509_strict`) requires a CA that carries a path
+    # length to also assert the keyCertSign key usage, and rejects CAs
+    # without an Authority Key Identifier.  Emit a fully RFC 5280
+    # compliant CA so the TLS-verified WORM submission path works on
+    # every supported platform.
     ski = x509.SubjectKeyIdentifier.from_public_key(key.public_key())
     certificate = (
         x509.CertificateBuilder()
@@ -51,6 +54,20 @@ def _generate_ca(ca_cert: Path, ca_key: Path) -> None:
         .not_valid_before(now - datetime.timedelta(minutes=5))
         .not_valid_after(now + datetime.timedelta(hours=12))
         .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=False,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=True,
+                crl_sign=True,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
         .add_extension(ski, critical=False)
         .add_extension(
             x509.AuthorityKeyIdentifier.from_issuer_subject_key_identifier(ski),
