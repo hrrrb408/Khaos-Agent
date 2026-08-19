@@ -127,15 +127,33 @@ def test_sigterm_ignoring_descendant_is_killed(tmp_path: Path) -> None:
 
 
 def test_successful_client_returns_stdout(tmp_path: Path) -> None:
-    client = _client_script(tmp_path, "echo '{\"ok\":true}'")
-    stdout = _bounded_native_call(client, (), timeout_seconds=10.0)
+    if os.name == "nt":
+        # Windows CreateProcess cannot execute a shebang script; the
+        # equivalent client is the interpreter with an inline program.
+        client = Path(sys.executable)
+        arguments: tuple[str, ...] = (
+            "-c",
+            "import sys; sys.stdout.write('{\"ok\":true}\\n')",
+        )
+    else:
+        client = _client_script(tmp_path, "echo '{\"ok\":true}'")
+        arguments = ()
+    stdout = _bounded_native_call(client, arguments, timeout_seconds=10.0)
     assert b'{"ok":true}' in stdout
 
 
 def test_nonzero_exit_reports_detail(tmp_path: Path) -> None:
-    client = _client_script(tmp_path, "echo boom >&2; exit 3")
+    if os.name == "nt":
+        client = Path(sys.executable)
+        arguments: tuple[str, ...] = (
+            "-c",
+            "import sys; sys.stderr.write('boom\\n'); sys.exit(3)",
+        )
+    else:
+        client = _client_script(tmp_path, "echo boom >&2; exit 3")
+        arguments = ()
     with pytest.raises(NativeAuthorityError, match="rc=3.*boom"):
-        _bounded_native_call(client, (), timeout_seconds=10.0)
+        _bounded_native_call(client, arguments, timeout_seconds=10.0)
 
 
 def test_missing_executable_fails_closed(tmp_path: Path) -> None:
@@ -157,7 +175,10 @@ def test_setsid_descendant_is_in_the_child_domain(tmp_path: Path) -> None:
 
 def test_client_script_permissions(tmp_path: Path) -> None:
     client = _client_script(tmp_path, "true")
-    assert stat.S_IMODE(client.stat().st_mode) & 0o111
+    # Exec bits only exist on POSIX filesystems; NTFS reports the
+    # read-only attribute instead of a permission mask.
+    if os.name == "posix":
+        assert stat.S_IMODE(client.stat().st_mode) & 0o111
     # Budget sanity for the shared caps used above.
     assert MAX_NATIVE_OUTPUT_BYTES == 64 * 1024
     assert sys.platform in {"darwin", "linux", "win32"}

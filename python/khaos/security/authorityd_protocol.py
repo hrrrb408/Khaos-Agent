@@ -461,7 +461,15 @@ class Ed25519KeyStore:
         path = path.expanduser().absolute()
         try:
             info = path.lstat()
-            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_mode & 0o022:
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise AuthorityControlPlaneError(
+                    "authority public key is not a regular single-link file"
+                )
+            # Group/other bits are the POSIX leak signal.  Windows ``stat``
+            # synthesizes them from the read-only attribute (every writable
+            # file reads as 0666), so they carry no ACL information there;
+            # the Windows key confinement is the service-account NTFS ACL.
+            if os.name == "posix" and info.st_mode & 0o022:
                 raise AuthorityControlPlaneError(
                     "authority public key has unsafe permissions"
                 )
@@ -493,7 +501,14 @@ class Ed25519KeyStore:
         path = path.expanduser().absolute()
         if path.exists():
             info = path.lstat()
-            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_mode & 0o077:
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise AuthorityControlPlaneError(
+                    "authority signing key is not a regular single-link file"
+                )
+            # See load_public_key: the group/other-bit leak signal exists
+            # only on POSIX filesystems; Windows confines the signing key
+            # with the service-account NTFS ACL instead.
+            if os.name == "posix" and info.st_mode & 0o077:
                 raise AuthorityControlPlaneError("authority signing key has unsafe permissions")
             descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
             try:

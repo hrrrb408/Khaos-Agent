@@ -76,6 +76,28 @@ def _euid() -> int:
     return os.geteuid()
 
 
+def _connect_when_listening(path: Path, *, timeout: float = 5.0) -> socket.socket:
+    """Connect once the listener is actually accepting.
+
+    ``serve_unix`` creates the socket file at ``bind()`` but only starts
+    accepting after ``chmod`` and environment validation; a client racing
+    into that window gets ECONNREFUSED even though the file exists.  Retry
+    within the test budget instead of treating the window as a failure.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(5)
+        try:
+            client.connect(str(path))
+            return client
+        except ConnectionRefusedError:
+            client.close()
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.05)
+
+
 def test_darwin_backend_mode_rejects_foreign_socket(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -95,6 +117,11 @@ def test_darwin_backend_mode_rejects_missing_backend_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(sys, "platform", "darwin")
+    # serve_unix guards on the real os.name before the darwin backend-mode
+    # validation; patch it so non-darwin runners reach the branch under test.
+    import khaos.security.authorityd as authorityd_module
+
+    monkeypatch.setattr(authorityd_module.os, "name", "posix", raising=False)
     monkeypatch.delenv("KHAOS_AUTHORITYD_BACKEND_SOCKET", raising=False)
     daemon = _daemon(tmp_path)
     with pytest.raises(AuthorityControlPlaneError, match="may only serve"):
@@ -137,9 +164,7 @@ def test_darwin_backend_serves_only_frontend_peers(
     assert stat.S_ISSOCK(info.st_mode)
     assert stat.S_IMODE(info.st_mode) == 0o600
     try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-            client.settimeout(5)
-            client.connect(str(short_root / "backend.sock"))
+        with _connect_when_listening(short_root / "backend.sock") as client:
             request = json.dumps(
                 {"protocol": AUTHORITYD_PROTOCOL, "operation": "unknown-op"}
             ).encode("utf-8")
@@ -190,9 +215,7 @@ def test_darwin_backend_rejects_wrong_peer_uid(
     while time.time() < deadline and not (short_root / "backend.sock").exists():
         time.sleep(0.05)
     try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-            client.settimeout(5)
-            client.connect(str(short_root / "backend.sock"))
+        with _connect_when_listening(short_root / "backend.sock") as client:
             client.sendall(b'{"protocol":1,"operation":"unknown"}\n')
             deadline = time.time() + 5
             data = b""
