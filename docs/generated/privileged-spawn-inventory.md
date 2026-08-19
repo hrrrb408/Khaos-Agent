@@ -25,8 +25,8 @@
 - `python/khaos/coding/execution/supervisor.py:1594` `subprocess.run` in `<module>._darwin_deleted_open_file_usage` owner=`ProcessSupervisor` threat-model=`child-tree-lifecycle` boundary=`execution-service`
 - `python/khaos/coding/planning/verification_sandbox.py:379` `asyncio.create_subprocess_exec` in `<module>._spawn_docker_process` owner=`VerificationSandbox` threat-model=`trusted-docker-verification` boundary=`verification-authority`
 - `python/khaos/coding/workspace/trusted_git.py:560` `asyncio.create_subprocess_exec` in `<module>.spawn` owner=`TrustedGitRunner` threat-model=`untrusted-repository-config` boundary=`workspace-control-plane`
-- `python/khaos/coding/workspace/trusted_git.py:2237` `subprocess.run` in `<module>.run_sync` owner=`TrustedGitRunner` threat-model=`untrusted-repository-config` boundary=`workspace-control-plane`
-- `python/khaos/coding/workspace/trusted_git.py:2318` `subprocess.run` in `<module>.run_sync_bytes` owner=`TrustedGitRunner` threat-model=`untrusted-repository-config` boundary=`workspace-control-plane`
+- `python/khaos/coding/workspace/trusted_git.py:2246` `subprocess.run` in `<module>.run_sync` owner=`TrustedGitRunner` threat-model=`untrusted-repository-config` boundary=`workspace-control-plane`
+- `python/khaos/coding/workspace/trusted_git.py:2327` `subprocess.run` in `<module>.run_sync_bytes` owner=`TrustedGitRunner` threat-model=`untrusted-repository-config` boundary=`workspace-control-plane`
 - `python/khaos/security/browser_sandbox.py:915` `subprocess.run` in `<module>._assert_resource_names_available` owner=`BrowserKernel` threat-model=`privileged-netns-and-nft` boundary=`browser-kernel`
 - `python/khaos/security/browser_sandbox.py:1164` `subprocess.run` in `<module>._apply_nft_script` owner=`BrowserKernel` threat-model=`privileged-netns-and-nft` boundary=`browser-kernel`
 - `python/khaos/security/browser_sandbox.py:1178` `subprocess.run` in `<module>._apply_nft_script` owner=`BrowserKernel` threat-model=`privileged-netns-and-nft` boundary=`browser-kernel`

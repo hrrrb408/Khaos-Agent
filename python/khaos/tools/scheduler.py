@@ -2531,6 +2531,7 @@ class ToolScheduler:
         principal_kind = str(tool_context.get("principal_kind") or "")
         parent_principal_id = str(tool_context.get("parent_principal_id") or "")
         delegation_digest = str(tool_context.get("delegation_digest") or "")
+        step_source_transport = str(tool_context.get("source_transport") or "")
         if tool_context.get("production_runtime") and not all(
             (principal_kind, parent_principal_id, delegation_digest)
         ):
@@ -2723,6 +2724,7 @@ class ToolScheduler:
                 principal_kind=principal_kind,
                 parent_principal_id=parent_principal_id,
                 delegation_digest=delegation_digest,
+                source_transport=step_source_transport,
             )
             call["_spawn_plan"] = spawn_plan
         elif not isinstance(spawn_plan, ResolvedSpawnPlan):
@@ -3456,6 +3458,7 @@ def _build_spawn_plan(
     principal_kind: str = "",
     parent_principal_id: str = "",
     delegation_digest: str = "",
+    source_transport: str = "",
 ) -> ResolvedSpawnPlan:
     """Create one immutable, pre-approval spawn authority."""
     arguments = call.get("arguments", {})
@@ -3518,6 +3521,7 @@ def _build_spawn_plan(
         principal_kind=principal_kind,
         parent_principal_id=parent_principal_id,
         delegation_digest=delegation_digest,
+        source_transport=source_transport,
     )
 
 

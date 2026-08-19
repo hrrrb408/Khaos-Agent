@@ -1697,6 +1697,7 @@ def _issue_execution_capability(
         parent_principal_id=step.parent_principal_id,
         session_id=step.session_id,
         delegation_digest=step.delegation_digest,
+        source_transport=step.source_transport,
     )
     capability = broker.issue(
         envelope,

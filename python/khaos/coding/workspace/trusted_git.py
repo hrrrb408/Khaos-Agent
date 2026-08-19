@@ -1218,6 +1218,15 @@ class TrustedGitRunner:
                 "GIT_TERMINAL_PROMPT",
                 "GIT_ASKPASS",
                 "SSH_ASKPASS",
+                # These are THIS runner's own pinned plumbing values, not
+                # inherited caller state: index-scoped plumbing and the
+                # pinned pagers are authority-chosen and must survive the
+                # scrub that strips the same names from untrusted spawns.
+                "GIT_INDEX_FILE",
+                "GIT_PAGER",
+                "PAGER",
+                "GIT_OBJECT_DIRECTORY",
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
             },
         )
 
