@@ -2515,7 +2515,17 @@ def serve_unix(daemon: AuthorityDaemon, *, production: bool = True) -> None:
         daemon.socket_path.unlink()
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
-        listener.bind(str(daemon.socket_path))
+        # bind() creates the socket inode with 0777 & ~umask, so an
+        # ambient 022 umask would briefly expose a 0755 socket before
+        # the chmod below.  Force the restrictive mode at creation time:
+        # the socket must never be observable with a mode looser than
+        # the configured one, and only the explicit agent-group mode
+        # (0660) may widen it before listen().
+        previous_umask = os.umask(0o177)
+        try:
+            listener.bind(str(daemon.socket_path))
+        finally:
+            os.umask(previous_umask)
         configured_mode = os.environ.get("KHAOS_AUTHORITYD_SOCKET_MODE", "0600")
         try:
             socket_mode = int(configured_mode, 8)
