@@ -10,6 +10,28 @@ _PINNED_GIT_CONFIG_SUPPRESSIONS = frozenset(
     {"GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"}
 )
 
+# Git reinterprets these variables as configuration or executable hooks:
+# GIT_EXTERNAL_DIFF runs an arbitrary helper for `git diff`, the
+# GIT_CONFIG_KEY_n/GIT_CONFIG_VALUE_n pairs enumerate inline `-c` config,
+# and GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE/GIT_OBJECT_DIRECTORY retarget
+# which repository the command operates on.  None of them may cross an
+# untrusted spawn boundary, or a SAFE-classified read-only git command's
+# real executable graph silently diverges from its classified argv.
+GIT_SEMANTIC_ENV = frozenset(
+    {
+        "GIT_EXTERNAL_DIFF",
+        "GIT_PAGER",
+        "PAGER",
+        "GIT_CONFIG_COUNT",
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    }
+)
+_GIT_SEMANTIC_PREFIXES = ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
+
 # Exact names cover provider credentials, local capability handles, credential
 # stores, and transport endpoints that are commonly present in a developer
 # shell.  The suffix rules below cover provider-specific names without
@@ -90,6 +112,8 @@ def is_non_inheritable_secret_key(
     upper = key.upper()
     return (
         key in NON_INHERITABLE_SECRET_ENV
+        or key in GIT_SEMANTIC_ENV
+        or upper.startswith(_GIT_SEMANTIC_PREFIXES)
         or upper.endswith(_SECRET_SUFFIXES)
         or _SECRET_NAME.search(upper) is not None
     )

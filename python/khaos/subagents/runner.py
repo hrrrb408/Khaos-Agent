@@ -159,6 +159,14 @@ class SubAgentRunner:
         # the runtime construction raises ValueError.  No implicit
         # local-uid fallback in the build_runtime path.
         principal_id = task.principal_id or self.principal_id
+        if task.delegation_digest:
+            # The child delegation was issued to the typed execution
+            # subject ``subagent:<owner>:<task-id>``; the runtime's
+            # authority principal must be exactly that subject or the
+            # authority-side grant check (delegation subject match) fails
+            # closed.  DB ownership stays task.principal_id (the owner);
+            # this value is only the security principal.
+            principal_id = f"subagent:{principal_id}:{task.id}"
         # Production-safe subagents use the structural config that cannot
         # carry a second scheduler, execution service, sandbox, network
         # guard, memory owner, browser manager, or workspace manager.  The

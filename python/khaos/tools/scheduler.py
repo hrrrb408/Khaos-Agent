@@ -12,6 +12,7 @@ import shlex
 import time
 import uuid
 from collections.abc import Awaitable, Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, cast
@@ -551,6 +552,15 @@ class ToolScheduler:
         self._operation_events: dict[str, asyncio.Event] = {}
         self._operation_claims: dict[str, _OperationClaim] = {}
         self._operation_claim_lock = asyncio.Lock()
+        # Synchronous confirm callbacks (UI/gateway adapters) run here,
+        # never on the loop's default executor: a hanging callback may
+        # occupy one of the bounded workers forever — that later approvals
+        # then fail closed on their own deadline is the intended bound,
+        # where before they accumulated leaked default-executor threads
+        # and eventually starved unrelated asyncio.to_thread users.
+        self._approval_executor = ThreadPoolExecutor(
+            max_workers=4, thread_name_prefix="khaos-approval-callback"
+        )
 
     def set_office_authority(self, authority: Any) -> None:
         """Register the shared OfficeMutationAuthority (called at startup)."""
@@ -3197,12 +3207,15 @@ class ToolScheduler:
             else:
                 # UI and gateway integrations may supply a synchronous
                 # callback.  It is untrusted with respect to latency, so run
-                # it off-loop and apply the same approval deadline as an
-                # asynchronous callback.  A timed-out worker cannot be
-                # force-killed, but it no longer starves scheduling or
-                # shutdown and its late result is discarded.
+                # it off-loop on the dedicated bounded approval executor and
+                # apply the same approval deadline as an asynchronous
+                # callback.  A timed-out worker cannot be force-killed; the
+                # bounded pool turns a hang into later fail-closed denials
+                # instead of an unbounded thread leak.
                 value = await asyncio.wait_for(
-                    asyncio.to_thread(confirm_callback, payload),
+                    asyncio.get_running_loop().run_in_executor(
+                        self._approval_executor, confirm_callback, payload
+                    ),
                     timeout=remaining,
                 )
         except TimeoutError:

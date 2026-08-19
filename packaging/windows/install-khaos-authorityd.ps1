@@ -39,6 +39,10 @@ if (-not (Test-Path -LiteralPath $ProtectedKeyPath -PathType Leaf)) {
         # Provision DPAPI-protected material under the SYSTEM identity via
         # a one-shot scheduled task: CryptProtectData scope must match the
         # service's own security context, never the caller's.
+        # The entropy literal below must stay byte-identical to the Rust
+        # CryptUnprotectData entropy in
+        # rust/khaos-core/src/bin/khaos-authorityd-windows.rs: DPAPI refuses
+        # to decrypt when the optional entropy does not match.
         $provisionScript = Join-Path $env:TEMP 'khaos-provision-dpapi.ps1'
         @(
             '$ErrorActionPreference = "Stop"'

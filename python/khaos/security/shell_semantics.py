@@ -475,8 +475,16 @@ def _command_is_literal_read_only(command: ShellCommandNode) -> bool:
     under the defined execution model — never merely that the executable
     or subcommand name looks read-only.
     """
-
+    raw_word = next(
+        (word.text for word in command.words if not word.assignment), ""
+    )
     executable = command.executable
+    # A path-qualified executable is NOT the system binary its basename
+    # names: ``/workspace/ls`` must never inherit the read-only
+    # classification of the system ``ls`` — only bare names, resolved
+    # through the scrubbed trusted spawn PATH, may be classified.
+    if raw_word != executable:
+        return False
     if executable in MUTATING_EXECUTABLES or executable in SHELL_EVALUATORS:
         if executable == "git":
             return _git_argv_is_read_only(command)

@@ -368,6 +368,55 @@ def test_adapter_rejects_unsigned_and_cross_transport_responses(tmp_path: Path) 
         )
 
 
+def test_probe_constructs_complete_proof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vertical probe test: _probe() -> _verify_attestation() -> proof.
+
+    Regression: _probe() used to build the proof payload WITHOUT the three
+    *_verified booleans, so every real probe (as opposed to unit tests that
+    hand-crafted payloads) failed closed in from_payload() with "fields
+    incomplete" — macOS/Windows adapters could never initialize.  Only the
+    native subprocess boundary is faked (routed to an in-process daemon);
+    the whole Python-side chain runs for real.
+    """
+    daemon = _daemon(tmp_path)
+    adapter = _adapter(tmp_path)
+    adapter.client = tmp_path / "native-client"
+
+    def fake_native_call(
+        executable: object,
+        arguments: tuple[str, ...],
+        *,
+        input_bytes: bytes = b"",
+        timeout_seconds: float,
+        extra_environment: dict[str, str] | None = None,
+    ) -> bytes:
+        assert "--probe" in arguments
+        challenge = arguments[arguments.index("--challenge") + 1]
+        response = _attested_response(
+            daemon,
+            challenge=challenge,
+            request=PROBE_INNER_REQUEST.encode("utf-8"),
+        )
+        return json.dumps(response).encode("utf-8")
+
+    monkeypatch.setattr(
+        "khaos.security.native_authority._bounded_native_call", fake_native_call
+    )
+    proof = adapter._probe()
+    assert proof.platform == "darwin"
+    assert proof.transport == "xpc"
+    assert proof.service_id == "com.khaos.authorityd"
+    assert proof.service_instance_id == "d" * 32
+    assert proof.protected_key_ref == "khaos-authority-signing-key"
+    assert proof.peer_verified is True
+    assert proof.transport_verified is True
+    assert proof.protected_key_verified is True
+    # The proof must answer the exact challenge the probe issued.
+    assert proof.challenge_digest
+
+
 def test_probe_inner_request_matches_frontend_constant() -> None:
     """The C/Rust frontends hardcode the probe request bytes; they must
     hash to exactly what the Python adapter expects."""

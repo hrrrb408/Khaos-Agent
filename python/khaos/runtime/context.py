@@ -36,6 +36,7 @@ from khaos.security.principals import (
     PrincipalKind,
     principal_for_transport,
     principal_from_kind,
+    transport_root_delegation_digest,
 )
 
 
@@ -70,22 +71,19 @@ def _transport_delegation_digest(
     The commitment is deliberately only an identity binding.  The
     independent authority still decides whether this root may issue an
     effect; it is not a Python-side permission grant or a fallback authority.
+    The recipe lives in khaos.security.principals so the authority daemon
+    can recompute and check the identical commitment at grant time.
     """
-    payload = {
-        "schema_version": 1,
-        "kind": "transport-root-delegation",
-        "principal_id": principal_id,
-        "principal_kind": principal_kind,
-        "parent_principal_id": parent_principal_id,
-        "project_id": project_id,
-        "session_id": session_id,
-        "runtime_id": runtime_id,
-        "source_transport": source_transport,
-        "policy_digest": policy_digest,
-    }
-    return hashlib.sha256(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
+    return transport_root_delegation_digest(
+        principal_id=principal_id,
+        principal_kind=principal_kind,
+        parent_principal_id=parent_principal_id,
+        project_id=project_id,
+        session_id=session_id,
+        runtime_id=runtime_id,
+        source_transport=source_transport,
+        policy_digest=policy_digest,
+    )
 
 
 @dataclass(frozen=True)

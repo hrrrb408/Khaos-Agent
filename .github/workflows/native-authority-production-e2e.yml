@@ -69,6 +69,13 @@ jobs:
       - name: Create the dedicated authority user and group
         run: |
           set -eu
+          # PrimaryGroupID below names the group by GID: without a real
+          # /Groups/khaos-authority record, chown user:group and launchd's
+          # group resolution cannot resolve the identity.
+          if ! dscl . -read /Groups/khaos-authority PrimaryGroupID >/dev/null 2>&1; then
+            sudo dscl . -create /Groups/khaos-authority PrimaryGroupID 505
+            sudo dscl . -create /Groups/khaos-authority RealName "Khaos Authority Service"
+          fi
           if ! dscl . -read /Users/khaos-authority UniqueID >/dev/null 2>&1; then
             sudo dscl . -create /Users/khaos-authority UniqueID 505
             sudo dscl . -create /Users/khaos-authority PrimaryGroupID 505
@@ -118,6 +125,24 @@ jobs:
             "$(command -v uv)" run --project . python -c \
             "from pathlib import Path; from khaos.security.authorityd_protocol import Ed25519KeyStore; k=Ed25519KeyStore.load_or_create(Path('/var/db/khaos-authorityd/authorityd.pem')); Path('/var/run/khaos-authorityd/authorityd.pub').write_bytes(k.public_key().public_bytes_raw())"
           sudo chmod 0644 /var/run/khaos-authorityd/authorityd.pub
+      - name: Provision the protected-key Keychain item for the authority identity
+        run: |
+          set -eu
+          # The XPC frontend fails closed unless a generic-password item with
+          # account=khaos-authority-signing-key exists in the access group
+          # its entitlement names.  The `security` CLI cannot set
+          # kSecAttrAccessGroup, so the signed provisioner (same entitlements
+          # as the frontend) creates the item.  The item is a random presence
+          # marker: the attestation signing key stays the file Ed25519 key.
+          AUTHORITY_HOME=/var/db/khaos-authorityd
+          sudo -u khaos-authority mkdir -p "$AUTHORITY_HOME/Library/Keychains"
+          if ! sudo -u khaos-authority env HOME="$AUTHORITY_HOME" security show-keychain-info "$AUTHORITY_HOME/Library/Keychains/login.keychain-db" >/dev/null 2>&1; then
+            sudo -u khaos-authority env HOME="$AUTHORITY_HOME" security create-keychain -p "$(uuidgen)" "$AUTHORITY_HOME/Library/Keychains/login.keychain-db"
+          fi
+          sudo -u khaos-authority env HOME="$AUTHORITY_HOME" security list-keychains -d user -s "$AUTHORITY_HOME/Library/Keychains/login.keychain-db"
+          sudo -u khaos-authority env HOME="$AUTHORITY_HOME" \
+            /usr/local/libexec/khaos-authorityd-keychain-provision \
+            khaos-authority-signing-key "${KHAOS_TEAM_ID}.com.khaos.authority"
       - name: Run a real TLS WORM audit receiver for the backend
         run: |
           set -eu
@@ -140,6 +165,7 @@ jobs:
           set -eu
           sudo cp native-bin/khaos-authorityd-xpc /usr/local/libexec/khaos-authorityd-xpc
           sudo cp native-bin/khaos-authorityd-xpc-client /usr/local/libexec/khaos-authorityd-xpc-client
+          sudo cp native-bin/khaos-authorityd-keychain-provision /usr/local/libexec/khaos-authorityd-keychain-provision
           # Backend wrapper runs the Python authority daemon under the
           # authority identity.
           VENV_PY="$(uv run --project . which python)"
@@ -157,7 +183,7 @@ jobs:
           KHAOS_AUTHORITYD_SERVICE_CODE_SIGNATURE=khaos-authorityd-xpc
           KHAOS_AUTHORITYD_SERVICE_CODE_REQUIREMENT=identifier "khaos-authorityd-xpc" and anchor apple generic and certificate leaf[subject.OU] = KHAOS_TEAM_ID_PLACEHOLDER
           ENVEOF
-          sudo sed -i '' "s/KHAOS_AUTHORITYD_KEYCHAIN_GROUP_PLACEHOLDER/${KHAOS_TEAM_ID}.khaos.authority/" /etc/khaos/native-authority.env
+          sudo sed -i '' "s/KHAOS_AUTHORITYD_KEYCHAIN_GROUP_PLACEHOLDER/${KHAOS_TEAM_ID}.com.khaos.authority/" /etc/khaos/native-authority.env
           sudo sed -i '' "s/KHAOS_TEAM_ID_PLACEHOLDER/${KHAOS_TEAM_ID}/g" /etc/khaos/native-authority.env
           sudo chmod 0600 /etc/khaos/native-authority.env
           sudo chown root:wheel /etc/khaos/native-authority.env
@@ -173,7 +199,7 @@ jobs:
         env:
           KHAOS_AUTHORITYD_LAUNCHD_SERVICE: com.khaos.authorityd
           KHAOS_AUTHORITYD_PROTECTED_KEY_REF: khaos-authority-signing-key
-          KHAOS_AUTHORITYD_KEYCHAIN_GROUP: ${{ secrets.KHAOS_MACOS_TEAM_ID }}.khaos.authority
+          KHAOS_AUTHORITYD_KEYCHAIN_GROUP: ${{ secrets.KHAOS_MACOS_TEAM_ID }}.com.khaos.authority
           KHAOS_AUTHORITYD_AGENT_CODE_SIGNATURE: com.khaos.agent
           KHAOS_AUTHORITYD_AGENT_CODE_REQUIREMENT: identifier "com.khaos.agent" and anchor apple generic and certificate leaf[subject.OU] = ${{ secrets.KHAOS_MACOS_TEAM_ID }}
           KHAOS_AUTHORITYD_PUBLIC_KEY_PATH: /var/run/khaos-authorityd/authorityd.pub
@@ -187,7 +213,7 @@ jobs:
         env:
           KHAOS_AUTHORITYD_LAUNCHD_SERVICE: com.khaos.authorityd
           KHAOS_AUTHORITYD_PROTECTED_KEY_REF: khaos-authority-signing-key
-          KHAOS_AUTHORITYD_KEYCHAIN_GROUP: ${{ secrets.KHAOS_MACOS_TEAM_ID }}.khaos.authority
+          KHAOS_AUTHORITYD_KEYCHAIN_GROUP: ${{ secrets.KHAOS_MACOS_TEAM_ID }}.com.khaos.authority
           KHAOS_AUTHORITYD_AGENT_CODE_SIGNATURE: com.khaos.agent
           KHAOS_AUTHORITYD_AGENT_CODE_REQUIREMENT: identifier "com.khaos.agent" and anchor apple generic and certificate leaf[subject.OU] = ${{ secrets.KHAOS_MACOS_TEAM_ID }}
           KHAOS_AUTHORITYD_PUBLIC_KEY_PATH: /var/run/khaos-authorityd/authorityd.pub

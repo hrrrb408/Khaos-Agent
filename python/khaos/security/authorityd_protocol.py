@@ -660,6 +660,7 @@ class AuthorityDaemonClient:
         parent_principal_id: str = "",
         session_id: str = "",
         delegation_digest: str = "",
+        source_transport: str = "",
     ) -> tuple[str, float]:
         response = self.request(
             {
@@ -679,6 +680,7 @@ class AuthorityDaemonClient:
                 "parent_principal_id": parent_principal_id,
                 "session_id": session_id,
                 "delegation_digest": delegation_digest,
+                "source_transport": source_transport,
             }
         )
         try:
@@ -812,6 +814,8 @@ class AuthorityDaemonClient:
         operation_family: str,
         resource_scope: list[str],
         expires_at: float,
+        task_id: str | None = None,
+        workspace_id: str | None = None,
     ) -> DelegationScope:
         """Issue one narrow child delegation from a live parent scope."""
         response = self.request(
@@ -823,6 +827,8 @@ class AuthorityDaemonClient:
                 "operation_family": operation_family,
                 "resource_scope": resource_scope,
                 "expires_at": expires_at,
+                "task_id": task_id or "",
+                "workspace_id": workspace_id or "",
             }
         )
         return DelegationScope.from_payload(response.get("delegation"))

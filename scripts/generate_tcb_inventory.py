@@ -100,7 +100,10 @@ TCB_OWNERS: dict[str, tuple[tuple[str, str, str], ...]] = {
         ),
         (
             "khaos-authorityd (backend daemon)",
-            "Ed25519 signing key, protected at rest by the platform (keychain/DPAPI/0600)",
+            "Ed25519 signing key held as a 0400 file owned by the authority "
+            "UID; the platform keychain (macOS) / DPAPI (Windows) item is a "
+            "protected-key-slot presence marker bound to the service "
+            "identity, NOT the signing key itself",
             "agent holds only the public verification key",
         ),
         (

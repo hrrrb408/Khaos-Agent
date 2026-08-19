@@ -16,6 +16,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 EXPECTED_REPOSITORY = "hrrrb408/Khaos-Agent"
 
@@ -207,6 +208,11 @@ def verify_evidence_manifests(
       macOS + Windows);
     - when ``require_all_types`` is set, every required proof type must
       be present exactly once.
+
+    These are all *local* consistency checks: they cannot tell a genuinely
+    CI-produced manifest from a locally synthesized one whose strings look
+    right.  Callers that decide closure must additionally pass the manifests
+    through :func:`verify_manifests_against_github`.
     """
     errors: list[str] = []
     seen_types: dict[str, str] = {}
@@ -252,6 +258,119 @@ def verify_evidence_manifests(
         errors=tuple(errors),
         proof_types=frozenset(seen_types),
     )
+
+
+def verify_manifests_against_github(
+    manifests: list[SecurityEvidenceManifest],
+    *,
+    fetch_json: Callable[[str], object],
+    fetch_artifact: Callable[[str], bytes],
+    expected_repository: str = EXPECTED_REPOSITORY,
+) -> EvidenceVerification:
+    """Re-resolve every manifest against the live GitHub Actions API.
+
+    A locally VERIFIED bundle is attacker-controlled input until each
+    manifest is re-queried at the trust root: the workflow run must exist
+    with the claimed head SHA, workflow name, and ``success`` conclusion;
+    the claimed job must exist in that run with a ``success`` conclusion;
+    and the claimed artifact must exist and its downloaded bytes must hash
+    to the manifest's ``artifact_sha256``.  A well-formed manifest naming a
+    nonexistent run/job/artifact — the forgery that pure local verification
+    accepts — fails closed here.
+
+    ``fetch_json(path)`` must return parsed JSON for a GitHub API path
+    (raising on any HTTP error); ``fetch_artifact(artifact_id)`` must
+    return the raw artifact bytes (raising on any error).  Both are
+    injected so tests can supply deterministic doubles.
+    """
+    errors: list[str] = []
+    seen_types: dict[str, str] = {}
+    for manifest in manifests:
+        label = f"{manifest.proof_type}:{manifest.artifact_id}"
+        try:
+            run = _require_mapping(
+                fetch_json(f"repos/{expected_repository}/actions/runs/{manifest.workflow_run_id}"),
+                label,
+            )
+            if run.get("head_sha") != manifest.commit_sha:
+                errors.append(f"{label}: GitHub run head SHA does not match the manifest commit")
+            if run.get("name") != manifest.workflow_name:
+                errors.append(
+                    f"{label}: GitHub run workflow is {run.get('name')!r}, "
+                    f"manifest claims {manifest.workflow_name!r}"
+                )
+            if run.get("conclusion") != "success":
+                errors.append(
+                    f"{label}: GitHub run conclusion is {run.get('conclusion')!r}"
+                )
+        except Exception as exc:  # noqa: BLE001 - any lookup failure fails closed
+            errors.append(f"{label}: GitHub run lookup failed ({exc})")
+            continue
+        try:
+            jobs_payload = _require_mapping(
+                fetch_json(
+                    f"repos/{expected_repository}/actions/runs/{manifest.workflow_run_id}/jobs?per_page=100"
+                ),
+                label,
+            )
+            jobs = jobs_payload.get("jobs")
+            if not isinstance(jobs, list):
+                raise ValueError("jobs payload is malformed")
+            if jobs_payload.get("total_count", len(jobs)) > 100:
+                raise ValueError("run has more jobs than one page can prove")
+            job = next(
+                (entry for entry in jobs if str(entry.get("id")) == str(manifest.job_id)),
+                None,
+            )
+            if job is None:
+                errors.append(f"{label}: claimed job {manifest.job_id} does not exist in the GitHub run")
+            elif job.get("conclusion") != "success":
+                errors.append(
+                    f"{label}: GitHub job conclusion is {job.get('conclusion')!r}"
+                )
+        except Exception as exc:  # noqa: BLE001 - any lookup failure fails closed
+            errors.append(f"{label}: GitHub job lookup failed ({exc})")
+        try:
+            artifacts_payload = _require_mapping(
+                fetch_json(
+                    f"repos/{expected_repository}/actions/runs/{manifest.workflow_run_id}/artifacts?per_page=100"
+                ),
+                label,
+            )
+            artifacts = artifacts_payload.get("artifacts")
+            if not isinstance(artifacts, list):
+                raise ValueError("artifacts payload is malformed")
+            artifact = next(
+                (
+                    entry
+                    for entry in artifacts
+                    if str(entry.get("id")) == str(manifest.artifact_id)
+                ),
+                None,
+            )
+            if artifact is None:
+                raise ValueError(f"artifact {manifest.artifact_id} does not exist in the GitHub run")
+            if artifact.get("name") != manifest.artifact_name:
+                raise ValueError("artifact name does not match the manifest")
+            if artifact.get("expired") is True:
+                raise ValueError("artifact has expired and cannot be re-verified")
+            payload = fetch_artifact(str(manifest.artifact_id))
+            digest = hashlib.sha256(payload).hexdigest()
+            if digest != manifest.artifact_sha256:
+                raise ValueError("downloaded artifact digest does not match the manifest")
+        except Exception as exc:  # noqa: BLE001 - any lookup failure fails closed
+            errors.append(f"{label}: GitHub artifact verification failed ({exc})")
+    return EvidenceVerification(
+        ok=not errors,
+        errors=tuple(errors),
+        proof_types=frozenset(seen_types),
+    )
+
+
+def _require_mapping(value: object, label: str) -> dict:
+    if not isinstance(value, dict):
+        raise ValueError(f"{label}: API response is not an object")
+    return value
 
 
 def verify_artifact_digest(manifest: SecurityEvidenceManifest, path: Path) -> None:

@@ -42,6 +42,21 @@ from khaos.security.authorityd_protocol import (
     SignedAuthorizationReceipt,
     derive_resource_digest,
 )
+from khaos.security.principals import transport_root_delegation_digest
+
+# Canonical transport-root commitment for the standard typed-principal test
+# context: grants must recompute and match exactly this (an arbitrary
+# 64-hex string is no longer an acceptable delegation provenance).
+_TEST_TRANSPORT_DELEGATION = transport_root_delegation_digest(
+    principal_id="agent",
+    principal_kind="human",
+    parent_principal_id="human:agent",
+    project_id="project",
+    session_id="session",
+    runtime_id="runtime",
+    source_transport="pytest",
+    policy_digest="policy-digest",
+)
 from khaos.security.network_broker import NetworkBroker, NetworkBrokerError
 from khaos.security.resource_scope import GitRefScope, TypedResourcePartialOrder
 
@@ -634,7 +649,8 @@ def test_production_daemon_requires_live_grant_and_same_operation_family(
         principal_kind="human",
         parent_principal_id="human:agent",
         session_id="session",
-        delegation_digest="a" * 64,
+        delegation_digest=_TEST_TRANSPORT_DELEGATION,
+        source_transport="pytest",
     )
     context_digest = authorityd_module._digest(
         {
@@ -650,7 +666,7 @@ def test_production_daemon_requires_live_grant_and_same_operation_family(
             "principal_kind": "human",
             "parent_principal_id": "human:agent",
             "session_id": "session",
-            "delegation_digest": "a" * 64,
+            "delegation_digest": _TEST_TRANSPORT_DELEGATION,
         }
     )
     intent = AuthorizationIntent(
@@ -670,7 +686,7 @@ def test_production_daemon_requires_live_grant_and_same_operation_family(
         principal_kind="human",
         parent_principal_id="human:agent",
         session_id="session",
-        delegation_digest="a" * 64,
+        delegation_digest=_TEST_TRANSPORT_DELEGATION,
     )
     with pytest.raises(AuthorityControlPlaneError, match="resource"):
         daemon.prepare(replace(intent, resource_digest="unrelated-resource"))
@@ -735,7 +751,8 @@ def test_expired_typed_child_receipt_renews_only_issued_action_and_scope(
         principal_kind="human",
         parent_principal_id="human:agent",
         session_id="session",
-        delegation_digest="a" * 64,
+        delegation_digest=_TEST_TRANSPORT_DELEGATION,
+        source_transport="pytest",
     )
     context_digest = authorityd_module._digest(
         {
@@ -751,7 +768,7 @@ def test_expired_typed_child_receipt_renews_only_issued_action_and_scope(
             "principal_kind": "human",
             "parent_principal_id": "human:agent",
             "session_id": "session",
-            "delegation_digest": "a" * 64,
+            "delegation_digest": _TEST_TRANSPORT_DELEGATION,
         }
     )
     parent_intent = AuthorizationIntent(
@@ -771,7 +788,7 @@ def test_expired_typed_child_receipt_renews_only_issued_action_and_scope(
         principal_kind="human",
         parent_principal_id="human:agent",
         session_id="session",
-        delegation_digest="a" * 64,
+        delegation_digest=_TEST_TRANSPORT_DELEGATION,
     )
     parent_receipt = daemon.prepare(parent_intent)
     child_receipt = daemon.narrow(

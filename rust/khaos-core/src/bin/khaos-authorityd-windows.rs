@@ -21,13 +21,17 @@ mod windows_authority {
     use std::os::windows::ffi::OsStrExt;
     use std::path::Path;
     use std::ptr::{null, null_mut};
+    use std::sync::OnceLock;
 
     use sha2::Digest;
     use windows_sys::Win32::Foundation::{
         CloseHandle, GetLastError, LocalFree, HANDLE, INVALID_HANDLE_VALUE,
     };
     use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
-    use windows_sys::Win32::Security::Cryptography::{CryptUnprotectData, CRYPT_INTEGER_BLOB};
+    use windows_sys::Win32::Security::Cryptography::{
+        BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG, CryptUnprotectData,
+        CRYPT_INTEGER_BLOB,
+    };
     use windows_sys::Win32::Security::{
         GetTokenInformation, TokenGroups, TokenUser, TOKEN_GROUPS, TOKEN_QUERY, TOKEN_USER,
     };
@@ -246,12 +250,21 @@ mod windows_authority {
             cbData: encrypted.len() as u32,
             pbData: encrypted.as_ptr() as *mut u8,
         };
+        // Must stay byte-identical to the installer's Protect entropy in
+        // packaging/windows/install-khaos-authorityd.ps1: DPAPI refuses to
+        // decrypt when the optional entropy does not match, so a mismatch
+        // here made every provisioned marker undecryptable.
+        let entropy_bytes: &[u8] = b"khaos-authorityd-key-marker";
+        let entropy = CRYPT_INTEGER_BLOB {
+            cbData: entropy_bytes.len() as u32,
+            pbData: entropy_bytes.as_ptr() as *mut u8,
+        };
         let mut output = CRYPT_INTEGER_BLOB {
             cbData: 0,
             pbData: null_mut(),
         };
         let ok = unsafe {
-            CryptUnprotectData(&input, null_mut(), null(), null(), null(), 0, &mut output)
+            CryptUnprotectData(&input, null_mut(), &entropy, null(), null(), 0, &mut output)
         } != 0;
         if output.pbData != null_mut() {
             unsafe { LocalFree(output.pbData.cast()) };
@@ -290,15 +303,31 @@ mod windows_authority {
     }
 
     fn service_instance_id() -> String {
-        // A per-run instance identity binds every proof to one service
-        // process lifetime.  It is derived from the pid and the monotonic
-        // wall clock so two consecutive service instances never share it.
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|value| value.as_nanos())
-            .unwrap_or(0);
-        let mixed = format!("{}|{}", std::process::id(), nanos);
-        format!("{:x}", sha2::Sha256::digest(mixed.as_bytes()))[..32].to_string()
+        // Process-lifetime instance identity, mirroring the macOS XPC
+        // frontend: generated once per process from the system CSPRNG and
+        // stable until restart.  Recomputing it per request changed the id
+        // between the adapter's probe and its first real request, tripping
+        // the "service instance changed mid-session" verifier on every
+        // session.  A CSPRNG failure is fatal (exit 78): never degrade to a
+        // guessable time-derived id.
+        static INSTANCE: OnceLock<String> = OnceLock::new();
+        INSTANCE
+            .get_or_init(|| {
+                let mut entropy = [0u8; 16];
+                let status = unsafe {
+                    BCryptGenRandom(
+                        null_mut(),
+                        entropy.as_mut_ptr(),
+                        entropy.len() as u32,
+                        BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+                    )
+                };
+                if status != 0 {
+                    std::process::exit(78);
+                }
+                format!("{:x}", sha2::Sha256::digest(entropy))[..32].to_string()
+            })
+            .clone()
     }
 
     fn agent_requirement_digest() -> String {
@@ -668,7 +697,7 @@ mod windows_authority {
                 unsafe { CloseHandle(handle) };
                 return Err("CreateEventW failed for the connect event".to_string());
             }
-            unsafe { overlapped.hEvent = connect_event };
+            overlapped.hEvent = connect_event;
             let connect_result = unsafe { ConnectNamedPipe(handle, &mut overlapped) };
             let connect_error = unsafe { GetLastError() };
             let connected = if connect_result != 0 {

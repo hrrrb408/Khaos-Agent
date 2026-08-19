@@ -627,6 +627,12 @@ class _SubprocessNativeAdapter:
         )
         # The proof object carries the digest of the challenge nonce this
         # attestation answered; freshness itself is the verified signature.
+        # The three *_verified booleans are the verdicts of the checks in
+        # _verify_attestation above: the signed peer identity fields (the
+        # backend attests the peer it admitted), the transport equality
+        # check, and the protected-key-ref equality check.  from_payload()
+        # requires all three; omitting them made every real probe fail
+        # closed at construction ("fields incomplete").
         proof_payload = {
             "platform": attestation["platform"],
             "transport": attestation["transport"],
@@ -644,6 +650,9 @@ class _SubprocessNativeAdapter:
             "challenge_digest": hashlib.sha256(
                 challenge.encode("ascii")
             ).hexdigest(),
+            "peer_verified": True,
+            "transport_verified": True,
+            "protected_key_verified": True,
         }
         return NativeAuthorityProof.from_payload(
             proof_payload,
