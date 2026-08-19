@@ -2482,21 +2482,14 @@ def serve_unix(daemon: AuthorityDaemon, *, production: bool = True) -> None:
     UID (the frontend's identity).  There is no same-user agent fallback.
     """
     backend_mode = sys.platform == "darwin"
-    if os.name == "nt":
-        raise AuthorityControlPlaneError(
-            "native authorityd transport is required on this platform; use the "
-            "Windows Named Pipe backend service"
-        )
-    contract = read_contract_from_environment()
-    if production:
-        contract.validate(production=True)
-        if contract.authority_uid is not None and os.geteuid() != contract.authority_uid:
-            raise IdentityIsolationError("authorityd is not running as its dedicated UID")
     if backend_mode:
         # The backend socket must be the one the native frontend forwards to,
         # and it must live under authority ownership.  Serving any other
         # darwin socket would expose a direct agent -> authorityd path that
-        # bypasses the XPC identity checks.
+        # bypasses the XPC identity checks.  This is a pure configuration
+        # check (path comparison only), so it runs before the platform
+        # transport check: a misconfigured backend socket is reported as a
+        # configuration error on every platform.
         expected_backend = os.environ.get("KHAOS_AUTHORITYD_BACKEND_SOCKET", "")
         if (
             not expected_backend
@@ -2507,6 +2500,16 @@ def serve_unix(daemon: AuthorityDaemon, *, production: bool = True) -> None:
                 "darwin authorityd may only serve the configured native "
                 "frontend backend socket"
             )
+    if os.name == "nt":
+        raise AuthorityControlPlaneError(
+            "native authorityd transport is required on this platform; use the "
+            "Windows Named Pipe backend service"
+        )
+    contract = read_contract_from_environment()
+    if production:
+        contract.validate(production=True)
+        if contract.authority_uid is not None and os.geteuid() != contract.authority_uid:
+            raise IdentityIsolationError("authorityd is not running as its dedicated UID")
     daemon.socket_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     if daemon.socket_path.exists():
         info = daemon.socket_path.lstat()

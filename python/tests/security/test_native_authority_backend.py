@@ -102,10 +102,12 @@ def test_darwin_backend_mode_rejects_foreign_socket(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Serving any darwin socket other than the frontend backend is refused."""
+    # Patching the global os.name to "posix" on Windows makes every later
+    # Path() construction instantiate PosixPath and crash the interpreter
+    # (NotImplementedError), including inside pytest's failure reporting.
+    # serve_unix validates the backend-socket binding before the platform
+    # transport check, so this test must not patch os.name at all.
     monkeypatch.setattr(sys, "platform", "darwin")
-    import khaos.security.authorityd as authorityd_module
-
-    monkeypatch.setattr(authorityd_module.os, "name", "posix", raising=False)
     monkeypatch.setenv("KHAOS_AUTHORITYD_BACKEND_SOCKET", str(tmp_path / "configured.sock"))
     daemon = _daemon(tmp_path)
     # daemon.socket_path differs from the configured backend socket.
@@ -116,12 +118,10 @@ def test_darwin_backend_mode_rejects_foreign_socket(
 def test_darwin_backend_mode_rejects_missing_backend_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # The backend-socket binding is validated before the platform transport
+    # check, so the darwin backend-mode branch is reachable on any platform
+    # without patching the global os.name (see foreign-socket test).
     monkeypatch.setattr(sys, "platform", "darwin")
-    # serve_unix guards on the real os.name before the darwin backend-mode
-    # validation; patch it so non-darwin runners reach the branch under test.
-    import khaos.security.authorityd as authorityd_module
-
-    monkeypatch.setattr(authorityd_module.os, "name", "posix", raising=False)
     monkeypatch.delenv("KHAOS_AUTHORITYD_BACKEND_SOCKET", raising=False)
     daemon = _daemon(tmp_path)
     with pytest.raises(AuthorityControlPlaneError, match="may only serve"):

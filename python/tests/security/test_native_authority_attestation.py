@@ -18,6 +18,7 @@ from pathlib import Path
 
 import pytest
 from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from khaos.security.authorityd import (
     AuthorityControlPlaneError,
     AuthorityDaemon,
@@ -203,6 +204,23 @@ def _adapter(tmp_path: Path) -> _FakeAdapter:
     return adapter
 
 
+def _public_key(adapter: _FakeAdapter) -> Ed25519PublicKey:
+    """Load the adapter's public key, tolerating transient file locks.
+
+    Windows runners can briefly hold an exclusive handle on a just-written
+    key file (antivirus/indexer); a momentary PermissionError must not be
+    reported as an attestation regression.  Bounded retry, then fail.
+    """
+    deadline = time.monotonic() + 5.0
+    while True:
+        try:
+            return adapter._load_public_key()
+        except NativeAuthorityError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.1)
+
+
 def test_adapter_accepts_fresh_signed_attestation(tmp_path: Path) -> None:
     daemon = _daemon(tmp_path)
     adapter = _adapter(tmp_path)
@@ -213,7 +231,7 @@ def test_adapter_accepts_fresh_signed_attestation(tmp_path: Path) -> None:
         response,
         challenge_nonce=challenge,
         request_bytes=request,
-        public_key=adapter._load_public_key(),
+        public_key=_public_key(adapter),
     )
     assert attestation["service_instance_id"] == "d" * 32
 
@@ -230,7 +248,7 @@ def test_adapter_rejects_replayed_nonce(tmp_path: Path) -> None:
             old_response,
             challenge_nonce=fresh_challenge,
             request_bytes=request,
-            public_key=adapter._load_public_key(),
+            public_key=_public_key(adapter),
         )
 
 
@@ -246,7 +264,7 @@ def test_adapter_rejects_substituted_request_digest(tmp_path: Path) -> None:
             response,
             challenge_nonce="3" * 64,
             request_bytes=request_b,
-            public_key=adapter._load_public_key(),
+            public_key=_public_key(adapter),
         )
 
 
@@ -263,7 +281,7 @@ def test_adapter_rejects_tampered_attestation(tmp_path: Path) -> None:
             tampered,
             challenge_nonce=challenge,
             request_bytes=request,
-            public_key=adapter._load_public_key(),
+            public_key=_public_key(adapter),
         )
 
 
@@ -284,7 +302,7 @@ def test_adapter_rejects_stale_attestation(
             response,
             challenge_nonce=challenge,
             request_bytes=request,
-            public_key=adapter._load_public_key(),
+            public_key=_public_key(adapter),
         )
 
 
@@ -302,7 +320,7 @@ def test_adapter_rejects_wrong_service_instance(tmp_path: Path) -> None:
             response,
             challenge_nonce=challenge,
             request_bytes=request,
-            public_key=adapter._load_public_key(),
+            public_key=_public_key(adapter),
             expected_instance_id="d" * 32,
         )
 
@@ -320,7 +338,7 @@ def test_adapter_rejects_unsigned_and_cross_transport_responses(tmp_path: Path) 
             unsigned,
             challenge_nonce=challenge,
             request_bytes=request,
-            public_key=adapter._load_public_key(),
+            public_key=_public_key(adapter),
         )
     wrong_transport = json.loads(json.dumps(response))
     wrong_transport["native_transport"] = "named-pipe"
@@ -329,7 +347,7 @@ def test_adapter_rejects_unsigned_and_cross_transport_responses(tmp_path: Path) 
             wrong_transport,
             challenge_nonce=challenge,
             request_bytes=request,
-            public_key=adapter._load_public_key(),
+            public_key=_public_key(adapter),
         )
 
 
