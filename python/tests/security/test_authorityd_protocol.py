@@ -14,6 +14,7 @@ from socket import socketpair
 import khaos.security.authorityd as authorityd_module
 import khaos.security.authorityd_protocol as authorityd_protocol_module
 import pytest
+from cryptography.hazmat.primitives import serialization
 from khaos.coding.execution.identity import (
     executable_identity,
     open_executable_authority,
@@ -206,6 +207,30 @@ def _start_gated_narrow(
     thread.start()
     assert entered.wait(timeout=2)
     return thread, release, outcome
+
+
+def test_public_key_load_is_binary_safe(tmp_path: Path) -> None:
+    """A raw Ed25519 public key containing 0x1A / CRLF must load verbatim.
+
+    Windows ``os.open`` without ``O_BINARY`` opens descriptors in CRT text
+    mode: 0x1A acts as EOF and CRLF pairs collapse, so ~12% of randomly
+    generated 32-byte keys were truncated and rejected as "malformed" (the
+    2026-08-19 Windows Product Suite flakes).  POSIX has no text mode, so the
+    deterministic repro payload below only distinguishes fixed from broken on
+    Windows — where it failed before the ``_O_BINARY`` fix.
+    """
+    payload = b"\x00\x1a\r\n" + bytes(range(4, 32))
+    assert len(payload) == 32 and b"\x1a" in payload and b"\r\n" in payload
+    path = tmp_path / "authorityd.pub"
+    path.write_bytes(payload)
+    key = Ed25519KeyStore.load_public_key(path)
+    assert (
+        key.public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
+        == payload
+    )
 
 
 def test_typed_kernel_keeps_native_execution_binding_exact() -> None:

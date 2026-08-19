@@ -2169,7 +2169,11 @@ class JsonlAuditWriter:
             self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             descriptor = os.open(
                 self.path,
-                os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0),
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_APPEND
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_BINARY", 0),
                 0o600,
             )
             try:
