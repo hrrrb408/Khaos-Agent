@@ -162,10 +162,26 @@ def test_forbidden_host_backend_name_is_detected_by_name() -> None:
     )
 
     assert "khaos.coding.execution.host.HostExecutionBackend" in FORBIDDEN_TYPE_NAMES
-    # The forbidden module is not imported by the verifier itself.
+    # The verifier module itself must not import the forbidden module.
+    # This must be checked in a fresh subprocess: in a shared pytest
+    # session other tests legitimately import the host backend, so the
+    # parent process's sys.modules says nothing about the verifier.
+    import subprocess
     import sys
 
-    assert "khaos.coding.execution.host" not in sys.modules
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys, khaos.security.production_composition_manifest; "
+            "assert 'khaos.coding.execution.host' not in sys.modules, "
+            "'verifier imported the forbidden module'",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert probe.returncode == 0, probe.stderr
 
     class _FakeHostBackend:
         pass
@@ -179,7 +195,6 @@ def test_forbidden_host_backend_name_is_detected_by_name() -> None:
     graph = _walk_object_graph(_Runtime())
     names = {f"{t.__module__}.{t.__qualname__}" for t in graph}
     assert "khaos.coding.execution.host.HostExecutionBackend" in names
-    manifest = None
     from khaos.security.production_composition_manifest import (
         verify_runtime_composition,
     )

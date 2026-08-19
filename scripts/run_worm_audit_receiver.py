@@ -38,6 +38,10 @@ def _generate_ca(ca_cert: Path, ca_key: Path) -> None:
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "khaos-ci-worm-ca")])
     now = datetime.datetime.now(datetime.UTC)
+    # SKI/AKI are required by stricter OpenSSL verification (e.g. Python
+    # 3.13's): a CA without an Authority Key Identifier is rejected with
+    # "Missing Authority Key Identifier" at TLS handshake time.
+    ski = x509.SubjectKeyIdentifier.from_public_key(key.public_key())
     certificate = (
         x509.CertificateBuilder()
         .subject_name(subject)
@@ -47,6 +51,11 @@ def _generate_ca(ca_cert: Path, ca_key: Path) -> None:
         .not_valid_before(now - datetime.timedelta(minutes=5))
         .not_valid_after(now + datetime.timedelta(hours=12))
         .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+        .add_extension(ski, critical=False)
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_subject_key_identifier(ski),
+            critical=False,
+        )
         .sign(key, hashes.SHA256())
     )
     ca_cert.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
@@ -80,6 +89,14 @@ def _generate_server_cert(
         .serial_number(x509.random_serial_number())
         .not_valid_before(now - datetime.timedelta(minutes=5))
         .not_valid_after(now + datetime.timedelta(hours=12))
+        .add_extension(
+            x509.SubjectKeyIdentifier.from_public_key(server_key.public_key()),
+            critical=False,
+        )
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(ca.public_key()),
+            critical=False,
+        )
         .add_extension(
             x509.SubjectAlternativeName(
                 [x509.DNSName("localhost"), x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]
