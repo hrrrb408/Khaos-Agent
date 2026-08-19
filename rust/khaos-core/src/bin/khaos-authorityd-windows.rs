@@ -32,21 +32,26 @@ mod windows_authority {
         GetTokenInformation, TokenGroups, TokenUser, TOKEN_GROUPS, TOKEN_QUERY, TOKEN_USER,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_FIRST_PIPE_INSTANCE,
-        FILE_GENERIC_READ, FILE_GENERIC_WRITE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
+        CreateFileW, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL,
+        FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, FILE_GENERIC_READ,
+        FILE_GENERIC_WRITE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
+    };
+    use windows_sys::Win32::System::IO::{
+        CancelIoEx, GetOverlappedResult, OVERLAPPED,
     };
     use windows_sys::Win32::System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
-        PIPE_READMODE_MESSAGE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_MESSAGE, PIPE_WAIT,
+        GetNamedPipeServerProcessId, PIPE_READMODE_MESSAGE, PIPE_REJECT_REMOTE_CLIENTS,
+        PIPE_TYPE_MESSAGE, PIPE_WAIT,
     };
     use windows_sys::Win32::System::Services::{
         RegisterServiceCtrlHandlerExW, SetServiceStatus, StartServiceCtrlDispatcherW,
-        SERVICE_ACCEPT_STOP, SERVICE_CONTROL_STOP, SERVICE_ERROR_CRITICAL, SERVICE_RUNNING,
-        SERVICE_STATUS, SERVICE_STATUS_HANDLE, SERVICE_STOPPED, SERVICE_TABLE_ENTRYW,
-        SERVICE_WIN32_OWN_PROCESS,
+        SERVICE_ACCEPT_STOP, SERVICE_CONTROL_STOP, SERVICE_ERROR_CRITICAL, SERVICE_RUNNING, SERVICE_STATUS, SERVICE_STATUS_HANDLE,
+        SERVICE_STOPPED, SERVICE_STOP_PENDING, SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS,
     };
     use windows_sys::Win32::System::Threading::{
-        GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+        CreateEventW, GetCurrentProcess, OpenProcess, OpenProcessToken, SetEvent,
+        WaitForSingleObject, WaitForMultipleObjects, PROCESS_QUERY_LIMITED_INFORMATION,
     };
 
     const MAX_MESSAGE_BYTES: usize = 64 * 1024;
@@ -84,6 +89,7 @@ mod windows_authority {
                     | "KHAOS_AUTHORITYD_BACKEND_PIPE"
                     | "KHAOS_AGENT_SID"
                     | "KHAOS_AUTHORITYD_SERVICE_SID"
+                    | "KHAOS_AUTHORITYD_BACKEND_SERVICE_SID"
                     | "KHAOS_AUTHORITYD_DPAPI_KEY_PATH"
                     | "KHAOS_AUTHORITYD_PROTECTED_KEY_REF"
             ) {
@@ -283,28 +289,112 @@ mod windows_authority {
         Ok((descriptor_w, attributes))
     }
 
-    fn native_probe_json(service_sid: &str, peer_pid: u32, pipe_acl: bool) -> String {
-        let key_ref = env::var("KHAOS_AUTHORITYD_PROTECTED_KEY_REF").unwrap_or_default();
-        let digest = format!(
-            "{:x}",
-            sha2::Sha256::digest(format!("{SERVICE_NAME}|{service_sid}|{key_ref}").as_bytes())
-        );
+    fn service_instance_id() -> String {
+        // A per-run instance identity binds every proof to one service
+        // process lifetime.  It is derived from the pid and the monotonic
+        // wall clock so two consecutive service instances never share it.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or(0);
+        let mixed = format!("{}|{}", std::process::id(), nanos);
+        format!("{:x}", sha2::Sha256::digest(mixed.as_bytes()))[..32].to_string()
+    }
+
+    fn agent_requirement_digest() -> String {
+        let agent_sid = env::var("KHAOS_AGENT_SID").unwrap_or_default();
         format!(
-            "{{\"platform\":\"win32\",\"transport\":\"named-pipe\",\"service_id\":\"{SERVICE_NAME}\",\"service_pid\":{},\"service_identity\":\"{service_sid}\",\"peer_identity\":\"pid:{peer_pid}\",\"protected_key_ref\":\"{key_ref}\",\"challenge_digest\":\"{digest}\",\"peer_verified\":true,\"transport_verified\":{},\"protected_key_verified\":true}}",
-            std::process::id(), pipe_acl
+            "{:x}",
+            sha2::Sha256::digest(format!("windows-agent-sid:{agent_sid}").as_bytes())
         )
     }
 
-    fn service_request(input: &[u8], service_sid: &str, peer_sid: &str) -> String {
-        if input == b"{\"kind\":\"probe\"}" {
-            return native_probe_json(service_sid, 1, true).replace("pid:1", peer_sid);
+    const PROBE_INNER_REQUEST: &str = "{\"operation\":\"ping\",\"protocol\":1}";
+
+    fn hex_encode(input: &[u8]) -> String {
+        let mut output = String::with_capacity(input.len() * 2);
+        for byte in input {
+            output.push_str(&format!("{byte:02x}"));
         }
+        output
+    }
+
+    fn sha256_hex(input: &[u8]) -> String {
+        format!("{:x}", sha2::Sha256::digest(input))
+    }
+
+    fn valid_challenge(value: &str) -> bool {
+        value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    }
+
+    /// Handle one client message: parse kind/challenge/request, wrap the
+    /// request into a backend `attest` envelope, forward it, and merge the
+    /// backend response with the transport binding for the client.
+    fn service_request(input: &[u8], service_sid: &str, peer_identity: &str) -> String {
+        let message: serde_json::Value = match serde_json::from_slice(input) {
+            Ok(value) => value,
+            Err(_) => {
+                return "{\"ok\":false,\"error\":\"native pipe message is malformed JSON\"}"
+                    .to_string()
+            }
+        };
+        let kind = message.get("kind").and_then(|value| value.as_str());
+        let challenge = message
+            .get("challenge_nonce")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let instance = service_instance_id();
+        let requirement_digest = agent_requirement_digest();
+        let key_ref = env::var("KHAOS_AUTHORITYD_PROTECTED_KEY_REF").unwrap_or_default();
+        let service_name =
+            env::var("KHAOS_AUTHORITYD_SERVICE_NAME").unwrap_or_else(|_| SERVICE_NAME.to_string());
+        if kind.is_none() || !valid_challenge(challenge) {
+            return "{\"ok\":false,\"error\":\"native pipe challenge is missing or malformed\"}"
+                .to_string();
+        }
+        let request_bytes: Vec<u8> = if kind == Some("probe") {
+            PROBE_INNER_REQUEST.as_bytes().to_vec()
+        } else {
+            match message.get("request_json").and_then(|value| value.as_str()) {
+                Some(request) => request.as_bytes().to_vec(),
+                None => {
+                    return "{\"ok\":false,\"error\":\"native pipe request body is missing\"}"
+                        .to_string()
+                }
+            }
+        };
+        if request_bytes.is_empty() || request_bytes.len() > MAX_MESSAGE_BYTES / 2 {
+            return "{\"ok\":false,\"error\":\"native pipe request is out of bounds\"}".to_string();
+        }
+        let attest_request = serde_json::json!({
+            "protocol": 1,
+            "operation": "attest",
+            "challenge_nonce": challenge,
+            "request_raw_hex": hex_encode(&request_bytes),
+            "request_digest": sha256_hex(&request_bytes),
+            "proof_fields": {
+                "platform": "win32",
+                "transport": "named-pipe",
+                "service_id": service_name,
+                "service_pid": std::process::id().to_string(),
+                "service_identity": service_sid,
+                "peer_identity": peer_identity,
+                "peer_team_id": peer_identity,
+                "peer_cdhash": "",
+                "designated_requirement_digest": requirement_digest,
+                "service_instance_id": instance,
+                "protected_key_ref": key_ref,
+            },
+        });
         let backend = match env::var("KHAOS_AUTHORITYD_BACKEND_PIPE") {
             Ok(value) if value.starts_with(r"\\.\pipe\") && value.len() <= 256 => wide(&value),
             _ => {
                 return "{\"ok\":false,\"error_code\":\"authority_backend_unavailable\",\"error\":\"authority backend pipe is not configured\"}".to_string()
             }
         };
+        // Open the backend pipe overlapped so a wedged backend cannot
+        // block the authority frontend forever: every operation carries
+        // a hard deadline and is cancelled on expiry.
         let handle = unsafe {
             CreateFileW(
                 backend.as_ptr(),
@@ -312,44 +402,227 @@ mod windows_authority {
                 0,
                 null(),
                 OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
                 null_mut(),
             )
         };
         if handle == INVALID_HANDLE_VALUE {
             return "{\"ok\":false,\"error_code\":\"authority_backend_unavailable\",\"error\":\"authority backend pipe is unavailable\"}".to_string();
         }
-        let bounded = input.len() <= MAX_MESSAGE_BYTES;
-        let mut written = 0_u32;
-        let write_ok = bounded
-            && unsafe {
-                WriteFile(
-                    handle,
-                    input.as_ptr(),
-                    input.len() as u32,
-                    &mut written,
-                    null_mut(),
-                )
-            } != 0;
-        let mut response = vec![0_u8; MAX_MESSAGE_BYTES];
-        let mut read = 0_u32;
-        let read_ok = write_ok
-            && unsafe {
-                ReadFile(
-                    handle,
-                    response.as_mut_ptr(),
-                    response.len() as u32,
-                    &mut read,
-                    null_mut(),
-                )
-            } != 0;
-        unsafe { CloseHandle(handle) };
-        if !read_ok || read == 0 || read as usize > MAX_MESSAGE_BYTES {
-            return "{\"ok\":false,\"error_code\":\"authority_backend_unavailable\",\"error\":\"authority backend returned no bounded response\"}".to_string();
+        // Verify the backend pipe really is served by a trusted authority
+        // identity before forwarding a request.  A pipe name alone is not
+        // identity: any process could create a pipe with the same name.
+        // The backend is trusted when its server process runs as the
+        // configured backend Service SID or as LocalSystem (the OS's own
+        // identity, which fronts the backend service in SCM deployments).
+        let backend_identity_ok = unsafe {
+            let mut server_pid = 0_u32;
+            if GetNamedPipeServerProcessId(handle, &mut server_pid) == 0 {
+                0
+            } else {
+                match peer_sid(server_pid) {
+                    Ok(observed)
+                        if observed == service_sid
+                            || observed == "S-1-5-18"
+                            || Some(observed.as_str())
+                                == env::var("KHAOS_AUTHORITYD_BACKEND_SERVICE_SID")
+                                    .ok()
+                                    .as_deref() =>
+                    {
+                        1
+                    }
+                    _ => 0,
+                }
+            }
+        };
+        if backend_identity_ok == 0 {
+            unsafe { CloseHandle(handle) };
+            return "{\"ok\":false,\"error_code\":\"authority_backend_unavailable\",\"error\":\"authority backend pipe identity is not the authority Service SID\"}".to_string();
         }
-        String::from_utf8(response[..read as usize].to_vec()).unwrap_or_else(|_| {
-            "{\"ok\":false,\"error\":\"authority backend returned malformed UTF-8\"}".to_string()
-        })
+        let payload = serde_json::to_vec(&attest_request).unwrap_or_default();
+        if payload.len() > MAX_MESSAGE_BYTES {
+            unsafe { CloseHandle(handle) };
+            return "{\"ok\":false,\"error_code\":\"authority_backend_unavailable\",\"error\":\"authority backend request is out of bounds\"}".to_string();
+        }
+        let write_result =
+            unsafe { write_message_deadline(handle, &payload, BACKEND_IO_TIMEOUT_MS) };
+        let backend_bytes = match write_result {
+            Ok(()) => {
+                let mut response = vec![0_u8; MAX_MESSAGE_BYTES];
+                unsafe { read_message_deadline(handle, &mut response, BACKEND_IO_TIMEOUT_MS) }
+            }
+            Err(error) => Err(error),
+        };
+        unsafe { CloseHandle(handle) };
+        let backend_bytes = match backend_bytes {
+            Ok(bytes) if !bytes.is_empty() && bytes.len() <= MAX_MESSAGE_BYTES => bytes,
+            Ok(_) => {
+                return "{\"ok\":false,\"error_code\":\"authority_backend_unavailable\",\"error\":\"authority backend returned no bounded response\"}".to_string()
+            }
+            Err(error) => {
+                return format!(
+                    "{{\"ok\":false,\"error_code\":\"authority_backend_unavailable\",\"error\":\"authority backend IO deadline: {error}\"}}"
+                )
+            }
+        };
+        let backend_body: serde_json::Value = match serde_json::from_slice(&backend_bytes) {
+            Ok(value) => value,
+            Err(_) => {
+                return "{\"ok\":false,\"error\":\"authority backend returned malformed JSON\"}"
+                    .to_string()
+            }
+        };
+        // Merge the transport binding into the backend response so the
+        // Python adapter can verify both the static instance digest and the
+        // signed challenge-response attestation.
+        let static_digest = format!(
+            "{:x}",
+            sha2::Sha256::digest(
+                format!(
+                    "{SERVICE_NAME}|{service_sid}|{peer_identity}|{requirement_digest}|{instance}|{key_ref}|native-authority-proof-v2"
+                )
+                .as_bytes()
+            )
+        );
+        let mut wrapper = serde_json::Map::new();
+        wrapper.insert(
+            "native_transport".to_string(),
+            serde_json::Value::String("named-pipe".to_string()),
+        );
+        wrapper.insert(
+            "proof_digest".to_string(),
+            serde_json::Value::String(static_digest),
+        );
+        if let serde_json::Value::Object(body) = backend_body {
+            for (key, value) in body {
+                wrapper.insert(key, value);
+            }
+        } else {
+            return "{\"ok\":false,\"error\":\"authority backend returned a non-object response\"}"
+                .to_string();
+        }
+        serde_json::Value::Object(wrapper).to_string()
+    }
+
+    const CLIENT_IO_TIMEOUT_MS: u32 = 10_000;
+    const BACKEND_IO_TIMEOUT_MS: u32 = 15_000;
+    const ERROR_PIPE_CONNECTED: u32 = 0x0000_0217;
+    const ERROR_IO_PENDING: u32 = 0x0000_03E5;
+    const WAIT_OBJECT_0: u32 = 0;
+    const WAIT_TIMEOUT: u32 = 0x0000_0102;
+    const INFINITE: u32 = 0xFFFF_FFFF;
+
+    static mut STOP_EVENT: HANDLE = std::ptr::null_mut();
+    static mut STATUS_HANDLE: SERVICE_STATUS_HANDLE = std::ptr::null_mut();
+
+    unsafe fn set_service_state(state: u32, controls: u32, wait_hint: u32) {
+        let handle = STATUS_HANDLE;
+        if handle.is_null() {
+            return;
+        }
+        let status = SERVICE_STATUS {
+            dwServiceType: SERVICE_WIN32_OWN_PROCESS,
+            dwCurrentState: state,
+            dwControlsAccepted: controls,
+            dwWin32ExitCode: 0,
+            dwServiceSpecificExitCode: 0,
+            dwCheckPoint: 0,
+            dwWaitHint: wait_hint,
+        };
+        SetServiceStatus(handle, &status);
+    }
+
+    /// Overlapped read of one bounded message with a hard deadline.
+    /// Message-mode pipes deliver one complete message per read; a
+    /// timeout cancels the IO instead of blocking the service forever.
+    unsafe fn read_message_deadline(handle: HANDLE, buffer: &mut [u8], timeout_ms: u32) -> Result<Vec<u8>, String> {
+        let mut overlapped: OVERLAPPED = std::mem::zeroed();
+        let event = CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
+        if event.is_null() {
+            return Err("CreateEventW failed".to_string());
+        }
+        overlapped.hEvent = event;
+        let mut transferred = 0_u32;
+        let pending = ReadFile(
+            handle,
+            buffer.as_mut_ptr().cast(),
+            buffer.len() as u32,
+            &mut transferred,
+            &mut overlapped,
+        );
+        let last_error = GetLastError();
+        if pending == 0 && last_error != ERROR_IO_PENDING {
+            CloseHandle(event);
+            return Err(format!("ReadFile failed: {last_error}"));
+        }
+        if pending == 0 {
+            let wait = WaitForSingleObject(event, timeout_ms);
+            if wait == WAIT_TIMEOUT {
+                CancelIoEx(handle, &mut overlapped);
+                CloseHandle(event);
+                return Err("read deadline exceeded".to_string());
+            }
+            if wait != WAIT_OBJECT_0 {
+                CancelIoEx(handle, &mut overlapped);
+                CloseHandle(event);
+                return Err(format!("read wait failed: {wait}"));
+            }
+            // The overlapped result carries the byte count.
+            if GetOverlappedResult(handle, &mut overlapped, &mut transferred, 0) == 0 {
+                CloseHandle(event);
+                return Err("GetOverlappedResult failed".to_string());
+            }
+        }
+        CloseHandle(event);
+        if transferred == 0 || transferred as usize > buffer.len() {
+            return Err("empty or oversized message".to_string());
+        }
+        Ok(buffer[..transferred as usize].to_vec())
+    }
+
+    /// Overlapped write of one bounded message with a hard deadline.
+    unsafe fn write_message_deadline(handle: HANDLE, payload: &[u8], timeout_ms: u32) -> Result<(), String> {
+        let mut overlapped: OVERLAPPED = std::mem::zeroed();
+        let event = CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
+        if event.is_null() {
+            return Err("CreateEventW failed".to_string());
+        }
+        overlapped.hEvent = event;
+        let mut transferred = 0_u32;
+        let pending = WriteFile(
+            handle,
+            payload.as_ptr().cast(),
+            payload.len() as u32,
+            &mut transferred,
+            &mut overlapped,
+        );
+        let last_error = GetLastError();
+        if pending == 0 && last_error != ERROR_IO_PENDING {
+            CloseHandle(event);
+            return Err(format!("WriteFile failed: {last_error}"));
+        }
+        if pending == 0 {
+            let wait = WaitForSingleObject(event, timeout_ms);
+            if wait == WAIT_TIMEOUT {
+                CancelIoEx(handle, &mut overlapped);
+                CloseHandle(event);
+                return Err("write deadline exceeded".to_string());
+            }
+            if wait != WAIT_OBJECT_0 {
+                CancelIoEx(handle, &mut overlapped);
+                CloseHandle(event);
+                return Err(format!("write wait failed: {wait}"));
+            }
+            if GetOverlappedResult(handle, &mut overlapped, &mut transferred, 0) == 0 {
+                CloseHandle(event);
+                return Err("GetOverlappedResult failed".to_string());
+            }
+        }
+        CloseHandle(event);
+        if transferred as usize != payload.len() {
+            return Err("incomplete write".to_string());
+        }
+        Ok(())
     }
 
     fn run_service_loop() -> Result<(), String> {
@@ -358,11 +631,21 @@ mod windows_authority {
         let pipe = pipe_name()?;
         let (_descriptor, attributes) = build_pipe_security()?;
         let pipe_w = wide(&pipe);
+        let stop_event = unsafe {
+            let event = CreateEventW(std::ptr::null(), 1, 0, std::ptr::null());
+            if event.is_null() {
+                return Err("CreateEventW failed for the stop event".to_string());
+            }
+            STOP_EVENT = event;
+            event
+        };
         loop {
+            // The pipe is opened overlapped so the blocking accept can be
+            // interrupted by SERVICE_CONTROL_STOP.
             let handle = unsafe {
                 CreateNamedPipeW(
                     pipe_w.as_ptr(),
-                    PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                    PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED,
                     PIPE_TYPE_MESSAGE
                         | PIPE_READMODE_MESSAGE
                         | PIPE_WAIT
@@ -379,58 +662,131 @@ mod windows_authority {
                     GetLastError()
                 }));
             }
-            let connected = unsafe { ConnectNamedPipe(handle, null_mut()) } != 0;
+            let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+            let connect_event = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
+            if connect_event.is_null() {
+                unsafe { CloseHandle(handle) };
+                return Err("CreateEventW failed for the connect event".to_string());
+            }
+            unsafe { overlapped.hEvent = connect_event };
+            let connect_result = unsafe { ConnectNamedPipe(handle, &mut overlapped) };
+            let connect_error = unsafe { GetLastError() };
+            let connected = if connect_result != 0 {
+                true
+            } else if connect_error == ERROR_PIPE_CONNECTED {
+                // The legal race: the client already connected between
+                // CreateNamedPipeW and ConnectNamedPipe.
+                true
+            } else if connect_error == ERROR_IO_PENDING {
+                // Wait for either a client connection or the stop signal.
+                let handles = [stop_event, connect_event];
+                let wait = unsafe {
+                    WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE)
+                };
+                if wait == WAIT_OBJECT_0 {
+                    // Stop requested: cancel the pending accept, drain, and
+                    // report STOP_PENDING before releasing resources.
+                    unsafe {
+                        CancelIoEx(handle, &mut overlapped);
+                        set_service_state(
+                            SERVICE_STOP_PENDING,
+                            0,
+                            10_000,
+                        );
+                        CloseHandle(connect_event);
+                        DisconnectNamedPipe(handle);
+                        CloseHandle(handle);
+                    }
+                    return Ok(());
+                }
+                if wait == WAIT_OBJECT_0 + 1 {
+                    let mut transferred = 0_u32;
+                    unsafe {
+                        GetOverlappedResult(handle, &mut overlapped, &mut transferred, 0) != 0
+                    }
+                } else {
+                    unsafe {
+                        CancelIoEx(handle, &mut overlapped);
+                        CloseHandle(connect_event);
+                        CloseHandle(handle);
+                    }
+                    continue;
+                }
+            } else {
+                false
+            };
             if connected {
-                let mut peer_pid = 0_u32;
-                let peer_ok = unsafe { GetNamedPipeClientProcessId(handle, &mut peer_pid) } != 0
-                    && peer_pid > 0;
-                let peer_identity = if peer_ok {
-                    peer_sid(peer_pid).ok()
-                } else {
-                    None
-                };
-                let expected_agent_sid = env::var("KHAOS_AGENT_SID").unwrap_or_default();
-                let peer_ok = peer_identity.as_deref() == Some(expected_agent_sid.as_str());
-                let mut input = vec![0_u8; MAX_MESSAGE_BYTES];
-                let mut read = 0_u32;
-                let read_ok = peer_ok
-                    && unsafe {
-                        ReadFile(
-                            handle,
-                            input.as_mut_ptr(),
-                            input.len() as u32,
-                            &mut read,
-                            null_mut(),
-                        )
-                    } != 0;
-                let response = if read_ok {
-                    service_request(
-                        &input[..read as usize],
-                        &service_sid,
-                        peer_identity.as_deref().unwrap_or("unknown"),
-                    )
-                } else {
-                    "{\"ok\":false,\"error\":\"Named Pipe peer proof failed\"}".to_string()
-                };
-                let mut written = 0_u32;
-                let _ = unsafe {
-                    WriteFile(
-                        handle,
-                        response.as_ptr(),
-                        response.len() as u32,
-                        &mut written,
-                        null_mut(),
-                    )
-                };
+                unsafe {
+                    let mut peer_pid = 0_u32;
+                    let peer_ok = GetNamedPipeClientProcessId(handle, &mut peer_pid) != 0
+                        && peer_pid > 0;
+                    let peer_identity = if peer_ok {
+                        peer_sid(peer_pid).ok()
+                    } else {
+                        None
+                    };
+                    let expected_agent_sid = env::var("KHAOS_AGENT_SID").unwrap_or_default();
+                    let peer_ok =
+                        peer_identity.as_deref() == Some(expected_agent_sid.as_str());
+                    let response = if peer_ok {
+                        let mut buffer = vec![0_u8; MAX_MESSAGE_BYTES];
+                        match read_message_deadline(handle, &mut buffer, CLIENT_IO_TIMEOUT_MS) {
+                            Ok(message) => service_request(
+                                &message,
+                                &service_sid,
+                                peer_identity.as_deref().unwrap_or("unknown"),
+                            ),
+                            Err(error) => format!(
+                                "{{\"ok\":false,\"error\":\"Named Pipe read failed: {error}\"}}"
+                            ),
+                        }
+                    } else {
+                        "{\"ok\":false,\"error\":\"Named Pipe peer proof failed\"}".to_string()
+                    };
+                    let _ = write_message_deadline(handle, response.as_bytes(), CLIENT_IO_TIMEOUT_MS);
+                    // A deterministic terminal state for the connection
+                    // even when stop arrives mid-request: the response is
+                    // flushed or the deadline fires before disconnect.
+                    DisconnectNamedPipe(handle);
+                }
             }
             unsafe {
-                DisconnectNamedPipe(handle);
+                CloseHandle(connect_event);
                 CloseHandle(handle);
             }
         }
     }
 
-    fn client_probe() -> Result<(), String> {
+    /// Client mode: send one probe or request (with the Agent-generated
+    /// challenge nonce) to the authority service pipe and print the reply.
+    /// The client never talks to the backend pipe directly.
+    fn client_request(kind: &str, challenge: Option<&str>) -> Result<(), String> {
+        let challenge_value = match challenge {
+            Some(value) if valid_challenge(value) => value.to_string(),
+            Some(_) => return Err("challenge nonce must be 64 lowercase hex characters".into()),
+            None => return Err("a challenge nonce is required".into()),
+        };
+        let mut message = serde_json::Map::new();
+        message.insert("kind".to_string(), serde_json::Value::String(kind.to_string()));
+        message.insert(
+            "challenge_nonce".to_string(),
+            serde_json::Value::String(challenge_value),
+        );
+        if kind == "request" {
+            let mut input = String::new();
+            use std::io::Read;
+            std::io::stdin()
+                .take(MAX_MESSAGE_BYTES as u64)
+                .read_to_string(&mut input)
+                .map_err(|_| "could not read the request payload".to_string())?;
+            if input.is_empty() || input.len() > MAX_MESSAGE_BYTES {
+                return Err("request payload is empty or oversized".into());
+            }
+            message.insert(
+                "request_json".to_string(),
+                serde_json::Value::String(input),
+            );
+        }
         let pipe = wide(&pipe_name()?);
         let handle = unsafe {
             CreateFileW(
@@ -446,7 +802,7 @@ mod windows_authority {
         if handle == INVALID_HANDLE_VALUE {
             return Err("authority Named Pipe is unavailable".to_string());
         }
-        let request = b"{\"kind\":\"probe\"}";
+        let request = serde_json::Value::Object(message).to_string();
         let mut written = 0_u32;
         let ok = unsafe {
             WriteFile(
@@ -471,7 +827,7 @@ mod windows_authority {
             } != 0;
         unsafe { CloseHandle(handle) };
         if !read_ok || read == 0 {
-            return Err("authority Named Pipe probe failed".to_string());
+            return Err("authority Named Pipe request failed".to_string());
         }
         println!("{}", String::from_utf8_lossy(&response[..read as usize]));
         Ok(())
@@ -484,6 +840,15 @@ mod windows_authority {
         _context: *mut c_void,
     ) -> u32 {
         if control == SERVICE_CONTROL_STOP {
+            // STOP_PENDING is reported immediately; the service loop
+            // observes the event, cancels its pending accept, drains the
+            // active connection within its IO deadline, and then reports
+            // STOPPED.  Stopping never leaves a wedged accept loop.
+            set_service_state(SERVICE_STOP_PENDING, 0, 10_000);
+            let event = STOP_EVENT;
+            if !event.is_null() {
+                SetEvent(event);
+            }
             return 0;
         }
         0
@@ -496,21 +861,27 @@ mod windows_authority {
         if status_handle.is_null() {
             return;
         }
-        let mut status = SERVICE_STATUS {
-            dwServiceType: SERVICE_WIN32_OWN_PROCESS,
-            dwCurrentState: SERVICE_RUNNING,
-            dwControlsAccepted: SERVICE_ACCEPT_STOP,
-            dwWin32ExitCode: 0,
-            dwServiceSpecificExitCode: 0,
-            dwCheckPoint: 0,
-            dwWaitHint: 0,
-        };
-        SetServiceStatus(status_handle, &status);
-        if run_service_loop().is_err() {
-            status.dwCurrentState = SERVICE_STOPPED;
-            status.dwControlsAccepted = 0;
-            status.dwWin32ExitCode = SERVICE_ERROR_CRITICAL;
-            SetServiceStatus(status_handle, &status);
+        STATUS_HANDLE = status_handle;
+        set_service_state(SERVICE_RUNNING, SERVICE_ACCEPT_STOP, 0);
+        match run_service_loop() {
+            Ok(()) => {
+                // Graceful stop: the loop already reported STOP_PENDING;
+                // every pipe and backend resource was closed inside it.
+                set_service_state(SERVICE_STOPPED, 0, 0);
+            }
+            Err(error) => {
+                eprintln!("khaos-authorityd-windows: service loop failed: {error}");
+                let status = SERVICE_STATUS {
+                    dwServiceType: SERVICE_WIN32_OWN_PROCESS,
+                    dwCurrentState: SERVICE_STOPPED,
+                    dwControlsAccepted: 0,
+                    dwWin32ExitCode: SERVICE_ERROR_CRITICAL,
+                    dwServiceSpecificExitCode: 0,
+                    dwCheckPoint: 0,
+                    dwWaitHint: 0,
+                };
+                SetServiceStatus(status_handle, &status);
+            }
         }
     }
 
@@ -524,8 +895,15 @@ mod windows_authority {
                 return 78;
             }
         }
-        if arguments.get(1).map(String::as_str) == Some("--probe") {
-            return client_probe().map(|_| 0).unwrap_or(78);
+        let kind = arguments.get(1).map(String::as_str);
+        if kind == Some("--probe") || kind == Some("--request") {
+            let mode = if kind == Some("--probe") { "probe" } else { "request" };
+            let challenge = arguments
+                .iter()
+                .position(|value| value == "--challenge")
+                .and_then(|index| arguments.get(index + 1))
+                .map(String::as_str);
+            return client_request(mode, challenge).map(|_| 0).unwrap_or(78);
         }
         let name = wide(SERVICE_NAME);
         let table = [

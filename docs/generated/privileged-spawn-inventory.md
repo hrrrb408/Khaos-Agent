@@ -38,7 +38,7 @@
 - `python/khaos/security/credential_provider_host.py:441` `subprocess.run` in `<module>._collect_descendants` owner=`CredentialProviderHost` threat-model=`contained-blocking-provider` boundary=`killable-worker-domain`
 - `python/khaos/security/credential_provider_host.py:490` `subprocess.run` in `<module>._pid_is_zombie` owner=`CredentialProviderHost` threat-model=`contained-blocking-provider` boundary=`killable-worker-domain`
 - `python/khaos/security/credential_provider_worker.py:235` `subprocess.Popen` in `<module>._run_bounded_helper` owner=`CredentialProviderWorker` threat-model=`provider-helper-execution` boundary=`one-shot-worker-spec`
-- `python/khaos/security/native_authority.py:150` `subprocess.Popen` in `<module>._bounded_native_call` owner=`NativeAuthorityAdapter` threat-model=`native-authority` boundary=`platform-transport`
+- `python/khaos/security/native_authority.py:223` `subprocess.Popen` in `<module>._bounded_native_call` owner=`NativeAuthorityAdapter` threat-model=`native-authority` boundary=`platform-transport`
 - `python/khaos/tools/clipboard_tools.py:25` `subprocess.run` in `<module>._clipboard_read_sync` owner=`HostClipboard` threat-model=`foreground-user-host-integration` boundary=`host-integration`
 - `python/khaos/tools/clipboard_tools.py:51` `subprocess.run` in `<module>._clipboard_write_sync` owner=`HostClipboard` threat-model=`foreground-user-host-integration` boundary=`host-integration`
 - `rust/khaos-core/src/bin/khaos-browser-kernel-helper.rs:963` `Command::new` in `rust::entrypoint` owner=`BrowserKernelHelper` threat-model=`root-owned-browser-kernel` boundary=`browser-kernel`

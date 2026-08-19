@@ -9,6 +9,8 @@ profile and is never a production fallback.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import logging
 import os
@@ -45,11 +47,19 @@ from khaos.security.authorityd_protocol import (
 from khaos.security.identity_isolation import (
     IdentityIsolationError,
     peer_uid,
+    peer_uid_platform,
     read_contract_from_environment,
     validate_private_unix_socket,
 )
+from khaos.security.principals import (
+    DelegationAuthority,
+    DelegationScope,
+    PrincipalDelegationError,
+    principal_from_kind,
+)
 from khaos.security.protocol_boundary import (
     ProtocolBoundaryError,
+    read_bounded_line,
     require_receipt_transition,
 )
 from khaos.security.resource_scope import (
@@ -239,6 +249,11 @@ class AuthorityDaemon:
         self._audit_quarantined = False
         self.require_live_grants = require_live_grants
         self.require_typed_principals = require_typed_principals
+        # Typed principal delegation state is owned by the authority daemon,
+        # never by the Python caller: roots are registered here, children are
+        # issued here (narrow-only, unique nonce), consumption is one-shot
+        # here, and revocation cascades to unclaimed descendants here.
+        self._delegations = DelegationAuthority()
         self._closed = False
 
     def _remember_grant_terminal_locked(self, grant_id: str, state: str) -> None:
@@ -1871,6 +1886,265 @@ class AuthorityDaemon:
             self._states.pop(receipt.nonce, None)
             self._remember_terminal_locked(receipt.nonce, "revoked")
 
+    _ATTEST_PROOF_FIELDS = (
+        "platform",
+        "transport",
+        "service_id",
+        "service_pid",
+        "service_identity",
+        "peer_identity",
+        "peer_team_id",
+        "peer_cdhash",
+        "designated_requirement_digest",
+        "service_instance_id",
+        "protected_key_ref",
+    )
+    _ATTEST_HEX_FIELDS = frozenset(
+        {"designated_requirement_digest", "peer_cdhash"}
+    )
+
+    def attest(
+        self,
+        *,
+        proof_fields: dict[str, Any],
+        challenge_nonce: str,
+        request_raw_hex: str,
+        request_digest: str,
+    ) -> dict[str, Any]:
+        """Sign one challenge-response attestation for a native request.
+
+        The native frontend relays the Agent's fresh challenge and the raw
+        request bytes.  The backend is the only holder of the signing key:
+        it validates the challenge/digest binding, re-dispatches the inner
+        request, and returns a signed attestation covering the transport
+        identity fields, the challenge nonce, and the exact request
+        digest.  A replayed attestation fails at the Agent because the
+        nonce never repeats.
+        """
+        if not _is_hex(challenge_nonce, 64) or not _is_hex(request_digest, 64):
+            raise AuthorityControlPlaneError(
+                "authority attestation challenge or request digest is malformed"
+            )
+        try:
+            raw = bytes.fromhex(request_raw_hex)
+        except ValueError as exc:
+            raise AuthorityControlPlaneError(
+                "authority attestation request payload is malformed"
+            ) from exc
+        if not raw or len(raw) > MAX_MESSAGE_BYTES:
+            raise AuthorityControlPlaneError(
+                "authority attestation request payload is out of bounds"
+            )
+        if hashlib.sha256(raw).hexdigest() != request_digest:
+            raise AuthorityControlPlaneError(
+                "authority attestation request digest does not match the payload"
+            )
+        try:
+            inner = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise AuthorityControlPlaneError(
+                "authority attestation request is malformed JSON"
+            ) from exc
+        if not isinstance(inner, dict) or inner.get("protocol") != AUTHORITYD_PROTOCOL:
+            raise AuthorityControlPlaneError(
+                "authority attestation request is not an authorityd request"
+            )
+        if set(proof_fields) != set(self._ATTEST_PROOF_FIELDS):
+            raise AuthorityControlPlaneError(
+                "authority attestation proof fields are incomplete"
+            )
+        for name, value in proof_fields.items():
+            # peer_cdhash may be empty on platforms without a stable
+            # code-directory-hash API (Windows); every other field is
+            # required to be non-empty.
+            if not isinstance(value, str) or len(value) > 256:
+                raise AuthorityControlPlaneError(
+                    "authority attestation proof field is invalid"
+                )
+            if not value and name != "peer_cdhash":
+                raise AuthorityControlPlaneError(
+                    "authority attestation proof field is empty"
+                )
+            if name in self._ATTEST_HEX_FIELDS and value and not _is_hex(value, len(value)):
+                raise AuthorityControlPlaneError(
+                    "authority attestation proof digest field is malformed"
+                )
+        try:
+            service_pid = int(proof_fields["service_pid"])
+        except (TypeError, ValueError) as exc:
+            raise AuthorityControlPlaneError(
+                "authority attestation service pid is invalid"
+            ) from exc
+        if service_pid <= 0:
+            raise AuthorityControlPlaneError(
+                "authority attestation service pid is invalid"
+            )
+        payload: dict[str, Any] = {
+            "schema_version": 1,
+            **proof_fields,
+            "challenge_nonce": challenge_nonce,
+            "request_digest": request_digest,
+            "issuer_id": self.issuer_id,
+            "issued_at": _encode_receipt_timestamp(
+                time.time(), field="attestation issued_at"
+            ),
+        }
+        signature = base64.b64encode(
+            self.signing_key.sign(_canonical(payload))
+        ).decode("ascii")
+        response = _dispatch(self, inner)
+        return {
+            "ok": True,
+            "response": response,
+            "attestation": {**payload, "signature": signature},
+        }
+
+    def delegation_root(self, scope: DelegationScope) -> str:
+        """Register one ingress root delegation (idempotent by digest)."""
+        try:
+            digest = self._delegations.register_root(scope)
+        except PrincipalDelegationError as exc:
+            raise AuthorityControlPlaneError(str(exc)) from exc
+        if self._delegations.live_count > self.terminal_tombstone_limit:
+            raise AuthorityControlPlaneError(
+                "authority live delegation registry is full"
+            )
+        root_event = self._audit_event(
+            {
+                "kind": "delegation.root",
+                "delegation_digest": digest,
+                "subject": scope.subject.identity,
+                "project_id": scope.project_id,
+                "session_id": scope.session_id,
+                "workspace_id": scope.workspace_id,
+                "issuer_id": self.issuer_id,
+            }
+        )
+        with self._lock:
+            self._reserve_audit_event_locked(root_event)
+        try:
+            self._append_or_queue_audit(root_event)
+        except BaseException:
+            with self._lock:
+                self._live_delegation_remove(digest)
+            raise
+        return digest
+
+    def delegation_child(
+        self,
+        parent: DelegationScope,
+        child_principal_id: str,
+        child_principal_kind: str,
+        *,
+        operation_family: str,
+        resource_scope: list[str],
+        expires_at: float,
+    ) -> DelegationScope:
+        """Issue one narrow child delegation from a live parent scope."""
+        if self._delegations.live_count >= self.terminal_tombstone_limit:
+            raise AuthorityControlPlaneError(
+                "authority live delegation registry is full"
+            )
+        try:
+            child = principal_from_kind(child_principal_id, child_principal_kind)
+            scope = self._delegations.delegate(
+                parent,
+                child,
+                operation_family=operation_family,
+                resource_scope=resource_scope,
+                expires_at=expires_at,
+            )
+        except PrincipalDelegationError as exc:
+            raise AuthorityControlPlaneError(str(exc)) from exc
+        child_event = self._audit_event(
+            {
+                "kind": "delegation.child",
+                "delegation_digest": scope.digest,
+                "parent_digest": parent.digest,
+                "subject": scope.subject.identity,
+                "operation_family": scope.operation_family,
+                "resource_scope": sorted(scope.resource_scope),
+                "expires_at": scope.expires_at,
+                "issuer_id": self.issuer_id,
+            }
+        )
+        with self._lock:
+            self._reserve_audit_event_locked(child_event)
+        try:
+            self._append_or_queue_audit(child_event)
+        except BaseException:
+            with self._lock:
+                self._live_delegation_remove(scope.digest)
+            raise
+        return scope
+
+    def delegation_consume(
+        self,
+        delegation: DelegationScope,
+        *,
+        principal_id: str,
+        principal_kind: str,
+        project_id: str,
+        session_id: str,
+        runtime_id: str,
+        task_id: str,
+        workspace_id: str,
+        operation_family: str,
+        resource_scope: list[str],
+        policy_digest: str,
+    ) -> None:
+        """Consume exactly one child delegation at the effect boundary."""
+        try:
+            principal = principal_from_kind(principal_id, principal_kind)
+            self._delegations.consume(
+                delegation,
+                principal=principal,
+                project_id=project_id,
+                session_id=session_id,
+                runtime_id=runtime_id,
+                task_id=task_id,
+                workspace_id=workspace_id,
+                operation_family=operation_family,
+                resource_scope=resource_scope,
+                policy_digest=policy_digest,
+            )
+        except PrincipalDelegationError as exc:
+            raise AuthorityControlPlaneError(str(exc)) from exc
+        consume_event = self._audit_event(
+            {
+                "kind": "delegation.consumed",
+                "delegation_digest": delegation.digest,
+                "subject": delegation.subject.identity,
+                "issuer_id": self.issuer_id,
+            }
+        )
+        with self._lock:
+            self._reserve_audit_event_locked(consume_event)
+        # The scope is already consumed at this point; a lost audit event
+        # propagates but must never make the one-shot consumption reusable.
+        self._append_or_queue_audit(consume_event)
+
+    def delegation_revoke(self, delegation: DelegationScope) -> None:
+        """Revoke one delegation and cascade to unclaimed descendants."""
+        try:
+            self._delegations.revoke(delegation)
+        except PrincipalDelegationError as exc:
+            raise AuthorityControlPlaneError(str(exc)) from exc
+        revoke_event = self._audit_event(
+            {
+                "kind": "delegation.revoked",
+                "delegation_digest": delegation.digest,
+                "issuer_id": self.issuer_id,
+            }
+        )
+        with self._lock:
+            self._reserve_audit_event_locked(revoke_event)
+        self._append_or_queue_audit(revoke_event)
+
+    def _live_delegation_remove(self, digest: str) -> None:
+        """Compensate a failed audit append by revoking the fresh scope."""
+        self._delegations.revoke_digest(digest)
+
     def _append_audit(self, record: dict[str, Any]) -> None:
         if self.audit_writer is None:
             raise AuthorityControlPlaneError("independent audit writer is unavailable")
@@ -2199,11 +2473,37 @@ def _require_native_execution_binding(
 
 
 def serve_unix(daemon: AuthorityDaemon, *, production: bool = True) -> None:
-    """Serve requests on a private 0600 socket or agent-group 0660 socket."""
-    if os.name == "nt" or sys.platform == "darwin":
+    """Serve requests on a private 0600 socket or agent-group 0660 socket.
+
+    On darwin this function only runs in *backend mode*: it serves the
+    ``KHAOS_AUTHORITYD_BACKEND_SOCKET`` consumed by the native launchd/XPC
+    frontend, never a socket the agent could reach directly.  Every peer is
+    kernel-verified through ``LOCAL_PEERCRED`` and must hold the authority
+    UID (the frontend's identity).  There is no same-user agent fallback.
+    """
+    backend_mode = sys.platform == "darwin"
+    if backend_mode:
+        # The backend socket must be the one the native frontend forwards to,
+        # and it must live under authority ownership.  Serving any other
+        # darwin socket would expose a direct agent -> authorityd path that
+        # bypasses the XPC identity checks.  This is a pure configuration
+        # check (path comparison only), so it runs before the platform
+        # transport check: a misconfigured backend socket is reported as a
+        # configuration error on every platform.
+        expected_backend = os.environ.get("KHAOS_AUTHORITYD_BACKEND_SOCKET", "")
+        if (
+            not expected_backend
+            or not Path(expected_backend).is_absolute()
+            or Path(daemon.socket_path) != Path(expected_backend)
+        ):
+            raise AuthorityControlPlaneError(
+                "darwin authorityd may only serve the configured native "
+                "frontend backend socket"
+            )
+    if os.name == "nt":
         raise AuthorityControlPlaneError(
             "native authorityd transport is required on this platform; use the "
-            "Windows Named Pipe or macOS launchd/XPC adapter"
+            "Windows Named Pipe backend service"
         )
     contract = read_contract_from_environment()
     if production:
@@ -2218,7 +2518,17 @@ def serve_unix(daemon: AuthorityDaemon, *, production: bool = True) -> None:
         daemon.socket_path.unlink()
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
-        listener.bind(str(daemon.socket_path))
+        # bind() creates the socket inode with 0777 & ~umask, so an
+        # ambient 022 umask would briefly expose a 0755 socket before
+        # the chmod below.  Force the restrictive mode at creation time:
+        # the socket must never be observable with a mode looser than
+        # the configured one, and only the explicit agent-group mode
+        # (0660) may widen it before listen().
+        previous_umask = os.umask(0o177)
+        try:
+            listener.bind(str(daemon.socket_path))
+        finally:
+            os.umask(previous_umask)
         configured_mode = os.environ.get("KHAOS_AUTHORITYD_SOCKET_MODE", "0600")
         try:
             socket_mode = int(configured_mode, 8)
@@ -2260,6 +2570,15 @@ def serve_unix(daemon: AuthorityDaemon, *, production: bool = True) -> None:
             )
         listener.listen(max_connections)
         slots = threading.BoundedSemaphore(max_connections)
+        # Backend mode (darwin): the only legitimate peer is the native
+        # frontend, which runs as the authority UID.  Linux production keeps
+        # validating the agent UID directly.
+        if backend_mode:
+            expected_peer_uid: int | None = contract.authority_uid
+            if expected_peer_uid is None:
+                expected_peer_uid = os.geteuid()
+        else:
+            expected_peer_uid = contract.agent_uid if production else None
         with ThreadPoolExecutor(
             max_workers=max_connections, thread_name_prefix="khaos-authorityd"
         ) as executor:
@@ -2272,9 +2591,10 @@ def serve_unix(daemon: AuthorityDaemon, *, production: bool = True) -> None:
                     _serve_connection,
                     daemon,
                     connection,
-                    contract.agent_uid if production else None,
+                    expected_peer_uid,
                     connection_timeout,
                     slots,
+                    backend_mode,
                 )
     finally:
         listener.close()
@@ -2287,14 +2607,25 @@ def _serve_connection(
     expected_uid: int | None,
     connection_timeout: float = 5.0,
     slots: threading.BoundedSemaphore | None = None,
+    backend_mode: bool = False,
 ) -> None:
     try:
         with connection:
             connection.settimeout(connection_timeout)
             try:
-                if expected_uid is not None and peer_uid(connection) != expected_uid:
-                    raise IdentityIsolationError("authorityd peer UID is not the agent UID")
-                body = _recv_line(connection)
+                if expected_uid is not None:
+                    observed_uid = (
+                        peer_uid_platform(connection)
+                        if backend_mode
+                        else peer_uid(connection)
+                    )
+                    if observed_uid != expected_uid:
+                        raise IdentityIsolationError(
+                            "authorityd peer UID is not the expected authority peer"
+                        )
+                body = read_bounded_line(
+                    connection, max_bytes=MAX_MESSAGE_BYTES
+                )
                 request = json.loads(body.decode("utf-8"))
                 response = _dispatch(daemon, request)
             except RemoteAuditUnavailableError as exc:
@@ -2399,6 +2730,50 @@ def _dispatch(daemon: AuthorityDaemon, request: object) -> dict[str, object]:
         receipt = SignedAuthorizationReceipt.from_dict(request.get("receipt"))
         daemon.revoke(receipt)
         return {"ok": True}
+    if operation == "ping":
+        return {"ok": True, "issuer_id": daemon.issuer_id}
+    if operation == "attest":
+        return daemon.attest(
+            proof_fields=_mapping(request.get("proof_fields")),
+            challenge_nonce=str(request.get("challenge_nonce", "")),
+            request_raw_hex=str(request.get("request_raw_hex", "")),
+            request_digest=str(request.get("request_digest", "")),
+        )
+    if operation == "delegation_root":
+        scope = DelegationScope.from_payload(request.get("scope"))
+        digest = daemon.delegation_root(scope)
+        return {"ok": True, "delegation_digest": digest}
+    if operation == "delegation_child":
+        parent = DelegationScope.from_payload(request.get("parent"))
+        child = daemon.delegation_child(
+            parent,
+            str(request.get("child_principal_id", "")),
+            str(request.get("child_principal_kind", "")),
+            operation_family=str(request.get("operation_family", "")),
+            resource_scope=[str(item) for item in request.get("resource_scope", [])],
+            expires_at=float(request.get("expires_at", 0)),
+        )
+        return {"ok": True, "delegation": child.canonical()}
+    if operation == "delegation_consume":
+        delegation = DelegationScope.from_payload(request.get("delegation"))
+        daemon.delegation_consume(
+            delegation,
+            principal_id=str(request.get("principal_id", "")),
+            principal_kind=str(request.get("principal_kind", "")),
+            project_id=str(request.get("project_id", "")),
+            session_id=str(request.get("session_id", "")),
+            runtime_id=str(request.get("runtime_id", "")),
+            task_id=str(request.get("task_id", "")),
+            workspace_id=str(request.get("workspace_id", "")),
+            operation_family=str(request.get("operation_family", "")),
+            resource_scope=[str(item) for item in request.get("resource_scope", [])],
+            policy_digest=str(request.get("policy_digest", "")),
+        )
+        return {"ok": True}
+    if operation == "delegation_revoke":
+        delegation = DelegationScope.from_payload(request.get("delegation"))
+        daemon.delegation_revoke(delegation)
+        return {"ok": True}
     raise AuthorityControlPlaneError("unknown authorityd operation")
 
 
@@ -2408,18 +2783,12 @@ def _mapping(value: object) -> dict[str, Any]:
     return value
 
 
-def _recv_line(connection: socket.socket) -> bytes:
-    data = bytearray()
-    while len(data) < MAX_MESSAGE_BYTES:
-        chunk = connection.recv(min(64 * 1024, MAX_MESSAGE_BYTES - len(data)))
-        if not chunk:
-            break
-        marker = chunk.find(b"\n")
-        if marker >= 0:
-            data.extend(chunk[:marker])
-            return bytes(data)
-        data.extend(chunk)
-    raise AuthorityControlPlaneError("authorityd request is too large or incomplete")
+def _is_hex(value: str, length: int) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == length
+        and all(character in _HEX_DIGITS for character in value)
+    )
 
 
 __all__ = [

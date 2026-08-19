@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import logging
+import uuid
 from typing import Any
 
 from khaos.runtime import RequestContext
+from khaos.security.delegation_issuer import SubAgentDelegationIssuer
 from khaos.subagents.runner import SubAgentRunner
 from khaos.subagents.spawner import SubAgentSpawner, SubAgentTask
 
@@ -31,11 +33,25 @@ class SubAgentService:
     of the RPC payload (which could be forged by a compromised
     Gateway).  The ``_handle_optional_subagent`` dispatcher no longer
     needs to stamp ``principal_id`` onto the payload.
+
+    M6.9 BATCH 4: a spawned child NEVER reuses the parent's
+    ``delegation_digest``.  When a delegation issuer is wired in, the
+    child receives an independent authority-issued narrow delegation
+    (unique nonce, subset scope, bounded expiry).  Without an issuer the
+    child carries an empty digest and the production runtime derives a
+    fresh transport-root commitment for the subagent principal — in
+    neither case can a child present the parent's delegation.
     """
 
-    def __init__(self, spawner: SubAgentSpawner, runner: SubAgentRunner | None):
+    def __init__(
+        self,
+        spawner: SubAgentSpawner,
+        runner: SubAgentRunner | None,
+        delegation_issuer: SubAgentDelegationIssuer | None = None,
+    ):
         self.spawner = spawner
         self.runner = runner
+        self.delegation_issuer = delegation_issuer
 
     async def shutdown(self, *, timeout: float = 30.0) -> None:
         """H1: production shutdown authority for the SubAgentService.
@@ -62,8 +78,27 @@ class SubAgentService:
         principal_id = ctx.principal_id
         if not principal_id:
             return {"ok": False, "error": "principal_id is required"}
+        # M6.9 BATCH 4: the parent's delegation digest is NEVER reused.
+        # With an authority issuer the child gets its own narrow
+        # delegation; without one the child runs unbound and the
+        # production runtime derives a fresh, unique transport-root
+        # commitment for the subagent principal.
+        child_delegation = ""
+        task_id_hint = ""
+        if self.delegation_issuer is not None:
+            task_id_hint = f"task_{uuid.uuid4().hex}"
+            try:
+                child_delegation = self.delegation_issuer.issue_subagent_delegation(
+                    ctx,
+                    task_id=task_id_hint,
+                    tools=list(payload.get("tools", []) or []),
+                    timeout_seconds=int(payload.get("timeout", 300)),
+                )
+            except Exception as exc:  # noqa: BLE001 - RPC handler returns structured failure
+                logger.warning("subagent delegation issuance failed: %s", exc)
+                return {"ok": False, "error": f"delegation issuance failed: {exc}"}
         task = SubAgentTask(
-            id="",
+            id=task_id_hint,
             goal=payload.get("goal", ""),
             context=payload.get("context", ""),
             tools=payload.get("tools", []),
@@ -75,7 +110,7 @@ class SubAgentService:
             principal_id=principal_id,
             principal_kind="subagent",
             parent_principal_id=f"{ctx.principal_kind}:{principal_id}",
-            delegation_digest=ctx.delegation_digest,
+            delegation_digest=child_delegation,
             # M4 batch 3.1.16A-5-1b: inherit the RPC-verified project
             # identity so the subagent's create_session / AgentLoop
             # stamps the SAME project_id as the parent runtime.  The

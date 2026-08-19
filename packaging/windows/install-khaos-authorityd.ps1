@@ -7,7 +7,13 @@ param(
     [string]$AgentSid,
     [string]$ProtectedKeyPath = 'C:\ProgramData\Khaos\authority-key.dpapi',
     [string]$NamedPipe = '\\.\pipe\KhaosAuthorityD',
-    [string]$BackendPipe = '\\.\pipe\KhaosAuthorityDBackend'
+    [string]$BackendPipe = '\\.\pipe\KhaosAuthorityDBackend',
+    # CI provisioning only: create the DPAPI marker under the SYSTEM
+    # identity (the account the service runs as) through a one-shot
+    # scheduled task.  Production must pre-provision the marker out of
+    # band; the installer never creates key material under the caller's
+    # own identity.
+    [switch]$ProvisionDpapiKey
 )
 $ErrorActionPreference = 'Stop'
 
@@ -27,7 +33,43 @@ if ([string]::IsNullOrWhiteSpace($AgentSid)) {
     throw 'Agent SID is required'
 }
 if (-not (Test-Path -LiteralPath $ProtectedKeyPath -PathType Leaf)) {
-    throw 'pre-provisioned DPAPI key marker is required; the installer will not create authority key material'
+    if ($ProvisionDpapiKey) {
+        $markerDir = Split-Path -Parent $ProtectedKeyPath
+        New-Item -ItemType Directory -Force -Path $markerDir | Out-Null
+        # Provision DPAPI-protected material under the SYSTEM identity via
+        # a one-shot scheduled task: CryptProtectData scope must match the
+        # service's own security context, never the caller's.
+        $provisionScript = Join-Path $env:TEMP 'khaos-provision-dpapi.ps1'
+        @(
+            '$ErrorActionPreference = "Stop"'
+            'Add-Type -AssemblyName System.Security'
+            '$entropy = [System.Text.Encoding]::UTF8.GetBytes("khaos-authorityd-key-marker")'
+            '$plain = [System.Text.Encoding]::UTF8.GetBytes("khaos-authority-protected-key-marker")'
+            '$protected = [System.Security.Cryptography.ProtectedData]::Protect($plain, $entropy, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)'
+            "[System.IO.File]::WriteAllBytes('$ProtectedKeyPath', [byte[]]`$protected)"
+        ) | Set-Content -LiteralPath $provisionScript -Encoding ascii
+        $action = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$provisionScript`""
+        & "$env:SystemRoot\System32\schtasks.exe" /Create /TN KhaosAuthorityDKeyProvision /RU SYSTEM /RL HIGHEST /SC ONCE /ST 00:00 /F /TR $action | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'failed to create the SYSTEM key-provisioning task' }
+        try {
+            & "$env:SystemRoot\System32\schtasks.exe" /Run /TN KhaosAuthorityDKeyProvision | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'failed to run the SYSTEM key-provisioning task' }
+            $deadline = (Get-Date).AddSeconds(60)
+            while ((Get-Date) -lt $deadline -and -not (Test-Path -LiteralPath $ProtectedKeyPath -PathType Leaf)) {
+                Start-Sleep -Milliseconds 500
+            }
+            if (-not (Test-Path -LiteralPath $ProtectedKeyPath -PathType Leaf)) {
+                throw 'SYSTEM key provisioning did not produce the DPAPI marker'
+            }
+        }
+        finally {
+            & "$env:SystemRoot\System32\schtasks.exe" /Delete /TN KhaosAuthorityDKeyProvision /F | Out-Null
+            Remove-Item -LiteralPath $provisionScript -Force -ErrorAction SilentlyContinue
+        }
+    }
+    else {
+        throw 'pre-provisioned DPAPI key marker is required; pass -ProvisionDpapiKey only in CI provisioning'
+    }
 }
 
 New-Item -ItemType Directory -Force -Path $InstallRoot, (Split-Path -Parent $ProtectedKeyPath) | Out-Null

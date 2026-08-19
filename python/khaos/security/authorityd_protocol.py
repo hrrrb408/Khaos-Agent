@@ -33,7 +33,7 @@ from khaos.security.identity_isolation import (
     IdentityIsolationError,
     validate_private_unix_socket,
 )
-from khaos.security.principals import PrincipalKind
+from khaos.security.principals import DelegationScope, PrincipalKind
 from khaos.security.protocol_boundary import canonical_json_bytes
 
 AUTHORITYD_PROTOCOL = 1
@@ -461,7 +461,15 @@ class Ed25519KeyStore:
         path = path.expanduser().absolute()
         try:
             info = path.lstat()
-            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_mode & 0o022:
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise AuthorityControlPlaneError(
+                    "authority public key is not a regular single-link file"
+                )
+            # Group/other bits are the POSIX leak signal.  Windows ``stat``
+            # synthesizes them from the read-only attribute (every writable
+            # file reads as 0666), so they carry no ACL information there;
+            # the Windows key confinement is the service-account NTFS ACL.
+            if os.name == "posix" and info.st_mode & 0o022:
                 raise AuthorityControlPlaneError(
                     "authority public key has unsafe permissions"
                 )
@@ -493,7 +501,14 @@ class Ed25519KeyStore:
         path = path.expanduser().absolute()
         if path.exists():
             info = path.lstat()
-            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_mode & 0o077:
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise AuthorityControlPlaneError(
+                    "authority signing key is not a regular single-link file"
+                )
+            # See load_public_key: the group/other-bit leak signal exists
+            # only on POSIX filesystems; Windows confines the signing key
+            # with the service-account NTFS ACL instead.
+            if os.name == "posix" and info.st_mode & 0o077:
                 raise AuthorityControlPlaneError("authority signing key has unsafe permissions")
             descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
             try:
@@ -767,6 +782,52 @@ class AuthorityDaemonClient:
 
     def revoke(self, receipt: SignedAuthorizationReceipt) -> None:
         self.request({"operation": "revoke", "receipt": receipt.to_dict()})
+
+    def delegation_register_root(self, scope: DelegationScope) -> str:
+        """Register one ingress root delegation with the authority owner."""
+        response = self.request(
+            {"operation": "delegation_root", "scope": scope.canonical()}
+        )
+        return str(response["delegation_digest"])
+
+    def delegation_issue_child(
+        self,
+        parent: DelegationScope,
+        child_principal_id: str,
+        child_principal_kind: str,
+        *,
+        operation_family: str,
+        resource_scope: list[str],
+        expires_at: float,
+    ) -> DelegationScope:
+        """Issue one narrow child delegation from a live parent scope."""
+        response = self.request(
+            {
+                "operation": "delegation_child",
+                "parent": parent.canonical(),
+                "child_principal_id": child_principal_id,
+                "child_principal_kind": child_principal_kind,
+                "operation_family": operation_family,
+                "resource_scope": resource_scope,
+                "expires_at": expires_at,
+            }
+        )
+        return DelegationScope.from_payload(response.get("delegation"))
+
+    def delegation_consume(self, delegation: DelegationScope, **effect: str) -> None:
+        """Consume exactly one child delegation at the effect boundary."""
+        self.request(
+            {
+                "operation": "delegation_consume",
+                "delegation": delegation.canonical(),
+                **effect,
+            }
+        )
+
+    def delegation_revoke(self, delegation: DelegationScope) -> None:
+        self.request(
+            {"operation": "delegation_revoke", "delegation": delegation.canonical()}
+        )
 
 
 @dataclass

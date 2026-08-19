@@ -4,8 +4,13 @@
  * This is intentionally a small XPC-only transport client.  It never opens
  * the authority backend socket and never contains signing material.  The
  * launchd Mach service proves the peer audit token, code signature and
- * Keychain access-group before forwarding a bounded request to the separately
- * owned authority backend.
+ * Keychain access-group before forwarding a bounded request to the
+ * separately owned authority backend.
+ *
+ * Every probe/request carries a client-generated 256-bit challenge nonce
+ * (ADR-023).  The response must contain a backend-signed attestation that
+ * covers this exact nonce; the Python adapter verifies the signature with
+ * the authority public key.  This client only transports the challenge.
  */
 
 #include <dispatch/dispatch.h>
@@ -30,6 +35,19 @@ static int valid_service_id(const char *value) {
               ('A' <= *cursor && *cursor <= 'Z') ||
               ('0' <= *cursor && *cursor <= '9') ||
               *cursor == '.' || *cursor == '-' || *cursor == '_')) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int valid_challenge(const char *value) {
+    if (value == NULL || strlen(value) != 64) {
+        return 0;
+    }
+    for (const char *cursor = value; *cursor; ++cursor) {
+        if (!((*cursor >= '0' && *cursor <= '9') ||
+              (*cursor >= 'a' && *cursor <= 'f'))) {
             return 0;
         }
     }
@@ -76,12 +94,22 @@ static xpc_object_t send_message(const char *service_id, xpc_object_t message) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 4 || (strcmp(argv[1], "--probe") != 0 && strcmp(argv[1], "--request") != 0) ||
+    if (argc < 4 || (strcmp(argv[1], "--probe") != 0 && strcmp(argv[1], "--request") != 0) ||
         strcmp(argv[2], "--service-id") != 0 || !valid_service_id(argv[3])) {
-        fail("usage: --probe|--request --service-id <launchd-mach-service>");
+        fail("usage: --probe|--request --service-id <launchd-mach-service> [--challenge <64-hex>]");
+    }
+    const char *challenge = NULL;
+    if (argc == 6 && strcmp(argv[4], "--challenge") == 0) {
+        challenge = argv[5];
+        if (!valid_challenge(challenge)) {
+            fail("challenge nonce must be 64 lowercase hex characters");
+        }
+    } else if (argc != 4) {
+        fail("usage: --probe|--request --service-id <launchd-mach-service> [--challenge <64-hex>]");
     }
 
     xpc_object_t message = xpc_dictionary_create(NULL, NULL, 0);
+    xpc_dictionary_set_string(message, "challenge_nonce", challenge == NULL ? "" : challenge);
     if (strcmp(argv[1], "--probe") == 0) {
         xpc_dictionary_set_string(message, "kind", "probe");
     } else {
@@ -91,9 +119,12 @@ int main(int argc, char **argv) {
         free(request);
     }
     xpc_object_t reply = send_message(argv[3], message);
-    const char *key = strcmp(argv[1], "--probe") == 0 ? "proof_json" : "response_json";
-    const char *json = xpc_dictionary_get_string(reply, key);
+    const char *json = xpc_dictionary_get_string(reply, "response_json");
     if (json == NULL || json[0] == '\0' || strlen(json) > MAX_REQUEST_BYTES) {
+        const char *error = xpc_dictionary_get_string(reply, "error");
+        if (error != NULL) {
+            fprintf(stderr, "khaos-authority-xpc-client: %s\n", error);
+        }
         xpc_release(reply);
         fail("native authority returned an empty or oversized JSON response");
     }

@@ -56,6 +56,68 @@ class for each invariant remains explicit below.
    without it, the runner's private root remains the final local TCB and the
    catalog is not independent pathname evidence.
 
+7. **Native authority frontend/backend chain is real and mutually
+   authenticated (M6.9, ADR-022).** On darwin the authority backend serves
+   *only* the configured `KHAOS_AUTHORITYD_BACKEND_SOCKET`, every peer is
+   kernel-verified through `LOCAL_PEERCRED` against the authority UID, and
+   the XPC frontend lstats the backend socket (socket, euid-owned, 0600)
+   before connecting. On Windows the backend Named Pipe's DACL grants
+   access only to SYSTEM and the authority Service SID, every connection's
+   process-token SID is validated, and the frontend verifies the backend
+   pipe's server-process identity before forwarding. There is no
+   agent-reachable backend path and no same-user Python fallback.
+
+8. **macOS peer identity binds designated code requirements (M6.9).** The
+   XPC frontend enforces a Team-ID anchored designated requirement
+   (`SecRequirementCreateWithString` + `SecCodeCheckValidity`) for the
+   Agent peer and for itself; identifier-only trust and ad-hoc/unsigned
+   binaries fail closed. The proof binds Team ID, cdhash, requirement
+   digest, and a per-run service instance id.
+
+9. **Native proofs are signed challenge-responses (M6.9, ADR-023).** Every
+   probe/request carries a fresh 256-bit client nonce; the authority
+   backend signs a canonical attestation covering the nonce and the exact
+   request digest with its Ed25519 key; the Agent verifies the signature
+   with the public key it owns. Replayed proofs, substituted requests,
+   stale attestations, and cross-service-instance responses fail closed.
+
+10. **Typed delegation is authority-owned and one-shot (M6.9).** The
+    delegation registry lives in the authority daemon; only ingress
+    principals (human/gateway/channel/automation) register roots; children
+    are narrow-only with unique nonces and cannot outlive their parents;
+    consumption is one-shot with exact context matching; revocation
+    cascades to unclaimed descendants. A spawned subagent never carries its
+    parent's delegation digest.
+
+11. **Closure evidence requires provenance (M6.9).** A CLOSED report is
+    reachable only through a verified evidence manifest bundle whose
+    manifests match the exact release commit, repository, workflow,
+    successful run conclusion, runner OS, and release policy digest, with
+    every required proof type present exactly once. Local files, CI run
+    id strings, and CLI booleans are not closure evidence.
+
+12. **SAFE argv semantics are proven, not name-matched (M6.9).** A command
+    is SAFE only when its complete argv is proven side-effect-free under
+    the defined execution model: `git branch` only as an explicit query,
+    forbidden git globals (`-c`/`--config-env`/`--exec-path`/`--paginate`)
+    rejected before the subcommand, diff/log/show reject
+    `--output`/`--ext-diff`/`--textconv`, `find` rejects executing and
+    file-writing predicates. Everything else is SEMANTIC_UNKNOWN and goes
+    to approval.
+
+13. **Native client process domains have terminal proof (M6.9).** Native
+    client calls enforce incremental stdout/stderr/combined budgets, one
+    deadline over spawn+IO+wait, and SIGTERM -> grace -> SIGKILL over the
+    whole process domain (process group on POSIX, kill-on-close Job Object
+    on Windows). No call returns without a proven terminal process domain.
+
+14. **Windows authority service lifecycle is deterministic (M6.9).**
+    SERVICE_CONTROL_STOP reports STOP_PENDING, signals the service loop,
+    cancels the pending accept, drains the active connection within its IO
+    deadline, and reports STOPPED. ConnectNamedPipe handles the
+    ERROR_PIPE_CONNECTED race; client and backend IO are overlapped with
+    hard deadlines and CancelIoEx.
+
 ## Orchestration phase evidence
 
 The Agent turn and tool dispatch pipelines expose immutable phase snapshots,
@@ -230,6 +292,18 @@ not evidence that an effect occurred.
   `python/tests/security/test_native_authority.py`; native E2E evidence is
   produced only by the macOS/Windows platform jobs when signed service
   artifacts and platform identity proofs are present.
+- M6.9 native backend ownership, attestation, delegation, provenance,
+  argv policy, process ownership, Windows lifecycle, composition, and TCB
+  boundaries:
+  `python/tests/security/test_native_authority_backend.py`,
+  `python/tests/security/test_native_authority_attestation.py`,
+  `python/tests/security/test_delegation_authority_owned.py`,
+  `python/tests/security/test_security_evidence_provenance.py`,
+  `python/tests/security/test_argv_semantic_policy.py`,
+  `python/tests/security/test_native_client_resource_ownership.py`,
+  `python/tests/security/test_windows_authority_lifecycle.py`,
+  `python/tests/security/test_production_composition_manifest.py`,
+  and `python/tests/security/test_tcb_boundaries.py`.
 - Pure TCB protocol/effect/state boundaries:
   `python/tests/security/test_protocol_boundary.py`,
   `python/khaos/security/protocol_boundary.py`, and the authorityd receipt
