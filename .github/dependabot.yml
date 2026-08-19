@@ -1,22 +1,48 @@
 version: 2
+# Every Dependabot PR triggers the full required CI battery (9 workflows,
+# ~50 jobs).  Per-dependency PRs opened in one weekly wave starve the shared
+# GitHub-hosted runner pool and delay main-branch gate jobs (observed
+# 2026-08-19: 5 dep PRs ≈ 29 queued workflow runs).  Each ecosystem therefore
+# batches all of its updates into a single grouped PR, and the ecosystems run
+# on different weekdays so at most one dep-PR battery runs per day.
 updates:
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+      day: monday
+    open-pull-requests-limit: 2
+    groups:
+      github-actions:
+        patterns:
+          - "*"
   - package-ecosystem: pip
     directory: "/"
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+      day: tuesday
+    open-pull-requests-limit: 2
+    groups:
+      python-dependencies:
+        patterns:
+          - "*"
   - package-ecosystem: gomod
     directory: "/go"
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+      day: wednesday
+    open-pull-requests-limit: 2
+    groups:
+      go-modules:
+        patterns:
+          - "*"
   - package-ecosystem: cargo
     directory: "/rust/khaos-core"
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+      day: thursday
+    open-pull-requests-limit: 2
+    groups:
+      cargo-dependencies:
+        patterns:
+          - "*"
