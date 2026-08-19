@@ -13,6 +13,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import sys
 import time
 from pathlib import Path
 
@@ -204,6 +205,11 @@ def _adapter(tmp_path: Path) -> _FakeAdapter:
     return adapter
 
 
+# Observed Windows runner AV/indexer holds on a just-written key file have
+# outlived a 5 s budget under load; keep the non-Windows budget tight.
+_KEY_LOAD_RETRY_SECONDS = 30.0 if sys.platform == "win32" else 5.0
+
+
 def _public_key(adapter: _FakeAdapter) -> Ed25519PublicKey:
     """Load the adapter's public key, tolerating transient file locks.
 
@@ -211,7 +217,7 @@ def _public_key(adapter: _FakeAdapter) -> Ed25519PublicKey:
     key file (antivirus/indexer); a momentary PermissionError must not be
     reported as an attestation regression.  Bounded retry, then fail.
     """
-    deadline = time.monotonic() + 5.0
+    deadline = time.monotonic() + _KEY_LOAD_RETRY_SECONDS
     while True:
         try:
             return adapter._load_public_key()
@@ -243,12 +249,16 @@ def test_adapter_rejects_replayed_nonce(tmp_path: Path) -> None:
     request = PROBE_INNER_REQUEST.encode("utf-8")
     old_response = _attested_response(daemon, challenge="1" * 64, request=request)
     fresh_challenge = "2" * 64
+    # The key load must happen before the raises window: a key-load flake
+    # surfacing inside pytest.raises reads as a matcher mismatch, hiding the
+    # real error.  The same applies to every rejection test below.
+    public_key = _public_key(adapter)
     with pytest.raises(NativeAuthorityError, match="nonce does not match"):
         adapter._verify_attestation(
             old_response,
             challenge_nonce=fresh_challenge,
             request_bytes=request,
-            public_key=_public_key(adapter),
+            public_key=public_key,
         )
 
 
@@ -259,12 +269,13 @@ def test_adapter_rejects_substituted_request_digest(tmp_path: Path) -> None:
     request_a = PROBE_INNER_REQUEST.encode("utf-8")
     request_b = b'{"operation":"ping","protocol":1,"extra":true}'
     response = _attested_response(daemon, challenge="3" * 64, request=request_a)
+    public_key = _public_key(adapter)
     with pytest.raises(NativeAuthorityError, match="does not cover this request"):
         adapter._verify_attestation(
             response,
             challenge_nonce="3" * 64,
             request_bytes=request_b,
-            public_key=_public_key(adapter),
+            public_key=public_key,
         )
 
 
@@ -276,12 +287,13 @@ def test_adapter_rejects_tampered_attestation(tmp_path: Path) -> None:
     response = _attested_response(daemon, challenge=challenge, request=request)
     tampered = json.loads(json.dumps(response))
     tampered["attestation"]["peer_team_id"] = "EVILTEAM"
+    public_key = _public_key(adapter)
     with pytest.raises(NativeAuthorityError, match="signature is invalid"):
         adapter._verify_attestation(
             tampered,
             challenge_nonce=challenge,
             request_bytes=request,
-            public_key=_public_key(adapter),
+            public_key=public_key,
         )
 
 
@@ -297,12 +309,13 @@ def test_adapter_rejects_stale_attestation(
     monkeypatch.setattr(
         "khaos.security.native_authority.time.time", lambda: future
     )
+    public_key = _public_key(adapter)
     with pytest.raises(NativeAuthorityError, match="stale"):
         adapter._verify_attestation(
             response,
             challenge_nonce=challenge,
             request_bytes=request,
-            public_key=_public_key(adapter),
+            public_key=public_key,
         )
 
 
@@ -315,12 +328,13 @@ def test_adapter_rejects_wrong_service_instance(tmp_path: Path) -> None:
     response = _attested_response(
         daemon, challenge=challenge, request=request, instance_id="e" * 32
     )
+    public_key = _public_key(adapter)
     with pytest.raises(NativeAuthorityError, match="service instance changed"):
         adapter._verify_attestation(
             response,
             challenge_nonce=challenge,
             request_bytes=request,
-            public_key=_public_key(adapter),
+            public_key=public_key,
             expected_instance_id="d" * 32,
         )
 
@@ -333,12 +347,13 @@ def test_adapter_rejects_unsigned_and_cross_transport_responses(tmp_path: Path) 
     response = _attested_response(daemon, challenge=challenge, request=request)
     unsigned = json.loads(json.dumps(response))
     unsigned["attestation"].pop("signature")
+    public_key = _public_key(adapter)
     with pytest.raises(NativeAuthorityError, match="unsigned"):
         adapter._verify_attestation(
             unsigned,
             challenge_nonce=challenge,
             request_bytes=request,
-            public_key=_public_key(adapter),
+            public_key=public_key,
         )
     wrong_transport = json.loads(json.dumps(response))
     wrong_transport["native_transport"] = "named-pipe"
@@ -347,7 +362,7 @@ def test_adapter_rejects_unsigned_and_cross_transport_responses(tmp_path: Path) 
             wrong_transport,
             challenge_nonce=challenge,
             request_bytes=request,
-            public_key=_public_key(adapter),
+            public_key=public_key,
         )
 
 
