@@ -216,13 +216,15 @@ def _public_key(adapter: _FakeAdapter) -> Ed25519PublicKey:
     Windows runners can briefly hold an exclusive handle on a just-written
     key file (antivirus/indexer); a momentary PermissionError must not be
     reported as an attestation regression.  Bounded retry, then fail.
+    Deterministic integrity findings ("malformed", "unsafe permissions")
+    are NOT transient and must fail immediately, not burn the retry budget.
     """
     deadline = time.monotonic() + _KEY_LOAD_RETRY_SECONDS
     while True:
         try:
             return adapter._load_public_key()
-        except NativeAuthorityError:
-            if time.monotonic() >= deadline:
+        except NativeAuthorityError as exc:
+            if "unavailable" not in str(exc) or time.monotonic() >= deadline:
                 raise
             time.sleep(0.1)
 

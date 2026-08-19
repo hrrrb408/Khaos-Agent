@@ -33,7 +33,10 @@ from typing import IO, Protocol
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
-from khaos.security.authorityd_protocol import Ed25519KeyStore
+from khaos.security.authorityd_protocol import (
+    AuthorityControlPlaneError,
+    Ed25519KeyStore,
+)
 from khaos.security.identity_isolation import (
     AuthorityIdentityContract,
     IdentityIsolationError,
@@ -520,7 +523,13 @@ class _SubprocessNativeAdapter:
     def _load_public_key(self) -> Ed25519PublicKey:
         try:
             return Ed25519KeyStore.load_public_key(self.public_key_path)
-        except Exception as exc:
+        except AuthorityControlPlaneError as exc:
+            # "malformed" / "not a regular single-link file" / "unsafe
+            # permissions" are deterministic integrity findings, not
+            # transient unavailability — conflating them with "unavailable"
+            # hid a Windows text-mode truncation bug behind load retries.
+            raise NativeAuthorityError(str(exc)) from exc
+        except OSError as exc:
             raise NativeAuthorityError(
                 "authority public verification key is unavailable"
             ) from exc

@@ -38,6 +38,13 @@ from khaos.security.protocol_boundary import canonical_json_bytes
 
 AUTHORITYD_PROTOCOL = 1
 MAX_MESSAGE_BYTES = 1024 * 1024
+
+# Windows os.open defaults to CRT text mode when neither O_BINARY nor O_TEXT
+# is passed: 0x1A acts as EOF (truncating ~12% of random 32-byte Ed25519
+# public keys) and CRLF pairs are collapsed.  Key material is binary — every
+# descriptor the keystore opens must force binary mode.  POSIX has no
+# O_BINARY; the getattr keeps those platforms unchanged.
+_O_BINARY = getattr(os, "O_BINARY", 0)
 MAX_TTL_SECONDS = 300.0
 MAX_GRANT_TTL_SECONDS = 24 * 60 * 60.0
 # Receipt timestamps are part of the signed wire payload. JSON floating-point
@@ -474,7 +481,7 @@ class Ed25519KeyStore:
                     "authority public key has unsafe permissions"
                 )
             descriptor = os.open(
-                path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | _O_BINARY
             )
             try:
                 payload = _read_descriptor(descriptor, 4096)
@@ -510,7 +517,9 @@ class Ed25519KeyStore:
             # with the service-account NTFS ACL instead.
             if os.name == "posix" and info.st_mode & 0o077:
                 raise AuthorityControlPlaneError("authority signing key has unsafe permissions")
-            descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            descriptor = os.open(
+                path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | _O_BINARY
+            )
             try:
                 key = serialization.load_pem_private_key(os.read(descriptor, 64 * 1024), password=None)
             finally:
@@ -529,7 +538,11 @@ class Ed25519KeyStore:
         )
         descriptor = os.open(
             path,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | _O_BINARY,
             0o600,
         )
         try:
