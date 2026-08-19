@@ -59,6 +59,11 @@ def _darwin_contract_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Non
     monkeypatch.setenv("KHAOS_AUTHORITYD_UID", str(_euid()))
     monkeypatch.setenv("KHAOS_AUTHORITYD_LAUNCHD_SERVICE", "com.khaos.authorityd")
     monkeypatch.setenv("KHAOS_AUTHORITYD_AGENT_CODE_SIGNATURE", "com.khaos.agent")
+    monkeypatch.setenv(
+        "KHAOS_AUTHORITYD_AGENT_CODE_REQUIREMENT",
+        'identifier "com.khaos.agent" and anchor apple generic '
+        'and certificate leaf[subject.OU] = TEAMID123',
+    )
     monkeypatch.setenv("KHAOS_AUTHORITYD_KEYCHAIN_GROUP", "TEAMID.com.khaos.authority")
     monkeypatch.setenv("KHAOS_AUTHORITYD_PROTECTED_KEY_REF", "khaos-authority-signing-key")
     monkeypatch.setenv("KHAOS_AUTHORITYD_BACKEND_SOCKET", str(tmp_path / "backend.sock"))
