@@ -8,6 +8,8 @@
 
 #![cfg_attr(not(windows), allow(dead_code))]
 
+// KHAOS-PRIVILEGED-SPAWN owner=AuthorityBackendServiceHost threat-model=trusted-backend-child-lifecycle boundary=windows-authority-backend-service
+
 #[cfg(not(windows))]
 fn main() {
     eprintln!("khaos-authorityd-backend-windows is Windows-only");
