@@ -2532,6 +2532,7 @@ class ToolScheduler:
         parent_principal_id = str(tool_context.get("parent_principal_id") or "")
         delegation_digest = str(tool_context.get("delegation_digest") or "")
         step_source_transport = str(tool_context.get("source_transport") or "")
+        step_runtime_id = str(tool_context.get("runtime_id") or "")
         if tool_context.get("production_runtime") and not all(
             (principal_kind, parent_principal_id, delegation_digest)
         ):
@@ -2764,6 +2765,8 @@ class ToolScheduler:
             principal_kind=principal_kind,
             parent_principal_id=parent_principal_id,
             delegation_digest=delegation_digest,
+            source_transport=step_source_transport,
+            runtime_id=step_runtime_id or session_id,
         )
 
     async def _prepare_sandbox_authority_inputs(

@@ -293,6 +293,7 @@ def _probe_request(
         parent_principal_id=_COMPOSE_PARENT_PRINCIPAL_ID,
         delegation_digest=delegation_digest,
         source_transport="cron",
+        runtime_id=_COMPOSE_RUNTIME_ID,
     )
     authority = ExecutionAuthority(step_authority=step, spawn_plan=plan)
     return ExecutionRequest(

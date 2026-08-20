@@ -1685,7 +1685,7 @@ def _issue_execution_capability(
     envelope = broker.envelope(
         principal_id=step.principal_id,
         project_id=step.project_id,
-        runtime_id=step.session_id,
+        runtime_id=step.runtime_id or step.session_id,
         task_id=step.task_id,
         workspace_id=step.workspace_id,
         workspace_generation=plan.workspace_generation,
