@@ -67,8 +67,9 @@ class RemoteWormAuditWriter:
         except RemoteAuditUnavailableError:
             raise
         except OSError as exc:
+            detail = str(exc).strip()[:256] or type(exc).__name__
             raise RemoteAuditUnavailableError(
-                "remote WORM audit endpoint is unavailable"
+                f"remote WORM audit endpoint is unavailable: {detail}"
             ) from exc
 
 

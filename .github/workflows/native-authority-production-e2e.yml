@@ -343,12 +343,13 @@ jobs:
         run: |
           $env:PYTHONPATH = "$env:GITHUB_WORKSPACE\python"
           $caPath = 'C:\ProgramData\Khaos\worm-ca.pem'
+          $wormLog = 'C:\ProgramData\Khaos\worm-receiver.log'
           $job = Start-Job -ScriptBlock {
-            param($workspace, $ca)
+            param($workspace, $ca, $log)
             $env:PYTHONPATH = "$workspace\python"
             Set-Location $workspace
-            uv run python scripts/run_worm_audit_receiver.py --port 8443 --directory C:\ProgramData\Khaos\worm-records --emit-ca $ca
-          } -ArgumentList $env:GITHUB_WORKSPACE, $caPath
+            uv run python scripts/run_worm_audit_receiver.py --port 8443 --directory C:\ProgramData\Khaos\worm-records --emit-ca $ca *> $log
+          } -ArgumentList $env:GITHUB_WORKSPACE, $caPath, $wormLog
           $deadline = (Get-Date).AddSeconds(60)
           while ((Get-Date) -lt $deadline -and -not (Test-Path $caPath)) { Start-Sleep -Milliseconds 500 }
           if (-not (Test-Path $caPath)) { Receive-Job $job; throw 'WORM receiver did not start' }
@@ -478,6 +479,12 @@ jobs:
               Get-Content -LiteralPath $log -Tail 200
           } else {
               'authority backend log was not created'
+          }
+          $wormLog = 'C:\ProgramData\Khaos\worm-receiver.log'
+          if (Test-Path -LiteralPath $wormLog) {
+              Get-Content -LiteralPath $wormLog -Tail 200
+          } else {
+              'WORM receiver log was not created'
           }
       - name: Bind native evidence to this run
         shell: pwsh
