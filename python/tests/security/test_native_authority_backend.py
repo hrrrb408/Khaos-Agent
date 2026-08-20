@@ -32,6 +32,7 @@ from khaos.security.authorityd_protocol import (
 )
 from khaos.security.authorityd_windows import build_backend_sddl
 from khaos.security.identity_isolation import (
+    AuthorityIdentityContract,
     IdentityIsolationError,
     peer_uid,
     peer_uid_darwin,
@@ -445,6 +446,36 @@ def test_e2e_probe_emits_exact_catalog_entry(tmp_path: Path) -> None:
         expected_policy_digest="a" * 64,
     )
     assert restored.catalog_digest == catalog.catalog_digest
+
+
+def test_native_e2e_client_does_not_require_a_unix_socket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "run_native_authority_e2e_native_client",
+        Path(__file__).resolve().parents[2].parent
+        / "scripts"
+        / "run_native_authority_e2e.py",
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    contract = AuthorityIdentityContract(501, 502, 503)
+    adapter = object()
+    monkeypatch.setattr(module, "read_contract_from_environment", lambda: contract)
+    monkeypatch.setattr(
+        module,
+        "build_native_authority_adapter",
+        lambda *, production, contract: adapter,
+    )
+
+    client = module._build_client()
+
+    assert client.socket_path is None
+    assert client.native_adapter is adapter
 
 
 def test_e2e_intent_reuses_the_grant_owner_context() -> None:

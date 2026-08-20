@@ -101,12 +101,7 @@ def write_e2e_catalog(output: Path, policy_digest: str) -> TypedResourcePartialO
 def _build_client() -> AuthorityDaemonClient:
     contract = read_contract_from_environment()
     adapter = build_native_authority_adapter(production=True, contract=contract)
-    socket_path = Path(
-        os.environ.get("KHAOS_AUTHORITYD_BACKEND_SOCKET", "")
-        or os.environ.get("KHAOS_AUTHORITYD_SOCKET", "/")
-    )
     return AuthorityDaemonClient(
-        socket_path,
         expected_authority_uid=contract.authority_uid,
         native_adapter=adapter,
     )

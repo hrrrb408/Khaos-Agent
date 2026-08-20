@@ -589,13 +589,20 @@ class AuthorityDaemonClient:
 
     def __init__(
         self,
-        socket_path: Path,
+        socket_path: Path | None = None,
         *,
         timeout_seconds: float = 3.0,
         expected_authority_uid: int | None = None,
         native_adapter: object | None = None,
     ) -> None:
-        if not socket_path.is_absolute() or timeout_seconds <= 0:
+        # Unix transport owns the socket path.  Native macOS/Windows
+        # transports are reached through the injected adapter and must not
+        # need a fake path merely to satisfy this shared client wrapper.
+        if (
+            (socket_path is None and native_adapter is None)
+            or (socket_path is not None and not socket_path.is_absolute())
+            or timeout_seconds <= 0
+        ):
             raise ValueError("authorityd socket and timeout are invalid")
         if expected_authority_uid is not None and expected_authority_uid < 0:
             raise ValueError("authorityd UID is invalid")
@@ -636,6 +643,10 @@ class AuthorityDaemonClient:
             if os.name == "nt" or sys.platform == "darwin":
                 raise IdentityIsolationError(
                     "native authorityd transport is required on this platform"
+                )
+            if self.socket_path is None:
+                raise AuthorityControlPlaneError(
+                    "authorityd Unix transport has no socket path"
                 )
             validate_private_unix_socket(
                 self.socket_path, expected_uid=self.expected_authority_uid

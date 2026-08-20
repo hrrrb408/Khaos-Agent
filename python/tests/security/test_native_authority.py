@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import sys
-from pathlib import Path
 
 import pytest
 from khaos.security.authorityd_protocol import AuthorityDaemonClient
@@ -177,8 +176,7 @@ def test_authority_client_uses_injected_native_transport(monkeypatch: pytest.Mon
                 "value": "native",
             }
 
-    # Construct an absolute path using the host platform's pathlib semantics.
-    # On Windows, Path("/unused.sock") is drive-relative even though this test
-    # temporarily simulates the macOS transport selection.
-    client = AuthorityDaemonClient(Path.cwd() / "unused.sock", native_adapter=FakeAdapter())
+    # Native transports have no Unix socket.  The shared client wrapper must
+    # accept that transport-specific shape without a fake path.
+    client = AuthorityDaemonClient(native_adapter=FakeAdapter())
     assert client.request({"operation": "probe"})["value"] == "native"
