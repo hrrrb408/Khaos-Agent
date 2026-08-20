@@ -14,20 +14,23 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import subprocess
 import sys
 import tempfile
 import time
-import zipfile
 from pathlib import Path
 
+from khaos.security.evidence_provenance import gh_api_bytes
 from khaos.security.security_evidence import (
     EXPECTED_REPOSITORY,
+    EXPECTED_RUNNER_OS,
+    MAX_ARTIFACT_BYTES,
     SecurityEvidenceError,
     SecurityEvidenceManifest,
+    parse_proof_archive,
 )
 
-# proof_type -> the artifact name prefix carrying that proof.
+# Exact producer artifact name -> proof type.  Prefix matching would allow an
+# unrelated artifact to masquerade as native evidence.
 ARTIFACT_PROOF_TYPES = {
     "native-authority-macos-proof": "macos-native-authority",
     "native-authority-windows-proof": "windows-native-authority",
@@ -35,19 +38,9 @@ ARTIFACT_PROOF_TYPES = {
 
 
 def _gh(args: list[str], *, repo: str) -> object:
-    result = subprocess.run(
-        ["gh", "api", "--repo", repo, *args],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        raise SecurityEvidenceError(
-            f"gh api failed: {result.stderr.strip()[:400]}"
-        )
     try:
-        return json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
+        return json.loads(gh_api_bytes(repo, *args).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise SecurityEvidenceError("gh api returned malformed JSON") from exc
 
 
@@ -89,25 +82,60 @@ def fetch_manifests(
         raise SecurityEvidenceError(
             f"run {run_id} head SHA {run.get('head_sha')!r} is not the release SHA"
         )
+    if run.get("status") != "completed":
+        raise SecurityEvidenceError(
+            f"run {run_id} status is {run.get('status')!r}, not completed"
+        )
+    if run.get("event") != "push" or run.get("head_branch") != "main":
+        raise SecurityEvidenceError(
+            f"run {run_id} is not the protected main push event"
+        )
+    try:
+        run_attempt = int(run.get("run_attempt") or 0)
+    except (TypeError, ValueError) as exc:
+        raise SecurityEvidenceError("workflow run attempt is malformed") from exc
+    if run_attempt != 1:
+        raise SecurityEvidenceError(
+            f"run {run_id} is rerun attempt {run_attempt}, not the original attempt"
+        )
     conclusion = run.get("conclusion")
     if conclusion != "success":
         raise SecurityEvidenceError(
             f"run {run_id} conclusion is {conclusion!r}, not success"
         )
     workflow_name = run.get("name", "")
+    if workflow_name != "Native Authority Production E2E":
+        raise SecurityEvidenceError(
+            f"run {run_id} is workflow {workflow_name!r}, not the native authority workflow"
+        )
+    if expected_workflow is not None and workflow_name != expected_workflow:
+        raise SecurityEvidenceError(
+            f"run {run_id} is workflow {workflow_name!r}, expected {expected_workflow!r}"
+        )
     jobs_payload = _gh([f"actions/runs/{run_id}/jobs"], repo=repo)
+    raw_jobs = jobs_payload.get("jobs")
+    if not isinstance(raw_jobs, list) or int(jobs_payload.get("total_count", len(raw_jobs)) or 0) > 100:
+        raise SecurityEvidenceError("workflow jobs exceed the bounded verification page")
     jobs = {
         str(job["id"]): job
-        for job in jobs_payload.get("jobs", [])
+        for job in raw_jobs
         if isinstance(job, dict) and job.get("conclusion") == "success"
     }
     if not jobs:
         raise SecurityEvidenceError(f"run {run_id} has no successful jobs")
     artifacts_payload = _gh([f"actions/runs/{run_id}/artifacts"], repo=repo)
     artifacts = artifacts_payload.get("artifacts", [])
-    if not artifacts:
+    if (
+        not isinstance(artifacts, list)
+        or not artifacts
+        or int(artifacts_payload.get("total_count", len(artifacts)) or 0) > 100
+    ):
         raise SecurityEvidenceError(f"run {run_id} produced no artifacts")
+    artifact_ids = [str(item.get("id", "")) for item in artifacts if isinstance(item, dict)]
+    if len(artifact_ids) != len(set(artifact_ids)):
+        raise SecurityEvidenceError("workflow artifact ids are not unique")
     manifests: list[SecurityEvidenceManifest] = []
+    seen_proof_types: set[str] = set()
     with tempfile.TemporaryDirectory(prefix="khaos-evidence-") as tmp:
         root = Path(tmp)
         for artifact in artifacts:
@@ -120,10 +148,49 @@ def fetch_manifests(
             proof_type = _artifact_proof_type(artifact_name)
             if proof_type is None:
                 continue
+            if proof_type in seen_proof_types:
+                raise SecurityEvidenceError(
+                    f"run {run_id} contains duplicate {proof_type} artifacts"
+                )
+            seen_proof_types.add(proof_type)
+            if artifact.get("expired") is not False:
+                raise SecurityEvidenceError(
+                    f"artifact {artifact_name} is expired or unverifiable"
+                )
+            workflow_run = artifact.get("workflow_run")
+            if not isinstance(workflow_run, dict) or str(workflow_run.get("id")) != str(run_id):
+                raise SecurityEvidenceError(
+                    f"artifact {artifact_name} is not bound to run {run_id}"
+                )
+            advertised_size = artifact.get("size_in_bytes")
+            if advertised_size is not None and int(advertised_size) > MAX_ARTIFACT_BYTES:
+                raise SecurityEvidenceError(
+                    f"artifact {artifact_name} exceeds the download limit"
+                )
             archive = root / f"{artifact_id}.zip"
             _download_artifact(repo, artifact_id, archive)
             digest = _sha256(archive)
-            proof = _extract_single_proof(archive)
+            api_digest = artifact.get("digest")
+            if api_digest:
+                normalized_api_digest = str(api_digest).removeprefix("sha256:")
+                if normalized_api_digest != digest:
+                    raise SecurityEvidenceError(
+                        f"artifact {artifact_name} digest does not match GitHub metadata"
+                    )
+            expected_os = EXPECTED_RUNNER_OS[proof_type]
+            expected_platform = {
+                "macos-native-authority": "darwin",
+                "windows-native-authority": "win32",
+            }[proof_type]
+            proof, proof_manifest_digest = _extract_proof_archive(
+                archive,
+                proof_type=proof_type,
+                expected_commit=expected_commit,
+                run_id=run_id,
+                workflow_name=workflow_name,
+                runner_os=expected_os,
+                platform=expected_platform,
+            )
             _validate_proof_binding(proof, expected_commit, run_id, proof_type)
             job = _job_for_artifact(jobs, proof)
             manifest = SecurityEvidenceManifest(
@@ -134,7 +201,7 @@ def fetch_manifests(
                 workflow_run_id=run_id,
                 job_id=str(job["id"]),
                 runner_os=_runner_os_for(job),
-                runner_arch="x86_64",
+                runner_arch=str(proof.get("runner_arch", "")),
                 artifact_id=artifact_id,
                 artifact_name=artifact_name,
                 artifact_sha256=digest,
@@ -144,57 +211,66 @@ def fetch_manifests(
                 generated_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 producer_identity=f"github-actions:{repo}:run:{run_id}",
                 run_conclusion="success",
+                proof_manifest_sha256=proof_manifest_digest,
+                producer_job_name=str(proof["job_name"]),
             )
             manifests.append(manifest)
     if not manifests:
         raise SecurityEvidenceError(
             f"run {run_id} produced no recognizable security proof artifacts"
         )
-    if expected_workflow is not None and workflow_name != expected_workflow:
+    proof_types = {manifest.proof_type for manifest in manifests}
+    if len(manifests) != len(ARTIFACT_PROOF_TYPES) or proof_types != set(ARTIFACT_PROOF_TYPES.values()):
         raise SecurityEvidenceError(
-            f"run {run_id} is workflow {workflow_name!r}, expected {expected_workflow!r}"
+            "native evidence must contain exactly one macOS and one Windows proof"
         )
     return manifests
 
 
 def _artifact_proof_type(artifact_name: str) -> str | None:
-    for prefix, proof_type in ARTIFACT_PROOF_TYPES.items():
-        if artifact_name.startswith(prefix):
-            return proof_type
-    return None
+    return ARTIFACT_PROOF_TYPES.get(artifact_name)
 
 
 def _download_artifact(repo: str, artifact_id: str, destination: Path) -> None:
-    result = subprocess.run(
-        [
-            "gh",
-            "api",
-            "--repo",
+    try:
+        payload = gh_api_bytes(
             repo,
             f"actions/artifacts/{artifact_id}/zip",
-        ],
-        check=False,
-        capture_output=True,
-    )
-    if result.returncode != 0 or not result.stdout:
+            timeout_seconds=60.0,
+            max_output_bytes=64 * 1024 * 1024,
+        )
+    except Exception as exc:
+        raise SecurityEvidenceError(
+            f"artifact {artifact_id} could not be downloaded: {exc}"
+        ) from exc
+    if not payload:
         raise SecurityEvidenceError(f"artifact {artifact_id} could not be downloaded")
-    destination.write_bytes(result.stdout)
+    destination.write_bytes(payload)
 
 
-def _extract_single_proof(archive: Path) -> dict:
-    with zipfile.ZipFile(archive) as bundle:
-        entries = [name for name in bundle.namelist() if name.endswith(".json")]
-        if len(entries) != 1:
-            raise SecurityEvidenceError(
-                f"artifact must contain exactly one proof JSON, found {len(entries)}"
-            )
-        try:
-            proof = json.loads(bundle.read(entries[0]).decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise SecurityEvidenceError("proof JSON is malformed") from exc
-    if not isinstance(proof, dict):
-        raise SecurityEvidenceError("proof JSON is not an object")
-    return proof
+def _extract_proof_archive(
+    archive: Path,
+    *,
+    proof_type: str,
+    expected_commit: str,
+    run_id: str,
+    workflow_name: str,
+    runner_os: str,
+    platform: str,
+) -> tuple[dict[str, object], str]:
+    try:
+        payload = archive.read_bytes()
+    except OSError as exc:
+        raise SecurityEvidenceError(f"proof archive cannot be read: {archive}") from exc
+    return parse_proof_archive(
+        payload,
+        expected_proof_type=proof_type,
+        expected_commit=expected_commit,
+        expected_run_id=run_id,
+        expected_workflow=workflow_name,
+        expected_runner_os=runner_os,
+        expected_platform=platform,
+    )
 
 
 def _validate_proof_binding(
@@ -222,14 +298,24 @@ def _validate_proof_binding(
 
 
 def _job_for_artifact(jobs: dict[str, dict], proof: dict) -> dict:
-    # The proof binds itself to the run; the job is resolved by matching
-    # the proof's platform to the successful job's runner OS.
+    # The proof binds itself to the exact job name.  Platform-only matching
+    # allowed another successful job in the same run to impersonate the
+    # producer, so both the name and runner OS are required.
+    wanted_name = str(proof.get("job_name", ""))
     platform = str(proof.get("platform", ""))
-    wanted = {"darwin": "macOS", "win32": "Windows"}.get(platform)
-    for job in jobs.values():
-        if wanted is None or _runner_os_for(job) == wanted:
-            return job
-    raise SecurityEvidenceError(f"no successful job produced proof platform {platform!r}")
+    wanted_os = {"darwin": "macOS", "win32": "Windows"}.get(platform)
+    matches = [
+        job
+        for job in jobs.values()
+        if str(job.get("name", "")) == wanted_name
+        and wanted_os is not None
+        and _runner_os_for(job) == wanted_os
+    ]
+    if len(matches) != 1:
+        raise SecurityEvidenceError(
+            f"proof producer job {wanted_name!r} is not uniquely successful"
+        )
+    return matches[0]
 
 
 def main(argv: list[str] | None = None) -> int:

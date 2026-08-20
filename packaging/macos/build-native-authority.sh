@@ -18,6 +18,47 @@ PREFIX=${KHAOS_NATIVE_PREFIX:-/usr/local/libexec}
 BUILD_DIR=${KHAOS_NATIVE_BUILD_DIR:-$(pwd)/build/macos-native-authority}
 mkdir -p "$BUILD_DIR" "$PREFIX"
 
+# Xcode expands build settings in an Xcode target, but this deployment is
+# intentionally command-line driven.  Render a concrete plist before
+# codesign; signing the source placeholder would either leave an unusable
+# entitlement or bind the binary to a literal ``$(...)`` group.
+case "$KHAOS_TEAM_ID" in
+  ""|*[!A-Za-z0-9]*)
+    echo "KHAOS_TEAM_ID must be an alphanumeric Team ID" >&2
+    exit 2
+    ;;
+esac
+ENTITLEMENTS="$BUILD_DIR/khaos-authorityd.rendered.entitlements"
+cp packaging/macos/khaos-authorityd.entitlements "$ENTITLEMENTS"
+/usr/libexec/PlistBuddy -c \
+  "Set :com.apple.security.application-groups:0 ${KHAOS_TEAM_ID}.com.khaos.authority" \
+  "$ENTITLEMENTS"
+/usr/libexec/PlistBuddy -c \
+  "Set :keychain-access-groups:0 ${KHAOS_TEAM_ID}.com.khaos.authority" \
+  "$ENTITLEMENTS"
+
+verify_entitlements() {
+  target="$1"
+  dump="$BUILD_DIR/$(basename "$target").signed-entitlements.plist"
+  codesign --display --entitlements :- "$target" 2>/dev/null > "$dump"
+  group=$(/usr/libexec/PlistBuddy -c "Print :keychain-access-groups:0" "$dump")
+  application_group=$(/usr/libexec/PlistBuddy -c \
+    "Print :com.apple.security.application-groups:0" "$dump")
+  expected="${KHAOS_TEAM_ID}.com.khaos.authority"
+  [ "$group" = "$expected" ] || {
+    echo "signed keychain access group is not concrete" >&2
+    exit 1
+  }
+  [ "$application_group" = "$expected" ] || {
+    echo "signed application group is not concrete" >&2
+    exit 1
+  }
+  ! grep -Fq '$(' "$dump" || {
+    echo "signed entitlements contain an unresolved build placeholder" >&2
+    exit 1
+  }
+}
+
 CLANG=${KHAOS_CLANG:-$(xcrun --find clang)}
 # The XPC service is compiled without ARC: the XPC C API manages object
 # lifetimes explicitly through xpc_release, which ARC forbids.  Blocks for
@@ -38,7 +79,7 @@ CLANG=${KHAOS_CLANG:-$(xcrun --find clang)}
   -framework Security -framework CoreFoundation
 
 codesign --force --sign "$KHAOS_CODESIGN_IDENTITY" \
-  --entitlements packaging/macos/khaos-authorityd.entitlements \
+  --entitlements "$ENTITLEMENTS" \
   --options runtime "$BUILD_DIR/khaos-authorityd-xpc"
 codesign --force --sign "$KHAOS_CODESIGN_IDENTITY" \
   --options runtime "$BUILD_DIR/khaos-authorityd-xpc-client"
@@ -46,8 +87,10 @@ codesign --force --sign "$KHAOS_CODESIGN_IDENTITY" \
 # as the frontend: SecItemAdd can only create an item inside an access
 # group the signing identity is entitled to.
 codesign --force --sign "$KHAOS_CODESIGN_IDENTITY" \
-  --entitlements packaging/macos/khaos-authorityd.entitlements \
+  --entitlements "$ENTITLEMENTS" \
   --options runtime "$BUILD_DIR/khaos-authorityd-keychain-provision"
+verify_entitlements "$BUILD_DIR/khaos-authorityd-xpc"
+verify_entitlements "$BUILD_DIR/khaos-authorityd-keychain-provision"
 install -m 0555 "$BUILD_DIR/khaos-authorityd-xpc" "$PREFIX/khaos-authorityd-xpc"
 install -m 0555 "$BUILD_DIR/khaos-authorityd-xpc-client" "$PREFIX/khaos-authorityd-xpc-client"
 install -m 0555 "$BUILD_DIR/khaos-authorityd-keychain-provision" "$PREFIX/khaos-authorityd-keychain-provision"

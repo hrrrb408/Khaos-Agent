@@ -43,6 +43,7 @@ class PrincipalDelegationError(PermissionError):
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@/-]{0,255}$")
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
+PRINCIPAL_DELEGATION_FAMILY = "principal.subagent"
 _TRANSPORT_KINDS = {
     "cli": PrincipalKind.HUMAN,
     "tui": PrincipalKind.HUMAN,
@@ -330,12 +331,20 @@ class DelegationScope:
     def contains(self, child: DelegationScope) -> bool:
         """Return whether ``child`` is a strict non-widening subset.
 
-        Task/workspace may only narrow: a child either keeps the parent's
-        binding or — when the parent is still ``unbound`` — binds a
-        concrete task/workspace for the first time.  A bound parent can
-        never be re-bound, and an unbound child of a bound parent is a
-        widening and is rejected.
+        Runtime/session/task/workspace may only narrow: a child either keeps
+        the parent's binding or — when the parent is still ``unbound`` —
+        binds a concrete value for the first time.  A bound parent can never
+        be re-bound, and an unbound child of a bound parent is a widening and
+        is rejected.  This lets an ingress root remain independent of the
+        child runtime while still making the real child execution identity a
+        first-class part of the issued scope.
         """
+        session_ok = child.session_id == self.session_id or (
+            self.session_id == "unbound" and child.session_id != "unbound"
+        )
+        runtime_ok = child.runtime_id == self.runtime_id or (
+            self.runtime_id == "unbound" and child.runtime_id != "unbound"
+        )
         task_ok = child.task_id == self.task_id or (
             self.task_id == "unbound" and child.task_id != "unbound"
         )
@@ -345,8 +354,8 @@ class DelegationScope:
         return (
             child.parent_principal == self.subject
             and child.project_id == self.project_id
-            and child.session_id == self.session_id
-            and child.runtime_id == self.runtime_id
+            and session_ok
+            and runtime_ok
             and task_ok
             and workspace_ok
             and child.policy_digest == self.policy_digest
@@ -405,15 +414,17 @@ class DelegationAuthority:
         expires_at: float,
         nonce: str | None = None,
         now: float | None = None,
+        session_id: str | None = None,
+        runtime_id: str | None = None,
         task_id: str | None = None,
         workspace_id: str | None = None,
     ) -> DelegationScope:
         """Issue one child scope only after validating the live parent.
 
-        ``task_id``/``workspace_id`` may bind the child to the real
-        subagent task and workspace — a one-way narrowing permitted only
-        while the parent scope is still ``unbound`` (validated by
-        ``contains``); a bound parent can never be re-bound.
+        ``session_id``/``runtime_id``/``task_id``/``workspace_id`` may bind
+        the child to the real subagent execution — a one-way narrowing
+        permitted only while the parent scope is still ``unbound``
+        (validated by ``contains``); a bound parent can never be re-bound.
         """
 
         current = time.time() if now is None else now
@@ -425,8 +436,8 @@ class DelegationAuthority:
             subject=child,
             parent_principal=parent.subject,
             project_id=parent.project_id,
-            session_id=parent.session_id,
-            runtime_id=parent.runtime_id,
+            session_id=parent.session_id if session_id is None else session_id,
+            runtime_id=parent.runtime_id if runtime_id is None else runtime_id,
             task_id=parent.task_id if task_id is None else task_id,
             workspace_id=parent.workspace_id if workspace_id is None else workspace_id,
             operation_family=operation_family,
@@ -520,6 +531,76 @@ class DelegationAuthority:
             self._live.pop(delegation.digest, None)
             self._parents.pop(delegation.digest, None)
             self._consumed.add(delegation.digest)
+
+    def consume_for_effect(
+        self,
+        delegation_digest: str,
+        *,
+        principal: Principal,
+        parent_principal_id: str,
+        project_id: str,
+        session_id: str,
+        runtime_id: str,
+        task_id: str,
+        workspace_id: str,
+        policy_digest: str,
+        delegation_resource: str,
+        now: float | None = None,
+    ) -> None:
+        """Atomically consume a principal delegation for one exact effect.
+
+        A principal delegation proves *who* may act and which registered
+        tool may be used.  The operation and resource digest remain the
+        separate effect capability owned by the authority daemon.  This
+        method is intentionally one critical section so receipt claim cannot
+        succeed while the one-shot principal capability remains reusable.
+        """
+        current = time.time() if now is None else now
+        with self._lock:
+            live = self._live.get(delegation_digest)
+            if live is None or delegation_digest in self._consumed:
+                raise PrincipalDelegationError(
+                    "delegation is unknown or already consumed"
+                )
+            if current >= live.expires_at:
+                self._live.pop(delegation_digest, None)
+                raise PrincipalDelegationError("delegation has expired")
+            parent_digest = self._parents.get(delegation_digest)
+            if parent_digest is not None:
+                parent = self._live.get(parent_digest)
+                if parent is None or current >= parent.expires_at:
+                    raise PrincipalDelegationError(
+                        "parent delegation is no longer live"
+                    )
+            if live.subject != principal:
+                raise PrincipalDelegationError(
+                    "delegation principal does not match the effect owner"
+                )
+            if live.parent_principal.identity != parent_principal_id:
+                raise PrincipalDelegationError(
+                    "delegation parent does not match the effect owner"
+                )
+            if (
+                live.project_id != project_id
+                or live.session_id != session_id
+                or live.runtime_id != runtime_id
+                or live.task_id not in ("unbound", task_id)
+                or live.workspace_id not in ("unbound", workspace_id)
+                or live.policy_digest != policy_digest
+            ):
+                raise PrincipalDelegationError(
+                    "delegation context does not match the effect owner"
+                )
+            if (
+                live.operation_family != PRINCIPAL_DELEGATION_FAMILY
+                or delegation_resource not in live.resource_scope
+            ):
+                raise PrincipalDelegationError(
+                    "principal delegation does not cover the effect tool"
+                )
+            self._live.pop(delegation_digest, None)
+            self._parents.pop(delegation_digest, None)
+            self._consumed.add(delegation_digest)
 
     def revoke(self, delegation: DelegationScope) -> None:
         """Revoke one scope and cascade to its unclaimed descendants."""
@@ -617,6 +698,7 @@ def _digest(value: object) -> str:
 
 
 __all__ = [
+    "PRINCIPAL_DELEGATION_FAMILY",
     "AutomationPrincipal",
     "BrowserPrincipal",
     "ChannelPrincipal",

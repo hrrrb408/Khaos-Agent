@@ -38,16 +38,14 @@ int main(int argc, char **argv) {
         fprintf(stderr, "CSPRNG failure: refusing to provision a guessable marker\n");
         return 3;
     }
-    char value_hex[2 * sizeof(entropy) + 1];
-    for (size_t i = 0; i < sizeof(entropy); i++) {
-        snprintf(value_hex + 2 * i, 3, "%02x", entropy[i]);
-    }
-
     CFStringRef account = CFStringCreateWithCString(NULL, argv[1], kCFStringEncodingUTF8);
     CFStringRef group = CFStringCreateWithCString(NULL, argv[2], kCFStringEncodingUTF8);
-    CFStringRef value = CFStringCreateWithCString(NULL, value_hex, kCFStringEncodingUTF8);
+    CFDataRef value = CFDataCreate(NULL, entropy, sizeof(entropy));
     if (account == NULL || group == NULL || value == NULL) {
-        fprintf(stderr, "account/access-group strings are not valid UTF-8\n");
+        fprintf(stderr, "could not allocate keychain account, group, or marker data\n");
+        if (account != NULL) CFRelease(account);
+        if (group != NULL) CFRelease(group);
+        if (value != NULL) CFRelease(value);
         return 4;
     }
     const void *keys[] = {kSecClass, kSecAttrAccount, kSecAttrAccessGroup, kSecValueData};

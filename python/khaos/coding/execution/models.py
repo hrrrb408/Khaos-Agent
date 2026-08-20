@@ -17,6 +17,7 @@ from khaos.coding.workspace.storage import (
     DEFAULT_WORKSPACE_ENTRIES,
     WorkspaceStorageSnapshot,
 )
+from khaos.security.authority_context import AuthorityContextV1
 from khaos.security.network_broker import NetworkLease
 
 if TYPE_CHECKING:
@@ -261,11 +262,17 @@ class ResolvedSpawnPlan:
     executable_identity: str
     argv: tuple[str, ...]
     budget_digest: str
+    tool_name: str
+    authorization_resource_digest: str
     plan_digest: str = ""
     principal_kind: str = ""
     parent_principal_id: str = ""
     delegation_digest: str = ""
     source_transport: str = ""
+    runtime_id: str = ""
+    authorization_epoch: int = 0
+    workspace_id: str = ""
+    policy_digest: str = ""
 
     def __post_init__(self) -> None:
         required = (
@@ -280,11 +287,17 @@ class ResolvedSpawnPlan:
             self.network_authority,
             self.executable_identity,
             self.budget_digest,
+            self.tool_name,
+            self.authorization_resource_digest,
         )
         if any(not isinstance(value, str) or not value for value in required):
             raise ValueError("resolved spawn plan identity fields must not be empty")
         if self.workspace_generation < 0:
             raise ValueError("resolved spawn plan workspace generation must be non-negative")
+        if self.authorization_epoch < 0:
+            raise ValueError("resolved spawn plan authorization epoch must be non-negative")
+        if not isinstance(self.runtime_id, str) or not isinstance(self.workspace_id, str):
+            raise TypeError("resolved spawn plan context fields must be strings")
         typed = (self.principal_kind, self.parent_principal_id, self.delegation_digest)
         if any(typed) and not all(typed):
             raise ValueError("resolved spawn plan typed principal binding is incomplete")
@@ -313,6 +326,7 @@ class ResolvedSpawnPlan:
         object.__setattr__(self, "plan_digest", calculated)
 
     def _payload(self) -> dict[str, object]:
+        authority_context = self.authority_context()
         return {
             "principal_id": self.principal_id,
             "project_id": self.project_id,
@@ -332,10 +346,36 @@ class ResolvedSpawnPlan:
             "executable_identity": self.executable_identity,
             "argv": self.argv,
             "budget_digest": self.budget_digest,
+            "tool_name": self.tool_name,
+            "authorization_resource_digest": self.authorization_resource_digest,
             "principal_kind": self.principal_kind,
             "parent_principal_id": self.parent_principal_id,
             "delegation_digest": self.delegation_digest,
+            "source_transport": self.source_transport,
+            "runtime_id": self.runtime_id,
+            "authorization_epoch": self.authorization_epoch,
+            "workspace_id": self.workspace_id,
+            "policy_digest": self.policy_digest,
+            "authority_context": authority_context.payload(),
+            "authority_context_digest": authority_context.digest(),
         }
+
+    def authority_context(self) -> AuthorityContextV1:
+        return AuthorityContextV1(
+            principal_id=self.principal_id,
+            principal_kind=self.principal_kind,
+            parent_principal_id=self.parent_principal_id,
+            project_id=self.project_id,
+            session_id=self.session_id,
+            runtime_id=self.runtime_id,
+            source_transport=self.source_transport,
+            task_id=self.task_id,
+            workspace_id=self.workspace_id or "plan-workspace",
+            workspace_generation=self.workspace_generation,
+            policy_digest=self.policy_digest or self.permission_profile_digest,
+            authorization_epoch=self.authorization_epoch,
+            delegation_digest=self.delegation_digest,
+        )
 
     def digest(self) -> str:
         """Return the canonical authority digest for this plan."""

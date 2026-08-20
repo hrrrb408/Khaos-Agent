@@ -18,6 +18,7 @@ from khaos.coding.workspace.trusted_git import (
     TrustedGitProcessOwner,
     TrustedGitProcessState,
     TrustedGitRunner,
+    _run_sync_bounded,
 )
 from khaos.security.authority_broker import AuthorityBroker
 
@@ -85,6 +86,28 @@ async def test_late_spawn_is_reaped_after_adoption_timeout(
         await asyncio.sleep(0.01)
     assert owner.process is not None
     assert owner.process.returncode is not None
+
+
+def test_sync_git_output_is_bounded_before_return(tmp_path: Path) -> None:
+    stdout, stderr, returncode = _run_sync_bounded(
+        [sys.executable, "-c", "import sys; print('ok'); print('err', file=sys.stderr)"],
+        cwd=tmp_path,
+        env={"PATH": os.defpath},
+        max_stdout_bytes=64,
+        max_stderr_bytes=64,
+    )
+    assert returncode == 0
+    assert stdout == b"ok\n"
+    assert stderr == b"err\n"
+
+    with pytest.raises(TrustedGitError, match="stdout output exceeds"):
+        _run_sync_bounded(
+            [sys.executable, "-c", "print('x' * 200)"],
+            cwd=tmp_path,
+            env={"PATH": os.defpath},
+            max_stdout_bytes=16,
+            max_stderr_bytes=64,
+        )
 
 
 def test_safe_workspace_file_descriptor_survives_leaf_replacement(

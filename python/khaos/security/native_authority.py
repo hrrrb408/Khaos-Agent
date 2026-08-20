@@ -43,6 +43,13 @@ from khaos.security.identity_isolation import (
     read_contract_from_environment,
 )
 from khaos.security.protocol_boundary import canonical_json_bytes
+from khaos.security.windows_native_ffi import (
+    assign_process_to_job,
+    close_handle,
+    create_termination_job,
+    terminate_job,
+    wait_for_job_terminal,
+)
 
 MAX_NATIVE_OUTPUT_BYTES = 64 * 1024
 # The native client wraps the raw request into a JSON envelope (escaping
@@ -60,6 +67,28 @@ PROBE_INNER_REQUEST = '{"operation":"ping","protocol":1}'
 
 class NativeAuthorityError(IdentityIsolationError):
     """The platform-native authority proof is unavailable or invalid."""
+
+
+@dataclass
+class _OwnedTerminationJob:
+    """Idempotent owner for one Windows kill-on-close Job Object."""
+
+    handle: object
+    closed: bool = False
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        # Closing a kill-on-close job requests termination but does not by
+        # itself prove that every assigned descendant has exited.  Explicitly
+        # terminate and wait while the handle is still valid, then release it.
+        terminate_job(self.handle)
+        if not wait_for_job_terminal(self.handle, 5000):
+            raise NativeAuthorityError(
+                "native authority Job Object did not reach a terminal state"
+            )
+        close_handle(self.handle)
+        self.closed = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,6 +205,7 @@ class NativeAuthorityAdapter(Protocol):
 
     def request(self, payload: dict[str, object]) -> dict[str, object]:
         """Send one authority protocol request over the native transport."""
+        ...
 
 
 def _required_absolute_executable(path: Path) -> Path:
@@ -216,7 +246,7 @@ def _bounded_native_call(
     }
     if extra_environment:
         environment.update(extra_environment)
-    job_handle: int | None = None
+    job_handle: object | None = None
     process: subprocess.Popen[bytes] | None = None
     overflow = threading.Event()
     collected: dict[str, bytearray] = {"stdout": bytearray(), "stderr": bytearray()}
@@ -238,20 +268,8 @@ def _bounded_native_call(
             "stdout": _spawn_budget_reader(process.stdout, "stdout", collected, overflow),
             "stderr": _spawn_budget_reader(process.stderr, "stderr", collected, overflow),
         }
+        writer = _spawn_input_writer(process.stdin, input_bytes)
         try:
-            if input_bytes:
-                assert process.stdin is not None
-                try:
-                    process.stdin.write(input_bytes)
-                except (BrokenPipeError, OSError):
-                    # The client may exit before consuming the input; the
-                    # output budget and deadline still bound the call.
-                    pass
-                finally:
-                    try:
-                        process.stdin.close()
-                    except OSError:
-                        pass
             deadline = time.monotonic() + timeout_seconds
             while True:
                 if overflow.is_set():
@@ -269,6 +287,11 @@ def _bounded_native_call(
                     )
             for reader in readers.values():
                 reader.join(timeout=2.0)
+            writer.join(timeout=2.0)
+            if writer.is_alive():
+                raise NativeAuthorityError(
+                    "native authority client stdin writer did not terminate"
+                )
             if overflow.is_set():
                 raise NativeAuthorityError(
                     "native authority client exceeded output budget"
@@ -280,10 +303,12 @@ def _bounded_native_call(
             _terminate_process_domain(process, job_handle)
             for reader in readers.values():
                 reader.join(timeout=0.5)
+            writer.join(timeout=0.5)
             raise
         finally:
             for reader in readers.values():
                 reader.join(timeout=0.5)
+            writer.join(timeout=0.5)
     except NativeAuthorityError:
         # Re-raised domain violations; termination already happened in the
         # inner handler (or the process exited).
@@ -356,8 +381,35 @@ def _spawn_budget_reader(
     return thread
 
 
+def _spawn_input_writer(
+    stream: IO[bytes] | None, input_bytes: bytes
+) -> threading.Thread:
+    """Write and close child stdin off the supervisor's deadline path."""
+
+    def _write() -> None:
+        if stream is None:
+            return
+        try:
+            if input_bytes:
+                stream.write(input_bytes)
+                stream.flush()
+        except (BrokenPipeError, OSError):
+            # A probe client does not consume stdin and a request client may
+            # exit before reading the full frame; both are bounded outcomes.
+            pass
+        finally:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+    thread = threading.Thread(target=_write, daemon=True, name="native-stdin")
+    thread.start()
+    return thread
+
+
 def _terminate_process_domain(
-    process: subprocess.Popen[bytes] | None, job_handle: int | None
+    process: subprocess.Popen[bytes] | None, job_handle: object | None
 ) -> None:
     """Terminate the child's whole execution domain, SIGTERM -> SIGKILL.
 
@@ -368,33 +420,36 @@ def _terminate_process_domain(
     """
     if process is None:
         return
-    if process.returncode is not None:
-        return
     if os.name == "posix":
         import signal as signal_module
 
         try:
-            os.killpg(os.getpgid(process.pid), signal_module.SIGTERM)
+            # ``start_new_session=True`` makes the child PID the process
+            # group ID.  Use that stable ID even if the group leader already
+            # exited while a descendant still owns one of the pipes.
+            os.killpg(process.pid, signal_module.SIGTERM)
         except (OSError, PermissionError):
+            if process.returncode is None:
+                try:
+                    process.terminate()
+                except OSError:
+                    pass
+        if process.returncode is None:
             try:
-                process.terminate()
-            except OSError:
+                process.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
                 pass
         try:
-            process.wait(timeout=2.0)
-            return
-        except subprocess.TimeoutExpired:
-            pass
-        try:
-            os.killpg(os.getpgid(process.pid), signal_module.SIGKILL)
+            os.killpg(process.pid, signal_module.SIGKILL)
         except (OSError, PermissionError):
             pass
-        try:
-            process.wait(timeout=2.0)
-        except subprocess.TimeoutExpired:
-            raise NativeAuthorityError(
-                "native authority client process domain did not terminate"
-            )
+        if process.returncode is None:
+            try:
+                process.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                raise NativeAuthorityError(
+                    "native authority client process domain did not terminate"
+                )
     else:
         try:
             process.terminate()
@@ -413,88 +468,38 @@ def _terminate_process_domain(
                 )
 
 
-def _create_termination_job() -> int | None:
-    """Create a kill-on-close Job Object for the Windows process domain."""
+def _create_termination_job() -> _OwnedTerminationJob | None:
+    """Create a kill-on-close Job Object; failure is never best effort."""
     if os.name != "nt":
         return None
-    import ctypes
-
-    class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
-        _fields_ = [
-            ("PerProcessUserTimeLimit", ctypes.c_int64),
-            ("PerJobUserTimeLimit", ctypes.c_int64),
-            ("LimitFlags", ctypes.c_uint32),
-            ("MinimumWorkingSetSize", ctypes.c_size_t),
-            ("MaximumWorkingSetSize", ctypes.c_size_t),
-            ("ActiveProcessLimit", ctypes.c_uint32),
-            ("Affinity", ctypes.c_size_t),
-            ("PriorityClass", ctypes.c_uint32),
-            ("SchedulingClass", ctypes.c_uint32),
-        ]
-
-    class _IO_COUNTERS(ctypes.Structure):
-        _fields_ = [(name, ctypes.c_uint64) for name in (
-            "ReadOperationCount",
-            "WriteOperationCount",
-            "OtherOperationCount",
-            "ReadTransferCount",
-            "WriteTransferCount",
-            "OtherTransferCount",
-        )]
-
-    class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
-        _fields_ = [
-            ("BasicLimitInformation", _JOBOBJECT_BASIC_LIMIT_INFORMATION),
-            ("IoInfo", _IO_COUNTERS),
-            ("ProcessMemoryLimit", ctypes.c_size_t),
-            ("JobMemoryLimit", ctypes.c_size_t),
-            ("PeakProcessMemoryUsed", ctypes.c_size_t),
-            ("PeakJobMemoryUsed", ctypes.c_size_t),
-        ]
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
-    job = kernel32.CreateJobObjectW(None, None)
-    if not job:
-        return None
-    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
-    info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
-    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-    if not kernel32.SetInformationJobObject(
-        job,
-        9,  # JobObjectExtendedLimitInformation
-        ctypes.byref(info),
-        ctypes.sizeof(info),
-    ):
-        kernel32.CloseHandle(job)
-        return None
-    return job
-
-
-def _assign_process_to_job(job_handle: int, pid: int) -> bool:
-    """Assign a process to the termination job (best effort before wait)."""
-    import ctypes
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
-    PROCESS_SET_QUOTA = 0x0100
-    PROCESS_TERMINATE = 0x0001
-    process = kernel32.OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, False, pid)
-    if not process:
-        return False
     try:
-        return bool(kernel32.AssignProcessToJobObject(job_handle, process))
-    finally:
-        kernel32.CloseHandle(process)
+        return _OwnedTerminationJob(create_termination_job())
+    except OSError as exc:
+        raise NativeAuthorityError(
+            "native authority process domain cannot be owned by a Job Object"
+        ) from exc
 
 
-def _close_job(job_handle: int | None) -> None:
+def _assign_process_to_job(job_handle: _OwnedTerminationJob, pid: int) -> None:
+    """Assign a process to the termination job or fail closed."""
+    try:
+        assign_process_to_job(job_handle.handle, pid)
+    except OSError as exc:
+        raise NativeAuthorityError(
+            "native authority process could not be assigned to its Job Object"
+        ) from exc
+
+
+def _close_job(job_handle: object | None) -> None:
     """Close the Job Object, terminating any remaining assigned processes."""
     if job_handle is None:
         return
-    import ctypes
-
-    ctypes.WinDLL("kernel32").CloseHandle(  # type: ignore[attr-defined]
-        ctypes.c_void_p(job_handle)
-    )
+    try:
+        if not isinstance(job_handle, _OwnedTerminationJob):
+            raise NativeAuthorityError("native authority Job Object owner is invalid")
+        job_handle.close()
+    except OSError as exc:
+        raise NativeAuthorityError("native authority Job Object close failed") from exc
 
 
 def _decode_native_response(raw: bytes) -> dict[str, object]:
@@ -705,6 +710,8 @@ class MacOSLaunchdXPCAdapter(_SubprocessNativeAdapter):
     service_id: str = "com.khaos.authorityd"
     protected_key_ref: str = ""
     client: Path = Path("/")
+    expected_requirement_digest: str = ""
+    public_key_path: Path = Path("/")
 
     @classmethod
     def from_contract(cls, contract: AuthorityIdentityContract) -> MacOSLaunchdXPCAdapter:
@@ -746,6 +753,8 @@ class WindowsServiceNamedPipeAdapter(_SubprocessNativeAdapter):
     client: Path = Path("/")
     named_pipe: str = ""
     agent_sid: str = ""
+    expected_requirement_digest: str = ""
+    public_key_path: Path = Path("/")
 
     def _native_environment(self) -> dict[str, str]:
         return {

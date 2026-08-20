@@ -24,7 +24,10 @@ from khaos.security.authorityd_protocol import (
     AUTHORITYD_PROTOCOL,
     Ed25519KeyStore,
 )
+from khaos.security.delegation_issuer import AuthorityDelegationIssuer
 from khaos.security.principals import (
+    PRINCIPAL_DELEGATION_FAMILY,
+    DelegationAuthority,
     DelegationScope,
     GatewayPrincipal,
     PrincipalDelegationError,
@@ -167,6 +170,58 @@ def test_consume_is_one_shot(tmp_path: Path) -> None:
     daemon.delegation_consume(child, **_consume_kwargs(child))
     with pytest.raises(AuthorityControlPlaneError, match="already consumed"):
         daemon.delegation_consume(child, **_consume_kwargs(child))
+
+
+def test_principal_delegation_consumes_at_effect_claim_with_unbound_workspace() -> None:
+    authority = DelegationAuthority()
+    root = DelegationScope.root(
+        GatewayPrincipal("gateway:api-key"),
+        project_id="proj",
+        session_id="sess",
+        runtime_id="rt",
+        task_id="unbound",
+        workspace_id="unbound",
+        operation_family=PRINCIPAL_DELEGATION_FAMILY,
+        resource_scope=["tool.a"],
+        policy_digest="a" * 64,
+        expires_at=time.time() + 600,
+    )
+    authority.register_root(root)
+    child = authority.delegate(
+        root,
+        SubagentPrincipal("subagent:a"),
+        operation_family=PRINCIPAL_DELEGATION_FAMILY,
+        resource_scope=["tool.a"],
+        expires_at=time.time() + 300,
+        task_id="child-task",
+        workspace_id="unbound",
+    )
+    authority.consume_for_effect(
+        child.digest,
+        principal=child.subject,
+        parent_principal_id=child.parent_principal.identity,
+        project_id="proj",
+        session_id="sess",
+        runtime_id="rt",
+        task_id="child-task",
+        workspace_id="real-workspace",
+        policy_digest="a" * 64,
+        delegation_resource="tool.a",
+    )
+    assert authority.live_scope(child.digest) is None
+    with pytest.raises(PrincipalDelegationError, match="unknown|consumed"):
+        authority.consume_for_effect(
+            child.digest,
+            principal=child.subject,
+            parent_principal_id=child.parent_principal.identity,
+            project_id="proj",
+            session_id="sess",
+            runtime_id="rt",
+            task_id="child-task",
+            workspace_id="real-workspace",
+            policy_digest="a" * 64,
+            delegation_resource="tool.a",
+        )
 
 
 def test_cross_context_consumption_fails_closed(tmp_path: Path) -> None:
@@ -334,6 +389,7 @@ class _FakeIssuer:
 
     def __init__(self) -> None:
         self.issued: list[str] = []
+        self.requests: list[dict[str, str]] = []
         self.fail = False
 
     def issue_subagent_delegation(
@@ -343,9 +399,20 @@ class _FakeIssuer:
         task_id: str,
         tools: list[str],
         timeout_seconds: int,
+        session_id: str = "",
+        runtime_id: str = "",
+        workspace_id: str = "",
     ) -> str:
         if self.fail:
             raise PermissionError("authority unavailable")
+        self.requests.append(
+            {
+                "task_id": task_id,
+                "session_id": session_id,
+                "runtime_id": runtime_id,
+                "workspace_id": workspace_id,
+            }
+        )
         digest = f"{len(self.issued):064d}"[-64:]
         self.issued.append(digest)
         return digest
@@ -402,6 +469,109 @@ async def test_spawn_with_issuer_receives_unique_child_digests() -> None:
     task_b = service.spawner._tasks[second["task_id"]]
     assert task_a.delegation_digest != task_b.delegation_digest
     assert task_a.delegation_digest != ctx.delegation_digest
+    assert task_a.session_id == issuer.requests[0]["session_id"]
+    assert task_a.runtime_id == issuer.requests[0]["runtime_id"]
+    assert task_a.parent_principal_id == ctx.parent_principal_id
+    assert task_a.session_id.endswith(f"/{task_a.id}")
+
+
+class _AuthorityClientDouble:
+    """In-process owner double for the issuer's vertical binding test."""
+
+    def __init__(self) -> None:
+        self.authority = DelegationAuthority()
+
+    def delegation_register_root(self, scope: DelegationScope) -> str:
+        return self.authority.register_root(scope)
+
+    def delegation_issue_child(
+        self,
+        parent: DelegationScope,
+        child_principal_id: str,
+        child_principal_kind: str,
+        *,
+        operation_family: str,
+        resource_scope: list[str],
+        expires_at: float,
+        session_id: str | None = None,
+        runtime_id: str | None = None,
+        task_id: str | None = None,
+        workspace_id: str | None = None,
+    ) -> DelegationScope:
+        return self.authority.delegate(
+            parent,
+            SubagentPrincipal(child_principal_id),
+            operation_family=operation_family,
+            resource_scope=resource_scope,
+            expires_at=expires_at,
+            session_id=session_id,
+            runtime_id=runtime_id,
+            task_id=task_id,
+            workspace_id=workspace_id,
+        )
+
+
+def test_issuer_binds_delegation_to_the_real_child_execution_context() -> None:
+    client = _AuthorityClientDouble()
+    issuer = AuthorityDelegationIssuer(client)
+    ctx = _ctx()
+    task_id = "task_child"
+    session_id = "subagent:gateway:api-key/task_child"
+    runtime_id = "runtime_child"
+    digest = issuer.issue_subagent_delegation(
+        ctx,
+        task_id=task_id,
+        tools=["tool.a"],
+        timeout_seconds=60,
+        session_id=session_id,
+        runtime_id=runtime_id,
+    )
+    child = client.authority.live_scope(digest)
+    assert child is not None
+    assert child.task_id == task_id
+    assert child.session_id == session_id
+    assert child.runtime_id == runtime_id
+    assert child.parent_principal.identity == ctx.parent_principal_id
+
+
+def test_principal_delegation_rejects_the_wrong_parent_identity() -> None:
+    authority = DelegationAuthority()
+    root = DelegationScope.root(
+        GatewayPrincipal("gateway:api-key"),
+        project_id="proj",
+        session_id="unbound",
+        runtime_id="unbound",
+        task_id="unbound",
+        workspace_id="unbound",
+        operation_family=PRINCIPAL_DELEGATION_FAMILY,
+        resource_scope=["tool.a"],
+        policy_digest="a" * 64,
+        expires_at=time.time() + 600,
+    )
+    authority.register_root(root)
+    child = authority.delegate(
+        root,
+        SubagentPrincipal("subagent:a"),
+        operation_family=PRINCIPAL_DELEGATION_FAMILY,
+        resource_scope=["tool.a"],
+        expires_at=time.time() + 300,
+        session_id="child-session",
+        runtime_id="child-runtime",
+        task_id="child-task",
+    )
+    with pytest.raises(PrincipalDelegationError, match="parent"):
+        authority.consume_for_effect(
+            child.digest,
+            principal=child.subject,
+            parent_principal_id="gateway:wrong",
+            project_id="proj",
+            session_id="child-session",
+            runtime_id="child-runtime",
+            task_id="child-task",
+            workspace_id="workspace",
+            policy_digest="a" * 64,
+            delegation_resource="tool.a",
+        )
 
 
 async def test_spawn_fails_closed_when_issuance_fails() -> None:

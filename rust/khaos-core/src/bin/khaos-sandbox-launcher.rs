@@ -1877,10 +1877,7 @@ mod linux {
                           CapPrm:\t0000000000000000\nCapEff:\t0000000000000000\n\
                           CapBnd:\t000001ffffffffff\nCapAmb:\t0000000000000000\n";
             assert_eq!(ambient_capabilities_from_status(status).unwrap(), 0);
-            let nonzero = status.replace(
-                "CapAmb:\t0000000000000000",
-                "CapAmb:\t0000000000000004",
-            );
+            let nonzero = status.replace("CapAmb:\t0000000000000000", "CapAmb:\t0000000000000004");
             assert_eq!(ambient_capabilities_from_status(&nonzero).unwrap(), 4);
         }
 

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -56,6 +57,24 @@ class CompositionError(PermissionError):
     """The runtime composition does not match the production contract."""
 
 
+_CONSTRUCTION_COMPONENT_KEYS = (
+    "tool_scheduler",
+    "security_middleware",
+    "sandbox_backend",
+    "network_guard",
+    "local_audit_logger",
+    "execution_service",
+    "workspace_authority",
+    "office_mutation_authority",
+    "credential_broker",
+    "network_broker",
+    "approval_broker",
+    "process_supervisor",
+    "execution_backend_selector",
+    "verification_backend",
+)
+
+
 @dataclass(frozen=True, slots=True)
 class CompositionManifest:
     """Verified runtime component types plus forbidden-type absence."""
@@ -92,6 +111,52 @@ def _exact_type_name(value: object) -> str:
     return f"{type(value).__module__}.{type(value).__qualname__}"
 
 
+def _declared_type_name(value: object) -> str:
+    """Return the type represented by a construction-time witness.
+
+    The verification factory is a class rather than an instance.  Treating
+    that class as a witness keeps the construction manifest explicit without
+    instantiating a second strategy object merely for inspection.
+    """
+    if isinstance(value, type):
+        return f"{value.__module__}.{value.__qualname__}"
+    return _exact_type_name(value)
+
+
+def _construction_digest(payload: Mapping[str, object]) -> str:
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def build_construction_manifest(
+    components: Mapping[str, object],
+) -> dict[str, object]:
+    """Build the exact component declaration at the factory boundary.
+
+    The runtime factory calls this with the objects it just constructed.  It
+    is deliberately a mapping supplied by the constructor, not a reflection
+    pass over a running object graph.  Runtime verification still resolves
+    the fixed component paths and compares both the live objects and this
+    declaration, so changing a component after construction is detected.
+    """
+    missing = [key for key in _CONSTRUCTION_COMPONENT_KEYS if key not in components]
+    if missing:
+        raise CompositionError(
+            "construction manifest is missing components: " + ", ".join(missing)
+        )
+    declared = {
+        key: _declared_type_name(components[key])
+        for key in _CONSTRUCTION_COMPONENT_KEYS
+    }
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "components": declared,
+    }
+    payload["construction_digest"] = _construction_digest(payload)
+    return payload
+
+
 def _collect_authority_component_names(runtime: Any) -> set[str]:
     """Exact names of authority receipt-broker types reachable from the runtime."""
     reachable = _walk_object_graph(runtime, max_depth=5)
@@ -107,7 +172,13 @@ def _collect_authority_component_names(runtime: Any) -> set[str]:
 
 
 def _walk_object_graph(root: object, max_depth: int = 4) -> set[type]:
-    """Collect the concrete types reachable from an object graph."""
+    """Collect concrete types without invoking arbitrary object properties.
+
+    This walk is a bounded forbidden-component detector, not the positive
+    composition proof.  Reading ``__dict__`` includes private state while
+    avoiding ``dir()``/property evaluation, which could both hide state and
+    execute attacker-controlled descriptors.
+    """
     seen_types: set[type] = set()
     visited: set[int] = set()
     pending: list[tuple[object, int]] = [(root, 0)]
@@ -122,8 +193,7 @@ def _walk_object_graph(root: object, max_depth: int = 4) -> set[type]:
         seen_types.add(type(node))
         if isinstance(node, dict):
             for key, value in node.items():
-                if isinstance(key, str):
-                    pending.append((value, depth + 1))
+                pending.append((key, depth + 1))
                 pending.append((value, depth + 1))
             continue
         if isinstance(node, (list, tuple, set, frozenset)):
@@ -132,17 +202,97 @@ def _walk_object_graph(root: object, max_depth: int = 4) -> set[type]:
             continue
         if isinstance(node, (str, bytes, int, float, bool)):
             continue
-        for attribute in dir(node):
-            if attribute.startswith("_"):
+        try:
+            attributes = object.__getattribute__(node, "__dict__")
+        except (AttributeError, TypeError):
+            attributes = None
+        if isinstance(attributes, dict):
+            pending.extend((value, depth + 1) for value in attributes.values())
+        # Some lightweight test doubles and immutable configuration objects
+        # keep their child component as a class attribute.  Read the raw
+        # class dictionary only; do not call descriptors or methods.
+        try:
+            class_attributes = vars(type(node))
+        except TypeError:
+            class_attributes = {}
+        for name, value in class_attributes.items():
+            if name.startswith("__") or callable(value) or isinstance(value, type):
                 continue
-            try:
-                value = getattr(node, attribute)
-            except Exception:  # noqa: BLE001, S112 - introspection only
-                continue
-            if callable(value) and not isinstance(value, type):
+            if isinstance(value, (property, staticmethod, classmethod)):
                 continue
             pending.append((value, depth + 1))
     return seen_types
+
+
+def _direct_component_values(runtime: Any) -> dict[str, object]:
+    """Resolve only the fixed production component paths.
+
+    These paths mirror the constructor wiring in ``runtime.factory``.  No
+    graph search or type-name fallback is used for the positive proof.
+    """
+    scheduler = getattr(runtime, "tool_scheduler", None)
+    middleware = getattr(scheduler, "security_middleware", None)
+    loop = getattr(runtime, "loop", None)
+    execution_service = getattr(runtime, "execution_service", None)
+    selector = getattr(execution_service, "backend_selector", None)
+    return {
+        "tool_scheduler": scheduler,
+        "security_middleware": middleware,
+        "sandbox_backend": getattr(middleware, "sandbox", None),
+        "network_guard": getattr(middleware, "network_guard", None),
+        "local_audit_logger": getattr(runtime, "audit_logger", None),
+        "execution_service": execution_service,
+        "workspace_authority": getattr(loop, "workspace_manager", None),
+        "office_mutation_authority": getattr(runtime, "office_authority", None),
+        "credential_broker": getattr(scheduler, "credential_broker", None),
+        "network_broker": getattr(scheduler, "network_broker_factory", None),
+        "approval_broker": getattr(loop, "approval_broker", None),
+        "process_supervisor": getattr(execution_service, "process_supervisor", None),
+        "execution_backend_selector": selector,
+        "verification_backend": getattr(runtime, "new_verify_fix_loop", None),
+    }
+
+
+def _verify_construction_manifest(
+    runtime: Any,
+    errors: list[str],
+) -> dict[str, str]:
+    """Validate the factory declaration and return its component names."""
+    declared = getattr(runtime, "composition_manifest", None)
+    if not isinstance(declared, dict):
+        errors.append("factory construction manifest is missing")
+        return {}
+    if declared.get("schema_version") != 1:
+        errors.append("factory construction manifest schema is unsupported")
+        return {}
+    components = declared.get("components")
+    digest = declared.get("construction_digest")
+    if not isinstance(components, dict) or not isinstance(digest, str):
+        errors.append("factory construction manifest is malformed")
+        return {}
+    base = {"schema_version": 1, "components": components}
+    if digest != _construction_digest(base):
+        errors.append("factory construction manifest digest mismatch")
+    direct = _direct_component_values(runtime)
+    expected_keys = set(_CONSTRUCTION_COMPONENT_KEYS)
+    if set(components) != expected_keys:
+        errors.append("factory construction manifest component set mismatch")
+    for key in _CONSTRUCTION_COMPONENT_KEYS:
+        value = direct.get(key)
+        if value is None:
+            errors.append(f"factory component is missing: {key}")
+            continue
+        actual = _declared_type_name(value)
+        if components.get(key) != actual:
+            errors.append(
+                f"factory component changed after construction: {key} "
+                f"({components.get(key)!r} != {actual!r})"
+            )
+    return {
+        str(key): str(value)
+        for key, value in components.items()
+        if isinstance(key, str) and isinstance(value, str)
+    }
 
 
 def verify_runtime_composition(runtime: Any) -> CompositionManifest:
@@ -156,32 +306,38 @@ def verify_runtime_composition(runtime: Any) -> CompositionManifest:
     components: dict[str, str] = {}
     errors: list[str] = []
 
+    # RuntimeResult always exposes this field; ad-hoc fake runtimes used by
+    # unit tests do not.  A real factory-built runtime must prove the
+    # construction declaration before the compatibility diagnostics below.
+    if hasattr(runtime, "composition_manifest"):
+        components.update(_verify_construction_manifest(runtime, errors))
+
     scheduler = getattr(runtime, "tool_scheduler", None)
-    if not isinstance(scheduler, ToolScheduler):
+    if type(scheduler) is not ToolScheduler:
         errors.append("tool_scheduler is missing or not a ToolScheduler")
     else:
         components["tool_scheduler"] = _exact_type_name(scheduler)
 
     middleware = getattr(scheduler, "security_middleware", None) if scheduler else None
-    if not isinstance(middleware, SecurityMiddleware):
+    if type(middleware) is not SecurityMiddleware:
         errors.append("security_middleware is missing or not a SecurityMiddleware")
     else:
         components["security_middleware"] = _exact_type_name(middleware)
 
     sandbox = getattr(middleware, "sandbox", None) if middleware else None
-    if not isinstance(sandbox, Sandbox):
+    if type(sandbox) is not Sandbox:
         errors.append("sandbox is missing or not a Sandbox")
     else:
         components["sandbox_backend"] = _exact_type_name(sandbox)
 
     network_guard = getattr(middleware, "network_guard", None) if middleware else None
-    if not isinstance(network_guard, NetworkGuard):
+    if type(network_guard) is not NetworkGuard:
         errors.append("network_guard is missing or not a NetworkGuard")
     else:
         components["network_guard"] = _exact_type_name(network_guard)
 
     audit_logger = getattr(runtime, "audit_logger", None)
-    if not isinstance(audit_logger, AuditLogger):
+    if type(audit_logger) is not AuditLogger:
         errors.append("audit_logger is missing or not an AuditLogger")
     else:
         # Honest semantics: this handle is the LOCAL SQLite/append-file
@@ -192,7 +348,7 @@ def verify_runtime_composition(runtime: Any) -> CompositionManifest:
         components["local_audit_logger"] = _exact_type_name(audit_logger)
 
     execution_service = getattr(runtime, "execution_service", None)
-    if not isinstance(execution_service, ExecutionService):
+    if type(execution_service) is not ExecutionService:
         errors.append("execution_service is missing or not an ExecutionService")
     else:
         components["execution_service"] = _exact_type_name(execution_service)
@@ -200,19 +356,19 @@ def verify_runtime_composition(runtime: Any) -> CompositionManifest:
     workspace_manager = getattr(runtime, "loop", None)
     loop = workspace_manager
     manager = getattr(loop, "workspace_manager", None) if loop else None
-    if not isinstance(manager, WorkspaceManager):
+    if type(manager) is not WorkspaceManager:
         errors.append("workspace_manager is missing or not a WorkspaceManager")
     else:
         components["workspace_authority"] = _exact_type_name(manager)
 
     office_authority = getattr(runtime, "office_authority", None)
-    if not isinstance(office_authority, OfficeMutationAuthority):
+    if type(office_authority) is not OfficeMutationAuthority:
         errors.append("office_authority is missing or not an OfficeMutationAuthority")
     else:
         components["office_mutation_authority"] = _exact_type_name(office_authority)
 
     credential_broker = getattr(scheduler, "credential_broker", None) if scheduler else None
-    if not isinstance(credential_broker, CredentialBroker):
+    if type(credential_broker) is not CredentialBroker:
         errors.append("credential_broker is missing or not a CredentialBroker")
     else:
         components["credential_broker"] = _exact_type_name(credential_broker)
@@ -220,7 +376,7 @@ def verify_runtime_composition(runtime: Any) -> CompositionManifest:
     network_broker_factory = (
         getattr(scheduler, "network_broker_factory", None) if scheduler else None
     )
-    if not isinstance(network_broker_factory, NetworkBrokerFactory):
+    if type(network_broker_factory) is not NetworkBrokerFactory:
         errors.append("network_broker_factory is missing or not a NetworkBrokerFactory")
     else:
         components["network_broker"] = _exact_type_name(network_broker_factory)
@@ -240,7 +396,7 @@ def verify_runtime_composition(runtime: Any) -> CompositionManifest:
     backend_selector = (
         getattr(execution_service, "backend_selector", None) if execution_service else None
     )
-    if not isinstance(backend_selector, BackendSelector):
+    if type(backend_selector) is not BackendSelector:
         errors.append("backend_selector is missing or not a BackendSelector")
     else:
         components["execution_backend_selector"] = _exact_type_name(backend_selector)
@@ -249,17 +405,15 @@ def verify_runtime_composition(runtime: Any) -> CompositionManifest:
             # The backend is selected lazily; verify the selector's decision
             # function resolves to the platform sandbox backend, never a
             # forbidden host backend.
-            resolve = getattr(backend_selector, "select", None) or getattr(
-                backend_selector, "resolve", None
-            )
+            resolve = getattr(backend_selector, "select", None)
             if callable(resolve):
                 try:
-                    backend = resolve()
+                    backend = resolve(writable=True)
                 except Exception:  # noqa: BLE001 - selection must succeed
                     errors.append("backend selection failed")
         if backend is not None:
             components["execution_backend"] = _exact_type_name(backend)
-            if not isinstance(backend, LinuxBubblewrapBackend):
+            if type(backend) is not LinuxBubblewrapBackend:
                 errors.append(
                     "execution backend is not the platform sandbox backend: "
                     + _exact_type_name(backend)
@@ -325,6 +479,6 @@ __all__ = [
     "FORBIDDEN_TYPE_NAMES",
     "CompositionError",
     "CompositionManifest",
+    "build_construction_manifest",
     "verify_runtime_composition",
 ]
-

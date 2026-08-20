@@ -21,13 +21,15 @@ indefinitely.
 
 from __future__ import annotations
 
+import ctypes
 import json
 import logging
 import os
 import struct
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
-from typing import Any, Callable
+from typing import Any
 
 from khaos.security.authorityd import AuthorityDaemon, _dispatch
 from khaos.security.authorityd_protocol import (
@@ -38,8 +40,19 @@ from khaos.security.identity_isolation import (
     IdentityIsolationError,
     read_contract_from_environment,
 )
+from khaos.security.windows_native_ffi import (
+    ERROR_OPERATION_ABORTED,
+    Overlapped,
+    SecurityAttributes,
+    get_windows_bindings,
+    is_invalid_handle,
+)
 
 logger = logging.getLogger(__name__)
+
+
+class _ActiveOverlappedIOError(OSError):
+    """The kernel has not proven an overlapped operation is terminal."""
 
 GENERIC_READ = 0x80000000
 GENERIC_WRITE = 0x40000000
@@ -62,6 +75,19 @@ TokenUser = 1
 TokenGroups = 2
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 _LOCAL_SYSTEM_SID = "S-1-5-18"
+
+
+def _last_error(ctypes_module: Any) -> int:
+    """Read Win32 last-error through a typed, fail-closed module boundary."""
+    getter = getattr(ctypes_module, "get_last_error", None)
+    if not callable(getter):
+        raise OSError("ctypes Win32 last-error API is unavailable")
+    value = getter()
+    if not isinstance(value, int):
+        raise OSError("ctypes Win32 last-error value is malformed")
+    return value
+
+
 # How long a blocking ConnectNamedPipe wait may hold before the shutdown
 # flag is re-checked.  Bound the wake-up latency of daemon close, never the
 # total client wait (a server legitimately waits for clients).
@@ -86,26 +112,17 @@ def build_backend_sddl(service_sid: str) -> str:
 
 
 def _kernel32() -> Any:
-    import ctypes
-
-    dll = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
-    # HANDLE-returning APIs must be bound: the ctypes default restype is a
-    # 32-bit c_int, which silently truncates 64-bit kernel handles.
-    dll.OpenProcess.restype = ctypes.c_void_p
-    dll.CreateNamedPipeW.restype = ctypes.c_void_p
-    dll.CreateEventW.restype = ctypes.c_void_p
-    return dll
+    """Return the process-wide typed kernel32 binding."""
+    return get_windows_bindings().kernel32
 
 
 def _advapi32() -> Any:
-    import ctypes
-
-    dll = ctypes.WinDLL("advapi32", use_last_error=True)  # type: ignore[attr-defined]
-    return dll
+    """Return the process-wide typed advapi32 binding."""
+    return get_windows_bindings().advapi32
 
 
 def _is_invalid_handle(handle: Any) -> bool:
-    return not handle or int(handle) in _INVALID_HANDLES
+    return not handle or is_invalid_handle(handle)
 
 
 def _connection_timeout_seconds() -> float:
@@ -177,8 +194,6 @@ def _peer_is_trusted(
 
 def _client_identity(kernel32: Any, advapi32: Any, pipe_handle: int) -> tuple[str, list[str]]:
     """Return (token-user SID, token-group SIDs); fail closed on any error."""
-    import ctypes
-
     client_pid = ctypes.c_ulong(0)
     if not kernel32.GetNamedPipeClientProcessId(
         ctypes.c_void_p(pipe_handle), ctypes.byref(client_pid)
@@ -229,7 +244,11 @@ def _client_identity(kernel32: Any, advapi32: Any, pipe_handle: int) -> tuple[st
                 try:
                     return text.value or ""
                 finally:
-                    kernel32.LocalFree(ctypes.c_void_p(text))
+                    # ``text`` is a pointer-to-pointer result.  Passing the
+                    # c_wchar_p object itself makes ctypes try to convert the
+                    # pointed-to string instead of freeing the returned
+                    # allocation.  Preserve the raw pointer value.
+                    kernel32.LocalFree(ctypes.cast(text, ctypes.c_void_p))
 
             user_sid = _sid_to_string(_parse_token_user_sid(_query(TokenUser)))
             group_sids = _parse_token_group_sids(
@@ -260,24 +279,44 @@ class _OverlappedIOWindow:
         if _is_invalid_handle(event):
             raise OSError("backend pipe event creation failed")
 
-        class _OVERLAPPED(ctypes.Structure):
-            _fields_ = [
-                ("Internal", ctypes.c_size_t),
-                ("InternalHigh", ctypes.c_size_t),
-                ("Offset", ctypes.c_ulong),
-                ("OffsetHigh", ctypes.c_ulong),
-                ("hEvent", ctypes.c_void_p),
-            ]
-
         self._event = event
-        self._overlapped = _OVERLAPPED()
+        self._overlapped = Overlapped()
         self._overlapped.hEvent = ctypes.c_void_p(event)
+        self._terminal = False
 
     def _start(self, starter: Callable[[Any], int]) -> tuple[bool, int]:
         ctypes = self._ctypes
         self._kernel32.ResetEvent(ctypes.c_void_p(self._event))
         started = starter(ctypes.byref(self._overlapped))
-        return bool(started), ctypes.get_last_error()
+        return bool(started), _last_error(ctypes)
+
+    def _cancel_and_reap(self, *, reason: str) -> None:
+        """Cancel and prove terminal completion before releasing OVERLAPPED."""
+        ctypes = self._ctypes
+        self._kernel32.CancelIoEx(
+            ctypes.c_void_p(self._handle), ctypes.byref(self._overlapped)
+        )
+        wait = self._kernel32.WaitForSingleObject(
+            ctypes.c_void_p(self._event), 5000
+        )
+        if wait != WAIT_OBJECT_0:
+            raise OSError(f"{reason}: cancelled I/O did not signal completion")
+        transferred = ctypes.c_ulong(0)
+        if self._kernel32.GetOverlappedResult(
+            ctypes.c_void_p(self._handle),
+            ctypes.byref(self._overlapped),
+            ctypes.byref(transferred),
+            False,
+        ):
+            self._terminal = True
+            return
+        error = _last_error(ctypes)
+        if error != ERROR_OPERATION_ABORTED:
+            raise OSError(
+                error,
+                f"{reason}: cancelled I/O completion is not terminal",
+            )
+        self._terminal = True
 
     def _wait(self, deadline_seconds: float) -> bool:
         ctypes = self._ctypes
@@ -287,11 +326,9 @@ class _OverlappedIOWindow:
         if wait == WAIT_OBJECT_0:
             return True
         if wait == WAIT_TIMEOUT:
-            self._kernel32.CancelIoEx(ctypes.c_void_p(self._handle), None)
-            # Reap the cancelled operation so the event cannot signal later.
-            self._kernel32.WaitForSingleObject(ctypes.c_void_p(self._event), 5000)
+            self._cancel_and_reap(reason="overlapped I/O deadline exceeded")
             return False
-        return False
+        raise OSError("overlapped I/O wait failed")
 
     def run(
         self, starter: Callable[[Any], int], *, deadline_seconds: float
@@ -301,14 +338,18 @@ class _OverlappedIOWindow:
         started, last_error = self._start(starter)
         if started:
             transferred = ctypes.c_ulong(0)
-            self._kernel32.GetOverlappedResult(
+            if not self._kernel32.GetOverlappedResult(
                 ctypes.c_void_p(self._handle),
                 ctypes.byref(self._overlapped),
                 ctypes.byref(transferred),
                 False,
-            )
+            ):
+                self._terminal = True
+                raise OSError("synchronous overlapped I/O completion failed")
+            self._terminal = True
             return transferred.value
         if last_error != ERROR_IO_PENDING:
+            self._terminal = True
             return 0
         if not self._wait(deadline_seconds):
             return 0
@@ -319,11 +360,15 @@ class _OverlappedIOWindow:
             ctypes.byref(transferred),
             False,
         ):
-            return 0
+            self._terminal = True
+            raise OSError("overlapped I/O completion failed")
+        self._terminal = True
         return transferred.value
 
     def poll_started(self, starter: Callable[[Any], int]) -> tuple[bool, int]:
         started, last_error = self._start(starter)
+        if started or last_error != ERROR_IO_PENDING:
+            self._terminal = True
         return started, last_error
 
     def wait_or_shutdown(self, *, shutdown: Callable[[], bool]) -> bool:
@@ -334,17 +379,14 @@ class _OverlappedIOWindow:
                 ctypes.c_void_p(self._event), _CONNECT_POLL_MILLISECONDS
             )
             if wait == WAIT_OBJECT_0:
+                # A signalled connect event still needs the kernel completion
+                # query before the OVERLAPPED storage can be released.
+                self.transferred()
                 return True
             if wait != WAIT_TIMEOUT:
                 return False
             if shutdown():
-                ctypes_override = self._ctypes
-                self._kernel32.CancelIoEx(
-                    ctypes_override.c_void_p(self._handle), None
-                )
-                self._kernel32.WaitForSingleObject(
-                    ctypes_override.c_void_p(self._event), 5000
-                )
+                self._cancel_and_reap(reason="overlapped connect shutdown")
                 return False
 
     def transferred(self) -> int:
@@ -356,10 +398,16 @@ class _OverlappedIOWindow:
             ctypes.byref(transferred),
             False,
         ):
-            return 0
+            self._terminal = True
+            raise OSError("overlapped connect completion failed")
+        self._terminal = True
         return transferred.value
 
     def close(self) -> None:
+        if not self._terminal:
+            raise _ActiveOverlappedIOError(
+                "refusing to release an active overlapped operation"
+            )
         self._kernel32.CloseHandle(self._ctypes.c_void_p(self._event))
 
 
@@ -393,8 +441,6 @@ def serve_windows_backend(daemon: AuthorityDaemon, *, production: bool = True) -
             "the authority backend requires the authority Service SID contract"
         )
     connection_timeout = _connection_timeout_seconds()
-    import ctypes
-
     kernel32 = _kernel32()
     advapi32 = _advapi32()
     sddl = ctypes.c_wchar_p(build_backend_sddl(service_sid))
@@ -404,69 +450,81 @@ def serve_windows_backend(daemon: AuthorityDaemon, *, production: bool = True) -
     ):
         raise IdentityIsolationError("backend pipe DACL construction failed")
 
-    class _SECURITY_ATTRIBUTES(ctypes.Structure):
-        _fields_ = [
-            ("nLength", ctypes.c_ulong),
-            ("lpSecurityDescriptor", ctypes.c_void_p),
-            ("bInheritHandle", ctypes.c_int),
-        ]
-
-    attributes = _SECURITY_ATTRIBUTES(
-        ctypes.sizeof(_SECURITY_ATTRIBUTES), security_attributes, 0
+    attributes = SecurityAttributes(
+        ctypes.sizeof(SecurityAttributes), security_attributes, 0
     )
     pipe_w = ctypes.c_wchar_p(pipe_name)
-    with ThreadPoolExecutor(
-        max_workers=2, thread_name_prefix="khaos-authorityd-win"
-    ) as dispatch_pool:
-        while not daemon._closed:
-            handle = kernel32.CreateNamedPipeW(
-                pipe_w,
-                PIPE_ACCESS_DUPLEX
-                | FILE_FLAG_FIRST_PIPE_INSTANCE
-                | FILE_FLAG_OVERLAPPED,
-                PIPE_TYPE_MESSAGE
-                | PIPE_READMODE_MESSAGE
-                | PIPE_WAIT
-                | PIPE_REJECT_REMOTE_CLIENTS,
-                PIPE_UNLIMITED_INSTANCES,
-                MAX_MESSAGE_BYTES,
-                MAX_MESSAGE_BYTES,
-                5000,
-                ctypes.byref(attributes),
-            )
-            if _is_invalid_handle(handle):
-                raise IdentityIsolationError("backend CreateNamedPipeW failed")
-            try:
-                connect = _OverlappedIOWindow(kernel32, handle)
+    try:
+        with ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="khaos-authorityd-win"
+        ) as dispatch_pool:
+            while not daemon._closed:
+                handle = kernel32.CreateNamedPipeW(
+                    pipe_w,
+                    PIPE_ACCESS_DUPLEX
+                    | FILE_FLAG_FIRST_PIPE_INSTANCE
+                    | FILE_FLAG_OVERLAPPED,
+                    PIPE_TYPE_MESSAGE
+                    | PIPE_READMODE_MESSAGE
+                    | PIPE_WAIT
+                    | PIPE_REJECT_REMOTE_CLIENTS,
+                    PIPE_UNLIMITED_INSTANCES,
+                    MAX_MESSAGE_BYTES,
+                    MAX_MESSAGE_BYTES,
+                    5000,
+                    ctypes.byref(attributes),
+                )
+                if _is_invalid_handle(handle):
+                    raise IdentityIsolationError("backend CreateNamedPipeW failed")
+                safe_to_release_handle = False
                 try:
-                    started, last_error = connect.poll_started(
-                        lambda overlapped: kernel32.ConnectNamedPipe(
-                            ctypes.c_void_p(handle), overlapped
+                    connect: _OverlappedIOWindow | None = None
+                    try:
+                        connect = _OverlappedIOWindow(kernel32, handle)
+                        started, last_error = connect.poll_started(
+                            lambda overlapped, pipe_handle=handle: kernel32.ConnectNamedPipe(
+                                ctypes.c_void_p(pipe_handle), overlapped
+                            )
                         )
-                    )
-                    if not started and last_error == ERROR_PIPE_CONNECTED:
-                        pass  # client won the create/connect race
-                    elif not started and last_error != ERROR_IO_PENDING:
-                        continue
-                    elif not started:
-                        if not connect.wait_or_shutdown(
+                        if not started and last_error == ERROR_PIPE_CONNECTED:
+                            pass  # client won the create/connect race
+                        elif not started and last_error != ERROR_IO_PENDING:
+                            continue
+                        elif not started and connect.wait_or_shutdown(
                             shutdown=lambda: daemon._closed
                         ):
+                            pass
+                        elif not started:
                             continue
-                    _serve_one_connection(
-                        daemon,
-                        kernel32,
-                        advapi32,
-                        handle,
-                        service_sid=service_sid,
-                        connection_timeout=connection_timeout,
-                        dispatch_pool=dispatch_pool,
+                        _serve_one_connection(
+                            daemon,
+                            kernel32,
+                            advapi32,
+                            handle,
+                            service_sid=service_sid,
+                            connection_timeout=connection_timeout,
+                            dispatch_pool=dispatch_pool,
+                        )
+                    finally:
+                        if connect is not None:
+                            connect.close()
+                            safe_to_release_handle = True
+                except _ActiveOverlappedIOError:
+                    # Closing this pipe would let a still-running operation
+                    # target a recycled handle.  Retain the handle and fail
+                    # the service so its process supervisor can terminate the
+                    # whole authority domain.
+                    safe_to_release_handle = False
+                    logger.critical(
+                        "retaining backend pipe after un-reaped overlapped I/O"
                     )
+                    raise
                 finally:
-                    connect.close()
-            finally:
-                kernel32.DisconnectNamedPipe(ctypes.c_void_p(handle))
-                kernel32.CloseHandle(ctypes.c_void_p(handle))
+                    if safe_to_release_handle:
+                        kernel32.DisconnectNamedPipe(ctypes.c_void_p(handle))
+                        kernel32.CloseHandle(ctypes.c_void_p(handle))
+    finally:
+        kernel32.LocalFree(security_attributes)
 
 
 def _serve_one_connection(
@@ -532,6 +590,8 @@ def _serve_one_connection(
             write_window.close()
         if written != len(body):
             raise OSError("backend pipe write timed out or was incomplete")
+    except _ActiveOverlappedIOError:
+        raise
     except IdentityIsolationError as exc:
         logger.error("authority backend rejected a peer: %s", exc)
     except (OSError, ValueError, TypeError) as exc:
@@ -557,13 +617,13 @@ def _serve_one_connection(
                     )
                 finally:
                     write_window.close()
+        except _ActiveOverlappedIOError:
+            raise
         except (OSError, ValueError):
             pass
 
 
 def _new_buffer(size: int) -> Any:
-    import ctypes
-
     return ctypes.create_string_buffer(size)
 
 

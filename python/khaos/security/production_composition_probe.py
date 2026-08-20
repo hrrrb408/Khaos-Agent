@@ -255,10 +255,16 @@ def _probe_request(
         executable_identity=executable,
         argv=command,
         budget_digest=budget.digest(),
+        tool_name="production_composition_probe",
+        authorization_resource_digest=_resource_digest(command, workspace),
         principal_kind=_COMPOSE_PRINCIPAL_KIND,
         parent_principal_id=_COMPOSE_PARENT_PRINCIPAL_ID,
         delegation_digest=delegation_digest,
         source_transport="cron",
+        runtime_id=_COMPOSE_RUNTIME_ID,
+        authorization_epoch=1,
+        workspace_id="authority-composition",
+        policy_digest=policy_digest,
     )
     step = StepExecutionAuthority(
         principal_id=_COMPOSE_PRINCIPAL_ID,

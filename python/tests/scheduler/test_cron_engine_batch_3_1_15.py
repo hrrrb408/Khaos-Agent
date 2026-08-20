@@ -22,21 +22,22 @@ Acceptance tests for the 10 criteria specified in the batch review:
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import shutil
 import stat
-from datetime import datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
-
-pytestmark = pytest.mark.posix_host
-
 from khaos.db import Database
 from khaos.exceptions import ServiceShutdownError
 from khaos.scheduler import CronEngine, ScheduleConfig, TaskStatus
 from khaos.scheduler.engine import CronEngineState, PendingPersistence
 from khaos.time_utils import utc_now_naive
+
+pytestmark = pytest.mark.posix_host
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -97,8 +98,8 @@ async def _force_cleanup_engine(engine: CronEngine) -> None:
             task.cancel()
             try:
                 await asyncio.wait_for(task, timeout=1.0)
-            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
-                pass
+            except BaseException:
+                logger.debug("force cleanup ignored task exception", exc_info=True)
     engine._execute_tasks.clear()
     engine._pending_persistence.clear()
     engine._persistence_owners.clear()
@@ -246,6 +247,7 @@ async def test_acceptance_2_shutdown_failure_lock_not_silently_released(
     ``_retained_instance_lock_fd`` and still holds the flock.
     """
     import fcntl
+
     import khaos.grpc_server as gs
 
     _khaos_dir, _run_dir = _make_safe_khaos_dir(tmp_path)
@@ -325,10 +327,7 @@ async def test_acceptance_3_failed_stop_then_start_rejected(tmp_path) -> None:
             try:
                 await asyncio.sleep(3600)
             except asyncio.CancelledError:
-                try:
-                    await asyncio.sleep(3600)
-                except asyncio.CancelledError:
-                    raise
+                await asyncio.sleep(3600)
 
         engine = CronEngine(
             db=db, executor=resistant_executor, tick_interval=0.05,
@@ -389,14 +388,14 @@ async def test_acceptance_4_failed_stop_no_recover_all_running(tmp_path) -> None
 
         db.recover_all_running_tasks = counting_recover
 
+        executor_started = asyncio.Event()
+
         async def resistant_executor(task_id, prompt, principal_id):
+            executor_started.set()
             try:
                 await asyncio.sleep(3600)
             except asyncio.CancelledError:
-                try:
-                    await asyncio.sleep(3600)
-                except asyncio.CancelledError:
-                    raise
+                await asyncio.sleep(3600)
 
         engine = CronEngine(
             db=db, executor=resistant_executor, tick_interval=0.05,
@@ -410,6 +409,7 @@ async def test_acceptance_4_failed_stop_no_recover_all_running(tmp_path) -> None
         )
         await asyncio.sleep(0.3)
         assert task_a.id in engine._execute_tasks
+        await asyncio.wait_for(executor_started.wait(), timeout=1.0)
 
         with pytest.raises(ServiceShutdownError):
             await engine.stop(timeout=0.5)
@@ -461,10 +461,7 @@ async def test_acceptance_5_failed_stop_no_pending_executions(tmp_path) -> None:
             try:
                 await asyncio.sleep(3600)
             except asyncio.CancelledError:
-                try:
-                    await asyncio.sleep(3600)
-                except asyncio.CancelledError:
-                    raise
+                await asyncio.sleep(3600)
 
         engine = CronEngine(
             db=db, executor=dispatch_executor, tick_interval=0.05,
@@ -532,6 +529,7 @@ async def test_acceptance_6_init_failure_emergency_cleanup(
     If cleanup succeeds → lock released.  If cleanup fails → lock retained.
     """
     import fcntl
+
     import khaos.grpc_server as gs
 
     _khaos_dir, _run_dir = _make_safe_khaos_dir(tmp_path)
@@ -692,6 +690,7 @@ async def test_acceptance_8_lockfile_path_identity_after_flock(
     compares with the lock fd's ``fstat``.
     """
     import fcntl
+
     import khaos.grpc_server as gs
 
     _khaos_dir, run_dir = _make_safe_khaos_dir(tmp_path)

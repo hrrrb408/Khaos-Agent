@@ -374,6 +374,12 @@ class RuntimeResult:
     # ``build_runtime`` sets it via ``object.__setattr__`` after construction.
     # ``None`` for runtimes constructed directly in tests (no seal minted).
     authority_seal: RuntimeAuthoritySeal | None = field(init=False, default=None)
+    # Built by the factory from the exact objects it just constructed.  This
+    # is intentionally a data declaration, not a reflective graph scan; the
+    # production composition verifier checks it against fixed live paths.
+    composition_manifest: dict[str, object] | None = field(
+        init=False, default=None
+    )
 
     @property
     def close_state(self) -> CloseState:
@@ -1293,7 +1299,29 @@ async def build_runtime(
         # rejection).
         project_id=project_id,
     )
-    return RuntimeResult(
+    from khaos.security.production_composition_manifest import (
+        build_construction_manifest,
+    )
+
+    composition_manifest = build_construction_manifest(
+        {
+            "tool_scheduler": scheduler,
+            "security_middleware": scheduler.security_middleware,
+            "sandbox_backend": sandbox,
+            "network_guard": network_guard,
+            "local_audit_logger": audit_logger,
+            "execution_service": execution_service,
+            "workspace_authority": workspace_manager,
+            "office_mutation_authority": office_authority,
+            "credential_broker": credential_broker,
+            "network_broker": scheduler.network_broker_factory,
+            "approval_broker": loop.approval_broker,
+            "process_supervisor": execution_service.process_supervisor,
+            "execution_backend_selector": execution_service.backend_selector,
+            "verification_backend": verify_factory,
+        }
+    )
+    runtime = RuntimeResult(
         loop=loop,
         mode_manager=mode_manager,
         task_manager=task_manager,
@@ -1325,6 +1353,8 @@ async def build_runtime(
         # P1-1: stamp the authority seal so callers can verify the runtime
         # was built under a known (principal, project, policy, runtime) tuple.
     )._with_seal(authority_seal)
+    runtime.composition_manifest = composition_manifest
+    return runtime
 
 
 async def build_production_runtime(cfg: ProductionRuntimeConfig) -> RuntimeResult:

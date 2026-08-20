@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import pytest
+import dataclasses
 
+import pytest
 from khaos.agent.approval import StepExecutionAuthority
 from khaos.coding.execution import ExecutionAuthority, ResolvedSpawnPlan
 
@@ -28,6 +29,11 @@ def _authority() -> ExecutionAuthority:
         executable_identity="executable",
         argv=("/bin/echo", "ok"),
         budget_digest="budget",
+        tool_name="terminal",
+        authorization_resource_digest="resource",
+        authorization_epoch=1,
+        workspace_id="workspace",
+        policy_digest="policy",
     )
     step = StepExecutionAuthority(
         principal_id="principal",
@@ -80,4 +86,23 @@ def test_execution_authority_rejects_divergent_plan() -> None:
         ExecutionAuthority(
             step_authority=authority.step_authority,
             spawn_plan=changed_plan,
+        )
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("tool_name", "different-tool"),
+        ("authorization_resource_digest", "different-resource"),
+    ],
+)
+def test_execution_authority_rejects_effect_binding_mutation(
+    field: str, value: str
+) -> None:
+    authority = _authority()
+    changed_step = dataclasses.replace(authority.step_authority, **{field: value})
+    with pytest.raises(ValueError, match="diverged"):
+        ExecutionAuthority(
+            step_authority=changed_step,
+            spawn_plan=authority.spawn_plan,
         )

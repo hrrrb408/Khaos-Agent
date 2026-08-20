@@ -65,6 +65,13 @@ class SubAgentTask:
     principal_kind: str = ""
     parent_principal_id: str = ""
     delegation_digest: str = ""
+    # The authority-issued child scope is bound to the exact execution
+    # session/runtime allocated before the task enters the spawner.  Keeping
+    # these values on the task prevents the runner from silently creating a
+    # second identity after the delegation was issued.
+    session_id: str = ""
+    runtime_id: str = ""
+    workspace_id: str = ""
 
 
 Runner = Callable[[SubAgentTask], Awaitable[str]]

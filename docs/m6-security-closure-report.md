@@ -4,7 +4,9 @@ Status: **NOT CLOSED (evidence incomplete)**
 
 This report is evidence-bound. A local green test run is not a closure claim.
 
-- Exact commit: `2beaf699e504f57db0a1afc551a722303841b25d`
+- Exact commit: `94c39b9e0601cb49b4d7519d24748725adcce980` (review baseline)
+- Remediation state: working-tree remediation is uncommitted; regenerate this
+  report against the final protected-main commit before claiming closure.
 - CI run evidence: `not-provided`
 - Full test counts: `not-provided`
 - Native evidence: `UNKNOWN`

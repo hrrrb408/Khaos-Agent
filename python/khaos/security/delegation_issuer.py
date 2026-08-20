@@ -15,7 +15,11 @@ from typing import Protocol
 
 from khaos.runtime.context import RequestContext
 from khaos.security.authorityd_protocol import AuthorityDaemonClient
-from khaos.security.principals import DelegationScope, PrincipalKind
+from khaos.security.principals import (
+    PRINCIPAL_DELEGATION_FAMILY,
+    DelegationScope,
+    PrincipalKind,
+)
 
 # Root delegations for subagent issuance live slightly longer than the
 # child task so the child can always be renewed inside the parent window.
@@ -33,6 +37,9 @@ class SubAgentDelegationIssuer(Protocol):
         task_id: str,
         tools: list[str],
         timeout_seconds: int,
+        session_id: str = "",
+        runtime_id: str = "",
+        workspace_id: str = "",
     ) -> str: ...
 
 
@@ -52,13 +59,18 @@ class AuthorityDelegationIssuer:
         return DelegationScope.root(
             ctx.principal,
             project_id=ctx.project_id or _UNBOUND,
-            session_id=ctx.session_id or _UNBOUND,
-            runtime_id=ctx.runtime_id or _UNBOUND,
-            # The root's task is the parent's request context; children are
-            # bound to it so a delegation cannot drift across tasks.
-            task_id=ctx.session_id or _UNBOUND,
+            # The ingress request has no child execution identity yet.  The
+            # real session/runtime are bound exactly once on the child scope
+            # below, after the service has allocated the task identity.
+            session_id=_UNBOUND,
+            runtime_id=_UNBOUND,
+            # A principal root is not an effect grant and therefore has no
+            # task binding.  The child task is bound exactly once at issuance;
+            # reusing the session id here made ``contains`` reject the real
+            # child scope as an attempted rebind.
+            task_id=_UNBOUND,
             workspace_id=_UNBOUND,
-            operation_family="subagent",
+            operation_family=PRINCIPAL_DELEGATION_FAMILY,
             resource_scope=resources,
             policy_digest=ctx.policy_digest or "0" * 64,
             expires_at=expires_at,
@@ -71,6 +83,8 @@ class AuthorityDelegationIssuer:
         task_id: str,
         tools: list[str],
         timeout_seconds: int,
+        session_id: str = "",
+        runtime_id: str = "",
         workspace_id: str = "",
     ) -> str:
         if ctx.principal.kind is PrincipalKind.SUBAGENT:
@@ -95,10 +109,12 @@ class AuthorityDelegationIssuer:
             root,
             f"subagent:{ctx.principal_id}:{task_id}",
             PrincipalKind.SUBAGENT.value,
-            operation_family="subagent",
+            operation_family=PRINCIPAL_DELEGATION_FAMILY,
             resource_scope=resources,
             expires_at=child_expires,
             task_id=task_id,
+            session_id=session_id or _UNBOUND,
+            runtime_id=runtime_id or _UNBOUND,
             workspace_id=workspace_id or _UNBOUND,
         )
         return child.digest

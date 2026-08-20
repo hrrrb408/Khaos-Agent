@@ -28,6 +28,7 @@ from typing import Any
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+from khaos.security.authority_context import AuthorityContextV1
 from khaos.security.authorityd_protocol import (
     AUTHORITYD_PROTOCOL,
     MAX_GRANT_TTL_SECONDS,
@@ -52,13 +53,14 @@ from khaos.security.identity_isolation import (
     validate_private_unix_socket,
 )
 from khaos.security.principals import (
+    PRINCIPAL_DELEGATION_FAMILY,
     DelegationAuthority,
     DelegationScope,
     PrincipalDelegationError,
+    _operation_is_narrower,
     principal_from_kind,
     transport_root_delegation_digest,
 )
-from khaos.security.principals import _operation_is_narrower
 from khaos.security.protocol_boundary import (
     ProtocolBoundaryError,
     read_bounded_line,
@@ -143,6 +145,9 @@ class _GrantRecord:
     parent_principal_id: str = ""
     session_id: str = ""
     delegation_digest: str = ""
+    source_transport: str = ""
+    delegation_resource: str = ""
+    principal_delegation: bool = False
 
 
 @dataclass
@@ -811,8 +816,9 @@ class AuthorityDaemon:
         workspace_id: str,
         operation_family: str,
         resource_digest: str,
+        delegation_resource: str,
         delegation_digest: str,
-    ) -> None:
+    ) -> bool:
         """A delegation digest must be provable, never merely well-formed.
 
         Accept exactly two provenances:
@@ -834,6 +840,10 @@ class AuthorityDaemon:
                 raise AuthorityControlPlaneError(
                     "authority grant principal does not match the delegation subject"
                 )
+            if scope.parent_principal.identity != parent_principal_id:
+                raise AuthorityControlPlaneError(
+                    "authority grant parent does not match the delegation parent"
+                )
             if (
                 scope.project_id != project_id
                 or scope.session_id != session_id
@@ -853,15 +863,28 @@ class AuthorityDaemon:
                 raise AuthorityControlPlaneError(
                     "authority delegation is not bound to this task/workspace"
                 )
-            if not _operation_is_narrower(scope.operation_family, operation_family):
-                raise AuthorityControlPlaneError(
-                    "authority delegation does not cover this operation family"
-                )
-            if resource_digest not in scope.resource_scope:
-                raise AuthorityControlPlaneError(
-                    "authority delegation does not cover this resource"
-                )
-            return
+            if scope.operation_family == PRINCIPAL_DELEGATION_FAMILY:
+                # Principal delegation is deliberately not an effect
+                # capability.  The scheduler supplies the registered tool
+                # name; the exact operation/resource digest is authorized by
+                # this grant and by the later signed effect receipt.
+                if (
+                    not delegation_resource
+                    or delegation_resource not in scope.resource_scope
+                ):
+                    raise AuthorityControlPlaneError(
+                        "principal delegation does not cover this tool"
+                    )
+            else:
+                if not _operation_is_narrower(scope.operation_family, operation_family):
+                    raise AuthorityControlPlaneError(
+                        "authority delegation does not cover this operation family"
+                    )
+                if resource_digest not in scope.resource_scope:
+                    raise AuthorityControlPlaneError(
+                        "authority delegation does not cover this resource"
+                    )
+            return scope.operation_family == PRINCIPAL_DELEGATION_FAMILY
         if not source_transport:
             raise AuthorityControlPlaneError(
                 "authority grant delegation digest is not a live authority-issued "
@@ -882,6 +905,7 @@ class AuthorityDaemon:
                 "authority grant delegation digest is neither a live authority "
                 "delegation nor the canonical transport-root commitment"
             )
+        return False
 
     def grant(
         self,
@@ -902,6 +926,7 @@ class AuthorityDaemon:
         session_id: str = "",
         delegation_digest: str = "",
         source_transport: str = "",
+        delegation_resource: str = "",
     ) -> tuple[str, float]:
         """Register a renewable grant in the independent authority owner."""
         self._expire_grants()
@@ -929,8 +954,9 @@ class AuthorityDaemon:
         operation_family, separator, operation_action = operation_class.partition(".")
         if not separator or not operation_action or "*" in operation_class:
             raise AuthorityControlPlaneError("authority grant operation is invalid")
+        principal_delegation = False
         if delegation_digest:
-            self._require_delegation_provenance(
+            principal_delegation = self._require_delegation_provenance(
                 principal_id=principal_id,
                 principal_kind=principal_kind,
                 parent_principal_id=parent_principal_id,
@@ -943,6 +969,7 @@ class AuthorityDaemon:
                 workspace_id=workspace_id,
                 operation_family=operation_family,
                 resource_digest=resource_digest,
+                delegation_resource=delegation_resource,
                 delegation_digest=delegation_digest,
             )
         grant_intent = AuthorizationIntent(
@@ -961,6 +988,8 @@ class AuthorityDaemon:
             parent_principal_id=parent_principal_id,
             session_id=session_id,
             delegation_digest=delegation_digest,
+            source_transport=source_transport,
+            delegation_resource=delegation_resource,
         )
         # The grant is an authority context, but its initial operation and
         # typed resource action are still an independent daemon decision.
@@ -974,27 +1003,21 @@ class AuthorityDaemon:
         grant_id = secrets.token_hex(24)
         issued_at = time.time()
         expires_at = issued_at + ttl_seconds
-        context_payload: dict[str, object] = {
-            "schema_version": 1,
-            "principal_id": principal_id,
-            "project_id": project_id,
-            "runtime_id": runtime_id,
-            "task_id": task_id,
-            "workspace_id": workspace_id,
-            "workspace_generation": workspace_generation,
-            "policy_digest": policy_digest,
-            "authorization_epoch": authorization_epoch,
-        }
-        if principal_kind:
-            context_payload.update(
-                {
-                    "principal_kind": principal_kind,
-                    "parent_principal_id": parent_principal_id,
-                    "session_id": session_id,
-                    "delegation_digest": delegation_digest,
-                }
-            )
-        context_digest = _digest(context_payload)
+        context_digest = AuthorityContextV1(
+            principal_id=principal_id,
+            principal_kind=principal_kind,
+            parent_principal_id=parent_principal_id,
+            project_id=project_id,
+            session_id=session_id,
+            runtime_id=runtime_id,
+            source_transport=source_transport,
+            task_id=task_id,
+            workspace_id=workspace_id,
+            workspace_generation=workspace_generation,
+            policy_digest=policy_digest,
+            authorization_epoch=authorization_epoch,
+            delegation_digest=delegation_digest,
+        ).digest()
         record = _GrantRecord(
             principal_id=principal_id,
             project_id=project_id,
@@ -1013,6 +1036,9 @@ class AuthorityDaemon:
             parent_principal_id=parent_principal_id,
             session_id=session_id,
             delegation_digest=delegation_digest,
+            source_transport=source_transport,
+            delegation_resource=delegation_resource,
+            principal_delegation=principal_delegation,
         )
         grant_event = self._audit_event(
             {
@@ -1235,6 +1261,8 @@ class AuthorityDaemon:
             (intent.parent_principal_id, record.parent_principal_id),
             (intent.session_id, record.session_id),
             (intent.delegation_digest, record.delegation_digest),
+            (intent.source_transport, record.source_transport),
+            (intent.delegation_resource, record.delegation_resource),
         )
         if any(left != right for left, right in fields):
             raise AuthorityControlPlaneError(
@@ -1437,6 +1465,8 @@ class AuthorityDaemon:
                     "parent_principal_id": intent.parent_principal_id,
                     "session_id": intent.session_id,
                     "delegation_digest": intent.delegation_digest,
+                    "source_transport": intent.source_transport,
+                    "delegation_resource": intent.delegation_resource,
                     "expires_at": expires_at,
                     "audit_intent_digest": _digest(audit_intent),
                     "issuer_id": self.issuer_id,
@@ -1450,6 +1480,8 @@ class AuthorityDaemon:
                     "parent_principal_id",
                     "session_id",
                     "delegation_digest",
+                    "source_transport",
+                    "delegation_resource",
                 ):
                     if receipt_fields[optional_field] is None or receipt_fields[optional_field] == "":
                         receipt_fields.pop(optional_field)
@@ -1520,6 +1552,8 @@ class AuthorityDaemon:
             parent_principal_id=receipt.parent_principal_id,
             session_id=receipt.session_id,
             delegation_digest=receipt.delegation_digest,
+            source_transport=receipt.source_transport,
+            delegation_resource=receipt.delegation_resource,
         )
 
     def _validate_receipt_grant_locked(
@@ -1539,6 +1573,44 @@ class AuthorityDaemon:
         self._validate_grant_locked(
             self._receipt_grant_intent(receipt),
         )
+
+    def _consume_principal_delegation_for_claim_locked(
+        self,
+        receipt: SignedAuthorizationReceipt,
+    ) -> None:
+        """Consume a live principal delegation at the signed effect claim."""
+        grant_record = (
+            self._grants.get(receipt.grant_id)
+            if receipt.grant_id is not None
+            else None
+        )
+        if grant_record is None or not grant_record.principal_delegation:
+            return
+        scope = self._delegations.live_scope(receipt.delegation_digest)
+        if scope is None:
+            raise AuthorityControlPlaneError(
+                "principal delegation is no longer live at effect claim"
+            )
+        if scope.operation_family != PRINCIPAL_DELEGATION_FAMILY:
+            return
+        try:
+            principal = principal_from_kind(
+                receipt.principal_id, receipt.principal_kind
+            )
+            self._delegations.consume_for_effect(
+                receipt.delegation_digest,
+                principal=principal,
+                parent_principal_id=receipt.parent_principal_id,
+                project_id=receipt.project_id,
+                session_id=receipt.session_id,
+                runtime_id=receipt.runtime_id,
+                task_id=receipt.task_id,
+                workspace_id=receipt.workspace_id,
+                policy_digest=receipt.policy_digest,
+                delegation_resource=grant_record.delegation_resource,
+            )
+        except PrincipalDelegationError as exc:
+            raise AuthorityControlPlaneError(str(exc)) from exc
 
     def claim(self, receipt: SignedAuthorizationReceipt) -> None:
         """Move a receipt from prepared to launched before the effect starts."""
@@ -1563,6 +1635,11 @@ class AuthorityDaemon:
                 }
             )
             self._reserve_audit_event_locked(claimed_event)
+            try:
+                self._consume_principal_delegation_for_claim_locked(receipt)
+            except BaseException:
+                self._release_audit_reservation(str(claimed_event["event_id"]))
+                raise
             _set_receipt_state(record, _RECEIPT_CLAIMING)
         try:
             self._append_or_queue_audit(claimed_event)
@@ -1742,6 +1819,8 @@ class AuthorityDaemon:
                 parent_principal_id=receipt.parent_principal_id,
                 session_id=receipt.session_id,
                 delegation_digest=receipt.delegation_digest,
+                source_transport=receipt.source_transport,
+                delegation_resource=receipt.delegation_resource,
             )
             narrow_policy = getattr(self.policy, "check_narrow", None)
             if callable(narrow_policy):
@@ -2145,6 +2224,8 @@ class AuthorityDaemon:
         operation_family: str,
         resource_scope: list[str],
         expires_at: float,
+        session_id: str | None = None,
+        runtime_id: str | None = None,
         task_id: str | None = None,
         workspace_id: str | None = None,
     ) -> DelegationScope:
@@ -2161,6 +2242,8 @@ class AuthorityDaemon:
                 operation_family=operation_family,
                 resource_scope=resource_scope,
                 expires_at=expires_at,
+                session_id=session_id,
+                runtime_id=runtime_id,
                 task_id=task_id,
                 workspace_id=workspace_id,
             )
@@ -2781,6 +2864,7 @@ def _dispatch(daemon: AuthorityDaemon, request: object) -> dict[str, object]:
             session_id=str(request.get("session_id", "")),
             delegation_digest=str(request.get("delegation_digest", "")),
             source_transport=str(request.get("source_transport", "")),
+            delegation_resource=str(request.get("delegation_resource", "")),
         )
         return {"ok": True, "grant_id": grant_id, "expires_at": expires_at}
     if operation == "revoke_grant":
@@ -2867,6 +2951,8 @@ def _dispatch(daemon: AuthorityDaemon, request: object) -> dict[str, object]:
             operation_family=str(request.get("operation_family", "")),
             resource_scope=[str(item) for item in request.get("resource_scope", [])],
             expires_at=float(request.get("expires_at", 0)),
+            session_id=str(request.get("session_id", "")) or None,
+            runtime_id=str(request.get("runtime_id", "")) or None,
             task_id=str(request.get("task_id", "")) or None,
             workspace_id=str(request.get("workspace_id", "")) or None,
         )

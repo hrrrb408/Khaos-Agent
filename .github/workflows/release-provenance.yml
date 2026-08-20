@@ -48,9 +48,10 @@ jobs:
             --tag "$RELEASE_TAG" \
             --token "$GH_TOKEN"
           # A tag event proves only that a tag exists.  Require successful
-          # aggregate Security Closure and Product Integrity runs for this
-          # exact commit before producing any attestable subject.
-          python3 scripts/verify_release_gate_runs.py \
+          # aggregate Security Closure, Product Integrity, and native
+          # authority E2E runs for this exact commit before producing any
+          # attestable subject.
+          PYTHONPATH=python python3 scripts/verify_release_gate_runs.py \
             --repo "$GITHUB_REPOSITORY" \
             --commit "$release_commit" \
             --output dist/release-gate-evidence.json

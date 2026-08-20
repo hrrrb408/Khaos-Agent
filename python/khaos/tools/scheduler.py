@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import shlex
+import threading
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -24,6 +25,7 @@ from khaos.coding.execution.environment import is_non_inheritable_secret_key
 from khaos.coding.execution.identity import (
     container_command_identity,
     executable_identity,
+    trusted_system_executable,
 )
 from khaos.coding.execution.models import (
     FileSystemAccess,
@@ -561,6 +563,12 @@ class ToolScheduler:
         self._approval_executor = ThreadPoolExecutor(
             max_workers=4, thread_name_prefix="khaos-approval-callback"
         )
+        self._approval_admission = threading.BoundedSemaphore(4)
+        self._approval_state_lock = threading.Lock()
+        self._approval_active = 0
+        self._approval_closed = False
+        self._approval_idle = threading.Event()
+        self._approval_idle.set()
 
     def set_office_authority(self, authority: Any) -> None:
         """Register the shared OfficeMutationAuthority (called at startup)."""
@@ -863,6 +871,35 @@ class ToolScheduler:
                 task_id=str(tool_context.get("task_id") or ""),
                 workspace_id=str(tool_context.get("workspace_id") or ""),
             )
+            if decision.approved == ApprovalMode.AUTO_APPROVE and _tool_has_capability(
+                tool, "process.execute"
+            ):
+                argv = _execution_argv_for_authority(
+                    tool.name, normalized["arguments"]
+                )
+                environment = tool_context.get("environment")
+                if not isinstance(environment, dict):
+                    environment = {"PATH": os.environ.get("PATH", os.defpath)}
+                # Shell AST safety proves command semantics, but a shell
+                # command still contains an executable graph that cannot be
+                # reduced to one trusted argv[0] here.  Keep that path on the
+                # explicit approval route; direct argv tools may use the
+                # stronger fixed system-root identity check.
+                trusted = (
+                    tool.name != "terminal_shell"
+                    and bool(argv)
+                    and trusted_system_executable(argv, environment)
+                )
+                if not trusted:
+                    decision = replace(
+                        decision,
+                        approved=ApprovalMode.ASK_EVERY,
+                        requires_user_confirm=True,
+                        reason=(
+                            "read-only command executable is not a trusted "
+                            "system executable"
+                        ),
+                    )
             self._advance_tool_phase(
                 normalized,
                 ToolPhase.PERMISSION_DECIDED,
@@ -2715,17 +2752,22 @@ class ToolScheduler:
                 call=call,
                 tool_context=tool_context,
                 workspace_generation=workspace_generation,
+                authorization_epoch=authorization_epoch,
                 permission_profile_digest=permission_profile_digest,
                 sandbox_decision_digest=sandbox_decision_digest,
                 network_authority=network_authority,
                 environment_payload=environment_payload,
                 executable_scope=str(executable_scope),
                 argv=argv,
+                authorization_resource_digest=authorization_resource_digest,
                 network_lease=network_lease,
                 principal_kind=principal_kind,
                 parent_principal_id=parent_principal_id,
                 delegation_digest=delegation_digest,
                 source_transport=step_source_transport,
+                policy_digest=str(
+                    self.permission_engine.policy_digest or "policy:unspecified"
+                ),
             )
             call["_spawn_plan"] = spawn_plan
         elif not isinstance(spawn_plan, ResolvedSpawnPlan):
@@ -3217,12 +3259,46 @@ class ToolScheduler:
                 # callback.  A timed-out worker cannot be force-killed; the
                 # bounded pool turns a hang into later fail-closed denials
                 # instead of an unbounded thread leak.
-                value = await asyncio.wait_for(
-                    asyncio.get_running_loop().run_in_executor(
-                        self._approval_executor, confirm_callback, payload
-                    ),
-                    timeout=remaining,
-                )
+                if not self._approval_admission.acquire(blocking=False):
+                    return {
+                        "approved": False,
+                        "reason": "approval_callback_capacity_exhausted",
+                    }
+                with self._approval_state_lock:
+                    if self._approval_closed:
+                        self._approval_admission.release()
+                        return {
+                            "approved": False,
+                            "reason": "approval_callback_executor_closed",
+                        }
+                    self._approval_active += 1
+                    self._approval_idle.clear()
+
+                def invoke_sync_callback() -> object:
+                    try:
+                        return confirm_callback(payload)
+                    finally:
+                        with self._approval_state_lock:
+                            self._approval_active -= 1
+                            if self._approval_active == 0:
+                                self._approval_idle.set()
+                        self._approval_admission.release()
+
+                try:
+                    callback_future = asyncio.get_running_loop().run_in_executor(
+                        self._approval_executor, invoke_sync_callback
+                    )
+                except RuntimeError:
+                    with self._approval_state_lock:
+                        self._approval_active -= 1
+                        if self._approval_active == 0:
+                            self._approval_idle.set()
+                    self._approval_admission.release()
+                    return {
+                        "approved": False,
+                        "reason": "approval_callback_executor_closed",
+                    }
+                value = await asyncio.wait_for(callback_future, timeout=remaining)
         except TimeoutError:
             return {"approved": False, "reason": "approval_callback_timeout"}
         if inspect.isawaitable(value):
@@ -3244,8 +3320,16 @@ class ToolScheduler:
 
     async def aclose(self) -> None:
         """Close every runtime-owned network and background-process handle."""
+        with self._approval_state_lock:
+            self._approval_closed = True
         await self._close_all_network_brokers()
         await self.process_authority.shutdown()
+        # A timed-out thread cannot be force-killed.  Do not report a clean
+        # runtime close while an owned callback is still executing; the
+        # caller's cleanup authority will retain this scheduler for retry.
+        if not await asyncio.to_thread(self._approval_idle.wait, 5.0):
+            raise RuntimeError("approval callback workers did not terminate")
+        self._approval_executor.shutdown(wait=True, cancel_futures=True)
 
     @staticmethod
     def _normalize_call(call: dict) -> dict:
@@ -3451,12 +3535,15 @@ def _build_spawn_plan(
     call: dict[str, Any],
     tool_context: dict[str, Any],
     workspace_generation: int,
+    authorization_epoch: int,
+    policy_digest: str,
     permission_profile_digest: str,
     sandbox_decision_digest: str,
     network_authority: str,
     environment_payload: dict[str, str],
     executable_scope: str,
     argv: tuple[str, ...],
+    authorization_resource_digest: str,
     network_lease: NetworkLease | None = None,
     principal_kind: str = "",
     parent_principal_id: str = "",
@@ -3521,10 +3608,19 @@ def _build_spawn_plan(
         executable_identity=executable_scope,
         argv=plan_argv,
         budget_digest=budget.digest(),
+        tool_name=str(tool.name),
+        authorization_resource_digest=authorization_resource_digest,
         principal_kind=principal_kind,
         parent_principal_id=parent_principal_id,
         delegation_digest=delegation_digest,
         source_transport=source_transport,
+        # Keep the legacy synthetic runtime owner identical to the step
+        # authority.  Production contexts always provide the real runtime
+        # id; the fallback is still part of the canonical owner tuple.
+        runtime_id=str(tool_context.get("runtime_id") or session_id),
+        authorization_epoch=authorization_epoch,
+        workspace_id=str(tool_context.get("workspace_id") or f"session:{session_id}"),
+        policy_digest=policy_digest,
     )
 
 

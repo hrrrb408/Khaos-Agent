@@ -9,7 +9,10 @@ provenance and verification fails closed on every mismatch.
 from __future__ import annotations
 
 import hashlib
+import io
 import json
+import zipfile
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -332,14 +335,24 @@ def _api_mirror(manifests, *, jobs=None, run_name_override=None, artifact_bytes=
             return {
                 "head_sha": manifest.commit_sha,
                 "name": run_name_override or manifest.workflow_name,
+                "status": "completed",
                 "conclusion": "success",
+                "event": "push",
+                "head_branch": "main",
+                "run_attempt": 1,
             }
         if tail == "jobs":
             if jobs is not None:
                 return jobs
             return {
                 "total_count": 1,
-                "jobs": [{"id": int(manifest.job_id), "conclusion": "success"}],
+                "jobs": [{
+                    "id": int(manifest.job_id),
+                    "status": "completed",
+                    "conclusion": "success",
+                    "name": manifest.producer_job_name,
+                    "labels": ["ubuntu-24.04"],
+                }],
             }
         if tail == "artifacts":
             return {
@@ -348,6 +361,7 @@ def _api_mirror(manifests, *, jobs=None, run_name_override=None, artifact_bytes=
                         "id": int(manifest.artifact_id),
                         "name": manifest.artifact_name,
                         "expired": False,
+                        "workflow_run": {"id": int(manifest.workflow_run_id)},
                     }
                 ]
             }
@@ -403,3 +417,70 @@ def test_recheck_rejects_artifact_digest_mismatch() -> None:
     )
     assert not verification.ok
     assert any("digest does not match" in error for error in verification.errors)
+
+
+def test_recheck_accepts_only_a_live_semantically_bound_native_archive() -> None:
+    from khaos.security.security_evidence import verify_manifests_against_github
+
+    producer_job_name = "macOS launchd/XPC authority"
+    record = {
+        "github_sha": COMMIT,
+        "github_run_id": "9001",
+        "proof_type": "macos-native-authority",
+        "policy_digest": POLICY,
+        "runner_os": "macOS",
+        "platform": "darwin",
+        "peer_verified": True,
+        "transport_verified": True,
+        "protected_key_verified": True,
+    }
+    record_bytes = json.dumps(record, sort_keys=True, separators=(",", ":")).encode()
+    proof_manifest = {
+        "schema_version": 1,
+        "proof_type": "macos-native-authority",
+        "github_sha": COMMIT,
+        "github_run_id": "9001",
+        "workflow_name": "Native Authority Production E2E",
+        "job_name": producer_job_name,
+        "runner_os": "macOS",
+        "runner_arch": "arm64",
+        "platform": "darwin",
+        "policy_digest": POLICY,
+        "files": {"native-proof.json": hashlib.sha256(record_bytes).hexdigest()},
+    }
+    proof_manifest_bytes = json.dumps(
+        proof_manifest, sort_keys=True, separators=(",", ":")
+    ).encode()
+    archive_buffer = io.BytesIO()
+    with zipfile.ZipFile(archive_buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("native-proof.json", record_bytes)
+        archive.writestr("proof-manifest.json", proof_manifest_bytes)
+    archive_bytes = archive_buffer.getvalue()
+    manifest = replace(
+        _manifest(
+            "macos-native-authority",
+            artifact_id="42",
+            artifact_sha256=hashlib.sha256(archive_bytes).hexdigest(),
+        ),
+        producer_job_name=producer_job_name,
+        runner_arch="arm64",
+        proof_manifest_sha256=hashlib.sha256(proof_manifest_bytes).hexdigest(),
+    )
+    fetch_json, fetch_artifact = _api_mirror(
+        [manifest],
+        jobs={
+            "total_count": 1,
+            "jobs": [{
+                "id": 10001,
+                "status": "completed",
+                "conclusion": "success",
+                "name": producer_job_name,
+                "labels": ["macos-14"],
+            }],
+        },
+        artifact_bytes=archive_bytes,
+    )
+    verification = verify_manifests_against_github(
+        [manifest], fetch_json=fetch_json, fetch_artifact=fetch_artifact
+    )
+    assert verification.ok, verification.errors

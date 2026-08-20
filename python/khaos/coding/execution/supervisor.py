@@ -1681,6 +1681,15 @@ def _issue_execution_capability(
         raise PermissionError("production native execution requires an effective policy digest")
     if not resource_digest:
         raise PermissionError("production native execution requires a launch binding digest")
+    authority = request.execution_authority
+    if authority is None:
+        raise PermissionError("production native execution requires an execution authority")
+    if (
+        authority.step_authority.tool_name != authority.spawn_plan.tool_name
+        or authority.step_authority.authorization_resource_digest
+        != authority.spawn_plan.authorization_resource_digest
+    ):
+        raise PermissionError("execution authority effect binding diverged")
     broker = AuthorityBroker.default()
     envelope = broker.envelope(
         principal_id=step.principal_id,
@@ -1698,6 +1707,7 @@ def _issue_execution_capability(
         session_id=step.session_id,
         delegation_digest=step.delegation_digest,
         source_transport=step.source_transport,
+        delegation_resource=step.tool_name,
     )
     capability = broker.issue(
         envelope,

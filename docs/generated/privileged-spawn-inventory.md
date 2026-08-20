@@ -24,9 +24,8 @@
 - `python/khaos/coding/execution/supervisor.py:465` `asyncio.create_subprocess_exec` in `<module>.run` owner=`ProcessSupervisor` threat-model=`child-tree-lifecycle` boundary=`execution-service`
 - `python/khaos/coding/execution/supervisor.py:1594` `subprocess.run` in `<module>._darwin_deleted_open_file_usage` owner=`ProcessSupervisor` threat-model=`child-tree-lifecycle` boundary=`execution-service`
 - `python/khaos/coding/planning/verification_sandbox.py:379` `asyncio.create_subprocess_exec` in `<module>._spawn_docker_process` owner=`VerificationSandbox` threat-model=`trusted-docker-verification` boundary=`verification-authority`
-- `python/khaos/coding/workspace/trusted_git.py:560` `asyncio.create_subprocess_exec` in `<module>.spawn` owner=`TrustedGitRunner` threat-model=`untrusted-repository-config` boundary=`workspace-control-plane`
-- `python/khaos/coding/workspace/trusted_git.py:2246` `subprocess.run` in `<module>.run_sync` owner=`TrustedGitRunner` threat-model=`untrusted-repository-config` boundary=`workspace-control-plane`
-- `python/khaos/coding/workspace/trusted_git.py:2327` `subprocess.run` in `<module>.run_sync_bytes` owner=`TrustedGitRunner` threat-model=`untrusted-repository-config` boundary=`workspace-control-plane`
+- `python/khaos/coding/workspace/trusted_git.py:567` `asyncio.create_subprocess_exec` in `<module>.spawn` owner=`TrustedGitRunner` threat-model=`untrusted-repository-config` boundary=`workspace-control-plane`
+- `python/khaos/coding/workspace/trusted_git.py:2477` `subprocess.Popen` in `<module>._run_sync_bounded` owner=`TrustedGitRunner` threat-model=`untrusted-repository-config` boundary=`workspace-control-plane`
 - `python/khaos/security/browser_sandbox.py:915` `subprocess.run` in `<module>._assert_resource_names_available` owner=`BrowserKernel` threat-model=`privileged-netns-and-nft` boundary=`browser-kernel`
 - `python/khaos/security/browser_sandbox.py:1164` `subprocess.run` in `<module>._apply_nft_script` owner=`BrowserKernel` threat-model=`privileged-netns-and-nft` boundary=`browser-kernel`
 - `python/khaos/security/browser_sandbox.py:1178` `subprocess.run` in `<module>._apply_nft_script` owner=`BrowserKernel` threat-model=`privileged-netns-and-nft` boundary=`browser-kernel`
@@ -38,8 +37,8 @@
 - `python/khaos/security/credential_provider_host.py:441` `subprocess.run` in `<module>._collect_descendants` owner=`CredentialProviderHost` threat-model=`contained-blocking-provider` boundary=`killable-worker-domain`
 - `python/khaos/security/credential_provider_host.py:490` `subprocess.run` in `<module>._pid_is_zombie` owner=`CredentialProviderHost` threat-model=`contained-blocking-provider` boundary=`killable-worker-domain`
 - `python/khaos/security/credential_provider_worker.py:235` `subprocess.Popen` in `<module>._run_bounded_helper` owner=`CredentialProviderWorker` threat-model=`provider-helper-execution` boundary=`one-shot-worker-spec`
-- `python/khaos/security/evidence_provenance.py:23` `subprocess.run` in `<module>._gh` owner=`EvidenceProvenanceFetcher` threat-model=`untrusted-gh-cli-output` boundary=`evidence-provenance-lookup`
-- `python/khaos/security/native_authority.py:226` `subprocess.Popen` in `<module>._bounded_native_call` owner=`NativeAuthorityAdapter` threat-model=`native-authority` boundary=`platform-transport`
+- `python/khaos/security/evidence_provenance.py:52` `subprocess.Popen` in `<module>._bounded_process` owner=`EvidenceProvenanceFetcher` threat-model=`untrusted-gh-cli-output` boundary=`evidence-provenance-lookup`
+- `python/khaos/security/native_authority.py:256` `subprocess.Popen` in `<module>._bounded_native_call` owner=`NativeAuthorityAdapter` threat-model=`native-authority` boundary=`platform-transport`
 - `python/khaos/tools/clipboard_tools.py:25` `subprocess.run` in `<module>._clipboard_read_sync` owner=`HostClipboard` threat-model=`foreground-user-host-integration` boundary=`host-integration`
 - `python/khaos/tools/clipboard_tools.py:51` `subprocess.run` in `<module>._clipboard_write_sync` owner=`HostClipboard` threat-model=`foreground-user-host-integration` boundary=`host-integration`
 - `rust/khaos-core/src/bin/khaos-browser-kernel-helper.rs:963` `Command::new` in `rust::entrypoint` owner=`BrowserKernelHelper` threat-model=`root-owned-browser-kernel` boundary=`browser-kernel`

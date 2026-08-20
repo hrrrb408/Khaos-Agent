@@ -18,6 +18,7 @@ import os
 import signal
 import stat
 import subprocess
+import threading
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
@@ -42,8 +43,14 @@ from khaos.security.resource_scope import (
 FileIdentity = tuple[int, int, int, int]
 _PROTECTED_GIT_NAME = ".git"
 _MAX_GIT_ERROR_BYTES = 64 * 1024
+_MAX_GIT_SYNC_SECONDS = 120.0
 _MAX_GIT_CHUNK_BYTES = 1024 * 1024
 _MAX_GIT_EFFECT_FILE_BYTES = 256 * 1024 * 1024
+_TRUSTED_GIT_PATH = (
+    r"C:\Windows\System32;C:\Program Files\Git\cmd"
+    if os.name == "nt"
+    else "/usr/bin:/bin"
+)
 _ALLOWED_COMMANDS = frozenset(
     {
         "apply",
@@ -648,25 +655,123 @@ class TrustedGitProcessOwner:
         await self.spawn(*argv, **kwargs)
         return await self.communicate(input_bytes)
 
+    async def communicate_bounded_after_spawn(
+        self,
+        *argv: str,
+        input_bytes: bytes | None = None,
+        max_stdout_bytes: int = 64 * 1024,
+        max_stderr_bytes: int = _MAX_GIT_ERROR_BYTES,
+        **kwargs: object,
+    ) -> tuple[bytes, bytes, int]:
+        """Spawn and drain one Git process under explicit output bounds."""
+        await self.spawn(*argv, **kwargs)
+        return await self.communicate_bounded(
+            input_bytes=input_bytes,
+            max_stdout_bytes=max_stdout_bytes,
+            max_stderr_bytes=max_stderr_bytes,
+        )
+
     async def communicate(
         self, input_bytes: bytes | None = None
     ) -> tuple[bytes, bytes]:
-        """Communicate with cancellation-safe ownership transfer."""
+        """Communicate with cancellation-safe, bounded output ownership."""
+        stdout, stderr, _ = await self.communicate_bounded(input_bytes=input_bytes)
+        return stdout, stderr
+
+    async def communicate_bounded(
+        self,
+        *,
+        input_bytes: bytes | None = None,
+        max_stdout_bytes: int = 64 * 1024,
+        max_stderr_bytes: int = _MAX_GIT_ERROR_BYTES,
+    ) -> tuple[bytes, bytes, int]:
+        """Drain both pipes under hard bounds before publishing termination.
+
+        ``Process.communicate`` buffers untrusted Git output until the child
+        exits.  This owner-level primitive reads both pipes concurrently,
+        aborts the whole process domain as soon as either bound is exceeded,
+        and only returns after the child has a proven terminal state.
+        """
+        if max_stdout_bytes <= 0 or max_stderr_bytes <= 0:
+            raise ValueError("Git output limits must be positive")
         process = self._require_process()
+        if process.stdout is None or process.stderr is None:
+            raise TrustedGitError(f"Git process {self.label} has no output pipes")
+
+        async def read_bounded(
+            stream: asyncio.StreamReader,
+            stream_name: str,
+            limit: int,
+        ) -> bytes:
+            output = bytearray()
+            while True:
+                remaining = max(limit + 1 - len(output), 1)
+                chunk = await stream.read(min(_MAX_GIT_CHUNK_BYTES, remaining))
+                if not chunk:
+                    return bytes(output)
+                output.extend(chunk)
+                if len(output) > limit:
+                    raise TrustedGitError(
+                        f"trusted Git {stream_name} output exceeds its bound"
+                    )
+
+        async def write_input() -> None:
+            if input_bytes is None:
+                return
+            if process.stdin is None:
+                raise TrustedGitError(f"Git process {self.label} has no input pipe")
+            try:
+                process.stdin.write(input_bytes)
+                await process.stdin.drain()
+            except (BrokenPipeError, ConnectionResetError) as exc:
+                raise TrustedGitError("trusted Git stdin could not be written") from exc
+            finally:
+                process.stdin.close()
+                wait_closed = getattr(process.stdin, "wait_closed", None)
+                if callable(wait_closed):
+                    await wait_closed()
+
+        tasks: list[asyncio.Task[object]] = [
+            asyncio.create_task(
+                read_bounded(process.stdout, "stdout", max_stdout_bytes)
+            ),
+            asyncio.create_task(
+                read_bounded(process.stderr, "stderr", max_stderr_bytes)
+            ),
+        ]
+        if input_bytes is not None:
+            tasks.append(asyncio.create_task(write_input()))
         try:
-            stdout, stderr = await process.communicate(input=input_bytes)
+            done, pending = await asyncio.wait(
+                tasks, return_when=asyncio.FIRST_EXCEPTION
+            )
+            failure: BaseException | None = None
+            for task in done:
+                if not task.cancelled():
+                    failure = task.exception()
+                    if failure is not None:
+                        break
+            if failure is not None:
+                await asyncio.shield(self.abort(cancelled=False))
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                raise failure
+            await asyncio.gather(*pending)
+            stdout = tasks[0].result()
+            stderr = tasks[1].result()
+            returncode = await self.wait()
         except asyncio.CancelledError:
             await asyncio.shield(self.abort(cancelled=True))
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
             raise
         except Exception:
             await asyncio.shield(self.abort(cancelled=False))
             raise
-        self.state = (
-            TrustedGitProcessState.COMPLETED
-            if process.returncode == 0
-            else TrustedGitProcessState.FAILED
-        )
-        return stdout, stderr
+        return stdout, stderr, returncode
 
     async def wait(self) -> int:
         """Wait for a process that has already had its pipes drained."""
@@ -1193,21 +1298,22 @@ class TrustedGitRunner:
         # not inherit PATH, credentials, proxy variables, Git aliases, or
         # caller-provided GIT_CONFIG_* injection variables.
         environment = {
-                "GIT_CONFIG_NOSYSTEM": "1",
-                "GIT_CONFIG_SYSTEM": os.devnull,
-                "GIT_CONFIG_GLOBAL": os.devnull,
-                "GIT_TERMINAL_PROMPT": "0",
-                "GIT_ASKPASS": os.devnull,
-                "SSH_ASKPASS": os.devnull,
-                "GIT_PAGER": "cat",
-                "PAGER": "cat",
-                "GIT_EDITOR": ":",
-                "GIT_SEQUENCE_EDITOR": ":",
-                "GIT_OPTIONAL_LOCKS": "0",
-                "LANG": "C.UTF-8",
-                "LC_ALL": "C.UTF-8",
-                "HOME": str(self.authority_root),
-            }
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_ASKPASS": os.devnull,
+            "SSH_ASKPASS": os.devnull,
+            "GIT_PAGER": "cat",
+            "PAGER": "cat",
+            "GIT_EDITOR": ":",
+            "GIT_SEQUENCE_EDITOR": ":",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "PATH": _TRUSTED_GIT_PATH,
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "HOME": str(self.authority_root),
+        }
         if index_file is not None:
             environment["GIT_INDEX_FILE"] = str(index_file)
         return scrub_spawn_environment(
@@ -1584,6 +1690,7 @@ class TrustedGitRunner:
         *args: str,
         authority: EffectCapability,
         preserve_output: bool = False,
+        max_output_bytes: int = 64 * 1024,
         index_file: Path | None = None,
         effect: GitEffect | None = None,
     ) -> str:
@@ -1605,9 +1712,10 @@ class TrustedGitRunner:
             raise TrustedGitError("a Git effect cannot authorize a read-only command")
         owner = self._new_owner("git.run")
         try:
-            stdout, stderr = await owner.communicate_after_spawn(
+            stdout, stderr, _ = await owner.communicate_bounded_after_spawn(
                 str(self.executable),
                 *self._argv(tuple(args)),
+                max_stdout_bytes=max_output_bytes,
                 cwd=str(repository),
                 env=self._environment(index_file=index_file),
                 stdout=asyncio.subprocess.PIPE,
@@ -1629,6 +1737,7 @@ class TrustedGitRunner:
         repository: Path,
         *args: str,
         authority: EffectCapability,
+        max_output_bytes: int = 64 * 1024,
         index_file: Path | None = None,
     ) -> bytes:
         """Run one binary-producing Git command with the same authority gate."""
@@ -1640,9 +1749,10 @@ class TrustedGitRunner:
             )
         owner = self._new_owner("git.run-bytes")
         try:
-            stdout, stderr = await owner.communicate_after_spawn(
+            stdout, stderr, _ = await owner.communicate_bounded_after_spawn(
                 str(self.executable),
                 *self._argv(tuple(args)),
+                max_stdout_bytes=max_output_bytes,
                 cwd=str(repository),
                 env=self._environment(index_file=index_file),
                 stdout=asyncio.subprocess.PIPE,
@@ -1687,22 +1797,22 @@ class TrustedGitRunner:
             raise TrustedGitError("a Git effect cannot authorize a read-only command")
         owner = self._new_owner("git.run-with-input")
         try:
-            stdout, stderr = await owner.communicate_after_spawn(
+            stdout, stderr, _ = await owner.communicate_bounded_after_spawn(
                 str(self.executable),
                 *self._argv(tuple(args)),
+                input_bytes=input_bytes,
+                max_stdout_bytes=max_output_bytes,
+                max_stderr_bytes=_MAX_GIT_ERROR_BYTES,
                 cwd=str(repository),
                 env=self._environment(index_file=index_file),
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                input_bytes=input_bytes,
             )
         except OSError as exc:
             raise TrustedGitError("trusted Git process could not start") from exc
         finally:
             self._release_owner(owner)
-        if len(stdout) > max_output_bytes or len(stderr) > _MAX_GIT_ERROR_BYTES:
-            raise TrustedGitError("trusted Git output exceeds the configured bound")
         if owner.process is None or owner.process.returncode != 0:
             message = stderr.decode("utf-8", errors="replace").strip()
             raise TrustedGitError(message or "trusted Git command failed")
@@ -2241,22 +2351,17 @@ class TrustedGitRunner:
                 "state-changing Git commands require a structured exact effect"
             )
         try:
-            import subprocess
-
-            completed = subprocess.run(
+            stdout, stderr, returncode = _run_sync_bounded(
                 [str(self.executable), *self._argv(tuple(args))],
                 cwd=repository,
                 env=self._environment(),
-                capture_output=True,
-                text=True,
-                check=False,
             )
         except OSError as exc:
             raise TrustedGitError("trusted Git process could not start") from exc
-        if completed.returncode != 0:
-            message = completed.stderr.strip()
+        if returncode != 0:
+            message = stderr.decode("utf-8", errors="replace").strip()
             raise TrustedGitError(message or "trusted Git command failed")
-        return completed.stdout.strip()
+        return stdout.decode("utf-8", errors="replace").strip()
 
     def is_dirty_sync(
         self,
@@ -2322,21 +2427,162 @@ class TrustedGitRunner:
                 "state-changing Git commands require a structured exact effect"
             )
         try:
-            import subprocess
-
-            completed = subprocess.run(
+            stdout, stderr, returncode = _run_sync_bounded(
                 [str(self.executable), *self._argv(tuple(args))],
                 cwd=repository,
                 env=self._environment(),
-                capture_output=True,
-                check=False,
             )
         except OSError as exc:
             raise TrustedGitError("trusted Git process could not start") from exc
-        if completed.returncode != 0:
-            message = completed.stderr.decode("utf-8", errors="replace").strip()
+        if returncode != 0:
+            message = stderr.decode("utf-8", errors="replace").strip()
             raise TrustedGitError(message or "trusted Git command failed")
-        return completed.stdout
+        return stdout
+
+
+def _run_sync_bounded(
+    argv: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    max_stdout_bytes: int = 64 * 1024,
+    max_stderr_bytes: int = _MAX_GIT_ERROR_BYTES,
+    timeout_seconds: float = _MAX_GIT_SYNC_SECONDS,
+) -> tuple[bytes, bytes, int]:
+    """Run one synchronous Git command with bounded pipes and terminal proof.
+
+    Recovery code cannot use the async process owner, but it must retain the
+    same safety properties: both pipes are drained concurrently, output and
+    lifetime are bounded before returning, and a failed bound terminates the
+    complete POSIX process group before the result is published.
+    """
+    if (
+        not argv
+        or max_stdout_bytes <= 0
+        or max_stderr_bytes <= 0
+        or timeout_seconds <= 0
+    ):
+        raise ValueError("invalid synchronous Git process limits")
+    popen_kwargs: dict[str, object] = {
+        "cwd": cwd,
+        "env": env,
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+    }
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        popen_kwargs["start_new_session"] = True
+    process = subprocess.Popen(argv, **popen_kwargs)
+    assert process.stdout is not None
+    assert process.stderr is not None
+    streams = ((process.stdout, max_stdout_bytes), (process.stderr, max_stderr_bytes))
+    outputs = [bytearray(), bytearray()]
+    failures: list[str] = []
+    failure_lock = threading.Lock()
+    stop_readers = threading.Event()
+
+    def read_stream(index: int, stream: Any, limit: int) -> None:
+        try:
+            while not stop_readers.is_set():
+                remaining = max(limit + 1 - len(outputs[index]), 1)
+                chunk = stream.read(min(_MAX_GIT_CHUNK_BYTES, remaining))
+                if not chunk:
+                    return
+                outputs[index].extend(chunk)
+                if len(outputs[index]) > limit:
+                    with failure_lock:
+                        failures.append(
+                            "trusted Git "
+                            f"{'stdout' if index == 0 else 'stderr'} output exceeds its bound"
+                        )
+                    stop_readers.set()
+                    return
+        except (OSError, ValueError) as exc:
+            with failure_lock:
+                failures.append(f"trusted Git output reader failed: {exc}")
+            stop_readers.set()
+
+    readers = [
+        threading.Thread(
+            target=read_stream,
+            args=(index, stream, limit),
+            name=f"khaos-git-sync-reader-{index}",
+            daemon=True,
+        )
+        for index, (stream, limit) in enumerate(streams)
+    ]
+    for reader in readers:
+        reader.start()
+
+    def terminate(force: bool) -> None:
+        if process.poll() is not None:
+            return
+        if os.name != "nt":
+            signum = signal.SIGKILL if force else signal.SIGTERM
+            try:
+                os.killpg(process.pid, signum)
+                return
+            except ProcessLookupError:
+                return
+            except OSError:
+                if not force:
+                    return
+        if force:
+            process.kill()
+        else:
+            process.terminate()
+
+    deadline = time.monotonic() + timeout_seconds
+    timed_out = False
+    while process.poll() is None:
+        with failure_lock:
+            failed = bool(failures)
+        if stop_readers.is_set() or failed:
+            terminate(force=False)
+            break
+        if time.monotonic() >= deadline:
+            timed_out = True
+            stop_readers.set()
+            terminate(force=False)
+            break
+        time.sleep(0.005)
+
+    try:
+        process.wait(timeout=1.0)
+    except subprocess.TimeoutExpired:
+        stop_readers.set()
+        terminate(force=True)
+        try:
+            process.wait(timeout=1.0)
+        except subprocess.TimeoutExpired as exc:
+            raise TrustedGitError(
+                "trusted Git synchronous process terminal state could not be proved"
+            ) from exc
+    finally:
+        for reader in readers:
+            reader.join(timeout=1.0)
+        if any(reader.is_alive() for reader in readers):
+            stop_readers.set()
+        for stream, _limit in streams:
+            try:
+                stream.close()
+            except OSError:
+                pass
+        for reader in readers:
+            if reader.is_alive():
+                reader.join(timeout=1.0)
+
+    if any(reader.is_alive() for reader in readers):
+        raise TrustedGitError("trusted Git output readers did not terminate")
+    with failure_lock:
+        failure = failures[0] if failures else ""
+    if timed_out:
+        raise TrustedGitError("trusted Git synchronous command exceeded its time limit")
+    if failure:
+        raise TrustedGitError(failure)
+    return bytes(outputs[0]), bytes(outputs[1]), int(process.returncode)
 
 
 def _safe_member_parts(name: str) -> tuple[str, ...]:
