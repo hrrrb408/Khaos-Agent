@@ -59,6 +59,11 @@ def test_windows_workflow_uses_the_native_backend_host() -> None:
     assert "$venvPython = (uv run --project . which python)" not in source
     assert "KHAOS_AUTHORITYD_SOCKET=unused" not in source
     assert "KHAOS_AUTHORITYD_BACKEND_PIPE=\\\\.\\pipe\\KhaosAuthorityDBackend" in source
+    assert (
+        "--catalog-output 'C:\\ProgramData\\Khaos\\native-resource-catalog.json'"
+        in source
+    )
+    assert "$entry = uv run python scripts/run_native_authority_e2e.py --emit-catalog" not in source
 
 
 def test_windows_backend_uses_the_named_pipe_as_its_control_plane_transport(

@@ -375,7 +375,7 @@ def test_windows_connection_timeout_contract(
         build_backend_sddl("  ")
 
 
-def test_e2e_probe_emits_exact_catalog_entry() -> None:
+def test_e2e_probe_emits_exact_catalog_entry(tmp_path: Path) -> None:
     import importlib.util
 
     spec = importlib.util.spec_from_file_location(
@@ -396,6 +396,15 @@ def test_e2e_probe_emits_exact_catalog_entry() -> None:
     assert manifest["scope"]["executable"] == "/bin/echo"
     # The effect payload the E2E writes stays inside its declared bound.
     assert len("khaos-native-e2e:") + 32 <= 64
+    catalog_path = tmp_path / "native-resource-catalog.json"
+    catalog = module.write_e2e_catalog(catalog_path, "a" * 64)
+    from khaos.security.resource_scope import TypedResourcePartialOrder
+
+    restored = TypedResourcePartialOrder.from_json_file(
+        catalog_path,
+        expected_policy_digest="a" * 64,
+    )
+    assert restored.catalog_digest == catalog.catalog_digest
 
 
 def test_e2e_intent_reuses_the_grant_owner_context() -> None:
