@@ -34,6 +34,7 @@ jobs:
       KHAOS_PRODUCER_JOB_NAME: macOS launchd/XPC authority
       KHAOS_TEAM_ID: ${{ secrets.KHAOS_MACOS_TEAM_ID }}
       KHAOS_AGENT_UID: "501"
+      KHAOS_AUTHORITYD_UID: "505"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
@@ -140,13 +141,50 @@ jobs:
           # a runner-local CA installed into the system trust store: the
           # submission path is genuinely TLS-verified and fails closed.
           sudo security delete-trusted-cert -d /tmp/khaos-worm-ca.pem >/dev/null 2>&1 || true
-          PYTHONPATH=python uv run python scripts/run_worm_audit_receiver.py --port 8443 --directory /tmp/khaos-worm-records --emit-ca /tmp/khaos-worm-ca.pem &
+          rm -f /tmp/khaos-worm-ca.pem /tmp/khaos-worm-receiver.log \
+            /tmp/khaos-worm-receiver.err.log /tmp/khaos-worm-receiver.pid
+          VENV_PY="$(uv run --project . which python)"
+          PYTHONPATH="$PWD/python" nohup "$VENV_PY" \
+            scripts/run_worm_audit_receiver.py \
+            --port 8443 \
+            --directory /tmp/khaos-worm-records \
+            --emit-ca /tmp/khaos-worm-ca.pem \
+            >/tmp/khaos-worm-receiver.log \
+            2>/tmp/khaos-worm-receiver.err.log &
+          WORM_PID=$!
+          printf '%s\n' "$WORM_PID" > /tmp/khaos-worm-receiver.pid
           for _ in $(seq 1 40); do
+            kill -0 "$WORM_PID" 2>/dev/null || {
+              cat /tmp/khaos-worm-receiver.log /tmp/khaos-worm-receiver.err.log || true
+              exit 1
+            }
             test -f /tmp/khaos-worm-ca.pem && break
             sleep 0.5
           done
+          test -s /tmp/khaos-worm-ca.pem || {
+            cat /tmp/khaos-worm-receiver.log /tmp/khaos-worm-receiver.err.log || true
+            echo 'WORM receiver did not emit its CA' >&2
+            exit 1
+          }
+          chmod 0644 /tmp/khaos-worm-ca.pem
           sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain /tmp/khaos-worm-ca.pem
-          echo "KHAOS_AUDIT_WORM_ENDPOINT=https://localhost:8443/append" >> "$GITHUB_ENV"
+          healthy=false
+          for _ in $(seq 1 60); do
+            kill -0 "$WORM_PID" 2>/dev/null || break
+            status=$(curl --silent --show-error --output /dev/null \
+              --write-out '%{http_code}' --cacert /tmp/khaos-worm-ca.pem \
+              --connect-timeout 2 --max-time 5 \
+              https://127.0.0.1:8443/healthz || true)
+            if [ "$status" = 204 ]; then healthy=true; break; fi
+            sleep 0.5
+          done
+          if [ "$healthy" != true ]; then
+            cat /tmp/khaos-worm-receiver.log /tmp/khaos-worm-receiver.err.log || true
+            echo 'WORM receiver did not become healthy' >&2
+            exit 1
+          fi
+          echo "KHAOS_AUDIT_WORM_ENDPOINT=https://127.0.0.1:8443/append" >> "$GITHUB_ENV"
+          echo "KHAOS_AUDIT_WORM_CA_FILE=/tmp/khaos-worm-ca.pem" >> "$GITHUB_ENV"
       - name: Install the launchd frontend and authority backend
         env:
           KHAOS_AGENT_CODE_SIGNATURE: com.khaos.agent
@@ -177,7 +215,11 @@ jobs:
           sudo chmod 0600 /etc/khaos/native-authority.env
           sudo chown root:wheel /etc/khaos/native-authority.env
           sudo cp packaging/macos/com.khaos.authorityd.plist /Library/LaunchDaemons/com.khaos.authorityd.plist
-          sudo cp packaging/macos/com.khaos.authorityd.backend.plist /Library/LaunchDaemons/com.khaos.authorityd.backend.plist
+          PYTHONPATH=python uv run python scripts/render_macos_authority_backend_plist.py \
+            --template packaging/macos/com.khaos.authorityd.backend.plist \
+            --output /tmp/com.khaos.authorityd.backend.plist
+          sudo cp /tmp/com.khaos.authorityd.backend.plist \
+            /Library/LaunchDaemons/com.khaos.authorityd.backend.plist
           sudo launchctl bootstrap system /Library/LaunchDaemons/com.khaos.authorityd.backend.plist
           sudo launchctl bootstrap system /Library/LaunchDaemons/com.khaos.authorityd.plist
           sleep 5
@@ -277,6 +319,20 @@ jobs:
           codesign --verify --strict --verbose=2 \
             -R="anchor apple generic and certificate leaf[subject.OU] = ${KHAOS_TEAM_ID}" \
             /usr/local/libexec/khaos-authorityd-xpc-client
+      - name: Collect macOS native diagnostics
+        if: always()
+        run: |
+          for log in \
+            /tmp/khaos-worm-receiver.log \
+            /tmp/khaos-worm-receiver.err.log \
+            /var/log/khaos-authorityd-backend.log \
+            /var/log/khaos-authorityd-backend.err.log; do
+            if test -f "$log"; then
+              echo "===== $log ====="
+              tail -200 "$log"
+            fi
+          done
+          sudo launchctl print system/com.khaos.authorityd.backend 2>&1 || true
       - name: Teardown launchd services
         if: always()
         run: |
@@ -286,6 +342,16 @@ jobs:
       - name: Cleanup CI keychain and secrets
         if: always()
         run: |
+          if test -f /tmp/khaos-worm-receiver.pid; then
+            worm_pid=$(cat /tmp/khaos-worm-receiver.pid)
+            kill "$worm_pid" 2>/dev/null || true
+            for _ in $(seq 1 20); do
+              kill -0 "$worm_pid" 2>/dev/null || break
+              sleep 0.1
+            done
+            kill -KILL "$worm_pid" 2>/dev/null || true
+            rm -f /tmp/khaos-worm-receiver.pid
+          fi
           security delete-keychain khaos-ci.keychain-db >/dev/null 2>&1 || true
           security list-keychains -d user -s login.keychain-db >/dev/null 2>&1 || true
           sudo security delete-trusted-cert -d /tmp/khaos-worm-ca.pem >/dev/null 2>&1 || true
@@ -344,24 +410,34 @@ jobs:
           $env:PYTHONPATH = "$env:GITHUB_WORKSPACE\python"
           $caPath = 'C:\ProgramData\Khaos\worm-ca.pem'
           $wormLog = 'C:\ProgramData\Khaos\worm-receiver.log'
-          $job = Start-Job -ScriptBlock {
-            param($workspace, $ca, $log)
-            $env:PYTHONPATH = "$workspace\python"
-            Set-Location $workspace
-            uv run python scripts/run_worm_audit_receiver.py --port 8443 --directory C:\ProgramData\Khaos\worm-records --emit-ca $ca *> $log
-          } -ArgumentList $env:GITHUB_WORKSPACE, $caPath, $wormLog
+          $wormErrorLog = 'C:\ProgramData\Khaos\worm-receiver.err.log'
+          $wormPidPath = 'C:\ProgramData\Khaos\worm-receiver.pid'
+          Remove-Item -LiteralPath $caPath, $wormLog, $wormErrorLog -Force -ErrorAction SilentlyContinue
+          & "$env:GITHUB_WORKSPACE\scripts\start_worm_audit_receiver.ps1" `
+            -Workspace $env:GITHUB_WORKSPACE `
+            -CaPath $caPath `
+            -Directory 'C:\ProgramData\Khaos\worm-records' `
+            -LogPath $wormLog `
+            -ErrorLogPath $wormErrorLog `
+            -PidPath $wormPidPath `
+            -Port 8443
           $deadline = (Get-Date).AddSeconds(60)
           while ((Get-Date) -lt $deadline -and -not (Test-Path $caPath)) { Start-Sleep -Milliseconds 500 }
-          if (-not (Test-Path $caPath)) { Receive-Job $job; throw 'WORM receiver did not start' }
+          if (-not (Test-Path $caPath)) {
+            Get-Content -LiteralPath $wormLog, $wormErrorLog -ErrorAction SilentlyContinue
+            throw 'WORM receiver did not start'
+          }
           # Trust the runner-local CA before probing HTTPS and before the
           # LocalSystem backend is started.
           Import-Certificate -FilePath $caPath -CertStoreLocation Cert:\LocalMachine\Root | Out-Null
           $healthDeadline = (Get-Date).AddSeconds(30)
           $healthy = $false
           while ((Get-Date) -lt $healthDeadline) {
-            if ($job.State -in @('Failed', 'Stopped', 'Completed')) {
-              Receive-Job $job
-              throw "WORM receiver job ended in state '$($job.State)'"
+            $receiverPid = [int](Get-Content -LiteralPath $wormPidPath -Raw)
+            $receiver = Get-Process -Id $receiverPid -ErrorAction SilentlyContinue
+            if ($null -eq $receiver -or $receiver.HasExited) {
+              Get-Content -LiteralPath $wormLog, $wormErrorLog -ErrorAction SilentlyContinue
+              throw "WORM receiver process ended (pid=$receiverPid)"
             }
             try {
               # This probe proves the receiver is listening and serving HTTP.
@@ -373,7 +449,7 @@ jobs:
             Start-Sleep -Milliseconds 500
           }
           if (-not $healthy) {
-            Receive-Job $job
+            Get-Content -LiteralPath $wormLog, $wormErrorLog -ErrorAction SilentlyContinue
             throw 'WORM receiver did not become healthy'
           }
           # The CA was imported before the health probe and is passed to the
@@ -481,10 +557,14 @@ jobs:
               'authority backend log was not created'
           }
           $wormLog = 'C:\ProgramData\Khaos\worm-receiver.log'
+          $wormErrorLog = 'C:\ProgramData\Khaos\worm-receiver.err.log'
           if (Test-Path -LiteralPath $wormLog) {
               Get-Content -LiteralPath $wormLog -Tail 200
           } else {
               'WORM receiver log was not created'
+          }
+          if (Test-Path -LiteralPath $wormErrorLog) {
+              Get-Content -LiteralPath $wormErrorLog -Tail 200
           }
       - name: Bind native evidence to this run
         shell: pwsh
@@ -531,6 +611,8 @@ jobs:
           sc.exe delete KhaosAuthorityDBackend | Out-Null
           Stop-Service -Name KhaosAuthorityD -ErrorAction SilentlyContinue
           sc.exe delete KhaosAuthorityD | Out-Null
+          & "$env:GITHUB_WORKSPACE\scripts\stop_worm_audit_receiver.ps1" `
+            -PidPath 'C:\ProgramData\Khaos\worm-receiver.pid'
       - name: Upload native proof
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
