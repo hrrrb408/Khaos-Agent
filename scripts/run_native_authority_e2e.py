@@ -41,7 +41,7 @@ from khaos.security.authorityd_protocol import (
 from khaos.security.identity_isolation import read_contract_from_environment
 from khaos.security.native_authority import build_native_authority_adapter
 from khaos.security.principals import transport_root_delegation_digest
-from khaos.security.resource_scope import ExecutionScope
+from khaos.security.resource_scope import ExecutionScope, TypedResourcePartialOrder
 
 E2E_WORKSPACE = "native-e2e-workspace"
 E2E_OPERATION = "exec.native-e2e"
@@ -66,6 +66,36 @@ def e2e_execution_scope() -> ExecutionScope:
         operations=frozenset({"native-e2e"}),
         argv_exact=True,
     )
+
+
+def e2e_resource_catalog(policy_digest: str) -> TypedResourcePartialOrder:
+    """Build the canonical one-scope catalog consumed by the native E2E."""
+    scope = e2e_execution_scope()
+    return TypedResourcePartialOrder(
+        {scope.digest(): scope},
+        policy_digest=policy_digest,
+    )
+
+
+def write_e2e_catalog(output: Path, policy_digest: str) -> TypedResourcePartialOrder:
+    """Write an immutable canonical catalog without platform JSON re-encoding."""
+    catalog = e2e_resource_catalog(policy_digest)
+    output = output.expanduser().absolute()
+    if output.exists() or output.is_symlink():
+        raise SystemExit(f"refusing to overwrite existing catalog: {output}")
+    output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    output.write_text(
+        json.dumps(
+            catalog.manifest(),
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    output.chmod(0o444)
+    return catalog
 
 
 def _build_client() -> AuthorityDaemonClient:
@@ -361,7 +391,21 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="emit the typed resource catalog entry this E2E requires",
     )
+    parser.add_argument(
+        "--catalog-output",
+        type=Path,
+        help="write the canonical typed resource catalog for this E2E",
+    )
     args = parser.parse_args(argv)
+    if args.emit_catalog and args.catalog_output is not None:
+        parser.error("--emit-catalog and --catalog-output are mutually exclusive")
+    if args.catalog_output is not None:
+        catalog = write_e2e_catalog(
+            args.catalog_output,
+            _require("KHAOS_EFFECTIVE_POLICY_DIGEST"),
+        )
+        print(catalog.catalog_digest)
+        return 0
     if args.emit_catalog:
         scope = e2e_execution_scope()
         print(

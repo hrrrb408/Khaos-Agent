@@ -97,24 +97,10 @@ jobs:
           set -eu
           POLICY_DIGEST=$(PYTHONPATH=python uv run python -c "from khaos.security.effective_policy import load_effective_policy; print(load_effective_policy('.').digest)")
           echo "KHAOS_EFFECTIVE_POLICY_DIGEST=$POLICY_DIGEST" >> "$GITHUB_ENV"
-          # Typed resource catalog bound to the effective policy, including
-          # the exact bounded ExecutionScope the E2E uses.
-          PYTHONPATH=python uv run python scripts/run_native_authority_e2e.py --emit-catalog > /tmp/e2e-catalog-entry.json
-          PYTHONPATH=python uv run python - <<'EOF'
-          import json, os
-          from pathlib import Path
-          entry = json.loads(Path("/tmp/e2e-catalog-entry.json").read_text())
-          policy = os.environ["KHAOS_EFFECTIVE_POLICY_DIGEST"]
-          manifest = {
-              "schema_version": 1,
-              "policy_digest": policy,
-              "scopes": [entry],
-          }
-          import hashlib
-          catalog = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
-          manifest["catalog_digest"] = hashlib.sha256(catalog.encode()).hexdigest()
-          Path("/tmp/native-resource-catalog.json").write_text(json.dumps(manifest, sort_keys=True, indent=2))
-          EOF
+          # The Python generator owns the canonical catalog digest consumed
+          # by authorityd; platform JSON serializers must not re-encode it.
+          PYTHONPATH=python uv run python scripts/run_native_authority_e2e.py \
+            --catalog-output /tmp/native-resource-catalog.json
           sudo install -o khaos-authority -g khaos-authority -m 0400 /tmp/native-resource-catalog.json /etc/khaos/native-resource-catalog.json
           # Create the Ed25519 authority key under the authority identity.
           sudo -u khaos-authority env \
@@ -378,15 +364,11 @@ jobs:
           New-Item -ItemType Directory -Force -Path $backendDir, $backendSite, C:\ProgramData\Khaos | Out-Null
           # Typed resource catalog with the exact bounded scope the E2E uses.
           $env:PYTHONPATH = "$env:GITHUB_WORKSPACE\python"
-          $entry = uv run python scripts/run_native_authority_e2e.py --emit-catalog
-          $manifest = @{
-              schema_version = 1
-              policy_digest = $env:KHAOS_EFFECTIVE_POLICY_DIGEST
-              scopes = @($entry | ConvertFrom-Json)
-          }
-          $canonical = $manifest | ConvertTo-Json -Depth 10 -Compress
-          $manifest.catalog_digest = [System.Security.Cryptography.SHA256]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes($canonical)) | ForEach-Object { $_.ToString('x2') } | Join-String
-          ($manifest | ConvertTo-Json -Depth 10) | Set-Content -Path C:\ProgramData\Khaos\native-resource-catalog.json -Encoding utf8
+          # Use the same Python canonical serializer as authorityd.  A
+          # PowerShell ConvertTo-Json digest is not wire-compatible because
+          # object ordering and separators differ from the authority digest.
+          uv run python scripts/run_native_authority_e2e.py `
+            --catalog-output 'C:\ProgramData\Khaos\native-resource-catalog.json'
           # Stage the package and its locked runtime dependencies under the
           # authority-owned install root.  The native SCM host starts the
           # fixed entry point with python -I -S; it never consumes the
