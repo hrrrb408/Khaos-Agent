@@ -43,6 +43,68 @@ def executable_identity(
         return _digest({"argv0": raw, "resolved_path": "unresolved"})
 
 
+def trusted_system_executable(
+    argv: tuple[str, ...], environment: Mapping[str, str] | None = None
+) -> bool:
+    """Return whether the complete executable graph is system-trusted.
+
+    A semantic read-only command is not enough for an AUTO_APPROVE decision:
+    ``PATH`` may resolve a model-created executable named ``ls`` before the
+    platform binary.  This predicate resolves the exact path and every
+    shebang interpreter, then requires each object to live in a fixed trusted
+    system root with a non-writable owner chain.
+    """
+    if not argv or not argv[0]:
+        return False
+    try:
+        resolved = resolved_executable(argv, environment)
+        if resolved is None or not _trusted_system_path(resolved):
+            return False
+        return _trusted_interpreter_graph(resolved, _search_path(environment), set())
+    except (OSError, ValueError):
+        return False
+
+
+def _trusted_interpreter_graph(
+    executable: Path, search_path: str, seen: set[Path]
+) -> bool:
+    if executable in seen:
+        return False
+    seen.add(executable)
+    interpreter = _shebang_interpreter(executable, search_path)
+    if interpreter is None:
+        return True
+    interpreter_path, _ = interpreter
+    return _trusted_system_path(interpreter_path) and _trusted_interpreter_graph(
+        interpreter_path, search_path, seen
+    )
+
+
+def _trusted_system_path(path: Path) -> bool:
+    resolved = path.resolve(strict=True)
+    if os.name == "nt":
+        normalized = str(resolved).casefold().replace("/", "\\")
+        roots = (
+            r"c:\windows\system32",
+            r"c:\program files\git\cmd",
+        )
+        if not any(
+            normalized == root or normalized.startswith(root + "\\")
+            for root in roots
+        ):
+            return False
+    else:
+        roots = (Path("/bin"), Path("/usr/bin"), Path("/usr/sbin"))
+        if not any(resolved == root or root in resolved.parents for root in roots):
+            return False
+        for parent in (resolved, *resolved.parents):
+            info = parent.stat()
+            if info.st_uid != 0 or info.st_mode & 0o022:
+                return False
+    info = resolved.stat()
+    return stat.S_ISREG(info.st_mode) and bool(info.st_mode & 0o111)
+
+
 @dataclass
 class ExecutableAuthority:
     """Descriptor authority retained through the final native exec.

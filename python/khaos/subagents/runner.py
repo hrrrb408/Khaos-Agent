@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -120,7 +121,7 @@ class SubAgentRunner:
         MemoryManager 即使在 ``loop.run`` 抛错或被取消时也能被释放。注入的
         共享 ``office_authority`` 是借用的，``aclose`` 不会关闭它。
         """
-        session_id = f"{task.parent_session_id}/{task.id}"
+        session_id = task.session_id or f"{task.parent_session_id}/{task.id}"
         project_root = self.project_root or Path.cwd()
         effective_project_id = task.project_id or compute_project_id(project_root)
         config = AgentConfig(
@@ -199,6 +200,8 @@ class SubAgentRunner:
             "delegation_digest": task.delegation_digest,
             "source_transport": "subagent",
             "foreground_session": False,
+            "session_id": session_id,
+            "runtime_id": task.runtime_id or uuid.uuid4().hex,
             "audit_logger": self.audit_logger,
             "project_id": effective_project_id,
             # B1: inherit the same project policy/config root.

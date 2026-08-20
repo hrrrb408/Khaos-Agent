@@ -11,6 +11,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Self
 
+from khaos.security.authority_context import AuthorityContextV1
+
 #: Namespace prefix reserved for plan-execution approval requests. This keeps
 #: plan approvals disjoint from Task approvals (keyed by tool_call_id) and
 #: from destructive-operation approvals (keyed by ChangeSet approval keys).
@@ -97,6 +99,7 @@ class StepExecutionAuthority:
             self.target,
             self.approval_target,
             self.arguments_digest,
+            self.authorization_resource_digest,
             self.policy_digest,
             self.tool_schema_digest,
             self.tool_security_digest,
@@ -125,6 +128,7 @@ class StepExecutionAuthority:
             raise ValueError("step execution delegation digest is invalid")
 
     def _payload(self, *, include_receipt: bool) -> dict[str, object]:
+        authority_context = self.authority_context()
         payload: dict[str, object] = {
             "principal_id": self.principal_id,
             "project_id": self.project_id,
@@ -156,11 +160,31 @@ class StepExecutionAuthority:
             "principal_kind": self.principal_kind,
             "parent_principal_id": self.parent_principal_id,
             "delegation_digest": self.delegation_digest,
+            "runtime_id": self.runtime_id,
             "source_transport": self.source_transport,
+            "authority_context": authority_context.payload(),
+            "authority_context_digest": authority_context.digest(),
         }
         if include_receipt:
             payload["approval_receipt_digest"] = self.approval_receipt_digest
         return payload
+
+    def authority_context(self) -> AuthorityContextV1:
+        return AuthorityContextV1(
+            principal_id=self.principal_id,
+            principal_kind=self.principal_kind,
+            parent_principal_id=self.parent_principal_id,
+            project_id=self.project_id,
+            session_id=self.session_id,
+            runtime_id=self.runtime_id,
+            source_transport=self.source_transport,
+            task_id=self.task_id,
+            workspace_id=self.workspace_id,
+            workspace_generation=self.workspace_generation,
+            policy_digest=self.policy_digest,
+            authorization_epoch=self.authorization_epoch,
+            delegation_digest=self.delegation_digest,
+        )
 
     def scope_digest(self) -> str:
         """Digest the authority scope before an approval receipt is attached."""

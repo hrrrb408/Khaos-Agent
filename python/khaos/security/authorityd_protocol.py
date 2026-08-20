@@ -203,6 +203,8 @@ class AuthorizationIntent:
     parent_principal_id: str = ""
     session_id: str = ""
     delegation_digest: str = ""
+    source_transport: str = ""
+    delegation_resource: str = ""
 
     def __post_init__(self) -> None:
         for name in (
@@ -240,6 +242,12 @@ class AuthorizationIntent:
             session_id=self.session_id,
             delegation_digest=self.delegation_digest,
         )
+        for name, value in (
+            ("source_transport", self.source_transport),
+            ("delegation_resource", self.delegation_resource),
+        ):
+            if not isinstance(value, str) or len(value) > 256:
+                raise AuthorityControlPlaneError(f"{name} is invalid")
 
     def payload(self) -> dict[str, object]:
         payload = {
@@ -255,6 +263,10 @@ class AuthorizationIntent:
             "nonce": self.nonce,
             "authorization_epoch": self.authorization_epoch,
         }
+        if self.source_transport:
+            payload["source_transport"] = self.source_transport
+        if self.delegation_resource:
+            payload["delegation_resource"] = self.delegation_resource
         if self.grant_id is not None:
             payload["grant_id"] = self.grant_id
             payload["grant_context_digest"] = self.grant_context_digest
@@ -300,6 +312,8 @@ class SignedAuthorizationReceipt:
     parent_principal_id: str = ""
     session_id: str = ""
     delegation_digest: str = ""
+    source_transport: str = ""
+    delegation_resource: str = ""
 
     def __post_init__(self) -> None:
         for name in (
@@ -346,6 +360,12 @@ class SignedAuthorizationReceipt:
             session_id=self.session_id,
             delegation_digest=self.delegation_digest,
         )
+        for name, value in (
+            ("source_transport", self.source_transport),
+            ("delegation_resource", self.delegation_resource),
+        ):
+            if not isinstance(value, str) or len(value) > 256:
+                raise AuthorityControlPlaneError(f"{name} is invalid")
 
     def unsigned_payload(self) -> dict[str, object]:
         payload = {
@@ -370,6 +390,10 @@ class SignedAuthorizationReceipt:
                 self.issued_at, field="issued_at"
             ),
         }
+        if self.source_transport:
+            payload["source_transport"] = self.source_transport
+        if self.delegation_resource:
+            payload["delegation_resource"] = self.delegation_resource
         if self.grant_id is not None:
             payload["grant_id"] = self.grant_id
             payload["grant_context_digest"] = self.grant_context_digest
@@ -435,6 +459,8 @@ class SignedAuthorizationReceipt:
                 parent_principal_id=str(value.get("parent_principal_id", "")),
                 session_id=str(value.get("session_id", "")),
                 delegation_digest=str(value.get("delegation_digest", "")),
+                source_transport=str(value.get("source_transport", "")),
+                delegation_resource=str(value.get("delegation_resource", "")),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise AuthorityControlPlaneError(
@@ -661,6 +687,7 @@ class AuthorityDaemonClient:
         session_id: str = "",
         delegation_digest: str = "",
         source_transport: str = "",
+        delegation_resource: str = "",
     ) -> tuple[str, float]:
         response = self.request(
             {
@@ -681,6 +708,7 @@ class AuthorityDaemonClient:
                 "session_id": session_id,
                 "delegation_digest": delegation_digest,
                 "source_transport": source_transport,
+                "delegation_resource": delegation_resource,
             }
         )
         try:
@@ -814,6 +842,8 @@ class AuthorityDaemonClient:
         operation_family: str,
         resource_scope: list[str],
         expires_at: float,
+        session_id: str | None = None,
+        runtime_id: str | None = None,
         task_id: str | None = None,
         workspace_id: str | None = None,
     ) -> DelegationScope:
@@ -827,6 +857,8 @@ class AuthorityDaemonClient:
                 "operation_family": operation_family,
                 "resource_scope": resource_scope,
                 "expires_at": expires_at,
+                "session_id": session_id or "",
+                "runtime_id": runtime_id or "",
                 "task_id": task_id or "",
                 "workspace_id": workspace_id or "",
             }

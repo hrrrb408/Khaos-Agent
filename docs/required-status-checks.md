@@ -26,10 +26,16 @@ not the 20 individual detail checks):
 | `Security Closure Gate` | every reusable security workflow + the explicit schema/authz/process/event-loop adversarial job + the Pyright type check succeeded; mandatory evidence artifact was validated and uploaded |
 | `Product Integrity Gate` | the full product test suite (Python 3.11/3.12/3.13, Go, Rust) succeeded independently of the security subset |
 
-Both are required. Neither substitutes for the other: Security Closure proves
+Both are required for merge. Neither substitutes for the other: Security Closure proves
 the security boundary holds; Product Integrity proves the product as a whole is
 not regressed. The detailed checks below are diagnostic dependencies of the
 aggregates — they remain visible but are no longer direct merge authorities.
+
+Release provenance has one additional exact-commit gate: the `Native Authority
+Production E2E` workflow must have a completed successful `push` run for the
+same protected `main` commit, with both macOS and Windows proof artifacts live
+and digest-bound. A green Linux aggregate cannot substitute for those
+platform-native proofs.
 
 The aggregate job also downloads per-test evidence emitted only after the
 owning job succeeds. Every fragment binds `commit`, Actions `run_id`, `job`,

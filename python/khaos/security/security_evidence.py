@@ -12,13 +12,26 @@ missing required proof type.
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import re
+import stat
+import zipfile
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
 
 EXPECTED_REPOSITORY = "hrrrb408/Khaos-Agent"
+
+# Artifact bytes are downloaded from an external API and are therefore
+# bounded before ZIP parsing.  These limits are deliberately independent of
+# the GitHub API's advertised artifact size: closure verification must remain
+# safe even when a hostile or corrupted archive is supplied by a test double
+# or a proxy.
+MAX_ARTIFACT_BYTES = 64 * 1024 * 1024
+MAX_ARCHIVE_ENTRIES = 128
+MAX_ARCHIVE_FILE_BYTES = 8 * 1024 * 1024
+MAX_ARCHIVE_TOTAL_UNCOMPRESSED_BYTES = 32 * 1024 * 1024
 
 # The workflow each proof type must come from.  A proof of the wrong type
 # coming from an unrelated green workflow is not closure evidence.
@@ -66,15 +79,260 @@ _MANIFEST_FIELDS = frozenset(
         "generated_at",
         "producer_identity",
         "run_conclusion",
+        "proof_manifest_sha256",
+        "producer_job_name",
+    }
+)
+
+_PROOF_MANIFEST_FIELDS = frozenset(
+    {
+        "schema_version",
+        "proof_type",
+        "github_sha",
+        "github_run_id",
+        "workflow_name",
+        "job_name",
+        "runner_os",
+        "runner_arch",
+        "platform",
+        "policy_digest",
+        "files",
     }
 )
 
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _HEX40 = re.compile(r"^[0-9a-f]{40}$")
+_GENERIC_PROOF_OUTCOME_FIELDS = frozenset(
+    {"ok", "outcome", "result", "status", "success", "tests", "checks"}
+)
+_NATIVE_IDENTITY_FIELDS = frozenset(
+    {"peer_verified", "transport_verified", "protected_key_verified"}
+)
 
 
 class SecurityEvidenceError(ValueError):
     """An evidence manifest is malformed or fails provenance verification."""
+
+
+def _json_object_without_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise SecurityEvidenceError(f"duplicate JSON key in proof manifest: {key}")
+        value[key] = item
+    return value
+
+
+def _safe_archive_name(name: str) -> str:
+    """Normalize one ZIP member name without permitting path traversal."""
+    if not name or "\x00" in name or "\\" in name:
+        raise SecurityEvidenceError("proof archive contains an unsafe member name")
+    if name.startswith("/") or any(part in {"", ".", ".."} for part in name.split("/")):
+        raise SecurityEvidenceError(f"proof archive contains an unsafe member path: {name!r}")
+    return name
+
+
+def _validate_bound_proof_record(
+    record: object,
+    *,
+    name: str,
+    expected_proof_type: str,
+    expected_bindings: Mapping[str, object],
+    expected_policy_digest: object,
+) -> None:
+    """Validate the producer result schema, not only its provenance labels."""
+    if not isinstance(record, dict):
+        raise SecurityEvidenceError(f"proof JSON is not an object: {name}")
+    required = {
+        "github_sha",
+        "github_run_id",
+        "proof_type",
+        "policy_digest",
+        "runner_os",
+        "platform",
+    }
+    if not required.issubset(record):
+        raise SecurityEvidenceError(
+            f"proof file {name} is not semantically bound to the producer run"
+        )
+    for key, expected in expected_bindings.items():
+        if key in record and str(record.get(key, "")) != str(expected):
+            raise SecurityEvidenceError(
+                f"proof file {name} has a mismatched {key} binding"
+            )
+    if record.get("policy_digest") != expected_policy_digest:
+        raise SecurityEvidenceError(f"proof file {name} has a mismatched policy digest")
+
+    if expected_proof_type in {
+        "macos-native-authority",
+        "windows-native-authority",
+    }:
+        if _NATIVE_IDENTITY_FIELDS.issubset(record):
+            if not all(record[field] is True for field in _NATIVE_IDENTITY_FIELDS):
+                raise SecurityEvidenceError(
+                    f"proof file {name} contains a failed native identity postcondition"
+                )
+            return
+        scenarios = record.get("scenarios")
+        if not isinstance(scenarios, list) or not scenarios:
+            raise SecurityEvidenceError(
+                f"proof file {name} has no native result schema"
+            )
+        if not any(
+            isinstance(item, dict) and item.get("outcome") == "SUCCESS"
+            for item in scenarios
+        ):
+            raise SecurityEvidenceError(
+                f"proof file {name} has no successful native transaction"
+            )
+        if not all(
+            isinstance(item, dict)
+            and (item.get("outcome") == "SUCCESS" or item.get("rejected") is True)
+            for item in scenarios
+        ):
+            raise SecurityEvidenceError(
+                f"proof file {name} contains an invalid native scenario result"
+            )
+        return
+
+    if not any(field in record for field in _GENERIC_PROOF_OUTCOME_FIELDS):
+        raise SecurityEvidenceError(f"proof file {name} has no result schema")
+
+
+def parse_proof_archive(
+    payload: bytes,
+    *,
+    expected_proof_type: str,
+    expected_commit: str,
+    expected_run_id: str,
+    expected_workflow: str,
+    expected_runner_os: str,
+    expected_platform: str,
+    expected_policy_digest: str | None = None,
+    expected_job_name: str | None = None,
+) -> tuple[dict[str, object], str]:
+    """Verify the bounded semantic manifest inside one CI artifact.
+
+    The archive may contain multiple proof JSON files.  ``proof-manifest.json``
+    is the single producer-owned index: it binds the exact file set, each
+    file digest, the GitHub run/workflow/job, the runner, the platform, and
+    the effective policy.  The returned digest is over the proof-manifest
+    bytes as stored in the artifact, so a live recheck can bind that
+    declaration to the manifest that was fetched locally.
+    """
+    if not isinstance(payload, bytes):
+        raise SecurityEvidenceError("proof artifact payload must be bytes")
+    if len(payload) > MAX_ARTIFACT_BYTES:
+        raise SecurityEvidenceError("proof artifact exceeds the download limit")
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(payload))
+    except (OSError, ValueError, zipfile.BadZipFile) as exc:
+        raise SecurityEvidenceError("proof artifact is not a valid ZIP archive") from exc
+    with archive:
+        infos = archive.infolist()
+        if not infos or len(infos) > MAX_ARCHIVE_ENTRIES:
+            raise SecurityEvidenceError("proof archive entry count is outside the limit")
+        members: dict[str, bytes] = {}
+        total_uncompressed = 0
+        for info in infos:
+            name = _safe_archive_name(info.filename)
+            if info.is_dir() or stat.S_ISLNK((info.external_attr >> 16) & 0xFFFF):
+                raise SecurityEvidenceError("proof archive contains a directory or symlink")
+            if info.flag_bits & 0x1:
+                raise SecurityEvidenceError("encrypted proof archives are unsupported")
+            if name in members:
+                raise SecurityEvidenceError(f"proof archive contains duplicate member: {name}")
+            if info.file_size < 0 or info.file_size > MAX_ARCHIVE_FILE_BYTES:
+                raise SecurityEvidenceError(f"proof archive member exceeds the file limit: {name}")
+            total_uncompressed += info.file_size
+            if total_uncompressed > MAX_ARCHIVE_TOTAL_UNCOMPRESSED_BYTES:
+                raise SecurityEvidenceError("proof archive exceeds the uncompressed limit")
+            try:
+                with archive.open(info, "r") as handle:
+                    data = handle.read(MAX_ARCHIVE_FILE_BYTES + 1)
+            except (OSError, RuntimeError, zipfile.BadZipFile) as exc:
+                raise SecurityEvidenceError(f"proof archive member cannot be read: {name}") from exc
+            if len(data) != info.file_size or len(data) > MAX_ARCHIVE_FILE_BYTES:
+                raise SecurityEvidenceError(f"proof archive member size is inconsistent: {name}")
+            members[name] = data
+
+        manifest_names = [
+            name for name in members if name.rsplit("/", 1)[-1] == "proof-manifest.json"
+        ]
+        if len(manifest_names) != 1:
+            raise SecurityEvidenceError("proof archive must contain exactly one proof-manifest.json")
+        manifest_name = manifest_names[0]
+        manifest_bytes = members[manifest_name]
+        try:
+            proof_manifest = json.loads(
+                manifest_bytes.decode("utf-8-sig"),
+                object_pairs_hook=_json_object_without_duplicate_keys,
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, SecurityEvidenceError) as exc:
+            raise SecurityEvidenceError("proof-manifest.json is malformed") from exc
+        if not isinstance(proof_manifest, dict):
+            raise SecurityEvidenceError("proof-manifest.json is not an object")
+        if set(proof_manifest) != _PROOF_MANIFEST_FIELDS:
+            missing = sorted(_PROOF_MANIFEST_FIELDS - set(proof_manifest))
+            extra = sorted(set(proof_manifest) - _PROOF_MANIFEST_FIELDS)
+            raise SecurityEvidenceError(
+                f"proof-manifest fields mismatch (missing={missing}, extra={extra})"
+            )
+        if proof_manifest.get("schema_version") != 1:
+            raise SecurityEvidenceError("proof-manifest schema version is unsupported")
+        expected_bindings = {
+            "proof_type": expected_proof_type,
+            "github_sha": expected_commit,
+            "github_run_id": str(expected_run_id),
+            "workflow_name": expected_workflow,
+            "runner_os": expected_runner_os,
+            "platform": expected_platform,
+        }
+        for key, expected in expected_bindings.items():
+            if str(proof_manifest.get(key, "")) != str(expected):
+                raise SecurityEvidenceError(
+                    f"proof-manifest {key} does not match the expected binding"
+                )
+        if expected_policy_digest is not None and proof_manifest.get("policy_digest") != expected_policy_digest:
+            raise SecurityEvidenceError("proof-manifest policy digest does not match")
+        if expected_job_name is not None and proof_manifest.get("job_name") != expected_job_name:
+            raise SecurityEvidenceError("proof-manifest job name does not match")
+        for key in ("job_name", "runner_arch", "policy_digest"):
+            value = proof_manifest.get(key)
+            if not isinstance(value, str) or not value:
+                raise SecurityEvidenceError(f"proof-manifest {key} is empty")
+        files = proof_manifest.get("files")
+        if not isinstance(files, dict) or not files:
+            raise SecurityEvidenceError("proof-manifest files is empty or malformed")
+        expected_files = set(members) - {manifest_name}
+        if set(files) != expected_files:
+            raise SecurityEvidenceError("proof-manifest file set does not match the archive")
+        bound_records = 0
+        for name in sorted(expected_files):
+            digest = files.get(name)
+            if not isinstance(digest, str) or not _HEX64.fullmatch(digest):
+                raise SecurityEvidenceError(f"proof-manifest digest is malformed for {name}")
+            if hashlib.sha256(members[name]).hexdigest() != digest:
+                raise SecurityEvidenceError(f"proof file digest does not match for {name}")
+            if name.lower().endswith(".json"):
+                try:
+                    record = json.loads(
+                        members[name].decode("utf-8-sig"),
+                        object_pairs_hook=_json_object_without_duplicate_keys,
+                    )
+                except (UnicodeDecodeError, json.JSONDecodeError, SecurityEvidenceError) as exc:
+                    raise SecurityEvidenceError(f"proof JSON is malformed: {name}") from exc
+                _validate_bound_proof_record(
+                    record,
+                    name=name,
+                    expected_proof_type=expected_proof_type,
+                    expected_bindings=expected_bindings,
+                    expected_policy_digest=proof_manifest["policy_digest"],
+                )
+                bound_records += 1
+        if bound_records == 0:
+            raise SecurityEvidenceError("proof archive has no semantically bound proof JSON")
+    return proof_manifest, hashlib.sha256(manifest_bytes).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +356,12 @@ class SecurityEvidenceManifest:
     generated_at: str
     producer_identity: str
     run_conclusion: str
+    # These fields are populated by the bounded archive contract.  Empty
+    # values remain readable for legacy local manifests, but the live
+    # GitHub recheck rejects them because a raw artifact digest alone cannot
+    # prove which job or proof files produced the artifact.
+    proof_manifest_sha256: str = ""
+    producer_job_name: str = ""
 
     @classmethod
     def from_payload(cls, value: object) -> SecurityEvidenceManifest:
@@ -128,6 +392,8 @@ class SecurityEvidenceManifest:
                 generated_at=str(value["generated_at"]),
                 producer_identity=str(value["producer_identity"]),
                 run_conclusion=str(value["run_conclusion"]),
+                proof_manifest_sha256=str(value["proof_manifest_sha256"]),
+                producer_job_name=str(value["producer_job_name"]),
             )
         except (TypeError, ValueError) as exc:
             raise SecurityEvidenceError("evidence manifest values are malformed") from exc
@@ -139,6 +405,12 @@ class SecurityEvidenceManifest:
             raise SecurityEvidenceError("evidence manifest artifact digest is malformed")
         if not _HEX64.fullmatch(manifest.policy_digest):
             raise SecurityEvidenceError("evidence manifest policy digest is malformed")
+        if manifest.proof_manifest_sha256 and not _HEX64.fullmatch(
+            manifest.proof_manifest_sha256
+        ):
+            raise SecurityEvidenceError(
+                "evidence manifest proof-manifest digest is malformed"
+            )
         for name in (
             "workflow_run_id",
             "job_id",
@@ -170,6 +442,8 @@ class SecurityEvidenceManifest:
             "generated_at": self.generated_at,
             "producer_identity": self.producer_identity,
             "run_conclusion": self.run_conclusion,
+            "proof_manifest_sha256": self.proof_manifest_sha256,
+            "producer_job_name": self.producer_job_name,
         }
 
 
@@ -216,8 +490,13 @@ def verify_evidence_manifests(
     """
     errors: list[str] = []
     seen_types: dict[str, str] = {}
+    seen_artifacts: set[str] = set()
     for manifest in manifests:
         label = f"{manifest.proof_type}:{manifest.artifact_id}"
+        if manifest.artifact_id in seen_artifacts:
+            errors.append(f"{label}: duplicate artifact id")
+        else:
+            seen_artifacts.add(manifest.artifact_id)
         if manifest.repository != expected_repository:
             errors.append(f"{label}: repository is {manifest.repository!r}")
         if manifest.commit_sha != expected_commit:
@@ -285,8 +564,40 @@ def verify_manifests_against_github(
     """
     errors: list[str] = []
     seen_types: dict[str, str] = {}
+    seen_artifacts: set[str] = set()
     for manifest in manifests:
         label = f"{manifest.proof_type}:{manifest.artifact_id}"
+        if manifest.artifact_id in seen_artifacts:
+            errors.append(f"{label}: duplicate artifact id")
+        else:
+            seen_artifacts.add(manifest.artifact_id)
+        if manifest.proof_type in seen_types:
+            errors.append(
+                f"{label}: duplicate proof type (already provided by artifact "
+                f"{seen_types[manifest.proof_type]})"
+            )
+        else:
+            seen_types[manifest.proof_type] = manifest.artifact_id
+        expected_workflow = EXPECTED_WORKFLOW_BY_PROOF_TYPE.get(manifest.proof_type)
+        expected_runner_os = EXPECTED_RUNNER_OS.get(manifest.proof_type)
+        if manifest.repository != expected_repository:
+            errors.append(f"{label}: repository is {manifest.repository!r}")
+        if expected_workflow is None:
+            errors.append(f"{label}: unknown proof type {manifest.proof_type!r}")
+        elif manifest.workflow_name != expected_workflow:
+            errors.append(
+                f"{label}: proof must come from workflow {expected_workflow!r}, "
+                f"got {manifest.workflow_name!r}"
+            )
+        if expected_runner_os is not None and manifest.runner_os != expected_runner_os:
+            errors.append(
+                f"{label}: proof platform requires runner OS {expected_runner_os!r}, "
+                f"got {manifest.runner_os!r}"
+            )
+        if manifest.commit_sha != manifest.commit_sha.lower():
+            errors.append(f"{label}: manifest commit SHA is not canonical lowercase")
+        if manifest.run_conclusion != "success":
+            errors.append(f"{label}: manifest run conclusion is not success")
         try:
             run = _require_mapping(
                 fetch_json(f"repos/{expected_repository}/actions/runs/{manifest.workflow_run_id}"),
@@ -303,6 +614,26 @@ def verify_manifests_against_github(
                 errors.append(
                     f"{label}: GitHub run conclusion is {run.get('conclusion')!r}"
                 )
+            if run.get("status") != "completed":
+                errors.append(
+                    f"{label}: GitHub run status is {run.get('status')!r}, not completed"
+                )
+            if run.get("event") != "push":
+                errors.append(
+                    f"{label}: GitHub run event is {run.get('event')!r}, not push"
+                )
+            if run.get("head_branch") != "main":
+                errors.append(
+                    f"{label}: GitHub run head branch is {run.get('head_branch')!r}, not main"
+                )
+            try:
+                run_attempt = int(run.get("run_attempt") or 0)
+            except (TypeError, ValueError):
+                run_attempt = 0
+            if run_attempt != 1:
+                errors.append(
+                    f"{label}: GitHub run attempt is {run.get('run_attempt')!r}, not 1"
+                )
         except Exception as exc:  # noqa: BLE001 - any lookup failure fails closed
             errors.append(f"{label}: GitHub run lookup failed ({exc})")
             continue
@@ -315,19 +646,47 @@ def verify_manifests_against_github(
             )
             jobs = jobs_payload.get("jobs")
             if not isinstance(jobs, list):
-                raise ValueError("jobs payload is malformed")
+                raise TypeError("jobs payload is malformed")
             if jobs_payload.get("total_count", len(jobs)) > 100:
                 raise ValueError("run has more jobs than one page can prove")
-            job = next(
-                (entry for entry in jobs if str(entry.get("id")) == str(manifest.job_id)),
-                None,
-            )
-            if job is None:
+            job_matches = [
+                entry for entry in jobs
+                if isinstance(entry, dict)
+                and str(entry.get("id")) == str(manifest.job_id)
+            ]
+            if len(job_matches) != 1:
                 errors.append(f"{label}: claimed job {manifest.job_id} does not exist in the GitHub run")
-            elif job.get("conclusion") != "success":
-                errors.append(
-                    f"{label}: GitHub job conclusion is {job.get('conclusion')!r}"
-                )
+            else:
+                job = job_matches[0]
+                if job.get("status") != "completed":
+                    errors.append(
+                        f"{label}: GitHub job status is {job.get('status')!r}, not completed"
+                    )
+                if job.get("conclusion") != "success":
+                    errors.append(
+                        f"{label}: GitHub job conclusion is {job.get('conclusion')!r}"
+                    )
+                if not manifest.producer_job_name:
+                    errors.append(f"{label}: manifest has no producer job name")
+                elif job.get("name") != manifest.producer_job_name:
+                    errors.append(
+                        f"{label}: GitHub job name is {job.get('name')!r}, "
+                        f"manifest claims {manifest.producer_job_name!r}"
+                    )
+                labels = job.get("labels")
+                if not isinstance(labels, list):
+                    errors.append(f"{label}: GitHub job runner labels are missing")
+                else:
+                    try:
+                        runner_os = _runner_os_from_labels(labels)
+                    except SecurityEvidenceError as exc:
+                        errors.append(f"{label}: {exc}")
+                    else:
+                        if expected_runner_os and runner_os != expected_runner_os:
+                            errors.append(
+                                f"{label}: GitHub job runner OS is {runner_os!r}, "
+                                f"expected {expected_runner_os!r}"
+                            )
         except Exception as exc:  # noqa: BLE001 - any lookup failure fails closed
             errors.append(f"{label}: GitHub job lookup failed ({exc})")
         try:
@@ -339,25 +698,70 @@ def verify_manifests_against_github(
             )
             artifacts = artifacts_payload.get("artifacts")
             if not isinstance(artifacts, list):
-                raise ValueError("artifacts payload is malformed")
-            artifact = next(
-                (
-                    entry
-                    for entry in artifacts
-                    if str(entry.get("id")) == str(manifest.artifact_id)
-                ),
-                None,
-            )
-            if artifact is None:
-                raise ValueError(f"artifact {manifest.artifact_id} does not exist in the GitHub run")
+                raise TypeError("artifacts payload is malformed")
+            if artifacts_payload.get("total_count", len(artifacts)) > 100:
+                raise ValueError("run has more artifacts than one page can prove")
+            artifact_matches = [
+                entry for entry in artifacts
+                if isinstance(entry, dict)
+                and str(entry.get("id")) == str(manifest.artifact_id)
+            ]
+            if len(artifact_matches) != 1:
+                raise ValueError(
+                    f"artifact {manifest.artifact_id} does not exist uniquely in the GitHub run"
+                )
+            artifact = artifact_matches[0]
             if artifact.get("name") != manifest.artifact_name:
                 raise ValueError("artifact name does not match the manifest")
-            if artifact.get("expired") is True:
-                raise ValueError("artifact has expired and cannot be re-verified")
+            workflow_run = artifact.get("workflow_run")
+            if not isinstance(workflow_run, dict) or str(workflow_run.get("id")) != str(manifest.workflow_run_id):
+                raise ValueError("artifact workflow run does not match the manifest")
+            if artifact.get("expired") is not False:
+                raise ValueError("artifact has expired or is unverifiable")
+            advertised_size = artifact.get("size_in_bytes")
+            if advertised_size is not None and int(advertised_size) > MAX_ARTIFACT_BYTES:
+                raise ValueError("artifact exceeds the download limit")
+            api_digest = artifact.get("digest")
+            if api_digest:
+                normalized_api_digest = str(api_digest).removeprefix("sha256:")
+                if normalized_api_digest != manifest.artifact_sha256:
+                    raise ValueError("GitHub artifact digest does not match the manifest")
             payload = fetch_artifact(str(manifest.artifact_id))
+            if not isinstance(payload, bytes):
+                raise TypeError("downloaded artifact is not bytes")
+            if len(payload) > MAX_ARTIFACT_BYTES:
+                raise ValueError("downloaded artifact exceeds the download limit")
             digest = hashlib.sha256(payload).hexdigest()
             if digest != manifest.artifact_sha256:
                 raise ValueError("downloaded artifact digest does not match the manifest")
+            if not manifest.proof_manifest_sha256:
+                raise ValueError("manifest has no proof-manifest digest")
+            expected_platform = {
+                "macos-native-authority": "darwin",
+                "windows-native-authority": "win32",
+                "linux-real-kernel": "linux",
+                "security-closure-gate": "linux",
+                "product-integrity-gate": "linux",
+                "resource-owner-proof": "linux",
+                "exact-effect-proof": "linux",
+            }.get(manifest.proof_type)
+            if expected_platform is None:
+                raise ValueError("proof type has no platform contract")
+            proof_manifest, proof_digest = parse_proof_archive(
+                payload,
+                expected_proof_type=manifest.proof_type,
+                expected_commit=manifest.commit_sha,
+                expected_run_id=manifest.workflow_run_id,
+                expected_workflow=manifest.workflow_name,
+                expected_runner_os=manifest.runner_os,
+                expected_platform=expected_platform,
+                expected_policy_digest=manifest.policy_digest,
+                expected_job_name=manifest.producer_job_name,
+            )
+            if proof_digest != manifest.proof_manifest_sha256:
+                raise ValueError("proof-manifest digest does not match the manifest")
+            if proof_manifest.get("runner_arch") != manifest.runner_arch:
+                raise ValueError("proof-manifest runner architecture does not match the manifest")
         except Exception as exc:  # noqa: BLE001 - any lookup failure fails closed
             errors.append(f"{label}: GitHub artifact verification failed ({exc})")
     return EvidenceVerification(
@@ -369,8 +773,19 @@ def verify_manifests_against_github(
 
 def _require_mapping(value: object, label: str) -> dict:
     if not isinstance(value, dict):
-        raise ValueError(f"{label}: API response is not an object")
+        raise TypeError(f"{label}: API response is not an object")
     return value
+
+
+def _runner_os_from_labels(labels: list[object]) -> str:
+    normalized = [str(label) for label in labels]
+    if any(label.startswith("macos-") for label in normalized):
+        return "macOS"
+    if any(label.startswith("windows-") for label in normalized):
+        return "Windows"
+    if any(label.startswith("ubuntu-") for label in normalized):
+        return "Linux"
+    raise SecurityEvidenceError("GitHub job has no recognized runner label")
 
 
 def verify_artifact_digest(manifest: SecurityEvidenceManifest, path: Path) -> None:
@@ -453,6 +868,10 @@ def load_verified_bundle(path: Path) -> dict[str, object]:
 __all__ = [
     "EXPECTED_REPOSITORY",
     "EXPECTED_WORKFLOW_BY_PROOF_TYPE",
+    "MAX_ARCHIVE_ENTRIES",
+    "MAX_ARCHIVE_FILE_BYTES",
+    "MAX_ARCHIVE_TOTAL_UNCOMPRESSED_BYTES",
+    "MAX_ARTIFACT_BYTES",
     "REQUIRED_PROOF_TYPES",
     "EvidenceVerification",
     "SecurityEvidenceError",
@@ -460,6 +879,7 @@ __all__ = [
     "build_verified_manifest",
     "load_manifest_file",
     "load_verified_bundle",
+    "parse_proof_archive",
     "verify_artifact_digest",
     "verify_evidence_manifests",
 ]

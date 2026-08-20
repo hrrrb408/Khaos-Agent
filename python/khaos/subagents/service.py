@@ -84,15 +84,18 @@ class SubAgentService:
         # production runtime derives a fresh, unique transport-root
         # commitment for the subagent principal.
         child_delegation = ""
-        task_id_hint = ""
+        task_id_hint = f"task_{uuid.uuid4().hex}"
+        child_session_id = f"subagent:{principal_id}/{task_id_hint}"
+        child_runtime_id = uuid.uuid4().hex
         if self.delegation_issuer is not None:
-            task_id_hint = f"task_{uuid.uuid4().hex}"
             try:
                 child_delegation = self.delegation_issuer.issue_subagent_delegation(
                     ctx,
                     task_id=task_id_hint,
                     tools=list(payload.get("tools", []) or []),
                     timeout_seconds=int(payload.get("timeout", 300)),
+                    session_id=child_session_id,
+                    runtime_id=child_runtime_id,
                 )
             except Exception as exc:  # noqa: BLE001 - RPC handler returns structured failure
                 logger.warning("subagent delegation issuance failed: %s", exc)
@@ -109,8 +112,10 @@ class SubAgentService:
             depth=1,
             principal_id=principal_id,
             principal_kind="subagent",
-            parent_principal_id=f"{ctx.principal_kind}:{principal_id}",
+            parent_principal_id=ctx.parent_principal_id,
             delegation_digest=child_delegation,
+            session_id=child_session_id,
+            runtime_id=child_runtime_id,
             # M4 batch 3.1.16A-5-1b: inherit the RPC-verified project
             # identity so the subagent's create_session / AgentLoop
             # stamps the SAME project_id as the parent runtime.  The

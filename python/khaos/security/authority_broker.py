@@ -809,6 +809,7 @@ class AuthorityBroker:
         session_id: str = "",
         delegation_digest: str = "",
         source_transport: str = "",
+        delegation_resource: str = "",
     ) -> AuthorityEnvelope:
         """Create one broker-owned context for a later capability issue."""
         try:
@@ -827,6 +828,8 @@ class AuthorityBroker:
                 "parent_principal_id": parent_principal_id,
                 "session_id": session_id,
                 "delegation_digest": delegation_digest,
+                "source_transport": source_transport,
+                "delegation_resource": delegation_resource,
             }
             # The broker process, rather than the Python object, generates
             # and owns the opaque live grant id.
@@ -855,6 +858,7 @@ class AuthorityBroker:
                     "session_id": session_id,
                     "delegation_digest": delegation_digest,
                     "source_transport": source_transport,
+                    "delegation_resource": delegation_resource,
                     "ttl_seconds": _DEFAULT_GRANT_TTL_SECONDS,
                 }
             )
@@ -877,6 +881,8 @@ class AuthorityBroker:
                 parent_principal_id=parent_principal_id,
                 session_id=session_id,
                 delegation_digest=delegation_digest,
+                source_transport=source_transport,
+                delegation_resource=delegation_resource,
             )
         except (KeyError, TypeError, ValueError, AuthorityBrokerError) as exc:
             raise AuthorityBrokerError("authority envelope is invalid") from exc
@@ -1068,6 +1074,7 @@ class AuthorityDaemonBroker(AuthorityBroker):
         session_id: str = "",
         delegation_digest: str = "",
         source_transport: str = "",
+        delegation_resource: str = "",
     ) -> AuthorityEnvelope:
         grant = getattr(self._authorityd, "grant", None)
         if callable(grant):
@@ -1087,6 +1094,7 @@ class AuthorityDaemonBroker(AuthorityBroker):
                 session_id=session_id,
                 delegation_digest=delegation_digest,
                 source_transport=source_transport,
+                delegation_resource=delegation_resource,
             )
         else:
             # Protocol test doubles predating live grants remain usable only
@@ -1114,6 +1122,8 @@ class AuthorityDaemonBroker(AuthorityBroker):
                 parent_principal_id=parent_principal_id,
                 session_id=session_id,
                 delegation_digest=delegation_digest,
+                source_transport=source_transport,
+                delegation_resource=delegation_resource,
             )
         except (TypeError, ValueError) as exc:
             raise AuthorityBrokerError("authority envelope is invalid") from exc
@@ -1219,6 +1229,8 @@ class AuthorityDaemonBroker(AuthorityBroker):
             parent_principal_id=authority.parent_principal_id,
             session_id=authority.session_id,
             delegation_digest=authority.delegation_digest,
+            source_transport=authority.source_transport,
+            delegation_resource=authority.delegation_resource,
         )
         try:
             receipt = self._authorityd.prepare(intent)

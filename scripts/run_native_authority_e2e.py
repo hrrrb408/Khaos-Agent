@@ -30,6 +30,7 @@ import time
 import uuid
 from pathlib import Path
 
+from khaos.security.authority_context import AuthorityContextV1
 from khaos.security.authorityd_protocol import (
     AuthorityControlPlaneError,
     AuthorityDaemonClient,
@@ -39,6 +40,7 @@ from khaos.security.authorityd_protocol import (
 )
 from khaos.security.identity_isolation import read_contract_from_environment
 from khaos.security.native_authority import build_native_authority_adapter
+from khaos.security.principals import transport_root_delegation_digest
 from khaos.security.resource_scope import ExecutionScope
 
 E2E_WORKSPACE = "native-e2e-workspace"
@@ -46,6 +48,12 @@ E2E_OPERATION = "exec.native-e2e"
 E2E_EXECUTABLE = "/bin/echo"
 E2E_ARGV = ("khaos-native-e2e",)
 E2E_CWD = "/"
+E2E_PRINCIPAL_ID = "native-e2e"
+E2E_PRINCIPAL_KIND = "human"
+E2E_PARENT_PRINCIPAL_ID = "human:native-e2e"
+E2E_PROJECT_ID = "native-e2e"
+E2E_SESSION_ID = "native-e2e-session"
+E2E_SOURCE_TRANSPORT = "cli"
 
 
 def e2e_execution_scope() -> ExecutionScope:
@@ -74,12 +82,52 @@ def _build_client() -> AuthorityDaemonClient:
     )
 
 
-def _intent(nonce: str, policy_digest: str, grant_id: str | None) -> AuthorizationIntent:
+def _delegation_digest(runtime_id: str, policy_digest: str) -> str:
+    """Return the canonical identity commitment used by the native E2E."""
+    return transport_root_delegation_digest(
+        principal_id=E2E_PRINCIPAL_ID,
+        principal_kind=E2E_PRINCIPAL_KIND,
+        parent_principal_id=E2E_PARENT_PRINCIPAL_ID,
+        project_id=E2E_PROJECT_ID,
+        session_id=E2E_SESSION_ID,
+        runtime_id=runtime_id,
+        source_transport=E2E_SOURCE_TRANSPORT,
+        policy_digest=policy_digest,
+    )
+
+
+def _context_digest(runtime_id: str, task_id: str, policy_digest: str) -> str:
+    """Return the exact grant context digest sent back in prepare."""
+    return AuthorityContextV1(
+        principal_id=E2E_PRINCIPAL_ID,
+        principal_kind=E2E_PRINCIPAL_KIND,
+        parent_principal_id=E2E_PARENT_PRINCIPAL_ID,
+        project_id=E2E_PROJECT_ID,
+        session_id=E2E_SESSION_ID,
+        runtime_id=runtime_id,
+        source_transport=E2E_SOURCE_TRANSPORT,
+        task_id=task_id,
+        workspace_id=E2E_WORKSPACE,
+        workspace_generation=1,
+        policy_digest=policy_digest,
+        authorization_epoch=0,
+        delegation_digest=_delegation_digest(runtime_id, policy_digest),
+    ).digest()
+
+
+def _intent(
+    nonce: str,
+    policy_digest: str,
+    grant_id: str | None,
+    *,
+    runtime_id: str,
+    task_id: str,
+) -> AuthorizationIntent:
     return AuthorizationIntent(
-        principal_id="native-e2e",
-        project_id="native-e2e",
-        runtime_id=f"e2e-{uuid.uuid4().hex[:8]}",
-        task_id=f"e2e-{uuid.uuid4().hex[:8]}",
+        principal_id=E2E_PRINCIPAL_ID,
+        project_id=E2E_PROJECT_ID,
+        runtime_id=runtime_id,
+        task_id=task_id,
         workspace_id=E2E_WORKSPACE,
         operation=E2E_OPERATION,
         resource_digest=e2e_execution_scope().digest(),
@@ -87,11 +135,44 @@ def _intent(nonce: str, policy_digest: str, grant_id: str | None) -> Authorizati
         nonce=nonce,
         authorization_epoch=0,
         workspace_generation=1,
-        grant_id=grant_id or "",
-        principal_kind="human",
-        parent_principal_id="human:native-e2e",
-        session_id="native-e2e-session",
-        delegation_digest=hashlib.sha256(b"native-e2e-delegation").hexdigest(),
+        grant_id=grant_id,
+        grant_context_digest=(
+            _context_digest(runtime_id, task_id, policy_digest)
+            if grant_id is not None
+            else None
+        ),
+        principal_kind=E2E_PRINCIPAL_KIND,
+        parent_principal_id=E2E_PARENT_PRINCIPAL_ID,
+        session_id=E2E_SESSION_ID,
+        delegation_digest=_delegation_digest(runtime_id, policy_digest),
+        source_transport=E2E_SOURCE_TRANSPORT,
+    )
+
+
+def _grant(
+    client: AuthorityDaemonClient,
+    *,
+    policy_digest: str,
+    runtime_id: str,
+    task_id: str,
+) -> tuple[str, float]:
+    """Issue a grant and bind every later intent to its exact owner context."""
+    return client.grant(
+        principal_id=E2E_PRINCIPAL_ID,
+        project_id=E2E_PROJECT_ID,
+        runtime_id=runtime_id,
+        task_id=task_id,
+        workspace_id=E2E_WORKSPACE,
+        workspace_generation=1,
+        policy_digest=policy_digest,
+        operation_class=E2E_OPERATION,
+        resource_digest=e2e_execution_scope().digest(),
+        authorization_epoch=0,
+        principal_kind=E2E_PRINCIPAL_KIND,
+        parent_principal_id=E2E_PARENT_PRINCIPAL_ID,
+        session_id=E2E_SESSION_ID,
+        delegation_digest=_delegation_digest(runtime_id, policy_digest),
+        source_transport=E2E_SOURCE_TRANSPORT,
     )
 
 
@@ -133,18 +214,11 @@ def run_e2e(*, expect_unavailable: bool) -> dict[str, object]:
         # The backend is deliberately absent.  The only acceptable result is
         # an explicit unavailable/UNKNOWN error; success would be fail-open.
         try:
-            client.grant(
-                principal_id="native-e2e",
-                project_id="native-e2e",
+            _grant(
+                client,
+                policy_digest=policy_digest,
                 runtime_id="e2e-unavailable",
                 task_id="e2e-unavailable",
-                workspace_id=E2E_WORKSPACE,
-                workspace_generation=1,
-                policy_digest=policy_digest,
-                operation_class=E2E_OPERATION,
-                resource_digest=e2e_execution_scope().digest(),
-                authorization_epoch=0,
-                principal_kind="human",
             )
         except (RemoteAuditUnavailableError, AuthorityControlPlaneError) as exc:
             evidence["scenarios"].append(
@@ -162,23 +236,21 @@ def run_e2e(*, expect_unavailable: bool) -> dict[str, object]:
         raise SystemExit(1)
 
     # Scenario 1: full transaction with a bounded test effect.
-    grant_id, _expires = client.grant(
-        principal_id="native-e2e",
-        project_id="native-e2e",
+    grant_id, _expires = _grant(
+        client,
+        policy_digest=policy_digest,
         runtime_id="e2e-runtime",
         task_id="e2e-task",
-        workspace_id=E2E_WORKSPACE,
-        workspace_generation=1,
-        policy_digest=policy_digest,
-        operation_class=E2E_OPERATION,
-        resource_digest=e2e_execution_scope().digest(),
-        authorization_epoch=0,
-        principal_kind="human",
-        parent_principal_id="human:native-e2e",
-        session_id="native-e2e-session",
-        delegation_digest=hashlib.sha256(b"native-e2e-delegation").hexdigest(),
     )
-    receipt = client.prepare(_intent(uuid.uuid4().hex, policy_digest, grant_id))
+    receipt = client.prepare(
+        _intent(
+            uuid.uuid4().hex,
+            policy_digest,
+            grant_id,
+            runtime_id="e2e-runtime",
+            task_id="e2e-task",
+        )
+    )
     client.claim(receipt)
     effect_root = Path(
         os.environ.get("KHAOS_NATIVE_E2E_EFFECT_ROOT") or tempfile.mkdtemp(
@@ -203,42 +275,44 @@ def run_e2e(*, expect_unavailable: bool) -> dict[str, object]:
     )
 
     # Scenario 2: revoked grant invalidates subsequent prepares.
-    revoked_grant, _ = client.grant(
-        principal_id="native-e2e",
-        project_id="native-e2e",
+    revoked_grant, _ = _grant(
+        client,
+        policy_digest=policy_digest,
         runtime_id="e2e-runtime",
         task_id="e2e-task-revoke",
-        workspace_id=E2E_WORKSPACE,
-        workspace_generation=1,
-        policy_digest=policy_digest,
-        operation_class=E2E_OPERATION,
-        resource_digest=e2e_execution_scope().digest(),
-        authorization_epoch=0,
-        principal_kind="human",
     )
     client.revoke_grant(revoked_grant)
     evidence["scenarios"].append(
         _expect_rejected(
-            lambda: client.prepare(_intent(uuid.uuid4().hex, policy_digest, revoked_grant)),
+            lambda: client.prepare(
+                _intent(
+                    uuid.uuid4().hex,
+                    policy_digest,
+                    revoked_grant,
+                    runtime_id="e2e-runtime",
+                    task_id="e2e-task-revoke",
+                )
+            ),
             "prepare-after-grant-revoke",
         )
     )
 
     # Scenario 3: one-shot receipt replay is rejected after completion.
-    replay_grant, _ = client.grant(
-        principal_id="native-e2e",
-        project_id="native-e2e",
+    replay_grant, _ = _grant(
+        client,
+        policy_digest=policy_digest,
         runtime_id="e2e-runtime",
         task_id="e2e-task-replay",
-        workspace_id=E2E_WORKSPACE,
-        workspace_generation=1,
-        policy_digest=policy_digest,
-        operation_class=E2E_OPERATION,
-        resource_digest=e2e_execution_scope().digest(),
-        authorization_epoch=0,
-        principal_kind="human",
     )
-    replay_receipt = client.prepare(_intent(uuid.uuid4().hex, policy_digest, replay_grant))
+    replay_receipt = client.prepare(
+        _intent(
+            uuid.uuid4().hex,
+            policy_digest,
+            replay_grant,
+            runtime_id="e2e-runtime",
+            task_id="e2e-task-replay",
+        )
+    )
     client.claim(replay_receipt)
     client.complete(
         replay_receipt,
@@ -253,20 +327,21 @@ def run_e2e(*, expect_unavailable: bool) -> dict[str, object]:
     )
 
     # Scenario 4: revoked receipt no longer validates.
-    stale_grant, _ = client.grant(
-        principal_id="native-e2e",
-        project_id="native-e2e",
+    stale_grant, _ = _grant(
+        client,
+        policy_digest=policy_digest,
         runtime_id="e2e-runtime",
         task_id="e2e-task-stale",
-        workspace_id=E2E_WORKSPACE,
-        workspace_generation=1,
-        policy_digest=policy_digest,
-        operation_class=E2E_OPERATION,
-        resource_digest=e2e_execution_scope().digest(),
-        authorization_epoch=0,
-        principal_kind="human",
     )
-    stale_receipt = client.prepare(_intent(uuid.uuid4().hex, policy_digest, stale_grant))
+    stale_receipt = client.prepare(
+        _intent(
+            uuid.uuid4().hex,
+            policy_digest,
+            stale_grant,
+            runtime_id="e2e-runtime",
+            task_id="e2e-task-stale",
+        )
+    )
     client.revoke(stale_receipt)
     evidence["scenarios"].append(
         _expect_rejected(

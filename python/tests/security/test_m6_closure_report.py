@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
+import io
+import json
+import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -47,8 +51,6 @@ def test_local_files_and_booleans_cannot_close():
 
 
 def _full_manifest_set(commit: str = COMMIT, policy: str = POLICY):
-    import hashlib
-
     from khaos.security.security_evidence import SecurityEvidenceManifest
 
     workflows = {
@@ -60,31 +62,104 @@ def _full_manifest_set(commit: str = COMMIT, policy: str = POLICY):
         "resource-owner-proof": ("Security Closure Gate", "Linux"),
         "exact-effect-proof": ("Security Closure Gate", "Linux"),
     }
+    def build_archive(
+        *,
+        proof_type: str,
+        workflow: str,
+        os_name: str,
+        runner_arch: str,
+        run_id: str,
+        job_name: str,
+    ) -> bytes:
+        platform = {
+            "Linux": "linux",
+            "macOS": "darwin",
+            "Windows": "win32",
+        }[os_name]
+        record = {
+            "github_sha": commit,
+            "github_run_id": run_id,
+            "proof_type": proof_type,
+            "policy_digest": policy,
+            "runner_os": os_name,
+            "platform": platform,
+        }
+        if proof_type in {"macos-native-authority", "windows-native-authority"}:
+            record.update(
+                peer_verified=True,
+                transport_verified=True,
+                protected_key_verified=True,
+            )
+        else:
+            record["ok"] = True
+        proof_bytes = json.dumps(
+            record, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        proof_manifest = {
+            "schema_version": 1,
+            "proof_type": proof_type,
+            "github_sha": commit,
+            "github_run_id": run_id,
+            "workflow_name": workflow,
+            "job_name": job_name,
+            "runner_os": os_name,
+            "runner_arch": runner_arch,
+            "platform": platform,
+            "policy_digest": policy,
+            "files": {"proof.json": hashlib.sha256(proof_bytes).hexdigest()},
+        }
+        manifest_bytes = json.dumps(
+            proof_manifest, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for name, value in (
+                ("proof.json", proof_bytes),
+                ("proof-manifest.json", manifest_bytes),
+            ):
+                info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+                info.compress_type = zipfile.ZIP_DEFLATED
+                archive.writestr(info, value)
+        return output.getvalue()
+
     manifests = []
     for index, (proof_type, (workflow, os_name)) in enumerate(workflows.items()):
         artifact_id = str(index)
-        # The digest must be recomputable by the fake GitHub API: the
-        # recheck hashes the downloaded artifact bytes.
-        artifact_sha256 = hashlib.sha256(f"artifact-{artifact_id}".encode()).hexdigest()
+        workflow_run_id = str(9001 + index)
+        job_id = str(10001 + index)
+        runner_arch = "arm64" if os_name == "macOS" else "x86_64"
+        producer_job_name = f"{workflow} ({os_name})"
+        artifact = build_archive(
+            proof_type=proof_type,
+            workflow=workflow,
+            os_name=os_name,
+            runner_arch=runner_arch,
+            run_id=workflow_run_id,
+            job_name=producer_job_name,
+        )
+        with zipfile.ZipFile(io.BytesIO(artifact)) as archive:
+            proof_manifest_bytes = archive.read("proof-manifest.json")
         manifests.append(
             SecurityEvidenceManifest(
                 schema_version=1,
                 repository="hrrrb408/Khaos-Agent",
                 commit_sha=commit,
                 workflow_name=workflow,
-                workflow_run_id=str(9001 + index),
-                job_id=str(10001 + index),
+                workflow_run_id=workflow_run_id,
+                job_id=job_id,
                 runner_os=os_name,
-                runner_arch="x86_64",
+                runner_arch=runner_arch,
                 artifact_id=artifact_id,
-                artifact_name="proof",
-                artifact_sha256=artifact_sha256,
+                artifact_name=f"proof-{proof_type}",
+                artifact_sha256=hashlib.sha256(artifact).hexdigest(),
                 proof_type=proof_type,
                 proof_schema_version=1,
                 policy_digest=policy,
                 generated_at="2026-08-19T00:00:00Z",
                 producer_identity="github-actions",
                 run_conclusion="success",
+                proof_manifest_sha256=hashlib.sha256(proof_manifest_bytes).hexdigest(),
+                producer_job_name=producer_job_name,
             )
         )
     return manifests
@@ -92,6 +167,58 @@ def _full_manifest_set(commit: str = COMMIT, policy: str = POLICY):
 
 def _faithful_fetchers(manifests):
     """Fake GitHub API that faithfully mirrors the synthetic manifests."""
+
+    def archive_for(manifest):
+        platform = {
+            "Linux": "linux",
+            "macOS": "darwin",
+            "Windows": "win32",
+        }[manifest.runner_os]
+        record = {
+            "github_sha": manifest.commit_sha,
+            "github_run_id": manifest.workflow_run_id,
+            "proof_type": manifest.proof_type,
+            "policy_digest": manifest.policy_digest,
+            "runner_os": manifest.runner_os,
+            "platform": platform,
+        }
+        if manifest.proof_type in {"macos-native-authority", "windows-native-authority"}:
+            record.update(
+                peer_verified=True,
+                transport_verified=True,
+                protected_key_verified=True,
+            )
+        else:
+            record["ok"] = True
+        proof_bytes = json.dumps(
+            record, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        proof_manifest = {
+            "schema_version": 1,
+            "proof_type": manifest.proof_type,
+            "github_sha": manifest.commit_sha,
+            "github_run_id": manifest.workflow_run_id,
+            "workflow_name": manifest.workflow_name,
+            "job_name": manifest.producer_job_name,
+            "runner_os": manifest.runner_os,
+            "runner_arch": manifest.runner_arch,
+            "platform": platform,
+            "policy_digest": manifest.policy_digest,
+            "files": {"proof.json": hashlib.sha256(proof_bytes).hexdigest()},
+        }
+        manifest_bytes = json.dumps(
+            proof_manifest, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for name, value in (
+                ("proof.json", proof_bytes),
+                ("proof-manifest.json", manifest_bytes),
+            ):
+                info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+                info.compress_type = zipfile.ZIP_DEFLATED
+                archive.writestr(info, value)
+        return output.getvalue()
 
     def fetch_json(path: str):
         rest = path.split("/actions/runs/", 1)[1]
@@ -105,29 +232,52 @@ def _faithful_fetchers(manifests):
             return {
                 "head_sha": manifest.commit_sha,
                 "name": manifest.workflow_name,
+                "status": "completed",
                 "conclusion": "success",
+                "event": "push",
+                "head_branch": "main",
+                "run_attempt": 1,
             }
         if tail == "jobs":
             return {
                 "total_count": 1,
-                "jobs": [{"id": int(manifest.job_id), "conclusion": "success"}],
+                "jobs": [
+                    {
+                        "id": int(manifest.job_id),
+                        "status": "completed",
+                        "conclusion": "success",
+                        "name": manifest.producer_job_name,
+                        "labels": [
+                            {
+                                "Linux": "ubuntu-24.04",
+                                "macOS": "macos-14",
+                                "Windows": "windows-2025",
+                            }[manifest.runner_os]
+                        ],
+                    }
+                ],
             }
         if tail == "artifacts":
+            artifact = archive_for(manifest)
             return {
                 "artifacts": [
                     {
                         "id": int(manifest.artifact_id),
                         "name": manifest.artifact_name,
                         "expired": False,
+                        "size_in_bytes": len(artifact),
+                        "digest": f"sha256:{manifest.artifact_sha256}",
+                        "workflow_run": {"id": int(manifest.workflow_run_id)},
                     }
                 ]
             }
         raise LookupError(f"HTTP 404: unknown API path {path}")
 
     def fetch_artifact(artifact_id: str) -> bytes:
-        if not any(m.artifact_id == artifact_id for m in manifests):
+        matching = [m for m in manifests if m.artifact_id == artifact_id]
+        if not matching:
             raise LookupError(f"HTTP 404: artifact {artifact_id} does not exist")
-        return f"artifact-{artifact_id}".encode()
+        return archive_for(matching[0])
 
     return fetch_json, fetch_artifact
 
@@ -179,7 +329,6 @@ def test_self_consistent_forged_bundle_cannot_close_without_recheck():
 def test_forged_bundle_with_nonexistent_run_cannot_close():
     """A well-formed bundle whose runs do not exist on GitHub fails closed."""
     manifests = _full_manifest_set()
-    fetch_json, fetch_artifact = _faithful_fetchers(manifests)
 
     def rejecting_fetch_json(path: str):
         raise LookupError("HTTP 404: not found")
@@ -189,7 +338,7 @@ def test_forged_bundle_with_nonexistent_run_cannot_close():
         policy_digest=POLICY,
         evidence_bundle=_bundle(manifests),
         github_fetch_json=rejecting_fetch_json,
-        github_fetch_artifact=fetch_artifact,
+        github_fetch_artifact=lambda _artifact_id: b"unused",
     )
     assert "Status: **NOT CLOSED" in report
     assert "run lookup failed" in report
@@ -198,7 +347,7 @@ def test_forged_bundle_with_nonexistent_run_cannot_close():
 def test_forged_bundle_with_digest_mismatch_cannot_close():
     """The API exists but the artifact bytes hash differently: rejected."""
     manifests = _full_manifest_set()
-    fetch_json, fetch_artifact = _faithful_fetchers(manifests)
+    fetch_json, _unused_fetch_artifact = _faithful_fetchers(manifests)
 
     def wrong_bytes_fetch_artifact(artifact_id: str) -> bytes:
         return b"tampered-bytes"

@@ -26,6 +26,7 @@ from khaos.security.authority_broker import (
     AuthorityBrokerError,
     AuthorityDaemonBroker,
 )
+from khaos.security.authority_context import AuthorityContextV1
 from khaos.security.authorityd import (
     AuthorityDaemon,
     AuthorityPolicyKernel,
@@ -134,6 +135,32 @@ def _intent() -> AuthorizationIntent:
     )
 
 
+def _authority_context_digest(
+    *,
+    principal_kind: str = "",
+    parent_principal_id: str = "",
+    session_id: str = "",
+    delegation_digest: str = "",
+    source_transport: str = "",
+) -> str:
+    """Build the same canonical owner binding that ``AuthorityDaemon.grant`` stores."""
+    return AuthorityContextV1(
+        principal_id="agent",
+        principal_kind=principal_kind,
+        parent_principal_id=parent_principal_id,
+        project_id="project",
+        session_id=session_id,
+        runtime_id="runtime",
+        source_transport=source_transport,
+        task_id="task",
+        workspace_id="workspace",
+        workspace_generation=1,
+        policy_digest="policy-digest",
+        authorization_epoch=2,
+        delegation_digest=delegation_digest,
+    ).digest()
+
+
 def _live_grant_parent(
     daemon: AuthorityDaemon,
     *,
@@ -154,19 +181,7 @@ def _live_grant_parent(
         authorization_epoch=2,
         ttl_seconds=grant_ttl_seconds,
     )
-    context_digest = authorityd_module._digest(
-        {
-            "schema_version": 1,
-            "principal_id": "agent",
-            "project_id": "project",
-            "runtime_id": "runtime",
-            "task_id": "task",
-            "workspace_id": "workspace",
-            "workspace_generation": 1,
-            "policy_digest": "policy-digest",
-            "authorization_epoch": 2,
-        }
-    )
+    context_digest = _authority_context_digest()
     parent = daemon.prepare(
         replace(
             _intent(),
@@ -368,6 +383,58 @@ def test_claimed_receipt_can_commit_after_launch_ttl(
         "execution.claimed",
         "execution.success",
     ]
+
+
+def test_transport_root_provenance_is_not_consumed_as_child_delegation(
+    tmp_path: Path,
+) -> None:
+    """A transport identity commitment must remain usable at the claim edge."""
+    daemon = AuthorityDaemon(
+        socket_path=tmp_path / "authorityd.sock",
+        signing_key=Ed25519KeyStore.load_or_create(tmp_path / "key.pem", create=True),
+        audit_writer=_MemoryWorm(),
+        issuer_id="test-authorityd",
+        policy=lambda _intent: None,
+    )
+    grant_id, _ = daemon.grant(
+        principal_id="agent",
+        project_id="project",
+        runtime_id="runtime",
+        task_id="task",
+        workspace_id="workspace",
+        workspace_generation=1,
+        policy_digest="policy-digest",
+        operation_class="git.workspace",
+        resource_digest="workspace-digest",
+        authorization_epoch=2,
+        principal_kind="human",
+        parent_principal_id="human:agent",
+        session_id="session",
+        delegation_digest=_TEST_TRANSPORT_DELEGATION,
+        source_transport="pytest",
+        delegation_resource="git.workspace",
+    )
+    receipt = daemon.prepare(
+        replace(
+            _intent(),
+            grant_id=grant_id,
+            grant_context_digest=_authority_context_digest(
+                principal_kind="human",
+                parent_principal_id="human:agent",
+                session_id="session",
+                delegation_digest=_TEST_TRANSPORT_DELEGATION,
+                source_transport="pytest",
+            ),
+            principal_kind="human",
+            parent_principal_id="human:agent",
+            session_id="session",
+            delegation_digest=_TEST_TRANSPORT_DELEGATION,
+            source_transport="pytest",
+            delegation_resource="git.workspace",
+            workspace_generation=1,
+        )
+    )
+    daemon.claim(receipt)
 
 
 def test_expired_prepared_receipts_are_gc_bounded_and_cannot_launch(
@@ -652,22 +719,12 @@ def test_production_daemon_requires_live_grant_and_same_operation_family(
         delegation_digest=_TEST_TRANSPORT_DELEGATION,
         source_transport="pytest",
     )
-    context_digest = authorityd_module._digest(
-        {
-            "schema_version": 1,
-            "principal_id": "agent",
-            "project_id": "project",
-            "runtime_id": "runtime",
-            "task_id": "task",
-            "workspace_id": "workspace",
-            "workspace_generation": 1,
-            "policy_digest": "policy-digest",
-            "authorization_epoch": 2,
-            "principal_kind": "human",
-            "parent_principal_id": "human:agent",
-            "session_id": "session",
-            "delegation_digest": _TEST_TRANSPORT_DELEGATION,
-        }
+    context_digest = _authority_context_digest(
+        principal_kind="human",
+        parent_principal_id="human:agent",
+        session_id="session",
+        delegation_digest=_TEST_TRANSPORT_DELEGATION,
+        source_transport="pytest",
     )
     intent = AuthorizationIntent(
         principal_id="agent",
@@ -687,6 +744,7 @@ def test_production_daemon_requires_live_grant_and_same_operation_family(
         parent_principal_id="human:agent",
         session_id="session",
         delegation_digest=_TEST_TRANSPORT_DELEGATION,
+        source_transport="pytest",
     )
     with pytest.raises(AuthorityControlPlaneError, match="resource"):
         daemon.prepare(replace(intent, resource_digest="unrelated-resource"))
@@ -754,22 +812,12 @@ def test_expired_typed_child_receipt_renews_only_issued_action_and_scope(
         delegation_digest=_TEST_TRANSPORT_DELEGATION,
         source_transport="pytest",
     )
-    context_digest = authorityd_module._digest(
-        {
-            "schema_version": 1,
-            "principal_id": "agent",
-            "project_id": "project",
-            "runtime_id": "runtime",
-            "task_id": "task",
-            "workspace_id": "workspace",
-            "workspace_generation": 1,
-            "policy_digest": "policy-digest",
-            "authorization_epoch": 2,
-            "principal_kind": "human",
-            "parent_principal_id": "human:agent",
-            "session_id": "session",
-            "delegation_digest": _TEST_TRANSPORT_DELEGATION,
-        }
+    context_digest = _authority_context_digest(
+        principal_kind="human",
+        parent_principal_id="human:agent",
+        session_id="session",
+        delegation_digest=_TEST_TRANSPORT_DELEGATION,
+        source_transport="pytest",
     )
     parent_intent = AuthorizationIntent(
         principal_id="agent",
@@ -789,6 +837,7 @@ def test_expired_typed_child_receipt_renews_only_issued_action_and_scope(
         parent_principal_id="human:agent",
         session_id="session",
         delegation_digest=_TEST_TRANSPORT_DELEGATION,
+        source_transport="pytest",
     )
     parent_receipt = daemon.prepare(parent_intent)
     child_receipt = daemon.narrow(
@@ -856,19 +905,7 @@ def test_expired_live_grant_is_terminally_audited_before_rejection(
         authorization_epoch=2,
         ttl_seconds=1.0,
     )
-    context_digest = authorityd_module._digest(
-        {
-            "schema_version": 1,
-            "principal_id": "agent",
-            "project_id": "project",
-            "runtime_id": "runtime",
-            "task_id": "task",
-            "workspace_id": "workspace",
-            "workspace_generation": 1,
-            "policy_digest": "policy-digest",
-            "authorization_epoch": 2,
-        }
-    )
+    context_digest = _authority_context_digest()
     clock[0] = 102.0
     with pytest.raises(AuthorityControlPlaneError, match="expired"):
         daemon.prepare(
@@ -914,19 +951,7 @@ def test_grant_revoke_invalidates_prepared_receipts_but_not_claimed_receipts(
             resource_digest="workspace-digest",
             authorization_epoch=2,
         )
-        context_digest = authorityd_module._digest(
-            {
-                "schema_version": 1,
-                "principal_id": "agent",
-                "project_id": "project",
-                "runtime_id": "runtime",
-                "task_id": "task",
-                "workspace_id": "workspace",
-                "workspace_generation": 1,
-                "policy_digest": "policy-digest",
-                "authorization_epoch": 2,
-            }
-        )
+        context_digest = _authority_context_digest()
         receipt = daemon.prepare(
             replace(
                 _intent(),
@@ -981,19 +1006,7 @@ def test_epoch_rotation_invalidates_prepared_grant_receipts(
         resource_digest="workspace-digest",
         authorization_epoch=2,
     )
-    context_digest = authorityd_module._digest(
-        {
-            "schema_version": 1,
-            "principal_id": "agent",
-            "project_id": "project",
-            "runtime_id": "runtime",
-            "task_id": "task",
-            "workspace_id": "workspace",
-            "workspace_generation": 1,
-            "policy_digest": "policy-digest",
-            "authorization_epoch": 2,
-        }
-    )
+    context_digest = _authority_context_digest()
     receipt = daemon.prepare(
         replace(
             _intent(),
@@ -1038,19 +1051,7 @@ def test_workspace_generation_rotation_invalidates_prepared_grant_receipts(
         resource_digest="workspace-digest",
         authorization_epoch=2,
     )
-    context_digest = authorityd_module._digest(
-        {
-            "schema_version": 1,
-            "principal_id": "agent",
-            "project_id": "project",
-            "runtime_id": "runtime",
-            "task_id": "task",
-            "workspace_id": "workspace",
-            "workspace_generation": 1,
-            "policy_digest": "policy-digest",
-            "authorization_epoch": 2,
-        }
-    )
+    context_digest = _authority_context_digest()
     receipt = daemon.prepare(
         replace(
             _intent(),
@@ -1103,19 +1104,7 @@ def test_grant_expiry_invalidates_prepared_receipt_before_claim(
         authorization_epoch=2,
         ttl_seconds=1.0,
     )
-    context_digest = authorityd_module._digest(
-        {
-            "schema_version": 1,
-            "principal_id": "agent",
-            "project_id": "project",
-            "runtime_id": "runtime",
-            "task_id": "task",
-            "workspace_id": "workspace",
-            "workspace_generation": 1,
-            "policy_digest": "policy-digest",
-            "authorization_epoch": 2,
-        }
-    )
+    context_digest = _authority_context_digest()
     receipt = daemon.prepare(
         replace(
             _intent(),

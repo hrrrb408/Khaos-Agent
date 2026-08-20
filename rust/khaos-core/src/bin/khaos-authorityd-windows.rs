@@ -16,6 +16,7 @@ fn main() {}
 mod windows_authority {
     use std::env;
     use std::ffi::c_void;
+    use std::fmt::{Display, Formatter};
     use std::fs;
     use std::mem::size_of;
     use std::os::windows::ffi::OsStrExt;
@@ -29,19 +30,15 @@ mod windows_authority {
     };
     use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
     use windows_sys::Win32::Security::Cryptography::{
-        BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG, CryptUnprotectData,
-        CRYPT_INTEGER_BLOB,
+        BCryptGenRandom, CryptUnprotectData, BCRYPT_USE_SYSTEM_PREFERRED_RNG, CRYPT_INTEGER_BLOB,
     };
     use windows_sys::Win32::Security::{
         GetTokenInformation, TokenGroups, TokenUser, TOKEN_GROUPS, TOKEN_QUERY, TOKEN_USER,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL,
-        FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, FILE_GENERIC_READ,
-        FILE_GENERIC_WRITE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
-    };
-    use windows_sys::Win32::System::IO::{
-        CancelIoEx, GetOverlappedResult, OVERLAPPED,
+        CreateFileW, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_FIRST_PIPE_INSTANCE,
+        FILE_FLAG_OVERLAPPED, FILE_GENERIC_READ, FILE_GENERIC_WRITE, OPEN_EXISTING,
+        PIPE_ACCESS_DUPLEX,
     };
     use windows_sys::Win32::System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
@@ -50,16 +47,48 @@ mod windows_authority {
     };
     use windows_sys::Win32::System::Services::{
         RegisterServiceCtrlHandlerExW, SetServiceStatus, StartServiceCtrlDispatcherW,
-        SERVICE_ACCEPT_STOP, SERVICE_CONTROL_STOP, SERVICE_ERROR_CRITICAL, SERVICE_RUNNING, SERVICE_STATUS, SERVICE_STATUS_HANDLE,
-        SERVICE_STOPPED, SERVICE_STOP_PENDING, SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS,
+        SERVICE_ACCEPT_STOP, SERVICE_CONTROL_STOP, SERVICE_ERROR_CRITICAL, SERVICE_RUNNING,
+        SERVICE_STATUS, SERVICE_STATUS_HANDLE, SERVICE_STOPPED, SERVICE_STOP_PENDING,
+        SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS,
     };
     use windows_sys::Win32::System::Threading::{
         CreateEventW, GetCurrentProcess, OpenProcess, OpenProcessToken, SetEvent,
-        WaitForSingleObject, WaitForMultipleObjects, PROCESS_QUERY_LIMITED_INFORMATION,
+        WaitForMultipleObjects, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
     };
+    use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
     const MAX_MESSAGE_BYTES: usize = 64 * 1024;
     const SERVICE_NAME: &str = "KhaosAuthorityD";
+    const ERROR_OPERATION_ABORTED: u32 = 995;
+    const ERROR_IO_INCOMPLETE: u32 = 996;
+
+    #[derive(Debug)]
+    struct OverlappedIoError {
+        message: String,
+        terminal: bool,
+    }
+
+    impl OverlappedIoError {
+        fn terminal(message: impl Into<String>) -> Self {
+            Self {
+                message: message.into(),
+                terminal: true,
+            }
+        }
+
+        fn active(message: impl Into<String>) -> Self {
+            Self {
+                message: message.into(),
+                terminal: false,
+            }
+        }
+    }
+
+    impl Display for OverlappedIoError {
+        fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str(&self.message)
+        }
+    }
 
     fn wide(value: &str) -> Vec<u16> {
         std::ffi::OsStr::new(value)
@@ -70,6 +99,34 @@ mod windows_authority {
 
     fn required(name: &str) -> Result<String, String> {
         env::var(name).map_err(|_| format!("{name} is missing"))
+    }
+
+    unsafe fn cancel_and_reap(
+        handle: HANDLE,
+        event: HANDLE,
+        overlapped: &mut OVERLAPPED,
+        operation: &str,
+    ) -> Result<(), OverlappedIoError> {
+        // CancelIoEx only requests cancellation.  Keep the OVERLAPPED
+        // storage and event alive until the kernel reports terminal state.
+        CancelIoEx(handle, overlapped);
+        let wait = WaitForSingleObject(event, 5_000);
+        if wait != WAIT_OBJECT_0 {
+            return Err(OverlappedIoError::active(format!(
+                "{operation} cancellation did not reach terminal completion"
+            )));
+        }
+        let mut transferred = 0_u32;
+        if GetOverlappedResult(handle, overlapped, &mut transferred, 0) != 0 {
+            return Ok(());
+        }
+        let error = GetLastError();
+        if error == ERROR_OPERATION_ABORTED {
+            return Ok(());
+        }
+        Err(OverlappedIoError::active(format!(
+            "{operation} cancellation completion failed: {error}"
+        )))
     }
 
     fn load_configuration(path: &str) -> Result<(), String> {
@@ -353,18 +410,27 @@ mod windows_authority {
     }
 
     fn valid_challenge(value: &str) -> bool {
-        value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        value.len() == 64
+            && value
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
     }
 
     /// Handle one client message: parse kind/challenge/request, wrap the
     /// request into a backend `attest` envelope, forward it, and merge the
     /// backend response with the transport binding for the client.
-    fn service_request(input: &[u8], service_sid: &str, peer_identity: &str) -> String {
+    fn service_request(
+        input: &[u8],
+        service_sid: &str,
+        peer_identity: &str,
+    ) -> Result<String, OverlappedIoError> {
         let message: serde_json::Value = match serde_json::from_slice(input) {
             Ok(value) => value,
             Err(_) => {
-                return "{\"ok\":false,\"error\":\"native pipe message is malformed JSON\"}"
-                    .to_string()
+                return Ok(
+                    "{\"ok\":false,\"error\":\"native pipe message is malformed JSON\"}"
+                        .to_string(),
+                )
             }
         };
         let kind = message.get("kind").and_then(|value| value.as_str());
@@ -378,8 +444,10 @@ mod windows_authority {
         let service_name =
             env::var("KHAOS_AUTHORITYD_SERVICE_NAME").unwrap_or_else(|_| SERVICE_NAME.to_string());
         if kind.is_none() || !valid_challenge(challenge) {
-            return "{\"ok\":false,\"error\":\"native pipe challenge is missing or malformed\"}"
-                .to_string();
+            return Ok(
+                "{\"ok\":false,\"error\":\"native pipe challenge is missing or malformed\"}"
+                    .to_string(),
+            );
         }
         let request_bytes: Vec<u8> = if kind == Some("probe") {
             PROBE_INNER_REQUEST.as_bytes().to_vec()
@@ -387,13 +455,17 @@ mod windows_authority {
             match message.get("request_json").and_then(|value| value.as_str()) {
                 Some(request) => request.as_bytes().to_vec(),
                 None => {
-                    return "{\"ok\":false,\"error\":\"native pipe request body is missing\"}"
-                        .to_string()
+                    return Ok(
+                        "{\"ok\":false,\"error\":\"native pipe request body is missing\"}"
+                            .to_string(),
+                    )
                 }
             }
         };
         if request_bytes.is_empty() || request_bytes.len() > MAX_MESSAGE_BYTES / 2 {
-            return "{\"ok\":false,\"error\":\"native pipe request is out of bounds\"}".to_string();
+            return Ok(
+                "{\"ok\":false,\"error\":\"native pipe request is out of bounds\"}".to_string(),
+            );
         }
         let attest_request = serde_json::json!({
             "protocol": 1,
@@ -418,7 +490,7 @@ mod windows_authority {
         let backend = match env::var("KHAOS_AUTHORITYD_BACKEND_PIPE") {
             Ok(value) if value.starts_with(r"\\.\pipe\") && value.len() <= 256 => wide(&value),
             _ => {
-                return "{\"ok\":false,\"error_code\":\"authority_backend_unavailable\",\"error\":\"authority backend pipe is not configured\"}".to_string()
+                return Ok("{\"ok\":false,\"error_code\":\"authority_backend_unavailable\",\"error\":\"authority backend pipe is not configured\"}".to_string())
             }
         };
         // Open the backend pipe overlapped so a wedged backend cannot
@@ -436,7 +508,7 @@ mod windows_authority {
             )
         };
         if handle == INVALID_HANDLE_VALUE {
-            return "{\"ok\":false,\"error_code\":\"authority_backend_unavailable\",\"error\":\"authority backend pipe is unavailable\"}".to_string();
+            return Ok("{\"ok\":false,\"error_code\":\"authority_backend_unavailable\",\"error\":\"authority backend pipe is unavailable\"}".to_string());
         }
         // Verify the backend pipe really is served by a trusted authority
         // identity before forwarding a request.  A pipe name alone is not
@@ -466,39 +538,45 @@ mod windows_authority {
         };
         if backend_identity_ok == 0 {
             unsafe { CloseHandle(handle) };
-            return "{\"ok\":false,\"error_code\":\"authority_backend_unavailable\",\"error\":\"authority backend pipe identity is not the authority Service SID\"}".to_string();
+            return Ok("{\"ok\":false,\"error_code\":\"authority_backend_unavailable\",\"error\":\"authority backend pipe identity is not the authority Service SID\"}".to_string());
         }
         let payload = serde_json::to_vec(&attest_request).unwrap_or_default();
         if payload.len() > MAX_MESSAGE_BYTES {
             unsafe { CloseHandle(handle) };
-            return "{\"ok\":false,\"error_code\":\"authority_backend_unavailable\",\"error\":\"authority backend request is out of bounds\"}".to_string();
+            return Ok("{\"ok\":false,\"error_code\":\"authority_backend_unavailable\",\"error\":\"authority backend request is out of bounds\"}".to_string());
         }
-        let write_result =
-            unsafe { write_message_deadline(handle, &payload, BACKEND_IO_TIMEOUT_MS) };
-        let backend_bytes = match write_result {
-            Ok(()) => {
+        let backend_bytes = unsafe {
+            write_message_deadline(handle, &payload, BACKEND_IO_TIMEOUT_MS).and_then(|()| {
                 let mut response = vec![0_u8; MAX_MESSAGE_BYTES];
-                unsafe { read_message_deadline(handle, &mut response, BACKEND_IO_TIMEOUT_MS) }
-            }
-            Err(error) => Err(error),
+                read_message_deadline(handle, &mut response, BACKEND_IO_TIMEOUT_MS)
+            })
         };
-        unsafe { CloseHandle(handle) };
         let backend_bytes = match backend_bytes {
-            Ok(bytes) if !bytes.is_empty() && bytes.len() <= MAX_MESSAGE_BYTES => bytes,
+            Ok(bytes) if !bytes.is_empty() && bytes.len() <= MAX_MESSAGE_BYTES => {
+                unsafe { CloseHandle(handle) };
+                bytes
+            }
             Ok(_) => {
-                return "{\"ok\":false,\"error_code\":\"authority_backend_unavailable\",\"error\":\"authority backend returned no bounded response\"}".to_string()
+                unsafe { CloseHandle(handle) };
+                return Ok("{\"ok\":false,\"error_code\":\"authority_backend_unavailable\",\"error\":\"authority backend returned no bounded response\"}".to_string());
             }
             Err(error) => {
-                return format!(
-                    "{{\"ok\":false,\"error_code\":\"authority_backend_unavailable\",\"error\":\"authority backend IO deadline: {error}\"}}"
-                )
+                if error.terminal {
+                    unsafe { CloseHandle(handle) };
+                    return Ok(format!(
+                        "{{\"ok\":false,\"error_code\":\"authority_backend_unavailable\",\"error\":\"authority backend IO deadline: {error}\"}}"
+                    ));
+                }
+                return Err(error);
             }
         };
         let backend_body: serde_json::Value = match serde_json::from_slice(&backend_bytes) {
             Ok(value) => value,
             Err(_) => {
-                return "{\"ok\":false,\"error\":\"authority backend returned malformed JSON\"}"
-                    .to_string()
+                return Ok(
+                    "{\"ok\":false,\"error\":\"authority backend returned malformed JSON\"}"
+                        .to_string(),
+                )
             }
         };
         // Merge the transport binding into the backend response so the
@@ -527,10 +605,12 @@ mod windows_authority {
                 wrapper.insert(key, value);
             }
         } else {
-            return "{\"ok\":false,\"error\":\"authority backend returned a non-object response\"}"
-                .to_string();
+            return Ok(
+                "{\"ok\":false,\"error\":\"authority backend returned a non-object response\"}"
+                    .to_string(),
+            );
         }
-        serde_json::Value::Object(wrapper).to_string()
+        Ok(serde_json::Value::Object(wrapper).to_string())
     }
 
     const CLIENT_IO_TIMEOUT_MS: u32 = 10_000;
@@ -564,11 +644,15 @@ mod windows_authority {
     /// Overlapped read of one bounded message with a hard deadline.
     /// Message-mode pipes deliver one complete message per read; a
     /// timeout cancels the IO instead of blocking the service forever.
-    unsafe fn read_message_deadline(handle: HANDLE, buffer: &mut [u8], timeout_ms: u32) -> Result<Vec<u8>, String> {
+    unsafe fn read_message_deadline(
+        handle: HANDLE,
+        buffer: &mut [u8],
+        timeout_ms: u32,
+    ) -> Result<Vec<u8>, OverlappedIoError> {
         let mut overlapped: OVERLAPPED = std::mem::zeroed();
         let event = CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
         if event.is_null() {
-            return Err("CreateEventW failed".to_string());
+            return Err(OverlappedIoError::terminal("CreateEventW failed"));
         }
         overlapped.hEvent = event;
         let mut transferred = 0_u32;
@@ -582,39 +666,61 @@ mod windows_authority {
         let last_error = GetLastError();
         if pending == 0 && last_error != ERROR_IO_PENDING {
             CloseHandle(event);
-            return Err(format!("ReadFile failed: {last_error}"));
+            return Err(OverlappedIoError::terminal(format!(
+                "ReadFile failed: {last_error}"
+            )));
         }
         if pending == 0 {
             let wait = WaitForSingleObject(event, timeout_ms);
             if wait == WAIT_TIMEOUT {
-                CancelIoEx(handle, &mut overlapped);
-                CloseHandle(event);
-                return Err("read deadline exceeded".to_string());
+                return match cancel_and_reap(handle, event, &mut overlapped, "read") {
+                    Ok(()) => {
+                        CloseHandle(event);
+                        Err(OverlappedIoError::terminal("read deadline exceeded"))
+                    }
+                    Err(error) => Err(error),
+                };
             }
             if wait != WAIT_OBJECT_0 {
-                CancelIoEx(handle, &mut overlapped);
-                CloseHandle(event);
-                return Err(format!("read wait failed: {wait}"));
+                return match cancel_and_reap(handle, event, &mut overlapped, "read") {
+                    Ok(()) => {
+                        CloseHandle(event);
+                        Err(OverlappedIoError::terminal(format!(
+                            "read wait failed: {wait}"
+                        )))
+                    }
+                    Err(error) => Err(error),
+                };
             }
             // The overlapped result carries the byte count.
             if GetOverlappedResult(handle, &mut overlapped, &mut transferred, 0) == 0 {
+                let error = GetLastError();
+                if error == ERROR_IO_INCOMPLETE {
+                    return Err(OverlappedIoError::active("read completion is not terminal"));
+                }
                 CloseHandle(event);
-                return Err("GetOverlappedResult failed".to_string());
+                return Err(OverlappedIoError::terminal(format!(
+                    "GetOverlappedResult failed: {error}"
+                )));
             }
         }
         CloseHandle(event);
         if transferred == 0 || transferred as usize > buffer.len() {
-            return Err("empty or oversized message".to_string());
+            return Err(OverlappedIoError::terminal("empty or oversized message"));
         }
         Ok(buffer[..transferred as usize].to_vec())
     }
 
     /// Overlapped write of one bounded message with a hard deadline.
-    unsafe fn write_message_deadline(handle: HANDLE, payload: &[u8], timeout_ms: u32) -> Result<(), String> {
+    unsafe fn write_message_deadline(
+        handle: HANDLE,
+        payload: &[u8],
+        timeout_ms: u32,
+    ) -> Result<(), OverlappedIoError> {
         let mut overlapped: OVERLAPPED = std::mem::zeroed();
         let event = CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
         if event.is_null() {
-            return Err("CreateEventW failed".to_string());
+            return Err(OverlappedIoError::terminal("CreateEventW failed"));
         }
         overlapped.hEvent = event;
         let mut transferred = 0_u32;
@@ -628,30 +734,82 @@ mod windows_authority {
         let last_error = GetLastError();
         if pending == 0 && last_error != ERROR_IO_PENDING {
             CloseHandle(event);
-            return Err(format!("WriteFile failed: {last_error}"));
+            return Err(OverlappedIoError::terminal(format!(
+                "WriteFile failed: {last_error}"
+            )));
         }
         if pending == 0 {
             let wait = WaitForSingleObject(event, timeout_ms);
             if wait == WAIT_TIMEOUT {
-                CancelIoEx(handle, &mut overlapped);
-                CloseHandle(event);
-                return Err("write deadline exceeded".to_string());
+                return match cancel_and_reap(handle, event, &mut overlapped, "write") {
+                    Ok(()) => {
+                        CloseHandle(event);
+                        Err(OverlappedIoError::terminal("write deadline exceeded"))
+                    }
+                    Err(error) => Err(error),
+                };
             }
             if wait != WAIT_OBJECT_0 {
-                CancelIoEx(handle, &mut overlapped);
-                CloseHandle(event);
-                return Err(format!("write wait failed: {wait}"));
+                return match cancel_and_reap(handle, event, &mut overlapped, "write") {
+                    Ok(()) => {
+                        CloseHandle(event);
+                        Err(OverlappedIoError::terminal(format!(
+                            "write wait failed: {wait}"
+                        )))
+                    }
+                    Err(error) => Err(error),
+                };
             }
             if GetOverlappedResult(handle, &mut overlapped, &mut transferred, 0) == 0 {
+                let error = GetLastError();
+                if error == ERROR_IO_INCOMPLETE {
+                    return Err(OverlappedIoError::active(
+                        "write completion is not terminal",
+                    ));
+                }
                 CloseHandle(event);
-                return Err("GetOverlappedResult failed".to_string());
+                return Err(OverlappedIoError::terminal(format!(
+                    "GetOverlappedResult failed: {error}"
+                )));
             }
         }
         CloseHandle(event);
         if transferred as usize != payload.len() {
-            return Err("incomplete write".to_string());
+            return Err(OverlappedIoError::terminal("incomplete write"));
         }
         Ok(())
+    }
+
+    unsafe fn finish_client_connection(
+        handle: HANDLE,
+        connect_event: HANDLE,
+        response: &str,
+    ) -> Result<(), String> {
+        match write_message_deadline(handle, response.as_bytes(), CLIENT_IO_TIMEOUT_MS) {
+            Ok(()) => {
+                // A deterministic terminal state for the connection even
+                // when stop arrives mid-request: the response is flushed
+                // before disconnecting and releasing the pipe handle.
+                DisconnectNamedPipe(handle);
+                CloseHandle(connect_event);
+                CloseHandle(handle);
+                Ok(())
+            }
+            Err(error) if error.terminal => {
+                DisconnectNamedPipe(handle);
+                CloseHandle(connect_event);
+                CloseHandle(handle);
+                Err(error.to_string())
+            }
+            Err(error) => {
+                // The connect event is already terminal, but the pipe write
+                // is not.  Do not close the pipe handle while the kernel can
+                // still complete the write; the process supervisor owns the
+                // remaining cleanup path.
+                CloseHandle(connect_event);
+                Err(error.to_string())
+            }
+        }
     }
 
     fn run_service_loop() -> Result<(), String> {
@@ -660,130 +818,171 @@ mod windows_authority {
         let pipe = pipe_name()?;
         let (_descriptor, attributes) = build_pipe_security()?;
         let pipe_w = wide(&pipe);
-        let stop_event = unsafe {
-            let event = CreateEventW(std::ptr::null(), 1, 0, std::ptr::null());
-            if event.is_null() {
-                return Err("CreateEventW failed for the stop event".to_string());
-            }
-            STOP_EVENT = event;
-            event
-        };
-        loop {
-            // The pipe is opened overlapped so the blocking accept can be
-            // interrupted by SERVICE_CONTROL_STOP.
-            let handle = unsafe {
-                CreateNamedPipeW(
-                    pipe_w.as_ptr(),
-                    PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED,
-                    PIPE_TYPE_MESSAGE
-                        | PIPE_READMODE_MESSAGE
-                        | PIPE_WAIT
-                        | PIPE_REJECT_REMOTE_CLIENTS,
-                    1,
-                    MAX_MESSAGE_BYTES as u32,
-                    MAX_MESSAGE_BYTES as u32,
-                    5000,
-                    &attributes,
-                )
-            };
-            if handle == INVALID_HANDLE_VALUE {
-                return Err(format!("CreateNamedPipeW failed: {}", unsafe {
-                    GetLastError()
-                }));
-            }
-            let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
-            let connect_event = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
-            if connect_event.is_null() {
-                unsafe { CloseHandle(handle) };
-                return Err("CreateEventW failed for the connect event".to_string());
-            }
-            overlapped.hEvent = connect_event;
-            let connect_result = unsafe { ConnectNamedPipe(handle, &mut overlapped) };
-            let connect_error = unsafe { GetLastError() };
-            let connected = if connect_result != 0 {
-                true
-            } else if connect_error == ERROR_PIPE_CONNECTED {
-                // The legal race: the client already connected between
-                // CreateNamedPipeW and ConnectNamedPipe.
-                true
-            } else if connect_error == ERROR_IO_PENDING {
-                // Wait for either a client connection or the stop signal.
-                let handles = [stop_event, connect_event];
-                let wait = unsafe {
-                    WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE)
+        let stop_event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+        if stop_event.is_null() {
+            unsafe { LocalFree(attributes.lpSecurityDescriptor.cast()) };
+            return Err("CreateEventW failed for the stop event".to_string());
+        }
+        unsafe { STOP_EVENT = stop_event };
+        let result = (|| -> Result<(), String> {
+            loop {
+                // The pipe is opened overlapped so the blocking accept can
+                // be interrupted by SERVICE_CONTROL_STOP.
+                let handle = unsafe {
+                    CreateNamedPipeW(
+                        pipe_w.as_ptr(),
+                        PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED,
+                        PIPE_TYPE_MESSAGE
+                            | PIPE_READMODE_MESSAGE
+                            | PIPE_WAIT
+                            | PIPE_REJECT_REMOTE_CLIENTS,
+                        1,
+                        MAX_MESSAGE_BYTES as u32,
+                        MAX_MESSAGE_BYTES as u32,
+                        5000,
+                        &attributes,
+                    )
                 };
-                if wait == WAIT_OBJECT_0 {
-                    // Stop requested: cancel the pending accept, drain, and
-                    // report STOP_PENDING before releasing resources.
-                    unsafe {
-                        CancelIoEx(handle, &mut overlapped);
-                        set_service_state(
-                            SERVICE_STOP_PENDING,
-                            0,
-                            10_000,
-                        );
-                        CloseHandle(connect_event);
-                        DisconnectNamedPipe(handle);
-                        CloseHandle(handle);
-                    }
-                    return Ok(());
+                if handle == INVALID_HANDLE_VALUE {
+                    return Err(format!("CreateNamedPipeW failed: {}", unsafe {
+                        GetLastError()
+                    }));
                 }
-                if wait == WAIT_OBJECT_0 + 1 {
-                    let mut transferred = 0_u32;
-                    unsafe {
-                        GetOverlappedResult(handle, &mut overlapped, &mut transferred, 0) != 0
+                let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+                let connect_event =
+                    unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
+                if connect_event.is_null() {
+                    unsafe { CloseHandle(handle) };
+                    return Err("CreateEventW failed for the connect event".to_string());
+                }
+                overlapped.hEvent = connect_event;
+                let connect_result = unsafe { ConnectNamedPipe(handle, &mut overlapped) };
+                let connect_error = unsafe { GetLastError() };
+                let connected = if connect_result != 0 {
+                    true
+                } else if connect_error == ERROR_PIPE_CONNECTED {
+                    // The legal race: the client already connected between
+                    // CreateNamedPipeW and ConnectNamedPipe.
+                    true
+                } else if connect_error == ERROR_IO_PENDING {
+                    // Wait for either a client connection or the stop signal.
+                    let handles = [stop_event, connect_event];
+                    let wait = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE) };
+                    if wait == WAIT_OBJECT_0 {
+                        // Stop requested: cancel the pending accept, drain,
+                        // and report STOP_PENDING before releasing resources.
+                        unsafe {
+                            cancel_and_reap(handle, connect_event, &mut overlapped, "connect")
+                                .map_err(|error| error.to_string())?;
+                            set_service_state(SERVICE_STOP_PENDING, 0, 10_000);
+                            CloseHandle(connect_event);
+                            DisconnectNamedPipe(handle);
+                            CloseHandle(handle);
+                        }
+                        return Ok(());
+                    }
+                    if wait == WAIT_OBJECT_0 + 1 {
+                        let mut transferred = 0_u32;
+                        unsafe {
+                            if GetOverlappedResult(handle, &mut overlapped, &mut transferred, 0)
+                                == 0
+                            {
+                                let error = GetLastError();
+                                if error == ERROR_IO_INCOMPLETE {
+                                    return Err(
+                                        "connect completion proof is not terminal".to_string()
+                                    );
+                                }
+                                CloseHandle(connect_event);
+                                CloseHandle(handle);
+                                return Err(format!("connect completion proof failed: {error}"));
+                            }
+                            true
+                        }
+                    } else {
+                        unsafe {
+                            cancel_and_reap(handle, connect_event, &mut overlapped, "connect")
+                                .map_err(|error| error.to_string())?;
+                            CloseHandle(connect_event);
+                            CloseHandle(handle);
+                        }
+                        continue;
                     }
                 } else {
+                    false
+                };
+                if !connected {
                     unsafe {
-                        CancelIoEx(handle, &mut overlapped);
                         CloseHandle(connect_event);
                         CloseHandle(handle);
                     }
                     continue;
                 }
-            } else {
-                false
-            };
-            if connected {
+
                 unsafe {
                     let mut peer_pid = 0_u32;
-                    let peer_ok = GetNamedPipeClientProcessId(handle, &mut peer_pid) != 0
-                        && peer_pid > 0;
-                    let peer_identity = if peer_ok {
+                    let peer_process_ok =
+                        GetNamedPipeClientProcessId(handle, &mut peer_pid) != 0 && peer_pid > 0;
+                    let peer_identity = if peer_process_ok {
                         peer_sid(peer_pid).ok()
                     } else {
                         None
                     };
                     let expected_agent_sid = env::var("KHAOS_AGENT_SID").unwrap_or_default();
-                    let peer_ok =
-                        peer_identity.as_deref() == Some(expected_agent_sid.as_str());
-                    let response = if peer_ok {
+                    let peer_ok = peer_identity.as_deref() == Some(expected_agent_sid.as_str());
+                    if peer_ok {
                         let mut buffer = vec![0_u8; MAX_MESSAGE_BYTES];
-                        match read_message_deadline(handle, &mut buffer, CLIENT_IO_TIMEOUT_MS) {
-                            Ok(message) => service_request(
-                                &message,
-                                &service_sid,
-                                peer_identity.as_deref().unwrap_or("unknown"),
-                            ),
-                            Err(error) => format!(
-                                "{{\"ok\":false,\"error\":\"Named Pipe read failed: {error}\"}}"
-                            ),
-                        }
+                        let message = match read_message_deadline(
+                            handle,
+                            &mut buffer,
+                            CLIENT_IO_TIMEOUT_MS,
+                        ) {
+                            Ok(message) => message,
+                            Err(error) if error.terminal => {
+                                DisconnectNamedPipe(handle);
+                                CloseHandle(connect_event);
+                                CloseHandle(handle);
+                                continue;
+                            }
+                            Err(error) => {
+                                // The pending read is still live; preserve
+                                // the handle and let the process supervisor
+                                // terminate the service domain.
+                                CloseHandle(connect_event);
+                                return Err(error.to_string());
+                            }
+                        };
+                        let response = match service_request(
+                            &message,
+                            &service_sid,
+                            peer_identity.as_deref().unwrap_or("unknown"),
+                        ) {
+                            Ok(response) => response,
+                            Err(error) => {
+                                // The frontend read has completed, so its
+                                // handle is safe to close.  The backend handle
+                                // is intentionally retained by service_request
+                                // when its overlapped completion is unproven.
+                                DisconnectNamedPipe(handle);
+                                CloseHandle(connect_event);
+                                CloseHandle(handle);
+                                return Err(error.to_string());
+                            }
+                        };
+                        finish_client_connection(handle, connect_event, &response)?;
                     } else {
-                        "{\"ok\":false,\"error\":\"Named Pipe peer proof failed\"}".to_string()
-                    };
-                    let _ = write_message_deadline(handle, response.as_bytes(), CLIENT_IO_TIMEOUT_MS);
-                    // A deterministic terminal state for the connection
-                    // even when stop arrives mid-request: the response is
-                    // flushed or the deadline fires before disconnect.
-                    DisconnectNamedPipe(handle);
+                        let response = "{\"ok\":false,\"error\":\"Named Pipe peer proof failed\"}";
+                        finish_client_connection(handle, connect_event, response)?;
+                    }
                 }
             }
-            unsafe {
-                CloseHandle(connect_event);
-                CloseHandle(handle);
-            }
+        })();
+        unsafe {
+            STOP_EVENT = null_mut();
+            CloseHandle(stop_event);
+            LocalFree(attributes.lpSecurityDescriptor.cast());
         }
+        result
     }
 
     /// Client mode: send one probe or request (with the Agent-generated
@@ -796,7 +995,10 @@ mod windows_authority {
             None => return Err("a challenge nonce is required".into()),
         };
         let mut message = serde_json::Map::new();
-        message.insert("kind".to_string(), serde_json::Value::String(kind.to_string()));
+        message.insert(
+            "kind".to_string(),
+            serde_json::Value::String(kind.to_string()),
+        );
         message.insert(
             "challenge_nonce".to_string(),
             serde_json::Value::String(challenge_value),
@@ -811,10 +1013,7 @@ mod windows_authority {
             if input.is_empty() || input.len() > MAX_MESSAGE_BYTES {
                 return Err("request payload is empty or oversized".into());
             }
-            message.insert(
-                "request_json".to_string(),
-                serde_json::Value::String(input),
-            );
+            message.insert("request_json".to_string(), serde_json::Value::String(input));
         }
         let pipe = wide(&pipe_name()?);
         let handle = unsafe {
@@ -824,7 +1023,7 @@ mod windows_authority {
                 0,
                 null(),
                 OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
                 null_mut(),
             )
         };
@@ -832,34 +1031,26 @@ mod windows_authority {
             return Err("authority Named Pipe is unavailable".to_string());
         }
         let request = serde_json::Value::Object(message).to_string();
-        let mut written = 0_u32;
-        let ok = unsafe {
-            WriteFile(
-                handle,
-                request.as_ptr(),
-                request.len() as u32,
-                &mut written,
-                null_mut(),
+        let response = unsafe {
+            write_message_deadline(handle, request.as_bytes(), CLIENT_IO_TIMEOUT_MS).and_then(
+                |_| {
+                    let mut response = vec![0_u8; MAX_MESSAGE_BYTES];
+                    read_message_deadline(handle, &mut response, CLIENT_IO_TIMEOUT_MS)
+                },
             )
-        } != 0;
-        let mut response = vec![0_u8; MAX_MESSAGE_BYTES];
-        let mut read = 0_u32;
-        let read_ok = ok
-            && unsafe {
-                ReadFile(
-                    handle,
-                    response.as_mut_ptr(),
-                    response.len() as u32,
-                    &mut read,
-                    null_mut(),
-                )
-            } != 0;
-        unsafe { CloseHandle(handle) };
-        if !read_ok || read == 0 {
-            return Err("authority Named Pipe request failed".to_string());
+        };
+        match response {
+            Ok(response) => {
+                unsafe { CloseHandle(handle) };
+                println!("{}", String::from_utf8_lossy(&response));
+                Ok(())
+            }
+            Err(error) if error.terminal => {
+                unsafe { CloseHandle(handle) };
+                Err(error.to_string())
+            }
+            Err(error) => Err(error.to_string()),
         }
-        println!("{}", String::from_utf8_lossy(&response[..read as usize]));
-        Ok(())
     }
 
     unsafe extern "system" fn service_handler(
@@ -926,7 +1117,11 @@ mod windows_authority {
         }
         let kind = arguments.get(1).map(String::as_str);
         if kind == Some("--probe") || kind == Some("--request") {
-            let mode = if kind == Some("--probe") { "probe" } else { "request" };
+            let mode = if kind == Some("--probe") {
+                "probe"
+            } else {
+                "request"
+            };
             let challenge = arguments
                 .iter()
                 .position(|value| value == "--challenge")

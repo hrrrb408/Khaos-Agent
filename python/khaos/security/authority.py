@@ -16,6 +16,8 @@ import math
 import re
 from dataclasses import dataclass, field
 
+from khaos.security.authority_context import AuthorityContextV1
+
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$")
 _DIGEST = re.compile(r"^[A-Za-z0-9_.:-]{1,256}$")
 _DELEGATION_DIGEST = re.compile(r"^[0-9a-f]{64}$")
@@ -50,6 +52,8 @@ class AuthorityEnvelope:
     parent_principal_id: str = ""
     session_id: str = ""
     delegation_digest: str = ""
+    source_transport: str = ""
+    delegation_resource: str = ""
     _broker: object | None = field(
         default=None, init=False, repr=False, compare=False
     )
@@ -74,6 +78,8 @@ class AuthorityEnvelope:
         parent_principal_id: str = "",
         session_id: str = "",
         delegation_digest: str = "",
+        source_transport: str = "",
+        delegation_resource: str = "",
         _issuer: object | None = None,
     ) -> None:
         if _issuer is not _AUTHORITY_ISSUER:
@@ -98,6 +104,8 @@ class AuthorityEnvelope:
             ("parent_principal_id", parent_principal_id),
             ("session_id", session_id),
             ("delegation_digest", delegation_digest),
+            ("source_transport", source_transport),
+            ("delegation_resource", delegation_resource),
         ):
             object.__setattr__(self, name, value)
         object.__setattr__(self, "_broker", None)
@@ -125,6 +133,8 @@ class AuthorityEnvelope:
         parent_principal_id: str = "",
         session_id: str = "",
         delegation_digest: str = "",
+        source_transport: str = "",
+        delegation_resource: str = "",
     ) -> AuthorityEnvelope:
         """Construct an envelope owned by one trusted AuthorityBroker."""
         envelope = cls(
@@ -145,6 +155,8 @@ class AuthorityEnvelope:
             parent_principal_id=parent_principal_id,
             session_id=session_id,
             delegation_digest=delegation_digest,
+            source_transport=source_transport,
+            delegation_resource=delegation_resource,
             _issuer=_AUTHORITY_ISSUER,
         )
         object.__setattr__(envelope, "_broker", broker)
@@ -195,6 +207,12 @@ class AuthorityEnvelope:
             raise ValueError("authority envelope session id is invalid")
         if self.delegation_digest and _DELEGATION_DIGEST.fullmatch(self.delegation_digest) is None:
             raise ValueError("authority envelope delegation digest is invalid")
+        for label, value in (
+            ("source_transport", self.source_transport),
+            ("delegation_resource", self.delegation_resource),
+        ):
+            if not isinstance(value, str) or len(value) > 256:
+                raise ValueError(f"authority envelope {label} is invalid")
 
     @property
     def has_typed_principal_binding(self) -> bool:
@@ -203,7 +221,7 @@ class AuthorityEnvelope:
 
     def payload(self) -> dict[str, object]:
         """Return the canonical, non-secret binding payload."""
-        return {
+        payload: dict[str, object] = {
             "schema_version": self.schema_version,
             "principal_id": self.principal_id,
             "project_id": self.project_id,
@@ -217,17 +235,21 @@ class AuthorityEnvelope:
             "authorization_epoch": self.authorization_epoch,
             "grant_id": self.grant_id,
             "grant_expires_at": self.grant_expires_at,
-            **(
+        }
+        if self.source_transport:
+            payload["source_transport"] = self.source_transport
+        if self.delegation_resource:
+            payload["delegation_resource"] = self.delegation_resource
+        if self.has_typed_principal_binding:
+            payload.update(
                 {
                     "principal_kind": self.principal_kind,
                     "parent_principal_id": self.parent_principal_id,
                     "session_id": self.session_id,
                     "delegation_digest": self.delegation_digest,
                 }
-                if self.has_typed_principal_binding
-                else {}
-            ),
-        }
+            )
+        return payload
 
     def digest(self) -> str:
         """Return the stable digest used by audit and child-owner bindings."""
@@ -238,32 +260,21 @@ class AuthorityEnvelope:
 
     def context_digest(self) -> str:
         """Return the stable owner digest excluding operation/resource labels."""
-        encoded = json.dumps(
-            {
-                "schema_version": self.schema_version,
-                "principal_id": self.principal_id,
-                "project_id": self.project_id,
-                "runtime_id": self.runtime_id,
-                "task_id": self.task_id,
-                "workspace_id": self.workspace_id,
-                "workspace_generation": self.workspace_generation,
-                "policy_digest": self.policy_digest,
-                "authorization_epoch": self.authorization_epoch,
-                **(
-                    {
-                        "principal_kind": self.principal_kind,
-                        "parent_principal_id": self.parent_principal_id,
-                        "session_id": self.session_id,
-                        "delegation_digest": self.delegation_digest,
-                    }
-                    if self.has_typed_principal_binding
-                    else {}
-                ),
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        return hashlib.sha256(encoded).hexdigest()
+        return AuthorityContextV1(
+            principal_id=self.principal_id,
+            principal_kind=self.principal_kind,
+            parent_principal_id=self.parent_principal_id,
+            project_id=self.project_id,
+            session_id=self.session_id,
+            runtime_id=self.runtime_id,
+            source_transport=self.source_transport,
+            task_id=self.task_id,
+            workspace_id=self.workspace_id,
+            workspace_generation=self.workspace_generation,
+            policy_digest=self.policy_digest,
+            authorization_epoch=self.authorization_epoch,
+            delegation_digest=self.delegation_digest,
+        ).digest()
 
     def derive(
         self,
@@ -293,6 +304,8 @@ class AuthorityEnvelope:
             parent_principal_id=self.parent_principal_id,
             session_id=self.session_id,
             delegation_digest=self.delegation_digest,
+            source_transport=self.source_transport,
+            delegation_resource=self.delegation_resource,
         )
 
     def matches_context(

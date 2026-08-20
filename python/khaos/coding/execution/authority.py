@@ -31,6 +31,8 @@ class ExecutionAuthority:
             raise TypeError("execution authority requires ResolvedSpawnPlan")
         if self.step_authority.spawn_plan_digest != self.spawn_plan.digest():
             raise ValueError("execution authority plan digest does not match approval")
+        if self.step_authority.authority_context().digest() != self.spawn_plan.authority_context().digest():
+            raise ValueError("execution authority owner context diverged")
         pairs = (
             (self.step_authority.principal_id, self.spawn_plan.principal_id),
             (self.step_authority.principal_kind, self.spawn_plan.principal_kind),
@@ -52,6 +54,16 @@ class ExecutionAuthority:
             ),
             (self.step_authority.network_authority, self.spawn_plan.network_authority),
             (self.step_authority.executable_identity, self.spawn_plan.executable_identity),
+            (self.step_authority.tool_name, self.spawn_plan.tool_name),
+            (
+                self.step_authority.authorization_resource_digest,
+                self.spawn_plan.authorization_resource_digest,
+            ),
+            (self.step_authority.runtime_id, self.spawn_plan.runtime_id),
+            (self.step_authority.source_transport, self.spawn_plan.source_transport),
+            (self.step_authority.authorization_epoch, self.spawn_plan.authorization_epoch),
+            (self.step_authority.workspace_id, self.spawn_plan.workspace_id),
+            (self.step_authority.policy_digest, self.spawn_plan.policy_digest),
         )
         if any(left != right for left, right in pairs):
             raise ValueError("execution authority approval and spawn plan diverged")

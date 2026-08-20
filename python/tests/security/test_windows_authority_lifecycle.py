@@ -44,9 +44,10 @@ def test_stop_handler_reports_pending_and_signals_event() -> None:
 def test_stop_reports_stopped_after_drain() -> None:
     source = _source()
     assert "set_service_state(SERVICE_STOPPED, 0, 0)" in source
-    # The stop path cancels the pending accept and disconnects before
-    # closing the pipe handle.
-    assert "CancelIoEx(handle, &mut overlapped)" in source
+    # The stop path cancels the pending accept through one helper that
+    # reaps the OVERLAPPED operation before disconnecting the pipe.
+    assert "cancel_and_reap(" in source
+    assert "GetOverlappedResult(handle, overlapped" in source
     assert "DisconnectNamedPipe(handle)" in source
 
 
@@ -64,8 +65,10 @@ def test_pipe_io_is_overlapped_with_deadlines() -> None:
     assert "write_message_deadline" in source
     assert "CLIENT_IO_TIMEOUT_MS" in source
     assert "BACKEND_IO_TIMEOUT_MS" in source
-    # Deadlines actually cancel the IO instead of waiting forever.
-    assert source.count("CancelIoEx(") >= 6
+    # Deadlines actually cancel and reap the IO instead of waiting forever.
+    assert source.count("cancel_and_reap(") >= 5
+    assert "CancelIoEx(handle, overlapped)" in source
+    assert "ERROR_OPERATION_ABORTED" in source
 
 
 def test_backend_and_service_pipes_are_bounded() -> None:

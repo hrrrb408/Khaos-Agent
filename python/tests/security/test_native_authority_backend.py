@@ -358,8 +358,8 @@ def test_windows_peer_trust_covers_service_sid_in_groups() -> None:
 def test_windows_connection_timeout_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from khaos.security.authorityd_windows import _connection_timeout_seconds
     from khaos.security.authorityd_protocol import AuthorityControlPlaneError
+    from khaos.security.authorityd_windows import _connection_timeout_seconds
 
     monkeypatch.delenv("KHAOS_AUTHORITYD_CONNECTION_TIMEOUT", raising=False)
     assert _connection_timeout_seconds() == 5.0
@@ -396,3 +396,31 @@ def test_e2e_probe_emits_exact_catalog_entry() -> None:
     assert manifest["scope"]["executable"] == "/bin/echo"
     # The effect payload the E2E writes stays inside its declared bound.
     assert len("khaos-native-e2e:") + 32 <= 64
+
+
+def test_e2e_intent_reuses_the_grant_owner_context() -> None:
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "run_native_authority_e2e_context",
+        Path(__file__).resolve().parents[2].parent
+        / "scripts"
+        / "run_native_authority_e2e.py",
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    intent = module._intent(
+        "native-e2e-nonce",
+        "a" * 64,
+        "grant-id",
+        runtime_id="runtime-id",
+        task_id="task-id",
+    )
+    assert intent.grant_context_digest == module._context_digest(
+        "runtime-id", "task-id", "a" * 64
+    )
+    assert intent.delegation_digest == module._delegation_digest(
+        "runtime-id", "a" * 64
+    )

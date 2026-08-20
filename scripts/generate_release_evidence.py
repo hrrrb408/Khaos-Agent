@@ -229,6 +229,7 @@ def _load_gate_evidence(path: Path, commit: str) -> dict[str, Any]:
     required = {
         "security_closure": "security-closure-gate.yml",
         "product_integrity": "product-integrity-gate.yml",
+        "native_authority": "native-authority-production-e2e.yml",
     }
     for name, workflow in required.items():
         record = gates.get(name)
@@ -264,6 +265,30 @@ def _load_gate_evidence(path: Path, commit: str) -> dict[str, Any]:
                 raise SystemExit(
                     f"security gate evidence artifact is not valid: {expected_artifact}"
                 )
+        if name == "native_authority":
+            expected_names = {
+                "native-authority-macos-proof",
+                "native-authority-windows-proof",
+            }
+            for expected_name in expected_names:
+                matches = [
+                    artifact for artifact in record.get("artifacts", [])
+                    if isinstance(artifact, dict)
+                    and artifact.get("name") == expected_name
+                ]
+                if len(matches) != 1:
+                    raise SystemExit(
+                        f"native authority evidence artifact is missing: {expected_name}"
+                    )
+                artifact = matches[0]
+                if (
+                    artifact.get("expired") is not False
+                    or not isinstance(artifact.get("digest"), str)
+                    or not artifact["digest"].strip()
+                ):
+                    raise SystemExit(
+                        f"native authority evidence artifact is not valid: {expected_name}"
+                    )
     return evidence
 
 
