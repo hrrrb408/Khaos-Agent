@@ -36,6 +36,7 @@ import hashlib
 import json
 import logging
 from dataclasses import dataclass, field
+from os import PathLike
 from pathlib import Path
 
 from khaos.security.policy import SandboxPolicy, load_policy
@@ -52,6 +53,7 @@ logger = logging.getLogger(__name__)
 # Default user/global policy path.  Loaded as a separate layer so the
 # effective policy is the true ``user ∩ project ∩ platform`` intersection.
 USER_POLICY_PATH = Path("~/.khaos/policy.yaml")
+PathInput = str | Path | PathLike[str]
 
 
 class PolicyCompilationError(ValueError):
@@ -375,10 +377,10 @@ def default_user_policy() -> SandboxPolicy:
 
 
 def load_effective_policy(
-    workspace_root: Path,
+    workspace_root: PathInput,
     *,
-    project_policy_path: Path | None = None,
-    user_policy_path: Path | None = None,
+    project_policy_path: PathInput | None = None,
+    user_policy_path: PathInput | None = None,
     platform_capability: PlatformCapability | None = None,
 ) -> EffectiveSecurityPolicy:
     """Load and compile the layered effective policy (B1).
@@ -395,9 +397,22 @@ def load_effective_policy(
     intersection — that would let an untrusted project elevate to ``yolo``.
     Instead, the safe ``default_user_policy()`` baseline is installed as the
     user layer, so the project can only tighten it.
+
+    Path-like inputs are normalized at this boundary so shell tooling and
+    cross-platform workflow runners can pass strings or ``Path`` instances
+    without changing policy semantics.
     """
-    project_path = project_policy_path or (workspace_root / "khaos_policy.yaml")
-    user_path = user_policy_path or USER_POLICY_PATH
+    workspace_root = Path(workspace_root)
+    project_path = (
+        Path(project_policy_path)
+        if project_policy_path is not None
+        else workspace_root / "khaos_policy.yaml"
+    )
+    user_path = (
+        Path(user_policy_path)
+        if user_policy_path is not None
+        else USER_POLICY_PATH
+    )
 
     project_policy = load_policy(project_path)
     expanded_user = user_path.expanduser()

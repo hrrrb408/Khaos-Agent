@@ -7,15 +7,12 @@ to root capabilities and that ``commands_require_approval`` survives into the
 effective policy (so the wiring commit can enforce it).
 """
 
-from pathlib import Path
-
 import pytest
-
 from khaos.security.effective_policy import (
-    EffectiveSecurityPolicy,
     PlatformCapability,
     PolicyCompilationError,
     compile_effective_policy,
+    load_effective_policy,
     validate_policy_dict,
 )
 from khaos.security.policy import SandboxPolicy
@@ -228,12 +225,6 @@ def test_missing_user_policy_installs_safe_default_layer(tmp_path):
     baseline is installed as the user layer, and ``PlatformCapability``
     defaults to ``WORKSPACE_WRITE``.
     """
-    from khaos.security.effective_policy import (
-        default_user_policy,
-        load_effective_policy,
-    )
-    from khaos.security.sandbox import SandboxMode
-
     # Project tries to elevate to yolo + network.
     project_policy = tmp_path / "khaos_policy.yaml"
     project_policy.write_text(
@@ -250,6 +241,22 @@ def test_missing_user_policy_installs_safe_default_layer(tmp_path):
     # Network must be off — the default user layer has network off, and
     # network requires BOTH layers to enable it.
     assert eff.network_enabled is False
+
+
+def test_load_effective_policy_normalizes_string_paths(tmp_path):
+    """Shell and workflow callers may provide path values as strings."""
+    project_policy_path = tmp_path / "khaos_policy.yaml"
+    project_policy_path.write_text(
+        "sandbox:\n  mode: read-only\n", encoding="utf-8"
+    )
+
+    effective = load_effective_policy(
+        str(tmp_path),
+        project_policy_path=str(project_policy_path),
+        user_policy_path=str(tmp_path / "missing_user_policy.yaml"),
+    )
+
+    assert effective.mode == SandboxMode.READ_ONLY
 
 
 def test_default_platform_capability_is_workspace_write():
