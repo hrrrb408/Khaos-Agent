@@ -16,6 +16,7 @@ param(
     [switch]$ProvisionDpapiKey
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'service-sid.ps1')
 
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     throw 'Khaos authority installation requires an elevated administrator shell'
@@ -89,7 +90,7 @@ if ($null -eq $service) {
 # service token.  Refuse the restricted/default modes.
 & "$env:SystemRoot\System32\sc.exe" sidtype KhaosAuthorityD unrestricted | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'failed to enable the KhaosAuthorityD Service SID' }
-$authoritySid = (New-Object System.Security.Principal.NTAccount('NT SERVICE\KhaosAuthorityD')).Translate([System.Security.Principal.SecurityIdentifier]).Value
+$authoritySid = Get-KhaosServiceSid -ServiceName 'KhaosAuthorityD'
 
 $envFile = Join-Path $InstallRoot 'native-authority.env'
 @(
