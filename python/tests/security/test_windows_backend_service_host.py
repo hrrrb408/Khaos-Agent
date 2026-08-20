@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+from khaos.security.authorityd_main import _authority_transport_value
+
 ROOT = Path(__file__).resolve().parents[3]
 HOST = ROOT / "rust" / "khaos-core" / "src" / "bin" / "khaos-authorityd-backend-windows.rs"
 ENTRY = ROOT / "packaging" / "windows" / "authorityd-backend-entry.py"
@@ -54,3 +57,27 @@ def test_windows_workflow_uses_the_native_backend_host() -> None:
     assert "Lib\\site-packages" in source
     assert "Test-Path -LiteralPath $venvSite -PathType Container" in source
     assert "$venvPython = (uv run --project . which python)" not in source
+    assert "KHAOS_AUTHORITYD_SOCKET=unused" not in source
+    assert "KHAOS_AUTHORITYD_BACKEND_PIPE=\\\\.\\pipe\\KhaosAuthorityDBackend" in source
+
+
+def test_windows_backend_uses_the_named_pipe_as_its_control_plane_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "KHAOS_AUTHORITYD_BACKEND_PIPE", r"\\.\pipe\KhaosAuthorityDBackend"
+    )
+    monkeypatch.setenv("KHAOS_AUTHORITYD_SOCKET", "unused")
+
+    assert _authority_transport_value(platform_name="nt") == (
+        r"\\.\pipe\KhaosAuthorityDBackend"
+    )
+
+
+def test_windows_backend_rejects_missing_named_pipe_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("KHAOS_AUTHORITYD_BACKEND_PIPE", raising=False)
+
+    with pytest.raises(SystemExit, match="KHAOS_AUTHORITYD_BACKEND_PIPE"):
+        _authority_transport_value(platform_name="nt")
