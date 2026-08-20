@@ -349,7 +349,8 @@ jobs:
             -AgentSid $agentSid `
             -ProtectedKeyPath 'C:\ProgramData\Khaos\authority-key.dpapi' `
             -ProvisionDpapiKey
-          $authoritySid = (New-Object System.Security.Principal.NTAccount('NT SERVICE\KhaosAuthorityD')).Translate([System.Security.Principal.SecurityIdentifier]).Value
+          . (Join-Path $env:GITHUB_WORKSPACE 'packaging\windows\service-sid.ps1')
+          $authoritySid = Get-KhaosServiceSid -ServiceName 'KhaosAuthorityD'
           "KHAOS_AUTHORITYD_SERVICE_SID=$authoritySid" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - name: Run a real TLS WORM audit receiver for the backend
         shell: pwsh
