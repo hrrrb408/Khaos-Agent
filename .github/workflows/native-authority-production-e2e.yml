@@ -391,9 +391,16 @@ jobs:
           # authority-owned install root.  The native SCM host starts the
           # fixed entry point with python -I -S; it never consumes the
           # checkout through PYTHONPATH or a shell wrapper.
-          $venvPython = (uv run --project . which python)
-          $venvRoot = Split-Path (Split-Path $venvPython -Parent) -Parent
-          $venvSite = Join-Path $venvRoot 'Lib\site-packages'
+          # Resolve the venv through PowerShell's native filesystem provider.
+          # Git-for-Windows `which` can return `/d/a/...` POSIX paths; feeding
+          # those back into PowerShell silently turns them into `D:\d\a\...`
+          # and stages from a directory that does not exist.
+          $venvRoot = (Resolve-Path -LiteralPath (Join-Path $env:GITHUB_WORKSPACE '.venv') -ErrorAction Stop).Path
+          $venvPython = (Resolve-Path -LiteralPath (Join-Path $venvRoot 'Scripts\python.exe') -ErrorAction Stop).Path
+          $venvSite = (Resolve-Path -LiteralPath (Join-Path $venvRoot 'Lib\site-packages') -ErrorAction Stop).Path
+          if (-not (Test-Path -LiteralPath $venvSite -PathType Container)) {
+              throw "Python site-packages directory is not a directory: $venvSite"
+          }
           Copy-Item -Path "$venvSite\*" -Destination $backendSite -Recurse -Force
           Get-ChildItem -Path $backendSite -Filter '*.pth' -File -ErrorAction SilentlyContinue | Remove-Item -Force
           Remove-Item -LiteralPath (Join-Path $backendSite 'khaos') -Recurse -Force -ErrorAction SilentlyContinue

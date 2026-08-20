@@ -49,3 +49,8 @@ def test_windows_workflow_uses_the_native_backend_host() -> None:
     assert "khaos-authorityd-backend-windows.exe" in source
     assert "khaos-authorityd-backend.cmd" not in source
     assert "sc.exe\" create KhaosAuthorityDBackend" in source
+    assert "Resolve-Path" in source
+    assert "Scripts\\python.exe" in source
+    assert "Lib\\site-packages" in source
+    assert "Test-Path -LiteralPath $venvSite -PathType Container" in source
+    assert "$venvPython = (uv run --project . which python)" not in source
