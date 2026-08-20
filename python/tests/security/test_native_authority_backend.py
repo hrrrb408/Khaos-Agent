@@ -361,6 +361,19 @@ def test_windows_sid_conversion_uses_pointer_to_pointer_abi() -> None:
     assert _sid_to_string(_Advapi(), _Kernel(), 1234) == "S-1-5-18"
 
 
+def test_windows_token_sid_buffers_outlive_their_embedded_pointers() -> None:
+    source = (
+        Path(__file__).resolve().parents[3]
+        / "python"
+        / "khaos"
+        / "security"
+        / "authorityd_windows.py"
+    ).read_text(encoding="utf-8")
+    assert "user_buffer = _query(TokenUser)" in source
+    assert "group_buffer = _query(TokenGroups)" in source
+    assert "return buffer.raw" not in source
+
+
 def test_windows_peer_trust_covers_service_sid_in_groups() -> None:
     """A Service SID (S-1-5-80-...) lives in TokenGroups, not TokenUser.
 

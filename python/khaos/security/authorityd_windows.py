@@ -237,7 +237,7 @@ def _client_identity(kernel32: Any, advapi32: Any, pipe_handle: int) -> tuple[st
             raise IdentityIsolationError("backend pipe client token is unavailable")
         try:
 
-            def _query(class_id: int) -> bytes:
+            def _query(class_id: int) -> Any:
                 needed = ctypes.c_ulong(0)
                 advapi32.GetTokenInformation(
                     token, class_id, None, 0, ctypes.byref(needed)
@@ -253,15 +253,23 @@ def _client_identity(kernel32: Any, advapi32: Any, pipe_handle: int) -> tuple[st
                     raise IdentityIsolationError(
                         "backend pipe client token information is unavailable"
                     )
-                return buffer.raw
+                # TOKEN_USER/TOKEN_GROUPS contain pointers into this exact
+                # allocation.  Returning ``buffer.raw`` here freed the
+                # allocation before the SID pointers were dereferenced,
+                # turning the first real Windows backend request into a
+                # use-after-lifetime and a misleading "SID is malformed".
+                # Keep the ctypes owner alive through all conversions.
+                return buffer
 
+            user_buffer = _query(TokenUser)
             user_sid = _sid_to_string(
                 advapi32,
                 kernel32,
-                _parse_token_user_sid(_query(TokenUser)),
+                _parse_token_user_sid(user_buffer),
             )
+            group_buffer = _query(TokenGroups)
             group_sids = _parse_token_group_sids(
-                _query(TokenGroups),
+                group_buffer,
                 dereference=lambda sid_ptr: _sid_to_string(
                     advapi32, kernel32, sid_ptr
                 ),
