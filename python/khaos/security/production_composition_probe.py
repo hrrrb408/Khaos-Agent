@@ -38,7 +38,7 @@ from khaos.security.identity_isolation import (
     LinuxProcessIdentityEvidence,
     read_linux_process_identity,
 )
-from khaos.security.principals import PrincipalKind
+from khaos.security.principals import PrincipalKind, transport_root_delegation_digest
 
 _IDENTITY_ORACLE_TIMEOUT_SECONDS = 15.0
 _IDENTITY_ORACLE_RETRY_SECONDS = 0.01
@@ -224,19 +224,17 @@ def _probe_request(
     root_info = workspace.stat()
     executable = executable_identity(command, environment)
     sandbox_digest = _digest_payload({"backend": "linux-bwrap", "network": "isolated"})
-    delegation_digest = _digest_payload(
-        {
-            "schema_version": 1,
-            "kind": "transport-root-delegation",
-            "principal_id": _COMPOSE_PRINCIPAL_ID,
-            "principal_kind": _COMPOSE_PRINCIPAL_KIND,
-            "parent_principal_id": _COMPOSE_PARENT_PRINCIPAL_ID,
-            "project_id": "compose",
-            "session_id": _COMPOSE_SESSION_ID,
-            "runtime_id": _COMPOSE_RUNTIME_ID,
-            "source_transport": "cron",
-            "policy_digest": policy_digest,
-        }
+    # Must be byte-identical to what the daemon recomputes from the grant's
+    # own fields: use the one canonical recipe, never a local copy.
+    delegation_digest = transport_root_delegation_digest(
+        principal_id=_COMPOSE_PRINCIPAL_ID,
+        principal_kind=_COMPOSE_PRINCIPAL_KIND,
+        parent_principal_id=_COMPOSE_PARENT_PRINCIPAL_ID,
+        project_id="compose",
+        session_id=_COMPOSE_SESSION_ID,
+        runtime_id=_COMPOSE_RUNTIME_ID,
+        source_transport="cron",
+        policy_digest=policy_digest,
     )
     plan = ResolvedSpawnPlan(
         principal_id=_COMPOSE_PRINCIPAL_ID,
@@ -260,6 +258,7 @@ def _probe_request(
         principal_kind=_COMPOSE_PRINCIPAL_KIND,
         parent_principal_id=_COMPOSE_PARENT_PRINCIPAL_ID,
         delegation_digest=delegation_digest,
+        source_transport="cron",
     )
     step = StepExecutionAuthority(
         principal_id=_COMPOSE_PRINCIPAL_ID,
@@ -293,6 +292,7 @@ def _probe_request(
         principal_kind=_COMPOSE_PRINCIPAL_KIND,
         parent_principal_id=_COMPOSE_PARENT_PRINCIPAL_ID,
         delegation_digest=delegation_digest,
+        source_transport="cron",
     )
     authority = ExecutionAuthority(step_authority=step, spawn_plan=plan)
     return ExecutionRequest(

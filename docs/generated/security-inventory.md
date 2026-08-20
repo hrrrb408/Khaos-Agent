@@ -76,7 +76,7 @@
 - `python/khaos/security/identity_isolation.py`: `c60132d574fdb8efe242271b15a78eb6f8edb930eff61401053694fd18b79d18`
 - `python/khaos/security/native_authority.py`: `7d209a4c4e96306bfec6d6c0365acddf51f1a1c5cb8e5b49ae81a35e773e6d51`
 - `python/khaos/security/protocol_boundary.py`: `d346cb36e445967ae17f1cef426e917fac833f13758faa33381b5008eca75960`
-- `python/khaos/security/production_composition_probe.py`: `c31de6d394e4b28aa5ec1944325c3a45c2a9209993a0cda8a88e11e43ed2ab55`
+- `python/khaos/security/production_composition_probe.py`: `208ee9c80b2f47c992806522c46d3c53d9842a37424463555123436df5e4b6cd`
 - `python/khaos/security/remote_audit.py`: `58a5d9a35c8446304a17e99ab6d3b20b52d9197e47a53372ac567867794207b2`
 - `python/khaos/security/network_broker.py`: `8ee48a91ddd55daf0f0b9e8459af210d82b64daca161f143d667fa6bfed4659f`
 - `python/khaos/security/resource_scope.py`: `9895685c9247caf037e6dfc98b9566ed93fc2c1f8a11ecf5f9477b32ab62f88b`
