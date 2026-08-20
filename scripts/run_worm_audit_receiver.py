@@ -25,7 +25,6 @@ import json
 import os
 import ssl
 import tempfile
-import threading
 from pathlib import Path
 
 
@@ -212,8 +211,10 @@ def main() -> int:
         server.socket = context.wrap_socket(server.socket, server_side=True)
         print(f"worm receiver listening on https://localhost:{args.port}/append")
         # Serve until the workflow tears the job down.
-        threading.Event().wait()
-        server.server_close()
+        try:
+            server.serve_forever()
+        finally:
+            server.server_close()
     return 0
 
 

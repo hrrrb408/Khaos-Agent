@@ -34,6 +34,13 @@ def _module():
     return module
 
 
+def test_production_receiver_enters_its_http_accept_loop() -> None:
+    source = _SCRIPT.read_text(encoding="utf-8")
+
+    assert "server.serve_forever()" in source
+    assert "threading.Event().wait()" not in source
+
+
 @pytest.fixture()
 def worm_server(tmp_path: Path):
     module = _module()
