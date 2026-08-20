@@ -413,7 +413,6 @@ jobs:
               "KHAOS_AUTHORITYD_BACKEND_PYTHON=$venvPython"
               "KHAOS_AUTHORITYD_BACKEND_ENTRY=$backendEntry"
               "KHAOS_AUTHORITYD_BACKEND_LOG=$backendLog"
-              'KHAOS_AUTHORITYD_SOCKET=unused'
               'KHAOS_AUTHORITYD_NAMED_PIPE=\\.\pipe\KhaosAuthorityD'
               'KHAOS_AUTHORITYD_BACKEND_PIPE=\\.\pipe\KhaosAuthorityDBackend'
               'KHAOS_AUTHORITYD_KEY_PATH=C:\ProgramData\Khaos\authorityd.pem'

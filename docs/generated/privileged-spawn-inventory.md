@@ -41,7 +41,7 @@
 - `python/khaos/security/native_authority.py:256` `subprocess.Popen` in `<module>._bounded_native_call` owner=`NativeAuthorityAdapter` threat-model=`native-authority` boundary=`platform-transport`
 - `python/khaos/tools/clipboard_tools.py:25` `subprocess.run` in `<module>._clipboard_read_sync` owner=`HostClipboard` threat-model=`foreground-user-host-integration` boundary=`host-integration`
 - `python/khaos/tools/clipboard_tools.py:51` `subprocess.run` in `<module>._clipboard_write_sync` owner=`HostClipboard` threat-model=`foreground-user-host-integration` boundary=`host-integration`
-- `rust/khaos-core/src/bin/khaos-authorityd-backend-windows.rs:220` `Command::new` in `rust::entrypoint` owner=`AuthorityBackendServiceHost` threat-model=`trusted-backend-child-lifecycle` boundary=`windows-authority-backend-service`
+- `rust/khaos-core/src/bin/khaos-authorityd-backend-windows.rs:219` `Command::new` in `rust::entrypoint` owner=`AuthorityBackendServiceHost` threat-model=`trusted-backend-child-lifecycle` boundary=`windows-authority-backend-service`
 - `rust/khaos-core/src/bin/khaos-browser-kernel-helper.rs:963` `Command::new` in `rust::entrypoint` owner=`BrowserKernelHelper` threat-model=`root-owned-browser-kernel` boundary=`browser-kernel`
 - `rust/khaos-core/src/bin/khaos-exec-launcher.rs:193` `Command::new` in `rust::entrypoint` owner=`NativeExecLauncher` threat-model=`fd-bound-executable-authority` boundary=`native-launcher`
 - `rust/khaos-core/src/bin/khaos-exec-launcher.rs:307` `Command::new` in `rust::entrypoint` owner=`NativeExecLauncher` threat-model=`fd-bound-executable-authority` boundary=`native-launcher`

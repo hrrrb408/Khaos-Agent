@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 from khaos.security.authorityd import build_production_daemon, serve_unix
 from khaos.security.identity_isolation import read_contract_from_environment
@@ -16,11 +16,11 @@ def main() -> int:
         raise SystemExit("authorityd refuses to run in KHAOS_DEV_MODE")
     contract = read_contract_from_environment()
     contract.validate(production=True)
-    socket_value = os.environ.get("KHAOS_AUTHORITYD_SOCKET")
+    transport_path = _authority_transport_path()
     key_value = os.environ.get("KHAOS_AUTHORITYD_KEY_PATH")
-    if not socket_value or not key_value:
+    if not key_value:
         raise SystemExit(
-            "KHAOS_AUTHORITYD_SOCKET and KHAOS_AUTHORITYD_KEY_PATH are required"
+            "KHAOS_AUTHORITYD_KEY_PATH is required"
         )
     catalog_value = os.environ.get("KHAOS_TYPED_RESOURCE_CATALOG_PATH")
     if not catalog_value:
@@ -33,7 +33,7 @@ def main() -> int:
     except ResourceScopeError as exc:
         raise SystemExit(f"typed resource catalog is invalid: {exc}") from exc
     daemon = build_production_daemon(
-        socket_path=Path(socket_value),
+        socket_path=transport_path,
         key_path=Path(key_value),
         audit_writer=writer_from_environment(),
         resource_order=resource_order,
@@ -41,7 +41,7 @@ def main() -> int:
     _publish_public_key(
         Path(os.environ.get(
             "KHAOS_AUTHORITYD_PUBLIC_KEY_PATH",
-            str(Path(socket_value).with_name("authorityd.pub")),
+            str(transport_path.with_name("authorityd.pub")),
         )),
         daemon.public_key_bytes,
     )
@@ -55,6 +55,35 @@ def main() -> int:
         return 0
     serve_unix(daemon, production=True)
     return 0
+
+
+def _authority_transport_value(*, platform_name: str | None = None) -> str:
+    """Return the platform-native authority backend transport identifier."""
+    current_platform = os.name if platform_name is None else platform_name
+    if current_platform == "nt":
+        value = os.environ.get("KHAOS_AUTHORITYD_BACKEND_PIPE", "")
+        if not value or not value.startswith("\\\\.\\pipe\\"):
+            raise SystemExit(
+                "KHAOS_AUTHORITYD_BACKEND_PIPE must be a local named pipe"
+            )
+        if not PureWindowsPath(value).is_absolute():
+            raise SystemExit(
+                "KHAOS_AUTHORITYD_BACKEND_PIPE must be an absolute named pipe"
+            )
+        return value
+    value = os.environ.get("KHAOS_AUTHORITYD_SOCKET", "")
+    if not value:
+        raise SystemExit("KHAOS_AUTHORITYD_SOCKET is required")
+    return value
+
+
+def _authority_transport_path() -> Path:
+    """Build the absolute path object used by the daemon transport boundary."""
+    value = _authority_transport_value()
+    path = Path(value)
+    if not path.is_absolute():
+        raise SystemExit("authorityd transport path must be absolute")
+    return path
 
 
 def _publish_public_key(path: Path, payload: bytes) -> None:
