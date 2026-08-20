@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import replace
+from pathlib import Path
 
 from khaos.coding.execution.identity import (
     executable_identity,
@@ -40,5 +42,17 @@ def test_trusted_system_executable_requires_trusted_script_path(tmp_path):
     assert not trusted_system_executable((str(script),), {"PATH": "/usr/bin:/bin"})
 
 
+def _platform_system_binary() -> Path:
+    if os.name == "nt":
+        return Path(os.environ.get("SystemRoot", "C:/Windows")) / "System32" / "cmd.exe"
+    for candidate in (Path("/bin/ls"), Path("/usr/bin/ls")):
+        if candidate.is_file():
+            return candidate
+    raise AssertionError("no platform system binary is available for this test")
+
+
 def test_trusted_system_executable_accepts_platform_binary():
-    assert trusted_system_executable(("/bin/ls",), {"PATH": "/usr/bin:/bin"})
+    binary = _platform_system_binary()
+    assert trusted_system_executable(
+        (str(binary),), {"PATH": os.environ.get("PATH", os.defpath)}
+    )
