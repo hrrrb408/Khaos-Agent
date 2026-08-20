@@ -60,6 +60,7 @@ def test_windows_workflow_uses_the_native_backend_host() -> None:
     assert "KHAOS_AUTHORITYD_SOCKET=unused" not in source
     assert "KHAOS_AUTHORITYD_BACKEND_PIPE=\\\\.\\pipe\\KhaosAuthorityDBackend" in source
     assert "KHAOS_AUDIT_WORM_CA_FILE=$env:KHAOS_AUDIT_WORM_CA_FILE" in source
+    assert "-SkipCertificateCheck" in source
     assert (
         "--catalog-output 'C:\\ProgramData\\Khaos\\native-resource-catalog.json'"
         in source

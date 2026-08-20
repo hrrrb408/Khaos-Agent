@@ -363,7 +363,10 @@ jobs:
               throw "WORM receiver job ended in state '$($job.State)'"
             }
             try {
-              $response = Invoke-WebRequest -Uri 'https://127.0.0.1:8443/healthz' -UseBasicParsing -TimeoutSec 5
+              # This probe proves the receiver is listening and serving HTTP.
+              # The authority backend performs the actual certificate
+              # validation with KHAOS_AUDIT_WORM_CA_FILE below.
+              $response = Invoke-WebRequest -Uri 'https://127.0.0.1:8443/healthz' -UseBasicParsing -SkipCertificateCheck -TimeoutSec 5
               if ($response.StatusCode -eq 204) { $healthy = $true; break }
             } catch { }
             Start-Sleep -Milliseconds 500
