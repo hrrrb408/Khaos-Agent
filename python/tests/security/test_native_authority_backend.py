@@ -448,6 +448,28 @@ def test_e2e_probe_emits_exact_catalog_entry(tmp_path: Path) -> None:
     assert restored.catalog_digest == catalog.catalog_digest
 
 
+def test_native_e2e_creates_configured_effect_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "run_native_authority_e2e_effect_root",
+        Path(__file__).resolve().parents[2].parent
+        / "scripts"
+        / "run_native_authority_e2e.py",
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    effect_root = tmp_path / "nested" / "effect-root"
+    monkeypatch.setenv(module.E2E_EFFECT_ROOT_ENV, str(effect_root))
+
+    assert module._prepare_effect_root() == effect_root.absolute()
+    assert effect_root.is_dir()
+
+
 def test_native_e2e_client_does_not_require_a_unix_socket(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
