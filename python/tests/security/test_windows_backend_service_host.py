@@ -66,6 +66,15 @@ def test_windows_workflow_uses_the_native_backend_host() -> None:
     assert "Start-Job" not in source
     assert "worm-receiver.pid" in source
     assert "Get-Process -Id $receiverPid" in source
+    transaction_step = source.index(
+        "- name: Run Windows native authority transaction with owned WORM receiver"
+    )
+    diagnostics_step = source.index("- name: Collect backend service diagnostics")
+    transaction_source = source[transaction_step:diagnostics_step]
+    assert "start_worm_audit_receiver.ps1" in transaction_source
+    assert "run_native_authority_identity_probe.py" in transaction_source
+    assert "run_native_authority_e2e.py" in transaction_source
+    assert "finally {" in transaction_source
     assert (
         "--catalog-output 'C:\\ProgramData\\Khaos\\native-resource-catalog.json'"
         in source

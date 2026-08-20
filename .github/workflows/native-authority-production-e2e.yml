@@ -404,7 +404,7 @@ jobs:
           . (Join-Path $env:GITHUB_WORKSPACE 'packaging\windows\service-sid.ps1')
           $authoritySid = Get-KhaosServiceSid -ServiceName 'KhaosAuthorityD'
           "KHAOS_AUTHORITYD_SERVICE_SID=$authoritySid" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-      - name: Run a real TLS WORM audit receiver for the backend
+      - name: Run Windows native authority transaction with owned WORM receiver
         shell: pwsh
         run: |
           $env:PYTHONPATH = "$env:GITHUB_WORKSPACE\python"
@@ -413,137 +413,108 @@ jobs:
           $wormErrorLog = 'C:\ProgramData\Khaos\worm-receiver.err.log'
           $wormPidPath = 'C:\ProgramData\Khaos\worm-receiver.pid'
           Remove-Item -LiteralPath $caPath, $wormLog, $wormErrorLog -Force -ErrorAction SilentlyContinue
-          & "$env:GITHUB_WORKSPACE\scripts\start_worm_audit_receiver.ps1" `
-            -Workspace $env:GITHUB_WORKSPACE `
-            -CaPath $caPath `
-            -Directory 'C:\ProgramData\Khaos\worm-records' `
-            -LogPath $wormLog `
-            -ErrorLogPath $wormErrorLog `
-            -PidPath $wormPidPath `
-            -Port 8443
-          $deadline = (Get-Date).AddSeconds(60)
-          while ((Get-Date) -lt $deadline -and -not (Test-Path $caPath)) { Start-Sleep -Milliseconds 500 }
-          if (-not (Test-Path $caPath)) {
-            Get-Content -LiteralPath $wormLog, $wormErrorLog -ErrorAction SilentlyContinue
-            throw 'WORM receiver did not start'
-          }
-          # Trust the runner-local CA before probing HTTPS and before the
-          # LocalSystem backend is started.
-          Import-Certificate -FilePath $caPath -CertStoreLocation Cert:\LocalMachine\Root | Out-Null
-          $healthDeadline = (Get-Date).AddSeconds(30)
-          $healthy = $false
-          while ((Get-Date) -lt $healthDeadline) {
-            $receiverPid = [int](Get-Content -LiteralPath $wormPidPath -Raw)
-            $receiver = Get-Process -Id $receiverPid -ErrorAction SilentlyContinue
-            if ($null -eq $receiver -or $receiver.HasExited) {
+          try {
+            & "$env:GITHUB_WORKSPACE\scripts\start_worm_audit_receiver.ps1" `
+              -Workspace $env:GITHUB_WORKSPACE `
+              -CaPath $caPath `
+              -Directory 'C:\ProgramData\Khaos\worm-records' `
+              -LogPath $wormLog `
+              -ErrorLogPath $wormErrorLog `
+              -PidPath $wormPidPath `
+              -Port 8443
+            $deadline = (Get-Date).AddSeconds(60)
+            while ((Get-Date) -lt $deadline -and -not (Test-Path $caPath)) { Start-Sleep -Milliseconds 500 }
+            if (-not (Test-Path $caPath)) {
               Get-Content -LiteralPath $wormLog, $wormErrorLog -ErrorAction SilentlyContinue
-              throw "WORM receiver process ended (pid=$receiverPid)"
+              throw 'WORM receiver did not start'
             }
-            try {
-              # This probe proves the receiver is listening and serving HTTP.
-              # The authority backend performs the actual certificate
-              # validation with KHAOS_AUDIT_WORM_CA_FILE below.
-              $response = Invoke-WebRequest -Uri 'https://127.0.0.1:8443/healthz' -UseBasicParsing -SkipCertificateCheck -TimeoutSec 5
-              if ($response.StatusCode -eq 204) { $healthy = $true; break }
-            } catch { }
-            Start-Sleep -Milliseconds 500
+            Import-Certificate -FilePath $caPath -CertStoreLocation Cert:\LocalMachine\Root | Out-Null
+            $healthDeadline = (Get-Date).AddSeconds(30)
+            $healthy = $false
+            while ((Get-Date) -lt $healthDeadline) {
+              $receiverPid = [int](Get-Content -LiteralPath $wormPidPath -Raw)
+              $receiver = Get-Process -Id $receiverPid -ErrorAction SilentlyContinue
+              if ($null -eq $receiver -or $receiver.HasExited) {
+                Get-Content -LiteralPath $wormLog, $wormErrorLog -ErrorAction SilentlyContinue
+                throw "WORM receiver process ended (pid=$receiverPid)"
+              }
+              try {
+                $response = Invoke-WebRequest -Uri 'https://127.0.0.1:8443/healthz' -UseBasicParsing -SkipCertificateCheck -TimeoutSec 5
+                if ($response.StatusCode -eq 204) { $healthy = $true; break }
+              } catch { }
+              Start-Sleep -Milliseconds 500
+            }
+            if (-not $healthy) {
+              Get-Content -LiteralPath $wormLog, $wormErrorLog -ErrorAction SilentlyContinue
+              throw 'WORM receiver did not become healthy'
+            }
+            $env:KHAOS_AUDIT_WORM_ENDPOINT = 'https://127.0.0.1:8443/append'
+            $env:KHAOS_AUDIT_WORM_CA_FILE = $caPath
+            "KHAOS_AUDIT_WORM_ENDPOINT=$($env:KHAOS_AUDIT_WORM_ENDPOINT)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            "KHAOS_AUDIT_WORM_CA_FILE=$caPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+            $backendDir = 'C:\Program Files\Khaos'
+            $backendSite = Join-Path $backendDir 'backend-site'
+            New-Item -ItemType Directory -Force -Path $backendDir, $backendSite, C:\ProgramData\Khaos | Out-Null
+            uv run python scripts/run_native_authority_e2e.py `
+              --catalog-output 'C:\ProgramData\Khaos\native-resource-catalog.json'
+            $venvRoot = (Resolve-Path -LiteralPath (Join-Path $env:GITHUB_WORKSPACE '.venv') -ErrorAction Stop).Path
+            $venvPython = (Resolve-Path -LiteralPath (Join-Path $venvRoot 'Scripts\python.exe') -ErrorAction Stop).Path
+            $venvSite = (Resolve-Path -LiteralPath (Join-Path $venvRoot 'Lib\site-packages') -ErrorAction Stop).Path
+            if (-not (Test-Path -LiteralPath $venvSite -PathType Container)) {
+                throw "Python site-packages directory is not a directory: $venvSite"
+            }
+            Copy-Item -Path "$venvSite\*" -Destination $backendSite -Recurse -Force
+            Get-ChildItem -Path $backendSite -Filter '*.pth' -File -ErrorAction SilentlyContinue | Remove-Item -Force
+            Remove-Item -LiteralPath (Join-Path $backendSite 'khaos') -Recurse -Force -ErrorAction SilentlyContinue
+            Copy-Item -Path "$env:GITHUB_WORKSPACE\python\khaos" -Destination (Join-Path $backendSite 'khaos') -Recurse -Force
+            $backendEntry = Join-Path $backendDir 'authorityd-backend-entry.py'
+            Copy-Item -LiteralPath "$env:GITHUB_WORKSPACE\packaging\windows\authorityd-backend-entry.py" -Destination $backendEntry -Force
+            $backendLog = 'C:\ProgramData\Khaos\authorityd-backend.log'
+            $backendConfig = 'C:\ProgramData\Khaos\authorityd-backend.env'
+            @(
+                "KHAOS_AUTHORITYD_BACKEND_PYTHON=$venvPython"
+                "KHAOS_AUTHORITYD_BACKEND_ENTRY=$backendEntry"
+                "KHAOS_AUTHORITYD_BACKEND_LOG=$backendLog"
+                'KHAOS_AUTHORITYD_NAMED_PIPE=\\.\pipe\KhaosAuthorityD'
+                'KHAOS_AUTHORITYD_BACKEND_PIPE=\\.\pipe\KhaosAuthorityDBackend'
+                'KHAOS_AUTHORITYD_KEY_PATH=C:\ProgramData\Khaos\authorityd.pem'
+                'KHAOS_AUTHORITYD_PUBLIC_KEY_PATH=C:\ProgramData\Khaos\authorityd.pub'
+                'KHAOS_TYPED_RESOURCE_CATALOG_PATH=C:\ProgramData\Khaos\native-resource-catalog.json'
+                "KHAOS_EFFECTIVE_POLICY_DIGEST=$env:KHAOS_EFFECTIVE_POLICY_DIGEST"
+                "KHAOS_AUTHORITYD_SERVICE_SID=$env:KHAOS_AUTHORITYD_SERVICE_SID"
+                "KHAOS_AGENT_SID=$env:KHAOS_AGENT_SID"
+                'KHAOS_AUTHORITYD_PROTECTED_KEY_REF=khaos-authority-signing-key'
+                "KHAOS_AUDIT_WORM_ENDPOINT=$env:KHAOS_AUDIT_WORM_ENDPOINT"
+                "KHAOS_AUDIT_WORM_CA_FILE=$env:KHAOS_AUDIT_WORM_CA_FILE"
+                'KHAOS_AUTHORITYD_CONNECTION_TIMEOUT=5'
+            ) | Set-Content -LiteralPath $backendConfig -Encoding ascii
+            & "$env:SystemRoot\System32\icacls.exe" $backendConfig /inheritance:r /grant:r 'SYSTEM:(F)' 'Administrators:(F)' | Out-Null
+            uv run python -c "from pathlib import Path; from khaos.security.authorityd_protocol import Ed25519KeyStore; k=Ed25519KeyStore.load_or_create(Path(r'C:\ProgramData\Khaos\authorityd.pem'), create=True); Path(r'C:\ProgramData\Khaos\authorityd.pub').write_bytes(k.public_key().public_bytes_raw())"
+            $backendBinary = "$env:GITHUB_WORKSPACE\rust\khaos-core\target\release\khaos-authorityd-backend-windows.exe"
+            & "$env:SystemRoot\System32\sc.exe" create KhaosAuthorityDBackend binPath= "`"$backendBinary`" --config `"$backendConfig`"" start= auto obj= LocalSystem | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'failed to create the backend service' }
+            & "$env:SystemRoot\System32\sc.exe" start KhaosAuthorityDBackend | Out-Null
+            Start-Sleep -Seconds 8
+            $status = (Get-Service -Name KhaosAuthorityDBackend -ErrorAction SilentlyContinue).Status
+            if ($status -ne 'Running') { throw "authority backend service is '$status'" }
+
+            New-Item -ItemType Directory -Force native-evidence | Out-Null
+            $env:KHAOS_AUTHORITYD_NAMED_PIPE = '\\.\pipe\KhaosAuthorityD'
+            $env:KHAOS_AUTHORITYD_PROTECTED_KEY_REF = 'khaos-authority-signing-key'
+            $env:KHAOS_AUTHORITYD_PUBLIC_KEY_PATH = 'C:\ProgramData\Khaos\authorityd.pub'
+            $env:KHAOS_WINDOWS_AUTHORITY_PIPE_CLIENT = "$env:GITHUB_WORKSPACE\rust\khaos-core\target\release\khaos-authorityd-windows.exe"
+            uv run python scripts/run_native_authority_identity_probe.py | Tee-Object -Variable proof | Out-Null
+            if (-not $proof) { throw 'native identity probe failed' }
+            Set-Content -Path native-evidence\windows-named-pipe-proof.json.tmp -Value $proof
+            $env:KHAOS_NATIVE_E2E_EFFECT_ROOT = 'C:\ProgramData\Khaos\e2e-effects'
+            uv run python scripts/run_native_authority_e2e.py --output native-evidence\windows-named-pipe-e2e.json
+            if (-not (Test-Path native-evidence\windows-named-pipe-e2e.json)) { throw 'native E2E artifact missing' }
           }
-          if (-not $healthy) {
-            Get-Content -LiteralPath $wormLog, $wormErrorLog -ErrorAction SilentlyContinue
-            throw 'WORM receiver did not become healthy'
+          finally {
+            & "$env:GITHUB_WORKSPACE\scripts\stop_worm_audit_receiver.ps1" `
+              -PidPath $wormPidPath
           }
-          # The CA was imported before the health probe and is passed to the
-          # backend explicitly through the protected service configuration.
-          "KHAOS_AUDIT_WORM_ENDPOINT=https://127.0.0.1:8443/append" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "KHAOS_AUDIT_WORM_CA_FILE=$caPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-      - name: Install and start the authority backend service
-        shell: pwsh
-        run: |
-          $backendDir = 'C:\Program Files\Khaos'
-          $backendSite = Join-Path $backendDir 'backend-site'
-          New-Item -ItemType Directory -Force -Path $backendDir, $backendSite, C:\ProgramData\Khaos | Out-Null
-          # Typed resource catalog with the exact bounded scope the E2E uses.
-          $env:PYTHONPATH = "$env:GITHUB_WORKSPACE\python"
-          # Use the same Python canonical serializer as authorityd.  A
-          # PowerShell ConvertTo-Json digest is not wire-compatible because
-          # object ordering and separators differ from the authority digest.
-          uv run python scripts/run_native_authority_e2e.py `
-            --catalog-output 'C:\ProgramData\Khaos\native-resource-catalog.json'
-          # Stage the package and its locked runtime dependencies under the
-          # authority-owned install root.  The native SCM host starts the
-          # fixed entry point with python -I -S; it never consumes the
-          # checkout through PYTHONPATH or a shell wrapper.
-          # Resolve the venv through PowerShell's native filesystem provider.
-          # Git-for-Windows `which` can return `/d/a/...` POSIX paths; feeding
-          # those back into PowerShell silently turns them into `D:\d\a\...`
-          # and stages from a directory that does not exist.
-          $venvRoot = (Resolve-Path -LiteralPath (Join-Path $env:GITHUB_WORKSPACE '.venv') -ErrorAction Stop).Path
-          $venvPython = (Resolve-Path -LiteralPath (Join-Path $venvRoot 'Scripts\python.exe') -ErrorAction Stop).Path
-          $venvSite = (Resolve-Path -LiteralPath (Join-Path $venvRoot 'Lib\site-packages') -ErrorAction Stop).Path
-          if (-not (Test-Path -LiteralPath $venvSite -PathType Container)) {
-              throw "Python site-packages directory is not a directory: $venvSite"
-          }
-          Copy-Item -Path "$venvSite\*" -Destination $backendSite -Recurse -Force
-          Get-ChildItem -Path $backendSite -Filter '*.pth' -File -ErrorAction SilentlyContinue | Remove-Item -Force
-          Remove-Item -LiteralPath (Join-Path $backendSite 'khaos') -Recurse -Force -ErrorAction SilentlyContinue
-          Copy-Item -Path "$env:GITHUB_WORKSPACE\python\khaos" -Destination (Join-Path $backendSite 'khaos') -Recurse -Force
-          $backendEntry = Join-Path $backendDir 'authorityd-backend-entry.py'
-          Copy-Item -LiteralPath "$env:GITHUB_WORKSPACE\packaging\windows\authorityd-backend-entry.py" -Destination $backendEntry -Force
-          $backendLog = 'C:\ProgramData\Khaos\authorityd-backend.log'
-          $backendConfig = 'C:\ProgramData\Khaos\authorityd-backend.env'
-          @(
-              "KHAOS_AUTHORITYD_BACKEND_PYTHON=$venvPython"
-              "KHAOS_AUTHORITYD_BACKEND_ENTRY=$backendEntry"
-              "KHAOS_AUTHORITYD_BACKEND_LOG=$backendLog"
-              'KHAOS_AUTHORITYD_NAMED_PIPE=\\.\pipe\KhaosAuthorityD'
-              'KHAOS_AUTHORITYD_BACKEND_PIPE=\\.\pipe\KhaosAuthorityDBackend'
-              'KHAOS_AUTHORITYD_KEY_PATH=C:\ProgramData\Khaos\authorityd.pem'
-              'KHAOS_AUTHORITYD_PUBLIC_KEY_PATH=C:\ProgramData\Khaos\authorityd.pub'
-              'KHAOS_TYPED_RESOURCE_CATALOG_PATH=C:\ProgramData\Khaos\native-resource-catalog.json'
-              "KHAOS_EFFECTIVE_POLICY_DIGEST=$env:KHAOS_EFFECTIVE_POLICY_DIGEST"
-              "KHAOS_AUTHORITYD_SERVICE_SID=$env:KHAOS_AUTHORITYD_SERVICE_SID"
-              "KHAOS_AGENT_SID=$env:KHAOS_AGENT_SID"
-              'KHAOS_AUTHORITYD_PROTECTED_KEY_REF=khaos-authority-signing-key'
-              "KHAOS_AUDIT_WORM_ENDPOINT=$env:KHAOS_AUDIT_WORM_ENDPOINT"
-              "KHAOS_AUDIT_WORM_CA_FILE=$env:KHAOS_AUDIT_WORM_CA_FILE"
-              'KHAOS_AUTHORITYD_CONNECTION_TIMEOUT=5'
-          ) | Set-Content -LiteralPath $backendConfig -Encoding ascii
-          & "$env:SystemRoot\System32\icacls.exe" $backendConfig /inheritance:r /grant:r 'SYSTEM:(F)' 'Administrators:(F)' | Out-Null
-          # Create the Ed25519 authority key before the service starts
-          # (the production daemon never creates keys itself).
-          uv run python -c "from pathlib import Path; from khaos.security.authorityd_protocol import Ed25519KeyStore; k=Ed25519KeyStore.load_or_create(Path(r'C:\ProgramData\Khaos\authorityd.pem'), create=True); Path(r'C:\ProgramData\Khaos\authorityd.pub').write_bytes(k.public_key().public_bytes_raw())"
-          $backendBinary = "$env:GITHUB_WORKSPACE\rust\khaos-core\target\release\khaos-authorityd-backend-windows.exe"
-          & "$env:SystemRoot\System32\sc.exe" create KhaosAuthorityDBackend binPath= "`"$backendBinary`" --config `"$backendConfig`"" start= auto obj= LocalSystem | Out-Null
-          if ($LASTEXITCODE -ne 0) { throw 'failed to create the backend service' }
-          & "$env:SystemRoot\System32\sc.exe" start KhaosAuthorityDBackend | Out-Null
-          Start-Sleep -Seconds 8
-          $status = (Get-Service -Name KhaosAuthorityDBackend -ErrorAction SilentlyContinue).Status
-          if ($status -ne 'Running') { throw "authority backend service is '$status'" }
-      - name: Run the native identity probe
-        shell: pwsh
-        env:
-          KHAOS_AUTHORITYD_NAMED_PIPE: \\.\pipe\KhaosAuthorityD
-          KHAOS_AUTHORITYD_PROTECTED_KEY_REF: khaos-authority-signing-key
-          KHAOS_AUTHORITYD_PUBLIC_KEY_PATH: C:\ProgramData\Khaos\authorityd.pub
-          KHAOS_WINDOWS_AUTHORITY_PIPE_CLIENT: ${{ github.workspace }}\rust\khaos-core\target\release\khaos-authorityd-windows.exe
-        run: |
-          New-Item -ItemType Directory -Force native-evidence | Out-Null
-          $env:PYTHONPATH = "$env:GITHUB_WORKSPACE\python"
-          uv run python scripts/run_native_authority_identity_probe.py | Tee-Object -Variable proof | Out-Null
-          if (-not $proof) { throw 'native identity probe failed' }
-          Set-Content -Path native-evidence\windows-named-pipe-proof.json.tmp -Value $proof
-      - name: Run the full authority transaction E2E
-        shell: pwsh
-        env:
-          KHAOS_AUTHORITYD_NAMED_PIPE: \\.\pipe\KhaosAuthorityD
-          KHAOS_AUTHORITYD_PROTECTED_KEY_REF: khaos-authority-signing-key
-          KHAOS_AUTHORITYD_PUBLIC_KEY_PATH: C:\ProgramData\Khaos\authorityd.pub
-          KHAOS_WINDOWS_AUTHORITY_PIPE_CLIENT: ${{ github.workspace }}\rust\khaos-core\target\release\khaos-authorityd-windows.exe
-          KHAOS_NATIVE_E2E_EFFECT_ROOT: C:\ProgramData\Khaos\e2e-effects
-        run: |
-          $env:PYTHONPATH = "$env:GITHUB_WORKSPACE\python"
-          uv run python scripts/run_native_authority_e2e.py --output native-evidence\windows-named-pipe-e2e.json
-          if (-not (Test-Path native-evidence\windows-named-pipe-e2e.json)) { throw 'native E2E artifact missing' }
       - name: Collect backend service diagnostics
         if: always()
         shell: pwsh
@@ -611,8 +582,6 @@ jobs:
           sc.exe delete KhaosAuthorityDBackend | Out-Null
           Stop-Service -Name KhaosAuthorityD -ErrorAction SilentlyContinue
           sc.exe delete KhaosAuthorityD | Out-Null
-          & "$env:GITHUB_WORKSPACE\scripts\stop_worm_audit_receiver.ps1" `
-            -PidPath 'C:\ProgramData\Khaos\worm-receiver.pid'
       - name: Upload native proof
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
