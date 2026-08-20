@@ -6,6 +6,7 @@ import hashlib
 import os
 import ssl
 from dataclasses import dataclass
+from pathlib import Path
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
@@ -24,6 +25,7 @@ class RemoteWormAuditWriter:
     endpoint: str
     bearer_token: str | None = None
     timeout_seconds: float = 3.0
+    ca_file: Path | None = None
 
     def __post_init__(self) -> None:
         parsed = urlparse(self.endpoint)
@@ -31,6 +33,12 @@ class RemoteWormAuditWriter:
             raise ValueError("remote WORM audit endpoint must use HTTPS")
         if self.timeout_seconds <= 0:
             raise ValueError("remote WORM audit timeout must be positive")
+        if self.ca_file is not None and (
+            not self.ca_file.is_absolute()
+            or self.ca_file.is_symlink()
+            or not self.ca_file.is_file()
+        ):
+            raise ValueError("remote WORM audit CA file must be an absolute regular file")
 
     def append(self, record: dict[str, object]) -> None:
         body = _canonical(
@@ -48,7 +56,10 @@ class RemoteWormAuditWriter:
             headers["Authorization"] = f"Bearer {self.bearer_token}"
         request = Request(self.endpoint, data=body, headers=headers, method="POST")
         try:
-            with urlopen(request, timeout=self.timeout_seconds, context=ssl.create_default_context()) as response:
+            context = ssl.create_default_context(
+                cafile=str(self.ca_file) if self.ca_file is not None else None
+            )
+            with urlopen(request, timeout=self.timeout_seconds, context=context) as response:
                 if not 200 <= int(response.status) < 300:
                     raise RemoteAuditUnavailableError(
                         f"remote WORM audit rejected record: HTTP {response.status}"
@@ -71,6 +82,11 @@ def writer_from_environment() -> RemoteWormAuditWriter:
     return RemoteWormAuditWriter(
         endpoint,
         bearer_token=os.environ.get("KHAOS_AUDIT_WORM_TOKEN"),
+        ca_file=(
+            Path(ca_file_value)
+            if (ca_file_value := os.environ.get("KHAOS_AUDIT_WORM_CA_FILE"))
+            else None
+        ),
     )
 
 

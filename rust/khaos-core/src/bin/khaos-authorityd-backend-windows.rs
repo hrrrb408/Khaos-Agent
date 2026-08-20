@@ -66,6 +66,7 @@ mod backend_service {
         "KHAOS_AGENT_SID",
         "KHAOS_AUTHORITYD_PROTECTED_KEY_REF",
         "KHAOS_AUDIT_WORM_ENDPOINT",
+        "KHAOS_AUDIT_WORM_CA_FILE",
         "KHAOS_AUTHORITYD_CONNECTION_TIMEOUT",
     ];
 

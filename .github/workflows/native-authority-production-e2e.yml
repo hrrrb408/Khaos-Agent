@@ -352,10 +352,30 @@ jobs:
           $deadline = (Get-Date).AddSeconds(60)
           while ((Get-Date) -lt $deadline -and -not (Test-Path $caPath)) { Start-Sleep -Milliseconds 500 }
           if (-not (Test-Path $caPath)) { Receive-Job $job; throw 'WORM receiver did not start' }
-          # Trust the runner-local CA for the machine so the production
-          # WORM writer verifies the TLS connection with default settings.
+          # Trust the runner-local CA before probing HTTPS and before the
+          # LocalSystem backend is started.
           Import-Certificate -FilePath $caPath -CertStoreLocation Cert:\LocalMachine\Root | Out-Null
-          "KHAOS_AUDIT_WORM_ENDPOINT=https://localhost:8443/append" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $healthDeadline = (Get-Date).AddSeconds(30)
+          $healthy = $false
+          while ((Get-Date) -lt $healthDeadline) {
+            if ($job.State -in @('Failed', 'Stopped', 'Completed')) {
+              Receive-Job $job
+              throw "WORM receiver job ended in state '$($job.State)'"
+            }
+            try {
+              $response = Invoke-WebRequest -Uri 'https://127.0.0.1:8443/healthz' -UseBasicParsing -TimeoutSec 5
+              if ($response.StatusCode -eq 204) { $healthy = $true; break }
+            } catch { }
+            Start-Sleep -Milliseconds 500
+          }
+          if (-not $healthy) {
+            Receive-Job $job
+            throw 'WORM receiver did not become healthy'
+          }
+          # The CA was imported before the health probe and is passed to the
+          # backend explicitly through the protected service configuration.
+          "KHAOS_AUDIT_WORM_ENDPOINT=https://127.0.0.1:8443/append" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "KHAOS_AUDIT_WORM_CA_FILE=$caPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - name: Install and start the authority backend service
         shell: pwsh
         run: |
@@ -405,6 +425,7 @@ jobs:
               "KHAOS_AGENT_SID=$env:KHAOS_AGENT_SID"
               'KHAOS_AUTHORITYD_PROTECTED_KEY_REF=khaos-authority-signing-key'
               "KHAOS_AUDIT_WORM_ENDPOINT=$env:KHAOS_AUDIT_WORM_ENDPOINT"
+              "KHAOS_AUDIT_WORM_CA_FILE=$env:KHAOS_AUDIT_WORM_CA_FILE"
               'KHAOS_AUTHORITYD_CONNECTION_TIMEOUT=5'
           ) | Set-Content -LiteralPath $backendConfig -Encoding ascii
           & "$env:SystemRoot\System32\icacls.exe" $backendConfig /inheritance:r /grant:r 'SYSTEM:(F)' 'Administrators:(F)' | Out-Null
