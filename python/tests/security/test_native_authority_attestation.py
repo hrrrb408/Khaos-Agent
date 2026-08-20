@@ -341,6 +341,28 @@ def test_adapter_rejects_wrong_service_instance(tmp_path: Path) -> None:
         )
 
 
+def test_adapter_surfaces_native_error_envelope(tmp_path: Path) -> None:
+    """A frontend rejection must not be misreported as an unbound transport."""
+    adapter = _adapter(tmp_path)
+    request = PROBE_INNER_REQUEST.encode("utf-8")
+    public_key = _public_key(adapter)
+    response = {
+        "ok": False,
+        "error_code": "authority_backend_unavailable",
+        "error": "authority backend pipe is unavailable: Win32 error 2",
+    }
+    with pytest.raises(
+        NativeAuthorityError,
+        match="authority_backend_unavailable: authority backend pipe is unavailable",
+    ):
+        adapter._verify_attestation(
+            response,
+            challenge_nonce="8" * 64,
+            request_bytes=request,
+            public_key=public_key,
+        )
+
+
 def test_adapter_rejects_unsigned_and_cross_transport_responses(tmp_path: Path) -> None:
     daemon = _daemon(tmp_path)
     adapter = _adapter(tmp_path)

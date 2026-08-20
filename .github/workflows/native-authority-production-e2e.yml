@@ -418,12 +418,6 @@ jobs:
           Start-Sleep -Seconds 8
           $status = (Get-Service -Name KhaosAuthorityDBackend -ErrorAction SilentlyContinue).Status
           if ($status -ne 'Running') { throw "authority backend service is '$status'" }
-      - name: Collect backend service diagnostics
-        if: failure()
-        shell: pwsh
-        run: |
-          $log = 'C:\ProgramData\Khaos\authorityd-backend.log'
-          if (Test-Path -LiteralPath $log) { Get-Content -LiteralPath $log -Tail 200 }
       - name: Run the native identity probe
         shell: pwsh
         env:
@@ -449,6 +443,18 @@ jobs:
           $env:PYTHONPATH = "$env:GITHUB_WORKSPACE\python"
           uv run python scripts/run_native_authority_e2e.py --output native-evidence\windows-named-pipe-e2e.json
           if (-not (Test-Path native-evidence\windows-named-pipe-e2e.json)) { throw 'native E2E artifact missing' }
+      - name: Collect backend service diagnostics
+        if: always()
+        shell: pwsh
+        run: |
+          $service = Get-Service -Name KhaosAuthorityDBackend -ErrorAction SilentlyContinue
+          if ($null -ne $service) { "backend service status: $($service.Status)" }
+          $log = 'C:\ProgramData\Khaos\authorityd-backend.log'
+          if (Test-Path -LiteralPath $log) {
+              Get-Content -LiteralPath $log -Tail 200
+          } else {
+              'authority backend log was not created'
+          }
       - name: Bind native evidence to this run
         shell: pwsh
         run: |

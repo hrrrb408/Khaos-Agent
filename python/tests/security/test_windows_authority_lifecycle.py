@@ -78,6 +78,26 @@ def test_backend_and_service_pipes_are_bounded() -> None:
     assert "bytes.is_empty() && bytes.len() <= MAX_MESSAGE_BYTES" in source
 
 
+def test_backend_startup_has_a_bounded_readiness_handshake() -> None:
+    source = _source()
+    # SCM can report the backend host as running before its Python child has
+    # created the backend pipe.  The frontend must absorb that startup race
+    # within a hard deadline instead of failing the first production probe.
+    assert "WaitNamedPipeW" in source
+    assert "open_backend_pipe" in source
+    assert "BACKEND_CONNECT_TIMEOUT_MS" in source
+
+
+def test_frontend_error_envelope_cannot_be_misreported_as_transport_proof() -> None:
+    source = _source()
+    assert "fn frontend_error" in source
+    assert '"error_code"' in source
+    # Backend data is untrusted with respect to the frontend transport
+    # binding; it may not replace the native transport or proof digest.
+    assert 'key != "native_transport" && key != "proof_digest"' in source
+    assert '"native_peer_identity_mismatch"' in source
+
+
 def test_service_accepts_stop_control() -> None:
     source = _source()
     assert "SERVICE_ACCEPT_STOP" in source
