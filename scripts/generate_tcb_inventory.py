@@ -100,10 +100,12 @@ TCB_OWNERS: dict[str, tuple[tuple[str, str, str], ...]] = {
         ),
         (
             "khaos-authorityd (backend daemon)",
-            "Ed25519 signing key held as a 0400 file owned by the authority "
-            "UID; the platform keychain (macOS) / DPAPI (Windows) item is a "
-            "protected-key-slot presence marker bound to the service "
-            "identity, NOT the signing key itself",
+            (
+                "Ed25519 signing key held as a 0400 file owned by the authority "
+                "UID; the platform keychain (macOS) / DPAPI (Windows) item is a "
+                "protected-key-slot presence marker bound to the service "
+                "identity, NOT the signing key itself"
+            ),
             "agent holds only the public verification key",
         ),
         (
@@ -173,6 +175,11 @@ TCB_OWNERS: dict[str, tuple[tuple[str, str, str], ...]] = {
             "rust/khaos-core/src/bin/khaos-authorityd-windows.rs",
             "Service-SID Named-Pipe frontend: SID validation + backend identity + deadlines",
             "platform TCB; no same-UID fallback",
+        ),
+        (
+            "rust/khaos-core/src/bin/khaos-authorityd-backend-windows.rs",
+            "SCM host for the Python authority backend: isolated spawn + child lifecycle",
+            "platform TCB; kill-on-close Job Object and terminal wait",
         ),
         (
             "python/khaos/security/authorityd_windows.py",

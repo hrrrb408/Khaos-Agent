@@ -96,7 +96,11 @@ production E2E.
   unchanged.
 - A new backend launchd plist (`com.khaos.authorityd.backend.plist`) and
   Windows service configuration run the Python backend under the authority
-  identity.
+  identity.  Windows uses the native `khaos-authorityd-backend-windows`
+  SCM host because a Python module is not itself an SCM service executable;
+  the host starts the staged backend entry point with `python -I -S`, owns the
+  child in a kill-on-close Job Object, and proves terminal child cleanup on
+  service stop.
 - CI native workflows must start the backend, run both probes, and bind
   artifacts to `GITHUB_SHA`/`GITHUB_RUN_ID`.
 - The native authority proof gains challenge-response semantics (see

@@ -330,7 +330,7 @@ jobs:
           python -m pip install --require-hashes -r python/bootstrap-requirements.txt
           uv sync --frozen --extra test
       - name: Build native authority service and backend
-        run: cargo build --locked --release --no-default-features --bin khaos-authorityd-windows --manifest-path rust/khaos-core/Cargo.toml
+        run: cargo build --locked --release --no-default-features --bin khaos-authorityd-windows --bin khaos-authorityd-backend-windows --manifest-path rust/khaos-core/Cargo.toml
       - name: Compute the effective policy digest
         shell: pwsh
         run: |
@@ -374,7 +374,8 @@ jobs:
         shell: pwsh
         run: |
           $backendDir = 'C:\Program Files\Khaos'
-          New-Item -ItemType Directory -Force -Path $backendDir, C:\ProgramData\Khaos | Out-Null
+          $backendSite = Join-Path $backendDir 'backend-site'
+          New-Item -ItemType Directory -Force -Path $backendDir, $backendSite, C:\ProgramData\Khaos | Out-Null
           # Typed resource catalog with the exact bounded scope the E2E uses.
           $env:PYTHONPATH = "$env:GITHUB_WORKSPACE\python"
           $entry = uv run python scripts/run_native_authority_e2e.py --emit-catalog
@@ -386,33 +387,55 @@ jobs:
           $canonical = $manifest | ConvertTo-Json -Depth 10 -Compress
           $manifest.catalog_digest = [System.Security.Cryptography.SHA256]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes($canonical)) | ForEach-Object { $_.ToString('x2') } | Join-String
           ($manifest | ConvertTo-Json -Depth 10) | Set-Content -Path C:\ProgramData\Khaos\native-resource-catalog.json -Encoding utf8
-          # Backend wrapper sets the authority-owned environment and runs
-          # the Python authority daemon as a real SCM service.
+          # Stage the package and its locked runtime dependencies under the
+          # authority-owned install root.  The native SCM host starts the
+          # fixed entry point with python -I -S; it never consumes the
+          # checkout through PYTHONPATH or a shell wrapper.
           $venvPython = (uv run --project . which python)
-          $wrapper = @(
-              '@echo off'
-              "set KHAOS_AUTHORITYD_SOCKET=unused"
-              "set KHAOS_AUTHORITYD_BACKEND_PIPE=\\.\pipe\KhaosAuthorityDBackend"
-              'set KHAOS_AUTHORITYD_KEY_PATH=C:\ProgramData\Khaos\authorityd.pem'
-              'set KHAOS_AUTHORITYD_PUBLIC_KEY_PATH=C:\ProgramData\Khaos\authorityd.pub'
-              'set KHAOS_TYPED_RESOURCE_CATALOG_PATH=C:\ProgramData\Khaos\native-resource-catalog.json'
-              "set KHAOS_EFFECTIVE_POLICY_DIGEST=$env:KHAOS_EFFECTIVE_POLICY_DIGEST"
-              "set KHAOS_AUTHORITYD_SERVICE_SID=$env:KHAOS_AUTHORITYD_SERVICE_SID"
-              "set KHAOS_AGENT_SID=$env:KHAOS_AGENT_SID"
-              "set KHAOS_AUDIT_WORM_ENDPOINT=$env:KHAOS_AUDIT_WORM_ENDPOINT"
-              "set PYTHONPATH=$env:GITHUB_WORKSPACE\python"
-              "`"$venvPython`" -m khaos.security.authorityd_main"
-          )
-          $wrapper | Set-Content -Path "$backendDir\khaos-authorityd-backend.cmd" -Encoding ascii
+          $venvRoot = Split-Path (Split-Path $venvPython -Parent) -Parent
+          $venvSite = Join-Path $venvRoot 'Lib\site-packages'
+          Copy-Item -Path "$venvSite\*" -Destination $backendSite -Recurse -Force
+          Get-ChildItem -Path $backendSite -Filter '*.pth' -File -ErrorAction SilentlyContinue | Remove-Item -Force
+          Remove-Item -LiteralPath (Join-Path $backendSite 'khaos') -Recurse -Force -ErrorAction SilentlyContinue
+          Copy-Item -Path "$env:GITHUB_WORKSPACE\python\khaos" -Destination (Join-Path $backendSite 'khaos') -Recurse -Force
+          $backendEntry = Join-Path $backendDir 'authorityd-backend-entry.py'
+          Copy-Item -LiteralPath "$env:GITHUB_WORKSPACE\packaging\windows\authorityd-backend-entry.py" -Destination $backendEntry -Force
+          $backendLog = 'C:\ProgramData\Khaos\authorityd-backend.log'
+          $backendConfig = 'C:\ProgramData\Khaos\authorityd-backend.env'
+          @(
+              "KHAOS_AUTHORITYD_BACKEND_PYTHON=$venvPython"
+              "KHAOS_AUTHORITYD_BACKEND_ENTRY=$backendEntry"
+              "KHAOS_AUTHORITYD_BACKEND_LOG=$backendLog"
+              'KHAOS_AUTHORITYD_SOCKET=unused'
+              'KHAOS_AUTHORITYD_NAMED_PIPE=\\.\pipe\KhaosAuthorityD'
+              'KHAOS_AUTHORITYD_BACKEND_PIPE=\\.\pipe\KhaosAuthorityDBackend'
+              'KHAOS_AUTHORITYD_KEY_PATH=C:\ProgramData\Khaos\authorityd.pem'
+              'KHAOS_AUTHORITYD_PUBLIC_KEY_PATH=C:\ProgramData\Khaos\authorityd.pub'
+              'KHAOS_TYPED_RESOURCE_CATALOG_PATH=C:\ProgramData\Khaos\native-resource-catalog.json'
+              "KHAOS_EFFECTIVE_POLICY_DIGEST=$env:KHAOS_EFFECTIVE_POLICY_DIGEST"
+              "KHAOS_AUTHORITYD_SERVICE_SID=$env:KHAOS_AUTHORITYD_SERVICE_SID"
+              "KHAOS_AGENT_SID=$env:KHAOS_AGENT_SID"
+              'KHAOS_AUTHORITYD_PROTECTED_KEY_REF=khaos-authority-signing-key'
+              "KHAOS_AUDIT_WORM_ENDPOINT=$env:KHAOS_AUDIT_WORM_ENDPOINT"
+              'KHAOS_AUTHORITYD_CONNECTION_TIMEOUT=5'
+          ) | Set-Content -LiteralPath $backendConfig -Encoding ascii
+          & "$env:SystemRoot\System32\icacls.exe" $backendConfig /inheritance:r /grant:r 'SYSTEM:(F)' 'Administrators:(F)' | Out-Null
           # Create the Ed25519 authority key before the service starts
           # (the production daemon never creates keys itself).
           uv run python -c "from pathlib import Path; from khaos.security.authorityd_protocol import Ed25519KeyStore; k=Ed25519KeyStore.load_or_create(Path(r'C:\ProgramData\Khaos\authorityd.pem'), create=True); Path(r'C:\ProgramData\Khaos\authorityd.pub').write_bytes(k.public_key().public_bytes_raw())"
-          & "$env:SystemRoot\System32\sc.exe" create KhaosAuthorityDBackend binPath= "`"$backendDir\khaos-authorityd-backend.cmd`"" start= auto | Out-Null
+          $backendBinary = "$env:GITHUB_WORKSPACE\rust\khaos-core\target\release\khaos-authorityd-backend-windows.exe"
+          & "$env:SystemRoot\System32\sc.exe" create KhaosAuthorityDBackend binPath= "`"$backendBinary`" --config `"$backendConfig`"" start= auto obj= LocalSystem | Out-Null
           if ($LASTEXITCODE -ne 0) { throw 'failed to create the backend service' }
           & "$env:SystemRoot\System32\sc.exe" start KhaosAuthorityDBackend | Out-Null
           Start-Sleep -Seconds 8
           $status = (Get-Service -Name KhaosAuthorityDBackend -ErrorAction SilentlyContinue).Status
           if ($status -ne 'Running') { throw "authority backend service is '$status'" }
+      - name: Collect backend service diagnostics
+        if: failure()
+        shell: pwsh
+        run: |
+          $log = 'C:\ProgramData\Khaos\authorityd-backend.log'
+          if (Test-Path -LiteralPath $log) { Get-Content -LiteralPath $log -Tail 200 }
       - name: Run the native identity probe
         shell: pwsh
         env:
