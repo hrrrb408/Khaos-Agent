@@ -334,6 +334,33 @@ def test_windows_token_groups_parsing_round_trip() -> None:
         _parse_token_group_sids(b"\x00" * 4, dereference=lambda _ptr: "")
 
 
+def test_windows_sid_conversion_uses_pointer_to_pointer_abi() -> None:
+    """ConvertSidToStringSidW must receive ``LPWSTR *``, not ``wchar_t **``."""
+    import ctypes
+
+    from khaos.security.authorityd_windows import _sid_to_string
+    from khaos.security.windows_native_ffi import LPWSTR
+
+    class _Advapi:
+        def ConvertSidToStringSidW(self, _sid: object, output: object) -> bool:
+            assert isinstance(output._obj, LPWSTR)  # type: ignore[attr-defined]
+            buffer = ctypes.create_unicode_buffer("S-1-5-18")
+            pointer = ctypes.cast(buffer, LPWSTR)
+            ctypes.memmove(
+                ctypes.byref(output._obj),  # type: ignore[attr-defined]
+                ctypes.byref(pointer),
+                ctypes.sizeof(pointer),
+            )
+            self.buffer = buffer
+            return True
+
+    class _Kernel:
+        def LocalFree(self, pointer: object) -> None:
+            assert isinstance(pointer, ctypes.c_void_p)
+
+    assert _sid_to_string(_Advapi(), _Kernel(), 1234) == "S-1-5-18"
+
+
 def test_windows_peer_trust_covers_service_sid_in_groups() -> None:
     """A Service SID (S-1-5-80-...) lives in TokenGroups, not TokenUser.
 

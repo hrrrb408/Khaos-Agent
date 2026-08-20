@@ -42,6 +42,7 @@ from khaos.security.identity_isolation import (
 )
 from khaos.security.windows_native_ffi import (
     ERROR_OPERATION_ABORTED,
+    LPWSTR,
     Overlapped,
     SecurityAttributes,
     get_windows_bindings,
@@ -175,6 +176,27 @@ def _parse_token_group_sids(
     return sids
 
 
+def _sid_to_string(advapi32: Any, kernel32: Any, sid_ptr: int) -> str:
+    """Convert a kernel-owned SID pointer with the exact Win32 ABI type."""
+    text = LPWSTR()
+    if not advapi32.ConvertSidToStringSidW(
+        ctypes.c_void_p(sid_ptr), ctypes.byref(text)
+    ):
+        raise IdentityIsolationError("backend pipe client SID is malformed")
+    if not text:
+        raise IdentityIsolationError("backend pipe client SID is malformed")
+    try:
+        value = ctypes.wstring_at(text)
+        if not value:
+            raise IdentityIsolationError("backend pipe client SID is malformed")
+        return value
+    finally:
+        # ConvertSidToStringSidW allocates the returned string with the
+        # process heap API paired with LocalFree; release it only after the
+        # Python copy has been made.
+        kernel32.LocalFree(ctypes.cast(text, ctypes.c_void_p))
+
+
 def _peer_is_trusted(
     user_sid: str, group_sids: list[str], service_sid: str
 ) -> bool:
@@ -233,26 +255,16 @@ def _client_identity(kernel32: Any, advapi32: Any, pipe_handle: int) -> tuple[st
                     )
                 return buffer.raw
 
-            def _sid_to_string(sid_ptr: int) -> str:
-                text = ctypes.c_wchar_p()
-                if not advapi32.ConvertSidToStringSidW(
-                    ctypes.c_void_p(sid_ptr), ctypes.byref(text)
-                ):
-                    raise IdentityIsolationError(
-                        "backend pipe client SID is malformed"
-                    )
-                try:
-                    return text.value or ""
-                finally:
-                    # ``text`` is a pointer-to-pointer result.  Passing the
-                    # c_wchar_p object itself makes ctypes try to convert the
-                    # pointed-to string instead of freeing the returned
-                    # allocation.  Preserve the raw pointer value.
-                    kernel32.LocalFree(ctypes.cast(text, ctypes.c_void_p))
-
-            user_sid = _sid_to_string(_parse_token_user_sid(_query(TokenUser)))
+            user_sid = _sid_to_string(
+                advapi32,
+                kernel32,
+                _parse_token_user_sid(_query(TokenUser)),
+            )
             group_sids = _parse_token_group_sids(
-                _query(TokenGroups), dereference=_sid_to_string
+                _query(TokenGroups),
+                dereference=lambda sid_ptr: _sid_to_string(
+                    advapi32, kernel32, sid_ptr
+                ),
             )
             return user_sid, group_sids
         finally:
