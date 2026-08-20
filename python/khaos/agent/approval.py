@@ -67,6 +67,14 @@ class StepExecutionAuthority:
     principal_kind: str = ""
     parent_principal_id: str = ""
     delegation_digest: str = ""
+    # The runtime identity the transport-root commitment covers: the
+    # authority recomputes the commitment with THIS value, so it must be
+    # the RequestContext runtime_id, never a stand-in.
+    runtime_id: str = ""
+    # Transport provenance for the delegation digest: the authority
+    # recomputes the transport-root commitment from it, so the grant
+    # caller must present the same transport the context was built from.
+    source_transport: str = ""
 
     def __post_init__(self) -> None:
         required = (
@@ -148,6 +156,7 @@ class StepExecutionAuthority:
             "principal_kind": self.principal_kind,
             "parent_principal_id": self.parent_principal_id,
             "delegation_digest": self.delegation_digest,
+            "source_transport": self.source_transport,
         }
         if include_receipt:
             payload["approval_receipt_digest"] = self.approval_receipt_digest

@@ -12,6 +12,7 @@ import shlex
 import time
 import uuid
 from collections.abc import Awaitable, Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, cast
@@ -551,6 +552,15 @@ class ToolScheduler:
         self._operation_events: dict[str, asyncio.Event] = {}
         self._operation_claims: dict[str, _OperationClaim] = {}
         self._operation_claim_lock = asyncio.Lock()
+        # Synchronous confirm callbacks (UI/gateway adapters) run here,
+        # never on the loop's default executor: a hanging callback may
+        # occupy one of the bounded workers forever — that later approvals
+        # then fail closed on their own deadline is the intended bound,
+        # where before they accumulated leaked default-executor threads
+        # and eventually starved unrelated asyncio.to_thread users.
+        self._approval_executor = ThreadPoolExecutor(
+            max_workers=4, thread_name_prefix="khaos-approval-callback"
+        )
 
     def set_office_authority(self, authority: Any) -> None:
         """Register the shared OfficeMutationAuthority (called at startup)."""
@@ -2521,6 +2531,8 @@ class ToolScheduler:
         principal_kind = str(tool_context.get("principal_kind") or "")
         parent_principal_id = str(tool_context.get("parent_principal_id") or "")
         delegation_digest = str(tool_context.get("delegation_digest") or "")
+        step_source_transport = str(tool_context.get("source_transport") or "")
+        step_runtime_id = str(tool_context.get("runtime_id") or "")
         if tool_context.get("production_runtime") and not all(
             (principal_kind, parent_principal_id, delegation_digest)
         ):
@@ -2713,6 +2725,7 @@ class ToolScheduler:
                 principal_kind=principal_kind,
                 parent_principal_id=parent_principal_id,
                 delegation_digest=delegation_digest,
+                source_transport=step_source_transport,
             )
             call["_spawn_plan"] = spawn_plan
         elif not isinstance(spawn_plan, ResolvedSpawnPlan):
@@ -2752,6 +2765,8 @@ class ToolScheduler:
             principal_kind=principal_kind,
             parent_principal_id=parent_principal_id,
             delegation_digest=delegation_digest,
+            source_transport=step_source_transport,
+            runtime_id=step_runtime_id or session_id,
         )
 
     async def _prepare_sandbox_authority_inputs(
@@ -3197,12 +3212,15 @@ class ToolScheduler:
             else:
                 # UI and gateway integrations may supply a synchronous
                 # callback.  It is untrusted with respect to latency, so run
-                # it off-loop and apply the same approval deadline as an
-                # asynchronous callback.  A timed-out worker cannot be
-                # force-killed, but it no longer starves scheduling or
-                # shutdown and its late result is discarded.
+                # it off-loop on the dedicated bounded approval executor and
+                # apply the same approval deadline as an asynchronous
+                # callback.  A timed-out worker cannot be force-killed; the
+                # bounded pool turns a hang into later fail-closed denials
+                # instead of an unbounded thread leak.
                 value = await asyncio.wait_for(
-                    asyncio.to_thread(confirm_callback, payload),
+                    asyncio.get_running_loop().run_in_executor(
+                        self._approval_executor, confirm_callback, payload
+                    ),
                     timeout=remaining,
                 )
         except TimeoutError:
@@ -3443,6 +3461,7 @@ def _build_spawn_plan(
     principal_kind: str = "",
     parent_principal_id: str = "",
     delegation_digest: str = "",
+    source_transport: str = "",
 ) -> ResolvedSpawnPlan:
     """Create one immutable, pre-approval spawn authority."""
     arguments = call.get("arguments", {})
@@ -3505,6 +3524,7 @@ def _build_spawn_plan(
         principal_kind=principal_kind,
         parent_principal_id=parent_principal_id,
         delegation_digest=delegation_digest,
+        source_transport=source_transport,
     )
 
 

@@ -87,3 +87,35 @@ async def test_supervisor_final_spawn_scrubs_secret_after_allowlist(tmp_path: Pa
 
     assert result.status == "passed"
     assert result.stdout.splitlines() == ["<missing>", "<missing>"]
+
+
+def test_git_semantic_environment_never_crosses_spawn_boundary() -> None:
+    """Config/hook/retarget env must not reach any spawned git command.
+
+    A SAFE-classified ``git diff`` is only proven read-only while the
+    executable graph stays the classified argv: GIT_EXTERNAL_DIFF or the
+    GIT_CONFIG_KEY_n/VALUE_n inline-config pairs would silently change git
+    semantics, and GIT_DIR/GIT_WORK_TREE would retarget the repository.
+    """
+    hostile = {
+        "GIT_EXTERNAL_DIFF": "/workspace/evil-diff",
+        "GIT_PAGER": "/workspace/evil-pager",
+        "PAGER": "/workspace/evil-pager",
+        "GIT_CONFIG_COUNT": "2",
+        "GIT_CONFIG_KEY_0": "core.pager",
+        "GIT_CONFIG_VALUE_0": "/workspace/evil-pager",
+        "GIT_CONFIG_KEY_1": "diff.external",
+        "GIT_CONFIG_VALUE_1": "/workspace/evil-diff",
+        "GIT_DIR": "/workspace/other-repo/.git",
+        "GIT_WORK_TREE": "/workspace/other-repo",
+        "GIT_INDEX_FILE": "/workspace/other-repo/.git/index",
+        "GIT_OBJECT_DIRECTORY": "/workspace/other-repo/.git/objects",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES": "/tmp/evil-objects",
+        "PATH": "/usr/bin:/bin",
+    }
+    scrubbed = scrub_spawn_environment(hostile)
+    assert "PATH" in scrubbed
+    for key in hostile:
+        if key == "PATH":
+            continue
+        assert key not in scrubbed, key

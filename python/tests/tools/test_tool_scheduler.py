@@ -1359,3 +1359,47 @@ async def test_scheduler_does_not_replay_orphaned_running_operation(tmp_path):
         result.reconciliation_hint + result.warning + result.error
     ).lower()
     await db.close()
+
+
+async def test_scheduler_hanging_confirm_callback_stays_bounded():
+    """A hanging synchronous confirm callback cannot leak shared executors.
+
+    Confirm callbacks run on a dedicated bounded pool (never the loop's
+    default executor): the hung call denies fail-closed on its deadline,
+    and a later fast callback is still served, so unrelated
+    asyncio.to_thread users cannot be starved by UI/gateway hangs.
+    """
+    import threading
+
+    scheduler = ToolScheduler(_registry(), object())
+    release = threading.Event()
+
+    def hanging(_request):
+        release.wait(timeout=30)
+        return {"approved": True}
+
+    slow_request = PermissionRequest(
+        tool_call_id="call-hang",
+        name="write",
+        arguments={"value": "safe"},
+        level="write",
+        target="write:safe",
+        reason="ask-every",
+        expires_at=time.time() + 1,
+    )
+    first = await scheduler._confirm(slow_request, hanging)
+    assert first["approved"] is False
+    assert first["reason"] == "approval_callback_timeout"
+
+    fast_request = PermissionRequest(
+        tool_call_id="call-fast",
+        name="write",
+        arguments={"value": "safe"},
+        level="write",
+        target="write:safe",
+        reason="ask-every",
+        expires_at=time.time() + 10,
+    )
+    second = await scheduler._confirm(fast_request, lambda _request: True)
+    assert second == {"approved": True}
+    release.set()

@@ -23,9 +23,15 @@ import sys
 from pathlib import Path
 
 from khaos.security.security_evidence import (
+    EXPECTED_REPOSITORY,
     SecurityEvidenceManifest,
     load_verified_bundle,
     verify_evidence_manifests,
+    verify_manifests_against_github,
+)
+from khaos.security.evidence_provenance import (
+    gh_fetch_artifact,
+    gh_fetch_json,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -159,18 +165,22 @@ def _git_head() -> str:
 
 def render(
     *,
-    commit: str,
+    commit: str = "not-provided",
     ci_run: str = "not-provided",
     test_counts: str = "not-provided",
     native_evidence: tuple[str, ...] = (),
     all_gates_success: bool = False,
     evidence_bundle: dict | None = None,
     policy_digest: str = "",
+    github_fetch_json: object = None,
+    github_fetch_artifact: object = None,
 ) -> str:
     # CLOSED is reachable ONLY through a verified evidence bundle whose
     # embedded manifests re-verify against this exact commit and the
-    # release policy digest.  Local files, run id strings, and booleans
-    # are recorded but never treated as proof.
+    # release policy digest AND whose runs/jobs/artifacts are re-resolved
+    # against the live GitHub API.  Local files, run id strings, booleans,
+    # and self-consistent local JSON are recorded but never treated as
+    # proof: a bundle forged offline fails the GitHub recheck.
     closed = False
     evidence_status = "UNKNOWN (no verified evidence bundle provided)"
     if evidence_bundle is not None:
@@ -184,13 +194,28 @@ def render(
                 expected_commit=commit,
                 expected_policy_digest=policy_digest,
             )
-            if verification.ok:
-                closed = True
-                evidence_status = "VERIFIED CI evidence bundle"
-            else:
+            if not verification.ok:
                 evidence_status = (
                     "REJECTED: " + "; ".join(verification.errors[:5])
                 )
+            elif github_fetch_json is None or github_fetch_artifact is None:
+                evidence_status = (
+                    "REJECTED: GitHub provenance recheck unavailable "
+                    "(closure requires live API re-verification of every run, job, and artifact)"
+                )
+            else:
+                recheck = verify_manifests_against_github(
+                    manifests,
+                    fetch_json=github_fetch_json,
+                    fetch_artifact=github_fetch_artifact,
+                )
+                if recheck.ok:
+                    closed = True
+                    evidence_status = "VERIFIED CI evidence bundle (GitHub-provenance rechecked)"
+                else:
+                    evidence_status = (
+                        "REJECTED: " + "; ".join(recheck.errors[:5])
+                    )
         except Exception as exc:  # noqa: BLE001 - any bundle failure stays NOT CLOSED
             evidence_status = f"REJECTED: {exc}"
     status = "CLOSED" if closed else "NOT CLOSED (evidence incomplete)"
@@ -260,6 +285,15 @@ def main(argv: list[str] | None = None) -> int:
         all_gates_success=args.all_gates_success,
         evidence_bundle=evidence_bundle,
         policy_digest=args.policy_digest,
+        # Live-API recheck is mandatory whenever a bundle is offered: a
+        # locally synthesized bundle must never reach CLOSED even when its
+        # strings are perfectly self-consistent.
+        github_fetch_json=(
+            gh_fetch_json(EXPECTED_REPOSITORY) if evidence_bundle is not None else None
+        ),
+        github_fetch_artifact=(
+            gh_fetch_artifact(EXPECTED_REPOSITORY) if evidence_bundle is not None else None
+        ),
     )
     if args.check_template:
         if not TEMPLATE.is_file() or "Status: **NOT CLOSED" not in TEMPLATE.read_text(encoding="utf-8"):

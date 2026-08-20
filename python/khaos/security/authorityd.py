@@ -56,7 +56,9 @@ from khaos.security.principals import (
     DelegationScope,
     PrincipalDelegationError,
     principal_from_kind,
+    transport_root_delegation_digest,
 )
+from khaos.security.principals import _operation_is_narrower
 from khaos.security.protocol_boundary import (
     ProtocolBoundaryError,
     read_bounded_line,
@@ -794,6 +796,93 @@ class AuthorityDaemon:
         else:
             self._release_audit_reservation(event_id)
 
+    def _require_delegation_provenance(
+        self,
+        *,
+        principal_id: str,
+        principal_kind: str,
+        parent_principal_id: str,
+        project_id: str,
+        session_id: str,
+        runtime_id: str,
+        source_transport: str,
+        policy_digest: str,
+        task_id: str,
+        workspace_id: str,
+        operation_family: str,
+        resource_digest: str,
+        delegation_digest: str,
+    ) -> None:
+        """A delegation digest must be provable, never merely well-formed.
+
+        Accept exactly two provenances:
+        1. a live authority-issued delegation whose subject, context,
+           policy, task/workspace binding, operation family, and resource
+           scope all cover this grant; or
+        2. the canonical transport-root commitment recomputed from THIS
+           grant's own verified fields (which a caller cannot choose
+           freely).  Anything else — the historic "caller says digest=ABC"
+           — fails closed.
+        """
+        scope = self._delegations.live_scope(delegation_digest)
+        if scope is not None:
+            subject = scope.subject
+            if (
+                subject.principal_id != principal_id
+                or subject.kind.value != principal_kind
+            ):
+                raise AuthorityControlPlaneError(
+                    "authority grant principal does not match the delegation subject"
+                )
+            if (
+                scope.project_id != project_id
+                or scope.session_id != session_id
+                or scope.runtime_id != runtime_id
+            ):
+                raise AuthorityControlPlaneError(
+                    "authority grant context does not match the delegation context"
+                )
+            if scope.policy_digest != policy_digest:
+                raise AuthorityControlPlaneError(
+                    "authority grant policy does not match the delegation policy"
+                )
+            if scope.task_id not in ("unbound", task_id) or scope.workspace_id not in (
+                "unbound",
+                workspace_id,
+            ):
+                raise AuthorityControlPlaneError(
+                    "authority delegation is not bound to this task/workspace"
+                )
+            if not _operation_is_narrower(scope.operation_family, operation_family):
+                raise AuthorityControlPlaneError(
+                    "authority delegation does not cover this operation family"
+                )
+            if resource_digest not in scope.resource_scope:
+                raise AuthorityControlPlaneError(
+                    "authority delegation does not cover this resource"
+                )
+            return
+        if not source_transport:
+            raise AuthorityControlPlaneError(
+                "authority grant delegation digest is not a live authority-issued "
+                "delegation and no transport provenance was provided"
+            )
+        expected = transport_root_delegation_digest(
+            principal_id=principal_id,
+            principal_kind=principal_kind,
+            parent_principal_id=parent_principal_id,
+            project_id=project_id,
+            session_id=session_id,
+            runtime_id=runtime_id,
+            source_transport=source_transport,
+            policy_digest=policy_digest,
+        )
+        if delegation_digest != expected:
+            raise AuthorityControlPlaneError(
+                "authority grant delegation digest is neither a live authority "
+                "delegation nor the canonical transport-root commitment"
+            )
+
     def grant(
         self,
         *,
@@ -812,6 +901,7 @@ class AuthorityDaemon:
         parent_principal_id: str = "",
         session_id: str = "",
         delegation_digest: str = "",
+        source_transport: str = "",
     ) -> tuple[str, float]:
         """Register a renewable grant in the independent authority owner."""
         self._expire_grants()
@@ -839,6 +929,22 @@ class AuthorityDaemon:
         operation_family, separator, operation_action = operation_class.partition(".")
         if not separator or not operation_action or "*" in operation_class:
             raise AuthorityControlPlaneError("authority grant operation is invalid")
+        if delegation_digest:
+            self._require_delegation_provenance(
+                principal_id=principal_id,
+                principal_kind=principal_kind,
+                parent_principal_id=parent_principal_id,
+                project_id=project_id,
+                session_id=session_id,
+                runtime_id=runtime_id,
+                source_transport=source_transport,
+                policy_digest=policy_digest,
+                task_id=task_id,
+                workspace_id=workspace_id,
+                operation_family=operation_family,
+                resource_digest=resource_digest,
+                delegation_digest=delegation_digest,
+            )
         grant_intent = AuthorizationIntent(
             principal_id=principal_id,
             project_id=project_id,
@@ -2039,6 +2145,8 @@ class AuthorityDaemon:
         operation_family: str,
         resource_scope: list[str],
         expires_at: float,
+        task_id: str | None = None,
+        workspace_id: str | None = None,
     ) -> DelegationScope:
         """Issue one narrow child delegation from a live parent scope."""
         if self._delegations.live_count >= self.terminal_tombstone_limit:
@@ -2053,6 +2161,8 @@ class AuthorityDaemon:
                 operation_family=operation_family,
                 resource_scope=resource_scope,
                 expires_at=expires_at,
+                task_id=task_id,
+                workspace_id=workspace_id,
             )
         except PrincipalDelegationError as exc:
             raise AuthorityControlPlaneError(str(exc)) from exc
@@ -2670,6 +2780,7 @@ def _dispatch(daemon: AuthorityDaemon, request: object) -> dict[str, object]:
             parent_principal_id=str(request.get("parent_principal_id", "")),
             session_id=str(request.get("session_id", "")),
             delegation_digest=str(request.get("delegation_digest", "")),
+            source_transport=str(request.get("source_transport", "")),
         )
         return {"ok": True, "grant_id": grant_id, "expires_at": expires_at}
     if operation == "revoke_grant":
@@ -2756,6 +2867,8 @@ def _dispatch(daemon: AuthorityDaemon, request: object) -> dict[str, object]:
             operation_family=str(request.get("operation_family", "")),
             resource_scope=[str(item) for item in request.get("resource_scope", [])],
             expires_at=float(request.get("expires_at", 0)),
+            task_id=str(request.get("task_id", "")) or None,
+            workspace_id=str(request.get("workspace_id", "")) or None,
         )
         return {"ok": True, "delegation": child.canonical()}
     if operation == "delegation_consume":

@@ -71,6 +71,7 @@ class AuthorityDelegationIssuer:
         task_id: str,
         tools: list[str],
         timeout_seconds: int,
+        workspace_id: str = "",
     ) -> str:
         if ctx.principal.kind is PrincipalKind.SUBAGENT:
             # Single-layer delegation: a subagent may never issue further
@@ -87,6 +88,9 @@ class AuthorityDelegationIssuer:
             expires_at=child_expires + _ROOT_GRACE_SECONDS,
         )
         self._client.delegation_register_root(root)
+        # The child scope is bound to the REAL subagent task and (when
+        # known) workspace — the bound values are what the authority
+        # matches at grant time, not the parent session placeholder.
         child = self._client.delegation_issue_child(
             root,
             f"subagent:{ctx.principal_id}:{task_id}",
@@ -94,6 +98,8 @@ class AuthorityDelegationIssuer:
             operation_family="subagent",
             resource_scope=resources,
             expires_at=child_expires,
+            task_id=task_id,
+            workspace_id=workspace_id or _UNBOUND,
         )
         return child.digest
 

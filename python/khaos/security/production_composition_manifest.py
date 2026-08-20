@@ -92,6 +92,20 @@ def _exact_type_name(value: object) -> str:
     return f"{type(value).__module__}.{type(value).__qualname__}"
 
 
+def _collect_authority_component_names(runtime: Any) -> set[str]:
+    """Exact names of authority receipt-broker types reachable from the runtime."""
+    reachable = _walk_object_graph(runtime, max_depth=5)
+    return {
+        f"{cls.__module__}.{cls.__qualname__}"
+        for cls in reachable
+        if cls.__module__ == "khaos.security.authority_broker"
+        and any(
+            token in cls.__qualname__.lower()
+            for token in ("broker", "capability")
+        )
+    }
+
+
 def _walk_object_graph(root: object, max_depth: int = 4) -> set[type]:
     """Collect the concrete types reachable from an object graph."""
     seen_types: set[type] = set()
@@ -132,7 +146,13 @@ def _walk_object_graph(root: object, max_depth: int = 4) -> set[type]:
 
 
 def verify_runtime_composition(runtime: Any) -> CompositionManifest:
-    """Verify the exact production composition of one real runtime."""
+    """Verify the exact production composition of one real runtime.
+
+    This is the *Linux production* composition verifier: it requires the
+    Linux bwrap execution backend and treats any other backend as an
+    error.  Cross-platform compositions are proven by other evidence
+    types, not by this manifest.
+    """
     components: dict[str, str] = {}
     errors: list[str] = []
 
@@ -164,7 +184,12 @@ def verify_runtime_composition(runtime: Any) -> CompositionManifest:
     if not isinstance(audit_logger, AuditLogger):
         errors.append("audit_logger is missing or not an AuditLogger")
     else:
-        components["worm_audit_writer"] = _exact_type_name(audit_logger)
+        # Honest semantics: this handle is the LOCAL SQLite/append-file
+        # audit logger.  The remote WORM writer is authority-side state
+        # (proven separately by the production composition probe); labeling
+        # the local logger as "worm_audit_writer" overclaimed the
+        # composition.
+        components["local_audit_logger"] = _exact_type_name(audit_logger)
 
     execution_service = getattr(runtime, "execution_service", None)
     if not isinstance(execution_service, ExecutionService):
@@ -248,6 +273,23 @@ def verify_runtime_composition(runtime: Any) -> CompositionManifest:
     else:
         components["verification_backend"] = (
             f"{VerifyFixLoop.__module__}.{VerifyFixLoop.__qualname__}"
+        )
+
+    # Authority-bound child spawn: the execution service must actually be
+    # bound to the runtime authority (the flag flips in bind_runtime_
+    # authority), and the supervisor's authority-broker imports must be
+    # live — the receipt claim path below is what turns spawns into
+    # two-phase authority effects.
+    if execution_service is not None and not getattr(
+        execution_service, "_authority_bound", False
+    ):
+        errors.append("execution service is not bound to the runtime authority")
+    authority_components = _collect_authority_component_names(runtime)
+    if not authority_components:
+        errors.append("no authority receipt broker reachable from the runtime")
+    else:
+        components["security_authority_broker"] = ",".join(
+            sorted(authority_components)
         )
 
     # Forbidden-type absence: walk the whole runtime graph and detect any

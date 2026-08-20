@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import socket
 import stat
+import struct
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -166,7 +167,12 @@ def peer_uid(connection: socket.socket) -> int:
         raise IdentityIsolationError("could not read authority peer credentials") from exc
     if len(raw) < 12:
         raise IdentityIsolationError("authority peer credential payload is malformed")
-    return int.from_bytes(raw[8:12], byteorder="little", signed=True)
+    # struct ucred { pid_t pid; uid_t uid; gid_t gid; } in native ABI layout:
+    # bytes 4..8 are the UID and bytes 8..12 the GID.  This used to return
+    # raw[8:12], i.e. the peer's GID, so the admission gate compared the
+    # peer's effective GID against the configured agent UID.
+    _pid, uid, _gid = struct.unpack("=3i", raw[:12])
+    return uid
 
 
 # darwin exposes peer credentials through the LOCAL_PEERCRED socket option

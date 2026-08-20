@@ -17,11 +17,14 @@ import subprocess
 import sys
 from pathlib import Path
 
+from khaos.security.evidence_provenance import gh_fetch_artifact, gh_fetch_json
 from khaos.security.security_evidence import (
+    EXPECTED_REPOSITORY,
     REQUIRED_PROOF_TYPES,
     SecurityEvidenceManifest,
     load_verified_bundle,
     verify_evidence_manifests,
+    verify_manifests_against_github,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -57,6 +60,8 @@ def render(
     policy_digest: str,
     verified_bundle: dict | None,
     test_counts: str = "not-provided",
+    github_fetch_json: object = None,
+    github_fetch_artifact: object = None,
 ) -> str:
     status = "NOT CLOSED (evidence incomplete)"
     satisfied: list[tuple[str, bool, str]] = []
@@ -71,10 +76,23 @@ def render(
             expected_policy_digest=policy_digest,
         )
         present = verification.proof_types
-        if verification.ok:
-            status = "CLOSED"
-        else:
+        if not verification.ok:
             status = "NOT CLOSED (evidence rejected)"
+        elif github_fetch_json is None or github_fetch_artifact is None:
+            # Local string checks alone cannot distinguish a real CI
+            # manifest from a locally synthesized one; CLOSED requires the
+            # live GitHub API recheck of every run, job, and artifact.
+            status = "NOT CLOSED (GitHub provenance recheck unavailable)"
+        else:
+            recheck = verify_manifests_against_github(
+                manifests,
+                fetch_json=github_fetch_json,
+                fetch_artifact=github_fetch_artifact,
+            )
+            if recheck.ok:
+                status = "CLOSED"
+            else:
+                status = "NOT CLOSED (GitHub provenance rejected: " + "; ".join(recheck.errors[:3]) + ")"
         for label, proof_type in CLOSURE_CRITERIA:
             satisfied.append((label, proof_type in present, proof_type))
     else:
@@ -135,6 +153,17 @@ def main(argv: list[str] | None = None) -> int:
         policy_digest=args.policy_digest,
         verified_bundle=verified_bundle,
         test_counts=args.test_counts,
+        # Live-API recheck is mandatory whenever a bundle is offered: a
+        # locally synthesized bundle must never reach CLOSED even when its
+        # strings are perfectly self-consistent.
+        github_fetch_json=(
+            gh_fetch_json(EXPECTED_REPOSITORY) if verified_bundle is not None else None
+        ),
+        github_fetch_artifact=(
+            gh_fetch_artifact(EXPECTED_REPOSITORY)
+            if verified_bundle is not None
+            else None
+        ),
     )
     if args.output is not None:
         args.output.parent.mkdir(parents=True, exist_ok=True)

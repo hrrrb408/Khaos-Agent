@@ -265,6 +265,7 @@ class ResolvedSpawnPlan:
     principal_kind: str = ""
     parent_principal_id: str = ""
     delegation_digest: str = ""
+    source_transport: str = ""
 
     def __post_init__(self) -> None:
         required = (

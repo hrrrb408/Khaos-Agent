@@ -328,15 +328,27 @@ class DelegationScope:
         return _digest(self.canonical())
 
     def contains(self, child: DelegationScope) -> bool:
-        """Return whether ``child`` is a strict non-widening subset."""
+        """Return whether ``child`` is a strict non-widening subset.
 
+        Task/workspace may only narrow: a child either keeps the parent's
+        binding or — when the parent is still ``unbound`` — binds a
+        concrete task/workspace for the first time.  A bound parent can
+        never be re-bound, and an unbound child of a bound parent is a
+        widening and is rejected.
+        """
+        task_ok = child.task_id == self.task_id or (
+            self.task_id == "unbound" and child.task_id != "unbound"
+        )
+        workspace_ok = child.workspace_id == self.workspace_id or (
+            self.workspace_id == "unbound" and child.workspace_id != "unbound"
+        )
         return (
             child.parent_principal == self.subject
             and child.project_id == self.project_id
             and child.session_id == self.session_id
             and child.runtime_id == self.runtime_id
-            and child.task_id == self.task_id
-            and child.workspace_id == self.workspace_id
+            and task_ok
+            and workspace_ok
             and child.policy_digest == self.policy_digest
             and child.expires_at <= self.expires_at
             and _operation_is_narrower(self.operation_family, child.operation_family)
@@ -393,8 +405,16 @@ class DelegationAuthority:
         expires_at: float,
         nonce: str | None = None,
         now: float | None = None,
+        task_id: str | None = None,
+        workspace_id: str | None = None,
     ) -> DelegationScope:
-        """Issue one child scope only after validating the live parent."""
+        """Issue one child scope only after validating the live parent.
+
+        ``task_id``/``workspace_id`` may bind the child to the real
+        subagent task and workspace — a one-way narrowing permitted only
+        while the parent scope is still ``unbound`` (validated by
+        ``contains``); a bound parent can never be re-bound.
+        """
 
         current = time.time() if now is None else now
         if current >= parent.expires_at:
@@ -407,8 +427,8 @@ class DelegationAuthority:
             project_id=parent.project_id,
             session_id=parent.session_id,
             runtime_id=parent.runtime_id,
-            task_id=parent.task_id,
-            workspace_id=parent.workspace_id,
+            task_id=parent.task_id if task_id is None else task_id,
+            workspace_id=parent.workspace_id if workspace_id is None else workspace_id,
             operation_family=operation_family,
             resource_scope=frozenset(resource_scope),
             policy_digest=parent.policy_digest,
@@ -429,6 +449,23 @@ class DelegationAuthority:
             self._live[child_scope.digest] = child_scope
             self._parents[child_scope.digest] = parent.digest
         return child_scope
+
+    def live_scope(
+        self, digest: str, *, now: float | None = None
+    ) -> DelegationScope | None:
+        """Return the live (unconsumed, unexpired) scope for a digest.
+
+        This is the authority-side lookup the grant path uses to prove a
+        caller-supplied delegation digest really resolves to an
+        authority-issued, still-live delegation — a format-valid hex
+        string alone must never pass.
+        """
+        current = time.time() if now is None else now
+        with self._lock:
+            scope = self._live.get(digest)
+            if scope is None or current >= scope.expires_at:
+                return None
+            return scope
 
     def consume(
         self,
@@ -534,6 +571,41 @@ def _same_effect_scope(left: DelegationScope, right: DelegationScope) -> bool:
         and left.issued_at == right.issued_at
         and left.nonce == right.nonce
     )
+
+
+def transport_root_delegation_digest(
+    *,
+    principal_id: str,
+    principal_kind: str,
+    parent_principal_id: str,
+    project_id: str,
+    session_id: str,
+    runtime_id: str,
+    source_transport: str,
+    policy_digest: str,
+) -> str:
+    """The one canonical transport-root delegation commitment recipe.
+
+    Both the runtime context (issuer side) and the authority daemon
+    (verifier side) must use exactly this function: the daemon recomputes
+    the commitment from its own verified grant fields, so a caller cannot
+    smuggle an arbitrary 64-hex string as a "delegation digest".
+    """
+    payload = {
+        "schema_version": 1,
+        "kind": "transport-root-delegation",
+        "principal_id": principal_id,
+        "principal_kind": principal_kind,
+        "parent_principal_id": parent_principal_id,
+        "project_id": project_id,
+        "session_id": session_id,
+        "runtime_id": runtime_id,
+        "source_transport": source_transport,
+        "policy_digest": policy_digest,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
 
 
 def _digest(value: object) -> str:

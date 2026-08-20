@@ -95,3 +95,24 @@ def test_bash_syntax_acceptance_does_not_create_a_security_shortcut(script: str)
     )
     assert syntax.returncode == 0, syntax.stderr
     assert analyze_shell_script(script).status is not ShellSemanticStatus.SAFE
+
+
+def test_path_qualified_executable_never_inherits_basename_classification() -> None:
+    """A workspace-owned binary named ``ls`` is not the system ``ls``.
+
+    The classifier used the basename of the executable word, so
+    ``/workspace/ls`` inherited the read-only classification of the
+    system ``ls``.  Path-qualified executables must stay
+    SEMANTIC_UNKNOWN (approval required); only bare names resolved
+    through the scrubbed trusted PATH may be classified.
+    """
+    for script in (
+        "/workspace/ls -la",
+        "./ls -la",
+        "../bin/ls -la",
+        "/workspace/git status",
+    ):
+        result = analyze_shell_script(script)
+        assert result.status is ShellSemanticStatus.SEMANTIC_UNKNOWN, script
+    # Bare names keep their classification.
+    assert analyze_shell_script("ls -la").status is ShellSemanticStatus.SAFE

@@ -32,16 +32,28 @@ CLANG=${KHAOS_CLANG:-$(xcrun --find clang)}
   packaging/macos/khaos-authorityd-xpc-client.c \
   -o "$BUILD_DIR/khaos-authorityd-xpc-client" \
   -framework Foundation
+"$CLANG" -Wall -Wextra -Werror \
+  packaging/macos/khaos-authorityd-keychain-provision.c \
+  -o "$BUILD_DIR/khaos-authorityd-keychain-provision" \
+  -framework Security -framework CoreFoundation
 
 codesign --force --sign "$KHAOS_CODESIGN_IDENTITY" \
   --entitlements packaging/macos/khaos-authorityd.entitlements \
   --options runtime "$BUILD_DIR/khaos-authorityd-xpc"
 codesign --force --sign "$KHAOS_CODESIGN_IDENTITY" \
   --options runtime "$BUILD_DIR/khaos-authorityd-xpc-client"
+# The provisioner must carry the same keychain-access-groups entitlement
+# as the frontend: SecItemAdd can only create an item inside an access
+# group the signing identity is entitled to.
+codesign --force --sign "$KHAOS_CODESIGN_IDENTITY" \
+  --entitlements packaging/macos/khaos-authorityd.entitlements \
+  --options runtime "$BUILD_DIR/khaos-authorityd-keychain-provision"
 install -m 0555 "$BUILD_DIR/khaos-authorityd-xpc" "$PREFIX/khaos-authorityd-xpc"
 install -m 0555 "$BUILD_DIR/khaos-authorityd-xpc-client" "$PREFIX/khaos-authorityd-xpc-client"
+install -m 0555 "$BUILD_DIR/khaos-authorityd-keychain-provision" "$PREFIX/khaos-authorityd-keychain-provision"
 codesign --verify --strict --verbose=2 "$PREFIX/khaos-authorityd-xpc"
 codesign --verify --strict --verbose=2 "$PREFIX/khaos-authorityd-xpc-client"
+codesign --verify --strict --verbose=2 "$PREFIX/khaos-authorityd-keychain-provision"
 # Verify the deployed binaries actually satisfy a Team-ID anchored
 # requirement: signing "succeeded" is not proof unless the Security
 # framework accepts the same requirement the XPC frontend will enforce.

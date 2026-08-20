@@ -808,6 +808,7 @@ class AuthorityBroker:
         parent_principal_id: str = "",
         session_id: str = "",
         delegation_digest: str = "",
+        source_transport: str = "",
     ) -> AuthorityEnvelope:
         """Create one broker-owned context for a later capability issue."""
         try:
@@ -853,6 +854,7 @@ class AuthorityBroker:
                     "parent_principal_id": parent_principal_id,
                     "session_id": session_id,
                     "delegation_digest": delegation_digest,
+                    "source_transport": source_transport,
                     "ttl_seconds": _DEFAULT_GRANT_TTL_SECONDS,
                 }
             )
@@ -1065,6 +1067,7 @@ class AuthorityDaemonBroker(AuthorityBroker):
         parent_principal_id: str = "",
         session_id: str = "",
         delegation_digest: str = "",
+        source_transport: str = "",
     ) -> AuthorityEnvelope:
         grant = getattr(self._authorityd, "grant", None)
         if callable(grant):
@@ -1083,6 +1086,7 @@ class AuthorityDaemonBroker(AuthorityBroker):
                 parent_principal_id=parent_principal_id,
                 session_id=session_id,
                 delegation_digest=delegation_digest,
+                source_transport=source_transport,
             )
         else:
             # Protocol test doubles predating live grants remain usable only

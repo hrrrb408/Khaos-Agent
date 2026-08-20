@@ -316,3 +316,90 @@ def test_local_file_injection_cannot_become_a_manifest(tmp_path: Path) -> None:
         SecurityEvidenceManifest.from_payload(
             json.loads(fake.read_text(encoding="utf-8"))
         )
+
+
+def _api_mirror(manifests, *, jobs=None, run_name_override=None, artifact_bytes=None):
+    """Minimal faithful GitHub API double for recheck tests."""
+    def fetch_json(path: str):
+        rest = path.split("/actions/runs/", 1)[1]
+        parts = [segment.split("?")[0] for segment in rest.split("/")]
+        run_id, tail = parts[0], (parts[1] if len(parts) > 1 else "")
+        matching = [m for m in manifests if m.workflow_run_id == run_id]
+        if not matching:
+            raise LookupError("HTTP 404")
+        manifest = matching[0]
+        if tail == "":
+            return {
+                "head_sha": manifest.commit_sha,
+                "name": run_name_override or manifest.workflow_name,
+                "conclusion": "success",
+            }
+        if tail == "jobs":
+            if jobs is not None:
+                return jobs
+            return {
+                "total_count": 1,
+                "jobs": [{"id": int(manifest.job_id), "conclusion": "success"}],
+            }
+        if tail == "artifacts":
+            return {
+                "artifacts": [
+                    {
+                        "id": int(manifest.artifact_id),
+                        "name": manifest.artifact_name,
+                        "expired": False,
+                    }
+                ]
+            }
+        raise LookupError("HTTP 404")
+
+    def fetch_artifact(artifact_id: str) -> bytes:
+        if artifact_bytes is not None:
+            return artifact_bytes
+        return f"artifact-{artifact_id}".encode()
+
+    return fetch_json, fetch_artifact
+
+
+def test_recheck_rejects_missing_job() -> None:
+    """A well-formed manifest whose claimed job does not exist fails closed."""
+    from khaos.security.security_evidence import verify_manifests_against_github
+
+    manifests = [_manifest("security-closure-gate")]
+    fetch_json, fetch_artifact = _api_mirror(
+        manifests, jobs={"total_count": 1, "jobs": [{"id": 999999, "conclusion": "success"}]}
+    )
+    verification = verify_manifests_against_github(
+        manifests, fetch_json=fetch_json, fetch_artifact=fetch_artifact
+    )
+    assert not verification.ok
+    assert any("does not exist" in error for error in verification.errors)
+
+
+def test_recheck_rejects_workflow_name_mismatch() -> None:
+    """A run that exists under a different workflow identity is rejected."""
+    from khaos.security.security_evidence import verify_manifests_against_github
+
+    manifests = [_manifest("security-closure-gate")]
+    fetch_json, fetch_artifact = _api_mirror(
+        manifests, run_name_override="Unrelated Green Workflow"
+    )
+    verification = verify_manifests_against_github(
+        manifests, fetch_json=fetch_json, fetch_artifact=fetch_artifact
+    )
+    assert not verification.ok
+    assert any("workflow is" in error for error in verification.errors)
+
+
+def test_recheck_rejects_artifact_digest_mismatch() -> None:
+    from khaos.security.security_evidence import verify_manifests_against_github
+
+    manifests = [_manifest("security-closure-gate")]
+    fetch_json, fetch_artifact = _api_mirror(
+        manifests, artifact_bytes=b"not-the-manifested-bytes"
+    )
+    verification = verify_manifests_against_github(
+        manifests, fetch_json=fetch_json, fetch_artifact=fetch_artifact
+    )
+    assert not verification.ok
+    assert any("digest does not match" in error for error in verification.errors)

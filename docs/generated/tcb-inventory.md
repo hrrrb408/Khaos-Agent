@@ -37,7 +37,7 @@
 | Owner | Responsibility | Boundary |
 | --- | --- | --- |
 | `python/khaos/security/credential_broker.py` | credential leases; secrets materialize only in final trusted environments | no plaintext in the agent process |
-| `khaos-authorityd (backend daemon)` | Ed25519 signing key, protected at rest by the platform (keychain/DPAPI/0600) | agent holds only the public verification key |
+| `khaos-authorityd (backend daemon)` | Ed25519 signing key held as a 0400 file owned by the authority UID; the platform keychain (macOS) / DPAPI (Windows) item is a protected-key-slot presence marker bound to the service identity, NOT the signing key itself | agent holds only the public verification key |
 | `packaging/*/agent-secret-init.py` | compose secret materialization for the agent identity | file-permission enforced |
 
 ## Network owners
