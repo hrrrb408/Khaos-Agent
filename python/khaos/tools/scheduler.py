@@ -70,6 +70,7 @@ from khaos.tools.budget import (
 from khaos.tools.execution_coordinator import ToolExecutionCoordinator
 from khaos.tools.operation_store import OperationClaim, ToolOperationStore
 from khaos.tools.registry import ToolInvocationBroker, ToolRegistry
+from khaos.tools.result_finalizer import ToolResultFinalizer
 from khaos.tools.result_store import ToolResultStore
 from khaos.tools.scheduler_models import (
     DELIVERY_AUDIT_DEGRADED,
@@ -173,6 +174,10 @@ class ToolScheduler:
             db=getattr(permission_engine, "db", None),
             result_store=self.result_store,
         )
+        self._result_finalizer = ToolResultFinalizer(
+            audit_writer=self.permission_engine,
+            operation_store=self._operation_store,
+        )
         # Approval adapters have their own bounded lifecycle owner. The
         # scheduler only projects PermissionRequest and consumes its result.
         self._approval_runner = ApprovalCallbackRunner()
@@ -244,14 +249,6 @@ class ToolScheduler:
     ) -> ToolPhaseSnapshot:
         """Advance the immutable phase evidence attached to one call."""
         return ToolPhaseCoordinator.advance(call, next_phase, **evidence)
-
-    @staticmethod
-    def _terminalize_tool_phase(
-        call: dict[str, Any],
-        result: ToolResult,
-    ) -> ToolResult:
-        """Close a dispatched call and expose its immutable phase digest."""
-        return ToolPhaseCoordinator.terminalize(call, result)
 
     async def stream_batch(
         self,
@@ -428,7 +425,7 @@ class ToolScheduler:
                 target = self._resolve_target(
                     tool.name, normalized["arguments"], resource
                 )
-                audit_error = await self._audit_best_effort(
+                audit_error = await self._result_finalizer.audit_best_effort(
                     tool.name,
                     target,
                     "denied",
@@ -492,7 +489,7 @@ class ToolScheduler:
                 ),
             )
             if decision.approved == ApprovalMode.DENY:
-                await self._audit_best_effort(
+                await self._result_finalizer.audit_best_effort(
                     tool.name,
                     decision.target,
                     "denied",
@@ -709,7 +706,7 @@ class ToolScheduler:
                     await self._close_network_broker(normalized)
                     if destructive_context is not None:
                         await destructive_context["approval_broker"].cancel_operation(normalized["id"])
-                    await self._audit_best_effort(
+                    await self._result_finalizer.audit_best_effort(
                         tool.name,
                         decision.target,
                         "denied",
@@ -886,7 +883,7 @@ class ToolScheduler:
             result = await self._execute_one_impl(
                 call, session_id, mode, tool_context, reservation
             )
-            return self._terminalize_tool_phase(call, result)
+            return self._result_finalizer.terminalize(call, result)
         finally:
             await self._close_network_broker(call)
 
@@ -993,7 +990,7 @@ class ToolScheduler:
             )
             if not security.allowed:
                 await self._release_best_effort(reservation)
-                audit_error = await self._audit_best_effort(
+                audit_error = await self._result_finalizer.audit_best_effort(
                     tool.name,
                     target,
                     "denied",
@@ -1094,7 +1091,7 @@ class ToolScheduler:
             await self._release_best_effort(reservation)
             if handler_started:
                 effect_status = self._interrupted_effect_status(tool)
-                audit_error = await self._audit_best_effort(
+                audit_error = await self._result_finalizer.audit_best_effort(
                     tool.name,
                     target,
                     "cancelled",
@@ -1128,16 +1125,13 @@ class ToolScheduler:
                     reconciliation_hint=reconciliation_hint,
                     retry_safe=False,
                 )
-                result = await self._operation_store.finish(
+                result = await self._result_finalizer.finish_and_store(
                     operation_claim,
                     result,
                     terminal_status="unknown",
-                )
-                await self._operation_store.put_result(
-                    call,
+                    call=call,
                     session_id=session_id,
                     tool_context=tool_context,
-                    result=result,
                 )
                 logger.error(
                     "tool execution cancelled after handler dispatch: tool=%s effect_id=%s",
@@ -1158,7 +1152,7 @@ class ToolScheduler:
             await self._release_best_effort(reservation)
             if handler_started:
                 effect_status = self._exception_effect_status(tool)
-            audit_error = await self._audit_best_effort(
+            audit_error = await self._result_finalizer.audit_best_effort(
                 tool.name,
                 target,
                 "error",
@@ -1193,7 +1187,7 @@ class ToolScheduler:
                 reconciliation_hint=reconciliation_hint,
                 retry_safe=not handler_started,
             )
-            result = await self._operation_store.finish(
+            result = await self._result_finalizer.finish_and_store(
                 operation_claim,
                 result,
                 terminal_status=(
@@ -1201,11 +1195,11 @@ class ToolScheduler:
                     if effect_status in {EFFECT_UNKNOWN, EFFECT_PARTIAL}
                     else "completed"
                 ),
+                call=call,
+                session_id=session_id,
+                tool_context=tool_context,
+                store_result=handler_started,
             )
-            if handler_started:
-                await self._operation_store.put_result(
-                    call, session_id=session_id, tool_context=tool_context, result=result
-                )
             return result
 
         if not handler_ok:
@@ -1234,7 +1228,7 @@ class ToolScheduler:
                 "effect_status": effect_status,
                 "reconciliation_hint": reconciliation_hint,
             }
-            audit_error = await self._audit_best_effort(
+            audit_error = await self._result_finalizer.audit_best_effort(
                 tool.name, target, "failure", detail, session_id
             )
             if audit_error:
@@ -1258,7 +1252,7 @@ class ToolScheduler:
                 reconciliation_hint=reconciliation_hint,
                 retry_safe=handler_retry_safe and effect_status == EFFECT_NOT_APPLIED,
             )
-            result = await self._operation_store.finish(
+            result = await self._result_finalizer.finish_and_store(
                 operation_claim,
                 result,
                 terminal_status=(
@@ -1266,9 +1260,9 @@ class ToolScheduler:
                     if effect_status in {EFFECT_UNKNOWN, EFFECT_PARTIAL}
                     else "completed"
                 ),
-            )
-            await self._operation_store.put_result(
-                call, session_id=session_id, tool_context=tool_context, result=result
+                call=call,
+                session_id=session_id,
+                tool_context=tool_context,
             )
             return result
 
@@ -1290,7 +1284,7 @@ class ToolScheduler:
             await self._release_best_effort(reservation)
             delivery_status = DELIVERY_DEGRADED
             warning = f"effect completed but result delivery failed: {exc}"
-            audit_error = await self._audit_best_effort(
+            audit_error = await self._result_finalizer.audit_best_effort(
                 tool.name,
                 target,
                 "success_degraded",
@@ -1327,7 +1321,7 @@ class ToolScheduler:
                 reconciliation_hint=reconciliation_hint,
                 retry_safe=effect_status == EFFECT_NOT_APPLIED,
             )
-            result = await self._operation_store.finish(
+            result = await self._result_finalizer.finish_and_store(
                 operation_claim,
                 result,
                 terminal_status=(
@@ -1335,9 +1329,9 @@ class ToolScheduler:
                     if effect_status in {EFFECT_UNKNOWN, EFFECT_PARTIAL}
                     else "completed"
                 ),
-            )
-            await self._operation_store.put_result(
-                call, session_id=session_id, tool_context=tool_context, result=result
+                call=call,
+                session_id=session_id,
+                tool_context=tool_context,
             )
             return result
 
@@ -1368,7 +1362,7 @@ class ToolScheduler:
             warnings.append(f"budget accounting failed: {exc}")
 
         detail["delivery_status"] = delivery_status
-        audit_error = await self._audit_best_effort(
+        audit_error = await self._result_finalizer.audit_best_effort(
             tool.name,
             target,
             "success",
@@ -1405,7 +1399,7 @@ class ToolScheduler:
             reconciliation_hint=reconciliation_hint,
             retry_safe=effect_status == EFFECT_NOT_APPLIED,
         )
-        result = await self._operation_store.finish(
+        result = await self._result_finalizer.finish_and_store(
             operation_claim,
             result,
             terminal_status=(
@@ -1413,9 +1407,9 @@ class ToolScheduler:
                 if effect_status in {EFFECT_UNKNOWN, EFFECT_PARTIAL}
                 else "completed"
             ),
-        )
-        await self._operation_store.put_result(
-            call, session_id=session_id, tool_context=tool_context, result=result
+            call=call,
+            session_id=session_id,
+            tool_context=tool_context,
         )
         return result
 
@@ -1439,60 +1433,6 @@ class ToolScheduler:
     def _interrupted_effect_status(cls, tool: Any) -> str:
         """Classify cancellation after dispatch conservatively."""
         return cls._exception_effect_status(tool)
-
-    async def _claim_operation(
-        self,
-        call: dict,
-        *,
-        tool: Any,
-        session_id: str | None,
-        tool_context: dict[str, Any],
-    ) -> OperationClaim | None:
-        """Compatibility delegate for the operation-store migration."""
-        return await self._operation_store.claim(
-            call,
-            tool=tool,
-            session_id=session_id,
-            tool_context=tool_context,
-        )
-
-    async def _wait_for_operation(
-        self,
-        claim: OperationClaim,
-        *,
-        call: dict,
-        tool: Any,
-        session_id: str | None,
-        tool_context: dict[str, Any],
-        timeout: float,
-    ) -> ToolResult:
-        """Compatibility delegate for the operation-store migration."""
-        return await self._operation_store.wait(
-            claim,
-            call=call,
-            tool=tool,
-            session_id=session_id,
-            tool_context=tool_context,
-            timeout=timeout,
-        )
-
-    async def _finish_operation(
-        self,
-        claim: OperationClaim | None,
-        result: ToolResult,
-        *,
-        terminal_status: str,
-    ) -> ToolResult:
-        """Compatibility delegate for the operation-store migration."""
-        return await self._operation_store.finish(
-            claim, result, terminal_status=terminal_status
-        )
-
-    async def _update_operation_effect_id(
-        self, claim: OperationClaim, effect_id: str
-    ) -> None:
-        """Compatibility delegate for the operation-store migration."""
-        await self._operation_store.update_effect_id(claim, effect_id)
 
     def _build_step_authority(
         self,
@@ -2053,34 +1993,6 @@ class ToolScheduler:
             return "execution refused: no execution backend configured"
         return ""
 
-    async def _audit_best_effort(
-        self,
-        tool_name: str,
-        target: str,
-        result: str,
-        detail: dict[str, Any],
-        session_id: str | None,
-    ) -> str:
-        """Attempt an audit without converting a completed effect to failure."""
-        try:
-            row_id = await self.permission_engine.audit(
-                tool_name,
-                target,
-                result,
-                detail,
-                session_id,
-            )
-            if isinstance(row_id, int) and row_id < 0:
-                return "audit repository rejected the event"
-        except Exception as exc:
-            logger.exception(
-                "tool audit persistence failed: tool=%s result=%s",
-                tool_name,
-                result,
-            )
-            return str(exc)
-        return ""
-
     async def _release_best_effort(self, reservation: ToolBudgetReservation) -> None:
         try:
             await reservation.release()
@@ -2098,37 +2010,17 @@ class ToolScheduler:
         session_id: str | None,
         tool_context: dict[str, Any],
     ) -> str:
+        """Expose the operation-store identity for recovery tooling.
+
+        The scheduler does not implement scope calculation; this narrow
+        projection remains for restart-recovery callers that need to seed or
+        inspect the durable operation row.
+        """
         return self._operation_store.scope(
             self._idempotency_key(call),
             tool_name=str(call.get("name") or ""),
             session_id=session_id,
             tool_context=tool_context,
-        )
-
-    async def _get_idempotent_result(
-        self,
-        call: dict,
-        *,
-        session_id: str | None,
-        tool_context: dict[str, Any],
-    ) -> ToolResult | None:
-        return await self._operation_store.get_result(
-            call, session_id=session_id, tool_context=tool_context
-        )
-
-    async def _store_idempotent_result(
-        self,
-        call: dict,
-        *,
-        session_id: str | None,
-        tool_context: dict[str, Any],
-        result: ToolResult,
-    ) -> None:
-        await self._operation_store.put_result(
-            call,
-            session_id=session_id,
-            tool_context=tool_context,
-            result=result,
         )
 
     async def _confirm(

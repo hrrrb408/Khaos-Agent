@@ -97,6 +97,7 @@
 - `python/khaos/scheduler/due_selector.py`: `7818c8542808a0657ae53681a6221a966bd4d00871aaecd5e92c2bc2776f7721`
 - `python/khaos/coding/planning/limits.py`: `f39749886151ed96b73a9e252bd6a568b0f85d295aed77282e5c8ebc64d87193`
 - `python/khaos/tools/result_codec.py`: `cf9852cb62f4daeb07a3bdfc4144492dfbcd95661a26f08e97d2d9ef99f716fb`
+- `python/khaos/tools/result_finalizer.py`: `f8d5fa676602a17f0c93cf7bb9cb92730157aa7488e68ecf759fc468eafc15a2`
 - `python/khaos/rpc/protocol.py`: `5960a4e41b94b63a47ccadd362288f97f4747ad56d6db065f9741cebfbc768a6`
 - `rust/khaos-core/src/bin/khaos-exec-launcher.rs`: `c5eb7343002ecb7f74e1ca10df5d5edaf4de39f90ecc68064cb355b56b2fda71`
 - `rust/khaos-core/src/bin/khaos-sandbox-launcher.rs`: `9e68f6b622c7ccd29f24d76aa504da1624bf04c128f9215b57ec580b317b75ab`

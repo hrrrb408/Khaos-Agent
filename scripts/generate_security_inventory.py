@@ -165,6 +165,7 @@ def render() -> str:
         ("python/khaos/scheduler/due_selector.py", sha256(ROOT / "python" / "khaos" / "scheduler" / "due_selector.py")),
         ("python/khaos/coding/planning/limits.py", sha256(ROOT / "python" / "khaos" / "coding" / "planning" / "limits.py")),
         ("python/khaos/tools/result_codec.py", sha256(ROOT / "python" / "khaos" / "tools" / "result_codec.py")),
+        ("python/khaos/tools/result_finalizer.py", sha256(ROOT / "python" / "khaos" / "tools" / "result_finalizer.py")),
         ("python/khaos/rpc/protocol.py", sha256(ROOT / "python" / "khaos" / "rpc" / "protocol.py")),
         ("rust/khaos-core/src/bin/khaos-exec-launcher.rs", sha256(ROOT / "rust" / "khaos-core" / "src" / "bin" / "khaos-exec-launcher.rs")),
         ("rust/khaos-core/src/bin/khaos-sandbox-launcher.rs", sha256(ROOT / "rust" / "khaos-core" / "src" / "bin" / "khaos-sandbox-launcher.rs")),

@@ -19,6 +19,7 @@ from khaos.tools.registry import (
     create_runtime_registry,
 )
 from khaos.tools.result_codec import ToolResultCodec
+from khaos.tools.result_finalizer import ToolResultFinalizer
 from khaos.tools.result_store import ToolResultStore
 
 __all__ = [
@@ -33,6 +34,7 @@ __all__ = [
     "ToolOperationStore",
     "ToolRegistry",
     "ToolResultCodec",
+    "ToolResultFinalizer",
     "ToolResultStore",
     "build_approval_binding",
     "build_permission_request",

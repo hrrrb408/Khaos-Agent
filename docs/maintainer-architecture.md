@@ -63,7 +63,7 @@ KHAOS.md / AGENTS.md
 | 领域状态/效果 | 当前入口 | 权威 writer | 观察者/适配器 | 备注 |
 | --- | --- | --- | --- | --- |
 | Turn/event/terminal | `python/khaos/agent/events.py`、`agent/core.py` | `TurnCoordinator` + `Database` 事件事务 | Gateway/TUI/message adapter | `Message` 是兼容投影，不应成为新终态来源 |
-| Tool invocation | `python/khaos/tools/registry.py`、`tools/scheduler.py` | `ToolScheduler`（调度）+ `tools/result_store.py`（runtime result replay） | tool handler、event renderer | handler 不接收 `approved=True` 作为权限证明；跨重启 replay 仍由 durable operation row 决定 |
+| Tool invocation | `python/khaos/tools/registry.py`、`tools/scheduler.py` | `ToolScheduler`（调度）+ `tools/result_finalizer.py`（terminal/audit/result delivery）+ `tools/result_store.py`（runtime result replay） | tool handler、event renderer | handler 不接收 `approved=True` 作为权限证明；跨重启 replay 仍由 durable operation row 决定 |
 | Effective policy | `python/khaos/security/effective_policy.py` | 启动期 immutable policy compiler | runtime、authorityd、execution selector | 原始 YAML 不是运行时权限对象 |
 | Ordinary approval | `python/khaos/agent/approval.py`、permissions/、`tools/approval_callback.py`、`tools/authorization.py` | `ToolAuthorization` 拥有 policy decision hardening/remember projection；broker/durable consume path 拥有 one-shot capability；`ApprovalCallbackRunner` 只拥有 adapter 生命周期 | Gateway confirm、TUI dialog | one-shot、principal/context/args/expiry 绑定；回调线程未终止时不得报告 CLOSED |
 | Plan/change approval | `coding/planning/approval/` | `approval/schema.py`（schema/migration）+ approval runtime/store + signed receipt | plan UI、verification | 不能与普通 tool approval 静默合并；schema owner 不执行业务状态转换 |
@@ -81,7 +81,8 @@ KHAOS.md / AGENTS.md
 | 文件 | 当前集中职责 | 拆分目标 |
 | --- | --- | --- |
 | `python/khaos/db/database.py` | 迁移、事务 owner、turn/event、audit、memory、task、scheduler 等领域 facade；session/message 只做 lease/transaction 编排 | `python/khaos/db/connection.py` 拥有物理连接生命周期；`db/repositories/sessions.py` 拥有 session/message SQL 与 row conversion，最终继续按领域拆 repository 并保留一个薄 facade |
-| `python/khaos/tools/scheduler.py` | admission 后的 approval、批次并发和结果事件编排 | `ToolAdmission`、`ToolResultStore`（runtime replay cache）、`ToolOperationStore`（claim/wait/terminal idempotency）、`ApprovalCallbackRunner`（adapter 生命周期）、`ToolAuthorization`（decision/remember/binding contract）、`ToolExecutionCoordinator`（authority-bound dispatch） |
+| `python/khaos/tools/scheduler.py` | admission 后的 approval、批次并发和结果事件编排 | `ToolAdmission`、`ToolResultFinalizer`（terminal phase/audit/result delivery）、`ToolResultStore`（runtime replay cache）、`ToolOperationStore`（claim/wait/terminal idempotency）、`ApprovalCallbackRunner`（adapter 生命周期）、`ToolAuthorization`（decision/remember/binding contract）、`ToolExecutionCoordinator`（authority-bound dispatch） |
+| `python/khaos/tools/result_finalizer.py` | dispatched tool 的 terminal phase、best-effort audit、durable operation finish 和 idempotent result publish | `ToolResultFinalizer`；不做 admission、permission decision、handler dispatch 或 budget ownership |
 | `python/khaos/tools/authorization.py` | permission decision hardening、remember rule projection、approval binding/request projection | `ToolAuthorization`、`build_approval_binding`、`build_permission_request`；不注册/消费 broker，不执行工具效果 |
 | `python/khaos/tools/operation_store.py` | operation scope、durable claim、in-process waiter、effect-id update 和 terminal replay | `ToolOperationStore`；只消费 result cache 与已授权 DB operation ports，不做 admission/permission/handler dispatch |
 | `python/khaos/tools/execution_coordinator.py` | 单步 authority context、handler timeout、broker dispatch 和 effect outcome normalization | `ToolExecutionCoordinator`；不做 permission、claim、budget、audit 或批次事件 |
@@ -208,7 +209,7 @@ REQUESTED -> SNAPSHOT_BOUND -> RUNNING -> PROOF_RECORDED
 
 ### Phase 3：工具和执行边界
 
-- `ToolScheduler` 的调用 admission 已收敛到 `python/khaos/tools/admission.py`；结果/事件值对象已收敛到 `python/khaos/tools/scheduler_models.py`，结果归一化与 durable JSON 编解码已收敛到 `python/khaos/tools/result_codec.py`，runtime 幂等结果 replay cache 已收敛到 `python/khaos/tools/result_store.py`，原子预算已收敛到 `python/khaos/tools/budget.py`；`tools.scheduler` 仅保留一个迁移周期的兼容导出。
+- `ToolScheduler` 的调用 admission 已收敛到 `python/khaos/tools/admission.py`；结果/事件值对象已收敛到 `python/khaos/tools/scheduler_models.py`，结果归一化与 durable JSON 编解码已收敛到 `python/khaos/tools/result_codec.py`，runtime 幂等结果 replay cache 已收敛到 `python/khaos/tools/result_store.py`，terminal phase/audit/result delivery 已收敛到 `python/khaos/tools/result_finalizer.py`，原子预算已收敛到 `python/khaos/tools/budget.py`；`tools.scheduler` 仅保留一个迁移周期的兼容导出。
 - approval callback 的 schema、deadline、容量和 worker 关闭语义已收敛到 `python/khaos/tools/approval_callback.py`；scheduler 不再直接拥有 callback executor。
 - `ToolAuthorization` 已收敛 permission decision hardening、interactive remember projection，以及 `ApprovalBinding`/`PermissionRequest` 的 digest/字段投影；scheduler 只保留 broker 注册、确认事件和 capability consume 编排，后续由 `ToolExecutionCoordinator` 接管效果准备与 dispatch。
 - `ToolOperationStore` 已收敛 durable operation claim/wait/finalize 与 runtime waiter map；scheduler 的旧幂等方法仅为兼容委托，后续删除并由 `ToolExecutionCoordinator` 直接消费该 owner。
@@ -218,7 +219,7 @@ REQUESTED -> SNAPSHOT_BOUND -> RUNNING -> PROOF_RECORDED
 - Plan approval 的 DDL 与 post-schema migration 已收敛到 `coding/planning/approval/schema.py`；`PlanApprovalStore` 的 `APPROVAL_SCHEMA` 仅为兼容导出，后续删除。
 - Plan approval request/decision/audit/authorization 的只读 SQL 与 row conversion 已收敛到 `coding/planning/approval/read_model.py`；execution run/journal/attestation 读取与 digest 校验已收敛到 `coding/planning/approval/execution_read_model.py`。`PlanApprovalStore` 的两组读取方法仅为兼容委托，后续在调用迁移完成后删除。
 - Plan execution run/attestation/terminal recovery 写事务已收敛到 `coding/planning/approval/execution_writer.py`，edit journal/rollback proof 写事务已收敛到 `coding/planning/approval/execution_journal_writer.py`；`PlanApprovalStore` 的公开写方法仅保留一周期兼容委托。
-- 下一步将 `ToolScheduler` 拆成 admission、capability consume、execution、result/audit 四段；每段只能消费上述类型，不能重新定义平行的 `ToolResult`、预算或 effect 状态。
+- `ToolScheduler` 已拆出 admission、execution、terminal/result delivery 四段；每段只能消费上述类型，不能重新定义平行的 `ToolResult`、预算或 effect 状态。下一步只处理 capability consume 与跨模块 port，不再把终态逻辑塞回 scheduler。
 - 将 file/Git/process 入口收敛为可注入 port，并为每个 port 提供 fail-closed contract tests。
 
 ### Phase 4：计划、验证和调度
