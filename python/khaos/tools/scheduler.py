@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import inspect
 import json
 import logging
@@ -14,7 +13,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -60,6 +59,7 @@ from khaos.security.orchestration_phases import (
     ToolPhaseSnapshot,
     digest_phase_payload,
 )
+from khaos.security.protocol_boundary import canonical_digest as _canonical_digest
 from khaos.tools.admission import RejectedToolCall, ToolAdmission
 from khaos.tools.budget import (
     ToolBudget,
@@ -69,6 +69,7 @@ from khaos.tools.budget import (
 )
 from khaos.tools.registry import ToolInvocationBroker, ToolRegistry
 from khaos.tools.result_codec import ToolResultCodec
+from khaos.tools.result_store import ToolResultStore
 from khaos.tools.scheduler_models import (
     DELIVERY_AUDIT_DEGRADED,
     DELIVERY_COMPLETE,
@@ -115,7 +116,6 @@ __all__ = (
     "ToolScheduler",
 )
 
-_IDEMPOTENCY_CACHE_LIMIT = 1024
 _CONFIRM_ALLOWED_KEYS = frozenset({
     "approved", "remember", "pattern", "reason",
 })
@@ -196,15 +196,6 @@ def _normalize_confirmation(value: object) -> dict[str, Any]:
 
 
 @dataclass
-class _IdempotencyRecord:
-    """Runtime-scoped result retained for an explicit idempotency key."""
-
-    arguments_digest: str
-    result: ToolResult
-    stored_at: float = field(default_factory=time.monotonic)
-
-
-@dataclass
 class _OperationClaim:
     """In-process view of a durable tool-operation claim."""
 
@@ -264,8 +255,7 @@ class ToolScheduler:
         # Idempotency is server-owned and runtime-scoped.  Model tool-call
         # IDs are only one input to the server binding; a model or plugin
         # supplied top-level ``idempotency_key`` is never trusted.
-        self._idempotency_lock = asyncio.Lock()
-        self._idempotency_results: dict[str, _IdempotencyRecord] = {}
+        self.result_store = ToolResultStore()
         # A durable row is the authority; these maps only coordinate
         # duplicate callers in this process.  A missing in-process owner on a
         # restart is treated as UNKNOWN and is never replayed automatically.
@@ -1719,20 +1709,15 @@ class ToolScheduler:
         # database row may still be ``running`` in that case; consulting it
         # first would misclassify a known completed effect as an orphan and
         # make the second caller lose the original effect facts.
-        async with self._idempotency_lock:
-            record = self._idempotency_results.get(operation_id)
-            if record is not None:
-                if record.arguments_digest != arguments_digest:
-                    raise PermissionDeniedError(
-                        "idempotency key was reused with different tool arguments"
-                    )
-                return _OperationClaim(
-                    operation_id=operation_id,
-                    owner_token="",
-                    effect_id=record.result.effect_id,
-                    arguments_digest=arguments_digest,
-                    result=record.result,
-                )
+        cached_result = await self.result_store.get(operation_id, arguments_digest)
+        if cached_result is not None:
+            return _OperationClaim(
+                operation_id=operation_id,
+                owner_token="",
+                effect_id=cached_result.effect_id,
+                arguments_digest=arguments_digest,
+                result=cached_result,
+            )
         active_event = self._operation_events.get(operation_id)
         if active_event is not None:
             active_claim = self._operation_claims.get(operation_id)
@@ -1842,47 +1827,42 @@ class ToolScheduler:
         # local usability, but close the old concurrent duplicate race with
         # the same claim/event protocol.  Production runtimes always use the
         # durable branch above.
-        async with self._idempotency_lock:
-            record = self._idempotency_results.get(operation_id)
-            if record is not None:
-                if record.arguments_digest != arguments_digest:
-                    raise PermissionDeniedError(
-                        "idempotency key was reused with different tool arguments"
-                    )
-                return _OperationClaim(
-                    operation_id=operation_id,
-                    owner_token="",
-                    effect_id=record.result.effect_id,
-                    arguments_digest=arguments_digest,
-                    result=record.result,
-                )
-            event = self._operation_events.get(operation_id)
-            if event is not None:
-                active_claim = self._operation_claims.get(operation_id)
-                if (
-                    active_claim is not None
-                    and active_claim.arguments_digest != arguments_digest
-                ):
-                    raise PermissionDeniedError(
-                        "idempotency key was reused with different tool arguments"
-                    )
-                return _OperationClaim(
-                    operation_id=operation_id,
-                    owner_token="",
-                    effect_id=(active_claim.effect_id if active_claim else ""),
-                    arguments_digest=arguments_digest,
-                    wait_event=event,
-                )
-            event = asyncio.Event()
-            self._operation_events[operation_id] = event
-            claim = _OperationClaim(
+        cached_result = await self.result_store.get(operation_id, arguments_digest)
+        if cached_result is not None:
+            return _OperationClaim(
                 operation_id=operation_id,
-                owner_token=owner_token,
-                effect_id=effect_id,
+                owner_token="",
+                effect_id=cached_result.effect_id,
                 arguments_digest=arguments_digest,
+                result=cached_result,
             )
-            self._operation_claims[operation_id] = claim
-            return claim
+        event = self._operation_events.get(operation_id)
+        if event is not None:
+            active_claim = self._operation_claims.get(operation_id)
+            if (
+                active_claim is not None
+                and active_claim.arguments_digest != arguments_digest
+            ):
+                raise PermissionDeniedError(
+                    "idempotency key was reused with different tool arguments"
+                )
+            return _OperationClaim(
+                operation_id=operation_id,
+                owner_token="",
+                effect_id=(active_claim.effect_id if active_claim else ""),
+                arguments_digest=arguments_digest,
+                wait_event=event,
+            )
+        event = asyncio.Event()
+        self._operation_events[operation_id] = event
+        claim = _OperationClaim(
+            operation_id=operation_id,
+            owner_token=owner_token,
+            effect_id=effect_id,
+            arguments_digest=arguments_digest,
+        )
+        self._operation_claims[operation_id] = claim
+        return claim
 
     async def _wait_for_operation(
         self,
@@ -1914,9 +1894,12 @@ class ToolScheduler:
                     retry_safe=False,
                 )
         operation_id = claim.operation_id
-        result = self._idempotency_results.get(operation_id)
+        result = await self.result_store.get(
+            operation_id,
+            _canonical_digest(call.get("arguments", {})),
+        )
         if result is not None:
-            return result.result
+            return result
         db = getattr(self.permission_engine, "db", None)
         claim_method = getattr(db, "claim_tool_operation", None)
         if callable(claim_method):
@@ -1997,47 +1980,36 @@ class ToolScheduler:
                     claim.operation_id,
                 )
         try:
-            async with self._idempotency_lock:
-                if (
-                    claim.operation_id not in self._idempotency_results
-                    and len(self._idempotency_results) >= _IDEMPOTENCY_CACHE_LIMIT
-                ):
-                    oldest = min(
-                        self._idempotency_results,
-                        key=lambda item: self._idempotency_results[item].stored_at,
-                    )
-                    self._idempotency_results.pop(oldest, None)
-                cached_result = result
-                if journal_error:
-                    hint = result.reconciliation_hint or (
-                        "durable operation finalization failed; reconcile effect_id "
-                        "before retry"
-                    )
-                    warning = result.warning
-                    warning = f"{warning}; " if warning else ""
-                    warning += journal_error
-                    cached_result = replace(
-                        result,
-                        delivery_status=(
-                            result.delivery_status
-                            if result.delivery_status == DELIVERY_AUDIT_DEGRADED
-                            else DELIVERY_DEGRADED
-                        ),
-                        warning=warning,
-                        reconciliation_hint=hint,
-                        retry_safe=False,
-                    )
-                self._idempotency_results[claim.operation_id] = _IdempotencyRecord(
-                    arguments_digest=_canonical_digest(
-                        cached_result.arguments or {}
-                    ),
-                    result=cached_result,
+            cached_result = result
+            if journal_error:
+                hint = result.reconciliation_hint or (
+                    "durable operation finalization failed; reconcile effect_id "
+                    "before retry"
                 )
-                event = self._operation_events.pop(claim.operation_id, None)
-                self._operation_claims.pop(claim.operation_id, None)
-                if event is not None:
-                    event.set()
-                return cached_result
+                warning = result.warning
+                warning = f"{warning}; " if warning else ""
+                warning += journal_error
+                cached_result = replace(
+                    result,
+                    delivery_status=(
+                        result.delivery_status
+                        if result.delivery_status == DELIVERY_AUDIT_DEGRADED
+                        else DELIVERY_DEGRADED
+                    ),
+                    warning=warning,
+                    reconciliation_hint=hint,
+                    retry_safe=False,
+                )
+            await self.result_store.put(
+                claim.operation_id,
+                _canonical_digest(cached_result.arguments or {}),
+                cached_result,
+            )
+            event = self._operation_events.pop(claim.operation_id, None)
+            self._operation_claims.pop(claim.operation_id, None)
+            if event is not None:
+                event.set()
+            return cached_result
         except Exception as exc:
             logger.exception(
                 "in-process operation finalization failed: operation_id=%s",
@@ -2711,15 +2683,7 @@ class ToolScheduler:
         if not scope:
             return None
         arguments_digest = _canonical_digest(call.get("arguments", {}))
-        async with self._idempotency_lock:
-            record = self._idempotency_results.get(scope)
-            if record is None:
-                return None
-            if record.arguments_digest != arguments_digest:
-                raise PermissionDeniedError(
-                    "idempotency key was reused with different tool arguments"
-                )
-            return record.result
+        return await self.result_store.get(scope, arguments_digest)
 
     async def _store_idempotent_result(
         self,
@@ -2734,17 +2698,11 @@ class ToolScheduler:
         )
         if not scope:
             return
-        async with self._idempotency_lock:
-            if len(self._idempotency_results) >= _IDEMPOTENCY_CACHE_LIMIT:
-                oldest = min(
-                    self._idempotency_results,
-                    key=lambda item: self._idempotency_results[item].stored_at,
-                )
-                self._idempotency_results.pop(oldest, None)
-            self._idempotency_results[scope] = _IdempotencyRecord(
-                arguments_digest=_canonical_digest(call.get("arguments", {})),
-                result=result,
-            )
+        await self.result_store.put(
+            scope,
+            _canonical_digest(call.get("arguments", {})),
+            result,
+        )
 
     async def _confirm(
         self,
@@ -2868,13 +2826,6 @@ class ToolScheduler:
     def _normalize_call(call: dict) -> dict:
         """Compatibility wrapper for callers of the old scheduler helper."""
         return ToolAdmission.normalize_call(call)
-
-
-def _canonical_digest(value: object) -> str:
-    encoded = json.dumps(
-        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
 
 
 def _execution_argv_for_authority(

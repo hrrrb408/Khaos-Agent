@@ -9,6 +9,7 @@ from khaos.tools.registry import (
     create_runtime_registry,
 )
 from khaos.tools.result_codec import ToolResultCodec
+from khaos.tools.result_store import ToolResultStore
 
 __all__ = [
     "ToolCapability",
@@ -16,6 +17,7 @@ __all__ = [
     "ToolInvocationBroker",
     "ToolRegistry",
     "ToolResultCodec",
+    "ToolResultStore",
     "create_builtin_registry",
     "create_runtime_registry",
 ]
