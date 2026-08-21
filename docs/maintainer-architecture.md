@@ -84,7 +84,7 @@ KHAOS.md / AGENTS.md
 | `python/khaos/tools/scheduler.py` | approval、authority、idempotency、并发和结果归一化 | `ToolAuthorization`、`ToolExecutionCoordinator`、`ToolResultStore` |
 | `python/khaos/tools/admission.py` | 工具调用规范化、raw phase、注册表解析和参数校验 | `ToolAdmission`；只返回 `AdmittedToolCall`/`RejectedToolCall`，不做权限、authority 或执行 |
 | `python/khaos/tools/scheduler_models.py`、`tools/budget.py` | 调度结果协议、权限请求事件和原子预算 reservation/commit | 已完成首个 seam；后续只允许由调度器编排，不在 handler 中复制预算或结果状态机 |
-| `python/khaos/grpc_server.py` | transport/auth/startup、Agent service，以及兼容导出 | protocol/auth middleware、composition root、每个 service 独立模块；服务只消费已认证 context。MemoryService、SessionService、AuditService 已迁移到 `python/khaos/rpc/` |
+| `python/khaos/grpc_server.py` | transport/auth/startup、Agent service，以及兼容导出 | protocol/auth middleware、composition root、每个 service 独立模块；服务只消费已认证 context。MemoryService、SessionService、AuditService 已迁移到 `python/khaos/rpc/`；`python/khaos/rpc/protocol.py` 现在拥有协议常量、协商、绑定声明和认证器，grpc 导入仅是迁移期兼容导出 |
 | `python/khaos/coding/planning/approval/store.py` | schema、CAS transition、receipt、lease、plan execution event 和 read model | schema/migration、approval ledger、receipt verifier、execution-event repository、read model |
 | `python/khaos/scheduler/engine.py` | cron 解析、持久化、调度、执行、恢复和审计 | schedule repository、due-item selector、execution coordinator、recovery worker |
 | `python/khaos/runtime/factory.py` | 依赖装配和兼容参数转换 | 保留为唯一 composition root；业务逻辑不得回流到 factory |
@@ -183,7 +183,7 @@ REQUESTED -> SNAPSHOT_BOUND -> RUNNING -> PROOF_RECORDED
 ### Phase 2：数据库与 RPC 边界
 
 - 从 `Database` 提取连接/迁移/repository，先迁移只读查询，再迁移写事务。
-- 从 `grpc_server.py` 提取 protocol/auth/service；MemoryService、SessionService、AuditService 已完成首批 seam，保留兼容导出，不增加第二套 server authority。
+- 从 `grpc_server.py` 提取 protocol/auth/service；MemoryService、SessionService、AuditService 已完成首批 seam，协议边界已落在 `python/khaos/rpc/protocol.py`。`grpc_server.py` 的旧名称只作为显式兼容导出保留，后续迁移周期必须删除，不增加第二套 server authority。
 
 ### Phase 3：工具和执行边界
 
