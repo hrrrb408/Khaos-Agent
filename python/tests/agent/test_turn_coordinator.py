@@ -1,8 +1,8 @@
 import asyncio
 
 import pytest
-
 from khaos.agent.events import TurnCoordinator
+from khaos.agent.turn_repository import DatabaseTurnRepository
 from khaos.db import Database
 
 
@@ -18,8 +18,9 @@ async def _database(path):
 
 async def test_turn_events_are_ordered_paired_and_single_terminal(tmp_path):
     db = await _database(tmp_path / "khaos.db")
+    repository = DatabaseTurnRepository(db)
     turn = await TurnCoordinator.start(
-        db, session_id="session", task_id="task", principal_id="principal"
+        repository, session_id="session", task_id="task", principal_id="principal"
     )
     with pytest.raises(PermissionError, match="unmatched tool call"):
         await turn.emit("tool.result", {"tool_call_id": "call"})
@@ -52,15 +53,19 @@ async def test_turn_events_are_ordered_paired_and_single_terminal(tmp_path):
 async def test_process_restart_interrupts_inflight_turn(tmp_path):
     path = tmp_path / "khaos.db"
     first_db = await _database(path)
+    first_repository = DatabaseTurnRepository(first_db)
     abandoned = await TurnCoordinator.start(
-        first_db, session_id="session", task_id=None, principal_id="principal"
+        first_repository,
+        session_id="session", task_id=None, principal_id="principal"
     )
     await abandoned.emit("model.retry", {"attempt": 1})
     await first_db.close()
 
     restarted_db = await _database(path)
+    restarted_repository = DatabaseTurnRepository(restarted_db)
     current = await TurnCoordinator.start(
-        restarted_db, session_id="session", task_id=None, principal_id="principal"
+        restarted_repository,
+        session_id="session", task_id=None, principal_id="principal"
     )
     old_events = await restarted_db.list_agent_turn_events(abandoned.turn_id)
     assert old_events[-1]["event_type"] == "turn.interrupted"
@@ -69,7 +74,7 @@ async def test_process_restart_interrupts_inflight_turn(tmp_path):
 
 
 async def test_concurrent_turn_starts_wait_for_the_same_recovery():
-    class BlockingRecoveryDatabase:
+    class BlockingRecoveryRepository:
         def __init__(self):
             self.recovery_started = asyncio.Event()
             self.allow_recovery = asyncio.Event()
@@ -85,37 +90,40 @@ async def test_concurrent_turn_starts_wait_for_the_same_recovery():
             assert self.allow_recovery.is_set()
             self.started_turns += 1
 
-    db = BlockingRecoveryDatabase()
+    repository = BlockingRecoveryRepository()
     first = asyncio.create_task(
         TurnCoordinator.start(
-            db, session_id="session", task_id=None, principal_id="principal"
+            repository,
+            session_id="session", task_id=None, principal_id="principal"
         )
     )
-    await db.recovery_started.wait()
+    await repository.recovery_started.wait()
     second = asyncio.create_task(
         TurnCoordinator.start(
-            db, session_id="session", task_id=None, principal_id="principal"
+            repository,
+            session_id="session", task_id=None, principal_id="principal"
         )
     )
     await asyncio.sleep(0)
 
     assert not first.done()
     assert not second.done()
-    db.allow_recovery.set()
+    repository.allow_recovery.set()
     await asyncio.gather(first, second)
 
-    assert db.recovery_calls == 1
-    assert db.started_turns == 2
+    assert repository.recovery_calls == 1
+    assert repository.started_turns == 2
 
 
 async def test_database_rejects_sequence_race(tmp_path):
     db = await _database(tmp_path / "khaos.db")
+    repository = DatabaseTurnRepository(db)
     turn = await TurnCoordinator.start(
-        db, session_id="session", task_id=None, principal_id="principal"
+        repository, session_id="session", task_id=None, principal_id="principal"
     )
 
     async def append(label):
-        return await db.append_agent_turn_event(
+        return await repository.append_agent_turn_event(
             turn_id=turn.turn_id,
             expected_sequence=1,
             event_type="model.retry",

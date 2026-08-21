@@ -23,6 +23,7 @@ import time
 
 import pytest
 from khaos.agent.core import Message
+from khaos.agent.turn_repository import DatabaseTurnRepository
 from khaos.db.database import Database
 from khaos.memory import SqliteMemoryRepository
 
@@ -288,9 +289,10 @@ async def test_concurrent_turn_terminalization_and_scheduler_write(db: Database)
     now = time.time()
 
     await db.create_session(session, principal_id=principal, project_id=project)
+    turn_repository = DatabaseTurnRepository(db)
 
     # Start a turn
-    await db.start_agent_turn(
+    await turn_repository.start_agent_turn(
         turn_id="turn-4",
         attempt_id="attempt-4",
         session_id=session,
@@ -316,7 +318,7 @@ async def test_concurrent_turn_terminalization_and_scheduler_write(db: Database)
     terminal_can_finish = asyncio.Event()
 
     async def terminalize_turn():
-        await db.append_agent_turn_event(
+        await turn_repository.append_agent_turn_event(
             turn_id="turn-4",
             expected_sequence=1,
             event_type="turn.completed",

@@ -39,16 +39,15 @@ Coverage:
 
 from __future__ import annotations
 
-import time
 import sqlite3
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-
 from khaos.agent.core import AgentConfig, AgentLoop, Message
 from khaos.agent.events import TurnCoordinator
+from khaos.agent.turn_repository import DatabaseTurnRepository
 from khaos.db import Database
-
 
 # ---------------------------------------------------------------------------
 # Schema migration
@@ -404,7 +403,7 @@ async def test_count_messages_before_after_filters_by_principal(tmp_path):
             "s1", Message(role="user", content="b1", token_count=1),
             principal_id="api:bob",
         )
-    a2 = await db.insert_message(
+    await db.insert_message(
         "s1", Message(role="user", content="a2", token_count=1),
         principal_id="api:alice",
     )
@@ -467,7 +466,8 @@ async def test_turn_coordinator_start_stamps_principal_id(tmp_path):
     await db.create_session("s1", principal_id="api:alice")
 
     coord = await TurnCoordinator.start(
-        db, session_id="s1", task_id=None, principal_id="api:alice",
+        DatabaseTurnRepository(db),
+        session_id="s1", task_id=None, principal_id="api:alice",
     )
 
     conn = await db._require_conn()

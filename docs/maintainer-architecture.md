@@ -210,6 +210,7 @@ REQUESTED -> SNAPSHOT_BOUND -> RUNNING -> PROOF_RECORDED
 - 从 `grpc_server.py` 提取 protocol/auth/service；MemoryService、SessionService、AuditService 已完成首批 seam，协议边界已落在 `python/khaos/rpc/protocol.py`。本轮已删除 `grpc_server.py` 的 protocol compatibility aliases；新代码必须直接依赖 `khaos.rpc.protocol`，不增加第二套 server authority。
 - authorityd 的 receipt、审计和 socket framing 已统一消费 `security/protocol_boundary.py` 的 canonical owner；删除 `_canonical`/`_digest` 私有包装器，后续不允许在 authority daemon 内重新实现摘要或序列化。
 - Memory 的第一阶段 seam 已完成：`MemoryStore` 只接受 `MemoryRepository`，`MemoryOwner` 统一 principal/project/namespace 规则，`SqliteMemoryRepository` 统一 SQL 适配；冲突、TTL、提取和 L0/L1/L2 检索策略均为可独立测试的纯模块。RPC `MemoryService` 通过 ADR-051 的 context-bound audit sink 绑定请求身份，root logger 仍是唯一 durable writer。
+- Turn 的第一阶段 seam 已完成：`TurnCoordinator` 只接受 `TurnRepository`，`DatabaseTurnRepository` 是当前 SQLite 组合适配器；恢复、创建和 CAS 追加由同一 repository owner 提供，详见 ADR-053。后续把 turn SQL 从 `Database` 移出时保持该端口不变。
 
 ### Phase 3：工具和执行边界
 
