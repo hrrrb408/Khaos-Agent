@@ -96,7 +96,8 @@
 - `python/khaos/grpc_server.py`: `4a418c4102fe0975547ba95f47d47f3cdfc7b33b45c13653565095198d350912`
 - `go/internal/api/handler.go`: `9dc6af7572c331685a4fa28f8902d148da4338a19603f55aeaf2094fc38662a7`
 - `go/cmd/gateway/main.go`: `5c27479e8ef5ffa3c05008077e12e89e4f274d4255765606b3ee91d04df56481`
-- `go/internal/platform/python_client.go`: `c4e68301ae6f54999636c9924bc832e57c46173f69ad852df7963af9d6de9df6`
+- `go/internal/platform/python_client.go`: `c5d1f28a03398abefcea941cd8474c3ce6e9118ed0e8dc063615e623141c26e6`
+- `go/internal/platform/rpc_contract.go`: `85a24e13654bb8957dace5b8a04d9c99979ddd3092d4dcfae5fae67d58721d54`
 - `scripts/generate_production_reachability.py`: `673d4385bb5ebf3bbd8a5c59fb4dd0248264ebf2c569f6adb34845c222654350`
 - `packaging/macos/khaos-authorityd-xpc.m`: `6b9d18f13fd280a8819e88a4cccc96fcda5e34f52b40cf2940d5264667200855`
 - `packaging/macos/khaos-authorityd-xpc-client.c`: `3c751b9936b8665140f68466af9b77138efd538cb3b41f3687b3135b595a9f8d`

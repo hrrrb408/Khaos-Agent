@@ -165,6 +165,7 @@ def render() -> str:
         ("go/internal/api/handler.go", sha256(ROOT / "go" / "internal" / "api" / "handler.go")),
         ("go/cmd/gateway/main.go", sha256(ROOT / "go" / "cmd" / "gateway" / "main.go")),
         ("go/internal/platform/python_client.go", sha256(ROOT / "go" / "internal" / "platform" / "python_client.go")),
+        ("go/internal/platform/rpc_contract.go", sha256(ROOT / "go" / "internal" / "platform" / "rpc_contract.go")),
         ("scripts/generate_production_reachability.py", sha256(ROOT / "scripts" / "generate_production_reachability.py")),
         ("packaging/macos/khaos-authorityd-xpc.m", sha256(ROOT / "packaging" / "macos" / "khaos-authorityd-xpc.m")),
         ("packaging/macos/khaos-authorityd-xpc-client.c", sha256(ROOT / "packaging" / "macos" / "khaos-authorityd-xpc-client.c")),

@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"net"
 	"path/filepath"
-	"sort"
 	"time"
 
 	"khaos/go/internal/api"
@@ -36,22 +35,6 @@ var (
 // 8 MiB comfortably fits the largest legitimate frame while still
 // bounding memory.
 const maxStreamFrameSize = 8 * 1024 * 1024
-
-const (
-	internalRPCProtocolVersion = 2
-	internalRPCMinVersion      = 2
-	internalRPCMaxVersion      = 2
-	internalRPCSchemaVersion   = 1
-	internalRPCMethodSchema    = 1
-)
-
-var internalRPCFeatures = []string{
-	"hmac-v2",
-	"project-policy-claims",
-	"method-schema-v1",
-	"typed-error-codes",
-	"unknown-fields-reject",
-}
 
 // CreateTask creates a persistent coding task.
 //
@@ -337,16 +320,6 @@ func (c PythonClient) writeRequest(conn net.Conn, method string, payload any, pr
 		envelope["protocol"] = protocolMetadata
 	}
 	return json.NewEncoder(conn).Encode(envelope)
-}
-
-func rpcFeatureDigest() string {
-	features := append([]string(nil), internalRPCFeatures...)
-	// The list is already deterministic; Python sorts before hashing, so sort
-	// here as well to make the cross-language binding explicit.
-	sort.Strings(features)
-	raw, _ := json.Marshal(features)
-	digest := sha256.Sum256(raw)
-	return hex.EncodeToString(digest[:])
 }
 
 func (c PythonClient) negotiate(conn net.Conn) error {
