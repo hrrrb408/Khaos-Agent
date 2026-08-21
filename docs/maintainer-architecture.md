@@ -94,6 +94,7 @@ KHAOS.md / AGENTS.md
 | `python/khaos/coding/workspace/boundary.py` | dirfd 文件读写、copy/move、snapshot/recovery 和 protected metadata 检查 | `workspace/policy.py` 统一 protected names/limits；`SafeWorkspaceFS` 只拥有 handle-based effect，`TrustedGitRunner` 只拥有 Git effect |
 | `python/khaos/coding/workspace/artifacts.py` | ChangeSet artifact 的 bounded no-follow read/write/copy、digest/length 校验和 exclusive publish | artifact 文件效果唯一 owner；不决定 workspace ownership、quota registration 或 lifecycle transition |
 | `python/khaos/coding/workspace/errors.py` | workspace-domain error type | `WorkspaceError` 唯一 owner；manager/application/artifact 共享同一错误边界 |
+| `python/khaos/coding/workspace/git_process.py` | trusted Git subprocess spawn/adoption, bounded pipes, termination and quarantine | `TrustedGitProcessOwner` 唯一进程生命周期 owner；`TrustedGitRunner` 只消费它并拥有 Git effect/authority 语义 |
 | `python/khaos/scheduler/engine.py` | 任务状态、持久化、调度、执行、恢复和审计 | `scheduler/calculator.py` 已拥有纯 schedule 计算；后续拆 schedule repository、due-item selector、execution coordinator、recovery worker |
 | `python/khaos/runtime/factory.py` | 依赖装配和兼容参数转换 | 保留为唯一 composition root；业务逻辑不得回流到 factory |
 | `python/khaos/security/authorityd.py`、`authorityd_protocol.py` | authority daemon lifecycle、签名 receipt、审计事件、socket framing；历史上各自保留 canonical/digest 包装器 | `security/protocol_boundary.py` 统一 canonical JSON/digest；authorityd 只拥有 authority 状态机和 transport 适配 |
@@ -208,6 +209,7 @@ REQUESTED -> SNAPSHOT_BOUND -> RUNNING -> PROOF_RECORDED
 - `ToolOperationStore` 已收敛 durable operation claim/wait/finalize 与 runtime waiter map；scheduler 的旧幂等方法仅为兼容委托，后续删除并由 `ToolExecutionCoordinator` 直接消费该 owner。
 - `ToolExecutionCoordinator` 已收敛单步 authority context 注入、broker invoke/timeout 和 effect outcome normalization；scheduler 不再直接调用 invocation broker，后续继续迁移 terminalization/result projection。
 - ChangeSet artifact 的 descriptor/no-follow IO、digest 校验和 exclusive publish 已收敛到 `workspace/artifacts.py`；`WorkspaceManager` 只保留 lifecycle/quota 编排，workspace 错误类型由 `workspace/errors.py` 统一拥有。
+- Trusted Git 的 process owner 已从 Git command/effect runner 独立到 `workspace/git_process.py`；Git runner 不再定义进程状态机，Windows/native 失败可分别归类为 argv/authority 或 process terminal evidence。
 - Plan approval 的 DDL 与 post-schema migration 已收敛到 `coding/planning/approval/schema.py`；`PlanApprovalStore` 的 `APPROVAL_SCHEMA` 仅为兼容导出，后续删除。
 - Plan approval 的只读 SQL 与 row conversion 已收敛到 `coding/planning/approval/read_model.py`；`PlanApprovalStore` 的读取方法仅为兼容委托，后续在调用迁移完成后删除。
 - 下一步将 `ToolScheduler` 拆成 admission、capability consume、execution、result/audit 四段；每段只能消费上述类型，不能重新定义平行的 `ToolResult`、预算或 effect 状态。

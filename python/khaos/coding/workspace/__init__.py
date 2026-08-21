@@ -8,12 +8,20 @@ from khaos.coding.workspace.artifacts import (
     write_exclusive_artifact,
 )
 from khaos.coding.workspace.errors import WorkspaceError
+from khaos.coding.workspace.git_process import (
+    TrustedGitError,
+    TrustedGitProcessOwner,
+    TrustedGitProcessState,
+)
 from khaos.coding.workspace.manager import WorkspaceManager
 from khaos.coding.workspace.models import ChangeSet, WorkspaceState, WorkspaceTransition
 
 __all__ = [
     "MAX_CHANGESET_BYTES",
     "ChangeSet",
+    "TrustedGitError",
+    "TrustedGitProcessOwner",
+    "TrustedGitProcessState",
     "WorkspaceError",
     "WorkspaceManager",
     "WorkspaceState",
