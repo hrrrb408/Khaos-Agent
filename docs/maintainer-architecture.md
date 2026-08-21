@@ -72,7 +72,7 @@ KHAOS.md / AGENTS.md
 | Git effect | `coding/workspace/trusted_git.py`、`tools/git_tools.py` | `TrustedGitRunner` + authority receipt | diff/status renderers | read-only Git 也要经过受控执行上下文 |
 | Verification proof | `coding/planning/verification_*` | trusted verification authority/ledger | plan gate、audit/export | 被测代码不能写 canonical input/result |
 | Task/workspace identity | `coding/task_manager.py`、`coding/workspace/` | Task/Workspace stores | AgentLoop、TUI、RPC | 客户端只提交引用，不能自报 owner 或 generation |
-| Durable audit | `audit/`、`db/`、authorityd/WORM adapters | 对应写入事务和 append-only ledger | export/query | Python 内存日志不是独立审计权威 |
+| Durable audit | `audit/`、`db/`、authorityd/WORM adapters | 对应写入事务和 append-only ledger | export/query | Python 内存日志不是独立审计权威；authorityd canonical wire encoding 由 `security/protocol_boundary.py` 统一拥有 |
 
 ## 4. 目前的过渡性热点
 
@@ -89,6 +89,7 @@ KHAOS.md / AGENTS.md
 | `python/khaos/coding/workspace/boundary.py` | dirfd 文件读写、copy/move、snapshot/recovery 和 protected metadata 检查 | `workspace/policy.py` 统一 protected names/limits；`SafeWorkspaceFS` 只拥有 handle-based effect，`TrustedGitRunner` 只拥有 Git effect |
 | `python/khaos/scheduler/engine.py` | 任务状态、持久化、调度、执行、恢复和审计 | `scheduler/calculator.py` 已拥有纯 schedule 计算；后续拆 schedule repository、due-item selector、execution coordinator、recovery worker |
 | `python/khaos/runtime/factory.py` | 依赖装配和兼容参数转换 | 保留为唯一 composition root；业务逻辑不得回流到 factory |
+| `python/khaos/security/authorityd.py`、`authorityd_protocol.py` | authority daemon lifecycle、签名 receipt、审计事件、socket framing；历史上各自保留 canonical/digest 包装器 | `security/protocol_boundary.py` 统一 canonical JSON/digest；authorityd 只拥有 authority 状态机和 transport 适配 |
 
 拆分完成的判据不是“文件变小”，而是：每个状态只有一个 writer；依赖方向可画出来；单元测试不需要启动完整 runtime；旧 facade 可以删除而不是永久并行。
 
@@ -190,6 +191,7 @@ REQUESTED -> SNAPSHOT_BOUND -> RUNNING -> PROOF_RECORDED
 - 连接生命周期第一 seam 已落在 `python/khaos/db/connection.py`；`Database` 的 underscored
   connection views 只为迁移期兼容，后续 repository 迁移完成后删除这些 views。
 - 从 `grpc_server.py` 提取 protocol/auth/service；MemoryService、SessionService、AuditService 已完成首批 seam，协议边界已落在 `python/khaos/rpc/protocol.py`。`grpc_server.py` 的旧名称只作为显式兼容导出保留，后续迁移周期必须删除，不增加第二套 server authority。
+- authorityd 的 receipt、审计和 socket framing 已统一消费 `security/protocol_boundary.py` 的 canonical owner；删除 `_canonical`/`_digest` 私有包装器，后续不允许在 authority daemon 内重新实现摘要或序列化。
 
 ### Phase 3：工具和执行边界
 

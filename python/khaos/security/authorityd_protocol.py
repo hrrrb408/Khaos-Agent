@@ -9,7 +9,6 @@ but it is never accepted as the production audit authority.
 from __future__ import annotations
 
 import base64
-import hashlib
 import json
 import math
 import os
@@ -34,7 +33,7 @@ from khaos.security.identity_isolation import (
     validate_private_unix_socket,
 )
 from khaos.security.principals import DelegationScope, PrincipalKind
-from khaos.security.protocol_boundary import canonical_json_bytes
+from khaos.security.protocol_boundary import canonical_digest, canonical_json_bytes
 
 AUTHORITYD_PROTOCOL = 1
 MAX_MESSAGE_BYTES = 1024 * 1024
@@ -72,14 +71,6 @@ class AuditWriter(Protocol):
 
     def append(self, record: dict[str, Any]) -> None:
         """Durably append one prepare/result record or raise."""
-
-
-def _canonical(value: object) -> bytes:
-    return canonical_json_bytes(value)
-
-
-def _digest(value: object) -> str:
-    return hashlib.sha256(_canonical(value)).hexdigest()
 
 
 def _encode_receipt_timestamp(value: object, *, field: str) -> int:
@@ -122,7 +113,7 @@ def derive_resource_digest(
     _required_text("parent_resource_digest", parent_digest)
     _required_text("operation", operation)
     _required_text("requested_resource_scope", requested_scope)
-    return _digest(
+    return canonical_digest(
         {
             "schema_version": 1,
             "kind": "authority-resource-subset-v1",
@@ -281,7 +272,7 @@ class AuthorizationIntent:
 
     @property
     def digest(self) -> str:
-        return _digest(self.payload())
+        return canonical_digest(self.payload())
 
 
 @dataclass(frozen=True, slots=True)
@@ -408,7 +399,7 @@ class SignedAuthorizationReceipt:
 
     @property
     def digest(self) -> str:
-        return _digest({**self.unsigned_payload(), "signature": self.signature})
+        return canonical_digest({**self.unsigned_payload(), "signature": self.signature})
 
     def to_dict(self) -> dict[str, object]:
         return {**self.unsigned_payload(), "signature": self.signature}
@@ -471,7 +462,7 @@ class SignedAuthorizationReceipt:
         """Verify authenticity without applying the launch-time expiry gate."""
         try:
             signature = base64.b64decode(self.signature.encode("ascii"), validate=True)
-            public_key.verify(signature, _canonical(self.unsigned_payload()))
+            public_key.verify(signature, canonical_json_bytes(self.unsigned_payload()))
         except (InvalidSignature, ValueError, UnicodeError) as exc:
             raise AuthorityControlPlaneError("authorization receipt signature is invalid") from exc
 
@@ -612,7 +603,7 @@ class AuthorityDaemonClient:
         self.native_adapter = native_adapter
 
     def request(self, payload: dict[str, object]) -> dict[str, object]:
-        body = _canonical({"protocol": AUTHORITYD_PROTOCOL, **payload}) + b"\n"
+        body = canonical_json_bytes({"protocol": AUTHORITYD_PROTOCOL, **payload}) + b"\n"
         if len(body) > MAX_MESSAGE_BYTES:
             raise AuthorityControlPlaneError("authorityd request is too large")
         if os.name == "nt" or sys.platform == "darwin":
@@ -921,7 +912,7 @@ def open_authority_receipt_fds(
         mode="w+b"
     )
     try:
-        receipt_file.write(_canonical(receipt.to_dict()))
+        receipt_file.write(canonical_json_bytes(receipt.to_dict()))
         receipt_file.flush()
         receipt_file.seek(0)
         public_key_file.write(public_key.public_bytes_raw())
