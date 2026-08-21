@@ -56,12 +56,34 @@ from khaos.security.network_broker import (
 )
 from khaos.security.orchestration_components import ToolPhaseCoordinator
 from khaos.security.orchestration_phases import (
-    OrchestrationPhaseError,
     ToolPhase,
     ToolPhaseSnapshot,
     digest_phase_payload,
 )
+from khaos.tools.admission import RejectedToolCall, ToolAdmission
+from khaos.tools.budget import (
+    ToolBudget,
+    ToolBudgetReservation,
+    ToolOutputBudgetExceeded,
+    _measure_tool_output,
+)
 from khaos.tools.registry import ToolInvocationBroker, ToolRegistry
+from khaos.tools.scheduler_models import (
+    DELIVERY_AUDIT_DEGRADED,
+    DELIVERY_COMPLETE,
+    DELIVERY_DEGRADED,
+    EFFECT_APPLIED,
+    EFFECT_NO_EFFECT,
+    EFFECT_NOT_APPLIED,
+    EFFECT_NOT_STARTED,
+    EFFECT_PARTIAL,
+    EFFECT_UNKNOWN,
+    EffectOutcome,
+    PermissionRequest,
+    SchedulerEvent,
+    ToolExecutionOutcome,
+    ToolResult,
+)
 from khaos.tools.terminal_tools import (
     BackgroundProcessAuthority,
     evaluate_command_safety,
@@ -71,18 +93,26 @@ ConfirmCallback = Callable[[dict], Awaitable[dict | bool] | dict | bool]
 
 logger = logging.getLogger(__name__)
 
-EFFECT_NOT_STARTED = "not_started"
-EFFECT_NOT_APPLIED = "not_applied"
-EFFECT_APPLIED = "applied"
-EFFECT_PARTIAL = "partial"
-EFFECT_UNKNOWN = "unknown"
-# Public spelling for callers that prefer outcome terminology.  Keep the
-# historical value for wire compatibility with existing ToolResult clients.
-EFFECT_NO_EFFECT = EFFECT_NOT_APPLIED
-
-DELIVERY_COMPLETE = "complete"
-DELIVERY_DEGRADED = "degraded"
-DELIVERY_AUDIT_DEGRADED = "audit_degraded"
+__all__ = (
+    "DELIVERY_AUDIT_DEGRADED",
+    "DELIVERY_COMPLETE",
+    "DELIVERY_DEGRADED",
+    "EFFECT_APPLIED",
+    "EFFECT_NOT_APPLIED",
+    "EFFECT_NOT_STARTED",
+    "EFFECT_NO_EFFECT",
+    "EFFECT_PARTIAL",
+    "EFFECT_UNKNOWN",
+    "EffectOutcome",
+    "PermissionRequest",
+    "SchedulerEvent",
+    "ToolBudget",
+    "ToolBudgetReservation",
+    "ToolExecutionOutcome",
+    "ToolOutputBudgetExceeded",
+    "ToolResult",
+    "ToolScheduler",
+)
 
 _IDEMPOTENCY_CACHE_LIMIT = 1024
 _CONFIRM_ALLOWED_KEYS = frozenset({
@@ -165,101 +195,6 @@ def _normalize_confirmation(value: object) -> dict[str, Any]:
 
 
 @dataclass
-class ToolExecutionOutcome:
-    """Complete handler outcome used at the scheduler boundary.
-
-    A normal Python value is still treated as a successful payload for
-    backwards compatibility.  Mutation handlers that can report a handled
-    business failure must return this type instead of an error-shaped dict;
-    otherwise the scheduler cannot distinguish ``forbidden`` from a
-    successful mutation response.
-    """
-
-    ok: bool = True
-    output: Any = ""
-    error: str = ""
-    error_code: str = ""
-    effect_status: str = ""
-    effect_id: str = ""
-    reconciliation_hint: str = ""
-    retry_safe: bool = True
-
-    def _legacy_payload(self) -> dict[str, Any]:
-        """Expose the old JSON-shaped payload to direct tool callers.
-
-        Handlers are migrated independently of callers that invoke them in
-        tests or integrations without a Scheduler.  Mapping-like access
-        keeps that compatibility while the scheduler consumes the typed
-        fields above.
-        """
-        payload = dict(self.output) if isinstance(self.output, dict) else {}
-        payload.setdefault("ok", self.ok)
-        if self.error:
-            payload.setdefault("error", self.error)
-        return payload
-
-    def __getitem__(self, key: str) -> Any:
-        return self._legacy_payload()[key]
-
-    def get(self, key: str, default: Any = None) -> Any:
-        return self._legacy_payload().get(key, default)
-
-    def __contains__(self, key: object) -> bool:
-        return key in self._legacy_payload()
-
-    def __eq__(self, other: object) -> bool:
-        if isinstance(other, dict):
-            return self._legacy_payload() == other
-        return super().__eq__(other)
-
-
-@dataclass
-class EffectOutcome:
-    """Backward-compatible effect-only outcome.
-
-    Existing handlers use ``status=...``.  New handlers should prefer
-    :class:`ToolExecutionOutcome`, which also carries explicit business
-    failure state and an error code.
-    """
-
-    status: str
-    effect_id: str = ""
-    reconciliation_hint: str = ""
-    output: Any = ""
-    ok: bool = True
-    error: str = ""
-    error_code: str = ""
-    retry_safe: bool = True
-
-
-@dataclass
-class ToolResult:
-    """Normalized result for one tool call."""
-
-    tool_call_id: str
-    name: str
-    success: bool
-    output: Any = ""
-    error: str = ""
-    error_code: str = ""
-    duration_ms: int = 0
-    arguments: dict[str, Any] | None = None
-    # Effect and delivery are deliberately separate.  A handler may have
-    # completed a mutation even when projection, auditing, budget accounting,
-    # or remember-rule persistence fails afterwards.  Callers must not turn
-    # such a result into an ordinary retryable failure.
-    effect_status: str = EFFECT_NOT_STARTED
-    delivery_status: str = DELIVERY_COMPLETE
-    warning: str = ""
-    effect_id: str = ""
-    reconciliation_hint: str = ""
-    retry_safe: bool = True
-    # Immutable ToolScheduler phase evidence.  Empty is retained only for
-    # direct legacy helper calls that bypass ``stream_batch``.
-    phase_digest: str = ""
-
-
-@dataclass
 class _IdempotencyRecord:
     """Runtime-scoped result retained for an explicit idempotency key."""
 
@@ -280,225 +215,6 @@ class _OperationClaim:
     wait_event: asyncio.Event | None = None
 
 
-@dataclass
-class PermissionRequest:
-    """Permission request emitted before an ask-every call can execute."""
-
-    tool_call_id: str
-    name: str
-    arguments: dict
-    level: str
-    target: str
-    reason: str
-    binding_digest: str = ""
-    expires_at: float = 0.0
-    principal_id: str = ""
-    session_id: str = ""
-    task_id: str = ""
-    workspace_id: str = ""
-    arguments_digest: str = ""
-    profile_digest: str = ""
-    project_id: str = ""
-    workspace_generation: int = 0
-    authorization_resource_digest: str = ""
-    authorization_epoch: int = 0
-    policy_digest: str = ""
-    tool_schema_digest: str = ""
-    tool_security_digest: str = ""
-    approval_id: str = ""
-    # Final digest of the immutable authority consumed by execution.  The
-    # binding itself carries the pre-receipt scope digest.
-    step_execution_digest: str = ""
-
-
-@dataclass
-class SchedulerEvent:
-    """Streaming scheduler event."""
-
-    event: str
-    result: ToolResult | None = None
-    permission_request: PermissionRequest | None = None
-
-
-@dataclass
-class ToolBudget:
-    """Atomic hard budget shared by serial and parallel tool dispatch."""
-
-    max_calls: int = 50
-    max_output_chars: int = 100000
-    max_batch_calls: int = 16
-    max_parallel_calls: int = 8
-    max_output_per_tool: int = 65536
-    max_total_output: int = 100000
-    max_background_processes: int = 4
-    max_processes_per_workspace: int = 2
-    max_browser_contexts: int = 4
-    _call_count: int = 0
-    _output_chars: int = 0
-    _reserved_calls: int = 0
-    _reserved_output: int = 0
-    _parallel_active: int = 0
-    _lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
-
-    @property
-    def is_exhausted(self) -> bool:
-        """Return true once call or output budget is exhausted."""
-        return (
-            self._call_count + self._reserved_calls >= self.max_calls
-            or self._output_chars + self._reserved_output >= self._total_output_limit
-        )
-
-    @property
-    def _total_output_limit(self) -> int:
-        return min(self.max_output_chars, self.max_total_output)
-
-    def validate_batch(self, size: int) -> bool:
-        return 0 <= size <= self.max_batch_calls
-
-    async def reserve(self, *, parallel: bool = False) -> ToolBudgetReservation | None:
-        async with self._lock:
-            if self._call_count + self._reserved_calls >= self.max_calls:
-                return None
-            if parallel and self._parallel_active >= self.max_parallel_calls:
-                return None
-            remaining = (
-                self._total_output_limit
-                - self._output_chars
-                - self._reserved_output
-            )
-            if remaining <= 0:
-                return None
-            output_limit = min(self.max_output_per_tool, remaining)
-            self._reserved_calls += 1
-            self._reserved_output += output_limit
-            if parallel:
-                self._parallel_active += 1
-            return ToolBudgetReservation(self, output_limit, parallel)
-
-    async def _finish(
-        self, reservation: ToolBudgetReservation, *, output_chars: int | None
-    ) -> None:
-        async with self._lock:
-            if not reservation.active:
-                return
-            reservation.active = False
-            self._reserved_calls -= 1
-            self._reserved_output -= reservation.output_limit
-            if reservation.parallel:
-                self._parallel_active -= 1
-            if output_chars is not None:
-                if output_chars > reservation.output_limit:
-                    raise RuntimeError("tool output exceeded reserved hard budget")
-                self._call_count += 1
-                self._output_chars += output_chars
-
-    def record(self, output_chars: int) -> None:
-        """Compatibility hook for trusted single-threaded callers."""
-        self._call_count += 1
-        self._output_chars += output_chars
-
-
-@dataclass
-class ToolBudgetReservation:
-    budget: ToolBudget
-    output_limit: int
-    parallel: bool
-    active: bool = True
-
-    async def commit(self, output_chars: int) -> None:
-        await self.budget._finish(self, output_chars=output_chars)
-
-    async def release(self) -> None:
-        await self.budget._finish(self, output_chars=None)
-
-
-class ToolOutputBudgetExceeded(RuntimeError):
-    """Raised without materializing an output larger than its reservation."""
-
-
-def _measure_tool_output(
-    value: Any,
-    limit: int,
-    *,
-    _depth: int = 0,
-    _seen: set[int] | None = None,
-) -> int:
-    """Measure JSON-compatible output incrementally and stop at ``limit``."""
-    if _depth > 64:
-        raise ToolOutputBudgetExceeded("tool output nesting exceeds 64 levels")
-    if value is None:
-        size = 4
-    elif isinstance(value, bool):
-        size = 4 if value else 5
-    elif isinstance(value, (int, float)):
-        size = len(json.dumps(value, allow_nan=False))
-    elif isinstance(value, str):
-        # json.dumps would allocate an escaped copy.  Reject obviously large
-        # strings first; accepted strings are at most one reservation.
-        if len(value) > limit:
-            raise ToolOutputBudgetExceeded(
-                "tool output exceeded reserved hard budget"
-            )
-        size = len(json.dumps(value, ensure_ascii=False))
-    elif isinstance(value, Path):
-        path_text = str(value)
-        if len(path_text) > limit:
-            raise ToolOutputBudgetExceeded(
-                "tool output exceeded reserved hard budget"
-            )
-        size = len(json.dumps(path_text, ensure_ascii=False))
-    elif isinstance(value, (list, tuple, dict)):
-        seen = _seen if _seen is not None else set()
-        identity = id(value)
-        if identity in seen:
-            raise ToolOutputBudgetExceeded("tool output contains a cycle")
-        seen.add(identity)
-        try:
-            size = 2
-            if isinstance(value, dict):
-                iterator = value.items()
-                for index, (key, item) in enumerate(iterator):
-                    if not isinstance(key, str):
-                        raise ToolOutputBudgetExceeded(
-                            "tool output object keys must be strings"
-                        )
-                    size += (1 if index else 0) + len(
-                        json.dumps(key, ensure_ascii=False)
-                    ) + 1
-                    if size > limit:
-                        raise ToolOutputBudgetExceeded(
-                            "tool output exceeded reserved hard budget"
-                        )
-                    size += _measure_tool_output(
-                        item,
-                        limit - size,
-                        _depth=_depth + 1,
-                        _seen=seen,
-                    )
-            else:
-                for index, item in enumerate(value):
-                    size += 1 if index else 0
-                    if size > limit:
-                        raise ToolOutputBudgetExceeded(
-                            "tool output exceeded reserved hard budget"
-                        )
-                    size += _measure_tool_output(
-                        item,
-                        limit - size,
-                        _depth=_depth + 1,
-                        _seen=seen,
-                    )
-        finally:
-            seen.remove(identity)
-    else:
-        raise ToolOutputBudgetExceeded(
-            f"tool output type is not JSON-compatible: {type(value).__name__}"
-        )
-    if size > limit:
-        raise ToolOutputBudgetExceeded("tool output exceeded reserved hard budget")
-    return size
-
-
 class ToolScheduler:
     """Split, authorize, and execute tool calls."""
 
@@ -517,6 +233,7 @@ class ToolScheduler:
         credential_broker: CredentialBroker | None = None,
     ):
         self.registry = registry
+        self.admission = ToolAdmission(registry)
         self.permission_engine = permission_engine
         self.budget = budget or ToolBudget()
         self.security_middleware = security_middleware or SecurityMiddleware()
@@ -731,24 +448,22 @@ class ToolScheduler:
 
         approved_calls: list[dict] = []
         for call in tool_calls:
-            normalized = self._normalize_call(call)
-            try:
-                raw_phase = ToolPhaseSnapshot.raw(normalized)
-            except OrchestrationPhaseError as exc:
+            admission = self.admission.admit(call)
+            if isinstance(admission, RejectedToolCall):
+                normalized = admission.call
                 yield SchedulerEvent(
                     event="tool_result",
                     result=ToolResult(
                         tool_call_id=normalized["id"],
                         name=normalized["name"],
                         success=False,
-                        error=f"Tool phase admission rejected: {exc}",
+                        error=admission.error,
                         arguments=normalized["arguments"],
                     ),
                 )
                 continue
-            normalized["_phase_snapshot"] = raw_phase
-            normalized["_phase_digest"] = raw_phase.digest()
-            tool = self.registry.get(normalized["name"])
+            normalized = admission.call
+            tool = admission.tool
             # Production AgentLoop calls are already bound to a server key.
             # Generate one here as a defense-in-depth boundary for direct
             # scheduler callers that do not provide an explicit key.  The
@@ -781,8 +496,6 @@ class ToolScheduler:
                     ),
                 )
                 continue
-            self._advance_tool_phase(normalized, ToolPhase.VALIDATED)
-
             resource: AuthorizationResource | None = None
             if tool_context.get("coding_workspace_enforced"):
                 try:
@@ -3333,20 +3046,8 @@ class ToolScheduler:
 
     @staticmethod
     def _normalize_call(call: dict) -> dict:
-        normalized = {
-            "id": str(call.get("id") or call.get("tool_call_id") or call.get("name")),
-            "name": str(call["name"]),
-            "arguments": dict(call.get("arguments") or {}),
-        }
-        # Only the server-side binding path may carry an operation key.
-        # A top-level value supplied by a model, gateway caller, or plugin is
-        # untrusted input and must not become durable idempotency authority.
-        if call.get("_server_operation_key") is True:
-            idempotency_key = call.get("_idempotency_key")
-            if idempotency_key:
-                normalized["_idempotency_key"] = str(idempotency_key)
-                normalized["_server_operation_key"] = True
-        return normalized
+        """Compatibility wrapper for callers of the old scheduler helper."""
+        return ToolAdmission.normalize_call(call)
 
 
 def _canonical_digest(value: object) -> str:

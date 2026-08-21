@@ -81,7 +81,9 @@ KHAOS.md / AGENTS.md
 | 文件 | 当前集中职责 | 拆分目标 |
 | --- | --- | --- |
 | `python/khaos/db/database.py` | 连接生命周期、迁移、session/message、turn/event、audit、memory、task、scheduler 等 | `DatabaseConnection`、migration runner、按领域的 repository/query service；保留一个薄 facade 兼容旧调用 |
-| `python/khaos/tools/scheduler.py` | admission、budget、approval、authority、idempotency、并发和结果归一化 | `ToolAdmission`、`ToolAuthorization`、`ToolExecutionCoordinator`、`ToolResultStore` |
+| `python/khaos/tools/scheduler.py` | approval、authority、idempotency、并发和结果归一化 | `ToolAuthorization`、`ToolExecutionCoordinator`、`ToolResultStore` |
+| `python/khaos/tools/admission.py` | 工具调用规范化、raw phase、注册表解析和参数校验 | `ToolAdmission`；只返回 `AdmittedToolCall`/`RejectedToolCall`，不做权限、authority 或执行 |
+| `python/khaos/tools/scheduler_models.py`、`tools/budget.py` | 调度结果协议、权限请求事件和原子预算 reservation/commit | 已完成首个 seam；后续只允许由调度器编排，不在 handler 中复制预算或结果状态机 |
 | `python/khaos/grpc_server.py` | transport/auth/startup、Agent service，以及兼容导出 | protocol/auth middleware、composition root、每个 service 独立模块；服务只消费已认证 context。MemoryService、SessionService、AuditService 已迁移到 `python/khaos/rpc/` |
 | `python/khaos/coding/planning/approval/store.py` | schema、CAS transition、receipt、lease、plan execution event 和 read model | schema/migration、approval ledger、receipt verifier、execution-event repository、read model |
 | `python/khaos/scheduler/engine.py` | cron 解析、持久化、调度、执行、恢复和审计 | schedule repository、due-item selector、execution coordinator、recovery worker |
@@ -185,7 +187,8 @@ REQUESTED -> SNAPSHOT_BOUND -> RUNNING -> PROOF_RECORDED
 
 ### Phase 3：工具和执行边界
 
-- 将 `ToolScheduler` 拆成 admission、capability consume、execution、result/audit 四段。
+- `ToolScheduler` 的调用 admission 已收敛到 `python/khaos/tools/admission.py`；结果/事件值对象已收敛到 `python/khaos/tools/scheduler_models.py`，原子预算已收敛到 `python/khaos/tools/budget.py`；`tools.scheduler` 仅保留一个迁移周期的兼容导出。
+- 下一步将 `ToolScheduler` 拆成 admission、capability consume、execution、result/audit 四段；每段只能消费上述类型，不能重新定义平行的 `ToolResult`、预算或 effect 状态。
 - 将 file/Git/process 入口收敛为可注入 port，并为每个 port 提供 fail-closed contract tests。
 
 ### Phase 4：计划、验证和调度
