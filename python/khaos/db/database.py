@@ -25,6 +25,7 @@ from khaos.db.connection import (
     _AsyncSqliteFallback,  # noqa: F401 - compatibility export
     aiosqlite,  # noqa: F401 - tests patch the shared driver module
 )
+from khaos.db.repositories import SessionRepository
 from khaos.time_utils import utc_now_naive
 
 # The release-pinned migration methods below are hashed byte-for-byte.  Keep
@@ -286,6 +287,7 @@ class Database:
         # migration runner and older tests; new code should use
         # ``DatabaseConnection`` through the explicit methods on this facade.
         self._connection = DatabaseConnection(self.path)
+        self._session_repository = SessionRepository()
         # F-01: Per-domain locks remain for logical serialization (e.g. two
         # concurrent permission grants must not race on epoch computation).
         self._operation_approval_lock = asyncio.Lock()
@@ -2522,30 +2524,13 @@ class Database:
         ``RuntimeConfig.project_id``).
         """
         async with self.transaction() as conn:
-            cursor = await conn.execute(
-                """
-                INSERT INTO messages (
-                    session_id, role, content, tool_calls, tool_call_id,
-                    token_count, principal_id, project_id
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    session_id,
-                    message.role,
-                    message.content,
-                    json.dumps(message.tool_calls),
-                    message.tool_call_id,
-                    message.token_count,
-                    principal_id,
-                    project_id,
-                ),
+            return await self._session_repository.insert_message(
+                conn,
+                session_id,
+                message,
+                principal_id=principal_id,
+                project_id=project_id,
             )
-            await conn.execute(
-                "UPDATE sessions SET updated_at = datetime('now') WHERE id = ?",
-                (session_id,),
-            )
-            return int(cursor.lastrowid)
 
     async def list_messages(
         self,
@@ -2570,34 +2555,12 @@ class Database:
         """
         async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
             conn = await self._require_conn()
-            clauses: list[str] = ["session_id = ?"]
-            params: list[Any] = [session_id]
-            if principal_id is not None:
-                clauses.append("principal_id = ?")
-                params.append(principal_id)
-            if project_id is not None:
-                clauses.append("project_id = ?")
-                params.append(project_id)
-            cursor = await conn.execute(
-                f"""
-                SELECT role, content, tool_calls, tool_call_id, token_count
-                FROM messages
-                WHERE {' AND '.join(clauses)}
-                ORDER BY created_at, id
-                """,
-                tuple(params),
+            return await self._session_repository.list_messages(
+                conn,
+                session_id,
+                principal_id=principal_id,
+                project_id=project_id,
             )
-            rows = await cursor.fetchall()
-            return [
-                Message(
-                    role=str(row["role"]),
-                    content=str(row["content"]),
-                    tool_calls=json.loads(str(row["tool_calls"] or "[]")),
-                    tool_call_id=row["tool_call_id"],
-                    token_count=int(row["token_count"]),
-                )
-                for row in rows
-            ]
 
     async def set_config(self, key: str, value: Any) -> None:
         """Persist a JSON configuration value."""
@@ -5244,47 +5207,14 @@ class Database:
         """
         async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
             conn = await self._require_conn()
-            # snippet: highlight matches with [ ... ]; bm25() rank (lower = better).
-            # When either owner filter is provided, JOIN the base messages
-            # table (messages_fts.rowid mirrors messages.id, so the JOIN is
-            # a primary-key lookup — cheap).
-            if principal_id is None and project_id is None:
-                cursor = await conn.execute(
-                    """
-                    SELECT rowid AS id, session_id, role, created_at,
-                           rank,
-                           snippet(messages_fts, 2, '[', ']]', '...', 12) AS snippet
-                    FROM messages_fts
-                    WHERE messages_fts MATCH ?
-                    ORDER BY rank
-                    LIMIT ? OFFSET ?
-                    """,
-                    (query, limit, offset),
-                )
-            else:
-                clauses: list[str] = ["fts.messages_fts MATCH ?"]
-                params: list[Any] = [query]
-                if principal_id is not None:
-                    clauses.append("m.principal_id = ?")
-                    params.append(principal_id)
-                if project_id is not None:
-                    clauses.append("m.project_id = ?")
-                    params.append(project_id)
-                params.extend([limit, offset])
-                cursor = await conn.execute(
-                    f"""
-                    SELECT fts.rowid AS id, fts.session_id, fts.role,
-                           fts.created_at, fts.rank,
-                           snippet(messages_fts, 2, '[', ']]', '...', 12) AS snippet
-                    FROM messages_fts AS fts
-                    JOIN messages AS m ON m.id = fts.rowid
-                    WHERE {' AND '.join(clauses)}
-                    ORDER BY fts.rank
-                    LIMIT ? OFFSET ?
-                    """,
-                    tuple(params),
-                )
-            return [dict(row) for row in await cursor.fetchall()]
+            return await self._session_repository.search_sessions(
+                conn,
+                query,
+                limit,
+                offset,
+                principal_id=principal_id,
+                project_id=project_id,
+            )
 
     async def get_session_messages(
         self,
@@ -5308,26 +5238,14 @@ class Database:
         """
         async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
             conn = await self._require_conn()
-            clauses: list[str] = ["session_id = ?"]
-            params: list[Any] = [session_id]
-            if principal_id is not None:
-                clauses.append("principal_id = ?")
-                params.append(principal_id)
-            if project_id is not None:
-                clauses.append("project_id = ?")
-                params.append(project_id)
-            params.extend([limit, offset])
-            cursor = await conn.execute(
-                f"""
-                SELECT id, session_id, role, content, token_count, created_at
-                FROM messages
-                WHERE {' AND '.join(clauses)}
-                ORDER BY created_at, id
-                LIMIT ? OFFSET ?
-                """,
-                tuple(params),
+            return await self._session_repository.get_session_messages(
+                conn,
+                session_id,
+                limit,
+                offset,
+                principal_id=principal_id,
+                project_id=project_id,
             )
-            return [dict(row) for row in await cursor.fetchall()]
 
     async def get_message_window(
         self,
@@ -5348,32 +5266,14 @@ class Database:
         """
         async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
             conn = await self._require_conn()
-            clauses: list[str] = ["session_id = ?"]
-            params: list[Any] = [session_id]
-            if principal_id is not None:
-                clauses.append("principal_id = ?")
-                params.append(principal_id)
-            if project_id is not None:
-                clauses.append("project_id = ?")
-                params.append(project_id)
-            # message_id feeds the ABS(id - ?) proximity sort and must come
-            # after the WHERE-clause params.
-            params.append(message_id)
-            params.append(window * 2 + 1)
-            cursor = await conn.execute(
-                f"""
-                SELECT id, session_id, role, content, token_count, created_at
-                FROM messages
-                WHERE {' AND '.join(clauses)}
-                ORDER BY ABS(id - ?), id
-                LIMIT ?
-                """,
-                tuple(params),
+            return await self._session_repository.get_message_window(
+                conn,
+                session_id,
+                message_id,
+                window,
+                principal_id=principal_id,
+                project_id=project_id,
             )
-            rows = [dict(row) for row in await cursor.fetchall()]
-            # Re-sort chronologically after the ABS-based proximity selection.
-            rows.sort(key=lambda r: r["id"])
-            return rows
 
     async def count_session_messages(
         self,
@@ -5392,20 +5292,12 @@ class Database:
         """
         async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
             conn = await self._require_conn()
-            clauses: list[str] = ["session_id = ?"]
-            params: list[Any] = [session_id]
-            if principal_id is not None:
-                clauses.append("principal_id = ?")
-                params.append(principal_id)
-            if project_id is not None:
-                clauses.append("project_id = ?")
-                params.append(project_id)
-            cursor = await conn.execute(
-                f"SELECT COUNT(*) AS n FROM messages WHERE {' AND '.join(clauses)}",
-                tuple(params),
+            return await self._session_repository.count_session_messages(
+                conn,
+                session_id,
+                principal_id=principal_id,
+                project_id=project_id,
             )
-            row = await cursor.fetchone()
-            return int(row["n"]) if row else 0
 
     async def count_messages_before_after(
         self,
@@ -5425,27 +5317,13 @@ class Database:
         """
         async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
             conn = await self._require_conn()
-            clauses: list[str] = ["session_id = ?"]
-            params: list[Any] = [session_id]
-            if principal_id is not None:
-                clauses.append("principal_id = ?")
-                params.append(principal_id)
-            if project_id is not None:
-                clauses.append("project_id = ?")
-                params.append(project_id)
-            # message_id feeds both CASE expressions, so it must be appended
-            # after the WHERE-clause params and appears twice in the tuple.
-            cursor = await conn.execute(
-                f"SELECT "
-                "SUM(CASE WHEN id < ? THEN 1 ELSE 0 END) AS before_n, "
-                "SUM(CASE WHEN id > ? THEN 1 ELSE 0 END) AS after_n "
-                f"FROM messages WHERE {' AND '.join(clauses)}",
-                (message_id, message_id, *params),
+            return await self._session_repository.count_messages_before_after(
+                conn,
+                session_id,
+                message_id,
+                principal_id=principal_id,
+                project_id=project_id,
             )
-            row = await cursor.fetchone()
-            if not row:
-                return (0, 0)
-            return (int(row["before_n"] or 0), int(row["after_n"] or 0))
 
     async def list_sessions(
         self,
@@ -5470,41 +5348,13 @@ class Database:
         """
         async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
             conn = await self._require_conn()
-            where_clauses: list[str] = ["s.status = 'active'"]
-            where_params: list[Any] = []
-            if principal_id is not None:
-                where_clauses.append("s.principal_id = ?")
-                where_params.append(principal_id)
-            if project_id is not None:
-                where_clauses.append("s.project_id = ?")
-                where_params.append(project_id)
-            # When an owner dimension is supplied, scope the message_count /
-            # preview subqueries to the session's own owner value for that
-            # dimension (matching the legacy principal-scoped subquery
-            # behaviour).
-            sub_filters: list[str] = []
-            if principal_id is not None:
-                sub_filters.append("m.principal_id = s.principal_id")
-            if project_id is not None:
-                sub_filters.append("m.project_id = s.project_id")
-            sub_where = (" AND " + " AND ".join(sub_filters)) if sub_filters else ""
-            where_params.extend([limit, offset])
-            cursor = await conn.execute(
-                f"""
-                SELECT s.id, s.mode, s.created_at,
-                       (SELECT COUNT(*) FROM messages m
-                        WHERE m.session_id = s.id{sub_where}) AS message_count,
-                       (SELECT content FROM messages m
-                        WHERE m.session_id = s.id{sub_where}
-                        ORDER BY m.id DESC LIMIT 1) AS preview
-                FROM sessions s
-                WHERE {' AND '.join(where_clauses)}
-                ORDER BY s.updated_at DESC
-                LIMIT ? OFFSET ?
-                """,
-                tuple(where_params),
+            return await self._session_repository.list_sessions(
+                conn,
+                limit,
+                offset,
+                principal_id=principal_id,
+                project_id=project_id,
             )
-            return [dict(row) for row in await cursor.fetchall()]
 
     async def get_session(
         self,
@@ -5528,25 +5378,12 @@ class Database:
         """
         async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
             conn = await self._require_conn()
-            clauses: list[str] = ["id = ?"]
-            params: list[Any] = [session_id]
-            if principal_id is not None:
-                clauses.append("principal_id = ?")
-                params.append(principal_id)
-            if project_id is not None:
-                clauses.append("project_id = ?")
-                params.append(project_id)
-            cursor = await conn.execute(
-                f"""
-                SELECT id, mode, principal_id, project_id, status,
-                       created_at, updated_at
-                FROM sessions
-                WHERE {' AND '.join(clauses)}
-                """,
-                tuple(params),
+            return await self._session_repository.get_session(
+                conn,
+                session_id,
+                principal_id=principal_id,
+                project_id=project_id,
             )
-            row = await cursor.fetchone()
-            return dict(row) if row is not None else None
 
     async def register_operation_approval(
         self,

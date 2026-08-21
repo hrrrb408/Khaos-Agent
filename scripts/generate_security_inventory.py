@@ -152,6 +152,8 @@ def render() -> str:
         ("python/khaos/security/shell_semantics.py", sha256(ROOT / "python" / "khaos" / "security" / "shell_semantics.py")),
         ("python/khaos/coding/planning/security_identities.py", sha256(ROOT / "python" / "khaos" / "coding" / "planning" / "security_identities.py")),
         ("python/khaos/coding/workspace/boundary.py", sha256(ROOT / "python" / "khaos" / "coding" / "workspace" / "boundary.py")),
+        ("python/khaos/db/connection.py", sha256(ROOT / "python" / "khaos" / "db" / "connection.py")),
+        ("python/khaos/db/repositories/sessions.py", sha256(ROOT / "python" / "khaos" / "db" / "repositories" / "sessions.py")),
         ("python/khaos/rpc/protocol.py", sha256(ROOT / "python" / "khaos" / "rpc" / "protocol.py")),
         ("rust/khaos-core/src/bin/khaos-exec-launcher.rs", sha256(ROOT / "rust" / "khaos-core" / "src" / "bin" / "khaos-exec-launcher.rs")),
         ("rust/khaos-core/src/bin/khaos-sandbox-launcher.rs", sha256(ROOT / "rust" / "khaos-core" / "src" / "bin" / "khaos-sandbox-launcher.rs")),
