@@ -10,8 +10,8 @@ replay.
 from __future__ import annotations
 
 import asyncio
-import time
-from dataclasses import dataclass, field
+from collections import OrderedDict
+from dataclasses import dataclass
 
 from khaos.exceptions import PermissionDeniedError
 from khaos.security.protocol_boundary import canonical_digest
@@ -26,7 +26,6 @@ class _CachedResult:
 
     arguments_digest: str
     result: ToolResult
-    stored_at: float = field(default_factory=time.monotonic)
 
 
 class ToolResultStore:
@@ -37,7 +36,11 @@ class ToolResultStore:
             raise ValueError("max_entries must be a positive integer")
         self._max_entries = max_entries
         self._lock = asyncio.Lock()
-        self._results: dict[str, _CachedResult] = {}
+        # OrderedDict gives eviction a deterministic insertion/update order.
+        # A wall/monotonic clock is not a safe ordering primitive here: on
+        # Windows, timer resolution can collapse adjacent writes to the same
+        # value and evict a freshly replaced idempotency entry.
+        self._results: OrderedDict[str, _CachedResult] = OrderedDict()
 
     @staticmethod
     def digest_arguments(arguments: object) -> str:
@@ -68,15 +71,12 @@ class ToolResultStore:
         if not operation_id:
             return
         async with self._lock:
-            if (
-                operation_id not in self._results
-                and len(self._results) >= self._max_entries
-            ):
-                oldest = min(
-                    self._results,
-                    key=lambda item: self._results[item].stored_at,
-                )
-                self._results.pop(oldest, None)
+            if operation_id in self._results:
+                # Replacing a result refreshes its retention order while the
+                # same argument digest continues to protect idempotency.
+                self._results.pop(operation_id)
+            elif len(self._results) >= self._max_entries:
+                self._results.popitem(last=False)
             self._results[operation_id] = _CachedResult(
                 arguments_digest=arguments_digest,
                 result=result,

@@ -15,6 +15,7 @@ from khaos.coding.workspace.errors import WorkspaceError
 from khaos.coding.workspace.models import ChangeSet, TaskWorkspace
 
 MAX_CHANGESET_BYTES = 64 * 1024 * 1024
+_O_BINARY = getattr(os, "O_BINARY", 0)
 
 
 def verified_artifact_path(workspace: TaskWorkspace, changeset: ChangeSet) -> Path:
@@ -45,7 +46,10 @@ def read_verified_artifact(
     max_bytes: int,
 ) -> bytes:
     """Read and verify one bounded artifact through a no-follow descriptor."""
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | _O_BINARY | getattr(os, "O_NOFOLLOW", 0),
+    )
     digest = hashlib.sha256()
     data = bytearray()
     try:
@@ -68,6 +72,7 @@ def write_exclusive_artifact(path: Path, payload: bytes) -> None:
         os.O_WRONLY
         | os.O_CREAT
         | os.O_EXCL
+        | _O_BINARY
         | getattr(os, "O_NOFOLLOW", 0),
         0o600,
     )
@@ -90,7 +95,8 @@ def copy_verified_artifact(
 ) -> None:
     """Copy an artifact with bounded streaming and digest verification."""
     source_descriptor = os.open(
-        source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        source,
+        os.O_RDONLY | _O_BINARY | getattr(os, "O_NOFOLLOW", 0),
     )
     destination_descriptor: int | None = None
     digest = hashlib.sha256()
@@ -102,6 +108,7 @@ def copy_verified_artifact(
             os.O_WRONLY
             | os.O_CREAT
             | os.O_EXCL
+            | _O_BINARY
             | getattr(os, "O_NOFOLLOW", 0),
             0o600,
         )
