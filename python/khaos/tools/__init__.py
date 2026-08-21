@@ -8,6 +8,7 @@ from khaos.tools.authorization import (
     build_permission_request,
     tool_has_capability,
 )
+from khaos.tools.operation_store import OperationClaim, ToolOperationStore
 from khaos.tools.registry import (
     ToolCapability,
     ToolDefinition,
@@ -21,11 +22,13 @@ from khaos.tools.result_store import ToolResultStore
 
 __all__ = [
     "ApprovalCallbackRunner",
+    "OperationClaim",
     "RememberRuleProjection",
     "ToolAuthorization",
     "ToolCapability",
     "ToolDefinition",
     "ToolInvocationBroker",
+    "ToolOperationStore",
     "ToolRegistry",
     "ToolResultCodec",
     "ToolResultStore",
