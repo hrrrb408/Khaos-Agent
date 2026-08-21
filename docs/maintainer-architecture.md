@@ -74,6 +74,7 @@ KHAOS.md / AGENTS.md
 | Task/workspace identity | `coding/task_manager.py`、`coding/workspace/` | Task/Workspace stores | AgentLoop、TUI、RPC | 客户端只提交引用，不能自报 owner 或 generation |
 | Durable audit | `audit/`、`db/`、authorityd/WORM adapters | 对应写入事务和 append-only ledger | export/query | Python 内存日志不是独立审计权威；authorityd canonical wire encoding 由 `security/protocol_boundary.py` 统一拥有 |
 | Durable memory | `memory/`、`rpc/memory_service.py` | `MemoryStore`（领域门面）+ `MemoryRepository`（持久化端口）+ `MemoryOwner`（principal/project/namespace） | `MemoryManager`、RPC/CLI/TUI | SQL、FTS、TTL、冲突、提取和检索策略不能重新堆回 store；所有 runtime 写入必须携带 owner 和审计 logger |
+| Channel configuration/health | `channels/registry.py` | `ChannelRegistry`（唯一 writer；配置/健康锁） | channel tools、TUI、webhook service | `get`/`list_all` 只返回 immutable snapshot；配置必须经 `replace_config`/enable/disable，不能修改返回对象 |
 
 ## 4. 目前的过渡性热点
 
@@ -81,7 +82,7 @@ KHAOS.md / AGENTS.md
 
 | 文件 | 当前集中职责 | 拆分目标 |
 | --- | --- | --- |
-| `python/khaos/db/database.py` | 迁移、事务 owner、turn/event、audit、task、scheduler 等领域 facade；session/message 和 memory 只做 lease/transaction 编排 | `python/khaos/db/connection.py` 拥有物理连接生命周期；`db/repositories/sessions.py` 与 `db/repositories/memories.py` 分别拥有 session/message、memory SQL 与 row conversion，最终继续按领域拆 repository 并保留一个薄 facade |
+| `python/khaos/db/database.py` | 迁移、事务 owner、turn/event、audit、task、scheduler 等领域 facade；session/message 和 memory 只做 lease/transaction 编排 | `python/khaos/db/connection.py` 拥有物理连接生命周期；`db/repositories/sessions.py` 与 `db/repositories/memories.py` 分别拥有 session/message、memory SQL 与 row conversion；Agent turn 通过 ADR-053 的 `TurnRepository` 端口隔离，后续继续按领域拆 repository 并保留一个薄 facade |
 | `python/khaos/tools/scheduler.py` | admission 后的 approval、批次并发和结果事件编排 | `ToolAdmission`、`ToolResultFinalizer`（terminal phase/audit/result delivery）、`ToolResultStore`（runtime replay cache）、`ToolOperationStore`（claim/wait/terminal idempotency）、`ApprovalCallbackRunner`（adapter 生命周期）、`ToolAuthorization`（decision/remember/binding contract）、`ToolExecutionCoordinator`（authority-bound dispatch） |
 | `python/khaos/tools/result_finalizer.py` | dispatched tool 的 terminal phase、best-effort audit、durable operation finish 和 idempotent result publish | `ToolResultFinalizer`；不做 admission、permission decision、handler dispatch 或 budget ownership |
 | `python/khaos/tools/authorization.py` | permission decision hardening、remember rule projection、approval binding/request projection | `ToolAuthorization`、`build_approval_binding`、`build_permission_request`；不注册/消费 broker，不执行工具效果 |
