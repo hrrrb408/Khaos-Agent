@@ -14,7 +14,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -68,6 +68,7 @@ from khaos.tools.budget import (
     _measure_tool_output,
 )
 from khaos.tools.registry import ToolInvocationBroker, ToolRegistry
+from khaos.tools.result_codec import ToolResultCodec
 from khaos.tools.scheduler_models import (
     DELIVERY_AUDIT_DEGRADED,
     DELIVERY_COMPLETE,
@@ -1315,7 +1316,7 @@ class ToolScheduler:
                 self.invocation_broker.invoke(tool.name, mode=mode, context=invocation_context, **call.get("arguments", {})),
                 timeout=tool.timeout,
             )
-            outcome = self._normalize_effect_outcome(
+            outcome = ToolResultCodec.normalize_effect_outcome(
                 output,
                 default_status=self._declared_effect_status(tool),
                 default_effect_id=effect_id,
@@ -1681,191 +1682,6 @@ class ToolScheduler:
         """Classify cancellation after dispatch conservatively."""
         return cls._exception_effect_status(tool)
 
-    @staticmethod
-    def _normalize_effect_outcome(
-        value: Any,
-        *,
-        default_status: str,
-        default_effect_id: str,
-        default_reconciliation_hint: str,
-    ) -> ToolExecutionOutcome:
-        """Normalize explicit outcomes and legacy error-shaped payloads.
-
-        Legacy handlers may still return their payload directly and use the
-        registered normal effect declaration.  New mutation handlers can
-        return ``ToolExecutionOutcome`` to report business failure without
-        abusing exceptions.  During migration, common structured error
-        dictionaries are also converted so ``forbidden``/``not_found`` can
-        never be reported as a successful mutation.
-        """
-        if isinstance(value, ToolExecutionOutcome):
-            ok = bool(value.ok)
-            status = str(value.effect_status or "")
-            output = value.output
-            error = str(value.error or "")
-            error_code = str(value.error_code or "")
-            effect_id = str(value.effect_id or default_effect_id)
-            reconciliation_hint = str(
-                value.reconciliation_hint or default_reconciliation_hint
-            )
-            retry_safe = bool(value.retry_safe)
-        elif isinstance(value, EffectOutcome):
-            ok = bool(value.ok)
-            status = str(value.status or "")
-            output = value.output
-            error = str(value.error or "")
-            error_code = str(value.error_code or "")
-            effect_id = str(value.effect_id or default_effect_id)
-            reconciliation_hint = str(
-                value.reconciliation_hint or default_reconciliation_hint
-            )
-            retry_safe = bool(value.retry_safe)
-        else:
-            output = value
-            legacy_payload = value
-            if isinstance(value, str):
-                # GitHub and a few older remote adapters serialized their
-                # result dictionaries before returning them.  Decode only a
-                # JSON object for failure classification; preserve the
-                # original string as the user-visible output.
-                try:
-                    decoded = json.loads(value)
-                except (TypeError, ValueError, json.JSONDecodeError):
-                    decoded = None
-                if isinstance(decoded, dict):
-                    legacy_payload = decoded
-            status_marker = (
-                str(legacy_payload.get("status") or "").strip().lower()
-                if isinstance(legacy_payload, dict)
-                else ""
-            )
-            failure_markers = {
-                "error", "failed", "failure", "forbidden", "invalid",
-                "invalid_state", "not_found", "not_initialized", "unavailable",
-            }
-            handled_failure = isinstance(legacy_payload, dict) and (
-                legacy_payload.get("ok") is False
-                or legacy_payload.get("success") is False
-                or status_marker in failure_markers
-                or bool(legacy_payload.get("error"))
-                or legacy_payload.get("created") is False
-            )
-            ok = not handled_failure
-            status = EFFECT_NOT_APPLIED if handled_failure else default_status
-            error = ""
-            error_code = ""
-            if handled_failure:
-                error = str(
-                    legacy_payload.get("error")
-                    or legacy_payload.get("message")
-                    or status_marker
-                    or "tool handler reported failure"
-                )
-                error_code = str(
-                    legacy_payload.get("error_code")
-                    or legacy_payload.get("code")
-                    or (status_marker.upper() if status_marker else "TOOL_REPORTED_FAILURE")
-                )
-            effect_id = default_effect_id
-            reconciliation_hint = default_reconciliation_hint
-            retry_safe = handled_failure
-        if not status:
-            status = EFFECT_NOT_APPLIED if not ok else default_status
-        if not ok and status == EFFECT_UNKNOWN and not effect_id:
-            status = EFFECT_NOT_APPLIED
-        if status not in {
-            EFFECT_NOT_APPLIED,
-            EFFECT_APPLIED,
-            EFFECT_PARTIAL,
-            EFFECT_UNKNOWN,
-        }:
-            raise ValueError(f"invalid ToolExecutionOutcome effect status: {status!r}")
-        if len(effect_id) > 256 or any(char in effect_id for char in "\x00\r\n"):
-            raise ValueError("invalid ToolExecutionOutcome effect_id")
-        if len(reconciliation_hint) > 4096 or any(
-            char in reconciliation_hint for char in "\x00\r\n"
-        ):
-            raise ValueError("invalid ToolExecutionOutcome reconciliation_hint")
-        return ToolExecutionOutcome(
-            ok=ok,
-            output=output,
-            error=error,
-            error_code=error_code,
-            effect_status=status,
-            effect_id=effect_id,
-            reconciliation_hint=reconciliation_hint,
-            retry_safe=retry_safe,
-        )
-
-    @staticmethod
-    def _serialize_operation_result(result: ToolResult) -> str:
-        return json.dumps(asdict(result), ensure_ascii=False, sort_keys=True)
-
-    @staticmethod
-    def _deserialize_operation_result(
-        row: dict[str, Any],
-        *,
-        call: dict,
-        tool: Any,
-    ) -> ToolResult:
-        payload = str(row.get("result_json") or "")
-        if payload:
-            try:
-                value = json.loads(payload)
-                if isinstance(value, dict):
-                    fields = set(ToolResult.__dataclass_fields__)
-                    values = {key: item for key, item in value.items() if key in fields}
-                    return ToolResult(
-                        tool_call_id=str(values.get("tool_call_id") or call["id"]),
-                        name=str(values.get("name") or tool.name),
-                        success=bool(values.get("success", False)),
-                        output=values.get("output", ""),
-                        error=str(values.get("error") or ""),
-                        error_code=str(values.get("error_code") or ""),
-                        duration_ms=int(values.get("duration_ms") or 0),
-                        arguments=values.get("arguments") or call.get("arguments", {}),
-                        effect_status=str(
-                            values.get("effect_status")
-                            or row.get("effect_status")
-                            or EFFECT_UNKNOWN
-                        ),
-                        delivery_status=str(
-                            values.get("delivery_status") or DELIVERY_COMPLETE
-                        ),
-                        warning=str(values.get("warning") or ""),
-                        effect_id=str(
-                            values.get("effect_id") or row.get("effect_id") or ""
-                        ),
-                        reconciliation_hint=str(
-                            values.get("reconciliation_hint")
-                            or row.get("reconciliation_hint")
-                            or ""
-                        ),
-                        retry_safe=bool(values.get("retry_safe", False)),
-                    )
-            except (TypeError, ValueError, json.JSONDecodeError):
-                logger.error(
-                    "durable tool operation result is malformed: operation_id=%s",
-                    row.get("operation_id"),
-                )
-        effect_status = str(row.get("effect_status") or EFFECT_UNKNOWN)
-        return ToolResult(
-            tool_call_id=call["id"],
-            name=tool.name,
-            success=False,
-            error="durable operation is unresolved; reconcile before retry",
-            arguments=call.get("arguments", {}),
-            effect_status=effect_status,
-            delivery_status=DELIVERY_DEGRADED,
-            warning=(
-                str(row.get("reconciliation_hint") or "")
-                or "the previous process may have stopped after dispatch"
-            ),
-            effect_id=str(row.get("effect_id") or ""),
-            reconciliation_hint=str(row.get("reconciliation_hint") or ""),
-            retry_safe=False,
-        )
-
     async def _claim_operation(
         self,
         call: dict,
@@ -1980,14 +1796,16 @@ class ToolScheduler:
                     owner_token="",
                     effect_id=str(row.get("effect_id") or ""),
                     arguments_digest=arguments_digest,
-                    result=self._deserialize_operation_result(
+                    result=ToolResultCodec.deserialize_operation_result(
                         row, call=call, tool=tool
                     ),
                 )
             # A running row without a local owner is an orphan from another
             # process or a prior crash.  Quarantine it instead of invoking
             # the handler a second time.
-            orphan = self._deserialize_operation_result(row, call=call, tool=tool)
+            orphan = ToolResultCodec.deserialize_operation_result(
+                row, call=call, tool=tool
+            )
             orphan = replace(
                 orphan,
                 effect_status=EFFECT_UNKNOWN,
@@ -2010,7 +1828,7 @@ class ToolScheduler:
                 await mark_operation_unknown(
                     operation_id=operation_id,
                     reconciliation_hint=orphan.reconciliation_hint,
-                    result_json=self._serialize_operation_result(orphan),
+                    result_json=ToolResultCodec.serialize_operation_result(orphan),
                 )
             return _OperationClaim(
                 operation_id=operation_id,
@@ -2118,7 +1936,9 @@ class ToolScheduler:
                 workspace_id=str(tool_context.get("workspace_id") or ""),
             )
             if row.get("status") != "running":
-                return self._deserialize_operation_result(row, call=call, tool=tool)
+                return ToolResultCodec.deserialize_operation_result(
+                    row, call=call, tool=tool
+                )
         return ToolResult(
             tool_call_id=call["id"],
             name=tool.name,
@@ -2156,7 +1976,7 @@ class ToolScheduler:
         complete_method = getattr(db, "complete_tool_operation", None)
         if callable(complete_method) and claim.owner_token:
             try:
-                result_json = self._serialize_operation_result(result)
+                result_json = ToolResultCodec.serialize_operation_result(result)
                 complete_operation = cast(
                     Callable[..., Awaitable[object]], complete_method
                 )

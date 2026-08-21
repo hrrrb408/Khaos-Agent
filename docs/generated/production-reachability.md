@@ -17,8 +17,8 @@
 
 ## Import reachability result
 
-- Reachable repository modules: `174`.
-- Resolved import edges: `1045`.
+- Reachable repository modules: `175`.
+- Resolved import edges: `1056`.
 - Forbidden production edges: `0`.
 - Unresolved internal edges: `0`.
 
@@ -202,6 +202,7 @@
 - `khaos.tools.git_tools`
 - `khaos.tools.github_tools`
 - `khaos.tools.registry`
+- `khaos.tools.result_codec`
 - `khaos.tools.sandbox_tools`
 - `khaos.tools.scheduler`
 - `khaos.tools.scheduler_models`
