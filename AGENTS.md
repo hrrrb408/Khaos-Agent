@@ -53,6 +53,7 @@ khaos/
 │   │   │   └── adapter.py          # Telegram/Discord/Slack/WeChat 适配器
 │   │   ├── cli/             # CLI 入口点
 │   │   ├── tui/             # 全屏 TUI（Phase 4：Textual + Rich，斜杠命令）
+│   │   ├── rpc/             # RPC 应用服务（按领域拆分，transport 留在 grpc_server.py）
 │   │   ├── permissions/     # 权限引擎（含 commands_require_approval 前置闸门）
 │   │   ├── security/        # 安全模块：命令、路径、敏感信息防护、EffectiveSecurityPolicy 编译
 │   │   ├── subagents/       # 子代理（Runner、Planner、Service）
@@ -116,6 +117,7 @@ khaos/
 | Webhook 与 Bot 通道 | — (channels/webhook.py, registry.py, adapter.py) | — |
 | 技能自动生成 (Hermes) | — (skills/generator.py) | — |
 | Go API 网关 | LLD §2 | audit_log |
+| Python RPC 应用服务 | `docs/maintainer-architecture.md` | 按领域复用现有存储 |
 | Rust FFI (Phase 3) | LLD §3 | — |
 | 数据库 DDL | LLD §4 | 全部 |
 
