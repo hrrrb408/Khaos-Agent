@@ -14,7 +14,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, cast
 
-from khaos.agent.approval import ApprovalBinding, StepExecutionAuthority
+from khaos.agent.approval import StepExecutionAuthority
 from khaos.coding.execution.authority import ExecutionAuthority
 from khaos.coding.execution.capability import DockerSandboxDecision, SandboxDecision
 from khaos.coding.execution.environment import is_non_inheritable_secret_key
@@ -61,6 +61,10 @@ from khaos.tools.admission import RejectedToolCall, ToolAdmission
 from khaos.tools.approval_callback import (
     ApprovalCallbackRunner,
     ConfirmCallback,
+)
+from khaos.tools.authorization import (
+    build_approval_binding,
+    build_permission_request,
 )
 from khaos.tools.budget import (
     ToolBudget,
@@ -661,53 +665,23 @@ class ToolScheduler:
                     )
                     continue
                 expires_at = time.time() + 120.0
-                project_id = str(tool_context.get("project_id") or "")
                 if resource is None and tool_context.get("coding_workspace_enforced"):
                     raise PermissionDeniedError("workspace authorization resource is missing")
-                binding = ApprovalBinding(
+                binding = build_approval_binding(
+                    tool=tool,
+                    arguments=normalized["arguments"],
+                    tool_context=tool_context,
                     principal_id=principal_id,
                     session_id=current_session,
-                    task_id=str(
-                        tool_context.get("task_id")
-                        or f"session:{current_session}"
-                    ),
-                    turn_id=str(
-                        tool_context.get("turn_id")
-                        or f"turn:{normalized['id']}"
-                    ),
                     tool_call_id=normalized["id"],
-                    tool_name=tool.name,
-                    arguments_digest=_canonical_digest(
-                        normalized["arguments"]
+                    turn_id=str(
+                        tool_context.get("turn_id") or f"turn:{normalized['id']}"
                     ),
-                    workspace_id=str(
-                        tool_context.get("workspace_id")
-                        or f"session:{current_session}"
-                    ),
-                    profile_digest=_canonical_digest(
-                        {
-                            "permission_level": tool.permission_level,
-                            "target": approval_target,
-                            "network_policy": tool_context["network_policy"],
-                            # M1: bind the approval to the exact effective
-                            # policy under which it was issued.  A different
-                            # policy (different allowed_paths, commands_require_
-                            # approval, network_allowed_domains, …) yields a
-                            # different digest, so an approval cannot be
-                            # replayed under a loosened policy.
-                            "effective_policy_digest": tool_context.get(
-                                "effective_policy_digest", ""
-                            ),
-                        }
-                    ),
+                    approval_target=approval_target,
+                    resource=resource,
                     expires_at=expires_at,
-                    project_id=project_id,
-                    workspace_generation=(resource.workspace_generation if resource else 0),
-                    authorization_resource_digest=(resource.digest() if resource else ""),
                     authorization_epoch=authorization_epoch,
                     policy_digest=self.permission_engine.policy_digest,
-                    tool_schema_digest=tool.schema_digest,
-                    tool_security_digest=tool.security_digest,
                     step_authority_digest=step_authority.scope_digest(),
                 )
                 broker = tool_context.get("approval_broker")
@@ -748,29 +722,14 @@ class ToolScheduler:
                 # able to mutate the arguments between approval and dispatch
                 # would not be caught by an arguments-digest mismatch.
                 normalized["_approval_arguments_digest"] = binding.arguments_digest
-                request = PermissionRequest(
-                    tool_call_id=normalized["id"],
-                    approval_id=normalized.get("_approval_id", ""),
-                    name=tool.name,
-                    arguments=normalized["arguments"],
-                    level=tool.permission_level,
-                    target=approval_target,
-                    reason=decision.reason,
+                request = build_permission_request(
+                    call=normalized,
+                    tool=tool,
+                    binding=binding,
+                    approval_id=str(normalized.get("_approval_id", "")),
                     binding_digest=binding_digest,
-                    expires_at=expires_at,
-                    principal_id=binding.principal_id,
-                    session_id=binding.session_id,
-                    task_id=binding.task_id,
-                    workspace_id=binding.workspace_id,
-                    arguments_digest=binding.arguments_digest,
-                    profile_digest=binding.profile_digest,
-                    project_id=binding.project_id,
-                    workspace_generation=binding.workspace_generation,
-                    authorization_resource_digest=binding.authorization_resource_digest,
-                    authorization_epoch=binding.authorization_epoch,
-                    policy_digest=binding.policy_digest,
-                    tool_schema_digest=binding.tool_schema_digest,
-                    tool_security_digest=binding.tool_security_digest,
+                    reason=decision.reason,
+                    target=approval_target,
                     step_execution_digest=step_authority.digest(),
                 )
                 yield SchedulerEvent(event="permission_request", permission_request=request)
