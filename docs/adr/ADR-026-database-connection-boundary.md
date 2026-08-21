@@ -23,7 +23,8 @@
 `Database` 仍拥有 transaction owner、migration runner 和领域写事务。它通过显式
 `DatabaseConnection` 调用获取句柄；旧的 `_conn`、`_reader_conn` 等属性只是迁移期兼容
 视图，不得成为新的 writer。迁移 registry 冻结的方法与 `_MigrationConnection` 不移动，
-避免篡改已发布 schema manifest。
+避免篡改已发布 schema manifest。记忆 SQL 是第一个完成的领域抽取，由
+`db/repositories/memories.py` 独占（见 ADR-052）。
 
 ## 迁移与删除条件
 

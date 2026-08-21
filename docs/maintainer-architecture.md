@@ -81,7 +81,7 @@ KHAOS.md / AGENTS.md
 
 | 文件 | 当前集中职责 | 拆分目标 |
 | --- | --- | --- |
-| `python/khaos/db/database.py` | 迁移、事务 owner、turn/event、audit、memory、task、scheduler 等领域 facade；session/message 只做 lease/transaction 编排 | `python/khaos/db/connection.py` 拥有物理连接生命周期；`db/repositories/sessions.py` 拥有 session/message SQL 与 row conversion，最终继续按领域拆 repository 并保留一个薄 facade |
+| `python/khaos/db/database.py` | 迁移、事务 owner、turn/event、audit、task、scheduler 等领域 facade；session/message 和 memory 只做 lease/transaction 编排 | `python/khaos/db/connection.py` 拥有物理连接生命周期；`db/repositories/sessions.py` 与 `db/repositories/memories.py` 分别拥有 session/message、memory SQL 与 row conversion，最终继续按领域拆 repository 并保留一个薄 facade |
 | `python/khaos/tools/scheduler.py` | admission 后的 approval、批次并发和结果事件编排 | `ToolAdmission`、`ToolResultFinalizer`（terminal phase/audit/result delivery）、`ToolResultStore`（runtime replay cache）、`ToolOperationStore`（claim/wait/terminal idempotency）、`ApprovalCallbackRunner`（adapter 生命周期）、`ToolAuthorization`（decision/remember/binding contract）、`ToolExecutionCoordinator`（authority-bound dispatch） |
 | `python/khaos/tools/result_finalizer.py` | dispatched tool 的 terminal phase、best-effort audit、durable operation finish 和 idempotent result publish | `ToolResultFinalizer`；不做 admission、permission decision、handler dispatch 或 budget ownership |
 | `python/khaos/tools/authorization.py` | permission decision hardening、remember rule projection、approval binding/request projection | `ToolAuthorization`、`build_approval_binding`、`build_permission_request`；不注册/消费 broker，不执行工具效果 |

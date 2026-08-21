@@ -19,9 +19,9 @@ from typing import Any
 
 from khaos.agent.core import Message
 from khaos.db.connection import (
+    READER_DRAIN_TIMEOUT,
     DatabaseClosingError,  # noqa: F401 - compatibility export
     DatabaseConnection,
-    READER_DRAIN_TIMEOUT,
     _AsyncCursor,  # noqa: F401 - compatibility export
     _AsyncSqliteFallback,  # noqa: F401 - compatibility export
     aiosqlite,  # noqa: F401 - tests patch the shared driver module
@@ -545,6 +545,18 @@ class Database:
         # ordering, generation bump, and reader drain semantics.
         async with self._write_transaction_lock:
             await self._connection.close()
+
+    @asynccontextmanager
+    async def read_connection(self) -> AsyncIterator[Any]:
+        """Yield the query-only connection under an explicit read lease.
+
+        Domain repositories use this port instead of reaching into
+        ``Database._reader_conn`` or duplicating connection lifecycle logic.
+        The lease prevents shutdown from closing the reader while a query is
+        still using it, and the connection remains ``PRAGMA query_only``.
+        """
+        async with self._read_lease():
+            yield await self._require_reader_conn()
 
     @asynccontextmanager
     async def _read_lease(self):
@@ -3253,298 +3265,6 @@ class Database:
                 tuple(params),
             )
             return [dict(row) for row in await cursor.fetchall()]
-
-    async def upsert_memory(
-        self,
-        scope: str,
-        key: str,
-        value: str,
-        ttl: int,
-        confidence: int,
-        *,
-        principal_id: str = "legacy",
-        namespace: str = "private",
-        session_id: str = "",
-        project_id: str = "",
-    ) -> int:
-        """Insert or update a memory by (project_id, namespace, principal_id, session_id, scope, key).
-
-        M4 batch 3.1.16A-2: memories are partitioned by
-        ``(namespace, principal_id, session_id)``.  Legacy callers that
-        omit them get ``principal_id='legacy'`` — the memory is stored
-        but never loaded by authenticated principals.
-
-        F-02 (third-round review): ``project_id`` is now part of the
-        UNIQUE constraint.  Two projects sharing a state DB get distinct
-        rows for the same (namespace, principal_id, session_id, scope,
-        key).  The ``ON CONFLICT`` clause includes ``project_id`` so
-        re-upserting from the same project updates the existing row,
-        while a different project creates a new row.  The old
-        "owner-preserving" behavior (where project B could silently
-        update project A's row) is removed.
-        """
-        async with self.transaction() as conn:
-            await conn.execute(
-                """
-                INSERT INTO memories (
-                    scope, key, value, ttl, confidence,
-                    principal_id, namespace, session_id, project_id
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(project_id, namespace, principal_id, session_id, scope, key) DO UPDATE SET
-                    value = excluded.value,
-                    ttl = excluded.ttl,
-                    confidence = excluded.confidence,
-                    updated_at = datetime('now')
-                """,
-                (scope, key, value, ttl, confidence,
-                 principal_id, namespace, session_id, project_id),
-            )
-            cursor = await conn.execute(
-                """
-                SELECT id FROM memories
-                WHERE project_id = ? AND namespace = ? AND principal_id = ?
-                  AND session_id = ? AND scope = ? AND key = ?
-                """,
-                (project_id, namespace, principal_id, session_id, scope, key),
-            )
-            row = await cursor.fetchone()
-            return int(row["id"])
-
-    async def get_memory(
-        self,
-        scope: str,
-        key: str,
-        *,
-        principal_id: str = "legacy",
-        namespace: str = "private",
-        session_id: str = "",
-        project_id: str = "",
-    ) -> dict[str, Any] | None:
-        """Fetch one memory by (project_id, namespace, principal_id, session_id, scope, key).
-
-        F-02: ``project_id`` is now part of the identity.  Callers that
-        omit it get ``project_id=''`` which matches legacy/unbound rows.
-        """
-        async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
-            conn = await self._require_conn()
-            cursor = await conn.execute(
-                """
-                SELECT id, scope, key, value, ttl, confidence, access_freq,
-                       created_at, updated_at, principal_id, namespace, session_id,
-                       project_id
-                FROM memories
-                WHERE project_id = ? AND namespace = ? AND principal_id = ?
-                  AND session_id = ? AND scope = ? AND key = ?
-                """,
-                (project_id, namespace, principal_id, session_id, scope, key),
-            )
-            row = await cursor.fetchone()
-            return dict(row) if row is not None else None
-
-    async def delete_memory(
-        self,
-        scope: str,
-        key: str,
-        *,
-        principal_id: str = "legacy",
-        namespace: str = "private",
-        session_id: str = "",
-        project_id: str = "",
-    ) -> None:
-        """Delete one memory by (project_id, namespace, principal_id, session_id, scope, key).
-
-        F-02: ``project_id`` scopes the delete so a caller from project B
-        cannot delete project A's memory of the same key.
-        """
-        async with self.transaction() as conn:
-            await conn.execute(
-                """
-                DELETE FROM memories
-                WHERE project_id = ? AND namespace = ? AND principal_id = ?
-                  AND session_id = ? AND scope = ? AND key = ?
-                """,
-                (project_id, namespace, principal_id, session_id, scope, key),
-            )
-
-    async def delete_memory_by_id(
-        self,
-        memory_id: int,
-        *,
-        principal_id: str | None = None,
-        project_id: str | None = None,
-    ) -> None:
-        """Delete one memory by id.
-
-        M4 batch 3.1.16A-4-2: when ``principal_id`` is provided, the
-        DELETE is scoped to that principal — preventing cross-principal
-        deletion.  ``principal_id=None`` (the default) preserves the
-        legacy unscoped behavior for internal/admin callers.
-
-        F-02: when ``project_id`` is provided, the DELETE is additionally
-        scoped to that project.  This prevents a caller from project B
-        deleting project A's memory by id.  ``project_id=None`` preserves
-        the legacy unscoped behavior.
-        """
-        async with self.transaction() as conn:
-            clauses = ["id = ?"]
-            params: list[Any] = [memory_id]
-            if principal_id is not None:
-                clauses.append(
-                    "(principal_id = ? OR (namespace = 'shared' AND principal_id = ''))"
-                )
-                params.append(principal_id)
-            if project_id is not None:
-                clauses.append("project_id = ?")
-                params.append(project_id)
-            where = " AND ".join(clauses)
-            await conn.execute(
-                f"DELETE FROM memories WHERE {where}",
-                tuple(params),
-            )
-
-    async def list_memories(
-        self,
-        scope: str | None = None,
-        *,
-        principal_id: str | None = None,
-        namespace: str | None = None,
-        project_id: str | None = None,
-    ) -> list[dict[str, Any]]:
-        """List memories, optionally filtered by scope/principal/namespace/project.
-
-        M4 batch 3.1.16A-2: when ``principal_id`` is provided, only
-        memories belonging to that principal (or project-shared with
-        ``namespace='shared'``) are returned.  Legacy rows with
-        ``principal_id='legacy'`` are excluded.  When ``principal_id``
-        is ``None`` (default), all memories are returned — this
-        preserves the legacy admin/inspection behaviour.
-
-        F-02: when ``project_id`` is provided, only memories in that
-        project are returned.  ``project_id=None`` (default) preserves
-        the legacy unscoped behavior (all projects) for admin callers.
-        Production callers should always pass ``project_id`` so a
-        shared DB cannot leak cross-project memories.
-        """
-        async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
-            conn = await self._require_conn()
-            clauses: list[str] = []
-            params: list[Any] = []
-            if scope is not None:
-                clauses.append("scope = ?")
-                params.append(scope)
-            if principal_id is not None:
-                # Include the principal's private memories AND project-shared
-                # memories (namespace='shared', principal_id='').
-                clauses.append(
-                    "(principal_id = ? OR (namespace = 'shared' AND principal_id = ''))"
-                )
-                params.append(principal_id)
-            if namespace is not None:
-                clauses.append("namespace = ?")
-                params.append(namespace)
-            if project_id is not None:
-                clauses.append("project_id = ?")
-                params.append(project_id)
-            where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-            cursor = await conn.execute(
-                f"""
-                SELECT id, scope, key, value, ttl, confidence, access_freq,
-                       created_at, updated_at, principal_id, namespace, session_id,
-                       project_id
-                FROM memories
-                {where}
-                ORDER BY confidence DESC, updated_at DESC, id DESC
-                """,
-                tuple(params),
-            )
-            return [dict(row) for row in await cursor.fetchall()]
-
-    async def search_memories(
-        self,
-        query: str,
-        top_k: int = 5,
-        *,
-        principal_id: str | None = None,
-        namespace: str | None = None,
-        project_id: str | None = None,
-    ) -> list[dict[str, Any]]:
-        """Search memories through FTS5.
-
-        M4 batch 3.1.16A-2: when ``principal_id`` is provided, only
-        memories belonging to that principal (or project-shared) are
-        returned.  Legacy rows are excluded.
-
-        F-02: when ``project_id`` is provided, only memories in that
-        project are returned.  Production callers should always pass
-        ``project_id`` so a shared DB cannot leak cross-project FTS
-        results.
-        """
-        async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
-            conn = await self._require_conn()
-            clauses: list[str] = ["memory_fts MATCH ?"]
-            params: list[Any] = [query]
-            if principal_id is not None:
-                clauses.append(
-                    "(m.principal_id = ? OR (m.namespace = 'shared' AND m.principal_id = ''))"
-                )
-                params.append(principal_id)
-            if namespace is not None:
-                clauses.append("m.namespace = ?")
-                params.append(namespace)
-            if project_id is not None:
-                clauses.append("m.project_id = ?")
-                params.append(project_id)
-            where = " AND ".join(clauses)
-            params.append(top_k)
-            cursor = await conn.execute(
-                f"""
-                SELECT m.id, m.scope, m.key, m.value, m.ttl, m.confidence,
-                       m.access_freq, m.created_at, m.updated_at,
-                       m.principal_id, m.namespace, m.session_id, m.project_id
-                FROM memory_fts
-                JOIN memories AS m ON m.id = memory_fts.rowid
-                WHERE {where}
-                ORDER BY bm25(memory_fts)
-                LIMIT ?
-                """,
-                tuple(params),
-            )
-            return [dict(row) for row in await cursor.fetchall()]
-
-    async def touch_memory(
-        self,
-        memory_id: int,
-        *,
-        principal_id: str | None = None,
-        project_id: str | None = None,
-    ) -> None:
-        """Increment memory access frequency within an optional owner scope.
-
-        The unscoped form remains available for legacy admin callers. Runtime
-        memory stores always provide both bindings through
-        ``SqliteMemoryRepository`` so a principal cannot mutate another
-        principal's access frequency by guessing a row ID.
-        """
-        async with self.transaction() as conn:
-            clauses = ["id = ?"]
-            params: list[Any] = [memory_id]
-            if principal_id is not None:
-                clauses.append(
-                    "(principal_id = ? OR (namespace = 'shared' AND principal_id = ''))"
-                )
-                params.append(principal_id)
-            if project_id is not None:
-                clauses.append("project_id = ?")
-                params.append(project_id)
-            await conn.execute(
-                f"""
-                UPDATE memories
-                SET access_freq = access_freq + 1, updated_at = datetime('now')
-                WHERE {' AND '.join(clauses)}
-                """,
-                tuple(params),
-            )
 
     async def insert_subagent_task(
         self,
