@@ -101,7 +101,10 @@ def workflow_actions() -> tuple[list[str], list[str]]:
 
 
 def render() -> str:
-    protocol_source = read(ROOT / "python" / "khaos" / "grpc_server.py")
+    # Protocol constants and negotiation are owned by the standalone RPC
+    # boundary.  Keep the inventory tied to that owner instead of the
+    # transport compatibility facade.
+    protocol_source = read(ROOT / "python" / "khaos" / "rpc" / "protocol.py")
     protocol_version = re.search(r"^RPC_PROTOCOL_VERSION\s*=\s*(\d+)", protocol_source, re.MULTILINE)
     protocol_min = re.search(r"^RPC_PROTOCOL_MIN_VERSION\s*=\s*(\d+)", protocol_source, re.MULTILINE)
     protocol_max = re.search(r"^RPC_PROTOCOL_MAX_VERSION\s*=\s*(\d+)", protocol_source, re.MULTILINE)
@@ -132,7 +135,12 @@ def render() -> str:
         ("python/khaos/coding/execution/binding.py", sha256(ROOT / "python" / "khaos" / "coding" / "execution" / "binding.py")),
         ("python/khaos/coding/execution/supervisor.py", sha256(ROOT / "python" / "khaos" / "coding" / "execution" / "supervisor.py")),
         ("python/khaos/coding/workspace/manager.py", sha256(ROOT / "python" / "khaos" / "coding" / "workspace" / "manager.py")),
+        ("python/khaos/coding/workspace/artifacts.py", sha256(ROOT / "python" / "khaos" / "coding" / "workspace" / "artifacts.py")),
         ("python/khaos/coding/workspace/trusted_git.py", sha256(ROOT / "python" / "khaos" / "coding" / "workspace" / "trusted_git.py")),
+        ("python/khaos/coding/workspace/git_process.py", sha256(ROOT / "python" / "khaos" / "coding" / "workspace" / "git_process.py")),
+        ("python/khaos/coding/planning/approval/execution_read_model.py", sha256(ROOT / "python" / "khaos" / "coding" / "planning" / "approval" / "execution_read_model.py")),
+        ("python/khaos/coding/planning/approval/execution_writer.py", sha256(ROOT / "python" / "khaos" / "coding" / "planning" / "approval" / "execution_writer.py")),
+        ("python/khaos/coding/planning/approval/execution_journal_writer.py", sha256(ROOT / "python" / "khaos" / "coding" / "planning" / "approval" / "execution_journal_writer.py")),
         ("python/khaos/security/authority.py", sha256(ROOT / "python" / "khaos" / "security" / "authority.py")),
         ("python/khaos/security/authority_broker.py", sha256(ROOT / "python" / "khaos" / "security" / "authority_broker.py")),
         ("python/khaos/security/authorityd.py", sha256(ROOT / "python" / "khaos" / "security" / "authorityd.py")),
@@ -149,12 +157,23 @@ def render() -> str:
         ("python/khaos/security/shell_semantics.py", sha256(ROOT / "python" / "khaos" / "security" / "shell_semantics.py")),
         ("python/khaos/coding/planning/security_identities.py", sha256(ROOT / "python" / "khaos" / "coding" / "planning" / "security_identities.py")),
         ("python/khaos/coding/workspace/boundary.py", sha256(ROOT / "python" / "khaos" / "coding" / "workspace" / "boundary.py")),
+        ("python/khaos/coding/workspace/policy.py", sha256(ROOT / "python" / "khaos" / "coding" / "workspace" / "policy.py")),
+        ("python/khaos/db/connection.py", sha256(ROOT / "python" / "khaos" / "db" / "connection.py")),
+        ("python/khaos/db/repositories/sessions.py", sha256(ROOT / "python" / "khaos" / "db" / "repositories" / "sessions.py")),
+        ("python/khaos/scheduler/calculator.py", sha256(ROOT / "python" / "khaos" / "scheduler" / "calculator.py")),
+        ("python/khaos/scheduler/repository.py", sha256(ROOT / "python" / "khaos" / "scheduler" / "repository.py")),
+        ("python/khaos/scheduler/due_selector.py", sha256(ROOT / "python" / "khaos" / "scheduler" / "due_selector.py")),
+        ("python/khaos/coding/planning/limits.py", sha256(ROOT / "python" / "khaos" / "coding" / "planning" / "limits.py")),
+        ("python/khaos/tools/result_codec.py", sha256(ROOT / "python" / "khaos" / "tools" / "result_codec.py")),
+        ("python/khaos/tools/result_finalizer.py", sha256(ROOT / "python" / "khaos" / "tools" / "result_finalizer.py")),
+        ("python/khaos/rpc/protocol.py", sha256(ROOT / "python" / "khaos" / "rpc" / "protocol.py")),
         ("rust/khaos-core/src/bin/khaos-exec-launcher.rs", sha256(ROOT / "rust" / "khaos-core" / "src" / "bin" / "khaos-exec-launcher.rs")),
         ("rust/khaos-core/src/bin/khaos-sandbox-launcher.rs", sha256(ROOT / "rust" / "khaos-core" / "src" / "bin" / "khaos-sandbox-launcher.rs")),
         ("python/khaos/grpc_server.py", sha256(ROOT / "python" / "khaos" / "grpc_server.py")),
         ("go/internal/api/handler.go", sha256(ROOT / "go" / "internal" / "api" / "handler.go")),
         ("go/cmd/gateway/main.go", sha256(ROOT / "go" / "cmd" / "gateway" / "main.go")),
         ("go/internal/platform/python_client.go", sha256(ROOT / "go" / "internal" / "platform" / "python_client.go")),
+        ("go/internal/platform/rpc_contract.go", sha256(ROOT / "go" / "internal" / "platform" / "rpc_contract.go")),
         ("scripts/generate_production_reachability.py", sha256(ROOT / "scripts" / "generate_production_reachability.py")),
         ("packaging/macos/khaos-authorityd-xpc.m", sha256(ROOT / "packaging" / "macos" / "khaos-authorityd-xpc.m")),
         ("packaging/macos/khaos-authorityd-xpc-client.c", sha256(ROOT / "packaging" / "macos" / "khaos-authorityd-xpc-client.c")),

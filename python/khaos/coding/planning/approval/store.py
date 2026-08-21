@@ -26,7 +26,6 @@ Batch 2.1 hardening:
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import sqlite3
@@ -40,6 +39,11 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from khaos.coding.planning.execution_models import RollbackResumeState
 
+from khaos.coding.planning.approval.execution_journal_writer import (
+    PlanExecutionJournalWriter,
+)
+from khaos.coding.planning.approval.execution_read_model import PlanExecutionReadModel
+from khaos.coding.planning.approval.execution_writer import PlanExecutionWriter
 from khaos.coding.planning.approval.models import (
     ALLOWED_APPROVAL_TRANSITIONS,
     AuthorizationStatus,
@@ -50,503 +54,11 @@ from khaos.coding.planning.approval.models import (
     PlanExecutionAuthorization,
     verify_nonce,
 )
+from khaos.coding.planning.approval.read_model import PlanApprovalReadModel
+from khaos.coding.planning.approval.schema import APPROVAL_SCHEMA, upgrade_schema
 from khaos.coding.planning.security_identities import CanonicalWorkspaceId
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Schema (also mirrored in khaos/db/schema.sql)
-# ---------------------------------------------------------------------------
-
-APPROVAL_SCHEMA = """
-CREATE TABLE IF NOT EXISTS plan_approval_requests (
-    approval_request_id   TEXT PRIMARY KEY,
-    plan_id               TEXT NOT NULL,
-    plan_content_hash     TEXT NOT NULL,
-    repository_id         TEXT NOT NULL,
-    task_id               TEXT NOT NULL,
-    workspace_id          TEXT NOT NULL,
-    base_sha              TEXT NOT NULL,
-    repository_generation INTEGER NOT NULL,
-    risk_level            TEXT NOT NULL,
-    requested_operations  TEXT NOT NULL DEFAULT '[]',
-    affected_files        TEXT NOT NULL DEFAULT '[]',
-    affected_symbols      TEXT NOT NULL DEFAULT '[]',
-    verification_digest   TEXT NOT NULL,
-    binding_digest        TEXT NOT NULL,
-    requested_at          REAL NOT NULL,
-    expires_at            REAL NOT NULL,
-    status                TEXT NOT NULL,
-    broker_request_id     TEXT NOT NULL DEFAULT '',
-    reason                TEXT NOT NULL DEFAULT '',
-    metadata              TEXT NOT NULL DEFAULT '{}'
-);
-
-CREATE INDEX IF NOT EXISTS idx_plan_approval_requests_plan
-    ON plan_approval_requests(plan_id, plan_content_hash);
-CREATE INDEX IF NOT EXISTS idx_plan_approval_requests_repo
-    ON plan_approval_requests(repository_id, task_id, workspace_id);
--- broker_request_id lookup index (uniqueness enforced separately because old
--- Batch 2 rows used the empty string for not-required requests).
-CREATE INDEX IF NOT EXISTS idx_plan_approval_requests_broker
-    ON plan_approval_requests(broker_request_id);
-CREATE INDEX IF NOT EXISTS idx_plan_approval_requests_status
-    ON plan_approval_requests(status, expires_at);
-
-CREATE TABLE IF NOT EXISTS plan_approval_decisions (
-    decision_id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    approval_request_id    TEXT NOT NULL,
-    decision               TEXT NOT NULL,
-    actor_id               TEXT NOT NULL,
-    actor_type             TEXT NOT NULL,
-    decided_at             REAL NOT NULL,
-    reason                 TEXT NOT NULL DEFAULT '',
-    authenticated_context  TEXT NOT NULL DEFAULT '{}',
-    metadata               TEXT NOT NULL DEFAULT '{}'
-);
-
-CREATE INDEX IF NOT EXISTS idx_plan_approval_decisions_request
-    ON plan_approval_decisions(approval_request_id, decided_at);
-
-CREATE TABLE IF NOT EXISTS plan_execution_authorizations (
-    authorization_id      TEXT PRIMARY KEY,
-    approval_request_id   TEXT NOT NULL,
-    plan_id               TEXT NOT NULL,
-    plan_content_hash     TEXT NOT NULL,
-    repository_id         TEXT NOT NULL,
-    task_id               TEXT NOT NULL,
-    workspace_id          TEXT NOT NULL,
-    base_sha              TEXT NOT NULL,
-    repository_generation INTEGER NOT NULL,
-    issued_at             REAL NOT NULL,
-    expires_at            REAL NOT NULL,
-    nonce_hash            TEXT NOT NULL UNIQUE,
-    binding_digest        TEXT NOT NULL,
-    status                TEXT NOT NULL,
-    server_epoch          INTEGER NOT NULL DEFAULT 0,
-    boot_id               TEXT NOT NULL DEFAULT ''
-);
-
-CREATE INDEX IF NOT EXISTS idx_plan_execution_authorizations_plan
-    ON plan_execution_authorizations(plan_id, approval_request_id);
-CREATE INDEX IF NOT EXISTS idx_plan_execution_authorizations_scope
-    ON plan_execution_authorizations(repository_id, task_id, workspace_id);
-CREATE INDEX IF NOT EXISTS idx_plan_execution_authorizations_status
-    ON plan_execution_authorizations(status, expires_at);
-
-CREATE TABLE IF NOT EXISTS plan_approval_audit_events (
-    event_id              TEXT PRIMARY KEY,
-    event_type            TEXT NOT NULL,
-    approval_request_id   TEXT NOT NULL,
-    plan_id               TEXT NOT NULL,
-    previous_status       TEXT NOT NULL,
-    new_status            TEXT NOT NULL,
-    actor_id              TEXT NOT NULL,
-    actor_type            TEXT NOT NULL,
-    authenticated_source  TEXT NOT NULL,
-    timestamp             REAL NOT NULL,
-    reason_code           TEXT NOT NULL,
-    task_id               TEXT NOT NULL,
-    workspace_id          TEXT NOT NULL,
-    repository_id         TEXT NOT NULL,
-    correlation_id        TEXT NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_plan_approval_audit_events_request
-    ON plan_approval_audit_events(approval_request_id, timestamp);
-CREATE INDEX IF NOT EXISTS idx_plan_approval_audit_events_plan
-    ON plan_approval_audit_events(plan_id, timestamp);
-
--- Batch 2.1: durable broker-decision receipt outbox. Only
--- ApprovalBroker.resolve_plan_approval can create a row here (via the
--- receipt_sink callback); apply_authenticated_decision verifies the token
--- hash AND every authoritative field against this row and marks it consumed
--- inside the same transaction.
--- Batch 2.6 §1: broker signature + canonical_payload_digest + signer_key_id
--- columns. apply_authenticated_decision re-verifies the Ed25519 signature so
--- direct DB writes by ordinary code cannot produce a valid receipt row.
-CREATE TABLE IF NOT EXISTS plan_approval_receipts (
-    receipt_id               TEXT PRIMARY KEY,
-    token_hash               TEXT NOT NULL UNIQUE,
-    approval_request_id      TEXT NOT NULL,
-    broker_request_id        TEXT NOT NULL,
-    binding_digest           TEXT NOT NULL,
-    decision                 TEXT NOT NULL,
-    namespace                TEXT NOT NULL DEFAULT 'plan-execution',
-    authenticated_actor_id   TEXT NOT NULL DEFAULT '',
-    authenticated_actor_type TEXT NOT NULL DEFAULT '',
-    authenticated_source     TEXT NOT NULL DEFAULT '',
-    session_request_id       TEXT NOT NULL DEFAULT '',
-    server_capability        TEXT NOT NULL DEFAULT '',
-    decided_at               REAL NOT NULL DEFAULT 0,
-    reason_digest            TEXT NOT NULL DEFAULT '',
-    consumed                 INTEGER NOT NULL DEFAULT 0,
-    created_at               REAL NOT NULL,
-    expires_at               REAL NOT NULL,
-    canonical_payload_digest TEXT NOT NULL DEFAULT '',
-    broker_signature         TEXT NOT NULL DEFAULT '',
-    signer_key_id            TEXT NOT NULL DEFAULT '',
-    signer_epoch             INTEGER NOT NULL DEFAULT 0,
-    signer_boot_id           TEXT NOT NULL DEFAULT '',
-    issued_at                REAL NOT NULL DEFAULT 0
-);
-
-CREATE INDEX IF NOT EXISTS idx_plan_approval_receipts_token
-    ON plan_approval_receipts(token_hash);
-CREATE INDEX IF NOT EXISTS idx_plan_approval_receipts_request
-    ON plan_approval_receipts(approval_request_id);
-
--- Batch 2.7: persisted Ed25519 public verification keys. Private signing
--- material remains broker-local and is never written to SQLite. A new boot
--- rotates the key while old public keys remain available for verification.
-CREATE TABLE IF NOT EXISTS receipt_verification_keys (
-    key_id       TEXT PRIMARY KEY,
-    public_key   TEXT NOT NULL,
-    key_version  INTEGER NOT NULL,
-    boot_epoch   INTEGER NOT NULL,
-    boot_id      TEXT NOT NULL DEFAULT '',
-    created_at   REAL NOT NULL,
-    active       INTEGER NOT NULL DEFAULT 1
-);
-
-CREATE TABLE IF NOT EXISTS approval_runtime_boots (
-    server_epoch INTEGER NOT NULL,
-    boot_id TEXT PRIMARY KEY,
-    started_at REAL NOT NULL,
-    replaced_at REAL
-);
-
-CREATE TABLE IF NOT EXISTS workspace_mutation_poison (
-    workspace_id TEXT PRIMARY KEY,
-    lease_id TEXT NOT NULL,
-    reason TEXT NOT NULL,
-    poisoned_at REAL NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS workspace_mutation_poison_scopes (
-    workspace_id TEXT NOT NULL,
-    poison_owner TEXT NOT NULL,
-    reason TEXT NOT NULL,
-    poisoned_at REAL NOT NULL,
-    PRIMARY KEY(workspace_id, poison_owner)
-);
-
-CREATE TABLE IF NOT EXISTS workspace_mutation_audit (
-    event_id TEXT PRIMARY KEY,
-    workspace_id TEXT NOT NULL,
-    lease_id TEXT NOT NULL,
-    event_type TEXT NOT NULL,
-    reason TEXT NOT NULL,
-    created_at REAL NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS plan_execution_runs (
-    execution_run_id TEXT PRIMARY KEY,
-    plan_id TEXT NOT NULL,
-    plan_content_hash TEXT NOT NULL,
-    approval_request_id TEXT NOT NULL,
-    authorization_id TEXT NOT NULL UNIQUE,
-    execution_context_id TEXT NOT NULL UNIQUE,
-    lease_id TEXT NOT NULL,
-    task_id TEXT NOT NULL,
-    workspace_id TEXT NOT NULL,
-    repository_id TEXT NOT NULL,
-    base_sha TEXT NOT NULL,
-    repository_generation INTEGER NOT NULL,
-    binding_digest TEXT NOT NULL,
-    edit_bundle_digest TEXT NOT NULL,
-    status TEXT NOT NULL,
-    started_at REAL NOT NULL,
-    updated_at REAL NOT NULL,
-    completed_at REAL,
-    failure_code TEXT NOT NULL DEFAULT '',
-    recovery_sealed_at REAL,
-    recovery_seal_digest TEXT NOT NULL DEFAULT '',
-    rollback_sealed_at REAL,
-    rollback_seal_digest TEXT NOT NULL DEFAULT '',
-    terminal_tombstone_digest TEXT NOT NULL DEFAULT '',
-    initial_attestation_digest TEXT NOT NULL DEFAULT '',
-    journaled_edit_count INTEGER NOT NULL DEFAULT 0,
-    metadata_json TEXT NOT NULL DEFAULT '{}'
-);
-
-CREATE TABLE IF NOT EXISTS plan_execution_edit_events (
-    event_id TEXT PRIMARY KEY,
-    execution_run_id TEXT NOT NULL,
-    edit_id TEXT NOT NULL,
-    ordinal INTEGER NOT NULL,
-    operation TEXT NOT NULL,
-    path TEXT NOT NULL,
-    destination_path TEXT,
-    before_hash TEXT,
-    after_hash TEXT,
-    before_mode INTEGER,
-    after_mode INTEGER,
-    status TEXT NOT NULL,
-    phase_version INTEGER NOT NULL DEFAULT 0,
-    applied_identity_digest TEXT NOT NULL DEFAULT '',
-    applied_parent_identity_digest TEXT NOT NULL DEFAULT '',
-    applied_destination_identity_digest TEXT NOT NULL DEFAULT '',
-    rollback_identity_digest TEXT NOT NULL DEFAULT '',
-    rollback_parent_identity_digest TEXT NOT NULL DEFAULT '',
-    rollback_destination_parent_identity_digest TEXT NOT NULL DEFAULT '',
-    rollback_sync_mask INTEGER NOT NULL DEFAULT 0,
-    rollback_directory_sync_digest TEXT NOT NULL DEFAULT '',
-    rollback_synced_at REAL,
-    identity_version INTEGER NOT NULL DEFAULT 0,
-    error_code TEXT NOT NULL DEFAULT '',
-    recovery_artifact TEXT,
-    created_at REAL NOT NULL,
-    updated_at REAL NOT NULL,
-    UNIQUE(execution_run_id, edit_id)
-);
-CREATE TABLE IF NOT EXISTS plan_execution_audit_events (
-    audit_id TEXT PRIMARY KEY,
-    execution_run_id TEXT NOT NULL,
-    event_type TEXT NOT NULL,
-    operation TEXT NOT NULL DEFAULT '',
-    path TEXT NOT NULL DEFAULT '',
-    before_hash TEXT NOT NULL DEFAULT '',
-    after_hash TEXT NOT NULL DEFAULT '',
-    result TEXT NOT NULL,
-    error_code TEXT NOT NULL DEFAULT '',
-    correlation_id TEXT NOT NULL,
-    created_at REAL NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS plan_execution_final_attestations (
-    execution_run_id TEXT PRIMARY KEY,
-    bundle_digest TEXT NOT NULL,
-    canonical_json TEXT NOT NULL,
-    attestation_digest TEXT NOT NULL,
-    attested_at REAL NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS plan_execution_rollback_attestations (
-    execution_run_id TEXT PRIMARY KEY,
-    bundle_digest TEXT NOT NULL,
-    canonical_json TEXT NOT NULL,
-    attestation_digest TEXT NOT NULL,
-    attested_at REAL NOT NULL
-);
-CREATE TABLE IF NOT EXISTS plan_execution_initial_attestations (
-    execution_run_id TEXT PRIMARY KEY,
-    canonical_json TEXT NOT NULL,
-    attestation_digest TEXT NOT NULL,
-    attested_at REAL NOT NULL
-);
-
--- Batch 2.2: persisted monotonic server epoch. The gate reads and rotates
--- this atomically at startup so a restart genuinely invalidates old
--- authorizations (the in-memory default epoch was not a real safety property).
-CREATE TABLE IF NOT EXISTS plan_execution_server_state (
-    singleton_key  TEXT PRIMARY KEY DEFAULT 'global',
-    current_epoch  INTEGER NOT NULL DEFAULT 0,
-    boot_id        TEXT NOT NULL DEFAULT '',
-    updated_at     REAL NOT NULL DEFAULT 0
-);
-
--- Batch 2.2: persisted authoritative plan snapshots. The gate and decision
--- path resolve plans by plan_id from here, not from a caller-supplied object.
--- A plan_id cannot be silently replaced with different content.
-CREATE TABLE IF NOT EXISTS plan_snapshots (
-    plan_id              TEXT PRIMARY KEY,
-    content_hash         TEXT NOT NULL,
-    binding_digest       TEXT NOT NULL,
-    repository_id        TEXT NOT NULL,
-    task_id              TEXT NOT NULL,
-    workspace_id         TEXT NOT NULL,
-    schema_version       TEXT NOT NULL DEFAULT 'khaos.planning.v1',
-    canonical_plan_json  TEXT NOT NULL,
-    created_at           REAL NOT NULL,
-    status               TEXT NOT NULL DEFAULT 'active'
-);
-
-CREATE INDEX IF NOT EXISTS idx_plan_snapshots_repo
-    ON plan_snapshots(repository_id, task_id, workspace_id);
-
--- Batch 2.2: workspace execution leases (TOCTOU closure for consume).
-CREATE TABLE IF NOT EXISTS plan_execution_leases (
-    lease_id              TEXT PRIMARY KEY,
-    task_id               TEXT NOT NULL,
-    workspace_id          TEXT NOT NULL,
-    repository_id         TEXT NOT NULL,
-    plan_id               TEXT NOT NULL,
-    head_sha              TEXT NOT NULL,
-    repository_generation INTEGER NOT NULL,
-    evidence_digest       TEXT NOT NULL,
-    binding_digest        TEXT NOT NULL,
-    authorization_id      TEXT NOT NULL,
-    expiry                REAL NOT NULL,
-    owner_execution_id    TEXT NOT NULL,
-    status                TEXT NOT NULL DEFAULT 'active',
-    server_epoch          INTEGER NOT NULL DEFAULT 0,
-    boot_id               TEXT NOT NULL DEFAULT '',
-    created_at            REAL NOT NULL
-);
-
--- At most one ACTIVE lease per workspace — enforces workspace exclusivity.
-CREATE UNIQUE INDEX IF NOT EXISTS uq_plan_execution_leases_active_workspace
-    ON plan_execution_leases(workspace_id) WHERE status = 'active';
-CREATE INDEX IF NOT EXISTS idx_plan_execution_leases_task
-    ON plan_execution_leases(task_id, status);
-"""
-
-
-# Extra idempotent DDL that needs PRAGMA-based column probing (SQLite cannot
-# add a column with IF NOT EXISTS). Run after APPROVAL_SCHEMA.
-def _post_schema(conn: sqlite3.Connection) -> None:
-    """Add columns / partial indexes introduced in Batch 2.1, idempotently."""
-    # Legacy HMAC rows contained private signing secrets. They are never
-    # migrated into verifier state; remove them fail-closed.
-    conn.execute("DROP TABLE IF EXISTS receipt_signing_keys")
-    cols = {r[1] for r in conn.execute("PRAGMA table_info(plan_execution_authorizations)")}
-    if "server_epoch" not in cols:
-        conn.execute(
-            "ALTER TABLE plan_execution_authorizations ADD COLUMN server_epoch INTEGER NOT NULL DEFAULT 0"
-        )
-    # Partial unique index: at most one ACTIVE authorization per request. We
-    # use a filtered unique index so consumed/revoked/expired rows do not
-    # block re-mint attempts (which the service refuses anyway, but the DB
-    # invariant is defense-in-depth). SQLite supports partial indexes since
-    # 3.8.0 (2014); safe to assume.
-    conn.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS uq_plan_exec_auth_active_per_request "
-        "ON plan_execution_authorizations(approval_request_id) WHERE status = 'active'"
-    )
-    # broker_request_id uniqueness for non-empty values (old not-required
-    # rows used '' and many can coexist).
-    conn.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS uq_plan_approval_requests_broker "
-        "ON plan_approval_requests(broker_request_id) WHERE broker_request_id != ''"
-    )
-    # Batch 2.2: add the full-binding receipt columns to old 2.1 databases.
-    receipt_cols = {r[1] for r in conn.execute("PRAGMA table_info(plan_approval_receipts)")}
-    for col, decl in (
-        ("namespace", "TEXT NOT NULL DEFAULT 'plan-execution'"),
-        ("authenticated_actor_id", "TEXT NOT NULL DEFAULT ''"),
-        ("authenticated_actor_type", "TEXT NOT NULL DEFAULT ''"),
-        ("authenticated_source", "TEXT NOT NULL DEFAULT ''"),
-        ("session_request_id", "TEXT NOT NULL DEFAULT ''"),
-        ("server_capability", "TEXT NOT NULL DEFAULT ''"),
-        ("decided_at", "REAL NOT NULL DEFAULT 0"),
-        ("reason_digest", "TEXT NOT NULL DEFAULT ''"),
-    ):
-        if col not in receipt_cols:
-            conn.execute(f"ALTER TABLE plan_approval_receipts ADD COLUMN {col} {decl}")
-    # Batch 2.6 §1: add broker signature columns to old 2.5 databases.
-    receipt_cols = {r[1] for r in conn.execute("PRAGMA table_info(plan_approval_receipts)")}
-    for col, decl in (
-        ("canonical_payload_digest", "TEXT NOT NULL DEFAULT ''"),
-        ("broker_signature", "TEXT NOT NULL DEFAULT ''"),
-        ("signer_key_id", "TEXT NOT NULL DEFAULT ''"),
-        ("signer_epoch", "INTEGER NOT NULL DEFAULT 0"),
-        ("signer_boot_id", "TEXT NOT NULL DEFAULT ''"),
-        ("issued_at", "REAL NOT NULL DEFAULT 0"),
-    ):
-        if col not in receipt_cols:
-            conn.execute(f"ALTER TABLE plan_approval_receipts ADD COLUMN {col} {decl}")
-    verifier_cols = {
-        r[1] for r in conn.execute("PRAGMA table_info(receipt_verification_keys)")
-    }
-    if "boot_id" not in verifier_cols:
-        conn.execute(
-            "ALTER TABLE receipt_verification_keys ADD COLUMN boot_id TEXT NOT NULL DEFAULT ''"
-        )
-    # Batch 2.3: add server_epoch to the leases table for old 2.2 databases.
-    lease_cols = {r[1] for r in conn.execute("PRAGMA table_info(plan_execution_leases)")}
-    if "server_epoch" not in lease_cols:
-        conn.execute(
-            "ALTER TABLE plan_execution_leases ADD COLUMN server_epoch INTEGER NOT NULL DEFAULT 0"
-        )
-    # Batch 2.5 §2: bind authorizations and leases to boot_id so a stale
-    # runtime cannot mint/consume/validate using a cached epoch alone — the
-    # persisted boot_id must also match.
-    auth_cols = {r[1] for r in conn.execute("PRAGMA table_info(plan_execution_authorizations)")}
-    if "boot_id" not in auth_cols:
-        conn.execute(
-            "ALTER TABLE plan_execution_authorizations ADD COLUMN boot_id TEXT NOT NULL DEFAULT ''"
-        )
-    lease_cols = {r[1] for r in conn.execute("PRAGMA table_info(plan_execution_leases)")}
-    if "boot_id" not in lease_cols:
-        conn.execute(
-            "ALTER TABLE plan_execution_leases ADD COLUMN boot_id TEXT NOT NULL DEFAULT ''"
-        )
-    run_cols = {r[1] for r in conn.execute("PRAGMA table_info(plan_execution_runs)")}
-    if run_cols:
-        if "recovery_sealed_at" not in run_cols:
-            conn.execute("ALTER TABLE plan_execution_runs ADD COLUMN recovery_sealed_at REAL")
-        if "recovery_seal_digest" not in run_cols:
-            conn.execute(
-                "ALTER TABLE plan_execution_runs ADD COLUMN "
-                "recovery_seal_digest TEXT NOT NULL DEFAULT ''"
-            )
-        if "rollback_sealed_at" not in run_cols:
-            conn.execute("ALTER TABLE plan_execution_runs ADD COLUMN rollback_sealed_at REAL")
-        if "rollback_seal_digest" not in run_cols:
-            conn.execute(
-                "ALTER TABLE plan_execution_runs ADD COLUMN "
-                "rollback_seal_digest TEXT NOT NULL DEFAULT ''"
-            )
-        if "terminal_tombstone_digest" not in run_cols:
-            conn.execute(
-                "ALTER TABLE plan_execution_runs ADD COLUMN "
-                "terminal_tombstone_digest TEXT NOT NULL DEFAULT ''"
-            )
-        if "initial_attestation_digest" not in run_cols:
-            conn.execute(
-                "ALTER TABLE plan_execution_runs ADD COLUMN "
-                "initial_attestation_digest TEXT NOT NULL DEFAULT ''"
-            )
-        if "journaled_edit_count" not in run_cols:
-            conn.execute(
-                "ALTER TABLE plan_execution_runs ADD COLUMN "
-                "journaled_edit_count INTEGER NOT NULL DEFAULT 0"
-            )
-    event_cols = {
-        r[1] for r in conn.execute("PRAGMA table_info(plan_execution_edit_events)")
-    }
-    if event_cols and "phase_version" not in event_cols:
-        conn.execute(
-            "ALTER TABLE plan_execution_edit_events ADD COLUMN "
-            "phase_version INTEGER NOT NULL DEFAULT 0"
-        )
-    for column, declaration in (
-        ("applied_identity_digest", "TEXT NOT NULL DEFAULT ''"),
-        ("applied_parent_identity_digest", "TEXT NOT NULL DEFAULT ''"),
-        ("applied_destination_identity_digest", "TEXT NOT NULL DEFAULT ''"),
-        ("rollback_identity_digest", "TEXT NOT NULL DEFAULT ''"),
-        ("rollback_parent_identity_digest", "TEXT NOT NULL DEFAULT ''"),
-        ("rollback_destination_parent_identity_digest", "TEXT NOT NULL DEFAULT ''"),
-        ("rollback_sync_mask", "INTEGER NOT NULL DEFAULT 0"),
-        ("rollback_directory_sync_digest", "TEXT NOT NULL DEFAULT ''"),
-        ("rollback_synced_at", "REAL"),
-        ("identity_version", "INTEGER NOT NULL DEFAULT 0"),
-    ):
-        if event_cols and column not in event_cols:
-            conn.execute(
-                f"ALTER TABLE plan_execution_edit_events ADD COLUMN "
-                f"{column} {declaration}"
-            )
-    if event_cols:
-        # This index must be created only after legacy Batch 3 databases have
-        # received the ownership columns above.  Putting it in APPROVAL_SCHEMA
-        # makes SQLite evaluate it before _post_schema can migrate the table.
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_plan_execution_edit_events_recovery "
-            "ON plan_execution_edit_events("
-            "execution_run_id,status,identity_version,ordinal)"
-        )
-    # Batch 3.1.5 §2: add approved_verification_plan columns to old databases.
-    request_cols = {r[1] for r in conn.execute("PRAGMA table_info(plan_approval_requests)")}
-    for col, decl in (
-        ("approved_verification_plan_id", "TEXT NOT NULL DEFAULT ''"),
-        ("approved_verification_plan_digest", "TEXT NOT NULL DEFAULT ''"),
-    ):
-        if col not in request_cols:
-            conn.execute(
-                f"ALTER TABLE plan_approval_requests ADD COLUMN {col} {decl}"
-            )
 
 
 class ApprovalTransitionResult(str, Enum):
@@ -577,7 +89,22 @@ class PlanApprovalStore:
         self._conn = conn
         self._transaction_lock = threading.RLock()
         self._conn.row_factory = sqlite3.Row
+        self._read_model = PlanApprovalReadModel(self._conn)
+        self._execution_read_model = PlanExecutionReadModel(self._conn)
         self.ensure_schema()
+        self._execution_writer = PlanExecutionWriter(
+            self._conn,
+            self._execution_read_model,
+            audit_writer=lambda *args, **kwargs: self._insert_execution_audit(
+                *args, **kwargs
+            ),
+        )
+        self._execution_journal_writer = PlanExecutionJournalWriter(
+            self._conn,
+            audit_writer=lambda *args, **kwargs: self._insert_execution_audit(
+                *args, **kwargs
+            ),
+        )
         # Batch 2.6 §1: a name-mangled writer handle that ONLY the runtime
         # can install (via _install_runtime_receipt_writer). It is NOT a
         # sink closure and NOT exposed as a public attribute. Ordinary
@@ -683,7 +210,7 @@ class PlanApprovalStore:
         self._conn.executescript(APPROVAL_SCHEMA)
         self._conn.execute("BEGIN IMMEDIATE")
         try:
-            _post_schema(self._conn)
+            upgrade_schema(self._conn)
             self._conn.commit()
         except Exception:
             self._conn.rollback()
@@ -843,54 +370,15 @@ class PlanApprovalStore:
         self._conn.commit()
 
     def get_request(self, approval_request_id: str) -> PlanApprovalRequest | None:
-        row = self._conn.execute(
-            "SELECT * FROM plan_approval_requests WHERE approval_request_id = ?",
-            (approval_request_id,),
-        ).fetchone()
-        if row is None:
-            return None
-        return self._row_to_request(row)
+        return self._read_model.get_request(approval_request_id)
 
     def get_request_by_broker(self, broker_request_id: str) -> PlanApprovalRequest | None:
-        row = self._conn.execute(
-            "SELECT * FROM plan_approval_requests WHERE broker_request_id = ?",
-            (broker_request_id,),
-        ).fetchone()
-        if row is None:
-            return None
-        return self._row_to_request(row)
+        return self._read_model.get_request_by_broker(broker_request_id)
 
     @staticmethod
     def _row_to_request(row: sqlite3.Row) -> PlanApprovalRequest:
-        # Batch 3.1.5 §2: read approved_verification_plan columns (may be
-        # absent in old rows before migration — use .keys() guard).
-        keys = set(row.keys())
-        avp_id = row["approved_verification_plan_id"] if "approved_verification_plan_id" in keys else ""
-        avp_digest = row["approved_verification_plan_digest"] if "approved_verification_plan_digest" in keys else ""
-        return PlanApprovalRequest(
-            approval_request_id=row["approval_request_id"],
-            plan_id=row["plan_id"],
-            plan_content_hash=row["plan_content_hash"],
-            repository_id=row["repository_id"],
-            task_id=row["task_id"],
-            workspace_id=row["workspace_id"],
-            base_sha=row["base_sha"],
-            repository_generation=int(row["repository_generation"]),
-            risk_level=row["risk_level"],
-            requested_operations=tuple(json.loads(row["requested_operations"])),
-            affected_files=tuple(json.loads(row["affected_files"])),
-            affected_symbols=tuple(json.loads(row["affected_symbols"])),
-            verification_digest=row["verification_digest"],
-            binding_digest=row["binding_digest"],
-            requested_at=float(row["requested_at"]),
-            expires_at=float(row["expires_at"]),
-            status=PlanApprovalStatus(row["status"]),
-            broker_request_id=row["broker_request_id"],
-            reason=row["reason"] or "",
-            metadata=json.loads(row["metadata"] or "{}"),
-            approved_verification_plan_id=avp_id or "",
-            approved_verification_plan_digest=avp_digest or "",
-        )
+        """Compatibility conversion alias; the read model owns conversion."""
+        return PlanApprovalReadModel.row_to_request(row)
 
     # ------------------------------------------------------------------
     # Atomic status CAS (internal helper — does NOT write decision/audit)
@@ -1377,24 +865,7 @@ class PlanApprovalStore:
         self._conn.commit()
 
     def list_decisions(self, approval_request_id: str) -> list[PlanApprovalDecision]:
-        rows = self._conn.execute(
-            "SELECT * FROM plan_approval_decisions WHERE approval_request_id = ? "
-            "ORDER BY decided_at ASC, decision_id ASC",
-            (approval_request_id,),
-        ).fetchall()
-        return [
-            PlanApprovalDecision(
-                approval_request_id=r["approval_request_id"],
-                decision=PlanApprovalStatus(r["decision"]),
-                actor_id=r["actor_id"],
-                actor_type=r["actor_type"],
-                decided_at=float(r["decided_at"]),
-                reason=r["reason"] or "",
-                authenticated_context=json.loads(r["authenticated_context"] or "{}"),
-                metadata=json.loads(r["metadata"] or "{}"),
-            )
-            for r in rows
-        ]
+        return self._read_model.list_decisions(approval_request_id)
 
     def insert_audit_event(self, event: PlanApprovalAuditEvent) -> None:
         self._conn.execute(
@@ -1418,33 +889,10 @@ class PlanApprovalStore:
     def list_audit_events(
         self, *, approval_request_id: str | None = None, plan_id: str | None = None
     ) -> list[PlanApprovalAuditEvent]:
-        clauses: list[str] = []
-        params: list[Any] = []
-        if approval_request_id is not None:
-            clauses.append("approval_request_id = ?")
-            params.append(approval_request_id)
-        if plan_id is not None:
-            clauses.append("plan_id = ?")
-            params.append(plan_id)
-        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        rows = self._conn.execute(
-            f"SELECT * FROM plan_approval_audit_events {where} "
-            "ORDER BY timestamp ASC, event_id ASC",
-            params,
-        ).fetchall()
-        return [
-            PlanApprovalAuditEvent(
-                event_id=r["event_id"], event_type=r["event_type"],
-                approval_request_id=r["approval_request_id"], plan_id=r["plan_id"],
-                previous_status=r["previous_status"], new_status=r["new_status"],
-                actor_id=r["actor_id"], actor_type=r["actor_type"],
-                authenticated_source=r["authenticated_source"],
-                timestamp=float(r["timestamp"]), reason_code=r["reason_code"],
-                task_id=r["task_id"], workspace_id=r["workspace_id"],
-                repository_id=r["repository_id"], correlation_id=r["correlation_id"],
-            )
-            for r in rows
-        ]
+        return self._read_model.list_audit_events(
+            approval_request_id=approval_request_id,
+            plan_id=plan_id,
+        )
 
     # ------------------------------------------------------------------
     # Execution authorizations
@@ -1479,33 +927,12 @@ class PlanApprovalStore:
         )
 
     def get_authorization(self, authorization_id: str) -> PlanExecutionAuthorization | None:
-        row = self._conn.execute(
-            "SELECT * FROM plan_execution_authorizations WHERE authorization_id = ?",
-            (authorization_id,),
-        ).fetchone()
-        if row is None:
-            return None
-        return self._row_to_authorization(row)
+        return self._read_model.get_authorization(authorization_id)
 
     @staticmethod
     def _row_to_authorization(row: sqlite3.Row) -> PlanExecutionAuthorization:
-        return PlanExecutionAuthorization(
-            authorization_id=row["authorization_id"],
-            approval_request_id=row["approval_request_id"],
-            plan_id=row["plan_id"],
-            plan_content_hash=row["plan_content_hash"],
-            repository_id=row["repository_id"],
-            task_id=row["task_id"],
-            workspace_id=row["workspace_id"],
-            base_sha=row["base_sha"],
-            repository_generation=int(row["repository_generation"]),
-            issued_at=float(row["issued_at"]),
-            expires_at=float(row["expires_at"]),
-            nonce="",  # plaintext deliberately unavailable after restart
-            nonce_hash=row["nonce_hash"],
-            status=AuthorizationStatus(row["status"]),
-            binding_digest=row["binding_digest"],
-        )
+        """Compatibility conversion alias; the read model owns conversion."""
+        return PlanApprovalReadModel.row_to_authorization(row)
 
     def _verify_persisted_boot_context(
         self, *, server_epoch: int, boot_id: str,
@@ -1622,7 +1049,7 @@ class PlanApprovalStore:
                     return False, None
                 # ACTIVE — return the same handle (idempotent re-mint).
                 self._conn.rollback()
-                return True, self._row_to_authorization(existing)
+                return True, self._read_model.row_to_authorization(existing)
 
             self._conn.execute(
                 """
@@ -1866,32 +1293,13 @@ class PlanApprovalStore:
             raise
 
     def list_authorizations_for_plan(self, plan_id: str) -> list[PlanExecutionAuthorization]:
-        rows = self._conn.execute(
-            "SELECT * FROM plan_execution_authorizations WHERE plan_id = ? "
-            "ORDER BY issued_at ASC",
-            (plan_id,),
-        ).fetchall()
-        return [self._row_to_authorization(r) for r in rows]
+        return self._read_model.list_authorizations_for_plan(plan_id)
 
     def list_registering_or_pending(self) -> list[PlanApprovalRequest]:
-        """Return every request still awaiting broker registration / decision.
-
-        Used by :meth:`PlanApprovalService.reconcile` at startup.
-        """
-        rows = self._conn.execute(
-            "SELECT * FROM plan_approval_requests WHERE status IN (?, ?) "
-            "ORDER BY requested_at ASC",
-            (PlanApprovalStatus.REGISTERING.value, PlanApprovalStatus.PENDING.value),
-        ).fetchall()
-        return [self._row_to_request(r) for r in rows]
+        return self._read_model.list_registering_or_pending()
 
     def list_requests_for_task(self, task_id: str) -> list[PlanApprovalRequest]:
-        rows = self._conn.execute(
-            "SELECT * FROM plan_approval_requests WHERE task_id = ? "
-            "ORDER BY requested_at ASC",
-            (task_id,),
-        ).fetchall()
-        return [self._row_to_request(r) for r in rows]
+        return self._read_model.list_requests_for_task(task_id)
 
     def refresh_expiry(self, approval_request_id: str, new_expiry: float) -> None:
         conn = self._conn
@@ -1904,12 +1312,7 @@ class PlanApprovalStore:
     def find_request_by_plan_binding(
         self, plan_id: str, binding_digest: str
     ) -> PlanApprovalRequest | None:
-        row = self._conn.execute(
-            "SELECT * FROM plan_approval_requests WHERE plan_id = ? AND binding_digest = ? "
-            "ORDER BY requested_at DESC LIMIT 1",
-            (plan_id, binding_digest),
-        ).fetchone()
-        return self._row_to_request(row) if row is not None else None
+        return self._read_model.find_request_by_plan_binding(plan_id, binding_digest)
 
     # ------------------------------------------------------------------
     # Persisted server epoch (Batch 2.2 §3)
@@ -2843,150 +2246,30 @@ class PlanApprovalStore:
     # ------------------------------------------------------------------
 
     def create_execution_run(self, run: Any) -> Any:
-        """Create one run per authorization/context, or return idempotent run."""
-        existing = self.get_execution_run_by_context(run.execution_context_id)
-        if existing is not None:
-            return existing
-        self._conn.execute("BEGIN IMMEDIATE")
-        try:
-            self._conn.execute(
-                "INSERT INTO plan_execution_runs "
-                "(execution_run_id,plan_id,plan_content_hash,approval_request_id,"
-                "authorization_id,execution_context_id,lease_id,task_id,workspace_id,"
-                "repository_id,base_sha,repository_generation,binding_digest,"
-                "edit_bundle_digest,status,started_at,updated_at,completed_at,"
-                "failure_code,metadata_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (run.execution_run_id, run.plan_id, run.plan_content_hash,
-                 run.approval_request_id, run.authorization_id,
-                 run.execution_context_id, run.lease_id, run.task_id,
-                 run.workspace_id, run.repository_id, run.base_sha,
-                 int(run.repository_generation), run.binding_digest,
-                 run.edit_bundle_digest, run.status.value, run.started_at,
-                 run.updated_at, run.completed_at, run.failure_code,
-                 json.dumps(
-                     {"edit_count": int(run.metadata.get("edit_count", 0))},
-                     sort_keys=True, separators=(",", ":"),
-                 )),
-            )
-            self._insert_execution_audit(
-                run.execution_run_id, "run-created", result="created",
-                correlation_id=run.execution_context_id,
-            )
-            self._conn.commit()
-            return run
-        except sqlite3.IntegrityError:
-            self._conn.rollback()
-            existing = self.get_execution_run_by_context(run.execution_context_id)
-            if existing is None:
-                raise
-            return existing
-        except Exception:
-            self._conn.rollback()
-            raise
+        """Compatibility delegate; execution writer owns the transaction."""
+        return self._execution_writer.create_execution_run(run)
 
     def transition_execution_run(
         self, execution_run_id: str, *, expected: tuple[str, ...], target: str,
         failure_code: str = "", completed: bool = False,
     ) -> None:
-        allowed = {
-            "created": frozenset({"validating", "cancelled"}),
-            "validating": frozenset({"mutating", "rolling-back", "failed", "poisoned", "cancelled"}),
-            "mutating": frozenset({"sealing", "rolling-back", "poisoned", "cancelled", "failed"}),
-            "sealing": frozenset({"mutated", "poisoned"}),
-            "rolling-back": frozenset({"rollback-sealing", "poisoned"}),
-            "rollback-sealing": frozenset({"rolled-back", "poisoned", "cancelled"}),
-            "poisoned": frozenset({"rolling-back"}),
-        }
-        if not expected or any(target not in allowed.get(source, frozenset()) for source in expected):
-            raise RuntimeError("invalid execution run state transition")
-        now = time.time()
-        placeholders = ",".join("?" for _ in expected)
-        self._conn.execute("BEGIN IMMEDIATE")
-        try:
-            cur = self._conn.execute(
-                f"UPDATE plan_execution_runs SET status=?,updated_at=?,"
-                "completed_at=?,failure_code=? WHERE execution_run_id=? "
-                f"AND status IN ({placeholders})",
-                (target, now, now if completed else None, failure_code,
-                 execution_run_id, *expected),
-            )
-            if int(cur.rowcount or 0) != 1:
-                raise RuntimeError("invalid execution run transition")
-            self._insert_execution_audit(
-                execution_run_id, "run-transition", result=target,
-                error_code=failure_code, correlation_id=execution_run_id,
-            )
-            self._conn.commit()
-        except Exception:
-            self._conn.rollback()
-            raise
+        self._execution_writer.transition_execution_run(
+            execution_run_id,
+            expected=expected,
+            target=target,
+            failure_code=failure_code,
+            completed=completed,
+        )
 
     def begin_or_resume_rollback(
         self, execution_run_id: str, *, failure_code: str,
         now: float | None = None,
     ) -> RollbackResumeState:
-        """Atomically begin or resume rollback without overwriting its reason."""
-        from khaos.coding.planning.execution_models import (
-            ExecutionRunStatus,
-            RollbackResumeDisposition,
-            RollbackResumeState,
+        return self._execution_writer.begin_or_resume_rollback(
+            execution_run_id,
+            failure_code=failure_code,
+            now=now,
         )
-
-        timestamp = time.time() if now is None else float(now)
-        self._conn.execute("BEGIN IMMEDIATE")
-        try:
-            row = self._conn.execute(
-                "SELECT status,failure_code FROM plan_execution_runs "
-                "WHERE execution_run_id=?", (execution_run_id,),
-            ).fetchone()
-            if row is None:
-                raise RuntimeError("execution run not found")
-            status = ExecutionRunStatus(row["status"])
-            stored_reason = str(row["failure_code"] or "")
-            effective_reason = stored_reason or failure_code
-            if status in {
-                ExecutionRunStatus.VALIDATING,
-                ExecutionRunStatus.MUTATING,
-                ExecutionRunStatus.POISONED,
-            }:
-                cur = self._conn.execute(
-                    "UPDATE plan_execution_runs SET status='rolling-back',"
-                    "failure_code=?,updated_at=? WHERE execution_run_id=? AND status=?",
-                    (effective_reason, timestamp, execution_run_id, status.value),
-                )
-                if int(cur.rowcount or 0) != 1:
-                    raise RuntimeError("rollback run CAS conflict")
-                self._insert_execution_audit(
-                    execution_run_id, "rollback-started", result="rolling-back",
-                    error_code=effective_reason, correlation_id=execution_run_id,
-                )
-                disposition = RollbackResumeDisposition.STARTED
-                status = ExecutionRunStatus.ROLLING_BACK
-            elif status == ExecutionRunStatus.ROLLING_BACK:
-                if not stored_reason:
-                    cur = self._conn.execute(
-                        "UPDATE plan_execution_runs SET failure_code=?,updated_at=? "
-                        "WHERE execution_run_id=? AND status='rolling-back' "
-                        "AND failure_code=''",
-                        (effective_reason, timestamp, execution_run_id),
-                    )
-                    if int(cur.rowcount or 0) != 1:
-                        raise RuntimeError("rollback reason CAS conflict")
-                disposition = RollbackResumeDisposition.RESUMED
-            elif status == ExecutionRunStatus.ROLLBACK_SEALING:
-                disposition = RollbackResumeDisposition.SEALING
-            elif status in {
-                ExecutionRunStatus.ROLLED_BACK,
-                ExecutionRunStatus.CANCELLED,
-            }:
-                disposition = RollbackResumeDisposition.TERMINAL
-            else:
-                raise RuntimeError("execution run cannot enter rollback")
-            self._conn.commit()
-            return RollbackResumeState(disposition, status, effective_reason)
-        except Exception:
-            self._conn.rollback()
-            raise
 
     def insert_edit_event(
         self, *, event_id: str, execution_run_id: str, edit_id: str,
@@ -2995,36 +2278,20 @@ class PlanApprovalStore:
         recovery_artifact: str | None, planned_after_hash: str = "",
         planned_after_mode: int | None = None,
     ) -> None:
-        now = time.time()
-        self._conn.execute("BEGIN IMMEDIATE")
-        try:
-            self._conn.execute(
-                "INSERT INTO plan_execution_edit_events "
-                "(event_id,execution_run_id,edit_id,ordinal,operation,path,"
-                "destination_path,before_hash,after_hash,before_mode,after_mode,status,recovery_artifact,"
-                "created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,'journaled',?,?,?)",
-                (event_id, execution_run_id, edit_id, ordinal, operation, path,
-                 destination_path, before_hash, planned_after_hash, before_mode,
-                 planned_after_mode,
-                 recovery_artifact,
-                 now, now),
-            )
-            cur = self._conn.execute(
-                "UPDATE plan_execution_runs SET journaled_edit_count="
-                "journaled_edit_count+1 WHERE execution_run_id=? AND status='mutating'",
-                (execution_run_id,),
-            )
-            if int(cur.rowcount or 0) != 1:
-                raise RuntimeError("run cannot accept journal event")
-            self._insert_execution_audit(
-                execution_run_id, "edit-journaled", operation=operation, path=path,
-                before_hash=before_hash or "", result="journaled",
-                correlation_id=edit_id,
-            )
-            self._conn.commit()
-        except Exception:
-            self._conn.rollback()
-            raise
+        self._execution_journal_writer.insert_edit_event(
+            event_id=event_id,
+            execution_run_id=execution_run_id,
+            edit_id=edit_id,
+            ordinal=ordinal,
+            operation=operation,
+            path=path,
+            destination_path=destination_path,
+            before_hash=before_hash,
+            before_mode=before_mode,
+            recovery_artifact=recovery_artifact,
+            planned_after_hash=planned_after_hash,
+            planned_after_mode=planned_after_mode,
+        )
 
     def transition_edit_event(
         self, execution_run_id: str, edit_id: str, *, expected_phase: str,
@@ -3035,162 +2302,18 @@ class PlanApprovalStore:
         applied_parent_identity_digest: str | None = None,
         applied_destination_identity_digest: str | None = None,
     ) -> None:
-        """Advance one edit phase using a transactionally checked CAS."""
-        from khaos.coding.planning.execution_models import DurableEditPhase
-
-        transitions = {
-            DurableEditPhase.JOURNALED.value: frozenset({
-                DurableEditPhase.MUTATION_STARTED.value,
-                DurableEditPhase.ROLLED_BACK.value,
-            }),
-            DurableEditPhase.MUTATION_STARTED.value: frozenset({
-                DurableEditPhase.FILESYSTEM_APPLIED.value,
-                DurableEditPhase.ROLLED_BACK.value,
-            }),
-            DurableEditPhase.FILESYSTEM_APPLIED.value: frozenset({
-                DurableEditPhase.DIRECTORY_SYNCED.value,
-                DurableEditPhase.ROLLBACK_STARTED.value,
-            }),
-            DurableEditPhase.DIRECTORY_SYNCED.value: frozenset({
-                DurableEditPhase.APPLIED.value,
-                DurableEditPhase.ROLLBACK_STARTED.value,
-            }),
-            DurableEditPhase.APPLIED.value: frozenset({
-                DurableEditPhase.ROLLBACK_STARTED.value,
-            }),
-            DurableEditPhase.ROLLBACK_STARTED.value: frozenset(),
-            DurableEditPhase.ROLLBACK_FILESYSTEM_APPLIED.value: frozenset(),
-            DurableEditPhase.ROLLBACK_DIRECTORY_SYNCED.value: frozenset({
-                DurableEditPhase.ROLLED_BACK.value,
-            }),
-        }
-        if target_phase != expected_phase and target_phase not in transitions.get(
-            expected_phase, frozenset()
-        ):
-            raise RuntimeError("invalid execution edit phase transition")
-        now = time.time()
-        self._conn.execute("BEGIN IMMEDIATE")
-        try:
-            row = self._conn.execute(
-                "SELECT e.operation,e.path,e.before_hash,e.after_hash,e.after_mode,"
-                "e.status,e.phase_version,e.error_code,"
-                "e.applied_identity_digest,e.applied_parent_identity_digest,"
-                "e.applied_destination_identity_digest,e.rollback_identity_digest,"
-                "e.rollback_parent_identity_digest,"
-                "e.rollback_destination_parent_identity_digest,"
-                "e.rollback_sync_mask,e.rollback_directory_sync_digest,"
-                "e.rollback_synced_at,e.identity_version,r.status AS run_status "
-                "FROM plan_execution_edit_events e JOIN plan_execution_runs r "
-                "ON r.execution_run_id=e.execution_run_id "
-                "WHERE e.execution_run_id=? AND e.edit_id=?",
-                (execution_run_id, edit_id),
-            ).fetchone()
-            if row is None:
-                raise RuntimeError("execution edit event not found")
-            if row["status"] != expected_phase:
-                raise RuntimeError("execution edit phase CAS conflict")
-            stored_after_hash = row["after_hash"] if after_hash is None else after_hash
-            stored_after_mode = row["after_mode"] if after_mode is None else after_mode
-            stored_identity = (
-                row["applied_identity_digest"]
-                if applied_identity_digest is None else applied_identity_digest
-            )
-            stored_parent_identity = (
-                row["applied_parent_identity_digest"]
-                if applied_parent_identity_digest is None
-                else applied_parent_identity_digest
-            )
-            stored_destination_identity = (
-                row["applied_destination_identity_digest"]
-                if applied_destination_identity_digest is None
-                else applied_destination_identity_digest
-            )
-            if target_phase == expected_phase:
-                if (stored_after_hash != row["after_hash"]
-                        or stored_after_mode != row["after_mode"]
-                        or error_code != str(row["error_code"] or "")
-                        or stored_identity != row["applied_identity_digest"]
-                        or stored_parent_identity
-                        != row["applied_parent_identity_digest"]
-                        or stored_destination_identity
-                        != row["applied_destination_identity_digest"]):
-                    raise RuntimeError("idempotent edit phase retry changed state")
-                self._conn.commit()
-                return
-            if row["status"] in {
-                DurableEditPhase.APPLIED.value,
-                DurableEditPhase.ROLLBACK_STARTED.value,
-                DurableEditPhase.ROLLBACK_FILESYSTEM_APPLIED.value,
-                DurableEditPhase.ROLLBACK_DIRECTORY_SYNCED.value,
-                DurableEditPhase.ROLLED_BACK.value,
-            } and (stored_after_hash != row["after_hash"]
-                   or stored_after_mode != row["after_mode"]):
-                raise RuntimeError("sealed edit after state cannot change")
-            if target_phase in {
-                DurableEditPhase.MUTATION_STARTED.value,
-                DurableEditPhase.FILESYSTEM_APPLIED.value,
-                DurableEditPhase.DIRECTORY_SYNCED.value,
-                DurableEditPhase.APPLIED.value,
-            } and row["run_status"] != "mutating":
-                raise RuntimeError("forward edit phase requires mutating run")
-            if target_phase in {
-                DurableEditPhase.ROLLBACK_STARTED.value,
-                DurableEditPhase.ROLLBACK_FILESYSTEM_APPLIED.value,
-                DurableEditPhase.ROLLBACK_DIRECTORY_SYNCED.value,
-                DurableEditPhase.ROLLED_BACK.value,
-            } and row["run_status"] not in {"rolling-back", "rollback-sealing"}:
-                raise RuntimeError("rollback phase requires rollback run")
-            if target_phase == DurableEditPhase.FILESYSTEM_APPLIED.value:
-                if not stored_parent_identity:
-                    raise RuntimeError("filesystem identity evidence missing")
-                if row["operation"] != "delete" and not stored_identity:
-                    raise RuntimeError("applied object identity evidence missing")
-                if row["operation"] == "rename" and not stored_destination_identity:
-                    raise RuntimeError("rename destination identity evidence missing")
-            if (
-                target_phase == DurableEditPhase.ROLLED_BACK.value
-                and expected_phase == DurableEditPhase.ROLLBACK_DIRECTORY_SYNCED.value
-                and (
-                    int(row["identity_version"]) != 3
-                    or not row["rollback_identity_digest"]
-                    or not row["rollback_parent_identity_digest"]
-                    or int(row["rollback_sync_mask"]) not in {1, 3}
-                    or not row["rollback_directory_sync_digest"]
-                    or row["rollback_synced_at"] is None
-                )
-            ):
-                raise RuntimeError("rollback directory sync evidence missing")
-            next_version = int(row["phase_version"]) + (target_phase != expected_phase)
-            next_identity_version = int(row["identity_version"])
-            if target_phase == DurableEditPhase.FILESYSTEM_APPLIED.value:
-                if next_identity_version not in {0, 1}:
-                    raise RuntimeError("applied identity version conflict")
-                next_identity_version = 1
-            cur = self._conn.execute(
-                "UPDATE plan_execution_edit_events SET status=?,after_hash=?,"
-                "after_mode=?,error_code=?,updated_at=?,phase_version=?,"
-                "applied_identity_digest=?,applied_parent_identity_digest=?,"
-                "applied_destination_identity_digest=?,identity_version=? "
-                "WHERE execution_run_id=? AND edit_id=? AND status=? AND phase_version=?",
-                (target_phase, stored_after_hash, stored_after_mode, error_code, now,
-                 next_version, stored_identity, stored_parent_identity,
-                 stored_destination_identity, next_identity_version,
-                 execution_run_id, edit_id, expected_phase,
-                 int(row["phase_version"])),
-            )
-            if int(cur.rowcount or 0) != 1:
-                raise RuntimeError("execution edit phase CAS conflict")
-            self._insert_execution_audit(
-                execution_run_id, "edit-transition", operation=row["operation"],
-                path=row["path"], before_hash=row["before_hash"] or "",
-                after_hash=stored_after_hash or "", result=target_phase,
-                error_code=error_code,
-                correlation_id=edit_id,
-            )
-            self._conn.commit()
-        except Exception:
-            self._conn.rollback()
-            raise
+        self._execution_journal_writer.transition_edit_event(
+            execution_run_id,
+            edit_id,
+            expected_phase=expected_phase,
+            target_phase=target_phase,
+            after_hash=after_hash,
+            after_mode=after_mode,
+            error_code=error_code,
+            applied_identity_digest=applied_identity_digest,
+            applied_parent_identity_digest=applied_parent_identity_digest,
+            applied_destination_identity_digest=applied_destination_identity_digest,
+        )
 
     def record_rollback_filesystem_applied(
         self, execution_run_id: str, edit_id: str, *,
@@ -3201,89 +2324,18 @@ class PlanApprovalStore:
         error_code: str,
         expected_phase: str = "rollback-started",
     ) -> None:
-        """Persist rollback syscall ownership before any directory fsync."""
-        if not rollback_identity_digest or not rollback_parent_identity_digest:
-            raise RuntimeError("rollback identity evidence missing")
-        if rollback_sync_mask not in {1, 3}:
-            raise RuntimeError("rollback sync mask invalid")
-        now = time.time()
-        self._conn.execute("BEGIN IMMEDIATE")
-        try:
-            row = self._conn.execute(
-                "SELECT e.operation,e.path,e.status,e.error_code,"
-                "e.phase_version,e.rollback_identity_digest,"
-                "e.rollback_parent_identity_digest,"
-                "e.rollback_destination_parent_identity_digest,"
-                "e.rollback_sync_mask,e.rollback_directory_sync_digest,"
-                "e.identity_version,r.status AS run_status "
-                "FROM plan_execution_edit_events e JOIN plan_execution_runs r "
-                "ON r.execution_run_id=e.execution_run_id "
-                "WHERE e.execution_run_id=? AND e.edit_id=?",
-                (execution_run_id, edit_id),
-            ).fetchone()
-            if row is None:
-                raise RuntimeError("execution edit event not found")
-            if row["run_status"] not in {"rolling-back", "rollback-sealing"}:
-                raise RuntimeError("rollback identity requires rollback run")
-            if row["operation"] != "rename" and (
-                rollback_sync_mask != 1
-                or rollback_destination_parent_identity_digest
-            ):
-                raise RuntimeError("non-rename rollback sync scope invalid")
-            if row["operation"] == "rename":
-                if not rollback_destination_parent_identity_digest:
-                    raise RuntimeError("rename rollback parent identity missing")
-                if rollback_sync_mask not in {1, 3}:
-                    raise RuntimeError("rename rollback sync mask invalid")
-            existing = str(row["rollback_identity_digest"] or "")
-            existing_error = str(row["error_code"] or "")
-            if row["status"] == "rollback-filesystem-applied":
-                if (
-                    existing != rollback_identity_digest
-                    or str(row["rollback_parent_identity_digest"] or "")
-                    != rollback_parent_identity_digest
-                    or str(row["rollback_destination_parent_identity_digest"] or "")
-                    != rollback_destination_parent_identity_digest
-                    or int(row["rollback_sync_mask"]) != rollback_sync_mask
-                    or existing_error != error_code
-                    or int(row["identity_version"]) != 2
-                    or row["rollback_directory_sync_digest"]
-                ):
-                    raise RuntimeError("rollback filesystem identity CAS conflict")
-                self._conn.commit()
-                return
-            if row["status"] != expected_phase:
-                raise RuntimeError("rollback filesystem phase CAS conflict")
-            if int(row["identity_version"]) not in {1, 2}:
-                raise RuntimeError("applied identity evidence missing")
-            if existing and existing != rollback_identity_digest:
-                raise RuntimeError("rollback identity CAS conflict")
-            if existing_error and existing_error != error_code:
-                raise RuntimeError("rollback reason CAS conflict")
-            cur = self._conn.execute(
-                "UPDATE plan_execution_edit_events SET status='rollback-filesystem-applied',"
-                "rollback_identity_digest=?,rollback_parent_identity_digest=?,"
-                "rollback_destination_parent_identity_digest=?,rollback_sync_mask=?,"
-                "identity_version=2,error_code=?,updated_at=?,phase_version=phase_version+1 "
-                "WHERE execution_run_id=? AND edit_id=? AND status=? "
-                "AND phase_version=? AND identity_version IN (1,2)",
-                (rollback_identity_digest, rollback_parent_identity_digest,
-                 rollback_destination_parent_identity_digest, rollback_sync_mask,
-                 error_code, now, execution_run_id, edit_id, expected_phase,
-                 int(row["phase_version"])),
-            )
-            if int(cur.rowcount or 0) != 1:
-                raise RuntimeError("rollback filesystem phase CAS conflict")
-            self._insert_execution_audit(
-                execution_run_id, "rollback-filesystem-applied",
-                operation=row["operation"], path=row["path"],
-                result="rollback-filesystem-applied", error_code=error_code,
-                correlation_id=edit_id,
-            )
-            self._conn.commit()
-        except Exception:
-            self._conn.rollback()
-            raise
+        self._execution_journal_writer.record_rollback_filesystem_applied(
+            execution_run_id,
+            edit_id,
+            rollback_identity_digest=rollback_identity_digest,
+            rollback_parent_identity_digest=rollback_parent_identity_digest,
+            rollback_destination_parent_identity_digest=(
+                rollback_destination_parent_identity_digest
+            ),
+            rollback_sync_mask=rollback_sync_mask,
+            error_code=error_code,
+            expected_phase=expected_phase,
+        )
 
     @staticmethod
     def _rollback_directory_sync_digest(
@@ -3292,94 +2344,20 @@ class PlanApprovalStore:
         destination_parent_identity_digest: str,
         sync_mask: int,
     ) -> str:
-        payload = {
-            "execution_run_id": execution_run_id,
-            "edit_id": edit_id,
-            "parent_identity_digest": parent_identity_digest,
-            "destination_parent_identity_digest": (
-                destination_parent_identity_digest
-            ),
-            "sync_mask": sync_mask,
-            "phase": "rollback-directory-synced",
-        }
-        return hashlib.sha256(json.dumps(
-            payload, sort_keys=True, separators=(",", ":"),
-        ).encode("utf-8")).hexdigest()
+        return PlanExecutionJournalWriter._rollback_directory_sync_digest(
+            execution_run_id=execution_run_id,
+            edit_id=edit_id,
+            parent_identity_digest=parent_identity_digest,
+            destination_parent_identity_digest=destination_parent_identity_digest,
+            sync_mask=sync_mask,
+        )
 
     def record_rollback_directory_synced(
         self, execution_run_id: str, edit_id: str, *, error_code: str,
     ) -> str:
-        """Commit proof that every persisted rollback parent was fsynced."""
-        now = time.time()
-        self._conn.execute("BEGIN IMMEDIATE")
-        try:
-            row = self._conn.execute(
-                "SELECT e.operation,e.path,e.status,e.phase_version,e.error_code,"
-                "e.rollback_identity_digest,"
-                "e.rollback_parent_identity_digest,"
-                "e.rollback_destination_parent_identity_digest,"
-                "e.rollback_sync_mask,e.rollback_directory_sync_digest,"
-                "e.rollback_synced_at,e.identity_version,r.status AS run_status "
-                "FROM plan_execution_edit_events e JOIN plan_execution_runs r "
-                "ON r.execution_run_id=e.execution_run_id "
-                "WHERE e.execution_run_id=? AND e.edit_id=?",
-                (execution_run_id, edit_id),
-            ).fetchone()
-            if row is None:
-                raise RuntimeError("execution edit event not found")
-            if row["run_status"] not in {"rolling-back", "rollback-sealing"}:
-                raise RuntimeError("rollback directory sync requires rollback run")
-            if str(row["error_code"] or "") != error_code:
-                raise RuntimeError("rollback directory sync reason conflict")
-            digest = self._rollback_directory_sync_digest(
-                execution_run_id=execution_run_id, edit_id=edit_id,
-                parent_identity_digest=str(
-                    row["rollback_parent_identity_digest"] or ""
-                ),
-                destination_parent_identity_digest=str(
-                    row["rollback_destination_parent_identity_digest"] or ""
-                ),
-                sync_mask=int(row["rollback_sync_mask"]),
-            )
-            if row["status"] == "rollback-directory-synced":
-                if (str(row["rollback_directory_sync_digest"] or "") != digest
-                        or row["rollback_synced_at"] is None
-                        or int(row["identity_version"]) != 3):
-                    raise RuntimeError("rollback directory sync CAS conflict")
-                self._conn.commit()
-                return digest
-            if (row["status"] != "rollback-filesystem-applied"
-                    or int(row["identity_version"]) != 2
-                    or not row["rollback_identity_digest"]
-                    or not row["rollback_parent_identity_digest"]
-                    or int(row["rollback_sync_mask"]) not in {1, 3}
-                    or (int(row["rollback_sync_mask"]) == 3
-                        and not row["rollback_destination_parent_identity_digest"])):
-                raise RuntimeError("rollback filesystem evidence missing")
-            cur = self._conn.execute(
-                "UPDATE plan_execution_edit_events "
-                "SET status='rollback-directory-synced',"
-                "rollback_directory_sync_digest=?,rollback_synced_at=?,"
-                "identity_version=3,updated_at=?,phase_version=phase_version+1 "
-                "WHERE execution_run_id=? AND edit_id=? "
-                "AND status='rollback-filesystem-applied' AND phase_version=? "
-                "AND identity_version=2 AND rollback_directory_sync_digest=''",
-                (digest, now, now, execution_run_id, edit_id,
-                 int(row["phase_version"])),
-            )
-            if int(cur.rowcount or 0) != 1:
-                raise RuntimeError("rollback directory sync CAS conflict")
-            self._insert_execution_audit(
-                execution_run_id, "rollback-directory-synced",
-                operation=row["operation"], path=row["path"],
-                result="rollback-directory-synced", error_code=error_code,
-                correlation_id=edit_id,
-            )
-            self._conn.commit()
-            return digest
-        except Exception:
-            self._conn.rollback()
-            raise
+        return self._execution_journal_writer.record_rollback_directory_synced(
+            execution_run_id, edit_id, error_code=error_code
+        )
 
     def update_edit_event(
         self, execution_run_id: str, edit_id: str, *, status: str,
@@ -3389,17 +2367,12 @@ class PlanApprovalStore:
         applied_parent_identity_digest: str | None = None,
         applied_destination_identity_digest: str | None = None,
     ) -> None:
-        """Compatibility facade; it no longer accepts arbitrary phase writes."""
-        row = self._conn.execute(
-            "SELECT status FROM plan_execution_edit_events "
-            "WHERE execution_run_id=? AND edit_id=?",
-            (execution_run_id, edit_id),
-        ).fetchone()
-        if row is None:
-            raise RuntimeError("execution edit event not found")
-        self.transition_edit_event(
-            execution_run_id, edit_id, expected_phase=str(row["status"]),
-            target_phase=status, after_hash=after_hash, after_mode=after_mode,
+        self._execution_journal_writer.update_edit_event(
+            execution_run_id,
+            edit_id,
+            status=status,
+            after_hash=after_hash,
+            after_mode=after_mode,
             error_code=error_code,
             applied_identity_digest=applied_identity_digest,
             applied_parent_identity_digest=applied_parent_identity_digest,
@@ -3409,432 +2382,113 @@ class PlanApprovalStore:
     def mark_execution_recovery_sealed(
         self, execution_run_id: str, *, seal_digest: str
     ) -> None:
-        now = time.time()
-        self._conn.execute("BEGIN IMMEDIATE")
-        try:
-            cur = self._conn.execute(
-                "UPDATE plan_execution_runs SET recovery_sealed_at=?,"
-                "recovery_seal_digest=?,updated_at=? WHERE execution_run_id=? "
-                "AND status='sealing'",
-                (now, seal_digest, now, execution_run_id),
-            )
-            if int(cur.rowcount or 0) != 1:
-                raise RuntimeError("execution run is not sealing")
-            self._insert_execution_audit(
-                execution_run_id, "recovery-sealed", result="sealed",
-                correlation_id=execution_run_id,
-            )
-            self._conn.commit()
-        except Exception:
-            self._conn.rollback()
-            raise
+        self._execution_writer.mark_execution_recovery_sealed(
+            execution_run_id, seal_digest=seal_digest
+        )
 
     def mark_execution_rollback_sealed(
         self, execution_run_id: str, *, seal_digest: str
     ) -> None:
-        now = time.time()
-        self._conn.execute("BEGIN IMMEDIATE")
-        try:
-            cur = self._conn.execute(
-                "UPDATE plan_execution_runs SET rollback_sealed_at=?,"
-                "rollback_seal_digest=?,updated_at=? WHERE execution_run_id=? "
-                "AND status='rollback-sealing'",
-                (now, seal_digest, now, execution_run_id),
-            )
-            if int(cur.rowcount or 0) != 1:
-                raise RuntimeError("execution run is not rollback-sealing")
-            self._insert_execution_audit(
-                execution_run_id, "rollback-recovery-sealed", result="sealed",
-                correlation_id=execution_run_id,
-            )
-            self._conn.commit()
-        except Exception:
-            self._conn.rollback()
-            raise
+        self._execution_writer.mark_execution_rollback_sealed(
+            execution_run_id, seal_digest=seal_digest
+        )
 
     def save_final_mutation_attestation(self, attestation: Any) -> None:
-        normalized = attestation.normalized()
-        payload = json.dumps(
-            normalized.canonical(), ensure_ascii=False, sort_keys=True,
-            separators=(",", ":"),
-        )
-        self._conn.execute("BEGIN IMMEDIATE")
-        try:
-            self._conn.execute(
-                "INSERT INTO plan_execution_final_attestations "
-                "(execution_run_id,bundle_digest,canonical_json,attestation_digest,attested_at) "
-                "VALUES (?,?,?,?,?)",
-                (normalized.execution_run_id, normalized.bundle_digest, payload,
-                 normalized.attestation_digest, normalized.attested_at),
-            )
-            self._insert_execution_audit(
-                normalized.execution_run_id, "final-mutation-attested",
-                result="attested", correlation_id=normalized.attestation_digest,
-            )
-            self._conn.commit()
-        except Exception:
-            self._conn.rollback()
-            raise
+        self._execution_writer.save_final_mutation_attestation(attestation)
 
     def save_initial_workspace_attestation(self, attestation: Any) -> None:
-        value = attestation.normalized()
-        payload = json.dumps({
-            **value.__dict__,
-            "declared_states": [item.__dict__ for item in value.declared_states],
-            "workspace_states": [item.__dict__ for item in value.workspace_states],
-            "approved_edits": [item.canonical() for item in value.approved_edits],
-        }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        self._conn.execute("BEGIN IMMEDIATE")
-        try:
-            self._conn.execute(
-                "INSERT INTO plan_execution_initial_attestations VALUES (?,?,?,?)",
-                (value.execution_run_id, payload, value.attestation_digest, value.attested_at),
-            )
-            cur = self._conn.execute(
-                "UPDATE plan_execution_runs SET initial_attestation_digest=? "
-                "WHERE execution_run_id=? AND status='validating'",
-                (value.attestation_digest, value.execution_run_id),
-            )
-            if int(cur.rowcount or 0) != 1:
-                raise RuntimeError("run cannot accept initial attestation")
-            self._insert_execution_audit(
-                value.execution_run_id, "initial-workspace-attested", result="attested",
-                correlation_id=value.attestation_digest,
-            )
-            self._conn.commit()
-        except Exception:
-            self._conn.rollback()
-            raise
+        self._execution_writer.save_initial_workspace_attestation(attestation)
 
     def get_initial_workspace_attestation(self, run_id: str) -> Any | None:
-        row = self._conn.execute(
-            "SELECT canonical_json,attestation_digest FROM plan_execution_initial_attestations "
-            "WHERE execution_run_id=?", (run_id,),
-        ).fetchone()
-        if row is None:
-            return None
-        from khaos.coding.planning.execution_models import (
-            InitialApprovedEdit,
-            InitialPathState,
-            InitialWorkspaceAttestation,
-            PlannedEditOperation,
-        )
-        try:
-            payload = json.loads(row["canonical_json"])
-            value = InitialWorkspaceAttestation(
-                **{key: val for key, val in payload.items() if key not in {
-                    "declared_states", "workspace_states", "approved_edits",
-                }},
-                declared_states=tuple(InitialPathState(**item) for item in payload["declared_states"]),
-                workspace_states=tuple(InitialPathState(**item) for item in payload["workspace_states"]),
-                approved_edits=tuple(InitialApprovedEdit(
-                    **{**item, "operation": PlannedEditOperation(item["operation"])}
-                ) for item in payload.get("approved_edits", ())),
-            )
-        except Exception as exc:
-            raise RuntimeError("initial attestation corrupt") from exc
-        normalized = value.normalized()
-        if normalized.attestation_digest != row["attestation_digest"]:
-            raise RuntimeError("initial attestation digest mismatch")
-        return normalized
+        return self._execution_read_model.get_initial_workspace_attestation(run_id)
 
     def get_final_mutation_attestation(self, execution_run_id: str) -> Any | None:
-        row = self._conn.execute(
-            "SELECT * FROM plan_execution_final_attestations WHERE execution_run_id=?",
-            (execution_run_id,),
-        ).fetchone()
-        if row is None:
-            return None
-        from khaos.coding.planning.execution_models import (
-            AttestedPathState,
-            FinalMutationAttestation,
-        )
-        try:
-            payload = json.loads(row["canonical_json"])
-            value = FinalMutationAttestation(
-                execution_run_id=payload["execution_run_id"],
-                bundle_digest=payload["bundle_digest"],
-                ordered_states=tuple(AttestedPathState(**item) for item in payload["ordered_states"]),
-                path_state_digest=payload["path_state_digest"], head=payload["head"],
-                generation=int(payload["generation"]), index_digest=payload["index_digest"],
-                worktree_admin_digest=payload["worktree_admin_digest"],
-                workspace_state_digest=payload["workspace_state_digest"],
-                execution_context_id=payload["execution_context_id"],
-                lease_id=payload["lease_id"], binding_digest=payload["binding_digest"],
-                attested_at=float(payload["attested_at"]),
-                attestation_digest=row["attestation_digest"],
-            )
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise RuntimeError("final mutation attestation is corrupt") from exc
-        normalized = value.normalized()
-        if (normalized.attestation_digest != row["attestation_digest"]
-                or normalized.bundle_digest != row["bundle_digest"]
-                or normalized.canonical() != value.canonical()):
-            raise RuntimeError("final mutation attestation digest mismatch")
-        return normalized
+        return self._execution_read_model.get_final_mutation_attestation(execution_run_id)
 
     def save_rollback_final_attestation(self, attestation: Any) -> None:
-        normalized = attestation.normalized()
-        payload = json.dumps(
-            normalized.canonical(), ensure_ascii=False, sort_keys=True,
-            separators=(",", ":"),
-        )
-        self._conn.execute("BEGIN IMMEDIATE")
-        try:
-            self._conn.execute(
-                "INSERT INTO plan_execution_rollback_attestations "
-                "(execution_run_id,bundle_digest,canonical_json,attestation_digest,attested_at) "
-                "VALUES (?,?,?,?,?)",
-                (normalized.execution_run_id, normalized.bundle_digest, payload,
-                 normalized.attestation_digest, normalized.attested_at),
-            )
-            self._insert_execution_audit(
-                normalized.execution_run_id, "rollback-final-attested",
-                result="attested", correlation_id=normalized.attestation_digest,
-            )
-            self._conn.commit()
-        except Exception:
-            self._conn.rollback()
-            raise
+        self._execution_writer.save_rollback_final_attestation(attestation)
 
     def get_rollback_final_attestation(self, execution_run_id: str) -> Any | None:
-        row = self._conn.execute(
-            "SELECT * FROM plan_execution_rollback_attestations WHERE execution_run_id=?",
-            (execution_run_id,),
-        ).fetchone()
-        if row is None:
-            return None
-        from khaos.coding.planning.execution_models import (
-            AttestedPathState,
-            RollbackFinalAttestation,
-        )
-        try:
-            payload = json.loads(row["canonical_json"])
-            value = RollbackFinalAttestation(
-                execution_run_id=payload["execution_run_id"],
-                bundle_digest=payload["bundle_digest"],
-                ordered_states=tuple(AttestedPathState(**item) for item in payload["ordered_states"]),
-                path_state_digest=payload["path_state_digest"], head=payload["head"],
-                generation=int(payload["generation"]), index_digest=payload["index_digest"],
-                worktree_admin_digest=payload["worktree_admin_digest"],
-                workspace_state_digest=payload["workspace_state_digest"],
-                execution_context_id=payload["execution_context_id"],
-                lease_id=payload["lease_id"], binding_digest=payload["binding_digest"],
-                attested_at=float(payload["attested_at"]),
-                rollback_reason=payload["rollback_reason"],
-                journal_digest=payload["journal_digest"],
-                attestation_digest=row["attestation_digest"],
-            )
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise RuntimeError("rollback attestation is corrupt") from exc
-        normalized = value.normalized()
-        if normalized.attestation_digest != row["attestation_digest"]:
-            raise RuntimeError("rollback attestation digest mismatch")
-        return normalized
+        return self._execution_read_model.get_rollback_final_attestation(execution_run_id)
 
     def commit_terminal_seal(
         self, execution_run_id: str, *, expected_status: str, terminal_status: str,
         seal_digest: str, tombstone_digest: str, rollback: bool,
         failure_code: str = "",
     ) -> None:
-        now = time.time()
-        seal_time = "rollback_sealed_at" if rollback else "recovery_sealed_at"
-        seal_column = "rollback_seal_digest" if rollback else "recovery_seal_digest"
-        self._conn.execute("BEGIN IMMEDIATE")
-        try:
-            cur = self._conn.execute(
-                f"UPDATE plan_execution_runs SET status=?,updated_at=?,completed_at=?,"
-                f"failure_code=?,{seal_time}=?,{seal_column}=?,terminal_tombstone_digest=? "
-                "WHERE execution_run_id=? AND status=?",
-                (terminal_status, now, now, failure_code, now, seal_digest,
-                 tombstone_digest, execution_run_id, expected_status),
-            )
-            if int(cur.rowcount or 0) != 1:
-                raise RuntimeError("invalid terminal seal transition")
-            self._insert_execution_audit(
-                execution_run_id, "terminal-seal-committed", result=terminal_status,
-                error_code=failure_code, correlation_id=tombstone_digest,
-            )
-            self._conn.commit()
-        except Exception:
-            self._conn.rollback()
-            raise
+        self._execution_writer.commit_terminal_seal(
+            execution_run_id,
+            expected_status=expected_status,
+            terminal_status=terminal_status,
+            seal_digest=seal_digest,
+            tombstone_digest=tombstone_digest,
+            rollback=rollback,
+            failure_code=failure_code,
+        )
 
     def commit_recovered_terminal_state(self, *, workspace_id: str, poison_owner: str,
                                         **kwargs: Any) -> None:
-        execution_run_id = kwargs["execution_run_id"]
-        now = time.time()
-        rollback = bool(kwargs["rollback"])
-        seal_time = "rollback_sealed_at" if rollback else "recovery_sealed_at"
-        seal_column = "rollback_seal_digest" if rollback else "recovery_seal_digest"
-        self._conn.execute("BEGIN IMMEDIATE")
-        try:
-            proof = (
-                self.get_rollback_final_attestation(execution_run_id)
-                if rollback else self.get_final_mutation_attestation(execution_run_id)
-            )
-            if (proof is None or proof.attestation_digest
-                    != kwargs["attestation_digest"]):
-                raise RuntimeError("recovered terminal attestation mismatch")
-            cur = self._conn.execute(
-                f"UPDATE plan_execution_runs SET status=?,updated_at=?,completed_at=?,"
-                f"failure_code=?,{seal_time}=?,{seal_column}=?,terminal_tombstone_digest=? "
-                "WHERE execution_run_id=? AND status=?",
-                (kwargs["terminal_status"], now, now, kwargs.get("failure_code", ""),
-                 now, kwargs["seal_digest"], kwargs["tombstone_digest"],
-                 execution_run_id, kwargs["expected_status"]),
-            )
-            if int(cur.rowcount or 0) != 1:
-                raise RuntimeError("invalid recovered terminal transition")
-            self._conn.execute(
-                "DELETE FROM workspace_mutation_poison_scopes WHERE workspace_id=? "
-                "AND poison_owner=?", (workspace_id, poison_owner),
-            )
-            self._insert_execution_audit(
-                execution_run_id, "recovered-terminal-committed",
-                result=kwargs["terminal_status"], correlation_id=kwargs["tombstone_digest"],
-            )
-            self._conn.commit()
-        except Exception:
-            self._conn.rollback()
-            raise
+        self._execution_writer.commit_recovered_terminal_state(
+            workspace_id=workspace_id, poison_owner=poison_owner, **kwargs
+        )
 
     def commit_recovered_no_mutation(
         self, *, execution_run_id: str, workspace_id: str,
         poison_owner: str, expected_status: str, terminal_status: str,
         baseline_digest: str, failure_code: str = "no-mutation-crash",
     ) -> None:
-        """Atomically terminalize a proven zero-journal startup crash."""
-        now = time.time()
-        self._conn.execute("BEGIN IMMEDIATE")
-        try:
-            proof = self.get_initial_workspace_attestation(execution_run_id)
-            run_digest = self._conn.execute(
-                "SELECT initial_attestation_digest FROM plan_execution_runs "
-                "WHERE execution_run_id=?", (execution_run_id,),
-            ).fetchone()
-            if (proof is None or proof.attestation_digest != baseline_digest
-                    or run_digest is None
-                    or run_digest["initial_attestation_digest"] != baseline_digest):
-                raise RuntimeError("zero-journal baseline mismatch")
-            count = self._conn.execute(
-                "SELECT COUNT(e.event_id) AS event_count,r.journaled_edit_count "
-                "FROM plan_execution_runs r LEFT JOIN plan_execution_edit_events e "
-                "ON e.execution_run_id=r.execution_run_id "
-                "WHERE r.execution_run_id=? GROUP BY r.execution_run_id",
-                (execution_run_id,),
-            ).fetchone()
-            if count is None or int(count["event_count"]) != 0 or int(
-                count["journaled_edit_count"]
-            ) != 0:
-                raise RuntimeError("zero-journal recovery found edit events")
-            cur = self._conn.execute(
-                "UPDATE plan_execution_runs SET status=?,updated_at=?,completed_at=?,"
-                "failure_code=? WHERE execution_run_id=? AND status=?",
-                (terminal_status, now, now, failure_code, execution_run_id,
-                 expected_status),
-            )
-            if int(cur.rowcount or 0) != 1:
-                raise RuntimeError("invalid zero-journal terminal transition")
-            self._insert_execution_audit(
-                execution_run_id, "recovered-no-mutation-committed",
-                result=terminal_status, error_code=failure_code,
-                correlation_id=baseline_digest,
-            )
-            self._conn.execute(
-                "DELETE FROM workspace_mutation_poison_scopes WHERE workspace_id=? "
-                "AND poison_owner=?", (workspace_id, poison_owner),
-            )
-            self._conn.commit()
-        except Exception:
-            self._conn.rollback()
-            raise
+        self._execution_writer.commit_recovered_no_mutation(
+            execution_run_id=execution_run_id,
+            workspace_id=workspace_id,
+            poison_owner=poison_owner,
+            expected_status=expected_status,
+            terminal_status=terminal_status,
+            baseline_digest=baseline_digest,
+            failure_code=failure_code,
+        )
 
     def _insert_execution_audit(
         self, execution_run_id: str, event_type: str, *, operation: str = "",
         path: str = "", before_hash: str = "", after_hash: str = "",
         result: str, error_code: str = "", correlation_id: str,
     ) -> None:
-        self._conn.execute(
-            "INSERT INTO plan_execution_audit_events "
-            "(audit_id,execution_run_id,event_type,operation,path,before_hash,"
-            "after_hash,result,error_code,correlation_id,created_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-            (uuid.uuid4().hex, execution_run_id, event_type, operation, path,
-             before_hash, after_hash, result, error_code, correlation_id,
-             time.time()),
+        self._execution_writer._insert_execution_audit(
+            execution_run_id,
+            event_type,
+            operation=operation,
+            path=path,
+            before_hash=before_hash,
+            after_hash=after_hash,
+            result=result,
+            error_code=error_code,
+            correlation_id=correlation_id,
         )
 
     def get_execution_run_by_context(self, execution_context_id: str) -> Any | None:
-        row = self._conn.execute(
-            "SELECT * FROM plan_execution_runs WHERE execution_context_id=?",
-            (execution_context_id,),
-        ).fetchone()
-        return self._row_to_execution_run(row) if row is not None else None
+        return self._execution_read_model.get_execution_run_by_context(execution_context_id)
 
     def get_execution_run(self, execution_run_id: str) -> Any | None:
-        row = self._conn.execute(
-            "SELECT * FROM plan_execution_runs WHERE execution_run_id=?",
-            (execution_run_id,),
-        ).fetchone()
-        if row is not None and row["status"] == "verified":
-            verifier = self.__verification_success_verifier
-            if verifier is None:
-                if self.__authoritative_verification_reads_required:
-                    raise PermissionError(
-                        "VERIFIED execution cannot be trusted without authority"
-                    )
-            else:
-                verifier(execution_run_id)
-        return self._row_to_execution_run(row) if row is not None else None
+        return self._execution_read_model.get_execution_run(
+            execution_run_id,
+            verification_success_verifier=self.__verification_success_verifier,
+            authoritative_verification_reads_required=(
+                self.__authoritative_verification_reads_required
+            ),
+        )
 
     def list_incomplete_execution_runs(self) -> tuple[Any, ...]:
-        rows = self._conn.execute(
-            "SELECT * FROM plan_execution_runs WHERE status IN "
-            "('validating','mutating','sealing','rolling-back','rollback-sealing','poisoned') "
-            "ORDER BY started_at,execution_run_id"
-        ).fetchall()
-        return tuple(self._row_to_execution_run(row) for row in rows)
+        return self._execution_read_model.list_incomplete_execution_runs()
 
     def list_execution_edit_events(self, execution_run_id: str) -> tuple[sqlite3.Row, ...]:
-        return tuple(self._conn.execute(
-            "SELECT * FROM plan_execution_edit_events WHERE execution_run_id=? "
-            "ORDER BY ordinal,event_id", (execution_run_id,),
-        ).fetchall())
+        return self._execution_read_model.list_execution_edit_events(execution_run_id)
 
     def execution_journal_progress(self, execution_run_id: str) -> tuple[int, int]:
-        row = self._conn.execute(
-            "SELECT journaled_edit_count,(SELECT COUNT(*) FROM "
-            "plan_execution_edit_events e WHERE e.execution_run_id=r.execution_run_id) "
-            "AS actual_count FROM plan_execution_runs r WHERE execution_run_id=?",
-            (execution_run_id,),
-        ).fetchone()
-        if row is None:
-            raise RuntimeError("execution run not found")
-        return int(row["journaled_edit_count"]), int(row["actual_count"])
+        return self._execution_read_model.execution_journal_progress(execution_run_id)
 
     @staticmethod
     def _row_to_execution_run(row: sqlite3.Row) -> Any:
-        from khaos.coding.planning.execution_models import (
-            ExecutionRunStatus,
-            PlanExecutionRun,
-        )
-        return PlanExecutionRun(
-            execution_run_id=row["execution_run_id"], plan_id=row["plan_id"],
-            plan_content_hash=row["plan_content_hash"],
-            approval_request_id=row["approval_request_id"],
-            authorization_id=row["authorization_id"],
-            execution_context_id=row["execution_context_id"],
-            lease_id=row["lease_id"], task_id=row["task_id"],
-            workspace_id=row["workspace_id"], repository_id=row["repository_id"],
-            base_sha=row["base_sha"],
-            repository_generation=int(row["repository_generation"]),
-            binding_digest=row["binding_digest"],
-            edit_bundle_digest=row["edit_bundle_digest"],
-            status=ExecutionRunStatus(row["status"]), started_at=float(row["started_at"]),
-            updated_at=float(row["updated_at"]), completed_at=row["completed_at"],
-            failure_code=row["failure_code"], metadata=json.loads(row["metadata_json"]),
-        )
+        """Compatibility conversion alias; execution read model owns it."""
+        return PlanExecutionReadModel.row_to_execution_run(row)
 
 
 def new_authorization_id() -> str:

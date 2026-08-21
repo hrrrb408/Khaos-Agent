@@ -17,7 +17,10 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from khaos.exceptions import ServiceShutdownError
+from khaos.scheduler.calculator import ScheduleCalculator
+from khaos.scheduler.due_selector import DueTaskSelector
 from khaos.scheduler.models import ScheduleConfig, ScheduledTask, TaskStatus
+from khaos.scheduler.repository import ScheduledTaskRepository
 from khaos.time_utils import utc_now_naive
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -189,6 +192,9 @@ class CronEngine:
         behaviour.
         """
         self.db = db
+        self._task_repository = ScheduledTaskRepository(
+            db, project_id=project_id
+        )
         self._executor = self._wrap_executor(executor)
         self._on_complete = on_complete
         self._tick_interval = tick_interval
@@ -439,8 +445,8 @@ class CronEngine:
                 # can per-task reload them afterwards (instead of the
                 # full ``_load_tasks()`` that overwrites other tasks'
                 # in-memory state).
-                running_ids = await self.db.query_running_task_ids()
-                recovered_running = await self.db.recover_all_running_tasks()
+                running_ids = await self._task_repository.query_running_task_ids()
+                recovered_running = await self._task_repository.recover_all_running()
                 if recovered_running > 0:
                     logger.warning(
                         "recovered %d running task(s) at startup — "
@@ -451,10 +457,10 @@ class CronEngine:
                 # M4 batch 3.1.10 (HIGH-3): also sweep expired leases
                 # (catches in-process hangs from a prior session that
                 # were never cleaned up — idempotent with the above).
-                expired_ids = await self.db.query_expired_lease_task_ids(
+                expired_ids = await self._task_repository.query_expired_lease_task_ids(
                     now_iso=utc_now_naive().isoformat(),
                 )
-                recovered_expired = await self.db.recover_expired_leases(
+                recovered_expired = await self._task_repository.recover_expired(
                     now_iso=utc_now_naive().isoformat(),
                 )
                 if recovered_expired > 0:
@@ -922,7 +928,7 @@ class CronEngine:
             — the caller raises ``ServiceShutdownError``).
         """
         try:
-            row = await self.db.get_scheduled_task(task_id, project_id=self._project_id)
+            row = await self._task_repository.get_task(task_id)
         except Exception:
             logger.exception(
                 "cron task %s: reconcile could not read DB — "
@@ -965,7 +971,7 @@ class CronEngine:
         # DB version < target — our CAS might still succeed.  Try it
         # with the marker's own (expected, target) pair.
         try:
-            rowcount = await self.db.control_finalize_scheduled_task(
+            rowcount = await self._task_repository.control_finalize(
                 task_id,
                 expected_version=marker.expected_version,
                 target_version=marker.target_version,
@@ -977,7 +983,7 @@ class CronEngine:
             # Check commit-then-raise: the CAS may have committed
             # before raising.
             try:
-                row2 = await self.db.get_scheduled_task(task_id, project_id=self._project_id)
+                row2 = await self._task_repository.get_task(task_id)
             except Exception:
                 logger.exception(
                     "cron task %s: reconcile CAS raised and read-back "
@@ -1009,7 +1015,7 @@ class CronEngine:
             # CAS mismatch — check if prior retry committed or a
             # newer op won.
             try:
-                row2 = await self.db.get_scheduled_task(task_id, project_id=self._project_id)
+                row2 = await self._task_repository.get_task(task_id)
             except Exception:  # noqa: BLE001 — treat as failure
                 row2 = None
             if (
@@ -1137,7 +1143,7 @@ class CronEngine:
         attempt it again.
         """
         try:
-            row = await self.db.get_scheduled_task(task_id, project_id=self._project_id)
+            row = await self._task_repository.get_task(task_id)
         except Exception:
             logger.exception(
                 "cron task %s: executor reconcile could not read "
@@ -1262,12 +1268,11 @@ class CronEngine:
         )
         task.next_run = self._compute_next_run(task)
         if self.db:
-            task.id = await self.db.insert_scheduled_task(
+            task.id = await self._task_repository.insert_task(
                 name, prompt, task.status.value, schedule,
                 deliver_to, meta,
                 principal_id=principal_id,
                 next_run=task.next_run.isoformat() if task.next_run else None,
-                project_id=self._project_id,
                 policy_digest=self._policy_digest,
             )
         else:
@@ -1578,7 +1583,7 @@ class CronEngine:
                 expected = task.lifecycle_version
                 target = expected + 1
                 try:
-                    rowcount = await self.db.control_finalize_scheduled_task(
+                    rowcount = await self._task_repository.control_finalize(
                         task.id,
                         expected_version=expected,
                         target_version=target,
@@ -1589,7 +1594,7 @@ class CronEngine:
                 except Exception:
                     # Could be commit-then-raise — read back to verify.
                     try:
-                        row = await self.db.get_scheduled_task(task.id, project_id=self._project_id)
+                        row = await self._task_repository.get_task(task.id)
                     except Exception:
                         logger.exception(
                             "cron task %s: could not persist resumed "
@@ -1625,7 +1630,7 @@ class CronEngine:
                     # committed (DB at ``target``) or a newer control
                     # op happened (DB at > ``target``).  Read back.
                     try:
-                        row = await self.db.get_scheduled_task(task.id, project_id=self._project_id)
+                        row = await self._task_repository.get_task(task.id)
                     except Exception:  # noqa: BLE001 — treat as failure
                         row = None
                     if (
@@ -1859,7 +1864,7 @@ class CronEngine:
         """
         if not self.db:
             return
-        await self.db.insert_scheduler_journal_entry(
+        await self._task_repository.insert_journal_entry(
             operation_id=operation_id,
             task_id=task.id,
             operation_type=operation_type,
@@ -1868,14 +1873,6 @@ class CronEngine:
             target_version=target_version,
             principal_id=task.principal_id,
             policy_digest=self._policy_digest,
-            # M4 batch 3.1.16A-5-1b: stamp the engine's bound project
-            # identity on the journal row so the durable operation
-            # journal is cryptographically tied to the project that
-            # produced it.  ``self._project_id`` is set at engine
-            # construction from the AgentService's _bound_project_id
-            # (which the RPC dispatcher has already verified against
-            # ``ctx.project_id``).
-            project_id=self._project_id,
         )
 
     async def _mark_journal_applied(self, operation_id: str) -> None:
@@ -1890,7 +1887,7 @@ class CronEngine:
         if not self.db:
             return
         try:
-            await self.db.mark_scheduler_journal_applied(operation_id)
+            await self._task_repository.mark_journal_applied(operation_id)
         except Exception:
             logger.warning(
                 "could not mark journal entry %s as applied — "
@@ -1943,7 +1940,7 @@ class CronEngine:
         if not self.db:
             return
         try:
-            entries = await self.db.list_pending_scheduler_journal_entries()
+            entries = await self._task_repository.list_pending_journal_entries()
         except Exception:
             logger.warning(
                 "cron engine start: could not read pending journal "
@@ -1961,7 +1958,7 @@ class CronEngine:
             desired = entry["desired_status"]
             op_type = entry["operation_type"]
             try:
-                row = await self.db.get_scheduled_task(task_id, project_id=self._project_id)
+                row = await self._task_repository.get_task(task_id)
             except Exception:
                 logger.warning(
                     "cron engine start: could not read task %s for "
@@ -2336,46 +2333,8 @@ class CronEngine:
         return self._tasks.get(task_id)
 
     def _compute_next_run(self, task: ScheduledTask) -> datetime:
-        """根据 ScheduleConfig 计算下次执行时间。
-
-        简化实现：
-        - iso_time: 直接返回（一次性）
-        - interval_seconds: now + interval
-        - cron: 简单解析分时日（仅支持基本格式，不支持高级 cron 语法）
-        """
-        now = utc_now_naive()
-        if task.schedule.iso_time:
-            try:
-                return datetime.fromisoformat(task.schedule.iso_time)
-            except ValueError:
-                pass
-        if task.schedule.interval_seconds:
-            return now + timedelta(seconds=task.schedule.interval_seconds)
-        # 简单 cron 解析：仅支持 "分 时" 格式，如 "0 9" = 每天 9:00
-        if task.schedule.cron:
-            return self._parse_simple_cron(task.schedule.cron, now)
-        return now + timedelta(hours=1)  # 默认每小时
-
-    def _parse_simple_cron(self, cron: str, now: datetime) -> datetime:
-        """解析简化的 cron 表达式。
-
-        支持格式：
-        - "分钟 小时"（如 "0 9" = 每天 9:00）
-        - "分钟 小时 日 月 星期"（完整 cron，简化解析）
-        """
-        parts = cron.strip().split()
-        if len(parts) < 2:
-            return now + timedelta(hours=1)
-        try:
-            minute = int(parts[0])
-            hour = int(parts[1])
-        except ValueError:
-            return now + timedelta(hours=1)
-        # 计算今天的下一个目标时间
-        target = now.replace(minute=minute, hour=hour, second=0, microsecond=0)
-        if target <= now:
-            target += timedelta(days=1)
-        return target
+        """Delegate pure schedule calculation to the dedicated calculator."""
+        return ScheduleCalculator.compute(task)
 
     def _task_lock(self, task_id: str) -> asyncio.Lock:
         """H1 (round-11): return (or create) the per-task lock.
@@ -2450,7 +2409,7 @@ class CronEngine:
             ):
                 self._last_lease_sweep = time.monotonic()
                 try:
-                    expired_ids = await self.db.query_expired_lease_task_ids(
+                    expired_ids = await self._task_repository.query_expired_lease_task_ids(
                         now_iso=now.isoformat(),
                     )
                     if expired_ids:
@@ -2511,14 +2470,16 @@ class CronEngine:
             # Snapshot candidates without the lock — worst case we
             # consider a candidate that was just paused/removed, and
             # the re-check under the lock below skips it.
-            due_candidates = [
-                task for task in self._tasks.values()
-                if task.enabled
-                and task.status == TaskStatus.PENDING
-                and task.next_run
-                and task.next_run <= now
-                and task.id not in self._pending_persistence
-            ]
+            due_candidates = DueTaskSelector.select(
+                self._tasks.values(),
+                now=now,
+                pending_persistence_ids=self._pending_persistence,
+                executing_ids={
+                    task_id
+                    for task_id, owner in self._execute_tasks.items()
+                    if not owner.done()
+                },
+            )
             for task in due_candidates:
                 # H1 (round-11): acquire the per-task lock for the
                 # re-check + publish.  If another operation
@@ -2710,15 +2671,15 @@ class CronEngine:
             # M4 batch 3.1.11 (CRITICAL-1): fail-closed on claim.
             claim_committed = False
             try:
-                rowcount = await self.db.claim_scheduled_task(
+                rowcount = await self._task_repository.claim_task(
                     task.id,
                     execution_id=execution_id,
                     started_at=started_at_dt.isoformat(),
                     lease_until=lease_until_dt.isoformat(),
                     expected_version=version_at_start,
-                    expected_principal_id=bound_principal_id,
-                    expected_project_id=bound_project_id,
-                    expected_policy_digest=bound_policy_digest,
+                    principal_id=bound_principal_id,
+                    policy_digest=bound_policy_digest,
+                    project_id=bound_project_id,
                 )
                 if rowcount == 1:
                     claim_committed = True
@@ -2743,7 +2704,7 @@ class CronEngine:
                     task.name,
                 )
                 try:
-                    row = await self.db.get_scheduled_task(task.id, project_id=self._project_id)
+                    row = await self._task_repository.get_task(task.id)
                 except Exception:
                     logger.exception(
                         "cron task %s: could not read back row after "
@@ -2920,7 +2881,7 @@ class CronEngine:
         if not self.db:
             return
         try:
-            await self.db.clear_scheduled_task_lease(
+            await self._task_repository.clear_lease(
                 task.id, execution_id=execution_id,
             )
         except Exception:
@@ -2978,7 +2939,7 @@ class CronEngine:
             expected_version=expected_version,
             is_control_op=False,
         )
-        rowcount = await self.db.finalize_scheduled_task(
+        rowcount = await self._task_repository.finalize_task(
             task.id,
             execution_id=task.execution_id or "",
             expected_version=expected_version,
@@ -3132,7 +3093,7 @@ class CronEngine:
         # high) and the CAS would permanently mismatch.  Reading the
         # DB gives us the ground truth.
         try:
-            row = await self.db.get_scheduled_task(task.id, project_id=self._project_id)
+            row = await self._task_repository.get_task(task.id)
         except Exception:
             # Can't read — can't supersede.  Place a marker so
             # ``stop()`` retries.  Use the in-memory version as a
@@ -3220,7 +3181,7 @@ class CronEngine:
                 )
                 raise
         try:
-            rowcount = await self.db.control_finalize_scheduled_task(
+            rowcount = await self._task_repository.control_finalize(
                 task.id,
                 expected_version=expected,
                 target_version=target,
@@ -3232,7 +3193,7 @@ class CronEngine:
             # The CAS raised — could be commit-then-raise.  Read back
             # to verify.  If the DB is already at ``target_version``
             # with the desired status, treat as success.
-            row2 = await self.db.get_scheduled_task(task.id, project_id=self._project_id)
+            row2 = await self._task_repository.get_task(task.id)
             if (
                 row2 is not None
                 and int(row2.get("lifecycle_version", 0)) == target
@@ -3259,7 +3220,7 @@ class CronEngine:
             # happened (DB at > ``target``).  Read back to
             # distinguish.
             try:
-                row2 = await self.db.get_scheduled_task(task.id, project_id=self._project_id)
+                row2 = await self._task_repository.get_task(task.id)
             except Exception:  # noqa: BLE001 — treat as failure
                 row2 = None
             if (
@@ -3332,7 +3293,7 @@ class CronEngine:
         """
         if not self.db:
             return
-        rows = await self.db.list_scheduled_tasks(project_id=self._project_id)
+        rows = await self._task_repository.list_tasks()
         for row in rows:
             task = _task_from_row(row)
             if task is not None:
@@ -3372,7 +3333,7 @@ class CronEngine:
             if exec_task is not None and not exec_task.done():
                 return
             try:
-                row = await self.db.get_scheduled_task(task_id, project_id=self._project_id)
+                row = await self._task_repository.get_task(task_id)
             except Exception:
                 self._degraded = True
                 logger.exception(
@@ -3449,7 +3410,7 @@ class CronEngine:
                 return True
             # No marker — safe to write FAILED to the DB.
             try:
-                recovered = await self.db.recover_one_expired_lease(
+                recovered = await self._task_repository.recover_one_expired(
                     task_id, now_iso=now_iso,
                 )
             except Exception:
@@ -3475,7 +3436,7 @@ class CronEngine:
                 )
                 # Reload the in-memory task to pick up the FAILED state.
                 try:
-                    row = await self.db.get_scheduled_task(task_id, project_id=self._project_id)
+                    row = await self._task_repository.get_task(task_id)
                 except Exception:  # noqa: BLE001 — DB unreadable
                     self._degraded = True
                     return True

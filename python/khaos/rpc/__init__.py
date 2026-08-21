@@ -9,4 +9,8 @@ from khaos.rpc.audit_service import AuditService
 from khaos.rpc.memory_service import MemoryService
 from khaos.rpc.session_service import SessionService
 
-__all__ = ["AuditService", "MemoryService", "SessionService"]
+__all__ = [
+    "AuditService",
+    "MemoryService",
+    "SessionService",
+]

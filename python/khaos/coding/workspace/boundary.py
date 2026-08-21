@@ -15,6 +15,15 @@ from khaos.coding.planning.safe_workspace_path import (
     SafePathError,
     WorkspacePathHandle,
 )
+from khaos.coding.workspace.policy import (
+    DEFAULT_FILE_TOOL_BYTES,
+    DEFAULT_TREE_BYTES,
+    DEFAULT_TREE_DEPTH,
+    DEFAULT_TREE_ENTRIES,
+    PROTECTED_WORKSPACE_NAMES,  # noqa: F401 - compatibility export
+    PROTECTED_WORKSPACE_NAMES_CASEFOLD,
+    is_protected_workspace_name,
+)
 
 
 class WorkspaceBoundaryError(PermissionError):
@@ -58,15 +67,6 @@ class CreatedDirectoryIdentity:
 
 # Consumed by SafeWorkspaceFS and OS execution backends.  A terminal must not
 # be able to rewrite the policy file when file APIs deny the same mutation.
-PROTECTED_WORKSPACE_NAMES = frozenset(
-    {".git", ".agents", ".codex", ".khaos", "khaos_policy.yaml"}
-)
-DEFAULT_FILE_TOOL_BYTES = 16 * 1024 * 1024
-DEFAULT_TREE_BYTES = 64 * 1024 * 1024
-DEFAULT_TREE_ENTRIES = 4096
-DEFAULT_TREE_DEPTH = 32
-
-
 class SafeWorkspaceFS:
     """Dirfd-anchored filesystem capability for one TaskWorkspace.
 
@@ -112,8 +112,7 @@ class SafeWorkspaceFS:
         # names, not just the first.  Previously ``submodule/.git/config``
         # passed because parts[0] == "submodule".  Now any component that
         # is .git/.agents/.codex/.khaos triggers the protection.
-        protected_lower = {name.casefold() for name in PROTECTED_WORKSPACE_NAMES}
-        if any(part.casefold() in protected_lower for part in relative.parts):
+        if any(is_protected_workspace_name(part) for part in relative.parts):
             raise WorkspaceBoundaryError("protected workspace metadata is read-only")
         return relative.as_posix()
 
@@ -452,10 +451,7 @@ class SafeWorkspaceFS:
                             raise WorkspaceBoundaryError(
                                 "directory exceeds the entry limit"
                             )
-                        if name.casefold() in {
-                            protected.casefold()
-                            for protected in PROTECTED_WORKSPACE_NAMES
-                        }:
+                        if name.casefold() in PROTECTED_WORKSPACE_NAMES_CASEFOLD:
                             continue
                         info = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
                         relative_parts = (*prefix, name)
@@ -508,10 +504,7 @@ class SafeWorkspaceFS:
                     names = sorted(os.listdir(descriptor), key=str.casefold)
                     children: list[tuple[int, tuple[str, ...], int]] = []
                     for name in names:
-                        if name.casefold() in {
-                            protected.casefold()
-                            for protected in PROTECTED_WORKSPACE_NAMES
-                        }:
+                        if name.casefold() in PROTECTED_WORKSPACE_NAMES_CASEFOLD:
                             continue
                         observed += 1
                         if observed > max_entries:
@@ -876,9 +869,7 @@ class SafeWorkspaceFS:
                 raise MutationCancelled(
                     "copy cancelled during recursive directory traversal"
                 )
-            if name.casefold() in {
-                protected.casefold() for protected in PROTECTED_WORKSPACE_NAMES
-            }:
+            if name.casefold() in PROTECTED_WORKSPACE_NAMES_CASEFOLD:
                 raise WorkspaceBoundaryError("copy source contains protected metadata")
             budget["entries"] += 1
             if budget["entries"] > max_entries:
@@ -987,9 +978,7 @@ class SafeWorkspaceFS:
                 raise MutationCancelled(
                     "move cancelled during recursive tree validation"
                 )
-            if name.casefold() in {
-                protected.casefold() for protected in PROTECTED_WORKSPACE_NAMES
-            }:
+            if name.casefold() in PROTECTED_WORKSPACE_NAMES_CASEFOLD:
                 raise WorkspaceBoundaryError("tree contains protected metadata")
             budget["entries"] += 1
             if budget["entries"] > max_entries:
@@ -1053,8 +1042,7 @@ class SafeWorkspaceFS:
         except ValueError as exc:
             raise WorkspaceBoundaryError("directory is outside task worktree") from exc
         # P1-4: check ALL components (same fix as relative()).
-        protected_lower = {name.casefold() for name in PROTECTED_WORKSPACE_NAMES}
-        if any(part.casefold() in protected_lower for part in relative.parts):
+        if any(is_protected_workspace_name(part) for part in relative.parts):
             raise WorkspaceBoundaryError("protected workspace metadata is read-only")
         return relative.as_posix() if relative.parts else ""
 

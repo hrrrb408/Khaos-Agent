@@ -39,8 +39,6 @@ from khaos.security.authorityd_protocol import (
     Ed25519KeyStore,
     RemoteAuditUnavailableError,
     SignedAuthorizationReceipt,
-    _canonical,
-    _digest,
     _encode_receipt_timestamp,
     _required_text,
     derive_resource_digest,
@@ -63,6 +61,8 @@ from khaos.security.principals import (
 )
 from khaos.security.protocol_boundary import (
     ProtocolBoundaryError,
+    canonical_digest,
+    canonical_json_bytes,
     read_bounded_line,
     require_receipt_transition,
 )
@@ -680,7 +680,7 @@ class AuthorityDaemon:
     def _audit_event(self, event: dict[str, Any]) -> dict[str, Any]:
         """Attach a stable id so a WORM retry can be made idempotent."""
         normalized = dict(event)
-        normalized.setdefault("event_id", _digest(normalized))
+        normalized.setdefault("event_id", canonical_digest(normalized))
         return normalized
 
     def _reserve_audit_event_locked(self, event: dict[str, Any]) -> str:
@@ -1468,7 +1468,7 @@ class AuthorityDaemon:
                     "source_transport": intent.source_transport,
                     "delegation_resource": intent.delegation_resource,
                     "expires_at": expires_at,
-                    "audit_intent_digest": _digest(audit_intent),
+                "audit_intent_digest": canonical_digest(audit_intent),
                     "issuer_id": self.issuer_id,
                     "issued_at": issued_at,
                 }
@@ -1492,7 +1492,7 @@ class AuthorityDaemon:
                 wire_receipt_fields["issued_at"] = _encode_receipt_timestamp(
                     receipt_fields["issued_at"], field="issued_at"
                 )
-                signature = self.signing_key.sign(_canonical(wire_receipt_fields))
+                signature = self.signing_key.sign(canonical_json_bytes(wire_receipt_fields))
                 receipt = SignedAuthorizationReceipt(
                     **receipt_fields,
                     signature=__import__("base64").b64encode(signature).decode("ascii"),
@@ -2175,7 +2175,7 @@ class AuthorityDaemon:
             ),
         }
         signature = base64.b64encode(
-            self.signing_key.sign(_canonical(payload))
+            self.signing_key.sign(canonical_json_bytes(payload))
         ).decode("ascii")
         response = _dispatch(self, inner)
         return {
@@ -2834,7 +2834,7 @@ def _serve_connection(
             except (AuthorityControlPlaneError, OSError, ValueError, TypeError) as exc:
                 response = {"ok": False, "error": str(exc)}
             try:
-                connection.sendall(_canonical(response) + b"\n")
+                connection.sendall(canonical_json_bytes(response) + b"\n")
             except OSError:
                 logger.debug("authorityd client disconnected before response", exc_info=True)
     finally:

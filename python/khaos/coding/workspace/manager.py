@@ -15,12 +15,27 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, TypeVar
 
+from khaos.coding.workspace.artifacts import (
+    MAX_CHANGESET_BYTES,
+)
+from khaos.coding.workspace.artifacts import (
+    copy_verified_artifact as _copy_verified_artifact,
+)
+from khaos.coding.workspace.artifacts import (
+    read_verified_artifact as _read_verified_artifact,
+)
+from khaos.coding.workspace.artifacts import (
+    verified_artifact_path as _verified_changeset_artifact_path,
+)
+from khaos.coding.workspace.artifacts import (
+    write_exclusive_artifact as _write_exclusive_artifact,
+)
 from khaos.coding.workspace.boundary import (
-    PROTECTED_WORKSPACE_NAMES,
     SafePathError,
     SafeWorkspaceFS,
     WorkspaceBoundaryError,
 )
+from khaos.coding.workspace.errors import WorkspaceError
 from khaos.coding.workspace.git_identity import (
     GitIdentityError,
     capture_git_worktree_identity,
@@ -34,6 +49,10 @@ from khaos.coding.workspace.models import (
     TaskWorkspace,
     WorkspaceState,
     WorkspaceTransition,
+)
+from khaos.coding.workspace.policy import (
+    PROTECTED_WORKSPACE_NAMES,
+    path_reaches_protected_metadata,
 )
 from khaos.coding.workspace.storage import (
     WorkspaceMutation,
@@ -67,17 +86,12 @@ from khaos.security.resource_scope import (
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
 FileIdentity = tuple[int, int, int, int]
-MAX_CHANGESET_BYTES = 64 * 1024 * 1024
 MAX_CHANGESET_PREVIEW_BYTES = 64 * 1024
 MAX_CHANGESET_FILES = 10_000
 MAX_CHANGESET_NAMES_BYTES = 8 * 1024 * 1024
 MAX_CHANGESET_STAT_BYTES = 1024 * 1024
 MAX_CHANGESET_ARTIFACTS = 64
 MAX_CHANGESET_ARTIFACT_BYTES = 256 * 1024 * 1024
-
-
-class WorkspaceError(RuntimeError):
-    """Raised when a worktree operation cannot be completed safely."""
 
 
 @dataclass
@@ -140,7 +154,7 @@ def _safe_workspace_target(
     path = PurePosixPath(relative)
     if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
         raise WorkspaceError("workspace path is not relative and normalized")
-    if any(part.casefold() in PROTECTED_WORKSPACE_NAMES for part in path.parts):
+    if path_reaches_protected_metadata(path):
         raise WorkspaceError("workspace path reaches protected metadata")
     root = workspace.worktree_path.resolve(strict=True)
     target = workspace.worktree_path.joinpath(*path.parts)
@@ -165,110 +179,6 @@ def _safe_branch_ref(branch_name: str) -> str:
     ):
         raise WorkspaceError("workspace branch ref is invalid")
     return f"refs/heads/{branch_name}"
-
-
-def _verified_changeset_artifact_path(
-    workspace: TaskWorkspace, changeset: ChangeSet
-) -> Path:
-    artifact = changeset.artifact
-    if artifact is None:
-        raise WorkspaceError("changeset has no artifact")
-    expected = workspace.worktree_path.parent / f"{changeset.id}.patch"
-    if artifact.path != expected or artifact.path.parent != workspace.worktree_path.parent:
-        raise WorkspaceError("changeset artifact is outside its authority root")
-    if artifact.path not in workspace.change_artifacts:
-        raise WorkspaceError("changeset artifact is not owned by the workspace")
-    try:
-        info = artifact.path.lstat()
-    except OSError as exc:
-        raise WorkspaceError("changeset artifact is unavailable") from exc
-    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-        raise WorkspaceError("changeset artifact has an unsafe file type")
-    if int(info.st_size) != artifact.byte_length:
-        raise WorkspaceError("changeset artifact length drifted")
-    return artifact.path
-
-
-def _read_verified_artifact(
-    path: Path,
-    expected_length: int,
-    expected_digest: str,
-    max_bytes: int,
-) -> bytes:
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    digest = hashlib.sha256()
-    data = bytearray()
-    try:
-        while chunk := os.read(descriptor, 1024 * 1024):
-            data.extend(chunk)
-            digest.update(chunk)
-            if len(data) > max_bytes:
-                raise WorkspaceError("changeset patch exceeds inline output bound")
-    finally:
-        os.close(descriptor)
-    if len(data) != expected_length or digest.hexdigest() != expected_digest:
-        raise WorkspaceError("changeset artifact digest or length drifted")
-    return bytes(data)
-
-
-def _write_exclusive_artifact(path: Path, payload: bytes) -> None:
-    descriptor = os.open(
-        path,
-        os.O_WRONLY
-        | os.O_CREAT
-        | os.O_EXCL
-        | getattr(os, "O_NOFOLLOW", 0),
-        0o600,
-    )
-    try:
-        offset = 0
-        while offset < len(payload):
-            offset += os.write(descriptor, payload[offset:])
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
-def _copy_verified_artifact(
-    source: Path,
-    destination: Path,
-    expected_length: int,
-    expected_digest: str,
-) -> None:
-    source_descriptor = os.open(
-        source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    )
-    destination_descriptor: int | None = None
-    digest = hashlib.sha256()
-    total = 0
-    try:
-        destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        destination_descriptor = os.open(
-            destination,
-            os.O_WRONLY
-            | os.O_CREAT
-            | os.O_EXCL
-            | getattr(os, "O_NOFOLLOW", 0),
-            0o600,
-        )
-        while chunk := os.read(source_descriptor, 1024 * 1024):
-            total += len(chunk)
-            if total > MAX_CHANGESET_BYTES:
-                raise WorkspaceError("changeset artifact exceeds the configured bound")
-            digest.update(chunk)
-            offset = 0
-            while offset < len(chunk):
-                offset += os.write(destination_descriptor, chunk[offset:])
-        if total != expected_length or digest.hexdigest() != expected_digest:
-            raise WorkspaceError("changeset artifact digest or length drifted")
-        os.fsync(destination_descriptor)
-    except Exception:
-        destination.unlink(missing_ok=True)
-        raise
-    finally:
-        os.close(source_descriptor)
-        if destination_descriptor is not None:
-            os.close(destination_descriptor)
 
 
 def _open_private_authority_root(configured: Path) -> tuple[Path, FileIdentity]:

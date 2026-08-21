@@ -20,14 +20,16 @@ from khaos.grpc_server import (
     AgentService,
     ChatRequest,
     ConfirmRequest,
-    GatewayRPCAuthenticator,
     _load_rpc_capability,
     _parse_json_line,
-    _rpc_binding_claim_error,
     load_router_from_config,
     MemoryService,
     serve_json_lines,
     TaskService,
+)
+from khaos.rpc.protocol import (
+    GatewayRPCAuthenticator,
+    rpc_binding_claim_error as _rpc_binding_claim_error,
 )
 from khaos.channels import ChannelType, PlatformMessage, Sender
 from khaos.runtime import RequestContext

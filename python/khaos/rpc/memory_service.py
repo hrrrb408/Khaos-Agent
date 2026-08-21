@@ -75,11 +75,10 @@ class MemoryService:
         self, ctx: RequestContext, memory_id: int
     ) -> dict[str, object]:
         """Delete only a row owned by this principal and project."""
-        await self.db.delete_memory_by_id(
-            memory_id,
-            principal_id=ctx.principal_id,
-            project_id=ctx.project_id,
-        )
+        # Keep deletion on the same MemoryStore boundary as every other
+        # operation so ownership and audit behavior cannot drift between RPC
+        # methods and local runtime callers.
+        await self._store(ctx).delete_by_id(memory_id)
         return {"ok": True}
 
     async def search_memory(

@@ -355,7 +355,7 @@ class DockerBackend:
             "--network", "none", "--mount",
             f"type=bind,src={context.worktree_path},dst=/workspace",
         ]
-        from khaos.coding.workspace.boundary import PROTECTED_WORKSPACE_NAMES
+        from khaos.coding.workspace.policy import PROTECTED_WORKSPACE_NAMES
 
         for name in sorted(PROTECTED_WORKSPACE_NAMES):
             source = context.worktree_path / name
@@ -997,7 +997,7 @@ def _canonical_digest(value: object) -> str:
 
 
 def _workspace_mount_policy_digest(workspace: Path) -> str:
-    from khaos.coding.workspace.boundary import PROTECTED_WORKSPACE_NAMES
+    from khaos.coding.workspace.policy import PROTECTED_WORKSPACE_NAMES
 
     return _canonical_digest(
         {

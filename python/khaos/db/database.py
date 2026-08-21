@@ -17,12 +17,22 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-try:
-    import aiosqlite
-except ModuleNotFoundError:  # pragma: no cover - exercised only in bare envs
-    aiosqlite = None
-
 from khaos.agent.core import Message
+from khaos.db.connection import (
+    DatabaseClosingError,  # noqa: F401 - compatibility export
+    DatabaseConnection,
+    READER_DRAIN_TIMEOUT,
+    _AsyncCursor,  # noqa: F401 - compatibility export
+    _AsyncSqliteFallback,  # noqa: F401 - compatibility export
+    aiosqlite,  # noqa: F401 - tests patch the shared driver module
+)
+
+# Compatibility name for released tests and integrations.  The lifecycle
+# owner is ``db.connection.READER_DRAIN_TIMEOUT``; this alias must not become
+# a second configuration knob and is scheduled for removal after callers
+# migrate to the canonical owner.
+_READER_DRAIN_TIMEOUT = READER_DRAIN_TIMEOUT
+from khaos.db.repositories import SessionRepository
 from khaos.time_utils import utc_now_naive
 
 # The release-pinned migration methods below are hashed byte-for-byte.  Keep
@@ -54,8 +64,6 @@ TELEGRAM_REPLAY_WINDOW = 4096
 # NEW reads, and a read still in flight after this window is a leak (logged,
 # then the connection is closed anyway; the stuck coroutine raises on its
 # next await).
-_READER_DRAIN_TIMEOUT = 10.0
-
 # Round-14 §4: audit_log hash-chain helpers.  The chain makes the audit
 # trail tamper-evident: each row stores sha256(prev_hash || canonical
 # fields), so a deleted/reordered/edited row breaks the link and is
@@ -178,14 +186,6 @@ class TransactionContextLeakError(RuntimeError):
     """A transaction ContextVar leaked across task or database boundaries."""
 
 
-class DatabaseClosingError(RuntimeError):
-    """Batch 7.6 (round-7 §二十): a read was attempted while the database
-    is closing.  ``close()`` sets the admission fence (``_closing=True``)
-    before draining in-flight reads, so a NEW read that arrives during
-    the drain is rejected rather than entering and then being torn down
-    mid-fetch.  Callers should retry on a re-opened database."""
-
-
 class OwnerMismatchError(RuntimeError):
     """An upsert collided with a row owned by a different principal/project.
 
@@ -265,50 +265,6 @@ _current_transaction_owner: ContextVar[TransactionOwner | None] = ContextVar(
 )
 
 
-class _AsyncCursor:
-    """Minimal async cursor facade for environments without aiosqlite."""
-
-    def __init__(self, cursor: sqlite3.Cursor):
-        self._cursor = cursor
-
-    @property
-    def lastrowid(self) -> int | None:
-        return self._cursor.lastrowid
-
-    @property
-    def rowcount(self) -> int:
-        return self._cursor.rowcount
-
-    async def fetchall(self) -> list[sqlite3.Row]:
-        return self._cursor.fetchall()
-
-    async def fetchone(self) -> sqlite3.Row | None:
-        return self._cursor.fetchone()
-
-
-class _AsyncSqliteFallback:
-    """Tiny sqlite3-backed subset matching the aiosqlite calls used in P0-A."""
-
-    def __init__(self, path: str):
-        self._conn = sqlite3.connect(path)
-        self._conn.row_factory = sqlite3.Row
-
-    async def execute(self, sql: str, params: tuple[Any, ...] = ()) -> _AsyncCursor:
-        return _AsyncCursor(self._conn.execute(sql, params))
-
-    async def executescript(self, sql: str) -> None:
-        self._conn.executescript(sql)
-
-    async def commit(self) -> None:
-        self._conn.commit()
-
-    async def rollback(self) -> None:
-        self._conn.rollback()
-
-    async def close(self) -> None:
-        self._conn.close()
-
-
 class _MigrationConnection:
     """Delegate a connection while suppressing legacy helper commits.
 
@@ -333,17 +289,12 @@ class Database:
 
     def __init__(self, path: str | Path = "khaos.db"):
         self.path = str(path)
-        # C-04 (round-4 review): split writer and reader connections so
-        # reads do not see the writer's uncommitted state on the shared
-        # SQLite connection.  In WAL mode the reader connection can read
-        # concurrently with the writer (different snapshot).  Inside an
-        # active ``transaction()``, ``_require_conn()`` routes to the
-        # writer so intra-transaction reads see uncommitted writes.
-        self._conn: aiosqlite.Connection | None = None  # writer
-        self._reader_conn: aiosqlite.Connection | None = None
-        # C-01: bumped on close() so a stale TransactionOwner token
-        # (from a pre-close task) cannot match after reopen.
-        self._connection_generation = 0
+        # Physical connection state is owned by one bounded component.  The
+        # underscored properties below are compatibility views for the
+        # migration runner and older tests; new code should use
+        # ``DatabaseConnection`` through the explicit methods on this facade.
+        self._connection = DatabaseConnection(self.path)
+        self._session_repository = SessionRepository()
         # F-01: Per-domain locks remain for logical serialization (e.g. two
         # concurrent permission grants must not race on epoch computation).
         self._operation_approval_lock = asyncio.Lock()
@@ -355,116 +306,81 @@ class Database:
         # acquire this lock, preventing cross-domain ``commit()`` 串扰 on the
         # shared single connection. Read-only queries do not need this lock.
         self._write_transaction_lock = asyncio.Lock()
-        # H-05 (round-5 Batch 5.4): dedicated connection-lifecycle lock.
-        # ``connect`` / ``close`` / generation bump ALL acquire this lock
-        # so two concurrent ``connect()`` calls cannot both see
-        # ``_conn is None`` and leak one set of connections.  ``transaction()``
-        # also acquires it (via ``_require_writer_conn_locked``) inside the
-        # write lock so the writer reference cannot be torn down by a
-        # concurrent ``close()`` between acquiring the ref and acquiring the
-        # write lock (H-06).
-        self._connection_lifecycle_lock = asyncio.Lock()
-        # Batch 6.5 (round-6 §十八): Reader Operation Lease.  Plain reads
-        # (``_require_conn()`` → ``execute`` → ``fetchall``) hold no lock,
-        # so ``close()`` could tear down the reader mid-fetch.  Each read
-        # method wraps its body in ``async with self._read_lease():`` which
-        # bumps ``_active_readers`` (clearing ``_readers_idle``); ``close()``
-        # drains to zero before closing the reader connection.  Writer-path
-        # reads (inside ``transaction()``) are already protected by the
-        # write+ lifecycle locks and do NOT take a lease.
-        self._active_readers = 0
-        self._readers_idle = asyncio.Event()
-        self._readers_idle.set()
-        self._reader_drain_lock = asyncio.Lock()
-        # Batch 7.6 (round-7 §二十): admission-fence state.  ``close()``
-        # sets this BEFORE draining so new ``_read_lease()`` entrants are
-        # rejected (the generation bump alone does not gate the reader
-        # path because ``_require_reader_conn`` re-opens under the
-        # lifecycle lock we hold — which would re-open mid-close).
-        self._closing = False
-        self._close_state = "OPEN"
+
+    # Compatibility views keep the migration runner and existing integrations
+    # source-compatible while ensuring the connection component remains the
+    # sole owner of physical handles and lifecycle state.
+    @property
+    def _conn(self) -> Any | None:
+        return self._connection.writer
+
+    @_conn.setter
+    def _conn(self, value: Any | None) -> None:
+        self._connection.writer = value
+
+    @property
+    def _reader_conn(self) -> Any | None:
+        return self._connection.reader
+
+    @_reader_conn.setter
+    def _reader_conn(self, value: Any | None) -> None:
+        self._connection.reader = value
+
+    @property
+    def _connection_generation(self) -> int:
+        return self._connection.generation
+
+    @_connection_generation.setter
+    def _connection_generation(self, value: int) -> None:
+        self._connection.generation = value
+
+    @property
+    def _connection_lifecycle_lock(self) -> asyncio.Lock:
+        return self._connection.lifecycle_lock
+
+    @property
+    def _active_readers(self) -> int:
+        return self._connection.active_readers
+
+    @_active_readers.setter
+    def _active_readers(self, value: int) -> None:
+        self._connection.active_readers = value
+
+    @property
+    def _readers_idle(self) -> asyncio.Event:
+        return self._connection.readers_idle
+
+    @property
+    def _reader_drain_lock(self) -> asyncio.Lock:
+        return self._connection.reader_drain_lock
+
+    @property
+    def _closing(self) -> bool:
+        return self._connection.closing
+
+    @_closing.setter
+    def _closing(self, value: bool) -> None:
+        self._connection.closing = value
+
+    @property
+    def _close_state(self) -> str:
+        return self._connection.close_state
+
+    @_close_state.setter
+    def _close_state(self, value: str) -> None:
+        self._connection.close_state = value
+
+    @property
+    def _memory_uri(self) -> str | None:
+        return self._connection.memory_uri
+
+    @_memory_uri.setter
+    def _memory_uri(self, value: str | None) -> None:
+        self._connection.memory_uri = value
 
     async def connect(self) -> None:
-        """Open writer and reader SQLite connections if not already open.
-
-        H-05 (round-5 Batch 5.4): the whole open-and-configure sequence is
-        now guarded by ``_connection_lifecycle_lock`` and uses atomic
-        publish — both connections are opened into LOCAL variables, fully
-        configured, and only THEN published to ``self._conn`` /
-        ``self._reader_conn``.  If reader open fails after writer open
-        succeeded, the writer is closed before raising, so
-        ``self._conn`` is never non-None while ``self._reader_conn`` is
-        None (the partial-initialization bug).  Two concurrent
-        ``connect()`` calls no longer race: the second sees
-        ``self._conn is not None`` after the first releases the lock.
-        """
-        async with self._connection_lifecycle_lock:
-            if self._close_state == "QUARANTINED":
-                raise DatabaseClosingError(
-                    "database close failed and is quarantined; retry close "
-                    "before reconnecting"
-                )
-            if self._conn is not None:
-                return  # another task opened it while we waited
-            writer: Any = None
-            reader: Any = None
-            try:
-                if aiosqlite is None:
-                    writer = _AsyncSqliteFallback(self.path)
-                    reader = _AsyncSqliteFallback(self.path)
-                elif self.path == ":memory:":
-                    # Batch 7.6 (round-7 §二十一): two bare
-                    # ``aiosqlite.connect(":memory:")`` calls create TWO
-                    # independent in-memory databases — the writer's
-                    # migration creates tables the reader never sees.
-                    # Use a shared-cache URI so both connections back the
-                    # SAME in-memory database.
-                    import uuid as _uuid
-                    if not hasattr(self, "_memory_uri") or not self._memory_uri:
-                        self._memory_uri = f"file:khaos-{_uuid.uuid4().hex}?mode=memory&cache=shared"
-                    writer = await aiosqlite.connect(self._memory_uri, uri=True)
-                    writer.row_factory = aiosqlite.Row
-                    reader = await aiosqlite.connect(self._memory_uri, uri=True)
-                    reader.row_factory = aiosqlite.Row
-                else:
-                    writer = await aiosqlite.connect(self.path)
-                    writer.row_factory = aiosqlite.Row
-                    reader = await aiosqlite.connect(self.path)
-                    reader.row_factory = aiosqlite.Row
-                # Writer PRAGMAs
-                await writer.execute("PRAGMA foreign_keys = ON")
-                # F-01: Enable WAL in connect() (not only in run_migrations)
-                # so that connections that skip migration still get
-                # concurrent-read benefits.  busy_timeout prevents immediate
-                # SQLITE_BUSY returns when a write transaction is held by
-                # another coroutine.
-                await writer.execute("PRAGMA journal_mode = WAL")
-                await writer.execute("PRAGMA busy_timeout = 5000")
-                # C-04: Reader PRAGMAs — query_only prevents accidental
-                # writes through the reader connection, enforcing the split
-                # at the SQLite level (not just by convention).
-                await reader.execute("PRAGMA foreign_keys = ON")
-                await reader.execute("PRAGMA query_only = ON")
-                await reader.execute("PRAGMA busy_timeout = 5000")
-                # Atomic publish: only visible to other tasks after BOTH
-                # connections are fully open and configured.
-                self._conn = writer
-                self._reader_conn = reader
-                writer = None
-                reader = None
-            finally:
-                # If anything raised after one connection opened, close it
-                # so it does not leak (partial initialization).
-                if reader is not None:
-                    try:
-                        await reader.close()
-                    except Exception as exc:
-                        logger.debug("failed to close partial reader connection", exc_info=exc)
-                if writer is not None:
-                    try:
-                        await writer.close()
-                    except Exception as exc:
-                        logger.debug("failed to close partial writer connection", exc_info=exc)
+        """Open the shared writer/reader pair through the connection owner."""
+        await self._connection.connect()
 
     @asynccontextmanager
     async def transaction(self) -> AsyncIterator[Any]:
@@ -618,122 +534,27 @@ class Database:
             await conn.commit()
 
     async def close(self) -> None:
-        """Close both writer and reader SQLite connections.
-
-        C-01: bumps ``_connection_generation`` so any stale
-        ``TransactionOwner`` token (from a pre-close task that is still
-        running) will fail the generation check on next access.
-
-        Batch 1 (§十九): acquires ``_write_transaction_lock`` so
-        ``close()`` cannot tear down connections while a write
-        transaction is in-flight on another task.  ``close()`` must NOT
-        be called from within a ``transaction()`` block in the same
-        task (that would deadlock — and is a programming error).
-
-        H-05 (round-5 Batch 5.4): now ALSO acquires
-        ``_connection_lifecycle_lock`` so the generation bump and
-        connection teardown are atomic with respect to a concurrent
-        ``connect()``.  Lock ORDER is ``_write_transaction_lock`` →
-        ``_connection_lifecycle_lock`` — the SAME order used by
-        ``transaction()`` (which acquires the lifecycle lock via
-        ``_require_writer_conn_locked`` → ``connect()`` while holding
-        the write lock).  Reversing the order would be a classic
-        lock-ordering inversion: ``transaction()`` holds WRITE waiting
-        for LIFECYCLE while ``close()`` holds LIFECYCLE waiting for
-        WRITE → deadlock.
-        """
+        """Close the connection owner after in-flight writes have drained."""
         if _current_transaction_owner.get() is not None:
             raise TransactionContextLeakError(
                 "close() called from within an active transaction; "
                 "commit or roll back before closing the database"
             )
-        # WRITE first (wait for in-flight transactions), then LIFECYCLE
-        # (block concurrent connect).  Both must be held while we bump
-        # the generation and tear down the connections.
-        async with self._write_transaction_lock, self._connection_lifecycle_lock:
-                # Batch 7.6 §二十: set the admission fence FIRST so new
-                # ``_read_lease()`` entrants are rejected while we drain.
-                self._closing = True
-                self._close_state = "CLOSING"
-                self._connection_generation += 1
-                try:
-                    if self._conn is not None:
-                        await self._conn.close()
-                        self._conn = None
-                # Batch 6.5 (round-6 §十八): drain in-flight reads BEFORE
-                # closing the reader.  ``_read_lease`` holders bump
-                # ``_active_readers``; we wait for them to finish (bounded
-                # by ``_READER_DRAIN_TIMEOUT``) so a read that already
-                # captured the reader ref does not hit a torn-down
-                # connection mid-fetch.  Batch 7.6 §二十: NEW reads are
-                # now rejected by the ``_closing`` fence above (the
-                # generation bump alone was insufficient because
-                # ``_require_reader_conn`` re-opens under the lifecycle
-                # lock we hold).
-                    await self._wait_readers_drained()
-                    if self._reader_conn is not None:
-                        await self._reader_conn.close()
-                        self._reader_conn = None
-                except BaseException:
-                    self._close_state = "QUARANTINED"
-                    raise
-                else:
-                    self._close_state = "CLOSED"
-                    # A cleanly closed Database may be explicitly reopened.
-                    self._closing = False
+        # The facade still owns the write lock because transaction ownership
+        # is a domain concern.  The connection component owns lifecycle lock
+        # ordering, generation bump, and reader drain semantics.
+        async with self._write_transaction_lock:
+            await self._connection.close()
 
     @asynccontextmanager
     async def _read_lease(self):
-        """Batch 6.5 (round-6 §十八) + Batch 7.6 (round-7 §二十): hold a
-        reader-operation lease.
-
-        Wraps the body of a read method so ``close()`` waits for all
-        in-flight reads to finish before tearing down the reader
-        connection.  Enter bumps ``_active_readers`` (clearing
-        ``_readers_idle``); exit decrements and sets ``_readers_idle``
-        when the count returns to zero.
-
-        Batch 7.6 §二十 admission fence: if ``close()`` has already set
-        ``_closing``, a NEW read is rejected with ``DatabaseClosingError``
-        instead of entering and then being torn down.  This closes the
-        gap where a read could enter between the drain-event returning
-        and ``reader.close()`` executing.
-        """
-        if self._closing:
-            raise DatabaseClosingError(
-                "database is closing; new read operations are rejected"
-            )
-        self._active_readers += 1
-        self._readers_idle.clear()
-        try:
+        """Hold a reader-operation lease owned by ``DatabaseConnection``."""
+        async with self._connection.read_lease():
             yield
-        finally:
-            self._active_readers -= 1
-            if self._active_readers <= 0:
-                self._active_readers = 0
-                self._readers_idle.set()
 
     async def _wait_readers_drained(self) -> None:
-        """Block until all in-flight reads finish, or the drain timeout
-        expires.  Called by ``close()`` under the lifecycle lock."""
-        if self._active_readers == 0:
-            return
-        logger.debug(
-            "close: waiting for %d in-flight reader(s) to drain",
-            self._active_readers,
-        )
-        try:
-            await asyncio.wait_for(
-                self._readers_idle.wait(), timeout=_READER_DRAIN_TIMEOUT
-            )
-        except TimeoutError:
-            logger.warning(
-                "close: %d reader(s) still in flight after %.1fs drain "
-                "timeout; closing reader connection anyway (stuck reads "
-                "will raise on their next await)",
-                self._active_readers,
-                _READER_DRAIN_TIMEOUT,
-            )
+        """Wait for in-flight readers through the connection owner."""
+        await self._connection.wait_readers_drained()
 
     async def _require_writer_conn(self):
         """Return the writer connection, opening if necessary.
@@ -744,10 +565,7 @@ class Database:
         should be migrated to ``transaction()`` but until then they
         still need the writer.
         """
-        if self._conn is None:
-            await self.connect()
-        assert self._conn is not None
-        return self._conn
+        return await self._connection.require_writer()
 
     async def _require_writer_conn_locked(self):
         """Return the writer connection, opening if necessary.
@@ -762,10 +580,7 @@ class Database:
         reference is captured while the write lock is held, so
         ``close()`` cannot tear it down before BEGIN.
         """
-        if self._conn is None:
-            await self.connect()
-        assert self._conn is not None
-        return self._conn
+        return await self._connection.require_writer_locked()
 
     async def _require_reader_conn(self):
         """Return the reader connection, opening if necessary.
@@ -773,10 +588,7 @@ class Database:
         C-04: the reader connection has ``PRAGMA query_only = ON`` so
         any accidental write through it fails at the SQLite level.
         """
-        if self._reader_conn is None:
-            await self.connect()
-        assert self._reader_conn is not None
-        return self._reader_conn
+        return await self._connection.require_reader()
 
     async def run_migrations(self) -> None:
         """Apply the schema as one locked, checksummed transaction.
@@ -2719,30 +2531,13 @@ class Database:
         ``RuntimeConfig.project_id``).
         """
         async with self.transaction() as conn:
-            cursor = await conn.execute(
-                """
-                INSERT INTO messages (
-                    session_id, role, content, tool_calls, tool_call_id,
-                    token_count, principal_id, project_id
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    session_id,
-                    message.role,
-                    message.content,
-                    json.dumps(message.tool_calls),
-                    message.tool_call_id,
-                    message.token_count,
-                    principal_id,
-                    project_id,
-                ),
+            return await self._session_repository.insert_message(
+                conn,
+                session_id,
+                message,
+                principal_id=principal_id,
+                project_id=project_id,
             )
-            await conn.execute(
-                "UPDATE sessions SET updated_at = datetime('now') WHERE id = ?",
-                (session_id,),
-            )
-            return int(cursor.lastrowid)
 
     async def list_messages(
         self,
@@ -2767,34 +2562,12 @@ class Database:
         """
         async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
             conn = await self._require_conn()
-            clauses: list[str] = ["session_id = ?"]
-            params: list[Any] = [session_id]
-            if principal_id is not None:
-                clauses.append("principal_id = ?")
-                params.append(principal_id)
-            if project_id is not None:
-                clauses.append("project_id = ?")
-                params.append(project_id)
-            cursor = await conn.execute(
-                f"""
-                SELECT role, content, tool_calls, tool_call_id, token_count
-                FROM messages
-                WHERE {' AND '.join(clauses)}
-                ORDER BY created_at, id
-                """,
-                tuple(params),
+            return await self._session_repository.list_messages(
+                conn,
+                session_id,
+                principal_id=principal_id,
+                project_id=project_id,
             )
-            rows = await cursor.fetchall()
-            return [
-                Message(
-                    role=str(row["role"]),
-                    content=str(row["content"]),
-                    tool_calls=json.loads(str(row["tool_calls"] or "[]")),
-                    tool_call_id=row["tool_call_id"],
-                    token_count=int(row["token_count"]),
-                )
-                for row in rows
-            ]
 
     async def set_config(self, key: str, value: Any) -> None:
         """Persist a JSON configuration value."""
@@ -3739,16 +3512,38 @@ class Database:
             )
             return [dict(row) for row in await cursor.fetchall()]
 
-    async def touch_memory(self, memory_id: int) -> None:
-        """Increment memory access frequency."""
+    async def touch_memory(
+        self,
+        memory_id: int,
+        *,
+        principal_id: str | None = None,
+        project_id: str | None = None,
+    ) -> None:
+        """Increment memory access frequency within an optional owner scope.
+
+        The unscoped form remains available for legacy admin callers. Runtime
+        memory stores always provide both bindings through
+        ``SqliteMemoryRepository`` so a principal cannot mutate another
+        principal's access frequency by guessing a row ID.
+        """
         async with self.transaction() as conn:
+            clauses = ["id = ?"]
+            params: list[Any] = [memory_id]
+            if principal_id is not None:
+                clauses.append(
+                    "(principal_id = ? OR (namespace = 'shared' AND principal_id = ''))"
+                )
+                params.append(principal_id)
+            if project_id is not None:
+                clauses.append("project_id = ?")
+                params.append(project_id)
             await conn.execute(
-                """
+                f"""
                 UPDATE memories
                 SET access_freq = access_freq + 1, updated_at = datetime('now')
-                WHERE id = ?
+                WHERE {' AND '.join(clauses)}
                 """,
-                (memory_id,),
+                tuple(params),
             )
 
     async def insert_subagent_task(
@@ -5441,47 +5236,14 @@ class Database:
         """
         async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
             conn = await self._require_conn()
-            # snippet: highlight matches with [ ... ]; bm25() rank (lower = better).
-            # When either owner filter is provided, JOIN the base messages
-            # table (messages_fts.rowid mirrors messages.id, so the JOIN is
-            # a primary-key lookup — cheap).
-            if principal_id is None and project_id is None:
-                cursor = await conn.execute(
-                    """
-                    SELECT rowid AS id, session_id, role, created_at,
-                           rank,
-                           snippet(messages_fts, 2, '[', ']]', '...', 12) AS snippet
-                    FROM messages_fts
-                    WHERE messages_fts MATCH ?
-                    ORDER BY rank
-                    LIMIT ? OFFSET ?
-                    """,
-                    (query, limit, offset),
-                )
-            else:
-                clauses: list[str] = ["fts.messages_fts MATCH ?"]
-                params: list[Any] = [query]
-                if principal_id is not None:
-                    clauses.append("m.principal_id = ?")
-                    params.append(principal_id)
-                if project_id is not None:
-                    clauses.append("m.project_id = ?")
-                    params.append(project_id)
-                params.extend([limit, offset])
-                cursor = await conn.execute(
-                    f"""
-                    SELECT fts.rowid AS id, fts.session_id, fts.role,
-                           fts.created_at, fts.rank,
-                           snippet(messages_fts, 2, '[', ']]', '...', 12) AS snippet
-                    FROM messages_fts AS fts
-                    JOIN messages AS m ON m.id = fts.rowid
-                    WHERE {' AND '.join(clauses)}
-                    ORDER BY fts.rank
-                    LIMIT ? OFFSET ?
-                    """,
-                    tuple(params),
-                )
-            return [dict(row) for row in await cursor.fetchall()]
+            return await self._session_repository.search_sessions(
+                conn,
+                query,
+                limit,
+                offset,
+                principal_id=principal_id,
+                project_id=project_id,
+            )
 
     async def get_session_messages(
         self,
@@ -5505,26 +5267,14 @@ class Database:
         """
         async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
             conn = await self._require_conn()
-            clauses: list[str] = ["session_id = ?"]
-            params: list[Any] = [session_id]
-            if principal_id is not None:
-                clauses.append("principal_id = ?")
-                params.append(principal_id)
-            if project_id is not None:
-                clauses.append("project_id = ?")
-                params.append(project_id)
-            params.extend([limit, offset])
-            cursor = await conn.execute(
-                f"""
-                SELECT id, session_id, role, content, token_count, created_at
-                FROM messages
-                WHERE {' AND '.join(clauses)}
-                ORDER BY created_at, id
-                LIMIT ? OFFSET ?
-                """,
-                tuple(params),
+            return await self._session_repository.get_session_messages(
+                conn,
+                session_id,
+                limit,
+                offset,
+                principal_id=principal_id,
+                project_id=project_id,
             )
-            return [dict(row) for row in await cursor.fetchall()]
 
     async def get_message_window(
         self,
@@ -5545,32 +5295,14 @@ class Database:
         """
         async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
             conn = await self._require_conn()
-            clauses: list[str] = ["session_id = ?"]
-            params: list[Any] = [session_id]
-            if principal_id is not None:
-                clauses.append("principal_id = ?")
-                params.append(principal_id)
-            if project_id is not None:
-                clauses.append("project_id = ?")
-                params.append(project_id)
-            # message_id feeds the ABS(id - ?) proximity sort and must come
-            # after the WHERE-clause params.
-            params.append(message_id)
-            params.append(window * 2 + 1)
-            cursor = await conn.execute(
-                f"""
-                SELECT id, session_id, role, content, token_count, created_at
-                FROM messages
-                WHERE {' AND '.join(clauses)}
-                ORDER BY ABS(id - ?), id
-                LIMIT ?
-                """,
-                tuple(params),
+            return await self._session_repository.get_message_window(
+                conn,
+                session_id,
+                message_id,
+                window,
+                principal_id=principal_id,
+                project_id=project_id,
             )
-            rows = [dict(row) for row in await cursor.fetchall()]
-            # Re-sort chronologically after the ABS-based proximity selection.
-            rows.sort(key=lambda r: r["id"])
-            return rows
 
     async def count_session_messages(
         self,
@@ -5589,20 +5321,12 @@ class Database:
         """
         async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
             conn = await self._require_conn()
-            clauses: list[str] = ["session_id = ?"]
-            params: list[Any] = [session_id]
-            if principal_id is not None:
-                clauses.append("principal_id = ?")
-                params.append(principal_id)
-            if project_id is not None:
-                clauses.append("project_id = ?")
-                params.append(project_id)
-            cursor = await conn.execute(
-                f"SELECT COUNT(*) AS n FROM messages WHERE {' AND '.join(clauses)}",
-                tuple(params),
+            return await self._session_repository.count_session_messages(
+                conn,
+                session_id,
+                principal_id=principal_id,
+                project_id=project_id,
             )
-            row = await cursor.fetchone()
-            return int(row["n"]) if row else 0
 
     async def count_messages_before_after(
         self,
@@ -5622,27 +5346,13 @@ class Database:
         """
         async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
             conn = await self._require_conn()
-            clauses: list[str] = ["session_id = ?"]
-            params: list[Any] = [session_id]
-            if principal_id is not None:
-                clauses.append("principal_id = ?")
-                params.append(principal_id)
-            if project_id is not None:
-                clauses.append("project_id = ?")
-                params.append(project_id)
-            # message_id feeds both CASE expressions, so it must be appended
-            # after the WHERE-clause params and appears twice in the tuple.
-            cursor = await conn.execute(
-                f"SELECT "
-                "SUM(CASE WHEN id < ? THEN 1 ELSE 0 END) AS before_n, "
-                "SUM(CASE WHEN id > ? THEN 1 ELSE 0 END) AS after_n "
-                f"FROM messages WHERE {' AND '.join(clauses)}",
-                (message_id, message_id, *params),
+            return await self._session_repository.count_messages_before_after(
+                conn,
+                session_id,
+                message_id,
+                principal_id=principal_id,
+                project_id=project_id,
             )
-            row = await cursor.fetchone()
-            if not row:
-                return (0, 0)
-            return (int(row["before_n"] or 0), int(row["after_n"] or 0))
 
     async def list_sessions(
         self,
@@ -5667,41 +5377,13 @@ class Database:
         """
         async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
             conn = await self._require_conn()
-            where_clauses: list[str] = ["s.status = 'active'"]
-            where_params: list[Any] = []
-            if principal_id is not None:
-                where_clauses.append("s.principal_id = ?")
-                where_params.append(principal_id)
-            if project_id is not None:
-                where_clauses.append("s.project_id = ?")
-                where_params.append(project_id)
-            # When an owner dimension is supplied, scope the message_count /
-            # preview subqueries to the session's own owner value for that
-            # dimension (matching the legacy principal-scoped subquery
-            # behaviour).
-            sub_filters: list[str] = []
-            if principal_id is not None:
-                sub_filters.append("m.principal_id = s.principal_id")
-            if project_id is not None:
-                sub_filters.append("m.project_id = s.project_id")
-            sub_where = (" AND " + " AND ".join(sub_filters)) if sub_filters else ""
-            where_params.extend([limit, offset])
-            cursor = await conn.execute(
-                f"""
-                SELECT s.id, s.mode, s.created_at,
-                       (SELECT COUNT(*) FROM messages m
-                        WHERE m.session_id = s.id{sub_where}) AS message_count,
-                       (SELECT content FROM messages m
-                        WHERE m.session_id = s.id{sub_where}
-                        ORDER BY m.id DESC LIMIT 1) AS preview
-                FROM sessions s
-                WHERE {' AND '.join(where_clauses)}
-                ORDER BY s.updated_at DESC
-                LIMIT ? OFFSET ?
-                """,
-                tuple(where_params),
+            return await self._session_repository.list_sessions(
+                conn,
+                limit,
+                offset,
+                principal_id=principal_id,
+                project_id=project_id,
             )
-            return [dict(row) for row in await cursor.fetchall()]
 
     async def get_session(
         self,
@@ -5725,25 +5407,12 @@ class Database:
         """
         async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
             conn = await self._require_conn()
-            clauses: list[str] = ["id = ?"]
-            params: list[Any] = [session_id]
-            if principal_id is not None:
-                clauses.append("principal_id = ?")
-                params.append(principal_id)
-            if project_id is not None:
-                clauses.append("project_id = ?")
-                params.append(project_id)
-            cursor = await conn.execute(
-                f"""
-                SELECT id, mode, principal_id, project_id, status,
-                       created_at, updated_at
-                FROM sessions
-                WHERE {' AND '.join(clauses)}
-                """,
-                tuple(params),
+            return await self._session_repository.get_session(
+                conn,
+                session_id,
+                principal_id=principal_id,
+                project_id=project_id,
             )
-            row = await cursor.fetchone()
-            return dict(row) if row is not None else None
 
     async def register_operation_approval(
         self,

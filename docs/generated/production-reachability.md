@@ -17,8 +17,8 @@
 
 ## Import reachability result
 
-- Reachable repository modules: `170`.
-- Resolved import edges: `1032`.
+- Reachable repository modules: `200`.
+- Resolved import edges: `1176`.
 - Forbidden production edges: `0`.
 - Unresolved internal edges: `0`.
 
@@ -69,13 +69,18 @@
 - `khaos.coding.indexer`
 - `khaos.coding.parser`
 - `khaos.coding.planning.approval.execution_contract`
+- `khaos.coding.planning.approval.execution_journal_writer`
+- `khaos.coding.planning.approval.execution_read_model`
+- `khaos.coding.planning.approval.execution_writer`
 - `khaos.coding.planning.approval.gate`
 - `khaos.coding.planning.approval.models`
 - `khaos.coding.planning.approval.mutation_fence`
+- `khaos.coding.planning.approval.read_model`
 - `khaos.coding.planning.approval.receipt_crypto`
 - `khaos.coding.planning.approval.repository`
 - `khaos.coding.planning.approval.requirement`
 - `khaos.coding.planning.approval.runtime`
+- `khaos.coding.planning.approval.schema`
 - `khaos.coding.planning.approval.service`
 - `khaos.coding.planning.approval.store`
 - `khaos.coding.planning.approval.validator`
@@ -98,23 +103,37 @@
 - `khaos.coding.planning.workspace_mutation`
 - `khaos.coding.task_manager`
 - `khaos.coding.verify_fix`
+- `khaos.coding.workspace.artifacts`
 - `khaos.coding.workspace.boundary`
+- `khaos.coding.workspace.errors`
 - `khaos.coding.workspace.git_identity`
+- `khaos.coding.workspace.git_process`
 - `khaos.coding.workspace.manager`
 - `khaos.coding.workspace.models`
 - `khaos.coding.workspace.office_authority`
+- `khaos.coding.workspace.policy`
 - `khaos.coding.workspace.storage`
 - `khaos.coding.workspace.trusted_git`
 - `khaos.config`
 - `khaos.db`
+- `khaos.db.connection`
 - `khaos.db.database`
 - `khaos.db.migrations._registry`
+- `khaos.db.repositories`
+- `khaos.db.repositories.sessions`
 - `khaos.db.state_root`
 - `khaos.exceptions`
 - `khaos.grpc_server`
 - `khaos.maintenance`
 - `khaos.memory`
+- `khaos.memory.conflict`
+- `khaos.memory.decay`
+- `khaos.memory.extraction`
 - `khaos.memory.manager`
+- `khaos.memory.models`
+- `khaos.memory.ownership`
+- `khaos.memory.repository`
+- `khaos.memory.retrieval`
 - `khaos.memory.store`
 - `khaos.modes`
 - `khaos.modes.manager`
@@ -135,6 +154,7 @@
 - `khaos.rpc`
 - `khaos.rpc.audit_service`
 - `khaos.rpc.memory_service`
+- `khaos.rpc.protocol`
 - `khaos.rpc.session_service`
 - `khaos.runtime`
 - `khaos.runtime.authority`
@@ -143,8 +163,11 @@
 - `khaos.runtime.lifecycle`
 - `khaos.rust_bridge`
 - `khaos.scheduler`
+- `khaos.scheduler.calculator`
+- `khaos.scheduler.due_selector`
 - `khaos.scheduler.engine`
 - `khaos.scheduler.models`
+- `khaos.scheduler.repository`
 - `khaos.security.authority`
 - `khaos.security.authority_broker`
 - `khaos.security.authority_context`
@@ -192,12 +215,19 @@
 - `khaos.time_utils`
 - `khaos.tools`
 - `khaos.tools.admission`
+- `khaos.tools.approval_callback`
+- `khaos.tools.authorization`
 - `khaos.tools.browser_tools`
 - `khaos.tools.budget`
 - `khaos.tools.channel_tools`
+- `khaos.tools.execution_coordinator`
 - `khaos.tools.git_tools`
 - `khaos.tools.github_tools`
+- `khaos.tools.operation_store`
 - `khaos.tools.registry`
+- `khaos.tools.result_codec`
+- `khaos.tools.result_finalizer`
+- `khaos.tools.result_store`
 - `khaos.tools.sandbox_tools`
 - `khaos.tools.scheduler`
 - `khaos.tools.scheduler_models`

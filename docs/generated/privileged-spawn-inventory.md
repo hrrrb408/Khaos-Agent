@@ -24,8 +24,8 @@
 - `python/khaos/coding/execution/supervisor.py:465` `asyncio.create_subprocess_exec` in `<module>.run` owner=`ProcessSupervisor` threat-model=`child-tree-lifecycle` boundary=`execution-service`
 - `python/khaos/coding/execution/supervisor.py:1594` `subprocess.run` in `<module>._darwin_deleted_open_file_usage` owner=`ProcessSupervisor` threat-model=`child-tree-lifecycle` boundary=`execution-service`
 - `python/khaos/coding/planning/verification_sandbox.py:379` `asyncio.create_subprocess_exec` in `<module>._spawn_docker_process` owner=`VerificationSandbox` threat-model=`trusted-docker-verification` boundary=`verification-authority`
-- `python/khaos/coding/workspace/trusted_git.py:567` `asyncio.create_subprocess_exec` in `<module>.spawn` owner=`TrustedGitRunner` threat-model=`untrusted-repository-config` boundary=`workspace-control-plane`
-- `python/khaos/coding/workspace/trusted_git.py:2477` `subprocess.Popen` in `<module>._run_sync_bounded` owner=`TrustedGitRunner` threat-model=`untrusted-repository-config` boundary=`workspace-control-plane`
+- `python/khaos/coding/workspace/git_process.py:92` `asyncio.create_subprocess_exec` in `<module>.spawn` owner=`TrustedGitProcessOwner` threat-model=`untrusted-repository-config` boundary=`workspace-control-plane`
+- `python/khaos/coding/workspace/trusted_git.py:2126` `subprocess.Popen` in `<module>._run_sync_bounded` owner=`TrustedGitRunner` threat-model=`untrusted-repository-config` boundary=`workspace-control-plane`
 - `python/khaos/security/browser_sandbox.py:915` `subprocess.run` in `<module>._assert_resource_names_available` owner=`BrowserKernel` threat-model=`privileged-netns-and-nft` boundary=`browser-kernel`
 - `python/khaos/security/browser_sandbox.py:1164` `subprocess.run` in `<module>._apply_nft_script` owner=`BrowserKernel` threat-model=`privileged-netns-and-nft` boundary=`browser-kernel`
 - `python/khaos/security/browser_sandbox.py:1178` `subprocess.run` in `<module>._apply_nft_script` owner=`BrowserKernel` threat-model=`privileged-netns-and-nft` boundary=`browser-kernel`
