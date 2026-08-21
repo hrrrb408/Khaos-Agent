@@ -73,6 +73,7 @@ KHAOS.md / AGENTS.md
 | Verification proof | `coding/planning/verification_*` | trusted verification authority/ledger | plan gate、audit/export | 被测代码不能写 canonical input/result |
 | Task/workspace identity | `coding/task_manager.py`、`coding/workspace/` | Task/Workspace stores | AgentLoop、TUI、RPC | 客户端只提交引用，不能自报 owner 或 generation |
 | Durable audit | `audit/`、`db/`、authorityd/WORM adapters | 对应写入事务和 append-only ledger | export/query | Python 内存日志不是独立审计权威；authorityd canonical wire encoding 由 `security/protocol_boundary.py` 统一拥有 |
+| Durable memory | `memory/`、`rpc/memory_service.py` | `MemoryStore`（领域门面）+ `MemoryRepository`（持久化端口）+ `MemoryOwner`（principal/project/namespace） | `MemoryManager`、RPC/CLI/TUI | SQL、FTS、TTL、冲突、提取和检索策略不能重新堆回 store；所有 runtime 写入必须携带 owner 和审计 logger |
 
 ## 4. 目前的过渡性热点
 
@@ -102,6 +103,8 @@ KHAOS.md / AGENTS.md
 | `python/khaos/scheduler/engine.py` | 任务生命周期、tick 编排、executor ownership、控制操作和恢复协调 | `scheduler/repository.py` 拥有 project-scoped persistence port；`scheduler/due_selector.py` 拥有纯 due selection；后续继续拆 execution coordinator/recovery worker |
 | `python/khaos/scheduler/repository.py` | scheduled-task CRUD、identity/CAS、lease、recovery 和 operation-journal 的 scheduler persistence port | `ScheduledTaskRepository` 绑定 project scope；不拥有 SQLite connection/schema 或 engine lifecycle |
 | `python/khaos/scheduler/due_selector.py` | enabled/PENDING/next-run/pending-marker/in-flight 的纯候选筛选 | `DueTaskSelector` 唯一拥有 due selection；不修改任务、不访问 DB、不启动 executor |
+| `python/khaos/memory/store.py` | 记忆领域 facade；历史上同时包含 SQL、owner mapping、TTL、冲突、FTS、访问频率和正则提取 | `memory/models.py`（值对象）、`ownership.py`（owner/namespace）、`repository.py`（SQLite adapter）、`conflict.py`、`decay.py`、`extraction.py`、`retrieval.py`；store 只编排这些端口并发出审计 |
+| `python/khaos/memory/manager.py` | 记忆读取、三层注入、token budget、跨模式 intent 和主动提取编排 | `MemoryRetriever` 拥有 L0/L1/L2 分类与排序；`MemoryManager` 只负责 orchestration/格式化/预算，不读 SQLite、不实现 regex |
 | `python/khaos/runtime/factory.py` | 依赖装配和兼容参数转换 | 保留为唯一 composition root；业务逻辑不得回流到 factory |
 | `python/khaos/security/authorityd.py`、`authorityd_protocol.py` | authority daemon lifecycle、签名 receipt、审计事件、socket framing；历史上各自保留 canonical/digest 包装器 | `security/protocol_boundary.py` 统一 canonical JSON/digest；authorityd 只拥有 authority 状态机和 transport 适配 |
 
@@ -206,6 +209,7 @@ REQUESTED -> SNAPSHOT_BOUND -> RUNNING -> PROOF_RECORDED
   connection views 只为迁移期兼容，后续 repository 迁移完成后删除这些 views。
 - 从 `grpc_server.py` 提取 protocol/auth/service；MemoryService、SessionService、AuditService 已完成首批 seam，协议边界已落在 `python/khaos/rpc/protocol.py`。本轮已删除 `grpc_server.py` 的 protocol compatibility aliases；新代码必须直接依赖 `khaos.rpc.protocol`，不增加第二套 server authority。
 - authorityd 的 receipt、审计和 socket framing 已统一消费 `security/protocol_boundary.py` 的 canonical owner；删除 `_canonical`/`_digest` 私有包装器，后续不允许在 authority daemon 内重新实现摘要或序列化。
+- Memory 的第一阶段 seam 已完成：`MemoryStore` 不再直接调用 Database，`MemoryOwner` 统一 principal/project/namespace 规则，`SqliteMemoryRepository` 统一 SQL 适配；冲突、TTL、提取和 L0/L1/L2 检索策略均为可独立测试的纯模块。后续迁移调用者后删除 `MemoryStore(db, ...)` 兼容构造器，并将 RPC audit logger 改为 context-bound sink。
 
 ### Phase 3：工具和执行边界
 

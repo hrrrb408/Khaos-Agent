@@ -1064,7 +1064,12 @@ async def build_runtime(
     )
     await permission_engine.load_rules()
     memory_manager = cfg.memory_manager or MemoryManager(
-        MemoryStore(cfg.db, principal_id=cfg.principal_id, project_id=project_id),
+        MemoryStore(
+            cfg.db,
+            principal_id=cfg.principal_id,
+            project_id=project_id,
+            audit_logger=audit_logger,
+        ),
         budget=MemoryBudget(),
         mode_getter=lambda: mode_manager.current_mode,
         intent_getter=lambda: getattr(mode_manager, "_intent_buffer", ""),

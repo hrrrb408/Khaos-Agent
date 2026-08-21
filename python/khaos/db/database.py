@@ -3512,16 +3512,38 @@ class Database:
             )
             return [dict(row) for row in await cursor.fetchall()]
 
-    async def touch_memory(self, memory_id: int) -> None:
-        """Increment memory access frequency."""
+    async def touch_memory(
+        self,
+        memory_id: int,
+        *,
+        principal_id: str | None = None,
+        project_id: str | None = None,
+    ) -> None:
+        """Increment memory access frequency within an optional owner scope.
+
+        The unscoped form remains available for legacy admin callers. Runtime
+        memory stores always provide both bindings through
+        ``SqliteMemoryRepository`` so a principal cannot mutate another
+        principal's access frequency by guessing a row ID.
+        """
         async with self.transaction() as conn:
+            clauses = ["id = ?"]
+            params: list[Any] = [memory_id]
+            if principal_id is not None:
+                clauses.append(
+                    "(principal_id = ? OR (namespace = 'shared' AND principal_id = ''))"
+                )
+                params.append(principal_id)
+            if project_id is not None:
+                clauses.append("project_id = ?")
+                params.append(project_id)
             await conn.execute(
-                """
+                f"""
                 UPDATE memories
                 SET access_freq = access_freq + 1, updated_at = datetime('now')
-                WHERE id = ?
+                WHERE {' AND '.join(clauses)}
                 """,
-                (memory_id,),
+                tuple(params),
             )
 
     async def insert_subagent_task(

@@ -1,97 +1,94 @@
-"""SQLite-backed memory store with FTS5 search."""
+"""Domain facade for principal- and project-scoped durable memories.
+
+``MemoryStore`` is intentionally small: ownership, persistence, conflict
+resolution, TTL policy, and extraction each live in their own module.  The
+facade preserves the public API used by the runtime and older callers while
+preventing SQL and text-parsing details from spreading through the system.
+"""
 
 from __future__ import annotations
 
 import logging
-import re
-from dataclasses import dataclass
 from datetime import datetime
-from enum import Enum
+from typing import Any
 
+from khaos.memory.conflict import ConflictResolver
+from khaos.memory.decay import expired_memory_ids
+from khaos.memory.extraction import (
+    extract_memories_from_messages,
+    extract_memories_from_text,
+)
+from khaos.memory.models import (
+    Memory,
+    MemoryConfidence,
+    MemoryScope,
+    memory_from_row,
+)
+from khaos.memory.ownership import MemoryOwner
+from khaos.memory.repository import MemoryRepository, SqliteMemoryRepository
 from khaos.time_utils import utc_now_naive
 
 logger = logging.getLogger(__name__)
 
-
-class MemoryScope(Enum):
-    """Memory visibility scope."""
-
-    GLOBAL = "global"
-    OFFICE = "office"
-    CODING = "coding"
-
-
-class MemoryConfidence(Enum):
-    """Memory confidence level."""
-
-    LOW = 1
-    MEDIUM = 2
-    HIGH = 3
-
-
-@dataclass
-class Memory:
-    """One durable memory entry."""
-
-    id: int | None
-    scope: MemoryScope
-    key: str
-    value: str
-    ttl: int = 604800
-    confidence: MemoryConfidence = MemoryConfidence.MEDIUM
-    access_freq: int = 0
-    created_at: datetime | None = None
-    updated_at: datetime | None = None
+MAX_SEARCH_TOP_K = 100
+MAX_SEARCH_QUERY_LENGTH = 4096
 
 
 class MemoryStore:
-    """Three-scope memory storage.
+    """Principal/project-bound memory aggregate.
 
-    M4 batch 3.1.16A-2 (CRITICAL #5): every store is bound to exactly
-    one ``principal_id`` at construction.  All reads and writes are
-    scoped to that principal — a different principal's memories are
-    invisible.  Project-shared memories (``namespace='shared'``,
-    ``principal_id=''``) are visible to every principal.
-
-    Legacy callers that omit ``principal_id`` get ``'legacy'`` — the
-    memory is stored but never loaded by authenticated principals.
-
-    M4 batch 3.1.16A-5-1b (CRITICAL): ``project_id`` is also bound at
-    construction and stamped on every upsert so memories are
-    cryptographically tied to the project that produced them.  The
-    RPC dispatcher's drift check (``ctx.project_id !=
-    agent._bound_project_id``) is the sole authority — when the store
-    is constructed via ``build_runtime`` the ``project_id`` comes from
-    ``RuntimeConfig.project_id`` (set by ``AgentService`` from the
-    verified RPC payload), NOT from ``compute_project_id(root)``.
-
-    F-02 (third-round review): ``project_id`` is now part of the
-    memories UNIQUE constraint and is forwarded to every DB read/write
-    call (get, delete, list, search, touch, decay).  This closes the
-    cross-project leak where a shared state DB (via explicit ``--db``)
-    could let project B read, overwrite, or delete project A's memories
-    of the same key.
+    The ``db`` positional argument is retained as a migration compatibility
+    seam.  New production code can inject a ``MemoryRepository`` directly;
+    when ``db`` is supplied, it is wrapped once by
+    :class:`SqliteMemoryRepository` and never accessed by this class again.
     """
 
     def __init__(
-        self, db, *, principal_id: str = "legacy", project_id: str = "",
-    ):
-        self.db = db
-        self._principal_id = principal_id
-        # M4 batch 3.1.16A-5-1b / F-02: project identity is bound at
-        # construction and forwarded to every DB call so memories are
-        # isolated by project, not just by principal.
-        self._project_id = project_id
+        self,
+        db: Any | None = None,
+        *,
+        principal_id: str = "legacy",
+        project_id: str = "",
+        repository: MemoryRepository | None = None,
+        audit_logger: Any | None = None,
+    ) -> None:
+        if db is not None and repository is not None:
+            raise ValueError("pass either db or repository, not both")
+        if repository is None:
+            if db is None:
+                raise ValueError("a database or memory repository is required")
+            repository = SqliteMemoryRepository(db)
+        self._repository = repository
+        self._owner = MemoryOwner(
+            principal_id=principal_id,
+            project_id=project_id,
+        )
+        self._audit_logger = audit_logger
+
+    @property
+    def principal_id(self) -> str:
+        """Return the immutable principal binding."""
+
+        return self._owner.principal_id
+
+    @property
+    def project_id(self) -> str:
+        """Return the immutable project binding."""
+
+        return self._owner.project_id
 
     def _effective_principal(self, namespace: str) -> str:
-        """A2-4: project-shared memories live under ``principal_id=''`` so
-        every principal sees them.  Private and session-scoped memories
-        stay bound to this store's principal.  This matches the
-        documented contract: ``namespace='shared'`` is the project-wide
-        cross-principal channel; everything else is principal-scoped."""
-        if namespace == "shared":
-            return ""
-        return self._principal_id
+        """Compatibility helper for callers that inspect the old boundary."""
+
+        return self._owner.effective_principal(namespace)
+
+    def _identity(self, namespace: str, session_id: str) -> tuple[str, str, str]:
+        self._owner.validate(namespace, session_id)
+        return (
+            self._owner.effective_principal(namespace),
+            namespace,
+            session_id,
+        )
 
     async def get(
         self,
@@ -101,16 +98,18 @@ class MemoryStore:
         namespace: str = "private",
         session_id: str = "",
     ) -> Memory | None:
-        row = await self.db.get_memory(
-            scope.value, key,
-            principal_id=self._effective_principal(namespace),
+        """Read one memory visible to this store's owner."""
+
+        principal_id, namespace, session_id = self._identity(namespace, session_id)
+        row = await self._repository.get(
+            scope.value,
+            key,
+            principal_id=principal_id,
             namespace=namespace,
             session_id=session_id,
-            # F-02: scope reads by project_id so a shared DB cannot
-            # leak another project's memory of the same key.
-            project_id=self._project_id,
+            project_id=self.project_id,
         )
-        return self._from_row(row) if row is not None else None
+        return memory_from_row(row) if row is not None else None
 
     async def set(
         self,
@@ -120,141 +119,122 @@ class MemoryStore:
         namespace: str = "private",
         session_id: str = "",
     ) -> Memory | None:
-        """Insert or update a memory.
+        """Insert or update a memory under the bound ownership context.
 
-        ``on_conflict`` controls what happens when a memory already exists for
-        the same (namespace, principal_id, session_id, scope, key) but with a
-        *different* value:
-
-        - ``"overwrite"`` (default, backward-compatible): always replace.
-        - ``"resolve"``: consult :meth:`resolve_conflict`; if it returns None
-          the conflict is unresolved and this method returns None without
-          writing (the caller should surface the conflict to the user). A
-          resolved winner is written.
-
-        When the value is unchanged the existing row is returned untouched.
+        ``overwrite`` preserves the historical API.  ``resolve`` delegates to
+        the pure conflict policy and returns ``None`` for an unresolved tie.
         """
-        existing = await self.get(
-            memory.scope, memory.key, namespace=namespace, session_id=session_id,
-        )
-        if existing is None or existing.value == memory.value:
-            return await self._raw_upsert(
-                memory, namespace=namespace, session_id=session_id,
-            )
 
-        if on_conflict == "resolve":
-            winner = self.resolve_conflict(memory, existing)
-            if winner is None:
+        if on_conflict not in {"overwrite", "resolve"}:
+            raise ValueError("on_conflict must be 'overwrite' or 'resolve'")
+        principal_id, namespace, session_id = self._identity(namespace, session_id)
+        existing = await self.get(
+            memory.scope,
+            memory.key,
+            namespace=namespace,
+            session_id=session_id,
+        )
+        if (
+            existing is not None
+            and existing.value != memory.value
+            and on_conflict == "resolve"
+        ):
+            decision = ConflictResolver.decide(memory, existing)
+            if decision.winner is None:
                 logger.warning(
-                    "memory conflict unresolved for (%s, %s): existing=%r new=%r",
+                    "memory conflict unresolved for (%s, %s): %s",
                     memory.scope.value,
                     memory.key,
-                    existing.value,
-                    memory.value,
+                    decision.reason,
+                )
+                await self._audit_event(
+                    "memory.conflict",
+                    f"{memory.scope.value}:{memory.key}",
+                    "unresolved",
+                    {"reason": decision.reason, "namespace": namespace},
+                    session_id,
                 )
                 return None
-            return await self._raw_upsert(
-                winner, namespace=namespace, session_id=session_id,
-            )
-
-        return await self._raw_upsert(
-            memory, namespace=namespace, session_id=session_id,
+            memory = decision.winner
+        stored = await self._raw_upsert(
+            memory,
+            principal_id=principal_id,
+            namespace=namespace,
+            session_id=session_id,
         )
+        await self._audit_event(
+            "memory.set",
+            f"{memory.scope.value}:{memory.key}",
+            "success",
+            {
+                "namespace": namespace,
+                "confidence": memory.confidence.value,
+                "ttl": memory.ttl,
+            },
+            session_id,
+        )
+        return stored
 
     async def _raw_upsert(
         self,
         memory: Memory,
         *,
-        namespace: str = "private",
-        session_id: str = "",
+        principal_id: str,
+        namespace: str,
+        session_id: str,
     ) -> Memory:
-        memory_id = await self.db.upsert_memory(
+        memory_id = await self._repository.upsert(
             memory.scope.value,
             memory.key,
             memory.value,
             memory.ttl,
             memory.confidence.value,
-            principal_id=self._effective_principal(namespace),
+            principal_id=principal_id,
             namespace=namespace,
             session_id=session_id,
-            # F-02: project_id is now part of the UNIQUE constraint.
-            # Re-upserting from the same project updates the existing
-            # row; a different project creates a new row.  The old
-            # "owner-preserving" behavior is removed — each project
-            # owns its own row.
-            project_id=self._project_id,
+            project_id=self.project_id,
         )
         stored = await self.get(
-            memory.scope, memory.key, namespace=namespace, session_id=session_id,
+            memory.scope,
+            memory.key,
+            namespace=namespace,
+            session_id=session_id,
         )
-        assert stored is not None
+        if stored is None:
+            raise RuntimeError(
+                "memory repository committed an upsert but returned no row"
+            )
         stored.id = memory_id
         return stored
 
     @staticmethod
     def resolve_conflict(new: Memory, existing: Memory) -> Memory | None:
-        """Pick the winner between two memories for the same key.
+        """Compatibility wrapper around the pure conflict policy."""
 
-        Rules (from FR-014 Phase 3):
-        - Higher confidence wins outright.
-        - Equal confidence: the incoming ``new`` wins by default — it is the
-          latest information being asserted right now (newest-information-first).
-          ``new`` only loses when it carries an explicit ``updated_at`` older
-          than ``existing``'s, which signals stale data being replayed.
-        - Equal confidence *and* equal timestamps cannot be decided -> return
-          None to flag the conflict for human resolution.
-
-        ``new`` and ``existing`` are treated as immutable; the winner is
-        returned by reference.
-        """
-        if new.confidence.value > existing.confidence.value:
-            return new
-        if existing.confidence.value > new.confidence.value:
-            return existing
-        # Equal confidence -> compare timestamps when both are known. An
-        # explicit older `new` is treated as stale and the existing winner
-        # stands; otherwise `new` (the current assertion) wins.
-        new_ts = new.updated_at
-        existing_ts = existing.updated_at
-        if new_ts is not None and existing_ts is not None and new_ts < existing_ts:
-            return existing
-        return new
+        return ConflictResolver.decide(new, existing).winner
 
     async def decay(self, now: datetime | None = None) -> int:
-        """Delete memories past their TTL and return the count removed.
+        """Delete expired visible memories and return the number removed."""
 
-        A memory is expired when ``updated_at + ttl_seconds < now``. ``now``
-        defaults to the current UTC time. Rows with a NULL ``updated_at`` are
-        treated as freshly created and never decayed.
-
-        M4 batch 3.1.16A-2: only this principal's memories are decayed —
-        the list_all() call is principal-scoped, so ``delete_memory_by_id``
-        can only receive IDs that belong to this principal.
-
-        F-02: ``delete_memory_by_id`` is now also scoped by ``project_id``
-        so decay cannot cross project boundaries on a shared DB.
-        """
         moment = now or utc_now_naive()
-        before = len(await self.list_all())
-        # SQLite stores ISO timestamps; compare in Python to avoid timezone
-        # parsing pitfalls inside SQL.
-        expired_ids: list[int] = []
-        for memory in await self.list_all():
-            if memory.id is None or memory.updated_at is None:
-                continue
-            age = (moment - memory.updated_at).total_seconds()
-            if age > memory.ttl:
-                expired_ids.append(memory.id)
+        memories = await self.list_all()
+        expired_ids = expired_memory_ids(memories, now=moment)
         for memory_id in expired_ids:
-            await self.db.delete_memory_by_id(
+            await self._repository.delete_by_id(
                 memory_id,
-                principal_id=self._principal_id,
-                project_id=self._project_id,
+                principal_id=self.principal_id,
+                project_id=self.project_id,
             )
-        removed = before - len(await self.list_all()) if expired_ids else 0
-        if removed:
-            logger.info("memory decay removed %d expired entries", removed)
-        return removed
+        if expired_ids:
+            logger.info("memory decay removed %d expired entries", len(expired_ids))
+            await self._audit_event(
+                "memory.decay",
+                self.project_id or "unbound-project",
+                "success",
+                {"removed": len(expired_ids)},
+                None,
+            )
+        return len(expired_ids)
 
     async def delete(
         self,
@@ -264,182 +244,140 @@ class MemoryStore:
         namespace: str = "private",
         session_id: str = "",
     ) -> None:
-        await self.db.delete_memory(
-            scope.value, key,
-            principal_id=self._effective_principal(namespace),
+        """Delete one visible memory by its stable identity."""
+
+        principal_id, namespace, session_id = self._identity(namespace, session_id)
+        await self._repository.delete(
+            scope.value,
+            key,
+            principal_id=principal_id,
             namespace=namespace,
             session_id=session_id,
-            # F-02: scope deletes by project_id so a shared DB cannot
-            # let project B delete project A's memory of the same key.
-            project_id=self._project_id,
+            project_id=self.project_id,
+        )
+        await self._audit_event(
+            "memory.delete",
+            f"{scope.value}:{key}",
+            "success",
+            {"namespace": namespace},
+            session_id,
+        )
+
+    async def delete_by_id(self, memory_id: int) -> None:
+        """Delete one row only when it belongs to this owner/project."""
+
+        if memory_id <= 0:
+            raise ValueError("memory_id must be positive")
+        await self._repository.delete_by_id(
+            memory_id,
+            principal_id=self.principal_id,
+            project_id=self.project_id,
+        )
+        await self._audit_event(
+            "memory.delete",
+            str(memory_id),
+            "success",
+            {"by": "id"},
+            None,
         )
 
     async def list_by_scope(self, scope: MemoryScope) -> list[Memory]:
-        """List all memories for this principal in the given scope.
+        """List memories in one scope visible to the bound principal."""
 
-        Includes the principal's private memories AND project-shared
-        memories (``namespace='shared'``).  Legacy rows are excluded.
-        """
-        return [
-            self._from_row(row)
-            for row in await self.db.list_memories(
-                scope.value,
-                principal_id=self._principal_id,
-                project_id=self._project_id,
-            )
-        ]
+        rows = await self._repository.list(
+            scope.value,
+            principal_id=self.principal_id,
+            project_id=self.project_id,
+        )
+        return [memory_from_row(row) for row in rows]
 
     async def list_all(self) -> list[Memory]:
-        """List all memories visible to this principal.
+        """List all private and project-shared memories visible to the owner."""
 
-        Includes the principal's private memories AND project-shared
-        memories.  Legacy rows and other principals' private memories
-        are excluded.
-        """
-        return [
-            self._from_row(row)
-            for row in await self.db.list_memories(
-                principal_id=self._principal_id,
-                project_id=self._project_id,
-            )
-        ]
+        rows = await self._repository.list(
+            principal_id=self.principal_id,
+            project_id=self.project_id,
+        )
+        return [memory_from_row(row) for row in rows]
 
     async def search(self, query: str, top_k: int = 5) -> list[Memory]:
-        """FTS5 search across this principal's visible memories."""
-        memories = [
-            self._from_row(row)
-            for row in await self.db.search_memories(
-                query, top_k,
-                principal_id=self._principal_id,
-                project_id=self._project_id,
-            )
-        ]
+        """Search visible memories through the repository's FTS boundary."""
+
+        if not isinstance(query, str) or len(query) > MAX_SEARCH_QUERY_LENGTH:
+            raise ValueError("memory search query is missing or too long")
+        if top_k < 0 or top_k > MAX_SEARCH_TOP_K:
+            raise ValueError(f"top_k must be between 0 and {MAX_SEARCH_TOP_K}")
+        if top_k == 0 or not query.strip():
+            return []
+        rows = await self._repository.search(
+            query,
+            top_k,
+            principal_id=self.principal_id,
+            project_id=self.project_id,
+        )
+        memories = [memory_from_row(row) for row in rows]
         for memory in memories:
             if memory.id is not None:
                 await self.touch(memory.id)
+        await self._audit_event(
+            "memory.search",
+            query[:128],
+            "success",
+            {"returned": len(memories), "top_k": top_k},
+            None,
+        )
         return memories
 
     async def touch(self, memory_id: int) -> None:
-        await self.db.touch_memory(memory_id)
+        """Increment access frequency within the owner/project boundary."""
 
-    @staticmethod
-    def _from_row(row: dict) -> Memory:
-        return Memory(
-            id=int(row["id"]),
-            scope=MemoryScope(str(row["scope"])),
-            key=str(row["key"]),
-            value=str(row["value"]),
-            ttl=int(row["ttl"]),
-            confidence=MemoryConfidence(int(row["confidence"])),
-            access_freq=int(row["access_freq"]),
-            created_at=_parse_datetime(row.get("created_at")),
-            updated_at=_parse_datetime(row.get("updated_at")),
+        if memory_id <= 0:
+            raise ValueError("memory_id must be positive")
+        await self._repository.touch(
+            memory_id,
+            principal_id=self.principal_id,
+            project_id=self.project_id,
+        )
+        await self._audit_event(
+            "memory.touch",
+            str(memory_id),
+            "success",
+            {},
+            None,
         )
 
+    async def _audit_event(
+        self,
+        action: str,
+        target: str,
+        result: str,
+        detail: dict[str, Any],
+        session_id: str | None,
+    ) -> None:
+        """Emit best-effort audit evidence through the injected logger."""
 
-def _parse_datetime(value) -> datetime | None:
-    if not value:
-        return None
-    return datetime.fromisoformat(str(value))
-
-
-# --- proactive memory extraction -------------------------------------------
-
-# Each rule is (regex, scope, key_template). The regex's first capture group
-# becomes the memory value. Patterns are deliberately simple and language-
-# mixed to keep this dependency-free; deeper extraction is a model-time task.
-_EXTRACTION_RULES: list[tuple[re.Pattern[str], MemoryScope, str]] = [
-    # "我叫X" / "我的名字是X" / "I am X" / "my name is X"
-    (
-        re.compile(r"(?:我叫|我的名字是|我是)\s*([^\s,，。.!！?？]{1,30})", re.IGNORECASE),
-        MemoryScope.GLOBAL,
-        "user_name",
-    ),
-    (
-        re.compile(r"my name is ([A-Za-z][\w\- ]{0,30})", re.IGNORECASE),
-        MemoryScope.GLOBAL,
-        "user_name",
-    ),
-    # "我喜欢X" / "I like X" / "I prefer X"  -> preference:<X>
-    (
-        re.compile(r"我(?:喜欢|偏好|倾向于)\s*([^\s,，。.!！?？]{1,40})", re.IGNORECASE),
-        MemoryScope.GLOBAL,
-        "preference",
-    ),
-    (
-        re.compile(r"i (?:like|prefer) ([a-z0-9 \-]{2,40})", re.IGNORECASE),
-        MemoryScope.GLOBAL,
-        "preference",
-    ),
-    # "记住X" / "remember X"  -> note:<X>
-    (
-        re.compile(r"记住[：:\s]*([^\n]{2,80})"),
-        MemoryScope.GLOBAL,
-        "note",
-    ),
-    (
-        re.compile(r"remember (?:that )?(.{2,80})", re.IGNORECASE),
-        MemoryScope.GLOBAL,
-        "note",
-    ),
-]
-
-
-def extract_memories_from_text(text: str, scope: MemoryScope = MemoryScope.GLOBAL) -> list[Memory]:
-    """Scan free text for declarative memory signals.
-
-    Returns a list of candidate :class:`Memory` objects (not yet persisted).
-    Each rule contributes at most one memory per match, keyed by a stable key
-    so repeated statements upsert rather than duplicate. Confidence is MEDIUM
-    since these are inferred from phrasing, not explicitly confirmed.
-    """
-    if not text:
-        return []
-    found: list[Memory] = []
-    seen: set[tuple[MemoryScope, str]] = set()
-    for pattern, rule_scope, key_base in _EXTRACTION_RULES:
-        for match in pattern.finditer(text):
-            value = match.group(1).strip()
-            if not value:
-                continue
-            key = key_base if key_base in {"user_name", "note"} else f"{key_base}:{value.lower()}"
-            identity = (rule_scope, key)
-            if identity in seen:
-                continue
-            seen.add(identity)
-            found.append(
-                Memory(
-                    id=None,
-                    scope=scope if scope != MemoryScope.GLOBAL else rule_scope,
-                    key=key,
-                    value=value,
-                    confidence=MemoryConfidence.MEDIUM,
-                )
+        if self._audit_logger is None:
+            return
+        try:
+            row_id = await self._audit_logger.log(
+                action,
+                target,
+                result,
+                detail,
+                session_id=session_id,
             )
-    return found
+            if row_id < 0:
+                logger.warning("audit logger rejected memory event: %s", action)
+        except Exception:
+            logger.warning("memory audit event failed: %s", action, exc_info=True)
 
 
-def extract_memories_from_messages(
-    messages: list,
-    scope: MemoryScope = MemoryScope.GLOBAL,
-) -> list[Memory]:
-    """Scan a list of chat messages for memory-worthy user statements.
-
-    Only ``user``-role messages are scanned (assistants and tools do not assert
-    personal facts). Each message object may be a khaos Message or any object
-    with ``.role``/``.content`` attributes, or a plain dict.
-    """
-    extracted: list[Memory] = []
-    for message in messages:
-        role = _get(message, "role")
-        if role != "user":
-            continue
-        content = _get(message, "content") or ""
-        extracted.extend(extract_memories_from_text(str(content), scope))
-    return extracted
-
-
-def _get(obj, attr: str):
-    if isinstance(obj, dict):
-        return obj.get(attr)
-    return getattr(obj, attr, None)
+# Compatibility for direct imports from the former monolithic module.
+__all__ = [
+    "Memory",
+    "MemoryConfidence",
+    "MemoryScope",
+    "MemoryStore",
+    "extract_memories_from_messages",
+    "extract_memories_from_text",
+]
