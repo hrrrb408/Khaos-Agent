@@ -47,6 +47,8 @@ _SAFE_EXECUTION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _OWNER_LABEL = "io.khaos.owner-nonce"
 _DELETED_FILE_EXIT_CODE = 173
 _DOCKER_HARDENING_GENERATION = "docker-hardened-v2"
+_CLEANUP_VERIFY_ATTEMPTS = 20
+_CLEANUP_VERIFY_INTERVAL_SECONDS = 0.1
 _DELETED_FILE_WATCHDOG = r'''
 import os, signal, stat, subprocess, sys, time
 limit = int(sys.argv[1])
@@ -912,22 +914,30 @@ class DockerBackend:
                     )
             rm_command = ("rm", "-f", lease.name)
             rm_result = await self._run_cli(rm_command, timeout=5)
-            if rm_result[0] != 0 and not _docker_object_absent(rm_result):
+            if (
+                rm_result[0] != 0
+                and not _docker_object_absent(rm_result)
+                and not _docker_removal_in_progress(rm_result)
+            ):
                 raise RuntimeError(
                     f"Docker cleanup command failed: {' '.join(rm_command)}"
                 )
-            verified = await self._run_cli(
-                ("inspect", lease.name), timeout=5
+            for attempt in range(_CLEANUP_VERIFY_ATTEMPTS):
+                verified = await self._run_cli(
+                    ("inspect", lease.name), timeout=5
+                )
+                if _docker_object_absent(verified):
+                    return True
+                if verified[0] != 0:
+                    raise RuntimeError(
+                        "Docker container disappearance was not proven: "
+                        f"{lease.name}"
+                    )
+                if attempt + 1 < _CLEANUP_VERIFY_ATTEMPTS:
+                    await asyncio.sleep(_CLEANUP_VERIFY_INTERVAL_SECONDS)
+            raise RuntimeError(
+                f"Docker container cleanup could not be verified: {lease.name}"
             )
-            if verified[0] == 0:
-                raise RuntimeError(
-                    "Docker container cleanup could not be verified"
-                )
-            if not _docker_object_absent(verified):
-                raise RuntimeError(
-                    f"Docker container disappearance was not proven: {lease.name}"
-                )
-            return True
 
     async def _run_cli(self, args: tuple[str, ...], *, timeout: float) -> tuple[int, str, str]:
         try:
@@ -969,6 +979,14 @@ def _docker_object_absent(result: tuple[int, str, str]) -> bool:
         marker in message
         for marker in ("no such object", "not found", "no such container")
     )
+
+
+def _docker_removal_in_progress(result: tuple[int, str, str]) -> bool:
+    """Recognize Docker's asynchronous ``--rm`` deletion race."""
+    if result[0] == 0:
+        return False
+    message = f"{result[1]}\n{result[2]}".lower()
+    return "removal of container" in message and "already in progress" in message
 
 
 def _canonical_digest(value: object) -> str:
