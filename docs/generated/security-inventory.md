@@ -67,7 +67,7 @@
 - `python/khaos/coding/execution/binding.py`: `99f3d8eb14d80a837ecf0f0d076d556ccdb366b8798c9e0fde6c69d0bb1a5501`
 - `python/khaos/coding/execution/supervisor.py`: `cd5b480602bb56ca230e0ebc8594202c54933527fba781b20aeda3b05343c3a8`
 - `python/khaos/coding/workspace/manager.py`: `661dabc96409c278a1ae05a0841b30a5c749a3218cce2ad7c4e4679ce0feeb28`
-- `python/khaos/coding/workspace/artifacts.py`: `c0522de9afac2e58d5ab4c71fb76febb1ffcca74f555c8646f8b5c432ac8a149`
+- `python/khaos/coding/workspace/artifacts.py`: `f670450ac283ac822fec16edb445ca2f70b5afab3be6aeb1cea747843758d3de`
 - `python/khaos/coding/workspace/trusted_git.py`: `12f6dc96fa2769d26835f1e6d7abb880594703684412792fd5c8d1e2ec85753f`
 - `python/khaos/coding/workspace/git_process.py`: `fb110ff687020411f1a57034e257fd86a591bbf72c9338c18c694f1dd7d014ee`
 - `python/khaos/coding/planning/approval/execution_read_model.py`: `2465f230bc8613a373756f9a82a88af819e9c7c17ef6c29248bfeea7d58860b1`
