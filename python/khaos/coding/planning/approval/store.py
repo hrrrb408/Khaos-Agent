@@ -50,6 +50,7 @@ from khaos.coding.planning.approval.models import (
     PlanExecutionAuthorization,
     verify_nonce,
 )
+from khaos.coding.planning.approval.read_model import PlanApprovalReadModel
 from khaos.coding.planning.approval.schema import APPROVAL_SCHEMA, upgrade_schema
 from khaos.coding.planning.security_identities import CanonicalWorkspaceId
 
@@ -83,6 +84,7 @@ class PlanApprovalStore:
         self._conn = conn
         self._transaction_lock = threading.RLock()
         self._conn.row_factory = sqlite3.Row
+        self._read_model = PlanApprovalReadModel(self._conn)
         self.ensure_schema()
         # Batch 2.6 §1: a name-mangled writer handle that ONLY the runtime
         # can install (via _install_runtime_receipt_writer). It is NOT a
@@ -349,54 +351,15 @@ class PlanApprovalStore:
         self._conn.commit()
 
     def get_request(self, approval_request_id: str) -> PlanApprovalRequest | None:
-        row = self._conn.execute(
-            "SELECT * FROM plan_approval_requests WHERE approval_request_id = ?",
-            (approval_request_id,),
-        ).fetchone()
-        if row is None:
-            return None
-        return self._row_to_request(row)
+        return self._read_model.get_request(approval_request_id)
 
     def get_request_by_broker(self, broker_request_id: str) -> PlanApprovalRequest | None:
-        row = self._conn.execute(
-            "SELECT * FROM plan_approval_requests WHERE broker_request_id = ?",
-            (broker_request_id,),
-        ).fetchone()
-        if row is None:
-            return None
-        return self._row_to_request(row)
+        return self._read_model.get_request_by_broker(broker_request_id)
 
     @staticmethod
     def _row_to_request(row: sqlite3.Row) -> PlanApprovalRequest:
-        # Batch 3.1.5 §2: read approved_verification_plan columns (may be
-        # absent in old rows before migration — use .keys() guard).
-        keys = set(row.keys())
-        avp_id = row["approved_verification_plan_id"] if "approved_verification_plan_id" in keys else ""
-        avp_digest = row["approved_verification_plan_digest"] if "approved_verification_plan_digest" in keys else ""
-        return PlanApprovalRequest(
-            approval_request_id=row["approval_request_id"],
-            plan_id=row["plan_id"],
-            plan_content_hash=row["plan_content_hash"],
-            repository_id=row["repository_id"],
-            task_id=row["task_id"],
-            workspace_id=row["workspace_id"],
-            base_sha=row["base_sha"],
-            repository_generation=int(row["repository_generation"]),
-            risk_level=row["risk_level"],
-            requested_operations=tuple(json.loads(row["requested_operations"])),
-            affected_files=tuple(json.loads(row["affected_files"])),
-            affected_symbols=tuple(json.loads(row["affected_symbols"])),
-            verification_digest=row["verification_digest"],
-            binding_digest=row["binding_digest"],
-            requested_at=float(row["requested_at"]),
-            expires_at=float(row["expires_at"]),
-            status=PlanApprovalStatus(row["status"]),
-            broker_request_id=row["broker_request_id"],
-            reason=row["reason"] or "",
-            metadata=json.loads(row["metadata"] or "{}"),
-            approved_verification_plan_id=avp_id or "",
-            approved_verification_plan_digest=avp_digest or "",
-        )
+        """Compatibility conversion alias; the read model owns conversion."""
+        return PlanApprovalReadModel.row_to_request(row)
 
     # ------------------------------------------------------------------
     # Atomic status CAS (internal helper — does NOT write decision/audit)
@@ -883,24 +846,7 @@ class PlanApprovalStore:
         self._conn.commit()
 
     def list_decisions(self, approval_request_id: str) -> list[PlanApprovalDecision]:
-        rows = self._conn.execute(
-            "SELECT * FROM plan_approval_decisions WHERE approval_request_id = ? "
-            "ORDER BY decided_at ASC, decision_id ASC",
-            (approval_request_id,),
-        ).fetchall()
-        return [
-            PlanApprovalDecision(
-                approval_request_id=r["approval_request_id"],
-                decision=PlanApprovalStatus(r["decision"]),
-                actor_id=r["actor_id"],
-                actor_type=r["actor_type"],
-                decided_at=float(r["decided_at"]),
-                reason=r["reason"] or "",
-                authenticated_context=json.loads(r["authenticated_context"] or "{}"),
-                metadata=json.loads(r["metadata"] or "{}"),
-            )
-            for r in rows
-        ]
+        return self._read_model.list_decisions(approval_request_id)
 
     def insert_audit_event(self, event: PlanApprovalAuditEvent) -> None:
         self._conn.execute(
@@ -924,33 +870,10 @@ class PlanApprovalStore:
     def list_audit_events(
         self, *, approval_request_id: str | None = None, plan_id: str | None = None
     ) -> list[PlanApprovalAuditEvent]:
-        clauses: list[str] = []
-        params: list[Any] = []
-        if approval_request_id is not None:
-            clauses.append("approval_request_id = ?")
-            params.append(approval_request_id)
-        if plan_id is not None:
-            clauses.append("plan_id = ?")
-            params.append(plan_id)
-        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        rows = self._conn.execute(
-            f"SELECT * FROM plan_approval_audit_events {where} "
-            "ORDER BY timestamp ASC, event_id ASC",
-            params,
-        ).fetchall()
-        return [
-            PlanApprovalAuditEvent(
-                event_id=r["event_id"], event_type=r["event_type"],
-                approval_request_id=r["approval_request_id"], plan_id=r["plan_id"],
-                previous_status=r["previous_status"], new_status=r["new_status"],
-                actor_id=r["actor_id"], actor_type=r["actor_type"],
-                authenticated_source=r["authenticated_source"],
-                timestamp=float(r["timestamp"]), reason_code=r["reason_code"],
-                task_id=r["task_id"], workspace_id=r["workspace_id"],
-                repository_id=r["repository_id"], correlation_id=r["correlation_id"],
-            )
-            for r in rows
-        ]
+        return self._read_model.list_audit_events(
+            approval_request_id=approval_request_id,
+            plan_id=plan_id,
+        )
 
     # ------------------------------------------------------------------
     # Execution authorizations
@@ -985,33 +908,12 @@ class PlanApprovalStore:
         )
 
     def get_authorization(self, authorization_id: str) -> PlanExecutionAuthorization | None:
-        row = self._conn.execute(
-            "SELECT * FROM plan_execution_authorizations WHERE authorization_id = ?",
-            (authorization_id,),
-        ).fetchone()
-        if row is None:
-            return None
-        return self._row_to_authorization(row)
+        return self._read_model.get_authorization(authorization_id)
 
     @staticmethod
     def _row_to_authorization(row: sqlite3.Row) -> PlanExecutionAuthorization:
-        return PlanExecutionAuthorization(
-            authorization_id=row["authorization_id"],
-            approval_request_id=row["approval_request_id"],
-            plan_id=row["plan_id"],
-            plan_content_hash=row["plan_content_hash"],
-            repository_id=row["repository_id"],
-            task_id=row["task_id"],
-            workspace_id=row["workspace_id"],
-            base_sha=row["base_sha"],
-            repository_generation=int(row["repository_generation"]),
-            issued_at=float(row["issued_at"]),
-            expires_at=float(row["expires_at"]),
-            nonce="",  # plaintext deliberately unavailable after restart
-            nonce_hash=row["nonce_hash"],
-            status=AuthorizationStatus(row["status"]),
-            binding_digest=row["binding_digest"],
-        )
+        """Compatibility conversion alias; the read model owns conversion."""
+        return PlanApprovalReadModel.row_to_authorization(row)
 
     def _verify_persisted_boot_context(
         self, *, server_epoch: int, boot_id: str,
@@ -1128,7 +1030,7 @@ class PlanApprovalStore:
                     return False, None
                 # ACTIVE — return the same handle (idempotent re-mint).
                 self._conn.rollback()
-                return True, self._row_to_authorization(existing)
+                return True, self._read_model.row_to_authorization(existing)
 
             self._conn.execute(
                 """
@@ -1372,32 +1274,13 @@ class PlanApprovalStore:
             raise
 
     def list_authorizations_for_plan(self, plan_id: str) -> list[PlanExecutionAuthorization]:
-        rows = self._conn.execute(
-            "SELECT * FROM plan_execution_authorizations WHERE plan_id = ? "
-            "ORDER BY issued_at ASC",
-            (plan_id,),
-        ).fetchall()
-        return [self._row_to_authorization(r) for r in rows]
+        return self._read_model.list_authorizations_for_plan(plan_id)
 
     def list_registering_or_pending(self) -> list[PlanApprovalRequest]:
-        """Return every request still awaiting broker registration / decision.
-
-        Used by :meth:`PlanApprovalService.reconcile` at startup.
-        """
-        rows = self._conn.execute(
-            "SELECT * FROM plan_approval_requests WHERE status IN (?, ?) "
-            "ORDER BY requested_at ASC",
-            (PlanApprovalStatus.REGISTERING.value, PlanApprovalStatus.PENDING.value),
-        ).fetchall()
-        return [self._row_to_request(r) for r in rows]
+        return self._read_model.list_registering_or_pending()
 
     def list_requests_for_task(self, task_id: str) -> list[PlanApprovalRequest]:
-        rows = self._conn.execute(
-            "SELECT * FROM plan_approval_requests WHERE task_id = ? "
-            "ORDER BY requested_at ASC",
-            (task_id,),
-        ).fetchall()
-        return [self._row_to_request(r) for r in rows]
+        return self._read_model.list_requests_for_task(task_id)
 
     def refresh_expiry(self, approval_request_id: str, new_expiry: float) -> None:
         conn = self._conn
@@ -1410,12 +1293,7 @@ class PlanApprovalStore:
     def find_request_by_plan_binding(
         self, plan_id: str, binding_digest: str
     ) -> PlanApprovalRequest | None:
-        row = self._conn.execute(
-            "SELECT * FROM plan_approval_requests WHERE plan_id = ? AND binding_digest = ? "
-            "ORDER BY requested_at DESC LIMIT 1",
-            (plan_id, binding_digest),
-        ).fetchone()
-        return self._row_to_request(row) if row is not None else None
+        return self._read_model.find_request_by_plan_binding(plan_id, binding_digest)
 
     # ------------------------------------------------------------------
     # Persisted server epoch (Batch 2.2 §3)

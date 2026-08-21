@@ -68,6 +68,7 @@ from khaos.coding.planning.approval.mutation_fence import (
     WorkspaceMutationFence,
     fenced_acquire_lease,
 )
+from khaos.coding.planning.approval.read_model import PlanApprovalReadModel
 from khaos.coding.planning.approval.repository import (
     PersistedPlanRepository,
     PlanRepository,
@@ -131,6 +132,7 @@ __all__ = [
     "PlanApprovalAuditEvent",
     "PlanApprovalDecision",
     "PlanApprovalError",
+    "PlanApprovalReadModel",
     "PlanApprovalRequest",
     "PlanApprovalService",
     "PlanApprovalStatus",

@@ -85,7 +85,8 @@ KHAOS.md / AGENTS.md
 | `python/khaos/tools/admission.py` | 工具调用规范化、raw phase、注册表解析和参数校验 | `ToolAdmission`；只返回 `AdmittedToolCall`/`RejectedToolCall`，不做权限、authority 或执行 |
 | `python/khaos/tools/scheduler_models.py`、`tools/budget.py` | 调度结果协议、权限请求事件和原子预算 reservation/commit | 已完成首个 seam；后续只允许由调度器编排，不在 handler 中复制预算或结果状态机 |
 | `python/khaos/grpc_server.py` | transport/auth/startup、Agent service，以及兼容导出 | protocol/auth middleware、composition root、每个 service 独立模块；服务只消费已认证 context。MemoryService、SessionService、AuditService 已迁移到 `python/khaos/rpc/`；`python/khaos/rpc/protocol.py` 现在拥有 Python 协议常量、协商、绑定声明和认证器，Go 对应的 version/features/digest 由 `go/internal/platform/rpc_contract.go` 拥有，grpc/client 导入仅是迁移期兼容导出 |
-| `python/khaos/coding/planning/approval/store.py` | schema、CAS transition、receipt、lease、plan execution event 和 read model | schema/migration、approval ledger、receipt verifier、execution-event repository、read model；planning traversal limits 已由 `coding/planning/limits.py` 独立拥有 |
+| `python/khaos/coding/planning/approval/store.py` | CAS transition、receipt、lease、plan execution event 和 transactional writers | schema/migration、approval ledger、receipt verifier、execution-event repository；只读查询由 `approval/read_model.py` 拥有 |
+| `python/khaos/coding/planning/approval/read_model.py` | approval request/decision/audit/authorization read SQL 与 row conversion | 只读连接查询；不打开/关闭连接、不 commit、不写入；由 store 提供一周期兼容委托 |
 | `python/khaos/coding/planning/approval/schema.py` | plan approval、receipt、authorization、lease、execution journal 的 DDL 与旧库 column/index upgrade | schema/migration 唯一 owner；`PlanApprovalStore` 只消费 `APPROVAL_SCHEMA`/`upgrade_schema` 并拥有 CAS 事务 |
 | `python/khaos/coding/workspace/boundary.py` | dirfd 文件读写、copy/move、snapshot/recovery 和 protected metadata 检查 | `workspace/policy.py` 统一 protected names/limits；`SafeWorkspaceFS` 只拥有 handle-based effect，`TrustedGitRunner` 只拥有 Git effect |
 | `python/khaos/scheduler/engine.py` | 任务状态、持久化、调度、执行、恢复和审计 | `scheduler/calculator.py` 已拥有纯 schedule 计算；后续拆 schedule repository、due-item selector、execution coordinator、recovery worker |
@@ -200,6 +201,7 @@ REQUESTED -> SNAPSHOT_BOUND -> RUNNING -> PROOF_RECORDED
 - approval callback 的 schema、deadline、容量和 worker 关闭语义已收敛到 `python/khaos/tools/approval_callback.py`；scheduler 不再直接拥有 callback executor，后续由 `ToolAuthorization` 接管确认与 capability consume。
 - `ApprovalBinding`/`PermissionRequest` 的 digest 与字段投影已收敛到 `python/khaos/tools/authorization.py`；scheduler 不再手工复制 approval contract，后续只保留 decision/consume orchestration。
 - Plan approval 的 DDL 与 post-schema migration 已收敛到 `coding/planning/approval/schema.py`；`PlanApprovalStore` 的 `APPROVAL_SCHEMA` 仅为兼容导出，后续删除。
+- Plan approval 的只读 SQL 与 row conversion 已收敛到 `coding/planning/approval/read_model.py`；`PlanApprovalStore` 的读取方法仅为兼容委托，后续在调用迁移完成后删除。
 - 下一步将 `ToolScheduler` 拆成 admission、capability consume、execution、result/audit 四段；每段只能消费上述类型，不能重新定义平行的 `ToolResult`、预算或 effect 状态。
 - 将 file/Git/process 入口收敛为可注入 port，并为每个 port 提供 fail-closed contract tests。
 
