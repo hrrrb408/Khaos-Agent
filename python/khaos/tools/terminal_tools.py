@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import Any
 
 from khaos.coding.execution.environment import scrub_spawn_environment
-from khaos.permissions.engine import split_command_segments
 from khaos.security.command_guard import CommandGuard
 from khaos.security.shell_semantics import (
     MUTATING_EXECUTABLES,

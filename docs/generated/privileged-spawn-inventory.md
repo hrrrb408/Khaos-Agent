@@ -8,9 +8,9 @@
 - `python/khaos/cli/main.py:367` `subprocess.run` in `<module>.cmd_test` owner=`CliGatewayProcess` threat-model=`user-authorized-local-gateway` boundary=`cli-runtime`
 - `python/khaos/cli/main.py:377` `subprocess.run` in `<module>.cmd_test` owner=`CliGatewayProcess` threat-model=`user-authorized-local-gateway` boundary=`cli-runtime`
 - `python/khaos/coding/execution/capability.py:263` `subprocess.run` in `<module>._capability_evidence` owner=`SandboxCapabilityProbe` threat-model=`trusted-tcb-probe` boundary=`execution-capability`
-- `python/khaos/coding/execution/native_launcher.py:366` `subprocess.run` in `<module>._darwin_signature_mode` owner=`NativeLauncherBoundary` threat-model=`fd-bound-exec-and-host-signature-probe` boundary=`native-launcher`
-- `python/khaos/coding/execution/native_launcher.py:376` `subprocess.run` in `<module>._darwin_signature_mode` owner=`NativeLauncherBoundary` threat-model=`fd-bound-exec-and-host-signature-probe` boundary=`native-launcher`
-- `python/khaos/coding/execution/native_launcher.py:392` `subprocess.run` in `<module>._darwin_signature_mode` owner=`NativeLauncherBoundary` threat-model=`fd-bound-exec-and-host-signature-probe` boundary=`native-launcher`
+- `python/khaos/coding/execution/native_launcher.py:365` `subprocess.run` in `<module>._darwin_signature_mode` owner=`NativeLauncherBoundary` threat-model=`fd-bound-exec-and-host-signature-probe` boundary=`native-launcher`
+- `python/khaos/coding/execution/native_launcher.py:375` `subprocess.run` in `<module>._darwin_signature_mode` owner=`NativeLauncherBoundary` threat-model=`fd-bound-exec-and-host-signature-probe` boundary=`native-launcher`
+- `python/khaos/coding/execution/native_launcher.py:391` `subprocess.run` in `<module>._darwin_signature_mode` owner=`NativeLauncherBoundary` threat-model=`fd-bound-exec-and-host-signature-probe` boundary=`native-launcher`
 - `python/khaos/coding/execution/native_launcher_runtime.py:130` `os.execve` in `<module>.main` owner=`NativeLauncherTCB` threat-model=`fd-bound-exec-and-codesign` boundary=`native-launcher`
 - `python/khaos/coding/execution/native_launcher_runtime.py:143` `os.execve` in `<module>.main` owner=`NativeLauncherTCB` threat-model=`fd-bound-exec-and-codesign` boundary=`native-launcher`
 - `python/khaos/coding/execution/native_launcher_runtime.py:149` `os.execvpe` in `<module>.main` owner=`NativeLauncherTCB` threat-model=`fd-bound-exec-and-codesign` boundary=`native-launcher`
@@ -36,7 +36,7 @@
 - `python/khaos/security/credential_provider_host.py:243` `asyncio.create_subprocess_exec` in `<module>._spawn_and_exchange` owner=`CredentialProviderHost` threat-model=`contained-blocking-provider` boundary=`killable-worker-domain`
 - `python/khaos/security/credential_provider_host.py:441` `subprocess.run` in `<module>._collect_descendants` owner=`CredentialProviderHost` threat-model=`contained-blocking-provider` boundary=`killable-worker-domain`
 - `python/khaos/security/credential_provider_host.py:490` `subprocess.run` in `<module>._pid_is_zombie` owner=`CredentialProviderHost` threat-model=`contained-blocking-provider` boundary=`killable-worker-domain`
-- `python/khaos/security/credential_provider_worker.py:235` `subprocess.Popen` in `<module>._run_bounded_helper` owner=`CredentialProviderWorker` threat-model=`provider-helper-execution` boundary=`one-shot-worker-spec`
+- `python/khaos/security/credential_provider_worker.py:238` `subprocess.Popen` in `<module>._run_bounded_helper` owner=`CredentialProviderWorker` threat-model=`provider-helper-execution` boundary=`one-shot-worker-spec`
 - `python/khaos/security/evidence_provenance.py:52` `subprocess.Popen` in `<module>._bounded_process` owner=`EvidenceProvenanceFetcher` threat-model=`untrusted-gh-cli-output` boundary=`evidence-provenance-lookup`
 - `python/khaos/security/native_authority.py:256` `subprocess.Popen` in `<module>._bounded_native_call` owner=`NativeAuthorityAdapter` threat-model=`native-authority` boundary=`platform-transport`
 - `python/khaos/tools/clipboard_tools.py:25` `subprocess.run` in `<module>._clipboard_read_sync` owner=`HostClipboard` threat-model=`foreground-user-host-integration` boundary=`host-integration`

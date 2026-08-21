@@ -20,7 +20,7 @@ import sys
 import time
 import uuid
 from collections.abc import AsyncIterator
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -60,15 +60,10 @@ from khaos.db import Database
 from khaos.db.database import SessionBusyError
 from khaos.exceptions import ServiceShutdownError
 from khaos.maintenance import MaintenanceService
-from khaos.memory import (
-    Memory,
-    MemoryConfidence,
-    MemoryScope,
-    MemoryStore,
-)
 from khaos.modes import ModeManager
 from khaos.routing import ModelRouter
 from khaos.routing.router import create_default_router
+from khaos.rpc import AuditService, MemoryService, SessionService
 from khaos.runtime import RequestContext
 from khaos.runtime.context import local_principal_id
 from khaos.rust_bridge import get_token_engine
@@ -2159,193 +2154,6 @@ class AgentService:
         )
 
 
-class MemoryService:
-    """Memory RPC service backed by a per-request :class:`MemoryStore`.
-
-    M4 batch 3.1.16A-4-2: the service holds the ``db`` handle and
-    constructs a fresh ``MemoryStore`` scoped to ``ctx.principal_id``
-    on every call.  Previously the service was bound to a server-level
-    ``MemoryStore(local-uid)`` singleton, so an API principal could
-    read/write the local-uid's memories.  Each principal now sees only
-    their own private memories plus project-shared memories
-    (``namespace='shared'``).
-    """
-
-    def __init__(self, db: Database):
-        self.db = db
-
-    def _store(self, ctx: RequestContext) -> MemoryStore:
-        # F-02: forward ctx.project_id so memories are isolated by
-        # project on shared state DBs, not just by principal.
-        return MemoryStore(
-            self.db,
-            principal_id=ctx.principal_id,
-            project_id=ctx.project_id,
-        )
-
-    async def get_memory(self, ctx: RequestContext, scope: str, key: str) -> dict:
-        store = self._store(ctx)
-        memory = await store.get(MemoryScope(scope), key)
-        if memory is None:
-            raise KeyError(key)
-        return _memory_to_dict(memory)
-
-    async def set_memory(
-        self,
-        ctx: RequestContext,
-        scope: str,
-        key: str,
-        value: str,
-        ttl: int = 604800,
-        confidence: int = 2,
-    ) -> dict:
-        store = self._store(ctx)
-        memory = await store.set(
-            Memory(
-                id=None,
-                scope=MemoryScope(scope),
-                key=key,
-                value=value,
-                ttl=ttl,
-                confidence=MemoryConfidence(confidence),
-            )
-        )
-        return {"ok": True, "id": memory.id}
-
-    async def delete_memory(self, ctx: RequestContext, memory_id: int) -> dict:
-        # M4 batch 3.1.16A-4-2: principal-scoped deletion.  Previously
-        # ``delete_memory_by_id`` had no principal filter, so any
-        # principal could delete any other principal's memory by id.
-        # Now the DELETE is scoped to ``ctx.principal_id`` (or
-        # project-shared rows with ``principal_id=''``).
-        # F-02: also scope by ``ctx.project_id`` so a caller from
-        # project B cannot delete project A's memory by id on a
-        # shared state DB.
-        await self.db.delete_memory_by_id(
-            memory_id,
-            principal_id=ctx.principal_id,
-            project_id=ctx.project_id,
-        )
-        return {"ok": True}
-
-    async def search_memory(self, ctx: RequestContext, query: str, top_k: int = 5) -> list[dict]:
-        store = self._store(ctx)
-        return [_memory_to_dict(memory) for memory in await store.search(query, top_k)]
-
-
-class SessionService:
-    """Session RPC service backed by the durable ``sessions`` table.
-
-    C-2-3 (MEDIUM): the REST ``GET /api/sessions`` and
-    ``GET /api/sessions/{id}`` endpoints previously read from the Go
-    Gateway's in-memory ``sessions`` map filtered by an equally
-    in-memory ``sessionOwners`` map.  That map is lost on restart,
-    does not include sessions created directly against Python (CLI,
-    subagents, webhooks), and cannot reconcile across multiple
-    Gateway instances.  This service proxies the list/detail reads to
-    the durable ``sessions`` table, scoped to ``ctx.principal_id`` so
-    a caller only sees their own sessions (cross-principal access is
-    hidden as "not found" — symmetric to ``TaskService`` and the
-    ``list_sessions`` principal filter added in
-    3.1.16A-4-3).
-    """
-
-    def __init__(self, db: Database):
-        self.db = db
-
-    async def list(
-        self,
-        ctx: RequestContext,
-        limit: int = 20,
-        offset: int = 0,
-    ) -> list[dict[str, object]]:
-        """List the caller's sessions newest-first.
-
-        ``ctx.principal_id`` is always passed to
-        :meth:`Database.list_sessions` so cross-principal rows are
-        filtered at the SQL layer (3.1.16A-4-3).  An empty
-        ``principal_id`` yields an empty list (fail-closed) rather
-        than the admin opt-in path (``principal_id=None``).
-        """
-        principal_id = ctx.principal_id or ""
-        # ``list_sessions(principal_id=None)`` is the admin opt-in that
-        # returns ALL principals' sessions.  We must NEVER pass ``None``
-        # for an unauthenticated RPC caller — pass the empty string so
-        # the SQL filter ``s.principal_id = ''`` matches nothing
-        # (legacy rows with ``principal_id='legacy'`` are excluded by
-        # the A-4-3 filter, and production principals are never empty).
-        rows = await self.db.list_sessions(
-            limit, offset, principal_id=principal_id, project_id=ctx.project_id,
-        )
-        return [dict(row) for row in rows]
-
-    async def get(
-        self,
-        ctx: RequestContext,
-        session_id: str,
-        message_limit: int = 50,
-    ) -> dict[str, object]:
-        """Return one session + its messages, scoped to the caller.
-
-        Cross-principal access is hidden as ``{"ok": false, "error":
-        "session not found"}`` (symmetric to ``TaskService.get``) so
-        the REST caller cannot enumerate other principals' session
-        ids via timing or response-shape differences.
-        """
-        principal_id = ctx.principal_id or ""
-        session = await self.db.get_session(
-            session_id, principal_id=principal_id, project_id=ctx.project_id,
-        )
-        if session is None:
-            return {
-                "ok": False,
-                "error": "session not found",
-                "session_id": session_id,
-            }
-        messages = await self.db.get_session_messages(
-            session_id, limit=message_limit, offset=0,
-            principal_id=principal_id, project_id=ctx.project_id,
-        )
-        return {
-            "ok": True,
-            "session": session,
-            "messages": [dict(m) for m in messages],
-        }
-
-
-class AuditService:
-    """Audit RPC service backed by AuditLogger."""
-
-    def __init__(self, logger: AuditLogger):
-        self.logger = logger
-
-    async def query(
-        self,
-        ctx: RequestContext,
-        action: str | None = None,
-        result: str | None = None,
-        since: str | None = None,
-        until: str | None = None,
-        limit: int = 100,
-    ) -> list[dict]:
-        # M4 batch 3.1.16A-4-2: scope audit queries to the transport
-        # principal.  Previously the query used the server-level
-        # AuditLogger's bound principal (``local-uid``), so an API
-        # principal could read the local-uid's audit trail.  The
-        # underlying ``AuditLogger.query`` already supports a
-        # ``principal_id`` parameter; we now pass ``ctx.principal_id``
-        # explicitly so each principal sees only their own audit events.
-        entries = await self.logger.query(
-            action=action,
-            result=result,
-            since=since,
-            until=until,
-            limit=limit,
-            principal_id=ctx.principal_id,
-        )
-        return [entry.to_dict() for entry in entries]
-
-
 class TaskService:
     """Coding-task RPC service with per-principal TaskManager.
 
@@ -3638,15 +3446,6 @@ def _message_to_event(message) -> dict:
     else:
         data = {"role": message.role, "content": message.content, "token_count": message.token_count}
     return {"event": event, "data": data}
-
-
-def _memory_to_dict(memory: Memory) -> dict:
-    data = asdict(memory)
-    data["scope"] = memory.scope.value
-    data["confidence"] = memory.confidence.value
-    data["created_at"] = memory.created_at.isoformat() if memory.created_at else ""
-    data["updated_at"] = memory.updated_at.isoformat() if memory.updated_at else ""
-    return data
 
 
 def main() -> None:

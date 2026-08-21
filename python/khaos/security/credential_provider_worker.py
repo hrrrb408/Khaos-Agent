@@ -232,12 +232,15 @@ def _run_bounded_helper(argv: list[str], timeout: float) -> bytes:
     """
     preexec = _helper_rlimit_preexec(timeout) if os.name == "posix" else None
     try:
+        # This is the deliberately isolated, single-threaded worker boundary.
+        # It applies rlimits before the helper starts; the async host and all
+        # long-lived Python processes must never copy this pre-exec pattern.
         process = subprocess.Popen(
             argv,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            preexec_fn=preexec,
+            preexec_fn=preexec,  # noqa: PLW1509 - isolated one-shot worker
         )
     except OSError as exc:
         raise ProviderSpecError(f"provider command failed: {exc}") from exc
