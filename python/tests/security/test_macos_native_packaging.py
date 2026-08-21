@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import plistlib
 from pathlib import Path
 
@@ -78,7 +79,11 @@ def test_renderer_publishes_a_complete_concrete_backend_contract(
         'identifier "com.khaos.agent" and anchor apple generic '
         "and certificate leaf[subject.OU] = TEAMID123"
     )
-    assert output.stat().st_mode & 0o777 == 0o600
+    # The private-mode contract is consumed by launchd on POSIX. Windows
+    # exposes chmod bits as compatibility metadata and cannot represent the
+    # POSIX 0600 mode that the macOS deployment requires.
+    if os.name == "posix":
+        assert output.stat().st_mode & 0o777 == 0o600
 
 
 def test_renderer_rejects_a_missing_or_non_file_worm_ca(
