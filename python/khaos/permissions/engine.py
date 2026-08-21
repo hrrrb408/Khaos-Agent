@@ -6,165 +6,54 @@ import fnmatch
 import json
 import logging
 import os
-import shlex
-import time
-from dataclasses import dataclass, replace
-from enum import Enum
+from dataclasses import replace
 from typing import Any
 from urllib.parse import urlparse
 
 from khaos.audit.logger import AuditLogger
 from khaos.exceptions import PermissionDeniedError
+from khaos.permissions.evaluator import (
+    PermissionEvaluator,
+    normalize_command_target,
+)
+from khaos.permissions.models import (
+    DEFAULT_EXEC_TOOLS,
+    ApprovalMode,
+    GrantLifetime,
+    PermissionDecision,
+    PermissionRule,
+    SourceTransport,  # noqa: F401 - compatibility re-export
+    TransportClass,
+)
 from khaos.permissions.resource import AuthorizationResource
 from khaos.permissions.rules import (
     is_relaxing_approval,
     legacy_pattern_to_typed,
-    match_typed_rule,
     validate_typed_rule,
 )
 
 logger = logging.getLogger(__name__)
 
 
-# Round-14 §7 / Round-15 A-4: tools that can invoke a shell command and
-# therefore must respect ``commands_require_approval``.  Used as the default
-# for ``PermissionEngine.exec_tool_names`` when the runtime does not derive
-# the set from the live ``ToolRegistry``.  The runtime factory passes the
-# registry-derived ``permission_level == "execute"`` set so a newly added
-# exec-style tool is gated automatically instead of bypassing the policy
-# approval requirement.
-#
-# Round-15 A-4: this default MUST track every tool the registry registers
-# with ``permission_level == "execute"`` (registry.py), otherwise a non-
-# factory PermissionEngine (CLI / admin adapter / library caller / future
-# runtime) silently under-gates the missing tools.  ``sandbox_exec`` runs
-# arbitrary commands inside Docker and ``sandbox_build`` builds images; both
-# are ``permission_level="execute"`` and must be gated.
-_DEFAULT_EXEC_TOOLS = frozenset({
-    "terminal", "terminal_argv", "terminal_shell", "process",
-    "sandbox_exec", "sandbox_build",
-})
-
-
-class ApprovalMode(Enum):
-    """Supported permission approval policies."""
-
-    AUTO_APPROVE = "auto-approve"
-    SUGGEST = "suggest"
-    ASK_EVERY = "ask-every"
-    DENY = "deny"
-
-
-class SourceTransport(str, Enum):
-    """Authenticated origin of a turn.
-
-    Only ``CLI`` and ``TUI`` represent a human-present interactive
-    transport. Values not represented by this enum are deliberately not
-    treated as interactive; legacy callers must map their origin explicitly.
-    """
-
-    CLI = "cli"
-    TUI = "tui"
-    RPC = "rpc"
-    WEBHOOK = "webhook"
-    CRON = "cron"
-    SUBAGENT = "subagent"
-    INTERNAL_VERIFICATION = "internal_verification"
-
-
-class TransportClass(str, Enum):
-    """Coarse trust class used to scope persistent permission grants."""
-
-    INTERACTIVE = "interactive"
-    UNATTENDED = "unattended"
-    ALL = "all"
-
-
-class GrantLifetime(str, Enum):
-    """Lifetime/scope of a persistent permission grant."""
-
-    ONCE = "once"
-    TURN = "turn"
-    SESSION = "session"
-    TASK = "task"
-    PROJECT_INTERACTIVE = "project_interactive"
-    PROJECT_ALL_TRANSPORTS = "project_all_transports"
-
-
-
-# Round-15 B-2 / review P1-2: only explicit human-present transports can use
-# the read-only terminal convenience. Empty, missing, and future values are
-# unattended by default so a forgotten security field cannot grant access.
-_INTERACTIVE_TRANSPORTS = frozenset(
-    {SourceTransport.CLI.value, SourceTransport.TUI.value}
-)
-
-
-def _is_interactive_transport(source_transport: str | None) -> bool:
-    """Return True when a human can confirm approvals for this turn.
-
-    Missing, empty, and unknown transports are fail-closed and therefore
-    treated as unattended. A malicious inbound message must never gain the
-    interactive shortcut merely because a caller omitted the security context.
-    """
-    value = getattr(source_transport, "value", source_transport)
-    return str(value or "").strip().lower() in _INTERACTIVE_TRANSPORTS
+_DEFAULT_EXEC_TOOLS = DEFAULT_EXEC_TOOLS
 
 
 def is_interactive_transport(source_transport: str | None) -> bool:
-    """Public transport-classification helper for boundary adapters."""
-    return _is_interactive_transport(source_transport)
-
-
-def _transport_class(source_transport: str | None) -> str:
-    """Return the fail-closed class for a transport value."""
-    return (
-        TransportClass.INTERACTIVE.value
-        if _is_interactive_transport(source_transport)
-        else TransportClass.UNATTENDED.value
+    """Compatibility export for the pure evaluator transport classifier."""
+    from khaos.permissions.evaluator import (
+        is_interactive_transport as classify_transport,
     )
 
-
-@dataclass
-class PermissionRule:
-    """Persistent permission rule."""
-
-    id: int | None
-    pattern: str
-    permission_level: str
-    approval: ApprovalMode
-    mode: str
-    granted_at: float = 0.0
-    policy_digest: str = ""
-    generation: int = 0
-    # Scope fields are deliberately explicit.  A remembered approval from a
-    # human-present transport must not silently become an unattended grant.
-    # Empty means "choose the safe approval-dependent default" at the
-    # persistence boundary: relaxing grants become project-interactive;
-    # deny/ask rules become project-wide enforcement rules.
-    transport_class: str = ""
-    grant_lifetime: str = ""
-    session_id: str = ""
-    task_id: str = ""
-    workspace_id: str = ""
-    expires_at: float | None = None
-    created_by: str = ""
-    # P1-4: relaxing grants use a typed resource family and canonical JSON
-    # spec. ``pattern`` remains for display and for non-relaxing legacy glob
-    # rules; it is never the high-authority matcher once these fields exist.
-    resource_type: str = ""
-    resource_spec: dict[str, Any] | None = None
+    return classify_transport(source_transport)
 
 
-@dataclass
-class PermissionDecision:
-    """Result of checking a tool call against permission rules."""
+def split_command_segments(command: str) -> list[str]:
+    """Compatibility export for evaluator command normalization."""
+    from khaos.permissions.evaluator import (
+        split_command_segments as split_segments,
+    )
 
-    approved: ApprovalMode
-    reason: str
-    target: str
-    matched_rule: PermissionRule | None = None
-    requires_user_confirm: bool = False
+    return split_segments(command)
 
 
 class PermissionEngine:
@@ -308,120 +197,23 @@ class PermissionEngine:
             # load_rules — a concurrent grant via another path could have
             # inserted an overbroad rule).
             self._rules = self._materialize_rules(rows)
-        # H4: policy-level required-approval list runs BEFORE every other
-        # shortcut, including the read-only terminal shortcut.  Otherwise a
-        # command classified as read-only (cat / grep / ls / rg / head /
-        # tail …) would be AUTO_APPROVE'd even when the effective policy
-        # explicitly requires confirmation for it, contradicting the
-        # "policy approval requirement covers automatic approval" contract.
-        # H3 (preserved): this also runs before the persistent-rule loop, so
-        # a remembered auto-approve rule cannot bypass a command the
-        # effective policy demands confirmation for.
-        if self._commands_require_approval and tool_name in self._exec_tool_names:
-            command_text = _command_text(params)
-            if _matches_required_approval(command_text, self._commands_require_approval):
-                return PermissionDecision(
-                    approved=ApprovalMode.ASK_EVERY,
-                    reason=f"Policy requires approval for command: {target}",
-                    target=target,
-                    requires_user_confirm=True,
-                )
-        if (
-            tool_name in {"terminal", "terminal_argv", "terminal_shell"}
-            and _is_read_only_terminal_call(tool_name, params)
-            # Round-15 B-2: the read-only auto-approve shortcut is a
-            # CONVENIENCE for interactive sessions.  An unattended transport
-            # (webhook / cron / rpc) must not auto-approve even read-only
-            # shell — a malicious inbound message could otherwise read
-            # secrets (``cat ~/.ssh/id_rsa``) with no human in the loop.
-            and _is_interactive_transport(source_transport)
-        ):
-            # P1-3 (round-13): read-only auto-approve is now a DEFAULT
-            # shortcut — it fires ONLY when no persistent rule matched.
-            # Previously it fired BEFORE the rule loop, so a remembered
-            # DENY rule for a "read-only" command (cat/grep/ls/rg…) was
-            # silently bypassed.  We set a flag and fall through to the
-            # rule loop; if no rule matches, we auto-approve at the end.
-            _read_only_terminal = True
-        else:
-            _read_only_terminal = False
-        current_transport_class = _transport_class(source_transport)
-        for rule in self._rules:
-            if rule.mode != "all" and rule.mode != mode:
-                continue
-            if rule.permission_level != permission_level:
-                continue
-            if not _rule_scope_matches(
-                rule,
-                transport_class=current_transport_class,
-                session_id=session_id,
-                task_id=task_id,
-                workspace_id=workspace_id,
-            ):
-                continue
-            matched = False
-            if rule.resource_type:
-                try:
-                    matched = match_typed_rule(
-                        rule.resource_type,
-                        rule.resource_spec or {},
-                        resource=resource,
-                        tool_name=tool_name,
-                        params=params,
-                        target=target,
-                        operation=permission_level,
-                    )
-                except (TypeError, ValueError, KeyError) as exc:
-                    logger.warning(
-                        "ignoring malformed typed permission rule id=%s: %s",
-                        rule.id,
-                        exc,
-                    )
-            elif not is_relaxing_approval(rule.approval):
-                # Generic glob syntax is retained only for enforcement rules
-                # that cannot widen authority. Relaxing rules are converted
-                # to typed specs during grant/load and fail closed otherwise.
-                matched = fnmatch.fnmatch(target, rule.pattern)
-            if matched:
-                match_label = (
-                    f"{rule.resource_type} resource"
-                    if rule.resource_type
-                    else rule.pattern
-                )
-                return PermissionDecision(
-                    approved=rule.approval,
-                    reason=f"Matched rule: {match_label}",
-                    target=target,
-                    matched_rule=rule,
-                    requires_user_confirm=rule.approval == ApprovalMode.ASK_EVERY,
-                )
-
-        # P1-3: read-only terminal shortcut fires AFTER the rule loop —
-        # explicit DENY rules take precedence over the convenience default.
-        if _read_only_terminal:
-            return PermissionDecision(
-                approved=ApprovalMode.AUTO_APPROVE,
-                reason="Read-only terminal command (no deny rule matched)",
-                target=target,
-                requires_user_confirm=False,
-            )
-        if self._default_mode == ApprovalMode.AUTO_APPROVE:
-            return PermissionDecision(
-                approved=ApprovalMode.AUTO_APPROVE,
-                reason="No matching rule, default: auto-approve",
-                target=target,
-            )
-        if self._default_mode == ApprovalMode.DENY:
-            return PermissionDecision(
-                approved=ApprovalMode.DENY,
-                reason="No matching rule, default: deny",
-                target=target,
-            )
-        return PermissionDecision(
-            approved=self._default_mode,
-            reason=f"No matching rule, default: {self._default_mode.value}",
-            target=target,
-            requires_user_confirm=True,
+        evaluator = PermissionEvaluator(
+            rules=tuple(self._rules),
+            default_mode=self._default_mode,
+            commands_require_approval=self._commands_require_approval,
+            exec_tool_names=self._exec_tool_names,
+        )
+        return evaluator.evaluate(
+            tool_name,
+            params,
+            permission_level,
+            mode,
+            target,
+            resource,
+            source_transport=source_transport,
+            session_id=session_id,
+            task_id=task_id,
+            workspace_id=workspace_id,
         )
 
     async def grant_rule(self, rule: PermissionRule) -> PermissionRule:
@@ -887,137 +679,9 @@ def validate_rule_scope(rule: PermissionRule, *, source: str = "permission") -> 
         raise ValueError(f"{source}: expires_at must be positive")
 
 
-def _rule_scope_matches(
-    rule: PermissionRule,
-    *,
-    transport_class: str,
-    session_id: str | None,
-    task_id: str | None,
-    workspace_id: str | None,
-) -> bool:
-    """Return whether a rule is valid for the current request context."""
-    if rule.expires_at is not None and rule.expires_at <= time.time():
-        return False
-    if rule.transport_class not in {
-        TransportClass.ALL.value,
-        transport_class,
-    }:
-        return False
-    if rule.workspace_id and rule.workspace_id != str(workspace_id or ""):
-        return False
-    if rule.grant_lifetime == GrantLifetime.PROJECT_INTERACTIVE.value:
-        return transport_class == TransportClass.INTERACTIVE.value
-    if rule.grant_lifetime == GrantLifetime.PROJECT_ALL_TRANSPORTS.value:
-        return True
-    if rule.grant_lifetime == GrantLifetime.SESSION.value:
-        return bool(session_id) and rule.session_id == str(session_id)
-    if rule.grant_lifetime == GrantLifetime.TASK.value:
-        return bool(task_id) and rule.task_id == str(task_id)
-    # Invalid/ephemeral values are quarantined on load and rejected before
-    # persistence. Keep the matcher fail-closed if a caller bypasses either.
-    return False
-
-
 # Minimum number of leading non-glob characters an AUTO_APPROVE /
 # SUGGEST rule pattern must carry before its first ``*`` / ``?`` / ``[``.
 # Tuned to reject ``"*"``, ``"**"``, ``"/*"``, ``"?*"``, ``"[a-z]*"``
 # while accepting concrete prefixes like ``"/home/u"`` or ``"terminal:"``.
 MIN_RULE_SPECIFICITY = 2
 MIN_COMMAND_RULE_SPECIFICITY = 3
-
-
-def normalize_command_target(command: str) -> str:
-    """Normalize a command into base command plus arguments."""
-    segments = split_command_segments(command)
-    if not segments:
-        return ""
-    first = segments[0]
-    try:
-        parts = shlex.split(first)
-    except ValueError:
-        return first.strip()
-    return " ".join(parts)
-
-
-def split_command_segments(command: str) -> list[str]:
-    """Split a shell command at high-level shell control operators."""
-    separators = {"|", ";", "&"}
-    segments: list[str] = []
-    current: list[str] = []
-    in_single = False
-    in_double = False
-    i = 0
-    while i < len(command):
-        char = command[i]
-        nxt = command[i + 1] if i + 1 < len(command) else ""
-        if char == "'" and not in_double:
-            in_single = not in_single
-        elif char == '"' and not in_single:
-            in_double = not in_double
-        if not in_single and not in_double:
-            two = char + nxt
-            if two in {"&&", "||"}:
-                _append_segment(segments, current)
-                current = []
-                i += 2
-                continue
-            if char in separators:
-                _append_segment(segments, current)
-                current = []
-                i += 1
-                continue
-        current.append(char)
-        i += 1
-    _append_segment(segments, current)
-    return segments
-
-
-def _append_segment(segments: list[str], chars: list[str]) -> None:
-    segment = "".join(chars).strip()
-    if segment:
-        segments.append(segment)
-
-
-def _is_read_only_terminal_call(tool_name: str, params: dict) -> bool:
-    from khaos.tools.terminal_tools import is_read_only_argv, is_read_only_command
-
-    if tool_name == "terminal_argv":
-        argv = params.get("argv")
-        return isinstance(argv, list) and is_read_only_argv(argv)
-    return is_read_only_command(_command_text(params))
-
-
-def _command_text(params: dict) -> str:
-    argv = params.get("argv")
-    if isinstance(argv, list) and all(isinstance(item, str) for item in argv):
-        return shlex.join(argv)
-    return str(params.get("script") or params.get("command") or params.get("id") or "")
-
-
-def _matches_required_approval(command_text: str, approval_list: frozenset[str]) -> bool:
-    """Whether any segment of ``command_text`` triggers required approval.
-
-    Each shell segment is normalized to ``base_cmd args`` and matched against
-    the approval list.  An entry matches when the normalized segment equals it
-    (e.g. ``rm``), starts with it followed by a space (e.g. ``git push origin``
-    matches ``git push``), or matches it via fnmatch.  Every segment of a
-    pipeline/chain is checked so ``ls; rm x`` is caught.
-    """
-    if not command_text or not approval_list:
-        return False
-    segments = split_command_segments(command_text)
-    for raw in segments:
-        normalized = normalize_command_target(raw)
-        if not normalized:
-            continue
-        for entry in approval_list:
-            entry = entry.strip()
-            if not entry:
-                continue
-            if (
-                normalized == entry
-                or normalized.startswith(entry + " ")
-                or fnmatch.fnmatch(normalized, entry)
-            ):
-                return True
-    return False

@@ -76,6 +76,7 @@ KHAOS.md / AGENTS.md
 | Durable memory | `memory/`、`rpc/memory_service.py` | `MemoryStore`（领域门面）+ `MemoryRepository`（持久化端口）+ `MemoryOwner`（principal/project/namespace） | `MemoryManager`、RPC/CLI/TUI | SQL、FTS、TTL、冲突、提取和检索策略不能重新堆回 store；所有 runtime 写入必须携带 owner 和审计 logger |
 | Channel configuration/health | `channels/registry.py` | `ChannelRegistry`（唯一 writer；配置/健康锁） | channel tools、TUI、webhook service | `get`/`list_all` 只返回 immutable snapshot；配置必须经 `replace_config`/enable/disable，不能修改返回对象 |
 | Function/model routing | `routing/table.py`、`routing/router.py` | `RoutingTable` + `ModelRouter.set_rule` | provider manager、AgentLoop、MoA | rules/fallback chain are immutable snapshots; provider availability is not routing-state mutation |
+| Permission decision | `permissions/evaluator.py`、`permissions/engine.py` | `PermissionEvaluator`（纯策略）+ `PermissionEngine`（DB epoch/rule owner） | scheduler、approval UI、audit adapter | evaluator never opens DB or writes audit; engine publishes a captured rule snapshot and owns durable mutations |
 
 ## 4. 目前的过渡性热点
 

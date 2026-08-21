@@ -1,15 +1,18 @@
-"""Permission engine."""
+"""Permission engine and pure decision value types."""
 
 from khaos.permissions.engine import (
+    PermissionEngine,
+    is_interactive_transport,
+    validate_rule_scope,
+)
+from khaos.permissions.evaluator import PermissionEvaluator
+from khaos.permissions.models import (
     ApprovalMode,
     GrantLifetime,
     PermissionDecision,
-    PermissionEngine,
     PermissionRule,
     SourceTransport,
     TransportClass,
-    is_interactive_transport,
-    validate_rule_scope,
 )
 from khaos.permissions.resource import (
     AuthorizationResource,
@@ -29,6 +32,7 @@ __all__ = [
     "GrantLifetime",
     "PermissionDecision",
     "PermissionEngine",
+    "PermissionEvaluator",
     "PermissionResourceType",
     "PermissionRule",
     "SourceTransport",
