@@ -20,7 +20,7 @@ import sys
 import time
 import uuid
 from collections.abc import AsyncIterator
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -60,15 +60,10 @@ from khaos.db import Database
 from khaos.db.database import SessionBusyError
 from khaos.exceptions import ServiceShutdownError
 from khaos.maintenance import MaintenanceService
-from khaos.memory import (
-    Memory,
-    MemoryConfidence,
-    MemoryScope,
-    MemoryStore,
-)
 from khaos.modes import ModeManager
 from khaos.routing import ModelRouter
 from khaos.routing.router import create_default_router
+from khaos.rpc import MemoryService
 from khaos.runtime import RequestContext
 from khaos.runtime.context import local_principal_id
 from khaos.rust_bridge import get_token_engine
@@ -2159,80 +2154,6 @@ class AgentService:
         )
 
 
-class MemoryService:
-    """Memory RPC service backed by a per-request :class:`MemoryStore`.
-
-    M4 batch 3.1.16A-4-2: the service holds the ``db`` handle and
-    constructs a fresh ``MemoryStore`` scoped to ``ctx.principal_id``
-    on every call.  Previously the service was bound to a server-level
-    ``MemoryStore(local-uid)`` singleton, so an API principal could
-    read/write the local-uid's memories.  Each principal now sees only
-    their own private memories plus project-shared memories
-    (``namespace='shared'``).
-    """
-
-    def __init__(self, db: Database):
-        self.db = db
-
-    def _store(self, ctx: RequestContext) -> MemoryStore:
-        # F-02: forward ctx.project_id so memories are isolated by
-        # project on shared state DBs, not just by principal.
-        return MemoryStore(
-            self.db,
-            principal_id=ctx.principal_id,
-            project_id=ctx.project_id,
-        )
-
-    async def get_memory(self, ctx: RequestContext, scope: str, key: str) -> dict:
-        store = self._store(ctx)
-        memory = await store.get(MemoryScope(scope), key)
-        if memory is None:
-            raise KeyError(key)
-        return _memory_to_dict(memory)
-
-    async def set_memory(
-        self,
-        ctx: RequestContext,
-        scope: str,
-        key: str,
-        value: str,
-        ttl: int = 604800,
-        confidence: int = 2,
-    ) -> dict:
-        store = self._store(ctx)
-        memory = await store.set(
-            Memory(
-                id=None,
-                scope=MemoryScope(scope),
-                key=key,
-                value=value,
-                ttl=ttl,
-                confidence=MemoryConfidence(confidence),
-            )
-        )
-        return {"ok": True, "id": memory.id}
-
-    async def delete_memory(self, ctx: RequestContext, memory_id: int) -> dict:
-        # M4 batch 3.1.16A-4-2: principal-scoped deletion.  Previously
-        # ``delete_memory_by_id`` had no principal filter, so any
-        # principal could delete any other principal's memory by id.
-        # Now the DELETE is scoped to ``ctx.principal_id`` (or
-        # project-shared rows with ``principal_id=''``).
-        # F-02: also scope by ``ctx.project_id`` so a caller from
-        # project B cannot delete project A's memory by id on a
-        # shared state DB.
-        await self.db.delete_memory_by_id(
-            memory_id,
-            principal_id=ctx.principal_id,
-            project_id=ctx.project_id,
-        )
-        return {"ok": True}
-
-    async def search_memory(self, ctx: RequestContext, query: str, top_k: int = 5) -> list[dict]:
-        store = self._store(ctx)
-        return [_memory_to_dict(memory) for memory in await store.search(query, top_k)]
-
-
 class SessionService:
     """Session RPC service backed by the durable ``sessions`` table.
 
@@ -3638,15 +3559,6 @@ def _message_to_event(message) -> dict:
     else:
         data = {"role": message.role, "content": message.content, "token_count": message.token_count}
     return {"event": event, "data": data}
-
-
-def _memory_to_dict(memory: Memory) -> dict:
-    data = asdict(memory)
-    data["scope"] = memory.scope.value
-    data["confidence"] = memory.confidence.value
-    data["created_at"] = memory.created_at.isoformat() if memory.created_at else ""
-    data["updated_at"] = memory.updated_at.isoformat() if memory.updated_at else ""
-    return data
 
 
 def main() -> None:

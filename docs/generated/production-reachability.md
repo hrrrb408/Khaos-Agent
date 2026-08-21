@@ -17,8 +17,8 @@
 
 ## Import reachability result
 
-- Reachable repository modules: `163`.
-- Resolved import edges: `997`.
+- Reachable repository modules: `165`.
+- Resolved import edges: `999`.
 - Forbidden production edges: `0`.
 - Unresolved internal edges: `0`.
 
@@ -132,6 +132,8 @@
 - `khaos.routing.providers.base`
 - `khaos.routing.providers.openai_compatible`
 - `khaos.routing.router`
+- `khaos.rpc`
+- `khaos.rpc.memory_service`
 - `khaos.runtime`
 - `khaos.runtime.authority`
 - `khaos.runtime.context`
