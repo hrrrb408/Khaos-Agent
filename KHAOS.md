@@ -6,6 +6,8 @@ Agents working in this repository must read and follow `AGENTS.md` before
 modifying code, tests, Docker files, or documentation. The active project
 layout is Python Agent logic, Go API gateway, Rust security-critical TCB
 launchers/helpers plus performance modules, and SQLite-backed local storage.
+For the current module map, ownership rules, refactor protocol, and verification
+entry points, read [`docs/maintainer-architecture.md`](docs/maintainer-architecture.md).
 The machine-readable security boundary is `docs/security_facts.yaml`.
 The production Docker composition must receive host-reviewed, hash-pinned
 outer seccomp, AppArmor, and system-path profile declarations through the

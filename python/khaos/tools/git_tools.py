@@ -24,7 +24,6 @@ from khaos.security.credential_broker import (
     credential_binding_digest,
 )
 from khaos.security.git_evidence import (
-    GitEvidenceError,
     require_complete_git_output,
     snapshot_untracked_files,
 )

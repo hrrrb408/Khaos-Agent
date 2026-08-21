@@ -36,7 +36,6 @@ from khaos.security.authorityd_protocol import (
     open_authority_receipt_fds,
 )
 
-
 _DARWIN_SIGNATURE_MODE: str | None = None
 
 
