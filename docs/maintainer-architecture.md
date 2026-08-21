@@ -92,6 +92,8 @@ KHAOS.md / AGENTS.md
 | `python/khaos/coding/planning/approval/read_model.py` | approval request/decision/audit/authorization read SQL 与 row conversion | 只读连接查询；不打开/关闭连接、不 commit、不写入；由 store 提供一周期兼容委托 |
 | `python/khaos/coding/planning/approval/schema.py` | plan approval、receipt、authorization、lease、execution journal 的 DDL 与旧库 column/index upgrade | schema/migration 唯一 owner；`PlanApprovalStore` 只消费 `APPROVAL_SCHEMA`/`upgrade_schema` 并拥有 CAS 事务 |
 | `python/khaos/coding/workspace/boundary.py` | dirfd 文件读写、copy/move、snapshot/recovery 和 protected metadata 检查 | `workspace/policy.py` 统一 protected names/limits；`SafeWorkspaceFS` 只拥有 handle-based effect，`TrustedGitRunner` 只拥有 Git effect |
+| `python/khaos/coding/workspace/artifacts.py` | ChangeSet artifact 的 bounded no-follow read/write/copy、digest/length 校验和 exclusive publish | artifact 文件效果唯一 owner；不决定 workspace ownership、quota registration 或 lifecycle transition |
+| `python/khaos/coding/workspace/errors.py` | workspace-domain error type | `WorkspaceError` 唯一 owner；manager/application/artifact 共享同一错误边界 |
 | `python/khaos/scheduler/engine.py` | 任务状态、持久化、调度、执行、恢复和审计 | `scheduler/calculator.py` 已拥有纯 schedule 计算；后续拆 schedule repository、due-item selector、execution coordinator、recovery worker |
 | `python/khaos/runtime/factory.py` | 依赖装配和兼容参数转换 | 保留为唯一 composition root；业务逻辑不得回流到 factory |
 | `python/khaos/security/authorityd.py`、`authorityd_protocol.py` | authority daemon lifecycle、签名 receipt、审计事件、socket framing；历史上各自保留 canonical/digest 包装器 | `security/protocol_boundary.py` 统一 canonical JSON/digest；authorityd 只拥有 authority 状态机和 transport 适配 |
@@ -205,6 +207,7 @@ REQUESTED -> SNAPSHOT_BOUND -> RUNNING -> PROOF_RECORDED
 - `ToolAuthorization` 已收敛 permission decision hardening、interactive remember projection，以及 `ApprovalBinding`/`PermissionRequest` 的 digest/字段投影；scheduler 只保留 broker 注册、确认事件和 capability consume 编排，后续由 `ToolExecutionCoordinator` 接管效果准备与 dispatch。
 - `ToolOperationStore` 已收敛 durable operation claim/wait/finalize 与 runtime waiter map；scheduler 的旧幂等方法仅为兼容委托，后续删除并由 `ToolExecutionCoordinator` 直接消费该 owner。
 - `ToolExecutionCoordinator` 已收敛单步 authority context 注入、broker invoke/timeout 和 effect outcome normalization；scheduler 不再直接调用 invocation broker，后续继续迁移 terminalization/result projection。
+- ChangeSet artifact 的 descriptor/no-follow IO、digest 校验和 exclusive publish 已收敛到 `workspace/artifacts.py`；`WorkspaceManager` 只保留 lifecycle/quota 编排，workspace 错误类型由 `workspace/errors.py` 统一拥有。
 - Plan approval 的 DDL 与 post-schema migration 已收敛到 `coding/planning/approval/schema.py`；`PlanApprovalStore` 的 `APPROVAL_SCHEMA` 仅为兼容导出，后续删除。
 - Plan approval 的只读 SQL 与 row conversion 已收敛到 `coding/planning/approval/read_model.py`；`PlanApprovalStore` 的读取方法仅为兼容委托，后续在调用迁移完成后删除。
 - 下一步将 `ToolScheduler` 拆成 admission、capability consume、execution、result/audit 四段；每段只能消费上述类型，不能重新定义平行的 `ToolResult`、预算或 effect 状态。
