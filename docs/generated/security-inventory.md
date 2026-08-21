@@ -87,6 +87,7 @@
 - `python/khaos/db/connection.py`: `ffc70a5796101cd2a629e5e05af0eaae865ac980e799dca3fec6330d0cb1005d`
 - `python/khaos/db/repositories/sessions.py`: `dfbaa4c24ac56fbec89a254ac24a55279b58e5ef305abe41e82e44d9c257b554`
 - `python/khaos/scheduler/calculator.py`: `af993de722689212943f4dddd7c5f60cd544c38fa98c9f0a7e7d2b699ddbe64c`
+- `python/khaos/coding/planning/limits.py`: `f39749886151ed96b73a9e252bd6a568b0f85d295aed77282e5c8ebc64d87193`
 - `python/khaos/tools/result_codec.py`: `cf9852cb62f4daeb07a3bdfc4144492dfbcd95661a26f08e97d2d9ef99f716fb`
 - `python/khaos/rpc/protocol.py`: `5960a4e41b94b63a47ccadd362288f97f4747ad56d6db065f9741cebfbc768a6`
 - `rust/khaos-core/src/bin/khaos-exec-launcher.rs`: `c5eb7343002ecb7f74e1ca10df5d5edaf4de39f90ecc68064cb355b56b2fda71`

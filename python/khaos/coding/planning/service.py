@@ -8,6 +8,7 @@ from typing import Any
 from khaos.coding.intelligence.query import CodeQueryService
 from khaos.coding.planning.contracts import *
 from khaos.coding.planning.dag import validate_steps
+from khaos.coding.planning.limits import PlanningLimits
 from khaos.coding.planning.risk import RiskEvaluator
 from khaos.coding.planning.verification import TrustedVerificationSelector
 from khaos.coding.planning.verification_catalog import VerificationCatalog
@@ -44,9 +45,32 @@ class ResolvedGoalTarget:
 
 class DeterministicPlanningService:
     """No tools, shell, writes, ChangeSets, or approval transitions are exposed here."""
-    def __init__(self, query: CodeQueryService, *, repositories: dict[str, dict[str, Any]], max_depth: int = 3, max_nodes: int = 200, max_files: int = 100, max_symbols: int = 100, max_edges: int = 500, max_reverse_imports: int = 50, max_test_candidates: int = 50) -> None:
-        self._query, self._repositories = query, repositories
-        self._limits=(max_depth,max_nodes,max_files,max_symbols,max_edges,max_reverse_imports,max_test_candidates); self._verification_selector=TrustedVerificationSelector(); self._risk_evaluator=RiskEvaluator()
+    def __init__(
+        self,
+        query: CodeQueryService,
+        *,
+        repositories: dict[str, dict[str, Any]],
+        max_depth: int = 3,
+        max_nodes: int = 200,
+        max_files: int = 100,
+        max_symbols: int = 100,
+        max_edges: int = 500,
+        max_reverse_imports: int = 50,
+        max_test_candidates: int = 50,
+    ) -> None:
+        self._query = query
+        self._repositories = repositories
+        self._limits = PlanningLimits(
+            max_depth=max_depth,
+            max_nodes=max_nodes,
+            max_files=max_files,
+            max_symbols=max_symbols,
+            max_edges=max_edges,
+            max_reverse_imports=max_reverse_imports,
+            max_test_candidates=max_test_candidates,
+        )
+        self._verification_selector = TrustedVerificationSelector()
+        self._risk_evaluator = RiskEvaluator()
         self._catalogs: dict[str, VerificationCatalog] = {}
 
     def _get_catalog(self, repository_id: str) -> VerificationCatalog:
@@ -98,15 +122,16 @@ class DeterministicPlanningService:
         Never scans the entire repository — test association uses bounded
         :meth:`CodeQueryService.associated_tests` with indexed LIMIT queries.
         """
-        budget = ImpactTraversalBudget(
-            max_depth=max_depth if max_depth is not None else self._limits[0],
-            max_nodes=max_nodes if max_nodes is not None else self._limits[1],
-            max_files=max_files if max_files is not None else self._limits[2],
-            max_symbols=max_symbols if max_symbols is not None else self._limits[3],
-            max_edges=max_edges if max_edges is not None else self._limits[4],
-            max_reverse_imports=max_reverse_imports if max_reverse_imports is not None else self._limits[5],
-            max_test_candidates=max_test_candidates if max_test_candidates is not None else self._limits[6],
+        limits = self._limits.override(
+            max_depth=max_depth,
+            max_nodes=max_nodes,
+            max_files=max_files,
+            max_symbols=max_symbols,
+            max_edges=max_edges,
+            max_reverse_imports=max_reverse_imports,
+            max_test_candidates=max_test_candidates,
         )
+        budget = ImpactTraversalBudget(**limits.as_dict())
         queue = [(sid, 0) for sid in sorted(target_symbols)]
         direct: list[ImpactEdge] = []
         indirect: list[ImpactEdge] = []

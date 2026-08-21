@@ -85,7 +85,7 @@ KHAOS.md / AGENTS.md
 | `python/khaos/tools/admission.py` | 工具调用规范化、raw phase、注册表解析和参数校验 | `ToolAdmission`；只返回 `AdmittedToolCall`/`RejectedToolCall`，不做权限、authority 或执行 |
 | `python/khaos/tools/scheduler_models.py`、`tools/budget.py` | 调度结果协议、权限请求事件和原子预算 reservation/commit | 已完成首个 seam；后续只允许由调度器编排，不在 handler 中复制预算或结果状态机 |
 | `python/khaos/grpc_server.py` | transport/auth/startup、Agent service，以及兼容导出 | protocol/auth middleware、composition root、每个 service 独立模块；服务只消费已认证 context。MemoryService、SessionService、AuditService 已迁移到 `python/khaos/rpc/`；`python/khaos/rpc/protocol.py` 现在拥有协议常量、协商、绑定声明和认证器，grpc 导入仅是迁移期兼容导出 |
-| `python/khaos/coding/planning/approval/store.py` | schema、CAS transition、receipt、lease、plan execution event 和 read model | schema/migration、approval ledger、receipt verifier、execution-event repository、read model |
+| `python/khaos/coding/planning/approval/store.py` | schema、CAS transition、receipt、lease、plan execution event 和 read model | schema/migration、approval ledger、receipt verifier、execution-event repository、read model；planning traversal limits 已由 `coding/planning/limits.py` 独立拥有 |
 | `python/khaos/scheduler/engine.py` | 任务状态、持久化、调度、执行、恢复和审计 | `scheduler/calculator.py` 已拥有纯 schedule 计算；后续拆 schedule repository、due-item selector、execution coordinator、recovery worker |
 | `python/khaos/runtime/factory.py` | 依赖装配和兼容参数转换 | 保留为唯一 composition root；业务逻辑不得回流到 factory |
 
