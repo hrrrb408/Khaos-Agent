@@ -80,7 +80,7 @@ KHAOS.md / AGENTS.md
 
 | 文件 | 当前集中职责 | 拆分目标 |
 | --- | --- | --- |
-| `python/khaos/db/database.py` | 连接生命周期、迁移、session/message、turn/event、audit、memory、task、scheduler 等 | `DatabaseConnection`、migration runner、按领域的 repository/query service；保留一个薄 facade 兼容旧调用 |
+| `python/khaos/db/database.py` | 迁移、事务 owner、session/message、turn/event、audit、memory、task、scheduler 等领域 facade | `python/khaos/db/connection.py` 拥有物理连接生命周期；继续拆按领域的 repository/query service，最终保留一个薄 facade 兼容旧调用 |
 | `python/khaos/tools/scheduler.py` | approval、authority、idempotency、并发和结果归一化 | `ToolAuthorization`、`ToolExecutionCoordinator`、`ToolResultStore` |
 | `python/khaos/tools/admission.py` | 工具调用规范化、raw phase、注册表解析和参数校验 | `ToolAdmission`；只返回 `AdmittedToolCall`/`RejectedToolCall`，不做权限、authority 或执行 |
 | `python/khaos/tools/scheduler_models.py`、`tools/budget.py` | 调度结果协议、权限请求事件和原子预算 reservation/commit | 已完成首个 seam；后续只允许由调度器编排，不在 handler 中复制预算或结果状态机 |
@@ -183,6 +183,8 @@ REQUESTED -> SNAPSHOT_BOUND -> RUNNING -> PROOF_RECORDED
 ### Phase 2：数据库与 RPC 边界
 
 - 从 `Database` 提取连接/迁移/repository，先迁移只读查询，再迁移写事务。
+- 连接生命周期第一 seam 已落在 `python/khaos/db/connection.py`；`Database` 的 underscored
+  connection views 只为迁移期兼容，后续 repository 迁移完成后删除这些 views。
 - 从 `grpc_server.py` 提取 protocol/auth/service；MemoryService、SessionService、AuditService 已完成首批 seam，协议边界已落在 `python/khaos/rpc/protocol.py`。`grpc_server.py` 的旧名称只作为显式兼容导出保留，后续迁移周期必须删除，不增加第二套 server authority。
 
 ### Phase 3：工具和执行边界
