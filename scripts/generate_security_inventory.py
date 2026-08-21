@@ -138,6 +138,7 @@ def render() -> str:
         ("python/khaos/coding/workspace/artifacts.py", sha256(ROOT / "python" / "khaos" / "coding" / "workspace" / "artifacts.py")),
         ("python/khaos/coding/workspace/trusted_git.py", sha256(ROOT / "python" / "khaos" / "coding" / "workspace" / "trusted_git.py")),
         ("python/khaos/coding/workspace/git_process.py", sha256(ROOT / "python" / "khaos" / "coding" / "workspace" / "git_process.py")),
+        ("python/khaos/coding/planning/approval/execution_read_model.py", sha256(ROOT / "python" / "khaos" / "coding" / "planning" / "approval" / "execution_read_model.py")),
         ("python/khaos/security/authority.py", sha256(ROOT / "python" / "khaos" / "security" / "authority.py")),
         ("python/khaos/security/authority_broker.py", sha256(ROOT / "python" / "khaos" / "security" / "authority_broker.py")),
         ("python/khaos/security/authorityd.py", sha256(ROOT / "python" / "khaos" / "security" / "authorityd.py")),

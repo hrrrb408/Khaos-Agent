@@ -63,6 +63,7 @@ from khaos.coding.planning.approval.models import (
     verify_nonce,
     verify_receipt_token,
 )
+from khaos.coding.planning.approval.execution_read_model import PlanExecutionReadModel
 from khaos.coding.planning.approval.mutation_fence import (
     PlannedHeadMutationAdapter,
     WorkspaceMutationFence,
@@ -133,6 +134,7 @@ __all__ = [
     "PlanApprovalDecision",
     "PlanApprovalError",
     "PlanApprovalReadModel",
+    "PlanExecutionReadModel",
     "PlanApprovalRequest",
     "PlanApprovalService",
     "PlanApprovalStatus",

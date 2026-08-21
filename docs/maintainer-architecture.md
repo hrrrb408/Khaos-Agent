@@ -88,8 +88,9 @@ KHAOS.md / AGENTS.md
 | `python/khaos/tools/admission.py` | 工具调用规范化、raw phase、注册表解析和参数校验 | `ToolAdmission`；只返回 `AdmittedToolCall`/`RejectedToolCall`，不做权限、authority 或执行 |
 | `python/khaos/tools/scheduler_models.py`、`tools/budget.py` | 调度结果协议、权限请求事件和原子预算 reservation/commit | 已完成首个 seam；后续只允许由调度器编排，不在 handler 中复制预算或结果状态机 |
 | `python/khaos/grpc_server.py` | transport/auth/startup、Agent service，以及兼容导出 | protocol/auth middleware、composition root、每个 service 独立模块；服务只消费已认证 context。MemoryService、SessionService、AuditService 已迁移到 `python/khaos/rpc/`；`python/khaos/rpc/protocol.py` 现在拥有 Python 协议常量、协商、绑定声明和认证器，Go 对应的 version/features/digest 由 `go/internal/platform/rpc_contract.go` 拥有，grpc/client 导入仅是迁移期兼容导出 |
-| `python/khaos/coding/planning/approval/store.py` | CAS transition、receipt、lease、plan execution event 和 transactional writers | schema/migration、approval ledger、receipt verifier、execution-event repository；只读查询由 `approval/read_model.py` 拥有 |
+| `python/khaos/coding/planning/approval/store.py` | CAS transition、receipt、lease、plan execution event 和 transactional writers | schema/migration、approval ledger、receipt verifier、execution-event repository；approval reads 由 `approval/read_model.py`、execution/proof reads 由 `approval/execution_read_model.py` 拥有 |
 | `python/khaos/coding/planning/approval/read_model.py` | approval request/decision/audit/authorization read SQL 与 row conversion | 只读连接查询；不打开/关闭连接、不 commit、不写入；由 store 提供一周期兼容委托 |
+| `python/khaos/coding/planning/approval/execution_read_model.py` | execution run/journal/attestation read SQL、row conversion 和 proof digest 校验 | `PlanExecutionReadModel` 唯一拥有执行读取与 verified authority 前置检查；不拥有事务写入或 recovery transition |
 | `python/khaos/coding/planning/approval/schema.py` | plan approval、receipt、authorization、lease、execution journal 的 DDL 与旧库 column/index upgrade | schema/migration 唯一 owner；`PlanApprovalStore` 只消费 `APPROVAL_SCHEMA`/`upgrade_schema` 并拥有 CAS 事务 |
 | `python/khaos/coding/workspace/boundary.py` | dirfd 文件读写、copy/move、snapshot/recovery 和 protected metadata 检查 | `workspace/policy.py` 统一 protected names/limits；`SafeWorkspaceFS` 只拥有 handle-based effect，`TrustedGitRunner` 只拥有 Git effect |
 | `python/khaos/coding/workspace/artifacts.py` | ChangeSet artifact 的 bounded no-follow read/write/copy、digest/length 校验和 exclusive publish | artifact 文件效果唯一 owner；不决定 workspace ownership、quota registration 或 lifecycle transition |
@@ -211,7 +212,7 @@ REQUESTED -> SNAPSHOT_BOUND -> RUNNING -> PROOF_RECORDED
 - ChangeSet artifact 的 descriptor/no-follow IO、digest 校验和 exclusive publish 已收敛到 `workspace/artifacts.py`；`WorkspaceManager` 只保留 lifecycle/quota 编排，workspace 错误类型由 `workspace/errors.py` 统一拥有。
 - Trusted Git 的 process owner 已从 Git command/effect runner 独立到 `workspace/git_process.py`；Git runner 不再定义进程状态机，Windows/native 失败可分别归类为 argv/authority 或 process terminal evidence。
 - Plan approval 的 DDL 与 post-schema migration 已收敛到 `coding/planning/approval/schema.py`；`PlanApprovalStore` 的 `APPROVAL_SCHEMA` 仅为兼容导出，后续删除。
-- Plan approval 的只读 SQL 与 row conversion 已收敛到 `coding/planning/approval/read_model.py`；`PlanApprovalStore` 的读取方法仅为兼容委托，后续在调用迁移完成后删除。
+- Plan approval request/decision/audit/authorization 的只读 SQL 与 row conversion 已收敛到 `coding/planning/approval/read_model.py`；execution run/journal/attestation 读取与 digest 校验已收敛到 `coding/planning/approval/execution_read_model.py`。`PlanApprovalStore` 的两组读取方法仅为兼容委托，后续在调用迁移完成后删除。
 - 下一步将 `ToolScheduler` 拆成 admission、capability consume、execution、result/audit 四段；每段只能消费上述类型，不能重新定义平行的 `ToolResult`、预算或 effect 状态。
 - 将 file/Git/process 入口收敛为可注入 port，并为每个 port 提供 fail-closed contract tests。
 
