@@ -82,6 +82,7 @@ from khaos.coding.planning.approval.runtime import (
     RuntimeState,
     WorkspaceExecutionLeaseCoordinator,
 )
+from khaos.coding.planning.approval.schema import APPROVAL_SCHEMA, upgrade_schema
 from khaos.coding.planning.approval.service import (
     ApprovalConflictError,
     ApprovalPolicy,
@@ -95,7 +96,6 @@ from khaos.coding.planning.approval.service import (
     UnknownBrokerRequestError,
 )
 from khaos.coding.planning.approval.store import (
-    APPROVAL_SCHEMA,
     ApprovalTransitionResult,
     PlanApprovalStore,
 )
@@ -160,6 +160,7 @@ __all__ = [
     "generate_receipt_token",
     "hash_nonce",
     "hash_receipt_token",
+    "upgrade_schema",
     "verify_nonce",
     "verify_receipt_token",
 ]
