@@ -78,28 +78,7 @@ from khaos.tools import create_runtime_registry
 
 logger = logging.getLogger(__name__)
 
-# Compatibility exports for callers that historically imported the protocol
-# from this transport module.  The implementation and all protocol constants
-# live in ``khaos.rpc.protocol``; this block deliberately contains no logic.
-from khaos.rpc import protocol as _rpc_protocol
-
-GatewayRPCAuthenticator = _rpc_protocol.GatewayRPCAuthenticator
-RPC_AUTH_WINDOW_SECONDS = _rpc_protocol.RPC_AUTH_WINDOW_SECONDS
-RPC_ERROR_CODES = _rpc_protocol.RPC_ERROR_CODES
-RPC_FEATURES = _rpc_protocol.RPC_FEATURES
-RPC_INITIALIZE_METHOD = _rpc_protocol.RPC_INITIALIZE_METHOD
-RPC_MAX_REQUEST_BYTES = _rpc_protocol.RPC_MAX_REQUEST_BYTES
-RPC_METHOD_SCHEMA_VERSION = _rpc_protocol.RPC_METHOD_SCHEMA_VERSION
-RPC_PROTOCOL_MAX_VERSION = _rpc_protocol.RPC_PROTOCOL_MAX_VERSION
-RPC_PROTOCOL_MIN_VERSION = _rpc_protocol.RPC_PROTOCOL_MIN_VERSION
-RPC_PROTOCOL_VERSION = _rpc_protocol.RPC_PROTOCOL_VERSION
-RPC_REQUIRED_SECURITY_FIELDS = _rpc_protocol.RPC_REQUIRED_SECURITY_FIELDS
-RPC_SCHEMA_VERSION = _rpc_protocol.RPC_SCHEMA_VERSION
-RPCProtocolError = _rpc_protocol.RPCProtocolError
-_rpc_binding_claim_error = _rpc_protocol.rpc_binding_claim_error
-_rpc_feature_digest = _rpc_protocol.rpc_feature_digest
-_rpc_initialize_response = _rpc_protocol.rpc_initialize_response
-_rpc_protocol_metadata = _rpc_protocol.rpc_protocol_metadata
+import khaos.rpc.protocol as _rpc_protocol
 
 # M2: bounded shutdown deadlines so a stuck handler / chat / detached
 # subagent task cannot wedge server teardown.  These are fail-safe ceilings;
@@ -2125,7 +2104,7 @@ async def serve_json_lines(
         raise ValueError("gateway GID requires an explicit gateway UID")
     parent_mode = 0o2750 if gateway_gid is not None else 0o700
     socket_mode = 0o660 if gateway_gid is not None else 0o600
-    authenticator = GatewayRPCAuthenticator(
+    authenticator = _rpc_protocol.GatewayRPCAuthenticator(
         capability,
         expected_uid=gateway_uid,
         expected_pid=gateway_pid,
@@ -2297,7 +2276,7 @@ async def serve_json_lines(
                     return
                 try:
                     principal_id = authenticator.authenticate(request, peer_pid=peer_pid)
-                except RPCProtocolError as exc:
+                except _rpc_protocol.RPCProtocolError as exc:
                     writer.write((json.dumps({
                         "error": exc.code, "message": str(exc),
                     }) + "\n").encode("utf-8"))
@@ -2312,7 +2291,10 @@ async def serve_json_lines(
                 method = request.get("method")
                 payload = request.get("payload", {})
                 require_initialize = os.environ.get("KHAOS_DEV_MODE") != "1"
-                if require_initialize and method != RPC_INITIALIZE_METHOD:
+                if (
+                    require_initialize
+                    and method != _rpc_protocol.RPC_INITIALIZE_METHOD
+                ):
                     writer.write((json.dumps({
                         "error": "rpc_negotiation_required",
                         "message": (
@@ -2321,15 +2303,17 @@ async def serve_json_lines(
                     }) + "\n").encode("utf-8"))
                     await writer.drain()
                     return
-                if method == RPC_INITIALIZE_METHOD:
+                if method == _rpc_protocol.RPC_INITIALIZE_METHOD:
                     try:
                         if not isinstance(payload, dict):
-                            raise RPCProtocolError(
+                            raise _rpc_protocol.RPCProtocolError(
                                 "rpc_schema_unsupported",
                                 "RPC initialize payload must be an object",
                             )
-                        initialize_response = _rpc_initialize_response(payload)
-                    except RPCProtocolError as exc:
+                        initialize_response = _rpc_protocol.rpc_initialize_response(
+                            payload
+                        )
+                    except _rpc_protocol.RPCProtocolError as exc:
                         writer.write((json.dumps({
                             "error": exc.code,
                             "message": str(exc),
@@ -2360,7 +2344,7 @@ async def serve_json_lines(
                         principal_id = authenticator.authenticate(
                             request, peer_pid=peer_pid,
                         )
-                    except RPCProtocolError as exc:
+                    except _rpc_protocol.RPCProtocolError as exc:
                         writer.write((json.dumps({
                             "error": exc.code,
                             "message": str(exc),
@@ -2407,7 +2391,7 @@ async def serve_json_lines(
                 # receive a misleading ready response.  It has no user
                 # principal and therefore does not enter a service context.
                 if method == "Bootstrap.Health":
-                    claim_error = _rpc_binding_claim_error(
+                    claim_error = _rpc_protocol.rpc_binding_claim_error(
                         payload,
                         bound_project_id=agent._bound_project_id,
                         bound_policy_digest=agent._effective_policy.digest,
@@ -2431,7 +2415,7 @@ async def serve_json_lines(
                 # server-bound claims on every non-bootstrap request. Empty
                 # claims remain available only under the explicit test/dev
                 # mode, never as a production compatibility default.
-                claim_error = _rpc_binding_claim_error(
+                claim_error = _rpc_protocol.rpc_binding_claim_error(
                     payload,
                     bound_project_id=agent._bound_project_id,
                     bound_policy_digest=agent._effective_policy.digest,
@@ -2711,7 +2695,9 @@ async def serve_json_lines(
 
         try:
             server = await asyncio.start_unix_server(
-                accept_connection, path=str(uds_path), limit=RPC_MAX_REQUEST_BYTES,
+                accept_connection,
+                path=str(uds_path),
+                limit=_rpc_protocol.RPC_MAX_REQUEST_BYTES,
             )
             os.chmod(uds_path, socket_mode)
             socket_stat = uds_path.lstat()

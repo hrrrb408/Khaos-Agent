@@ -46,7 +46,7 @@ import time
 
 import pytest
 
-from khaos.grpc_server import GatewayRPCAuthenticator
+from khaos.rpc.protocol import GatewayRPCAuthenticator
 
 
 # ───────────────────────── helpers ────────────────────────────

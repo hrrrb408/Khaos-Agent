@@ -12,7 +12,8 @@ from pathlib import Path
 import pytest
 
 import khaos.audit.logger as logger_module
-from khaos.grpc_server import (
+from khaos.grpc_server import serve_json_lines
+from khaos.rpc.protocol import (
     RPC_FEATURES,
     RPC_INITIALIZE_METHOD,
     RPC_METHOD_SCHEMA_VERSION,
@@ -20,9 +21,8 @@ from khaos.grpc_server import (
     RPC_SCHEMA_VERSION,
     GatewayRPCAuthenticator,
     RPCProtocolError,
-    _rpc_feature_digest,
-    _rpc_initialize_response,
-    serve_json_lines,
+    rpc_feature_digest as _rpc_feature_digest,
+    rpc_initialize_response as _rpc_initialize_response,
 )
 from khaos.security.effective_policy import load_effective_policy
 from khaos.db.state_root import project_id as compute_project_id

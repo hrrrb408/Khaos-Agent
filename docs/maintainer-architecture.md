@@ -88,7 +88,7 @@ KHAOS.md / AGENTS.md
 | `python/khaos/tools/execution_coordinator.py` | 单步 authority context、handler timeout、broker dispatch 和 effect outcome normalization | `ToolExecutionCoordinator`；不做 permission、claim、budget、audit 或批次事件 |
 | `python/khaos/tools/admission.py` | 工具调用规范化、raw phase、注册表解析和参数校验 | `ToolAdmission`；只返回 `AdmittedToolCall`/`RejectedToolCall`，不做权限、authority 或执行 |
 | `python/khaos/tools/scheduler_models.py`、`tools/budget.py` | 调度结果协议、权限请求事件和原子预算 reservation/commit | 已完成首个 seam；后续只允许由调度器编排，不在 handler 中复制预算或结果状态机 |
-| `python/khaos/grpc_server.py` | transport/auth/startup、Agent service，以及兼容导出 | protocol/auth middleware、composition root、每个 service 独立模块；服务只消费已认证 context。MemoryService、SessionService、AuditService 已迁移到 `python/khaos/rpc/`；`python/khaos/rpc/protocol.py` 现在拥有 Python 协议常量、协商、绑定声明和认证器，Go 对应的 version/features/digest 由 `go/internal/platform/rpc_contract.go` 拥有，grpc/client 导入仅是迁移期兼容导出 |
+| `python/khaos/grpc_server.py` | transport/auth/startup、Agent service | protocol/auth middleware、composition root、每个 service 独立模块；服务只消费已认证 context。MemoryService、SessionService、AuditService 已迁移到 `python/khaos/rpc/`；`python/khaos/rpc/protocol.py` 拥有 Python 协议常量、协商、绑定声明和认证器，Go 对应的 version/features/digest 由 `go/internal/platform/rpc_contract.go` 拥有；transport 不再导出 protocol compatibility aliases |
 | `python/khaos/coding/planning/approval/store.py` | CAS transition、receipt、lease、plan execution event 和 transactional writers | schema/migration、approval ledger、receipt verifier、execution-event repository；approval reads 由 `approval/read_model.py`、execution/proof reads 由 `approval/execution_read_model.py` 拥有 |
 | `python/khaos/coding/planning/approval/read_model.py` | approval request/decision/audit/authorization read SQL 与 row conversion | 只读连接查询；不打开/关闭连接、不 commit、不写入；由 store 提供一周期兼容委托 |
 | `python/khaos/coding/planning/approval/execution_read_model.py` | execution run/journal/attestation read SQL、row conversion 和 proof digest 校验 | `PlanExecutionReadModel` 唯一拥有执行读取与 verified authority 前置检查；不拥有事务写入或 recovery transition |
@@ -204,7 +204,7 @@ REQUESTED -> SNAPSHOT_BOUND -> RUNNING -> PROOF_RECORDED
   和 transaction。
 - 连接生命周期第一 seam 已落在 `python/khaos/db/connection.py`；`Database` 的 underscored
   connection views 只为迁移期兼容，后续 repository 迁移完成后删除这些 views。
-- 从 `grpc_server.py` 提取 protocol/auth/service；MemoryService、SessionService、AuditService 已完成首批 seam，协议边界已落在 `python/khaos/rpc/protocol.py`。`grpc_server.py` 的旧名称只作为显式兼容导出保留，后续迁移周期必须删除，不增加第二套 server authority。
+- 从 `grpc_server.py` 提取 protocol/auth/service；MemoryService、SessionService、AuditService 已完成首批 seam，协议边界已落在 `python/khaos/rpc/protocol.py`。本轮已删除 `grpc_server.py` 的 protocol compatibility aliases；新代码必须直接依赖 `khaos.rpc.protocol`，不增加第二套 server authority。
 - authorityd 的 receipt、审计和 socket framing 已统一消费 `security/protocol_boundary.py` 的 canonical owner；删除 `_canonical`/`_digest` 私有包装器，后续不允许在 authority daemon 内重新实现摘要或序列化。
 
 ### Phase 3：工具和执行边界

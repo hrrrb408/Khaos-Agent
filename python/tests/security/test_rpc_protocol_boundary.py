@@ -1,7 +1,6 @@
 """Contract tests for the standalone authenticated RPC protocol boundary."""
 
 import pytest
-from khaos import grpc_server
 from khaos.rpc.protocol import (
     RPC_FEATURES,
     RPC_METHOD_SCHEMA_VERSION,
@@ -29,13 +28,18 @@ def _metadata(*, features: list[str] | None = None) -> dict[str, object]:
     }
 
 
-def test_protocol_module_is_the_compatibility_export_owner():
-    """The old grpc module must not grow a second protocol implementation."""
-    assert grpc_server.GatewayRPCAuthenticator is GatewayRPCAuthenticator
-    assert grpc_server.RPCProtocolError is RPCProtocolError
-    assert grpc_server._rpc_feature_digest is rpc_feature_digest
-    assert grpc_server._rpc_initialize_response is rpc_initialize_response
-    assert grpc_server._rpc_protocol_metadata is rpc_protocol_metadata
+def test_protocol_module_is_the_single_owner():
+    """The transport module must not expose a second protocol surface."""
+    import khaos.grpc_server as grpc_server
+    import khaos.rpc as rpc_package
+
+    assert not hasattr(grpc_server, "GatewayRPCAuthenticator")
+    assert not hasattr(grpc_server, "RPCProtocolError")
+    assert not hasattr(grpc_server, "_rpc_feature_digest")
+    assert not hasattr(grpc_server, "_rpc_initialize_response")
+    assert not hasattr(grpc_server, "_rpc_protocol_metadata")
+    assert not hasattr(rpc_package, "GatewayRPCAuthenticator")
+    assert not hasattr(rpc_package, "RPCProtocolError")
 
 
 def test_metadata_contract_accepts_only_the_negotiated_security_features():
