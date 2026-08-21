@@ -35,7 +35,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from khaos.db import Database
-from khaos.memory import Memory, MemoryConfidence, MemoryScope, MemoryStore
+from khaos.memory import (
+    Memory,
+    MemoryConfidence,
+    MemoryScope,
+    MemoryStore,
+    SqliteMemoryRepository,
+)
 
 
 PROJECT_ID_A = "a" * 32
@@ -65,7 +71,9 @@ def _mem(key: str, value: str, *, ttl: int = 604800) -> Memory:
 
 
 def _store(db: Database, project_id: str) -> MemoryStore:
-    return MemoryStore(db, principal_id=PRINCIPAL, project_id=project_id)
+    return MemoryStore(
+        SqliteMemoryRepository(db), principal_id=PRINCIPAL, project_id=project_id
+    )
 
 
 # ───────────────────────────── tests ──────────────────────────────────
@@ -351,8 +359,12 @@ async def test_f02_10_shared_namespace_isolation(tmp_path):
         # Both stores use principal_id='' via the shared-namespace path
         # (see MemoryStore._effective_principal), but bind to different
         # project_ids.
-        store_a = MemoryStore(db, principal_id="alice", project_id=PROJECT_ID_A)
-        store_b = MemoryStore(db, principal_id="bob", project_id=PROJECT_ID_B)
+        store_a = MemoryStore(
+            SqliteMemoryRepository(db), principal_id="alice", project_id=PROJECT_ID_A
+        )
+        store_b = MemoryStore(
+            SqliteMemoryRepository(db), principal_id="bob", project_id=PROJECT_ID_B
+        )
 
         await store_a.set(_mem("team-note", "from-A"), namespace="shared")
         await store_b.set(_mem("team-note", "from-B"), namespace="shared")

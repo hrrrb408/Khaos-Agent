@@ -131,6 +131,7 @@ async def test_agent_service_owns_shared_audit_logger_across_turns(tmp_path):
     await db.run_migrations()
     service = AgentService(db, project_root=tmp_path)
     shared = MagicMock()
+    shared.bind.return_value = shared
     service._audit_logger = shared
 
     runtime = await service._build_runtime(_test_ctx(), "s1", "office")
@@ -1006,7 +1007,9 @@ async def test_memory_service_crud_search(tmp_path):
     db = Database(tmp_path / "khaos.db")
     await db.connect()
     await db.run_migrations()
-    service = MemoryService(db)
+    from khaos.memory import SqliteMemoryRepository
+
+    service = MemoryService(SqliteMemoryRepository(db))
 
     stored = await service.set_memory(_test_ctx(), "global", "user", "Ruibang likes tests")
     memory = await service.get_memory(_test_ctx(), "global", "user")

@@ -31,7 +31,6 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-
 from khaos.agent.approval import ApprovalBinding, ApprovalBroker
 from khaos.audit import AuditLogger
 from khaos.coding.task_manager import TaskManager, TaskStatus
@@ -41,6 +40,7 @@ from khaos.grpc_server import (
     MemoryService,
     TaskService,
 )
+from khaos.memory import SqliteMemoryRepository
 from khaos.runtime import RequestContext
 
 
@@ -59,7 +59,7 @@ async def test_memory_service_private_memory_is_principal_scoped(tmp_path):
     db = Database(tmp_path / "khaos.db")
     await db.connect()
     await db.run_migrations()
-    service = MemoryService(db)
+    service = MemoryService(SqliteMemoryRepository(db))
 
     # Principal A writes a private memory.
     await service.set_memory(_ctx("api:alice"), "coding", "secret", "alice-secret")
@@ -85,7 +85,7 @@ async def test_memory_service_delete_is_principal_scoped(tmp_path):
     db = Database(tmp_path / "khaos.db")
     await db.connect()
     await db.run_migrations()
-    service = MemoryService(db)
+    service = MemoryService(SqliteMemoryRepository(db))
 
     set_result = await service.set_memory(
         _ctx("api:alice"), "coding", "secret", "alice-secret",
@@ -116,7 +116,7 @@ async def test_memory_service_search_is_principal_scoped(tmp_path):
     db = Database(tmp_path / "khaos.db")
     await db.connect()
     await db.run_migrations()
-    service = MemoryService(db)
+    service = MemoryService(SqliteMemoryRepository(db))
 
     await service.set_memory(
         _ctx("api:alice"), "coding", "hobby", "alice likes cryptography",

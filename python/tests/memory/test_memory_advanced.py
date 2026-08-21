@@ -12,6 +12,7 @@ from khaos.memory import (
     MemoryManager,
     MemoryScope,
     MemoryStore,
+    SqliteMemoryRepository,
 )
 from khaos.memory.store import extract_memories_from_messages, extract_memories_from_text
 from khaos.modes import Mode
@@ -22,7 +23,7 @@ async def _store(tmp_path):
     db = Database(tmp_path / "khaos.db")
     await db.connect()
     await db.run_migrations()
-    return db, MemoryStore(db)
+    return db, MemoryStore(SqliteMemoryRepository(db))
 
 
 async def _manager(tmp_path, **kwargs):

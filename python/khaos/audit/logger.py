@@ -147,6 +147,7 @@ class AuditEntry:
     task_id: str | None = None
     operation_id: str | None = None
     policy_digest: str | None = None
+    project_id: str | None = None
     authority_generation: int | None = None
     source_transport: str | None = None
 
@@ -165,6 +166,7 @@ class AuditEntry:
             task_id=row.get("task_id"),
             operation_id=row.get("operation_id"),
             policy_digest=row.get("policy_digest"),
+            project_id=row.get("project_id"),
             authority_generation=row.get("authority_generation"),
             source_transport=row.get("source_transport"),
         )
@@ -172,6 +174,183 @@ class AuditEntry:
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         return data
+
+
+@dataclass(frozen=True, slots=True)
+class AuditBinding:
+    """Immutable identity attached to one request-scoped audit sink.
+
+    The shared :class:`AuditLogger` remains the only owner of the SQLite
+    chain, file descriptor, and anchor.  A binding only carries attribution;
+    it cannot close or replace the underlying writer.
+    """
+
+    principal_id: str
+    project_id: str
+    policy_digest: str | None = None
+    runtime_id: str | None = None
+    source_transport: str | None = None
+
+
+class BoundAuditLogger:
+    """Request-scoped audit facade backed by one shared ``AuditLogger``.
+
+    This object deliberately exposes only logging/query operations.  ``close``
+    is a no-op because lifecycle belongs to the shared root logger; allowing a
+    request handler to close that logger would race unrelated requests.
+    """
+
+    def __init__(self, root: AuditLogger, binding: AuditBinding) -> None:
+        self._root = root
+        self._binding = binding
+
+    @property
+    def principal_id(self) -> str:
+        return self._binding.principal_id
+
+    @property
+    def project_id(self) -> str:
+        return self._binding.project_id
+
+    @property
+    def policy_digest(self) -> str | None:
+        return self._binding.policy_digest
+
+    @property
+    def runtime_id(self) -> str | None:
+        return self._binding.runtime_id
+
+    async def log(
+        self,
+        action: str,
+        target: str,
+        result: str,
+        detail: dict[str, Any] | None = None,
+        session_id: str | None = None,
+        *,
+        task_id: str | None = None,
+        operation_id: str | None = None,
+        authority_generation: int | None = None,
+        source_transport: str | None = None,
+    ) -> int:
+        """Persist an event with this request's immutable attribution."""
+        return await self._root._log_for_binding(
+            self._binding,
+            action,
+            target,
+            result,
+            detail,
+            session_id,
+            task_id=task_id,
+            operation_id=operation_id,
+            authority_generation=authority_generation,
+            source_transport=(
+                source_transport
+                if source_transport is not None
+                else self._binding.source_transport
+            ),
+        )
+
+    async def log_permission(
+        self,
+        tool_name: str,
+        target: str,
+        approved: bool,
+        reason: str = "",
+        session_id: str | None = None,
+        *,
+        task_id: str | None = None,
+        operation_id: str | None = None,
+        authority_generation: int | None = None,
+        source_transport: str | None = None,
+    ) -> int:
+        return await self.log(
+            tool_name,
+            target,
+            RESULT_APPROVED if approved else RESULT_DENIED,
+            {"reason": reason},
+            session_id,
+            task_id=task_id,
+            operation_id=operation_id,
+            authority_generation=authority_generation,
+            source_transport=source_transport,
+        )
+
+    async def log_tool(
+        self,
+        tool_name: str,
+        target: str,
+        success: bool,
+        duration_ms: int = 0,
+        error: str = "",
+        session_id: str | None = None,
+        *,
+        task_id: str | None = None,
+        operation_id: str | None = None,
+        authority_generation: int | None = None,
+        source_transport: str | None = None,
+    ) -> int:
+        return await self.log(
+            tool_name,
+            target,
+            RESULT_SUCCESS if success else RESULT_ERROR,
+            {"duration_ms": duration_ms, "error": error},
+            session_id,
+            task_id=task_id,
+            operation_id=operation_id,
+            authority_generation=authority_generation,
+            source_transport=source_transport,
+        )
+
+    async def log_security_event(
+        self,
+        event_type: str,
+        tool_name: str,
+        reason: str,
+        detail: dict[str, Any] | None = None,
+        session_id: str | None = None,
+        *,
+        task_id: str | None = None,
+        operation_id: str | None = None,
+        authority_generation: int | None = None,
+        source_transport: str | None = None,
+    ) -> int:
+        return await self.log(
+            f"security:{event_type}",
+            f"{tool_name}:{reason}",
+            RESULT_DENIED,
+            detail,
+            session_id,
+            task_id=task_id,
+            operation_id=operation_id,
+            authority_generation=authority_generation,
+            source_transport=source_transport,
+        )
+
+    async def query(
+        self,
+        action: str | None = None,
+        result: str | None = None,
+        since: str | datetime | None = None,
+        until: str | datetime | None = None,
+        limit: int = 100,
+    ) -> list[AuditEntry]:
+        """Query only this binding's principal/project rows."""
+        return await self._root._query_for_binding(
+            self._binding,
+            action=action,
+            result=result,
+            since=since,
+            until=until,
+            limit=limit,
+        )
+
+    async def verify_anchor(self) -> None:
+        """Verify the shared chain without taking lifecycle ownership."""
+        await self._root.verify_anchor()
+
+    def close(self) -> None:
+        """Keep the shared logger alive; ownership remains at the server."""
 
 
 class AuditLogger:
@@ -264,6 +443,66 @@ class AuditLogger:
                 # caller can refuse to start the runtime.
                 logger.exception("failed to open audit chain anchor")
                 raise
+
+    @property
+    def principal_id(self) -> str:
+        """Return the root logger's default principal binding."""
+        return self._principal_id
+
+    @property
+    def runtime_id(self) -> str | None:
+        """Return the root logger's default runtime binding."""
+        return self._runtime_id
+
+    @property
+    def policy_digest(self) -> str | None:
+        """Return the policy digest sealed into the root logger."""
+        return self._policy_digest
+
+    @property
+    def project_id(self) -> str:
+        """Return the project scope sealed into the root logger."""
+        return self._project_id
+
+    def bind(
+        self,
+        *,
+        principal_id: str,
+        project_id: str,
+        policy_digest: str | None = None,
+        runtime_id: str | None = None,
+        source_transport: str | None = None,
+    ) -> BoundAuditLogger:
+        """Create a request-scoped sink without duplicating the writer.
+
+        A binding may change the principal and runtime attribution, but it
+        may never change the project or effective policy owned by this root
+        logger.  This is the fail-closed seam used by RPC services.
+        """
+        if not isinstance(principal_id, str) or not principal_id.strip():
+            raise ValueError("audit binding requires a non-empty principal_id")
+        if project_id != self._project_id:
+            raise ValueError("audit binding project_id does not match root logger")
+        if (
+            policy_digest is not None
+            and self._policy_digest is not None
+            and policy_digest != self._policy_digest
+        ):
+            raise ValueError("audit binding policy_digest does not match root logger")
+        return BoundAuditLogger(
+            self,
+            AuditBinding(
+                principal_id=principal_id,
+                project_id=project_id,
+                policy_digest=(
+                    self._policy_digest
+                    if policy_digest is None
+                    else policy_digest
+                ),
+                runtime_id=runtime_id,
+                source_transport=source_transport,
+            ),
+        )
 
     def _open_log_fd(self, log_path: str | os.PathLike[str]) -> None:
         """H1: open and validate the audit log file via an ``openat``
@@ -557,6 +796,40 @@ class AuditLogger:
         M4 batch 3.1.16A-5-1b: ``project_id`` likewise comes from the
         logger's construction — it is a runtime property, not per-event.
         """
+        return await self._log_for_binding(
+            AuditBinding(
+                principal_id=self._principal_id,
+                project_id=self._project_id,
+                policy_digest=self._policy_digest,
+                runtime_id=self._runtime_id,
+                source_transport=source_transport,
+            ),
+            action,
+            target,
+            result,
+            detail,
+            session_id,
+            task_id=task_id,
+            operation_id=operation_id,
+            authority_generation=authority_generation,
+            source_transport=source_transport,
+        )
+
+    async def _log_for_binding(
+        self,
+        binding: AuditBinding,
+        action: str,
+        target: str,
+        result: str,
+        detail: dict[str, Any] | None = None,
+        session_id: str | None = None,
+        *,
+        task_id: str | None = None,
+        operation_id: str | None = None,
+        authority_generation: int | None = None,
+        source_transport: str | None = None,
+    ) -> int:
+        """Write one event under a validated identity binding."""
         detail_json = json.dumps(detail or {}, ensure_ascii=False, sort_keys=True)
         if self._anchor is not None:
             try:
@@ -578,10 +851,18 @@ class AuditLogger:
                     result=result,
                     detail_json=detail_json,
                     session_id=session_id,
+                    principal_id=binding.principal_id,
+                    runtime_id=binding.runtime_id,
+                    policy_digest=binding.policy_digest,
+                    project_id=binding.project_id,
                     task_id=task_id,
                     operation_id=operation_id,
                     authority_generation=authority_generation,
-                    source_transport=source_transport,
+                    source_transport=(
+                        source_transport
+                        if source_transport is not None
+                        else binding.source_transport
+                    ),
                 )
             except Exception:
                 logger.debug(
@@ -596,14 +877,18 @@ class AuditLogger:
                 result=result,
                 detail=detail_json,
                 session_id=session_id,
-                principal_id=self._principal_id,
-                runtime_id=self._runtime_id,
+                principal_id=binding.principal_id,
+                runtime_id=binding.runtime_id,
                 task_id=task_id,
                 operation_id=operation_id,
-                policy_digest=self._policy_digest,
+                policy_digest=binding.policy_digest,
                 authority_generation=authority_generation,
-                source_transport=source_transport,
-                project_id=self._project_id,
+                source_transport=(
+                    source_transport
+                    if source_transport is not None
+                    else binding.source_transport
+                ),
+                project_id=binding.project_id,
             )
             if self._anchor is not None:
                 try:
@@ -628,6 +913,10 @@ class AuditLogger:
         result: str,
         detail_json: str,
         session_id: str | None,
+        principal_id: str,
+        runtime_id: str | None,
+        policy_digest: str | None,
+        project_id: str,
         task_id: str | None = None,
         operation_id: str | None = None,
         authority_generation: int | None = None,
@@ -654,12 +943,12 @@ class AuditLogger:
             "result": result,
             "detail": json.loads(detail_json),
             "session_id": session_id,
-            "principal_id": self._principal_id,
-            "runtime_id": self._runtime_id,
-            "policy_digest": self._policy_digest,
+            "principal_id": principal_id,
+            "runtime_id": runtime_id,
+            "policy_digest": policy_digest,
             # M4 batch 3.1.16A-5-1b: project identity stamp so the file
             # audit trail matches the DB row 1:1.
-            "project_id": self._project_id,
+            "project_id": project_id,
         }
         # Only include per-event context when set, so the file line stays
         # compact for the common case (no task / operation / transport).
@@ -1228,8 +1517,51 @@ class AuditLogger:
         different principal's events.  Both are explicit opt-ins; the
         default is fail-closed isolation.
         """
+        binding = AuditBinding(
+            principal_id=self._principal_id,
+            project_id=self._project_id,
+            policy_digest=self._policy_digest,
+            runtime_id=self._runtime_id,
+        )
+        if principal_id not in {"__default__", self._principal_id}:
+            # Preserve the explicit administrative query escape hatch on the
+            # root logger.  Request-bound sinks never expose this parameter.
+            return await self._query_for_binding(
+                binding,
+                action=action,
+                result=result,
+                since=since,
+                until=until,
+                limit=limit,
+                principal_override=principal_id,
+                principal_override_set=True,
+            )
+        return await self._query_for_binding(
+            binding,
+            action=action,
+            result=result,
+            since=since,
+            until=until,
+            limit=limit,
+        )
+
+    async def _query_for_binding(
+        self,
+        binding: AuditBinding,
+        *,
+        action: str | None = None,
+        result: str | None = None,
+        since: str | datetime | None = None,
+        until: str | datetime | None = None,
+        limit: int = 100,
+        principal_override: str | None = None,
+        principal_override_set: bool = False,
+    ) -> list[AuditEntry]:
+        """Query rows for one binding; never widen a bound project."""
         effective_principal = (
-            self._principal_id if principal_id == "__default__" else principal_id
+            binding.principal_id
+            if not principal_override_set
+            else principal_override
         )
         rows = await self.db.query_audit_logs(
             action=action,
@@ -1238,7 +1570,7 @@ class AuditLogger:
             until=_normalize_time(until),
             limit=limit,
             principal_id=effective_principal,
-            project_id=self._project_id,
+            project_id=binding.project_id,
         )
         return [AuditEntry.from_row(row) for row in rows]
 

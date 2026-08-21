@@ -54,7 +54,13 @@ from khaos.db.state_root import project_id as compute_project_id
 from khaos.grpc_server import (
     serve_json_lines,
 )
-from khaos.memory import Memory, MemoryConfidence, MemoryScope, MemoryStore
+from khaos.memory import (
+    Memory,
+    MemoryConfidence,
+    MemoryScope,
+    MemoryStore,
+    SqliteMemoryRepository,
+)
 from khaos.permissions import PermissionEngine
 from khaos.runtime import RequestContext
 from khaos.scheduler import ScheduleConfig
@@ -165,7 +171,9 @@ async def test_acceptance_3_memory_store_stamps_project_id(tmp_path):
     """A5-1b #3: MemoryStore constructed with project_id stamps it on rows."""
     db = await _make_db(tmp_path / "khaos.db")
     try:
-        store = MemoryStore(db, principal_id="u1", project_id=PROJECT_ID_A)
+        store = MemoryStore(
+            SqliteMemoryRepository(db), principal_id="u1", project_id=PROJECT_ID_A
+        )
         memory = Memory(
             id=None, scope=MemoryScope.GLOBAL, key="k1", value="v1",
             confidence=MemoryConfidence.MEDIUM,
@@ -322,14 +330,18 @@ async def test_acceptance_9_memories_project_id_isolation_on_conflict(tmp_path):
     db = await _make_db(tmp_path / "khaos.db")
     try:
         # First write: stamps PROJECT_ID_A, value "v1".
-        store_a = MemoryStore(db, principal_id="u1", project_id=PROJECT_ID_A)
+        store_a = MemoryStore(
+            SqliteMemoryRepository(db), principal_id="u1", project_id=PROJECT_ID_A
+        )
         memory_a = Memory(
             id=None, scope=MemoryScope.GLOBAL, key="shared-key", value="v1",
             confidence=MemoryConfidence.MEDIUM,
         )
         await store_a.set(memory_a, namespace="private")
         # Second write with different project_id: must create a new row.
-        store_b = MemoryStore(db, principal_id="u1", project_id=PROJECT_ID_B)
+        store_b = MemoryStore(
+            SqliteMemoryRepository(db), principal_id="u1", project_id=PROJECT_ID_B
+        )
         memory_b = Memory(
             id=None, scope=MemoryScope.GLOBAL, key="shared-key", value="v2",
             confidence=MemoryConfidence.MEDIUM,

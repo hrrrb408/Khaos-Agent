@@ -13,7 +13,14 @@ from typing import AsyncIterator
 from khaos.agent import AgentConfig, AgentLoop, Message
 from khaos.agent.compressor import CompressionLevel, CompressionResult
 from khaos.db import Database
-from khaos.memory import Memory, MemoryConfidence, MemoryManager, MemoryScope, MemoryStore
+from khaos.memory import (
+    Memory,
+    MemoryConfidence,
+    MemoryManager,
+    MemoryScope,
+    MemoryStore,
+    SqliteMemoryRepository,
+)
 from khaos.modes import Mode, ModeManager
 from khaos.tools.scheduler import PermissionRequest, SchedulerEvent, ToolResult
 
@@ -227,7 +234,7 @@ class TestAgentLoopMemoryInjection:
         write_prompts(tmp_path)
         db = await create_test_db(tmp_path / "khaos.db")
         await db.create_session("s-memory")
-        store = MemoryStore(db)
+        store = MemoryStore(SqliteMemoryRepository(db))
         await store.set(
             Memory(
                 id=None,

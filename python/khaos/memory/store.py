@@ -25,7 +25,7 @@ from khaos.memory.models import (
     memory_from_row,
 )
 from khaos.memory.ownership import MemoryOwner
-from khaos.memory.repository import MemoryRepository, SqliteMemoryRepository
+from khaos.memory.repository import MemoryRepository
 from khaos.time_utils import utc_now_naive
 
 logger = logging.getLogger(__name__)
@@ -37,33 +37,28 @@ MAX_SEARCH_QUERY_LENGTH = 4096
 class MemoryStore:
     """Principal/project-bound memory aggregate.
 
-    The ``db`` positional argument is retained as a migration compatibility
-    seam.  New production code can inject a ``MemoryRepository`` directly;
-    when ``db`` is supplied, it is wrapped once by
-    :class:`SqliteMemoryRepository` and never accessed by this class again.
+    Persistence is an explicit port.  The store never accepts a ``Database``
+    object, so a caller cannot accidentally reintroduce SQL into this domain
+    facade.  SQLite callers construct :class:`SqliteMemoryRepository` at the
+    composition root and inject it here.
     """
 
     def __init__(
         self,
-        db: Any | None = None,
+        repository: MemoryRepository,
         *,
         principal_id: str = "legacy",
         project_id: str = "",
-        repository: MemoryRepository | None = None,
         audit_logger: Any | None = None,
+        audit_session_id: str | None = None,
     ) -> None:
-        if db is not None and repository is not None:
-            raise ValueError("pass either db or repository, not both")
-        if repository is None:
-            if db is None:
-                raise ValueError("a database or memory repository is required")
-            repository = SqliteMemoryRepository(db)
         self._repository = repository
         self._owner = MemoryOwner(
             principal_id=principal_id,
             project_id=project_id,
         )
         self._audit_logger = audit_logger
+        self._audit_session_id = audit_session_id
 
     @property
     def principal_id(self) -> str:
@@ -358,13 +353,14 @@ class MemoryStore:
 
         if self._audit_logger is None:
             return
+        effective_session_id = session_id or self._audit_session_id
         try:
             row_id = await self._audit_logger.log(
                 action,
                 target,
                 result,
                 detail,
-                session_id=session_id,
+                session_id=effective_session_id,
             )
             if row_id < 0:
                 logger.warning("audit logger rejected memory event: %s", action)

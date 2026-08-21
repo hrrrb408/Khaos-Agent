@@ -6,6 +6,7 @@ from khaos.memory import (
     MemoryManager,
     MemoryScope,
     MemoryStore,
+    SqliteMemoryRepository,
 )
 from khaos.modes import Mode
 
@@ -14,7 +15,7 @@ async def _manager(tmp_path, mode=Mode.CODING, budget=None, intent=""):
     db = Database(tmp_path / "khaos.db")
     await db.connect()
     await db.run_migrations()
-    store = MemoryStore(db)
+    store = MemoryStore(SqliteMemoryRepository(db))
     manager = MemoryManager(
         store,
         budget=budget,
@@ -81,4 +82,3 @@ async def test_update_from_conversation_phase1_noop(tmp_path):
 
     assert await manager.update_from_conversation([], Mode.CODING) == []
     await db.close()
-

@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from khaos.db import Database
-from khaos.memory import Memory, MemoryScope, MemoryStore
+from khaos.memory import Memory, MemoryScope, MemoryStore, SqliteMemoryRepository
 from khaos.modes import Mode, ModeManager
 from khaos.routing.router import create_default_router
 from khaos.skills import Skill, SkillManager, SkillRegistry
@@ -21,7 +21,7 @@ async def _ctx(tmp_path, **kw) -> TuiContext:
     await db.run_migrations()
     mode_manager = ModeManager(db, project_root=tmp_path)
     await mode_manager.load()
-    store = MemoryStore(db)
+    store = MemoryStore(SqliteMemoryRepository(db))
     return TuiContext(
         mode_manager=mode_manager,
         memory_store=store,
