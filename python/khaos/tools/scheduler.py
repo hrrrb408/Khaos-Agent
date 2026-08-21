@@ -21,7 +21,6 @@ from khaos.coding.execution.environment import is_non_inheritable_secret_key
 from khaos.coding.execution.identity import (
     container_command_identity,
     executable_identity,
-    trusted_system_executable,
 )
 from khaos.coding.execution.models import (
     FileSystemAccess,
@@ -33,16 +32,11 @@ from khaos.coding.execution.models import (
 from khaos.exceptions import PermissionDeniedError
 from khaos.permissions import (
     ApprovalMode,
-    GrantLifetime,
-    PermissionRule,
-    TransportClass,
-    is_interactive_transport,
 )
 from khaos.permissions.resource import (
     AuthorizationResource,
     resolve_authorization_resource,
 )
-from khaos.permissions.rules import typed_rule_from_authorization_resource
 from khaos.security.credential_broker import CredentialBroker
 from khaos.security.middleware import SecurityMiddleware
 from khaos.security.network_broker import (
@@ -63,9 +57,11 @@ from khaos.tools.approval_callback import (
     ConfirmCallback,
 )
 from khaos.tools.authorization import (
+    ToolAuthorization,
     build_approval_binding,
     build_permission_request,
 )
+from khaos.tools.authorization import tool_has_capability as _tool_has_capability
 from khaos.tools.budget import (
     ToolBudget,
     ToolBudgetReservation,
@@ -189,6 +185,7 @@ class ToolScheduler:
         # Approval adapters have their own bounded lifecycle owner. The
         # scheduler only projects PermissionRequest and consumes its result.
         self._approval_runner = ApprovalCallbackRunner()
+        self._tool_authorization = ToolAuthorization(permission_engine)
 
     def set_office_authority(self, authority: Any) -> None:
         """Register the shared OfficeMutationAuthority (called at startup)."""
@@ -473,49 +470,23 @@ class ToolScheduler:
                 continue
 
             source_transport = str(tool_context.get("source_transport") or "")
-            decision = await self.permission_engine.check(
-                tool_name=tool.name,
-                params=normalized["arguments"],
-                permission_level=tool.permission_level,
+            environment = tool_context.get("environment")
+            if not isinstance(environment, dict):
+                environment = {"PATH": os.environ.get("PATH", os.defpath)}
+            decision = await self._tool_authorization.decide(
+                tool=tool,
+                arguments=normalized["arguments"],
                 mode=mode,
                 resource=resource,
-                # Round-15 B-2: gate the read-only terminal auto-approve
-                # shortcut on an interactive transport so an unattended
-                # webhook/cron/rpc turn cannot auto-approve ``cat ~/.ssh/id_rsa``.
                 source_transport=source_transport,
                 session_id=str(tool_context.get("session_id") or session_id or ""),
                 task_id=str(tool_context.get("task_id") or ""),
                 workspace_id=str(tool_context.get("workspace_id") or ""),
-            )
-            if decision.approved == ApprovalMode.AUTO_APPROVE and _tool_has_capability(
-                tool, "process.execute"
-            ):
-                argv = _execution_argv_for_authority(
+                environment=environment,
+                executable_argv=_execution_argv_for_authority(
                     tool.name, normalized["arguments"]
-                )
-                environment = tool_context.get("environment")
-                if not isinstance(environment, dict):
-                    environment = {"PATH": os.environ.get("PATH", os.defpath)}
-                # Shell AST safety proves command semantics, but a shell
-                # command still contains an executable graph that cannot be
-                # reduced to one trusted argv[0] here.  Keep that path on the
-                # explicit approval route; direct argv tools may use the
-                # stronger fixed system-root identity check.
-                trusted = (
-                    tool.name != "terminal_shell"
-                    and bool(argv)
-                    and trusted_system_executable(argv, environment)
-                )
-                if not trusted:
-                    decision = replace(
-                        decision,
-                        approved=ApprovalMode.ASK_EVERY,
-                        requires_user_confirm=True,
-                        reason=(
-                            "read-only command executable is not a trusted "
-                            "system executable"
-                        ),
-                    )
+                ),
+            )
             self._advance_tool_phase(
                 normalized,
                 ToolPhase.PERMISSION_DECIDED,
@@ -783,46 +754,20 @@ class ToolScheduler:
                         )
                         continue
                     normalized["_approval_context"] = destructive_context
-                if confirmation.get("remember") and is_interactive_transport(
-                    source_transport
-                ):
-                    try:
-                        if resource is not None:
-                            resource_type, resource_spec = (
-                                typed_rule_from_authorization_resource(
-                                    resource, tool.permission_level
-                                )
-                            )
-                            remember_pattern = decision.target
-                        else:
-                            resource_type, resource_spec = "", None
-                            remember_pattern = confirmation.get(
-                                "pattern", decision.target
-                            )
-                        normalized["_remember_rule"] = PermissionRule(
-                            id=None,
-                            pattern=remember_pattern,
-                            permission_level=tool.permission_level,
-                            approval=ApprovalMode.AUTO_APPROVE,
-                            mode=mode,
-                            transport_class=TransportClass.INTERACTIVE.value,
-                            grant_lifetime=GrantLifetime.PROJECT_INTERACTIVE.value,
-                            session_id=session_id or "",
-                            task_id=str(tool_context.get("task_id") or ""),
-                            workspace_id=str(tool_context.get("workspace_id") or ""),
-                            created_by=f"approval:{source_transport}",
-                            resource_type=resource_type,
-                            resource_spec=resource_spec,
-                        )
-                    except (TypeError, ValueError) as exc:
-                        normalized["_remember_warning"] = (
-                            f"remember-rule rejected: typed resource invalid ({exc})"
-                        )
-                elif confirmation.get("remember"):
-                    normalized["_remember_warning"] = (
-                        "remember request ignored for unattended or unknown "
-                        "transport"
-                    )
+                remember_projection = self._tool_authorization.project_remember_rule(
+                    confirmation=confirmation,
+                    source_transport=source_transport,
+                    resource=resource,
+                    decision_target=decision.target,
+                    tool=tool,
+                    mode=mode,
+                    session_id=session_id or "",
+                    tool_context=tool_context,
+                )
+                if remember_projection.rule is not None:
+                    normalized["_remember_rule"] = remember_projection.rule
+                if remember_projection.warning:
+                    normalized["_remember_warning"] = remember_projection.warning
             self._advance_tool_phase(
                 normalized,
                 ToolPhase.APPROVAL_BOUND,
@@ -2646,16 +2591,6 @@ def _authority_identity(value: object) -> str:
     if isinstance(value, (tuple, list)):
         return json.dumps(list(value), separators=(",", ":"), ensure_ascii=False)
     return f"{type(value).__module__}.{type(value).__qualname__}"
-
-
-def _tool_has_capability(tool: object, capability_name: str) -> bool:
-    """Check the declarative capability contract, never a tool-name list."""
-    for capability in getattr(tool, "capabilities", ()):
-        name = getattr(capability, "name", "")
-        value = getattr(name, "value", name)
-        if str(value) == capability_name:
-            return True
-    return False
 
 
 def _default_environment_value(key: str) -> str:

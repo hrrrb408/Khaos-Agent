@@ -1,7 +1,13 @@
 """Tool registry skeleton."""
 
 from khaos.tools.approval_callback import ApprovalCallbackRunner
-from khaos.tools.authorization import build_approval_binding, build_permission_request
+from khaos.tools.authorization import (
+    RememberRuleProjection,
+    ToolAuthorization,
+    build_approval_binding,
+    build_permission_request,
+    tool_has_capability,
+)
 from khaos.tools.registry import (
     ToolCapability,
     ToolDefinition,
@@ -15,6 +21,8 @@ from khaos.tools.result_store import ToolResultStore
 
 __all__ = [
     "ApprovalCallbackRunner",
+    "RememberRuleProjection",
+    "ToolAuthorization",
     "ToolCapability",
     "ToolDefinition",
     "ToolInvocationBroker",
@@ -25,4 +33,5 @@ __all__ = [
     "build_permission_request",
     "create_builtin_registry",
     "create_runtime_registry",
+    "tool_has_capability",
 ]

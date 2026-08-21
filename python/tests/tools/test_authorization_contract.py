@@ -1,9 +1,18 @@
 """Contract tests for approval binding/request projections."""
 
+import asyncio
+import inspect
+import json
 from types import SimpleNamespace
 
+from khaos.permissions import ApprovalMode, PermissionDecision
 from khaos.permissions.resource import AuthorizationResource, AuthorizationResourceKind
-from khaos.tools.authorization import build_approval_binding, build_permission_request
+from khaos.tools.authorization import (
+    ToolAuthorization,
+    build_approval_binding,
+    build_permission_request,
+)
+from khaos.tools.scheduler import ToolScheduler
 
 
 def _resource() -> AuthorizationResource:
@@ -14,7 +23,11 @@ def _resource() -> AuthorizationResource:
         task_id="task",
         workspace_id="workspace",
         workspace_generation=3,
-        canonical_target="workspace:file.txt",
+        canonical_target=json.dumps(
+            {"path": "/workspace/file.txt", "tool": "write_file"},
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
         root_device=1,
         root_inode=2,
     )
@@ -27,6 +40,24 @@ def _tool() -> SimpleNamespace:
         schema_digest="s" * 64,
         security_digest="t" * 64,
     )
+
+
+def _process_tool() -> SimpleNamespace:
+    return SimpleNamespace(
+        name="terminal_argv",
+        permission_level="execute",
+        capabilities=(SimpleNamespace(name="process.execute"),),
+        schema_digest="s" * 64,
+        security_digest="t" * 64,
+    )
+
+
+class _PermissionEngine:
+    def __init__(self, decision: PermissionDecision) -> None:
+        self.decision = decision
+
+    async def check(self, **_kwargs):
+        return self.decision
 
 
 def test_binding_projection_binds_arguments_profile_policy_and_resource() -> None:
@@ -100,3 +131,73 @@ def test_request_projection_reuses_registered_binding_identity() -> None:
     assert request.arguments_digest == binding.arguments_digest
     assert request.profile_digest == binding.profile_digest
     assert request.step_execution_digest == "e" * 64
+
+
+def test_tool_authorization_forces_untrusted_process_auto_approval_to_confirm() -> None:
+    authorization = ToolAuthorization(
+        _PermissionEngine(
+            PermissionDecision(
+                approved=ApprovalMode.AUTO_APPROVE,
+                reason="remembered",
+                target="process:/tmp/fake",
+            )
+        )
+    )
+
+    decision = asyncio.run(
+        authorization.decide(
+            tool=_process_tool(),
+            arguments={"argv": ["/definitely-not-trusted/khaos"]},
+            mode="coding",
+            resource=None,
+            source_transport="cli",
+            session_id="session",
+            task_id="task",
+            workspace_id="workspace",
+            environment={"PATH": "/usr/bin"},
+            executable_argv=("/definitely-not-trusted/khaos",),
+        )
+    )
+
+    assert decision.approved == ApprovalMode.ASK_EVERY
+    assert decision.requires_user_confirm is True
+
+
+def test_tool_authorization_projects_interactive_remember_rule() -> None:
+    projection = ToolAuthorization.project_remember_rule(
+        confirmation={"remember": True},
+        source_transport="cli",
+        resource=_resource(),
+        decision_target="workspace:file.txt",
+        tool=_tool(),
+        mode="coding",
+        session_id="session",
+        tool_context={"task_id": "task", "workspace_id": "workspace"},
+    )
+
+    assert projection.warning == ""
+    assert projection.rule is not None
+    assert projection.rule.resource_type
+    assert projection.rule.grant_lifetime == "project_interactive"
+
+
+def test_tool_authorization_rejects_remember_for_unattended_transport() -> None:
+    projection = ToolAuthorization.project_remember_rule(
+        confirmation={"remember": True},
+        source_transport="webhook",
+        resource=None,
+        decision_target="workspace:file.txt",
+        tool=_tool(),
+        mode="coding",
+        session_id="session",
+        tool_context={},
+    )
+
+    assert projection.rule is None
+    assert "ignored for unattended" in projection.warning
+
+
+def test_scheduler_delegates_permission_decision_to_authorization_owner() -> None:
+    source = inspect.getsource(ToolScheduler)
+    assert "self.permission_engine.check" not in source
+    assert "self._tool_authorization.decide" in source
