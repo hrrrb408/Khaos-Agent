@@ -21,10 +21,17 @@ from khaos.agent.core import Message
 from khaos.db.connection import (
     DatabaseClosingError,  # noqa: F401 - compatibility export
     DatabaseConnection,
+    READER_DRAIN_TIMEOUT,
     _AsyncCursor,  # noqa: F401 - compatibility export
     _AsyncSqliteFallback,  # noqa: F401 - compatibility export
     aiosqlite,  # noqa: F401 - tests patch the shared driver module
 )
+
+# Compatibility name for released tests and integrations.  The lifecycle
+# owner is ``db.connection.READER_DRAIN_TIMEOUT``; this alias must not become
+# a second configuration knob and is scheduled for removal after callers
+# migrate to the canonical owner.
+_READER_DRAIN_TIMEOUT = READER_DRAIN_TIMEOUT
 from khaos.db.repositories import SessionRepository
 from khaos.time_utils import utc_now_naive
 

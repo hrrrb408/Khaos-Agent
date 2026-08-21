@@ -10,7 +10,8 @@ from pathlib import Path
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
-from khaos.security.authorityd_protocol import RemoteAuditUnavailableError, _canonical
+from khaos.security.authorityd_protocol import RemoteAuditUnavailableError
+from khaos.security.protocol_boundary import canonical_json_bytes
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,11 +42,11 @@ class RemoteWormAuditWriter:
             raise ValueError("remote WORM audit CA file must be an absolute regular file")
 
     def append(self, record: dict[str, object]) -> None:
-        body = _canonical(
+        body = canonical_json_bytes(
             {
                 "schema_version": 1,
                 "record": record,
-                "record_digest": hashlib.sha256(_canonical(record)).hexdigest(),
+                "record_digest": hashlib.sha256(canonical_json_bytes(record)).hexdigest(),
             }
         )
         headers = {
