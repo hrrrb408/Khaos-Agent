@@ -101,7 +101,10 @@ def workflow_actions() -> tuple[list[str], list[str]]:
 
 
 def render() -> str:
-    protocol_source = read(ROOT / "python" / "khaos" / "grpc_server.py")
+    # Protocol constants and negotiation are owned by the standalone RPC
+    # boundary.  Keep the inventory tied to that owner instead of the
+    # transport compatibility facade.
+    protocol_source = read(ROOT / "python" / "khaos" / "rpc" / "protocol.py")
     protocol_version = re.search(r"^RPC_PROTOCOL_VERSION\s*=\s*(\d+)", protocol_source, re.MULTILINE)
     protocol_min = re.search(r"^RPC_PROTOCOL_MIN_VERSION\s*=\s*(\d+)", protocol_source, re.MULTILINE)
     protocol_max = re.search(r"^RPC_PROTOCOL_MAX_VERSION\s*=\s*(\d+)", protocol_source, re.MULTILINE)
@@ -149,6 +152,7 @@ def render() -> str:
         ("python/khaos/security/shell_semantics.py", sha256(ROOT / "python" / "khaos" / "security" / "shell_semantics.py")),
         ("python/khaos/coding/planning/security_identities.py", sha256(ROOT / "python" / "khaos" / "coding" / "planning" / "security_identities.py")),
         ("python/khaos/coding/workspace/boundary.py", sha256(ROOT / "python" / "khaos" / "coding" / "workspace" / "boundary.py")),
+        ("python/khaos/rpc/protocol.py", sha256(ROOT / "python" / "khaos" / "rpc" / "protocol.py")),
         ("rust/khaos-core/src/bin/khaos-exec-launcher.rs", sha256(ROOT / "rust" / "khaos-core" / "src" / "bin" / "khaos-exec-launcher.rs")),
         ("rust/khaos-core/src/bin/khaos-sandbox-launcher.rs", sha256(ROOT / "rust" / "khaos-core" / "src" / "bin" / "khaos-sandbox-launcher.rs")),
         ("python/khaos/grpc_server.py", sha256(ROOT / "python" / "khaos" / "grpc_server.py")),

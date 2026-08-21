@@ -17,8 +17,8 @@
 
 ## Import reachability result
 
-- Reachable repository modules: `170`.
-- Resolved import edges: `1032`.
+- Reachable repository modules: `171`.
+- Resolved import edges: `1035`.
 - Forbidden production edges: `0`.
 - Unresolved internal edges: `0`.
 
@@ -135,6 +135,7 @@
 - `khaos.rpc`
 - `khaos.rpc.audit_service`
 - `khaos.rpc.memory_service`
+- `khaos.rpc.protocol`
 - `khaos.rpc.session_service`
 - `khaos.runtime`
 - `khaos.runtime.authority`
