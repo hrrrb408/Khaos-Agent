@@ -17,7 +17,7 @@ from khaos.coding.execution.models import ResolvedSpawnPlan
 from khaos.security.middleware import SecurityMiddleware
 from khaos.tools.registry import ToolInvocationBroker
 from khaos.tools.result_codec import ToolResultCodec
-from khaos.tools.scheduler_models import EffectOutcome
+from khaos.tools.scheduler_models import ToolExecutionOutcome
 
 
 class ToolExecutionCoordinator:
@@ -52,7 +52,7 @@ class ToolExecutionCoordinator:
         timeout: float,
         default_effect_status: str,
         reconciliation_hint: str,
-    ) -> EffectOutcome:
+    ) -> ToolExecutionOutcome:
         """Invoke a handler with an authority-bound, bounded context."""
         invocation_context = dict(tool_context)
         invocation_context["process_authority"] = self._process_authority

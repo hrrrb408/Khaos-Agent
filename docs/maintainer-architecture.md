@@ -98,7 +98,9 @@ KHAOS.md / AGENTS.md
 | `python/khaos/coding/workspace/artifacts.py` | ChangeSet artifact 的 bounded no-follow read/write/copy、digest/length 校验和 exclusive publish | artifact 文件效果唯一 owner；不决定 workspace ownership、quota registration 或 lifecycle transition |
 | `python/khaos/coding/workspace/errors.py` | workspace-domain error type | `WorkspaceError` 唯一 owner；manager/application/artifact 共享同一错误边界 |
 | `python/khaos/coding/workspace/git_process.py` | trusted Git subprocess spawn/adoption, bounded pipes, termination and quarantine | `TrustedGitProcessOwner` 唯一进程生命周期 owner；`TrustedGitRunner` 只消费它并拥有 Git effect/authority 语义 |
-| `python/khaos/scheduler/engine.py` | 任务状态、持久化、调度、执行、恢复和审计 | `scheduler/calculator.py` 已拥有纯 schedule 计算；后续拆 schedule repository、due-item selector、execution coordinator、recovery worker |
+| `python/khaos/scheduler/engine.py` | 任务生命周期、tick 编排、executor ownership、控制操作和恢复协调 | `scheduler/repository.py` 拥有 project-scoped persistence port；`scheduler/due_selector.py` 拥有纯 due selection；后续继续拆 execution coordinator/recovery worker |
+| `python/khaos/scheduler/repository.py` | scheduled-task CRUD、identity/CAS、lease、recovery 和 operation-journal 的 scheduler persistence port | `ScheduledTaskRepository` 绑定 project scope；不拥有 SQLite connection/schema 或 engine lifecycle |
+| `python/khaos/scheduler/due_selector.py` | enabled/PENDING/next-run/pending-marker/in-flight 的纯候选筛选 | `DueTaskSelector` 唯一拥有 due selection；不修改任务、不访问 DB、不启动 executor |
 | `python/khaos/runtime/factory.py` | 依赖装配和兼容参数转换 | 保留为唯一 composition root；业务逻辑不得回流到 factory |
 | `python/khaos/security/authorityd.py`、`authorityd_protocol.py` | authority daemon lifecycle、签名 receipt、审计事件、socket framing；历史上各自保留 canonical/digest 包装器 | `security/protocol_boundary.py` 统一 canonical JSON/digest；authorityd 只拥有 authority 状态机和 transport 适配 |
 
@@ -222,7 +224,8 @@ REQUESTED -> SNAPSHOT_BOUND -> RUNNING -> PROOF_RECORDED
 ### Phase 4：计划、验证和调度
 
 - 拆分 approval store 与 CronEngine，显式区分 ledger、read model、recovery worker；纯 schedule
-  计算已落在 `python/khaos/scheduler/calculator.py`，engine 不再内嵌 cron 解析。
+  计算已落在 `python/khaos/scheduler/calculator.py`，scheduler persistence port 与 due
+  selector 已落位，engine 不再直接调用 Database task API 或内联 due filter。
 - 删除已经没有调用者的兼容分支，更新 schema/ADR 和迁移文档。
 
 ### Phase 5：持续维护
