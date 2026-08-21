@@ -8,7 +8,6 @@ import os
 import shlex
 import uuid
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
 from pathlib import Path
 
 from khaos.agent.core import Message
@@ -21,16 +20,7 @@ from khaos.config import (
 from khaos.exceptions import ModelUnavailableError
 from khaos.routing.model_client import ModelClient
 from khaos.routing.provider import ModelSpec, ProviderConfig, ProviderManager
-
-
-@dataclass(frozen=True)
-class RoutingRule:
-    """Mapping from function key to primary and fallback model names."""
-
-    function: str
-    primary_model: str
-    fallback_models: list[str] = field(default_factory=list)
-    prefer_coding_model: bool = False
+from khaos.routing.table import RoutingRule, RoutingTable
 
 
 class ModelRouter:
@@ -45,11 +35,16 @@ class ModelRouter:
         self.provider_manager = provider_manager or _default_provider_manager()
         self.mock_response = mock_response
         self.model_client = model_client or ModelClient()
-        self._rules: dict[str, RoutingRule] = {}
+        self._routing_table = RoutingTable.empty()
+
+    @property
+    def _rules(self):
+        """Read-only compatibility view of the current routing table."""
+        return self._routing_table.rules
 
     def set_rule(self, function: str, rule: RoutingRule) -> None:
         """Register or replace a routing rule."""
-        self._rules[function] = rule
+        self._routing_table = self._routing_table.with_rule(function, rule)
 
     async def resolve(self, function: str) -> str:
         """Resolve a function key to a model name, preserving P0 test API."""
@@ -57,7 +52,7 @@ class ModelRouter:
 
     async def resolve_model(self, function: str) -> ModelSpec:
         """Resolve a function key to the first available model spec."""
-        rule = self._rules.get(function)
+        rule = self._routing_table.get(function)
         if rule is None:
             raise ModelUnavailableError(f"no routing rule for function: {function}")
         for model_name in [rule.primary_model, *rule.fallback_models]:
@@ -107,7 +102,7 @@ class ModelRouter:
         outputs.  Instead we raise immediately so the caller can surface
         the partial-output failure.
         """
-        rule = self._rules.get(function)
+        rule = self._routing_table.get(function)
         if rule is None:
             raise ModelUnavailableError(f"no routing rule for function: {function}")
         errors: list[str] = []
