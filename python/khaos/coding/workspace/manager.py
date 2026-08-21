@@ -16,7 +16,6 @@ from pathlib import Path, PurePosixPath
 from typing import Any, TypeVar
 
 from khaos.coding.workspace.boundary import (
-    PROTECTED_WORKSPACE_NAMES,
     SafePathError,
     SafeWorkspaceFS,
     WorkspaceBoundaryError,
@@ -34,6 +33,10 @@ from khaos.coding.workspace.models import (
     TaskWorkspace,
     WorkspaceState,
     WorkspaceTransition,
+)
+from khaos.coding.workspace.policy import (
+    PROTECTED_WORKSPACE_NAMES,
+    path_reaches_protected_metadata,
 )
 from khaos.coding.workspace.storage import (
     WorkspaceMutation,
@@ -140,7 +143,7 @@ def _safe_workspace_target(
     path = PurePosixPath(relative)
     if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
         raise WorkspaceError("workspace path is not relative and normalized")
-    if any(part.casefold() in PROTECTED_WORKSPACE_NAMES for part in path.parts):
+    if path_reaches_protected_metadata(path):
         raise WorkspaceError("workspace path reaches protected metadata")
     root = workspace.worktree_path.resolve(strict=True)
     target = workspace.worktree_path.joinpath(*path.parts)

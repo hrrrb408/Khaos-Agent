@@ -1312,7 +1312,7 @@ class MacOSSandboxBackend:
             f'(allow file-write* (subpath "{_seatbelt_escape(path)}"))'
             for path in write_roots
         )
-        from khaos.coding.workspace.boundary import PROTECTED_WORKSPACE_NAMES
+        from khaos.coding.workspace.policy import PROTECTED_WORKSPACE_NAMES
 
         protected_write_rules = "".join(
             f'(deny file-write* (literal "{_seatbelt_escape(path)}"))'
@@ -1714,7 +1714,7 @@ class LinuxBubblewrapBackend:
             "--bind" if writable else "--ro-bind", workspace_mount, self.SANDBOX_WORKDIR,
         ]
         if writable:
-            from khaos.coding.workspace.boundary import PROTECTED_WORKSPACE_NAMES
+            from khaos.coding.workspace.policy import PROTECTED_WORKSPACE_NAMES
 
             for name in sorted(PROTECTED_WORKSPACE_NAMES):
                 metadata = canonical_worktree / name

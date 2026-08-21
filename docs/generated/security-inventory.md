@@ -61,12 +61,12 @@
 - `python/khaos/coding/execution/identity.py`: `f5b21dd9098def1ea894b4830181fd9a6be1196b00235a404027794f8b4b0bef`
 - `python/khaos/coding/execution/models.py`: `bc6cee60bd4b1e73edaabc75e41b46810b5a5d571425ee587f188c64d85d71e0`
 - `python/khaos/coding/execution/native_launcher.py`: `87bb0b0dea2ad42c0d7bdb12f08abf9c15df2fff3ba2d6a2ecbbf05356f43132`
-- `python/khaos/coding/execution/platform.py`: `2749cd54298a06dacddb9309265d6883e568ca1d4c6d41450a7b109443182618`
+- `python/khaos/coding/execution/platform.py`: `a077b49da485ba297ad603e9f2c0c9a022728d049605e160461612d5f1dee38d`
 - `python/khaos/coding/execution/resource_owner.py`: `9304e64dda07b968159333fab1abae603ca19b43c972a2794c77b65dd06b52e8`
 - `python/khaos/coding/execution/service.py`: `bfce34ed38e3c77ab93ae68ab6a83e12c4de31ec6a3ed0dd8fc8b4d33c089ac6`
 - `python/khaos/coding/execution/binding.py`: `99f3d8eb14d80a837ecf0f0d076d556ccdb366b8798c9e0fde6c69d0bb1a5501`
 - `python/khaos/coding/execution/supervisor.py`: `cd5b480602bb56ca230e0ebc8594202c54933527fba781b20aeda3b05343c3a8`
-- `python/khaos/coding/workspace/manager.py`: `8d72fe0ac0ab49f852776f8c0612d67415e53d87eea57c928496575097c24011`
+- `python/khaos/coding/workspace/manager.py`: `b24ffc659b697fdb798dac111a58e5ea749f15e3ab6f6a251bf0e0a4d9d07be6`
 - `python/khaos/coding/workspace/trusted_git.py`: `a110987a2743f12753ce0dbdba98db43ee15958e0f8aa79f75ce63eb69326536`
 - `python/khaos/security/authority.py`: `635a96fe32200ac088bd15a9d051a7c2342f110f4f4461840aa64b7db4a6994c`
 - `python/khaos/security/authority_broker.py`: `08689e7723b52e25917285c267bd9a5ad71490ab4b2b69df081c6d9e2b1e75e2`
@@ -83,7 +83,8 @@
 - `python/khaos/security/principals.py`: `cc81b10ffa5a2a54b413a3b5cc37a85fe428253c7687be4dbf30b61610b4f8b0`
 - `python/khaos/security/shell_semantics.py`: `a44d1b70e10e94fb612fe0f9bd134b660ffae1a26d12949f3f4f5b08c9a3ff6b`
 - `python/khaos/coding/planning/security_identities.py`: `bcafd43a2920e087f4c064091d9faa04184739a4a8a6454aa654ffd134790a38`
-- `python/khaos/coding/workspace/boundary.py`: `e1a310f3bfe2b1ca085f02be14b11f35dd1b52e923c7a2893bb5a68b9a3ff91e`
+- `python/khaos/coding/workspace/boundary.py`: `5dcfcbad54001279f3baa0b0d60d6d28816180f7eba4ff49cc09f48136724367`
+- `python/khaos/coding/workspace/policy.py`: `7081f370dfd94078abfba0b03ecdd35cb1945e585df40b593f8436b207163b13`
 - `python/khaos/db/connection.py`: `ffc70a5796101cd2a629e5e05af0eaae865ac980e799dca3fec6330d0cb1005d`
 - `python/khaos/db/repositories/sessions.py`: `dfbaa4c24ac56fbec89a254ac24a55279b58e5ef305abe41e82e44d9c257b554`
 - `python/khaos/scheduler/calculator.py`: `af993de722689212943f4dddd7c5f60cd544c38fa98c9f0a7e7d2b699ddbe64c`
