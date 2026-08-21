@@ -33,7 +33,7 @@ enabled、PENDING、next-run、pending-persistence 和 in-flight execution 五�
 
 ## 证据与删除条件
 
-- `python/tests/scheduler/test_scheduler_boundaries.py` 覆盖 project-scoped repository
+- `python/tests/scheduler/test_scheduler_repository_due_selector_boundary.py` 覆盖 project-scoped repository
   调用和无副作用的 due selection。
 - `python/tests/scheduler/` 全部 202 个测试通过，证明 lease/recovery/control CAS、
   journal replay、生命周期和 tick 行为保持不变。
