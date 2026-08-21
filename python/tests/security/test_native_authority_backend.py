@@ -220,16 +220,21 @@ def test_darwin_backend_rejects_wrong_peer_uid(
         time.sleep(0.05)
     try:
         with _connect_when_listening(short_root / "backend.sock") as client:
-            client.sendall(b'{"protocol":1,"operation":"unknown"}\n')
-            deadline = time.time() + 5
             data = b""
-            while time.time() < deadline:
-                chunk = client.recv(4096)
-                if not chunk:
-                    break
-                data += chunk
-                if b"\n" in data:
-                    break
+            try:
+                client.sendall(b'{"protocol":1,"operation":"unknown"}\n')
+                deadline = time.time() + 5
+                while time.time() < deadline:
+                    chunk = client.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+                    if b"\n" in data:
+                        break
+            except (BrokenPipeError, ConnectionResetError):
+                # The daemon may complete peer-credential rejection before the
+                # client writes or reads. An immediate close is fail-closed.
+                pass
             # The wrong-UID peer must be rejected with an explicit error,
             # never a dispatched response.
             assert b"peer UID" in data or data == b""
