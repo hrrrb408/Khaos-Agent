@@ -15,7 +15,6 @@ from pathlib import Path
 from typing import Any, cast
 
 from khaos.agent.approval import StepExecutionAuthority
-from khaos.coding.execution.authority import ExecutionAuthority
 from khaos.coding.execution.capability import DockerSandboxDecision, SandboxDecision
 from khaos.coding.execution.environment import is_non_inheritable_secret_key
 from khaos.coding.execution.identity import (
@@ -68,9 +67,9 @@ from khaos.tools.budget import (
     ToolOutputBudgetExceeded,
     _measure_tool_output,
 )
+from khaos.tools.execution_coordinator import ToolExecutionCoordinator
 from khaos.tools.operation_store import OperationClaim, ToolOperationStore
 from khaos.tools.registry import ToolInvocationBroker, ToolRegistry
-from khaos.tools.result_codec import ToolResultCodec
 from khaos.tools.result_store import ToolResultStore
 from khaos.tools.scheduler_models import (
     DELIVERY_AUDIT_DEGRADED,
@@ -158,6 +157,11 @@ class ToolScheduler:
             max_processes_per_workspace=self.budget.max_processes_per_workspace,
             output_limit=self.budget.max_output_per_tool,
         )
+        self._execution_coordinator = ToolExecutionCoordinator(
+            invocation_broker=self.invocation_broker,
+            security_middleware=self.security_middleware,
+            process_authority=self.process_authority,
+        )
         # H1: optional shared OfficeMutationAuthority. Set by the runtime
         # factory so Office copy/move are fenced against cancellation/timeout.
         self.office_authority: Any = None
@@ -177,6 +181,7 @@ class ToolScheduler:
     def set_office_authority(self, authority: Any) -> None:
         """Register the shared OfficeMutationAuthority (called at startup)."""
         self.office_authority = authority
+        self._execution_coordinator.set_office_authority(authority)
 
     def bind_server_operation_key(
         self,
@@ -1064,52 +1069,16 @@ class ToolScheduler:
                 else uuid.uuid4().hex
             )
             handler_started = True
-            invocation_context = dict(tool_context)
-            invocation_context["process_authority"] = self.process_authority
-            sandbox = self.security_middleware.sandbox
-            if mode == "office" and sandbox is not None:
-                # Internal capability: never sourced from model arguments.
-                invocation_context["office_workspace_root"] = sandbox.workspace_root
-            # H1: the OfficeMutationAuthority (registered at startup) fences
-            # office mutations against cancellation/timeout side effects.
-            office_authority = getattr(self, "office_authority", None)
-            if mode == "office" and office_authority is not None:
-                invocation_context["office_authority"] = office_authority
-            if call.get("_approval_context") is not None:
-                invocation_context["approval_context"] = call["_approval_context"]
-            if isinstance(step_authority, StepExecutionAuthority):
-                invocation_context["step_execution_authority"] = step_authority
-                invocation_context["step_execution_digest"] = step_authority.digest()
-                invocation_context["step_authority_required"] = bool(
-                    call.get("_step_authority_required")
-                )
-            if call.get("_sandbox_decision") is not None:
-                invocation_context["sandbox_decision"] = call["_sandbox_decision"]
-            if call.get("_executable_identity"):
-                invocation_context["executable_identity"] = call[
-                    "_executable_identity"
-                ]
-            if call.get("_spawn_plan") is not None:
-                invocation_context["spawn_plan"] = call["_spawn_plan"]
-            if isinstance(step_authority, StepExecutionAuthority) and isinstance(
-                call.get("_spawn_plan"), ResolvedSpawnPlan
-            ):
-                invocation_context["execution_authority"] = ExecutionAuthority(
-                    step_authority=step_authority,
-                    spawn_plan=call["_spawn_plan"],
-                )
-            if call.get("_network_lease") is not None:
-                invocation_context["network_lease"] = call["_network_lease"]
-            invocation_context["effect_id"] = effect_id
-            output = await asyncio.wait_for(
-                self.invocation_broker.invoke(tool.name, mode=mode, context=invocation_context, **call.get("arguments", {})),
-                timeout=tool.timeout,
-            )
-            outcome = ToolResultCodec.normalize_effect_outcome(
-                output,
-                default_status=self._declared_effect_status(tool),
-                default_effect_id=effect_id,
-                default_reconciliation_hint=reconciliation_hint,
+            outcome = await self._execution_coordinator.invoke(
+                tool=tool,
+                call=call,
+                mode=mode,
+                tool_context=tool_context,
+                step_authority=step_authority,
+                effect_id=effect_id,
+                timeout=float(tool.timeout),
+                default_effect_status=self._declared_effect_status(tool),
+                reconciliation_hint=reconciliation_hint,
             )
             output = outcome.output
             handler_ok = outcome.ok

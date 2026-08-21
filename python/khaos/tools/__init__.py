@@ -8,6 +8,7 @@ from khaos.tools.authorization import (
     build_permission_request,
     tool_has_capability,
 )
+from khaos.tools.execution_coordinator import ToolExecutionCoordinator
 from khaos.tools.operation_store import OperationClaim, ToolOperationStore
 from khaos.tools.registry import (
     ToolCapability,
@@ -27,6 +28,7 @@ __all__ = [
     "ToolAuthorization",
     "ToolCapability",
     "ToolDefinition",
+    "ToolExecutionCoordinator",
     "ToolInvocationBroker",
     "ToolOperationStore",
     "ToolRegistry",
