@@ -19,6 +19,7 @@ from pathlib import Path
 
 import pytest
 from khaos.security.protocol_boundary import canonical_json_bytes
+from khaos.security.remote_audit import RemoteWormAuditWriter, writer_from_environment
 
 _SCRIPT = (
     Path(__file__).resolve().parents[2].parent / "scripts" / "run_worm_audit_receiver.py"
@@ -31,6 +32,13 @@ def _module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_production_receiver_enters_its_http_accept_loop() -> None:
+    source = _SCRIPT.read_text(encoding="utf-8")
+
+    assert "server.serve_forever()" in source
+    assert "threading.Event().wait()" not in source
 
 
 @pytest.fixture()
@@ -60,7 +68,12 @@ def worm_server(tmp_path: Path):
         urllib.request.HTTPSHandler(context=client_context),
     )
     try:
-        yield {"port": port, "opener": opener, "records": records}
+        yield {
+            "port": port,
+            "opener": opener,
+            "records": records,
+            "ca_cert": ca_cert,
+        }
     finally:
         server.shutdown()
         server.server_close()
@@ -127,6 +140,21 @@ def test_worm_health_and_audit_content_stay_local(worm_server) -> None:
     except urllib.error.HTTPError as exc:
         status = exc.code
     assert status == 404
+
+
+def test_remote_writer_uses_an_explicit_runner_ca(
+    worm_server, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    endpoint = f"https://127.0.0.1:{worm_server['port']}/append"
+    monkeypatch.setenv("KHAOS_AUDIT_WORM_ENDPOINT", endpoint)
+    monkeypatch.setenv("KHAOS_AUDIT_WORM_CA_FILE", str(worm_server["ca_cert"]))
+
+    writer = writer_from_environment()
+
+    assert isinstance(writer, RemoteWormAuditWriter)
+    assert writer.ca_file == worm_server["ca_cert"]
+    writer.append({"kind": "authority.grant", "grant_id": "explicit-ca"})
+    assert len(list(worm_server["records"].iterdir())) == 1
 
 
 def test_generated_chain_passes_strict_openssl_verification(tmp_path: Path) -> None:

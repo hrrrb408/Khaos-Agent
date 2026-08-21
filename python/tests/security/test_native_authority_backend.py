@@ -32,6 +32,7 @@ from khaos.security.authorityd_protocol import (
 )
 from khaos.security.authorityd_windows import build_backend_sddl
 from khaos.security.identity_isolation import (
+    AuthorityIdentityContract,
     IdentityIsolationError,
     peer_uid,
     peer_uid_darwin,
@@ -219,16 +220,21 @@ def test_darwin_backend_rejects_wrong_peer_uid(
         time.sleep(0.05)
     try:
         with _connect_when_listening(short_root / "backend.sock") as client:
-            client.sendall(b'{"protocol":1,"operation":"unknown"}\n')
-            deadline = time.time() + 5
             data = b""
-            while time.time() < deadline:
-                chunk = client.recv(4096)
-                if not chunk:
-                    break
-                data += chunk
-                if b"\n" in data:
-                    break
+            try:
+                client.sendall(b'{"protocol":1,"operation":"unknown"}\n')
+                deadline = time.time() + 5
+                while time.time() < deadline:
+                    chunk = client.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+                    if b"\n" in data:
+                        break
+            except (BrokenPipeError, ConnectionResetError):
+                # The daemon may complete peer-credential rejection before the
+                # client writes or reads. An immediate close is fail-closed.
+                pass
             # The wrong-UID peer must be rejected with an explicit error,
             # never a dispatched response.
             assert b"peer UID" in data or data == b""
@@ -334,6 +340,46 @@ def test_windows_token_groups_parsing_round_trip() -> None:
         _parse_token_group_sids(b"\x00" * 4, dereference=lambda _ptr: "")
 
 
+def test_windows_sid_conversion_uses_pointer_to_pointer_abi() -> None:
+    """ConvertSidToStringSidW must receive ``LPWSTR *``, not ``wchar_t **``."""
+    import ctypes
+
+    from khaos.security.authorityd_windows import _sid_to_string
+    from khaos.security.windows_native_ffi import LPWSTR
+
+    class _Advapi:
+        def ConvertSidToStringSidW(self, _sid: object, output: object) -> bool:
+            assert isinstance(output._obj, LPWSTR)  # type: ignore[attr-defined]
+            buffer = ctypes.create_unicode_buffer("S-1-5-18")
+            pointer = ctypes.cast(buffer, LPWSTR)
+            ctypes.memmove(
+                ctypes.byref(output._obj),  # type: ignore[attr-defined]
+                ctypes.byref(pointer),
+                ctypes.sizeof(pointer),
+            )
+            self.buffer = buffer
+            return True
+
+    class _Kernel:
+        def LocalFree(self, pointer: object) -> None:
+            assert isinstance(pointer, ctypes.c_void_p)
+
+    assert _sid_to_string(_Advapi(), _Kernel(), 1234) == "S-1-5-18"
+
+
+def test_windows_token_sid_buffers_outlive_their_embedded_pointers() -> None:
+    source = (
+        Path(__file__).resolve().parents[3]
+        / "python"
+        / "khaos"
+        / "security"
+        / "authorityd_windows.py"
+    ).read_text(encoding="utf-8")
+    assert "user_buffer = _query(TokenUser)" in source
+    assert "group_buffer = _query(TokenGroups)" in source
+    assert "return buffer.raw" not in source
+
+
 def test_windows_peer_trust_covers_service_sid_in_groups() -> None:
     """A Service SID (S-1-5-80-...) lives in TokenGroups, not TokenUser.
 
@@ -405,6 +451,58 @@ def test_e2e_probe_emits_exact_catalog_entry(tmp_path: Path) -> None:
         expected_policy_digest="a" * 64,
     )
     assert restored.catalog_digest == catalog.catalog_digest
+
+
+def test_native_e2e_creates_configured_effect_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "run_native_authority_e2e_effect_root",
+        Path(__file__).resolve().parents[2].parent
+        / "scripts"
+        / "run_native_authority_e2e.py",
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    effect_root = tmp_path / "nested" / "effect-root"
+    monkeypatch.setenv(module.E2E_EFFECT_ROOT_ENV, str(effect_root))
+
+    assert module._prepare_effect_root() == effect_root.absolute()
+    assert effect_root.is_dir()
+
+
+def test_native_e2e_client_does_not_require_a_unix_socket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "run_native_authority_e2e_native_client",
+        Path(__file__).resolve().parents[2].parent
+        / "scripts"
+        / "run_native_authority_e2e.py",
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    contract = AuthorityIdentityContract(501, 502, 503)
+    adapter = object()
+    monkeypatch.setattr(module, "read_contract_from_environment", lambda: contract)
+    monkeypatch.setattr(
+        module,
+        "build_native_authority_adapter",
+        lambda *, production, contract: adapter,
+    )
+
+    client = module._build_client()
+
+    assert client.socket_path is None
+    assert client.native_adapter is adapter
 
 
 def test_e2e_intent_reuses_the_grant_owner_context() -> None:

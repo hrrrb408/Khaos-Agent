@@ -660,9 +660,14 @@ class AuthorityBroker:
                         raise AuthorityBrokerError(
                             "production AuthorityBroker requires native identity handles"
                         ) from exc
+                    socket_path = (
+                        None
+                        if native_adapter is not None
+                        else Path(os.environ.get("KHAOS_AUTHORITYD_SOCKET", "/"))
+                    )
                     cls._default = AuthorityDaemonBroker(
                         AuthorityDaemonClient(
-                            Path(os.environ.get("KHAOS_AUTHORITYD_SOCKET", "/")),
+                            socket_path,
                             expected_authority_uid=contract.authority_uid,
                             native_adapter=native_adapter,
                         )

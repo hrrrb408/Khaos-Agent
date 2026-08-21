@@ -549,6 +549,16 @@ class _SubprocessNativeAdapter:
         expected_instance_id: str | None = None,
     ) -> dict[str, object]:
         """Verify the signed challenge-response for one native round trip."""
+        if response.get("ok") is False:
+            error_code = response.get("error_code", "native_authority_rejected")
+            detail = response.get("error", "native authority rejected the request")
+            if not isinstance(error_code, str) or not error_code:
+                error_code = "native_authority_rejected"
+            if not isinstance(detail, str) or not detail:
+                detail = "native authority rejected the request"
+            raise NativeAuthorityError(
+                f"native authority request rejected: {error_code}: {detail}"
+            )
         if response.get("native_transport") != self.expected_transport:
             raise NativeAuthorityError("native authority response transport is unbound")
         attestation = response.get("attestation")

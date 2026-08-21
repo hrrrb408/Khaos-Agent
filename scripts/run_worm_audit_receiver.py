@@ -25,7 +25,6 @@ import json
 import os
 import ssl
 import tempfile
-import threading
 from pathlib import Path
 
 
@@ -183,7 +182,11 @@ class _WormHandler(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, format: str, *args: object) -> None:
         # Keep CI logs small: record the digest-relevant fact only.
-        print(f"worm: {self.address_string()} {hashlib.sha1(format.encode()).hexdigest()[:8]}")
+        print(
+            f"worm: {self.address_string()} "
+            f"{hashlib.sha1(format.encode()).hexdigest()[:8]}",
+            flush=True,
+        )
 
 
 def main() -> int:
@@ -210,10 +213,15 @@ def main() -> int:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(str(server_cert), str(server_key))
         server.socket = context.wrap_socket(server.socket, server_side=True)
-        print(f"worm receiver listening on https://localhost:{args.port}/append")
+        print(
+            f"worm receiver listening on https://localhost:{args.port}/append",
+            flush=True,
+        )
         # Serve until the workflow tears the job down.
-        threading.Event().wait()
-        server.server_close()
+        try:
+            server.serve_forever()
+        finally:
+            server.server_close()
     return 0
 
 

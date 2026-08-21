@@ -54,6 +54,7 @@ E2E_PARENT_PRINCIPAL_ID = "human:native-e2e"
 E2E_PROJECT_ID = "native-e2e"
 E2E_SESSION_ID = "native-e2e-session"
 E2E_SOURCE_TRANSPORT = "cli"
+E2E_EFFECT_ROOT_ENV = "KHAOS_NATIVE_E2E_EFFECT_ROOT"
 
 
 def e2e_execution_scope() -> ExecutionScope:
@@ -98,15 +99,30 @@ def write_e2e_catalog(output: Path, policy_digest: str) -> TypedResourcePartialO
     return catalog
 
 
+def _prepare_effect_root() -> Path:
+    """Create and validate the directory used by the bounded test effect."""
+    configured_root = os.environ.get(E2E_EFFECT_ROOT_ENV)
+    if not configured_root:
+        return Path(tempfile.mkdtemp(prefix="khaos-native-e2e-"))
+
+    effect_root = Path(configured_root).expanduser().absolute()
+    try:
+        effect_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    except OSError as exc:
+        raise SystemExit(
+            f"native authority E2E effect root is unavailable: {effect_root}: {exc}"
+        ) from exc
+    if effect_root.is_symlink() or not effect_root.is_dir():
+        raise SystemExit(
+            f"native authority E2E effect root is not a regular directory: {effect_root}"
+        )
+    return effect_root
+
+
 def _build_client() -> AuthorityDaemonClient:
     contract = read_contract_from_environment()
     adapter = build_native_authority_adapter(production=True, contract=contract)
-    socket_path = Path(
-        os.environ.get("KHAOS_AUTHORITYD_BACKEND_SOCKET", "")
-        or os.environ.get("KHAOS_AUTHORITYD_SOCKET", "/")
-    )
     return AuthorityDaemonClient(
-        socket_path,
         expected_authority_uid=contract.authority_uid,
         native_adapter=adapter,
     )
@@ -266,6 +282,7 @@ def run_e2e(*, expect_unavailable: bool) -> dict[str, object]:
         raise SystemExit(1)
 
     # Scenario 1: full transaction with a bounded test effect.
+    effect_root = _prepare_effect_root()
     grant_id, _expires = _grant(
         client,
         policy_digest=policy_digest,
@@ -282,11 +299,6 @@ def run_e2e(*, expect_unavailable: bool) -> dict[str, object]:
         )
     )
     client.claim(receipt)
-    effect_root = Path(
-        os.environ.get("KHAOS_NATIVE_E2E_EFFECT_ROOT") or tempfile.mkdtemp(
-            prefix="khaos-native-e2e-"
-        )
-    )
     effect_path = effect_root / f"effect-{receipt.nonce}.bin"
     payload = f"khaos-native-e2e:{receipt.nonce}".encode()
     if len(payload) > 64:

@@ -59,6 +59,22 @@ def test_windows_workflow_uses_the_native_backend_host() -> None:
     assert "$venvPython = (uv run --project . which python)" not in source
     assert "KHAOS_AUTHORITYD_SOCKET=unused" not in source
     assert "KHAOS_AUTHORITYD_BACKEND_PIPE=\\\\.\\pipe\\KhaosAuthorityDBackend" in source
+    assert "KHAOS_AUDIT_WORM_CA_FILE=$env:KHAOS_AUDIT_WORM_CA_FILE" in source
+    assert "-SkipCertificateCheck" in source
+    assert "start_worm_audit_receiver.ps1" in source
+    assert "stop_worm_audit_receiver.ps1" in source
+    assert "Start-Job" not in source
+    assert "worm-receiver.pid" in source
+    assert "Get-Process -Id $receiverPid" in source
+    transaction_step = source.index(
+        "- name: Run Windows native authority transaction with owned WORM receiver"
+    )
+    diagnostics_step = source.index("- name: Collect backend service diagnostics")
+    transaction_source = source[transaction_step:diagnostics_step]
+    assert "start_worm_audit_receiver.ps1" in transaction_source
+    assert "run_native_authority_identity_probe.py" in transaction_source
+    assert "run_native_authority_e2e.py" in transaction_source
+    assert "finally {" in transaction_source
     assert (
         "--catalog-output 'C:\\ProgramData\\Khaos\\native-resource-catalog.json'"
         in source
@@ -86,3 +102,22 @@ def test_windows_backend_rejects_missing_named_pipe_transport(
 
     with pytest.raises(SystemExit, match="KHAOS_AUTHORITYD_BACKEND_PIPE"):
         _authority_transport_value(platform_name="nt")
+
+
+def test_worm_receiver_lifecycle_is_owned_by_a_real_process() -> None:
+    start = (ROOT / "scripts" / "start_worm_audit_receiver.ps1").read_text(
+        encoding="utf-8"
+    )
+    stop = (ROOT / "scripts" / "stop_worm_audit_receiver.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    assert "Start-Process" in start
+    assert "-PassThru" in start
+    assert "RedirectStandardOutput" in start
+    assert "RedirectStandardError" in start
+    assert "WriteAllText" in start
+    assert "Get-CimInstance Win32_Process" in stop
+    assert "run_worm_audit_receiver\\.py" in stop
+    assert "Stop-Process -Id $receiverPid -Force" in stop
+    assert "WaitForExit(10000)" in stop

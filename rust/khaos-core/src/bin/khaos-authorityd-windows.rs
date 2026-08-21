@@ -23,6 +23,7 @@ mod windows_authority {
     use std::path::Path;
     use std::ptr::{null, null_mut};
     use std::sync::OnceLock;
+    use std::time::{Duration, Instant};
 
     use sha2::Digest;
     use windows_sys::Win32::Foundation::{
@@ -42,8 +43,8 @@ mod windows_authority {
     };
     use windows_sys::Win32::System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
-        GetNamedPipeServerProcessId, PIPE_READMODE_MESSAGE, PIPE_REJECT_REMOTE_CLIENTS,
-        PIPE_TYPE_MESSAGE, PIPE_WAIT,
+        GetNamedPipeServerProcessId, WaitNamedPipeW, PIPE_READMODE_MESSAGE,
+        PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_MESSAGE, PIPE_WAIT,
     };
     use windows_sys::Win32::System::Services::{
         RegisterServiceCtrlHandlerExW, SetServiceStatus, StartServiceCtrlDispatcherW,
@@ -416,6 +417,61 @@ mod windows_authority {
                 .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
     }
 
+    // Keep backend readiness below the Python probe's five-second native
+    // client budget; a client deadline must never leave the service waiting
+    // on a pipe that the caller has already abandoned.
+    const BACKEND_CONNECT_TIMEOUT_MS: u32 = 4_000;
+
+    fn frontend_error(code: &str, message: impl Into<String>) -> String {
+        serde_json::json!({
+            "ok": false,
+            "error_code": code,
+            "error": message.into(),
+        })
+        .to_string()
+    }
+
+    /// Open the backend pipe within one bounded startup/readiness window.
+    ///
+    /// The backend is hosted by a separate SCM service.  SCM reports that
+    /// host as running immediately after its Python child is spawned, while
+    /// the child still has to load the staged interpreter and create its
+    /// Named Pipe.  A single CreateFileW therefore made a clean deployment
+    /// fail as a startup race.  WaitNamedPipeW is only a readiness hint, so
+    /// CreateFileW is retried until the same hard deadline expires.
+    unsafe fn open_backend_pipe(backend: &[u16]) -> Result<HANDLE, String> {
+        let deadline = Instant::now() + Duration::from_millis(BACKEND_CONNECT_TIMEOUT_MS as u64);
+        let mut last_error;
+        loop {
+            let handle = CreateFileW(
+                backend.as_ptr(),
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+                0,
+                null(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
+                null_mut(),
+            );
+            if handle != INVALID_HANDLE_VALUE {
+                return Ok(handle);
+            }
+            last_error = GetLastError();
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(format!(
+                    "authority backend pipe is unavailable: Win32 error {last_error}"
+                ));
+            }
+            let wait_milliseconds = remaining.as_millis().min(250).max(1) as u32;
+            if WaitNamedPipeW(backend.as_ptr(), wait_milliseconds) == 0 {
+                // ERROR_FILE_NOT_FOUND means the backend has not created its
+                // first instance yet.  Keep the bounded retry alive rather
+                // than turning normal child startup into a false failure.
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+    }
+
     /// Handle one client message: parse kind/challenge/request, wrap the
     /// request into a backend `attest` envelope, forward it, and merge the
     /// backend response with the transport binding for the client.
@@ -427,10 +483,10 @@ mod windows_authority {
         let message: serde_json::Value = match serde_json::from_slice(input) {
             Ok(value) => value,
             Err(_) => {
-                return Ok(
-                    "{\"ok\":false,\"error\":\"native pipe message is malformed JSON\"}"
-                        .to_string(),
-                )
+                return Ok(frontend_error(
+                    "native_request_malformed",
+                    "native pipe message is malformed JSON",
+                ))
             }
         };
         let kind = message.get("kind").and_then(|value| value.as_str());
@@ -444,10 +500,10 @@ mod windows_authority {
         let service_name =
             env::var("KHAOS_AUTHORITYD_SERVICE_NAME").unwrap_or_else(|_| SERVICE_NAME.to_string());
         if kind.is_none() || !valid_challenge(challenge) {
-            return Ok(
-                "{\"ok\":false,\"error\":\"native pipe challenge is missing or malformed\"}"
-                    .to_string(),
-            );
+            return Ok(frontend_error(
+                "native_request_malformed",
+                "native pipe challenge is missing or malformed",
+            ));
         }
         let request_bytes: Vec<u8> = if kind == Some("probe") {
             PROBE_INNER_REQUEST.as_bytes().to_vec()
@@ -455,17 +511,18 @@ mod windows_authority {
             match message.get("request_json").and_then(|value| value.as_str()) {
                 Some(request) => request.as_bytes().to_vec(),
                 None => {
-                    return Ok(
-                        "{\"ok\":false,\"error\":\"native pipe request body is missing\"}"
-                            .to_string(),
-                    )
+                    return Ok(frontend_error(
+                        "native_request_malformed",
+                        "native pipe request body is missing",
+                    ))
                 }
             }
         };
         if request_bytes.is_empty() || request_bytes.len() > MAX_MESSAGE_BYTES / 2 {
-            return Ok(
-                "{\"ok\":false,\"error\":\"native pipe request is out of bounds\"}".to_string(),
-            );
+            return Ok(frontend_error(
+                "native_request_out_of_bounds",
+                "native pipe request is out of bounds",
+            ));
         }
         let attest_request = serde_json::json!({
             "protocol": 1,
@@ -490,26 +547,21 @@ mod windows_authority {
         let backend = match env::var("KHAOS_AUTHORITYD_BACKEND_PIPE") {
             Ok(value) if value.starts_with(r"\\.\pipe\") && value.len() <= 256 => wide(&value),
             _ => {
-                return Ok("{\"ok\":false,\"error_code\":\"authority_backend_unavailable\",\"error\":\"authority backend pipe is not configured\"}".to_string())
+                return Ok(frontend_error(
+                    "authority_backend_unavailable",
+                    "authority backend pipe is not configured",
+                ))
             }
         };
         // Open the backend pipe overlapped so a wedged backend cannot
         // block the authority frontend forever: every operation carries
         // a hard deadline and is cancelled on expiry.
-        let handle = unsafe {
-            CreateFileW(
-                backend.as_ptr(),
-                FILE_GENERIC_READ | FILE_GENERIC_WRITE,
-                0,
-                null(),
-                OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
-                null_mut(),
-            )
+        let handle = match unsafe { open_backend_pipe(&backend) } {
+            Ok(handle) => handle,
+            Err(error) => {
+                return Ok(frontend_error("authority_backend_unavailable", error));
+            }
         };
-        if handle == INVALID_HANDLE_VALUE {
-            return Ok("{\"ok\":false,\"error_code\":\"authority_backend_unavailable\",\"error\":\"authority backend pipe is unavailable\"}".to_string());
-        }
         // Verify the backend pipe really is served by a trusted authority
         // identity before forwarding a request.  A pipe name alone is not
         // identity: any process could create a pipe with the same name.
@@ -538,12 +590,18 @@ mod windows_authority {
         };
         if backend_identity_ok == 0 {
             unsafe { CloseHandle(handle) };
-            return Ok("{\"ok\":false,\"error_code\":\"authority_backend_unavailable\",\"error\":\"authority backend pipe identity is not the authority Service SID\"}".to_string());
+            return Ok(frontend_error(
+                "authority_backend_unavailable",
+                "authority backend pipe identity is not the authority Service SID",
+            ));
         }
         let payload = serde_json::to_vec(&attest_request).unwrap_or_default();
         if payload.len() > MAX_MESSAGE_BYTES {
             unsafe { CloseHandle(handle) };
-            return Ok("{\"ok\":false,\"error_code\":\"authority_backend_unavailable\",\"error\":\"authority backend request is out of bounds\"}".to_string());
+            return Ok(frontend_error(
+                "authority_backend_unavailable",
+                "authority backend request is out of bounds",
+            ));
         }
         let backend_bytes = unsafe {
             write_message_deadline(handle, &payload, BACKEND_IO_TIMEOUT_MS).and_then(|()| {
@@ -558,13 +616,17 @@ mod windows_authority {
             }
             Ok(_) => {
                 unsafe { CloseHandle(handle) };
-                return Ok("{\"ok\":false,\"error_code\":\"authority_backend_unavailable\",\"error\":\"authority backend returned no bounded response\"}".to_string());
+                return Ok(frontend_error(
+                    "authority_backend_unavailable",
+                    "authority backend returned no bounded response",
+                ));
             }
             Err(error) => {
                 if error.terminal {
                     unsafe { CloseHandle(handle) };
-                    return Ok(format!(
-                        "{{\"ok\":false,\"error_code\":\"authority_backend_unavailable\",\"error\":\"authority backend IO deadline: {error}\"}}"
+                    return Ok(frontend_error(
+                        "authority_backend_unavailable",
+                        format!("authority backend IO deadline: {error}"),
                     ));
                 }
                 return Err(error);
@@ -573,10 +635,10 @@ mod windows_authority {
         let backend_body: serde_json::Value = match serde_json::from_slice(&backend_bytes) {
             Ok(value) => value,
             Err(_) => {
-                return Ok(
-                    "{\"ok\":false,\"error\":\"authority backend returned malformed JSON\"}"
-                        .to_string(),
-                )
+                return Ok(frontend_error(
+                    "authority_backend_malformed",
+                    "authority backend returned malformed JSON",
+                ))
             }
         };
         // Merge the transport binding into the backend response so the
@@ -602,13 +664,15 @@ mod windows_authority {
         );
         if let serde_json::Value::Object(body) = backend_body {
             for (key, value) in body {
-                wrapper.insert(key, value);
+                if key != "native_transport" && key != "proof_digest" {
+                    wrapper.insert(key, value);
+                }
             }
         } else {
-            return Ok(
-                "{\"ok\":false,\"error\":\"authority backend returned a non-object response\"}"
-                    .to_string(),
-            );
+            return Ok(frontend_error(
+                "authority_backend_malformed",
+                "authority backend returned a non-object response",
+            ));
         }
         Ok(serde_json::Value::Object(wrapper).to_string())
     }
@@ -971,8 +1035,11 @@ mod windows_authority {
                         };
                         finish_client_connection(handle, connect_event, &response)?;
                     } else {
-                        let response = "{\"ok\":false,\"error\":\"Named Pipe peer proof failed\"}";
-                        finish_client_connection(handle, connect_event, response)?;
+                        let response = frontend_error(
+                            "native_peer_identity_mismatch",
+                            "Named Pipe peer proof failed",
+                        );
+                        finish_client_connection(handle, connect_event, &response)?;
                     }
                 }
             }

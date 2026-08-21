@@ -590,6 +590,37 @@ async def test_docker_backend_timeout_cleanup_output_truncation_and_shutdown(tmp
     assert any(call[-1:] == ("khaos-active",) for call in backend.cli_calls)
 
 
+async def test_docker_cleanup_waits_for_auto_remove_race_to_settle():
+    """A --rm container can disappear asynchronously after docker stop."""
+    backend = _InspectableDockerBackend()
+    lease = _ContainerLease("khaos-auto-remove", "owner")
+    backend._active["exec-auto-remove"] = lease
+    original_run_cli = backend._run_cli
+    removal_started = False
+    verification_inspects = 0
+
+    async def racing_run_cli(args, *, timeout):
+        nonlocal removal_started, verification_inspects
+        if args[:1] == ("rm",):
+            removal_started = True
+            return (
+                1,
+                "",
+                "removal of container khaos-auto-remove is already in progress",
+            )
+        if removal_started and args == ("inspect", lease.name):
+            verification_inspects += 1
+            if verification_inspects == 1:
+                return 0, lease.name, ""
+            return 1, "", "No such container: khaos-auto-remove"
+        return await original_run_cli(args, timeout=timeout)
+
+    backend._run_cli = racing_run_cli
+
+    assert await backend._cleanup_container(lease) is True
+    assert verification_inspects == 2
+
+
 async def test_docker_backend_closes_admission_before_shutdown_cleanup():
     backend = _InspectableDockerBackend()
     await backend.shutdown()
