@@ -154,6 +154,7 @@ def render() -> str:
         ("python/khaos/coding/workspace/boundary.py", sha256(ROOT / "python" / "khaos" / "coding" / "workspace" / "boundary.py")),
         ("python/khaos/db/connection.py", sha256(ROOT / "python" / "khaos" / "db" / "connection.py")),
         ("python/khaos/db/repositories/sessions.py", sha256(ROOT / "python" / "khaos" / "db" / "repositories" / "sessions.py")),
+        ("python/khaos/scheduler/calculator.py", sha256(ROOT / "python" / "khaos" / "scheduler" / "calculator.py")),
         ("python/khaos/tools/result_codec.py", sha256(ROOT / "python" / "khaos" / "tools" / "result_codec.py")),
         ("python/khaos/rpc/protocol.py", sha256(ROOT / "python" / "khaos" / "rpc" / "protocol.py")),
         ("rust/khaos-core/src/bin/khaos-exec-launcher.rs", sha256(ROOT / "rust" / "khaos-core" / "src" / "bin" / "khaos-exec-launcher.rs")),

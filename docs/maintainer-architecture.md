@@ -86,7 +86,7 @@ KHAOS.md / AGENTS.md
 | `python/khaos/tools/scheduler_models.py`、`tools/budget.py` | 调度结果协议、权限请求事件和原子预算 reservation/commit | 已完成首个 seam；后续只允许由调度器编排，不在 handler 中复制预算或结果状态机 |
 | `python/khaos/grpc_server.py` | transport/auth/startup、Agent service，以及兼容导出 | protocol/auth middleware、composition root、每个 service 独立模块；服务只消费已认证 context。MemoryService、SessionService、AuditService 已迁移到 `python/khaos/rpc/`；`python/khaos/rpc/protocol.py` 现在拥有协议常量、协商、绑定声明和认证器，grpc 导入仅是迁移期兼容导出 |
 | `python/khaos/coding/planning/approval/store.py` | schema、CAS transition、receipt、lease、plan execution event 和 read model | schema/migration、approval ledger、receipt verifier、execution-event repository、read model |
-| `python/khaos/scheduler/engine.py` | cron 解析、持久化、调度、执行、恢复和审计 | schedule repository、due-item selector、execution coordinator、recovery worker |
+| `python/khaos/scheduler/engine.py` | 任务状态、持久化、调度、执行、恢复和审计 | `scheduler/calculator.py` 已拥有纯 schedule 计算；后续拆 schedule repository、due-item selector、execution coordinator、recovery worker |
 | `python/khaos/runtime/factory.py` | 依赖装配和兼容参数转换 | 保留为唯一 composition root；业务逻辑不得回流到 factory |
 
 拆分完成的判据不是“文件变小”，而是：每个状态只有一个 writer；依赖方向可画出来；单元测试不需要启动完整 runtime；旧 facade 可以删除而不是永久并行。
@@ -198,7 +198,8 @@ REQUESTED -> SNAPSHOT_BOUND -> RUNNING -> PROOF_RECORDED
 
 ### Phase 4：计划、验证和调度
 
-- 拆分 approval store 与 CronEngine，显式区分 ledger、read model、recovery worker。
+- 拆分 approval store 与 CronEngine，显式区分 ledger、read model、recovery worker；纯 schedule
+  计算已落在 `python/khaos/scheduler/calculator.py`，engine 不再内嵌 cron 解析。
 - 删除已经没有调用者的兼容分支，更新 schema/ADR 和迁移文档。
 
 ### Phase 5：持续维护

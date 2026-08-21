@@ -17,6 +17,7 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from khaos.exceptions import ServiceShutdownError
+from khaos.scheduler.calculator import ScheduleCalculator
 from khaos.scheduler.models import ScheduleConfig, ScheduledTask, TaskStatus
 from khaos.time_utils import utc_now_naive
 
@@ -2336,46 +2337,8 @@ class CronEngine:
         return self._tasks.get(task_id)
 
     def _compute_next_run(self, task: ScheduledTask) -> datetime:
-        """根据 ScheduleConfig 计算下次执行时间。
-
-        简化实现：
-        - iso_time: 直接返回（一次性）
-        - interval_seconds: now + interval
-        - cron: 简单解析分时日（仅支持基本格式，不支持高级 cron 语法）
-        """
-        now = utc_now_naive()
-        if task.schedule.iso_time:
-            try:
-                return datetime.fromisoformat(task.schedule.iso_time)
-            except ValueError:
-                pass
-        if task.schedule.interval_seconds:
-            return now + timedelta(seconds=task.schedule.interval_seconds)
-        # 简单 cron 解析：仅支持 "分 时" 格式，如 "0 9" = 每天 9:00
-        if task.schedule.cron:
-            return self._parse_simple_cron(task.schedule.cron, now)
-        return now + timedelta(hours=1)  # 默认每小时
-
-    def _parse_simple_cron(self, cron: str, now: datetime) -> datetime:
-        """解析简化的 cron 表达式。
-
-        支持格式：
-        - "分钟 小时"（如 "0 9" = 每天 9:00）
-        - "分钟 小时 日 月 星期"（完整 cron，简化解析）
-        """
-        parts = cron.strip().split()
-        if len(parts) < 2:
-            return now + timedelta(hours=1)
-        try:
-            minute = int(parts[0])
-            hour = int(parts[1])
-        except ValueError:
-            return now + timedelta(hours=1)
-        # 计算今天的下一个目标时间
-        target = now.replace(minute=minute, hour=hour, second=0, microsecond=0)
-        if target <= now:
-            target += timedelta(days=1)
-        return target
+        """Delegate pure schedule calculation to the dedicated calculator."""
+        return ScheduleCalculator.compute(task)
 
     def _task_lock(self, task_id: str) -> asyncio.Lock:
         """H1 (round-11): return (or create) the per-task lock.
