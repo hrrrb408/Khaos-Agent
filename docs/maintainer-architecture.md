@@ -82,7 +82,7 @@ KHAOS.md / AGENTS.md
 | --- | --- | --- |
 | `python/khaos/db/database.py` | 连接生命周期、迁移、session/message、turn/event、audit、memory、task、scheduler 等 | `DatabaseConnection`、migration runner、按领域的 repository/query service；保留一个薄 facade 兼容旧调用 |
 | `python/khaos/tools/scheduler.py` | admission、budget、approval、authority、idempotency、并发和结果归一化 | `ToolAdmission`、`ToolAuthorization`、`ToolExecutionCoordinator`、`ToolResultStore` |
-| `python/khaos/grpc_server.py` | transport/auth/startup、Agent service，以及兼容导出 | protocol/auth middleware、composition root、每个 service 独立模块；服务只消费已认证 context。MemoryService 已迁移到 `python/khaos/rpc/memory_service.py` |
+| `python/khaos/grpc_server.py` | transport/auth/startup、Agent service，以及兼容导出 | protocol/auth middleware、composition root、每个 service 独立模块；服务只消费已认证 context。MemoryService、SessionService、AuditService 已迁移到 `python/khaos/rpc/` |
 | `python/khaos/coding/planning/approval/store.py` | schema、CAS transition、receipt、lease、plan execution event 和 read model | schema/migration、approval ledger、receipt verifier、execution-event repository、read model |
 | `python/khaos/scheduler/engine.py` | cron 解析、持久化、调度、执行、恢复和审计 | schedule repository、due-item selector、execution coordinator、recovery worker |
 | `python/khaos/runtime/factory.py` | 依赖装配和兼容参数转换 | 保留为唯一 composition root；业务逻辑不得回流到 factory |
@@ -181,7 +181,7 @@ REQUESTED -> SNAPSHOT_BOUND -> RUNNING -> PROOF_RECORDED
 ### Phase 2：数据库与 RPC 边界
 
 - 从 `Database` 提取连接/迁移/repository，先迁移只读查询，再迁移写事务。
-- 从 `grpc_server.py` 提取 protocol/auth/service；MemoryService 的迁移作为首个 seam，保留兼容导出，不增加第二套 server authority。
+- 从 `grpc_server.py` 提取 protocol/auth/service；MemoryService、SessionService、AuditService 已完成首批 seam，保留兼容导出，不增加第二套 server authority。
 
 ### Phase 3：工具和执行边界
 
