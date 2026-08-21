@@ -3,16 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import json
 import logging
 import os
 import shlex
-import threading
 import time
 import uuid
 from collections.abc import Awaitable, Callable
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, cast
@@ -61,6 +58,10 @@ from khaos.security.orchestration_phases import (
 )
 from khaos.security.protocol_boundary import canonical_digest as _canonical_digest
 from khaos.tools.admission import RejectedToolCall, ToolAdmission
+from khaos.tools.approval_callback import (
+    ApprovalCallbackRunner,
+    ConfirmCallback,
+)
 from khaos.tools.budget import (
     ToolBudget,
     ToolBudgetReservation,
@@ -91,8 +92,6 @@ from khaos.tools.terminal_tools import (
     evaluate_command_safety,
 )
 
-ConfirmCallback = Callable[[dict], Awaitable[dict | bool] | dict | bool]
-
 logger = logging.getLogger(__name__)
 
 __all__ = (
@@ -115,85 +114,6 @@ __all__ = (
     "ToolResult",
     "ToolScheduler",
 )
-
-_CONFIRM_ALLOWED_KEYS = frozenset({
-    "approved", "remember", "pattern", "reason",
-})
-_CONFIRM_PATTERN_MAX_LENGTH = 4096
-_CONFIRM_REASON_MAX_LENGTH = 1024
-
-
-def _normalize_confirmation(value: object) -> dict[str, Any]:
-    """Normalize an untrusted approval-adapter result fail-closed.
-
-    Confirmation adapters sit outside the scheduler's trust boundary (UI,
-    gateway, or an integration plugin).  Treating ``dict(value)`` as a valid
-    response used to let strings, lists, non-bool values, and unexpected
-    fields reach the approval broker.  The scheduler now accepts one strict
-    schema and converts every malformed response into an explicit denial.
-    """
-    if type(value) is bool:
-        return {"approved": value}
-    if type(value) is not dict:
-        return {
-            "approved": False,
-            "remember": False,
-            "reason": "invalid_confirmation_response",
-        }
-    unknown = set(value) - _CONFIRM_ALLOWED_KEYS
-    if unknown:
-        return {
-            "approved": False,
-            "remember": False,
-            "reason": "invalid_confirmation_response",
-        }
-    if type(value.get("approved")) is not bool:
-        return {
-            "approved": False,
-            "remember": False,
-            "reason": "invalid_confirmation_response",
-        }
-    remember = value.get("remember", False)
-    if type(remember) is not bool:
-        return {
-            "approved": False,
-            "remember": False,
-            "reason": "invalid_confirmation_response",
-        }
-    pattern = value.get("pattern")
-    if pattern is not None and (
-        type(pattern) is not str
-        or not pattern
-        or len(pattern) > _CONFIRM_PATTERN_MAX_LENGTH
-        or any(char in pattern for char in "\x00\r\n")
-    ):
-        return {
-            "approved": False,
-            "remember": False,
-            "reason": "invalid_confirmation_response",
-        }
-    reason = value.get("reason")
-    if reason is not None and (
-        type(reason) is not str
-        or len(reason) > _CONFIRM_REASON_MAX_LENGTH
-        or any(char in reason for char in "\x00\r\n")
-    ):
-        return {
-            "approved": False,
-            "remember": False,
-            "reason": "invalid_confirmation_response",
-        }
-    normalized: dict[str, Any] = {
-        "approved": value["approved"],
-    }
-    if "remember" in value:
-        normalized["remember"] = remember
-    if pattern is not None:
-        normalized["pattern"] = pattern
-    if reason is not None:
-        normalized["reason"] = reason
-    return normalized
-
 
 @dataclass
 class _OperationClaim:
@@ -262,21 +182,9 @@ class ToolScheduler:
         self._operation_events: dict[str, asyncio.Event] = {}
         self._operation_claims: dict[str, _OperationClaim] = {}
         self._operation_claim_lock = asyncio.Lock()
-        # Synchronous confirm callbacks (UI/gateway adapters) run here,
-        # never on the loop's default executor: a hanging callback may
-        # occupy one of the bounded workers forever — that later approvals
-        # then fail closed on their own deadline is the intended bound,
-        # where before they accumulated leaked default-executor threads
-        # and eventually starved unrelated asyncio.to_thread users.
-        self._approval_executor = ThreadPoolExecutor(
-            max_workers=4, thread_name_prefix="khaos-approval-callback"
-        )
-        self._approval_admission = threading.BoundedSemaphore(4)
-        self._approval_state_lock = threading.Lock()
-        self._approval_active = 0
-        self._approval_closed = False
-        self._approval_idle = threading.Event()
-        self._approval_idle.set()
+        # Approval adapters have their own bounded lifecycle owner. The
+        # scheduler only projects PermissionRequest and consumes its result.
+        self._approval_runner = ApprovalCallbackRunner()
 
     def set_office_authority(self, authority: Any) -> None:
         """Register the shared OfficeMutationAuthority (called at startup)."""
@@ -2709,118 +2617,13 @@ class ToolScheduler:
         request: PermissionRequest,
         confirm_callback: ConfirmCallback | None,
     ) -> dict:
-        if confirm_callback is None:
-            return {"approved": False}
-        remaining = request.expires_at - time.time()
-        if remaining <= 0:
-            return {"approved": False, "reason": "approval_expired_before_callback"}
-        payload = {
-            "id": request.tool_call_id,
-            "name": request.name,
-            "arguments": request.arguments,
-            "level": request.level,
-            "target": request.target,
-            "reason": request.reason,
-            "binding_digest": request.binding_digest,
-            "expires_at": request.expires_at,
-            "principal_id": request.principal_id,
-            "session_id": request.session_id,
-            "task_id": request.task_id,
-            "workspace_id": request.workspace_id,
-            "arguments_digest": request.arguments_digest,
-            "profile_digest": request.profile_digest,
-            "project_id": request.project_id,
-            "workspace_generation": request.workspace_generation,
-            "authorization_resource_digest": request.authorization_resource_digest,
-            "authorization_epoch": request.authorization_epoch,
-            "policy_digest": request.policy_digest,
-            "tool_schema_digest": request.tool_schema_digest,
-            "tool_security_digest": request.tool_security_digest,
-        }
-        try:
-            if inspect.iscoroutinefunction(confirm_callback):
-                value = await asyncio.wait_for(
-                    confirm_callback(payload), timeout=remaining
-                )
-            else:
-                # UI and gateway integrations may supply a synchronous
-                # callback.  It is untrusted with respect to latency, so run
-                # it off-loop on the dedicated bounded approval executor and
-                # apply the same approval deadline as an asynchronous
-                # callback.  A timed-out worker cannot be force-killed; the
-                # bounded pool turns a hang into later fail-closed denials
-                # instead of an unbounded thread leak.
-                if not self._approval_admission.acquire(blocking=False):
-                    return {
-                        "approved": False,
-                        "reason": "approval_callback_capacity_exhausted",
-                    }
-                with self._approval_state_lock:
-                    if self._approval_closed:
-                        self._approval_admission.release()
-                        return {
-                            "approved": False,
-                            "reason": "approval_callback_executor_closed",
-                        }
-                    self._approval_active += 1
-                    self._approval_idle.clear()
-
-                def invoke_sync_callback() -> object:
-                    try:
-                        return confirm_callback(payload)
-                    finally:
-                        with self._approval_state_lock:
-                            self._approval_active -= 1
-                            if self._approval_active == 0:
-                                self._approval_idle.set()
-                        self._approval_admission.release()
-
-                try:
-                    callback_future = asyncio.get_running_loop().run_in_executor(
-                        self._approval_executor, invoke_sync_callback
-                    )
-                except RuntimeError:
-                    with self._approval_state_lock:
-                        self._approval_active -= 1
-                        if self._approval_active == 0:
-                            self._approval_idle.set()
-                    self._approval_admission.release()
-                    return {
-                        "approved": False,
-                        "reason": "approval_callback_executor_closed",
-                    }
-                value = await asyncio.wait_for(callback_future, timeout=remaining)
-        except TimeoutError:
-            return {"approved": False, "reason": "approval_callback_timeout"}
-        if inspect.isawaitable(value):
-            # A synchronous adapter may return an awaitable.  Preserve the
-            # same fixed approval deadline across both execution phases.
-            remaining = request.expires_at - time.time()
-            if remaining <= 0:
-                return {"approved": False, "reason": "approval_expired_before_callback"}
-            try:
-                value = await asyncio.wait_for(value, timeout=remaining)
-            except TimeoutError:
-                return {"approved": False, "reason": "approval_callback_timeout"}
-        normalized = _normalize_confirmation(value)
-        if normalized.get("reason") == "invalid_confirmation_response":
-            logger.warning(
-                "approval callback returned a malformed response; denying request"
-            )
-        return normalized
+        return await self._approval_runner.run(request, confirm_callback)
 
     async def aclose(self) -> None:
         """Close every runtime-owned network and background-process handle."""
-        with self._approval_state_lock:
-            self._approval_closed = True
         await self._close_all_network_brokers()
         await self.process_authority.shutdown()
-        # A timed-out thread cannot be force-killed.  Do not report a clean
-        # runtime close while an owned callback is still executing; the
-        # caller's cleanup authority will retain this scheduler for retry.
-        if not await asyncio.to_thread(self._approval_idle.wait, 5.0):
-            raise RuntimeError("approval callback workers did not terminate")
-        self._approval_executor.shutdown(wait=True, cancel_futures=True)
+        await self._approval_runner.aclose()
 
     @staticmethod
     def _normalize_call(call: dict) -> dict:
