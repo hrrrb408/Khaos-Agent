@@ -71,6 +71,8 @@
 - `python/khaos/coding/workspace/trusted_git.py`: `12f6dc96fa2769d26835f1e6d7abb880594703684412792fd5c8d1e2ec85753f`
 - `python/khaos/coding/workspace/git_process.py`: `fb110ff687020411f1a57034e257fd86a591bbf72c9338c18c694f1dd7d014ee`
 - `python/khaos/coding/planning/approval/execution_read_model.py`: `2465f230bc8613a373756f9a82a88af819e9c7c17ef6c29248bfeea7d58860b1`
+- `python/khaos/coding/planning/approval/execution_writer.py`: `0bdf12407e1bf16c8c7ab44d9c331f8c0e492d73e51b8f90e406b9d6a263612d`
+- `python/khaos/coding/planning/approval/execution_journal_writer.py`: `e4fc05a50d28387ad2d1f8a7e02b0fa1adb0d39472b362bbbc4ee53649194635`
 - `python/khaos/security/authority.py`: `635a96fe32200ac088bd15a9d051a7c2342f110f4f4461840aa64b7db4a6994c`
 - `python/khaos/security/authority_broker.py`: `08689e7723b52e25917285c267bd9a5ad71490ab4b2b69df081c6d9e2b1e75e2`
 - `python/khaos/security/authorityd.py`: `958a0ad34a3fdcf4963c3619dfbd1bd31d2180b37170be19b09b71d2c4ffba1d`

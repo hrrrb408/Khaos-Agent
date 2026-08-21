@@ -64,6 +64,10 @@ from khaos.coding.planning.approval.models import (
     verify_receipt_token,
 )
 from khaos.coding.planning.approval.execution_read_model import PlanExecutionReadModel
+from khaos.coding.planning.approval.execution_journal_writer import (
+    PlanExecutionJournalWriter,
+)
+from khaos.coding.planning.approval.execution_writer import PlanExecutionWriter
 from khaos.coding.planning.approval.mutation_fence import (
     PlannedHeadMutationAdapter,
     WorkspaceMutationFence,
@@ -135,6 +139,8 @@ __all__ = [
     "PlanApprovalError",
     "PlanApprovalReadModel",
     "PlanExecutionReadModel",
+    "PlanExecutionJournalWriter",
+    "PlanExecutionWriter",
     "PlanApprovalRequest",
     "PlanApprovalService",
     "PlanApprovalStatus",
