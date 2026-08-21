@@ -77,6 +77,8 @@ KHAOS.md / AGENTS.md
 | Channel configuration/health | `channels/registry.py` | `ChannelRegistry`（唯一 writer；配置/健康锁） | channel tools、TUI、webhook service | `get`/`list_all` 只返回 immutable snapshot；配置必须经 `replace_config`/enable/disable，不能修改返回对象 |
 | Function/model routing | `routing/table.py`、`routing/router.py` | `RoutingTable` + `ModelRouter.set_rule` | provider manager、AgentLoop、MoA | rules/fallback chain are immutable snapshots; provider availability is not routing-state mutation |
 | Permission decision | `permissions/evaluator.py`、`permissions/engine.py` | `PermissionEvaluator`（纯策略）+ `PermissionEngine`（DB epoch/rule owner） | scheduler、approval UI、audit adapter | evaluator never opens DB or writes audit; engine publishes a captured rule snapshot and owns durable mutations |
+| Gateway RPC connection | `go/internal/platform/rpc_transport.go`、`python_client.go` | `RPCTransport` + `RPCConnection`（拨号、deadline、取消、关闭） | `PythonClient`（认证 envelope、协议、service calls） | transport 不解释 JSON；新增平台 transport 只能实现接口，不能复制 client 生命周期 |
+| Native receipt verification | `rust/khaos-core/src/authority_receipt.rs`、native launchers | `ReceiptVerifier`（绑定 operation/resource、验证与结果证明） | exec launcher、Python authority adapter | launcher 只能消费已绑定 receipt；不把 receipt 字段重新解释为业务状态 |
 
 ## 4. 目前的过渡性热点
 
@@ -110,6 +112,8 @@ KHAOS.md / AGENTS.md
 | `python/khaos/memory/manager.py` | 记忆读取、三层注入、token budget、跨模式 intent 和主动提取编排 | `MemoryRetriever` 拥有 L0/L1/L2 分类与排序；`MemoryManager` 只负责 orchestration/格式化/预算，不读 SQLite、不实现 regex |
 | `python/khaos/runtime/factory.py` | 依赖装配和兼容参数转换 | 保留为唯一 composition root；业务逻辑不得回流到 factory |
 | `python/khaos/security/authorityd.py`、`authorityd_protocol.py` | authority daemon lifecycle、签名 receipt、审计事件、socket framing；历史上各自保留 canonical/digest 包装器 | `security/protocol_boundary.py` 统一 canonical JSON/digest；authorityd 只拥有 authority 状态机和 transport 适配 |
+| `go/internal/platform/python_client.go` | Unix 拨号、deadline、context 取消、JSON framing、RPC auth 与 service calls | `rpc_transport.go` 拥有 connection lifecycle；`rpc_contract.go` 拥有版本/features；client 只拥有 auth/envelope 与 service adapter |
+| `rust/khaos-core/src/bin/khaos-exec-launcher.rs`、`authority_receipt.rs` | 参数解析、FD 校验、receipt 验证、rlimit、session 与 exec | `authority_receipt.rs` 的 `ReceiptVerifier` 拥有 receipt binding/verification；launcher 只拥有 native launch sequencing |
 
 拆分完成的判据不是“文件变小”，而是：每个状态只有一个 writer；依赖方向可画出来；单元测试不需要启动完整 runtime；旧 facade 可以删除而不是永久并行。
 
@@ -214,6 +218,8 @@ REQUESTED -> SNAPSHOT_BOUND -> RUNNING -> PROOF_RECORDED
 - authorityd 的 receipt、审计和 socket framing 已统一消费 `security/protocol_boundary.py` 的 canonical owner；删除 `_canonical`/`_digest` 私有包装器，后续不允许在 authority daemon 内重新实现摘要或序列化。
 - Memory 的第一阶段 seam 已完成：`MemoryStore` 只接受 `MemoryRepository`，`MemoryOwner` 统一 principal/project/namespace 规则，`SqliteMemoryRepository` 统一 SQL 适配；冲突、TTL、提取和 L0/L1/L2 检索策略均为可独立测试的纯模块。RPC `MemoryService` 通过 ADR-051 的 context-bound audit sink 绑定请求身份，root logger 仍是唯一 durable writer。
 - Turn 的第一阶段 seam 已完成：`TurnCoordinator` 只接受 `TurnRepository`，`DatabaseTurnRepository` 是当前 SQLite 组合适配器；恢复、创建和 CAS 追加由同一 repository owner 提供，详见 ADR-053。后续把 turn SQL 从 `Database` 移出时保持该端口不变。
+- Go RPC 的 connection seam 已完成：`PythonClient` 不再拥有 Unix 拨号、deadline 或 context watcher；`RPCTransport`/`RPCConnection` 统一连接建立与关闭语义，详见 ADR-057。协议版本/features 仍只由 `rpc_contract.go` 拥有，client 不得新增第二套 contract。
+- Rust native receipt seam 已完成：`ReceiptBinding`/`ReceiptVerifier` 统一 operation/resource 绑定、FD 读取和签名验证结果；launcher 只编排验证通过后的 session、limits 和 exec，不重新解析 receipt 字段。
 
 ### Phase 3：工具和执行边界
 
