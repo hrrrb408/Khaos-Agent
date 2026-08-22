@@ -12,7 +12,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -35,11 +35,16 @@ from khaos.db.repositories import (
     AuditRepository,
     ConfigurationRepository,
     PermissionRepository,
+    SchedulerRepository,
     SessionRepository,
+    ToolOperationRepository,
 )
 from khaos.db.repositories.audit import (
     _audit_previous_hash,  # noqa: F401 - compatibility export
     _audit_row_hash,  # noqa: F401 - compatibility export
+)
+from khaos.db.repositories.scheduler import (  # noqa: F401 - compatibility export
+    _schedule_to_dict,
 )
 from khaos.time_utils import utc_now_naive
 
@@ -235,6 +240,8 @@ class Database:
         self._configuration_repository = ConfigurationRepository(self)
         self._permission_repository = PermissionRepository(self)
         self._audit_repository = AuditRepository(self)
+        self._scheduler_repository = SchedulerRepository(self)
+        self._tool_operation_repository = ToolOperationRepository(self)
         # F-01: Per-domain locks remain for logical serialization (e.g. two
         # concurrent permission grants must not race on epoch computation).
         self._operation_approval_lock = asyncio.Lock()
@@ -3295,887 +3302,233 @@ class Database:
         project_id: str = "",
         policy_digest: str = "",
     ) -> str:
-        """Persist a new scheduled task and return its id.
-
-        M4 batch 3.1.10:
-          - ``principal_id`` is REQUIRED (non-empty).  Every task is
-            bound to its creator; list / pause / resume / remove filter
-            on it.  Empty principal is rejected — fail-closed.
-          - ``next_run`` is now persisted atomically with the INSERT.
-            Previously the engine computed ``next_run`` in memory but
-            did NOT pass it here, so the DB row's ``next_run`` stayed
-            NULL until the first execution — a restart before the first
-            fire left the task permanently stuck (tick skips tasks with
-            ``next_run IS NULL``).
-
-        M4 batch 3.1.16B-1 (CRITICAL): ``project_id`` and
-        ``policy_digest`` are now persisted atomically with the INSERT
-        so B-2 drift detection can compare the stored snapshot against
-        the live values at ``start()`` and ``_execute_task`` claim
-        time.  Empty ``policy_digest`` is fail-closed — the migration
-        helper quarantines such rows to ``status='failed'``.
-        """
-        import uuid
-
-        if not principal_id:
-            raise ValueError("principal_id is required for scheduled task creation")
-        async with self.transaction() as conn:
-            task_id = uuid.uuid4().hex[:12]
-            schedule_json = json.dumps(_schedule_to_dict(schedule), ensure_ascii=False)
-            meta_json = json.dumps(meta or {}, ensure_ascii=False)
-            await conn.execute(
-                """
-                INSERT INTO scheduled_tasks
-                    (id, name, prompt, status, schedule_config, deliver_to, meta,
-                     principal_id, next_run, project_id, policy_digest)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (task_id, name, prompt, status, schedule_json, deliver_to, meta_json,
-                 principal_id, next_run, project_id, policy_digest),
-            )
-            return task_id
+        """Compatibility facade for the scheduler repository."""
+        return await self._scheduler_repository.insert_scheduled_task(
+            name, prompt, status, schedule, deliver_to, meta,
+            principal_id=principal_id, next_run=next_run,
+            project_id=project_id, policy_digest=policy_digest,
+        )
 
     async def update_scheduled_task_status(
-        self, task_id: str, status: str, bump_version: bool = False,
+        self, task_id: str, status: str, bump_version: bool = False
     ) -> int:
-        """Update only the status column.
-
-        HIGH-3 (batch 3.1.8): if ``bump_version`` is True, also increments
-        ``lifecycle_version``.  Returns the rowcount (1 = success, 0 = no
-        such task).  Used by control operations (pause / resume / remove)
-        which always win over stale executor writes.
-        """
-        async with self.transaction() as conn:
-            if bump_version:
-                cursor = await conn.execute(
-                    "UPDATE scheduled_tasks SET status = ?, "
-                    "lifecycle_version = lifecycle_version + 1 WHERE id = ?",
-                    (status, task_id),
-                )
-            else:
-                cursor = await conn.execute(
-                    "UPDATE scheduled_tasks SET status = ? WHERE id = ?",
-                    (status, task_id),
-                )
-            return cursor.rowcount
+        """Compatibility facade for the scheduler repository."""
+        return await self._scheduler_repository.update_scheduled_task_status(
+            task_id, status, bump_version
+        )
 
     async def update_scheduled_task(
-        self,
-        task_id: str,
-        status: str | None = None,
-        last_run: str | None = None,
-        next_run: str | None = None,
-        run_count: int | None = None,
-        last_result: str | None = None,
-        error: str | None = None,
-        bump_version: bool = False,
+        self, task_id: str, status: str | None = None,
+        last_run: str | None = None, next_run: str | None = None,
+        run_count: int | None = None, last_result: str | None = None,
+        error: str | None = None, bump_version: bool = False,
     ) -> int:
-        """Update multiple columns.  Returns rowcount (1 = success, 0 = no
-        such task).
-
-        HIGH-3 (batch 3.1.8): if ``bump_version`` is True, also increments
-        ``lifecycle_version``.  Used by control operations which always
-        win over stale executor writes.
-        """
-        async with self.transaction() as conn:
-            clauses: list[str] = []
-            params: list[Any] = []
-            for col, val in [
-                ("status", status),
-                ("last_run", last_run),
-                ("next_run", next_run),
-                ("run_count", run_count),
-                ("last_result", last_result),
-                ("error", error),
-            ]:
-                if val is not None:
-                    clauses.append(f"{col} = ?")
-                    params.append(val)
-            if bump_version:
-                clauses.append("lifecycle_version = lifecycle_version + 1")
-            if not clauses:
-                return 1
-            params.append(task_id)
-            cursor = await conn.execute(
-                f"UPDATE scheduled_tasks SET {', '.join(clauses)} WHERE id = ?",
-                tuple(params),
-            )
-            return cursor.rowcount
+        """Compatibility facade for the scheduler repository."""
+        return await self._scheduler_repository.update_scheduled_task(
+            task_id, status, last_run, next_run, run_count,
+            last_result, error, bump_version
+        )
 
     async def update_scheduled_task_conditional(
-        self,
-        task_id: str,
-        expected_version: int,
-        status: str | None = None,
-        last_run: str | None = None,
-        next_run: str | None = None,
-        run_count: int | None = None,
-        last_result: str | None = None,
+        self, task_id: str, expected_version: int, status: str | None = None,
+        last_run: str | None = None, next_run: str | None = None,
+        run_count: int | None = None, last_result: str | None = None,
         error: str | None = None,
     ) -> int:
-        """Optimistic-concurrency UPDATE for executor terminal writes.
-
-        HIGH-3 (batch 3.1.8): the executor captures ``lifecycle_version``
-        at start and passes it as ``expected_version``.  The UPDATE only
-        succeeds if the version hasn't changed (no control operation
-        happened in between).  Returns rowcount:
-          - 1 = success (version matched, state written)
-          - 0 = version mismatch (a pause / remove / resume happened;
-            the stale write is discarded)
-
-        HIGH (batch 3.1.9): the UPDATE does NOT bump ``lifecycle_version``
-        on success.  Only control operations (pause / resume / remove)
-        bump the version — so multiple sequential executions of a
-        recurring task reuse the same version and the conditional UPDATE
-        matches every time.  Previously the executor bumped the version
-        on each successful write, which caused the SECOND execution's
-        ``expected_version`` (still the captured-at-start value) to
-        mismatch the now-incremented DB version — every subsequent
-        execution's terminal state was silently discarded, the task
-        appeared stuck at its pre-execution ``next_run``, and a process
-        restart could re-fire the task immediately.
-        """
-        async with self.transaction() as conn:
-            clauses: list[str] = []
-            params: list[Any] = []
-            for col, val in [
-                ("status", status),
-                ("last_run", last_run),
-                ("next_run", next_run),
-                ("run_count", run_count),
-                ("last_result", last_result),
-                ("error", error),
-            ]:
-                if val is not None:
-                    clauses.append(f"{col} = ?")
-                    params.append(val)
-            # HIGH (batch 3.1.9): NO version bump here — only the WHERE
-            # clause checks the version.  Control ops bump the version;
-            # executor writes only check it.
-            # HIGH-3 (batch 3.1.8): WHERE clause is ``id = ? AND
-            # lifecycle_version = ?`` — params MUST be in that order
-            # (task_id first, then expected_version).  A previous version
-            # had these reversed, which made every conditional UPDATE
-            # match 0 rows (id column received an int, lifecycle_version
-            # received a string) — silently discarding every executor
-            # terminal write as a "version mismatch".
-            params.extend([task_id, expected_version])
-            cursor = await conn.execute(
-                f"UPDATE scheduled_tasks SET {', '.join(clauses)} "
-                f"WHERE id = ? AND lifecycle_version = ?",
-                tuple(params),
-            )
-            return cursor.rowcount
+        """Compatibility facade for the scheduler repository."""
+        return await self._scheduler_repository.update_scheduled_task_conditional(
+            task_id, expected_version, status, last_run, next_run,
+            run_count, last_result, error
+        )
 
     async def list_scheduled_tasks(
-        self, *, principal_id: str | None = None, project_id: str | None = None,
+        self, *, principal_id: str | None = None,
+        project_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        """List scheduled tasks, optionally filtered by ``principal_id``.
-
-        M4 batch 3.1.10: when ``principal_id`` is provided, only tasks
-        belonging to that principal are returned.  ``None`` returns all
-        (used by the engine's internal ``_load_tasks`` / reconcile).
-
-        M4 batch 3.1.16B-1: the SELECT now includes ``policy_digest``
-        and ``project_id`` so ``_task_from_row`` can restore the
-        security-context snapshot for B-2 drift detection.
-
-        H-02/H-03/H-04 (round-4 review): ``project_id`` is an
-        independent owner dimension.  When provided, tasks are further
-        scoped to that project — closing the cross-project read path on
-        shared DBs.  Production callers pass both; ``None`` on either
-        remains the admin opt-in.
-        """
-        async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
-            conn = await self._require_conn()
-            clauses: list[str] = []
-            params: list[Any] = []
-            if principal_id is not None:
-                clauses.append("principal_id = ?")
-                params.append(principal_id)
-            if project_id is not None:
-                clauses.append("project_id = ?")
-                params.append(project_id)
-            where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-            cursor = await conn.execute(
-                f"""
-                SELECT id, name, prompt, status, schedule_config, deliver_to, meta,
-                       created_at, last_run, next_run, run_count, last_result, error,
-                       lifecycle_version, principal_id, execution_id, lease_until,
-                       policy_digest, project_id
-                FROM scheduled_tasks
-                {where}
-                ORDER BY created_at
-                """,
-                tuple(params),
-            )
-            return [dict(row) for row in await cursor.fetchall()]
+        """Compatibility facade for the scheduler repository."""
+        return await self._scheduler_repository.list_scheduled_tasks(
+            principal_id=principal_id, project_id=project_id
+        )
 
     async def get_scheduled_task(
         self, task_id: str, *, principal_id: str | None = None,
         project_id: str | None = None,
     ) -> dict[str, Any] | None:
-        """Get a scheduled task by id, optionally verifying ``principal_id``.
-
-        M4 batch 3.1.10: when ``principal_id`` is provided, returns
-        ``None`` if the task belongs to a different principal — so the
-        engine can return ``not_found`` (rather than revealing the
-        task's existence to an unauthorized caller).
-
-        H-02/H-03/H-04 (round-4 review): ``project_id`` is an
-        independent owner dimension.  When provided, returns ``None``
-        if the task belongs to a different project.  Production callers
-        pass both; ``None`` on either remains the admin opt-in.
-        """
-        async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
-            conn = await self._require_conn()
-            cursor = await conn.execute(
-                "SELECT * FROM scheduled_tasks WHERE id = ?", (task_id,)
-            )
-            row = await cursor.fetchone()
-            if row is None:
-                return None
-            result = dict(row)
-            if principal_id is not None and result.get("principal_id") != principal_id:
-                return None
-            if project_id is not None and result.get("project_id") != project_id:
-                return None
-            return result
+        """Compatibility facade for the scheduler repository."""
+        return await self._scheduler_repository.get_scheduled_task(
+            task_id, principal_id=principal_id, project_id=project_id
+        )
 
     async def claim_scheduled_task(
-        self,
-        task_id: str,
-        *,
-        execution_id: str,
-        started_at: str,
-        lease_until: str,
-        expected_version: int,
+        self, task_id: str, *, execution_id: str, started_at: str,
+        lease_until: str, expected_version: int,
         expected_principal_id: str | None = None,
         expected_project_id: str | None = None,
         expected_policy_digest: str | None = None,
     ) -> int:
-        """Atomically claim a task for execution (durable lease).
-
-        M4 batch 3.1.10: CAS UPDATE that transitions a task from
-        PENDING to RUNNING, stamping an ``execution_id`` and
-        ``lease_until`` so a crash during execution leaves a durable
-        marker that restart recovery can detect and disclose.
-
-        M4 batch 3.1.11 (MEDIUM-1): ``last_run`` is now set to
-        ``started_at`` (the actual execution start time), NOT
-        ``lease_until`` (the deadline).  Previously ``last_run`` was
-        set to ``lease_until``, making the DB appear ~10 minutes
-        behind the real start time during execution — corrupting
-        audit timelines and crash-recovery forensics.
-
-        Round-12 review P1-2: the CAS WHERE clause now also binds
-        ``principal_id``, ``project_id`` and ``policy_digest`` when
-        provided, so a DB row whose identity drifted (concurrent
-        migration, data corruption, a future admin tool that forgot
-        to bump lifecycle_version) cannot be claimed under a stale
-        in-memory snapshot.  The claim returns 0 (not claimed) if any
-        identity field mismatches — the executor is never called.
-
-        Returns rowcount:
-          - 1 = claim succeeded (status, version AND identity matched)
-          - 0 = claim failed (task was not PENDING, version changed,
-                or identity drifted)
-
-        The UPDATE does NOT bump ``lifecycle_version`` — execution
-        claims are not control operations.
-        """
-        # Build the WHERE clause with optional identity bindings.
-        where_parts = [
-            "id = ?", "status = 'pending'", "lifecycle_version = ?"
-        ]
-        params: list = [task_id, expected_version]
-        if expected_principal_id is not None:
-            where_parts.append("principal_id = ?")
-            params.append(expected_principal_id)
-        if expected_project_id is not None:
-            where_parts.append("project_id = ?")
-            params.append(expected_project_id)
-        if expected_policy_digest is not None:
-            where_parts.append("policy_digest = ?")
-            params.append(expected_policy_digest)
-        where_clause = " AND ".join(where_parts)
-        sql = (
-            "UPDATE scheduled_tasks "
-            "SET status = 'running', execution_id = ?, lease_until = ?, "
-            "last_run = ? "
-            f"WHERE {where_clause}"
+        """Compatibility facade for the scheduler repository."""
+        return await self._scheduler_repository.claim_scheduled_task(
+            task_id, execution_id=execution_id, started_at=started_at,
+            lease_until=lease_until, expected_version=expected_version,
+            expected_principal_id=expected_principal_id,
+            expected_project_id=expected_project_id,
+            expected_policy_digest=expected_policy_digest,
         )
-        # INSERT execution params at the front (SET clause), then WHERE params.
-        all_params = (execution_id, lease_until, started_at, *params)
-        async with self.transaction() as conn:
-            cursor = await conn.execute(sql, all_params)
-            return cursor.rowcount
 
     async def clear_scheduled_task_lease(
-        self, task_id: str, *, execution_id: str,
+        self, task_id: str, *, execution_id: str
     ) -> int:
-        """Clear the execution lease on a task after successful terminal write.
-
-        M4 batch 3.1.10: called by the executor after it has written
-        the terminal state (COMPLETED / FAILED / PENDING-for-next-run).
-        Clears ``execution_id`` and ``lease_until`` only if the stored
-        ``execution_id`` matches — so a stale executor that lost a
-        lease race cannot clear a newer executor's lease.
-
-        Returns rowcount (1 = cleared, 0 = execution_id mismatch).
-        """
-        async with self.transaction() as conn:
-            cursor = await conn.execute(
-                """
-                UPDATE scheduled_tasks
-                SET execution_id = NULL, lease_until = NULL
-                WHERE id = ? AND execution_id = ?
-                """,
-                (task_id, execution_id),
-            )
-            return cursor.rowcount
+        """Compatibility facade for the scheduler repository."""
+        return await self._scheduler_repository.clear_scheduled_task_lease(
+            task_id, execution_id=execution_id
+        )
 
     async def recover_expired_leases(self, *, now_iso: str) -> int:
-        """Mark tasks with expired leases as FAILED (durable at-least-once disclosure).
-
-        M4 batch 3.1.10: called by ``CronEngine.start()`` after loading
-        tasks.  Any task with ``status='running'`` and
-        ``lease_until < now`` represents a crashed execution — its
-        terminal state was never persisted.  Mark it FAILED with an
-        error explaining the crash, and bump the lifecycle_version so
-        any stale executor that somehow resumes will fail its
-        conditional write.
-
-        M4 batch 3.1.12 (HIGH-1): ``recover_all_running_tasks`` is now
-        the preferred startup recovery path (single-instance model —
-        all RUNNING rows belong to the dead previous process).  This
-        method is still used for periodic sweep inside a running
-        engine (catches executor hangs where the lease expires but
-        the process is still alive).
-
-        Returns the number of tasks recovered.
-        """
-        async with self.transaction() as conn:
-            cursor = await conn.execute(
-                """
-                UPDATE scheduled_tasks
-                SET status = 'failed', error = 'execution lease expired '
-                    || '(process crash during execution; at-least-once disclosure)',
-                    execution_id = NULL, lease_until = NULL,
-                    lifecycle_version = lifecycle_version + 1
-                WHERE status = 'running' AND lease_until IS NOT NULL
-                      AND lease_until < ?
-                """,
-                (now_iso,),
-            )
-            return cursor.rowcount
+        """Compatibility facade for the scheduler repository."""
+        return await self._scheduler_repository.recover_expired_leases(
+            now_iso=now_iso
+        )
 
     async def recover_all_running_tasks(self) -> int:
-        """M4 batch 3.1.12 (HIGH-1): mark ALL running tasks as FAILED.
-
-        Single-instance model: when the engine starts, any task with
-        ``status='running'`` belongs to a DEAD previous process (the
-        process crash is why we're starting).  Without this, a task
-        whose lease hasn't expired yet would stay RUNNING forever —
-        ``recover_expired_leases`` only matches ``lease_until < now``,
-        and the tick loop only fires PENDING tasks, so an unexpired
-        RUNNING row is never re-evaluated.
-
-        This method is called by ``CronEngine.start()`` BEFORE
-        ``recover_expired_leases``.  It catches:
-          - Tasks with unexpired leases (the gap left by 3.1.10).
-          - Tasks with expired leases (idempotent with
-            ``recover_expired_leases`` — the second call matches 0
-            rows because status is no longer 'running').
-          - Tasks with NULL leases (the CRITICAL-2 hole from 3.1.11
-            where a stale executor cleared the lease but left status
-            RUNNING — though 3.1.12's atomic control_finalize closes
-            that hole at the source, this is the defense-in-depth).
-
-        Bumps ``lifecycle_version`` so any stale executor that
-        somehow resumes will fail its conditional write.
-
-        Returns the number of tasks recovered.
-        """
-        async with self.transaction() as conn:
-            cursor = await conn.execute(
-                """
-                UPDATE scheduled_tasks
-                SET status = 'failed',
-                    error = 'process restart detected - task was running '
-                            || 'at startup; single-instance model treats '
-                            || 'this as a crash (at-least-once disclosure)',
-                    execution_id = NULL, lease_until = NULL,
-                    lifecycle_version = lifecycle_version + 1
-                WHERE status = 'running'
-                """
-            )
-            return cursor.rowcount
+        """Compatibility facade for the scheduler repository."""
+        return await self._scheduler_repository.recover_all_running_tasks()
 
     async def query_running_task_ids(self) -> list[str]:
-        """M4 batch 3.1.13 (CRITICAL-2): query task IDs with
-        ``status='running'`` WITHOUT writing FAILED.
+        """Compatibility facade for the scheduler repository."""
+        return await self._scheduler_repository.query_running_task_ids()
 
-        Called by ``CronEngine.start()`` BEFORE
-        ``recover_all_running_tasks`` so the engine can per-task
-        reload the recovered tasks (instead of the full
-        ``_load_tasks()`` that overwrites other tasks' in-memory
-        state — see CRITICAL-2 in the security review).
-
-        Single-instance model: at startup, any task with
-        ``status='running'`` belongs to a DEAD previous process.
-        We query the IDs first so we know which tasks will be
-        recovered, then call ``recover_all_running_tasks`` to
-        bulk-UPDATE them, then per-task reload each one.
-        """
-        async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
-            conn = await self._require_conn()
-            cursor = await conn.execute(
-                "SELECT id FROM scheduled_tasks WHERE status = 'running'"
-            )
-            rows = await cursor.fetchall()
-            return [str(row[0]) for row in rows]
-
-    async def query_expired_lease_task_ids(self, *, now_iso: str) -> list[str]:
-        """M4 batch 3.1.13 (CRITICAL-1): query task IDs with expired
-        leases WITHOUT writing FAILED.
-
-        The tick loop uses this to identify which executors need to be
-        revoked BEFORE the sweep writes FAILED.  Previously the sweep
-        unconditionally wrote FAILED via ``recover_expired_leases`` and
-        then called ``_load_tasks()`` — the live executor was never
-        cancelled, producing side effects after the DB said FAILED.
-        """
-        async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
-            conn = await self._require_conn()
-            cursor = await conn.execute(
-                "SELECT id FROM scheduled_tasks "
-                "WHERE status = 'running' AND lease_until IS NOT NULL "
-                "AND lease_until < ?",
-                (now_iso,),
-            )
-            rows = await cursor.fetchall()
-            return [str(row[0]) for row in rows]
+    async def query_expired_lease_task_ids(
+        self, *, now_iso: str
+    ) -> list[str]:
+        """Compatibility facade for the scheduler repository."""
+        return await self._scheduler_repository.query_expired_lease_task_ids(
+            now_iso=now_iso
+        )
 
     async def recover_one_expired_lease(
-        self, task_id: str, *, now_iso: str,
+        self, task_id: str, *, now_iso: str
     ) -> bool:
-        """M4 batch 3.1.13 (CRITICAL-1): per-task lease recovery.
-
-        Conditional on ``status='running'`` AND ``lease_until < now``
-        AND ``lease_until IS NOT NULL``.  Called by the tick loop's
-        periodic sweep AFTER the live executor has been cancelled and
-        bounded-awaited.  Returns ``True`` if the row was updated.
-        """
-        async with self.transaction() as conn:
-            cursor = await conn.execute(
-                """
-                UPDATE scheduled_tasks
-                SET status = 'failed', error = 'execution lease expired '
-                    || '(periodic sweep; live executor revoked; '
-                    || 'at-least-once disclosure)',
-                    execution_id = NULL, lease_until = NULL,
-                    lifecycle_version = lifecycle_version + 1
-                WHERE id = ? AND status = 'running'
-                      AND lease_until IS NOT NULL AND lease_until < ?
-                """,
-                (task_id, now_iso),
-            )
-            return cursor.rowcount == 1
+        """Compatibility facade for the scheduler repository."""
+        return await self._scheduler_repository.recover_one_expired_lease(
+            task_id, now_iso=now_iso
+        )
 
     async def finalize_scheduled_task(
-        self,
-        task_id: str,
-        *,
-        execution_id: str,
-        expected_version: int,
-        status: str,
-        last_run: str | None = None,
-        next_run: str | None = None,
-        run_count: int | None = None,
-        last_result: str | None = None,
-        error: str | None = None,
+        self, task_id: str, *, execution_id: str, expected_version: int,
+        status: str, last_run: str | None = None,
+        next_run: str | None = None, run_count: int | None = None,
+        last_result: str | None = None, error: str | None = None,
     ) -> int:
-        """Atomic terminal write + lease clear (CAS).
-
-        M4 batch 3.1.11 (CRITICAL-2): combines the terminal state
-        write AND the lease clear into a single conditional UPDATE so
-        they cannot diverge.  Previously the executor wrote the
-        terminal state, then SEPARATELY cleared the lease — if the
-        terminal write raised (DB error, commit-then-raise), the
-        ``except`` branch still cleared the lease, leaving the DB row
-        at ``status='running' + execution_id=NULL + lease_until=NULL``
-        — permanently stuck (``recover_expired_leases`` only matches
-        rows with ``lease_until IS NOT NULL``).
-
-        The UPDATE is conditional on BOTH ``execution_id`` (so a stale
-        executor can't finalize a newer executor's task) AND
-        ``lifecycle_version`` (so a stale executor can't overwrite a
-        control op's desired state).  Returns rowcount:
-          - 1 = success (terminal state written + lease cleared)
-          - 0 = version mismatch OR execution_id mismatch (a control
-                op or a newer executor won; the stale write is
-                discarded).  The lease is NOT cleared in this case —
-                the caller must leave it intact for restart recovery.
-        """
-        async with self.transaction() as conn:
-            clauses: list[str] = [
-                "status = ?",
-                "execution_id = NULL",
-                "lease_until = NULL",
-            ]
-            params: list[Any] = [status]
-            for col, val in [
-                ("last_run", last_run),
-                ("next_run", next_run),
-                ("run_count", run_count),
-                ("last_result", last_result),
-                ("error", error),
-            ]:
-                if val is not None:
-                    clauses.append(f"{col} = ?")
-                    params.append(val)
-            # NO version bump — executor terminal writes never bump the
-            # version (only control operations do).
-            params.extend([task_id, execution_id, expected_version])
-            cursor = await conn.execute(
-                f"UPDATE scheduled_tasks SET {', '.join(clauses)} "
-                f"WHERE id = ? AND execution_id = ? AND lifecycle_version = ?",
-                tuple(params),
-            )
-            return cursor.rowcount
+        """Compatibility facade for the scheduler repository."""
+        return await self._scheduler_repository.finalize_scheduled_task(
+            task_id, execution_id=execution_id, expected_version=expected_version,
+            status=status, last_run=last_run, next_run=next_run,
+            run_count=run_count, last_result=last_result, error=error,
+        )
 
     async def control_update_scheduled_task(
-        self,
-        task_id: str,
-        *,
-        expected_version: int,
-        target_version: int,
-        status: str,
-        next_run: str | None = None,
-        error: str | None = None,
+        self, task_id: str, *, expected_version: int, target_version: int,
+        status: str, next_run: str | None = None, error: str | None = None,
     ) -> int:
-        """Idempotent CAS for control operations (pause / resume / remove).
-
-        M4 batch 3.1.11 (HIGH-2): replaces the unconditional
-        ``update_scheduled_task(bump_version=True)`` for control ops.
-        Previously a control op used
-        ``lifecycle_version = lifecycle_version + 1`` unconditionally,
-        so a retry after commit-then-raise bumped the version AGAIN
-        — causing version drift between the in-memory epoch (still
-        the first bump) and the DB (bumped twice).  Subsequent
-        executor writes with the captured ``expected_version`` would
-        permanently mismatch.
-
-        This method takes an explicit ``expected_version`` (the
-        version the control op observed at start) and a
-        ``target_version`` (exactly ``expected_version + 1``).  The
-        UPDATE is conditional on ``lifecycle_version = expected_version``
-        and sets it to ``target_version`` — so a retry after
-        commit-then-raise is idempotent:
-          - If the DB is still at ``expected_version``: UPDATE
-            succeeds, sets to ``target_version``.
-          - If the DB is already at ``target_version`` (prior retry
-            committed): UPDATE matches 0 rows (version mismatch) —
-            the caller treats this as success by reading back.
-          - If the DB is at a HIGHER version (a newer control op
-            happened): UPDATE matches 0 rows — the caller must NOT
-            overwrite; the newer op wins.
-
-        M4 batch 3.1.12 (CRITICAL-2): this method does NOT clear the
-        execution lease (``execution_id`` / ``lease_until``).  Use
-        ``control_finalize_scheduled_task`` for control ops that need
-        to release the lease atomically with the state transition —
-        otherwise a stale executor's ``_clear_lease`` could clear the
-        lease while the control op's persist has failed, leaving the
-        DB at ``status='running' + execution_id=NULL + lease_until=NULL``
-        (permanently stuck, unrecoverable).
-
-        Returns rowcount (1 = applied, 0 = version mismatch).
-        """
-        async with self.transaction() as conn:
-            clauses: list[str] = [
-                "status = ?",
-                "lifecycle_version = ?",
-            ]
-            params: list[Any] = [status, target_version]
-            for col, val in [
-                ("next_run", next_run),
-                ("error", error),
-            ]:
-                if val is not None:
-                    clauses.append(f"{col} = ?")
-                    params.append(val)
-            params.append(task_id)
-            cursor = await conn.execute(
-                f"UPDATE scheduled_tasks SET {', '.join(clauses)} "
-                f"WHERE id = ? AND lifecycle_version = ?",
-                tuple(params + [expected_version]),
-            )
-            return cursor.rowcount
+        """Compatibility facade for the scheduler repository."""
+        return await self._scheduler_repository.control_update_scheduled_task(
+            task_id, expected_version=expected_version,
+            target_version=target_version, status=status,
+            next_run=next_run, error=error,
+        )
 
     async def control_finalize_scheduled_task(
-        self,
-        task_id: str,
-        *,
-        expected_version: int,
-        target_version: int,
-        status: str,
-        next_run: str | None = None,
-        error: str | None = None,
+        self, task_id: str, *, expected_version: int, target_version: int,
+        status: str, next_run: str | None = None, error: str | None = None,
     ) -> int:
-        """M4 batch 3.1.12 (CRITICAL-2): atomic control state + lease clear.
+        """Compatibility facade for the scheduler repository."""
+        return await self._scheduler_repository.control_finalize_scheduled_task(
+            task_id, expected_version=expected_version,
+            target_version=target_version, status=status,
+            next_run=next_run, error=error,
+        )
 
-        Combines the control op's state transition (status +
-        lifecycle_version) AND the execution lease release
-        (``execution_id = NULL`` / ``lease_until = NULL``) into a
-        single CAS UPDATE.  This closes the CRITICAL-2 hole where a
-        control op persisted the desired state but left the lease in
-        the DB — then a stale executor's ``_clear_lease`` cleared
-        the lease independently while the control op's persist had
-        actually FAILED, leaving ``status='running' + NULL lease``
-        (permanently stuck, unrecoverable by ``recover_expired_leases``
-        which matches ``lease_until IS NOT NULL``).
+    async def insert_scheduler_journal_entry(
+        self, *, operation_id: str, task_id: str, operation_type: str,
+        desired_status: str, expected_version: int, target_version: int,
+        principal_id: str = "", policy_digest: str = "",
+        project_id: str = "",
+    ) -> int:
+        """Compatibility facade for the scheduler repository."""
+        return await self._scheduler_repository.insert_scheduler_journal_entry(
+            operation_id=operation_id, task_id=task_id,
+            operation_type=operation_type, desired_status=desired_status,
+            expected_version=expected_version, target_version=target_version,
+            principal_id=principal_id, policy_digest=policy_digest,
+            project_id=project_id,
+        )
 
-        The UPDATE is conditional on ``lifecycle_version =
-        expected_version``.  Idempotent on retry:
-          - DB at ``expected_version``: UPDATE succeeds, sets
-            ``target_version`` + clears lease.
-          - DB at ``target_version`` (prior retry committed): UPDATE
-            matches 0 rows — caller reads back to confirm.
-          - DB at higher version (newer control op): UPDATE matches
-            0 rows — caller must NOT overwrite.
+    async def mark_scheduler_journal_applied(self, operation_id: str) -> int:
+        """Compatibility facade for the scheduler repository."""
+        return await self._scheduler_repository.mark_scheduler_journal_applied(
+            operation_id
+        )
 
-        Returns rowcount (1 = applied, 0 = version mismatch).
-        """
-        async with self.transaction() as conn:
-            clauses: list[str] = [
-                "status = ?",
-                "lifecycle_version = ?",
-                "execution_id = NULL",
-                "lease_until = NULL",
-            ]
-            params: list[Any] = [status, target_version]
-            for col, val in [
-                ("next_run", next_run),
-                ("error", error),
-            ]:
-                if val is not None:
-                    clauses.append(f"{col} = ?")
-                    params.append(val)
-            params.append(task_id)
-            cursor = await conn.execute(
-                f"UPDATE scheduled_tasks SET {', '.join(clauses)} "
-                f"WHERE id = ? AND lifecycle_version = ?",
-                tuple(params + [expected_version]),
-            )
-            return cursor.rowcount
-
-    # ------------------------------------------------------------------
+    async def list_pending_scheduler_journal_entries(
+        self,
+    ) -> list[dict[str, Any]]:
+        """Compatibility facade for the scheduler repository."""
+        return await self._scheduler_repository.list_pending_scheduler_journal_entries()
     # Durable tool-operation journal (security closure)
     # ------------------------------------------------------------------
 
     async def claim_tool_operation(
-        self,
-        *,
-        operation_id: str,
-        tool_name: str,
-        arguments_digest: str,
-        effect_id: str,
-        owner_token: str,
-        principal_id: str = "",
-        project_id: str = "",
-        session_id: str = "",
-        task_id: str = "",
+        self, *, operation_id: str, tool_name: str, arguments_digest: str,
+        effect_id: str, owner_token: str, principal_id: str = "",
+        project_id: str = "", session_id: str = "", task_id: str = "",
         workspace_id: str = "",
     ) -> dict[str, Any]:
-        """Atomically claim or replay one durable idempotent operation.
-
-        ``operation_id`` is the scheduler's scope digest, not a model
-        supplied identifier.  A different argument digest is always a
-        conflict.  Existing terminal rows are returned for replay; a
-        ``running`` row is returned to the caller so the scheduler can either
-        wait for its in-process owner or disclose an orphaned operation after
-        restart without invoking the handler again.
-        """
-        async with self.transaction() as conn:
-            cursor = await conn.execute(
-                "SELECT operation_id, tool_name, arguments_digest, status, "
-                "effect_id, effect_status, reconciliation_hint, result_json, "
-                "owner_token, principal_id, project_id, session_id, task_id, "
-                "workspace_id, created_at, updated_at "
-                "FROM tool_operations WHERE operation_id = ?",
-                (operation_id,),
-            )
-            row = await cursor.fetchone()
-            if row is not None:
-                values = dict(row)
-                scope_fields = {
-                    "principal_id": principal_id,
-                    "project_id": project_id,
-                    "session_id": session_id,
-                    "task_id": task_id,
-                    "workspace_id": workspace_id,
-                }
-                mismatched_scope = [
-                    field
-                    for field, expected in scope_fields.items()
-                    if str(values.get(field) or "") != str(expected or "")
-                ]
-                if mismatched_scope:
-                    return {
-                        "state": "conflict",
-                        "conflict_reason": (
-                            "operation scope mismatch: "
-                            + ", ".join(sorted(mismatched_scope))
-                        ),
-                        **values,
-                    }
-                if (
-                    values["tool_name"] != tool_name
-                    or values["arguments_digest"] != arguments_digest
-                ):
-                    return {
-                        "state": "conflict",
-                        "conflict_reason": (
-                            "idempotency key was reused with different tool arguments"
-                        ),
-                        **values,
-                    }
-                return {"state": "existing", **values}
-            now = utc_now_naive().isoformat()
-            await conn.execute(
-                """
-                INSERT INTO tool_operations (
-                    operation_id, tool_name, arguments_digest, status,
-                    effect_id, effect_status, reconciliation_hint, result_json,
-                    owner_token, principal_id, project_id, session_id, task_id,
-                    workspace_id, created_at, updated_at
-                ) VALUES (?, ?, ?, 'running', ?, ?, '', '', ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    operation_id, tool_name, arguments_digest, effect_id,
-                    "not_started", owner_token, principal_id, project_id,
-                    session_id, task_id, workspace_id, now, now,
-                ),
-            )
-            return {
-                "state": "claimed",
-                "operation_id": operation_id,
-                "tool_name": tool_name,
-                "arguments_digest": arguments_digest,
-                "status": "running",
-                "effect_id": effect_id,
-                "effect_status": "not_started",
-                "reconciliation_hint": "",
-                "result_json": "",
-                "owner_token": owner_token,
-            }
+        """Compatibility facade for the tool-operation repository."""
+        return await self._tool_operation_repository.claim_tool_operation(
+            operation_id=operation_id, tool_name=tool_name,
+            arguments_digest=arguments_digest, effect_id=effect_id,
+            owner_token=owner_token, principal_id=principal_id,
+            project_id=project_id, session_id=session_id, task_id=task_id,
+            workspace_id=workspace_id,
+        )
 
     async def complete_tool_operation(
-        self,
-        *,
-        operation_id: str,
-        owner_token: str,
-        status: str,
-        effect_status: str,
-        reconciliation_hint: str = "",
+        self, *, operation_id: str, owner_token: str, status: str,
+        effect_status: str, reconciliation_hint: str = "",
         result_json: str = "",
     ) -> int:
-        """Finalize a claimed operation only for its original owner."""
-        if status not in {"completed", "unknown"}:
-            raise ValueError(f"invalid tool operation terminal status: {status}")
-        async with self.transaction() as conn:
-            cursor = await conn.execute(
-                """
-                UPDATE tool_operations
-                SET status = ?, effect_status = ?, reconciliation_hint = ?,
-                    result_json = ?, updated_at = ?
-                WHERE operation_id = ? AND owner_token = ? AND status = 'running'
-                """,
-                (
-                    status, effect_status, reconciliation_hint, result_json,
-                    utc_now_naive().isoformat(), operation_id, owner_token,
-                ),
-            )
-            return int(cursor.rowcount or 0)
+        """Compatibility facade for the tool-operation repository."""
+        return await self._tool_operation_repository.complete_tool_operation(
+            operation_id=operation_id, owner_token=owner_token, status=status,
+            effect_status=effect_status, reconciliation_hint=reconciliation_hint,
+            result_json=result_json,
+        )
 
     async def update_tool_operation_effect_id(
         self, *, operation_id: str, owner_token: str, effect_id: str
     ) -> int:
-        """Persist a handler's external effect identifier while it owns a row."""
-        if not effect_id or len(effect_id) > 256 or any(
-            char in effect_id for char in "\x00\r\n"
-        ):
-            raise ValueError("invalid tool operation effect_id")
-        async with self.transaction() as conn:
-            cursor = await conn.execute(
-                """
-                UPDATE tool_operations
-                SET effect_id = ?, updated_at = ?
-                WHERE operation_id = ? AND owner_token = ? AND status = 'running'
-                """,
-                (
-                    effect_id, utc_now_naive().isoformat(), operation_id, owner_token
-                ),
-            )
-            return int(cursor.rowcount or 0)
+        """Compatibility facade for the tool-operation repository."""
+        return await self._tool_operation_repository.update_tool_operation_effect_id(
+            operation_id=operation_id, owner_token=owner_token, effect_id=effect_id
+        )
 
     async def mark_tool_operation_unknown(
-        self,
-        *,
-        operation_id: str,
-        reconciliation_hint: str,
-        result_json: str,
+        self, *, operation_id: str, reconciliation_hint: str,
+        result_json: str
     ) -> int:
-        """Quarantine an orphaned running operation without replaying it."""
-        async with self.transaction() as conn:
-            cursor = await conn.execute(
-                """
-                UPDATE tool_operations
-                SET status = 'unknown', effect_status = 'unknown',
-                    reconciliation_hint = ?, result_json = ?, updated_at = ?
-                WHERE operation_id = ? AND status = 'running'
-                """,
-                (
-                    reconciliation_hint, result_json, utc_now_naive().isoformat(),
-                    operation_id,
-                ),
-            )
-            return int(cursor.rowcount or 0)
+        """Compatibility facade for the tool-operation repository."""
+        return await self._tool_operation_repository.mark_tool_operation_unknown(
+            operation_id=operation_id, reconciliation_hint=reconciliation_hint,
+            result_json=result_json,
+        )
 
     async def prune_tool_operations(
         self, *, older_than_seconds: float, now: float, limit: int = 256
     ) -> int:
-        """Prune only terminal operations proven to have no external effect.
-
-        A completed row with ``applied``, ``partial``, or ``unknown`` effect
-        status is also a replay-suppression tombstone.  Deleting it merely
-        because it is old can turn a later retry into a duplicate external
-        mutation.  Those rows require an explicit reconciliation/archive
-        workflow; routine maintenance may remove only ``not_applied`` rows.
-        """
-        cutoff = datetime.fromtimestamp(
-            now - max(0.0, older_than_seconds), UTC
-        ).replace(tzinfo=None).isoformat()
-        async with self.transaction() as conn:
-            cursor = await conn.execute(
-                "SELECT operation_id FROM tool_operations "
-                "WHERE status = 'completed' AND effect_status = 'not_applied' "
-                "AND updated_at < ? "
-                "ORDER BY updated_at LIMIT ?",
-                (cutoff, max(1, min(limit, 10_000))),
-            )
-            operation_ids = [str(row["operation_id"]) for row in await cursor.fetchall()]
-            if not operation_ids:
-                return 0
-            placeholders = ",".join("?" for _ in operation_ids)
-            deleted = await conn.execute(
-                f"DELETE FROM tool_operations WHERE operation_id IN ({placeholders})",
-                tuple(operation_ids),
-            )
-            return int(deleted.rowcount or 0)
-
+        """Compatibility facade for the tool-operation repository."""
+        return await self._tool_operation_repository.prune_tool_operations(
+            older_than_seconds=older_than_seconds, now=now, limit=limit
+        )
     async def checkpoint_wal(self) -> dict[str, int]:
         """Run a bounded passive WAL checkpoint under the writer lock."""
         async with self._write_transaction_lock:
@@ -4221,128 +3574,6 @@ class Database:
                 "quick_check": "error",
                 "error": exc.__class__.__name__,
             }
-
-    # ------------------------------------------------------------------
-    # M4 batch 3.1.16B-5: scheduler operation journal (durable intent)
-    # ------------------------------------------------------------------
-
-    async def insert_scheduler_journal_entry(
-        self,
-        *,
-        operation_id: str,
-        task_id: str,
-        operation_type: str,
-        desired_status: str,
-        expected_version: int,
-        target_version: int,
-        principal_id: str = "",
-        policy_digest: str = "",
-        project_id: str = "",
-    ) -> int:
-        """M4 batch 3.1.16B-5 (CRITICAL): record a control op's intent.
-
-        Called by ``CronEngine._persist_task_state`` (control-op branch)
-        AFTER the in-memory ``_pending_persistence`` marker is placed
-        and BEFORE the CAS UPDATE is attempted.  ``applied_at`` stays
-        NULL until the CAS is confirmed successful (or the entry is
-        marked stale by replay).
-
-        The INSERT is atomic — if it fails, the caller MUST NOT proceed
-        with the CAS (the journal entry is the durability proof; a CAS
-        without a journal entry would be unrecoverable on crash).  The
-        caller raises on failure, leaving the in-memory marker in place
-        so ``stop()`` retries.
-
-        M4 batch 3.1.16A-5-1b: ``project_id`` is stamped on the entry
-        for cross-project forensics (B-5 oversight — the table had
-        ``principal_id`` and ``policy_digest`` but not ``project_id``).
-        ``CronEngine._project_id`` is the source.
-
-        Returns the ``seq`` of the inserted row.
-        """
-        async with self.transaction() as conn:
-            created = utc_now_naive().isoformat()
-            cursor = await conn.execute(
-                """
-                INSERT INTO scheduler_operation_journal
-                    (operation_id, task_id, operation_type, desired_status,
-                     expected_version, target_version, principal_id,
-                     policy_digest, project_id, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    operation_id, task_id, operation_type, desired_status,
-                    expected_version, target_version, principal_id,
-                    policy_digest, project_id, created,
-                ),
-            )
-            return int(cursor.lastrowid or 0)
-
-    async def mark_scheduler_journal_applied(
-        self, operation_id: str,
-    ) -> int:
-        """M4 batch 3.1.16B-5: mark a journal entry as applied.
-
-        Called by ``CronEngine._persist_task_state`` after a successful
-        CAS (or after replay confirms the entry is stale / idempotent).
-        Sets ``applied_at`` so the next ``start()`` does not replay it.
-
-        Returns rowcount (1 = marked, 0 = entry not found — already
-        marked or never inserted; both are safe).
-        """
-        async with self.transaction() as conn:
-            applied = utc_now_naive().isoformat()
-            cursor = await conn.execute(
-                "UPDATE scheduler_operation_journal SET applied_at = ? "
-                "WHERE operation_id = ? AND applied_at IS NULL",
-                (applied, operation_id),
-            )
-            return cursor.rowcount
-
-    async def list_pending_scheduler_journal_entries(
-        self,
-    ) -> list[dict[str, Any]]:
-        """M4 batch 3.1.16B-5: scan ``applied_at IS NULL`` entries in
-        ``seq`` order.
-
-        Called by ``CronEngine.start()`` BEFORE
-        ``recover_all_running_tasks`` so replay can roll forward
-        pause/remove intents before the bulk FAILED sweep would
-        otherwise lose them.
-
-        Returns a list of dicts with keys: ``seq``, ``operation_id``,
-        ``task_id``, ``operation_type``, ``desired_status``,
-        ``expected_version``, ``target_version``, ``principal_id``,
-        ``policy_digest``, ``created_at``.
-        """
-        async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
-            conn = await self._require_conn()
-            cursor = await conn.execute(
-                """
-                SELECT seq, operation_id, task_id, operation_type,
-                       desired_status, expected_version, target_version,
-                       principal_id, policy_digest, created_at
-                FROM scheduler_operation_journal
-                WHERE applied_at IS NULL
-                ORDER BY seq ASC
-                """
-            )
-            rows = await cursor.fetchall()
-            return [
-                {
-                    "seq": int(row[0]),
-                    "operation_id": str(row[1]),
-                    "task_id": str(row[2]),
-                    "operation_type": str(row[3]),
-                    "desired_status": str(row[4]),
-                    "expected_version": int(row[5]),
-                    "target_version": int(row[6]),
-                    "principal_id": str(row[7]),
-                    "policy_digest": str(row[8]),
-                    "created_at": str(row[9]),
-                }
-                for row in rows
-            ]
 
         # ------------------------------------------------------------------
         # Hermes batch 2: session history FTS5 search
@@ -5586,14 +4817,3 @@ class Database:
             # reads see uncommitted writes within the same transaction.
             return self._conn  # type: ignore[return-value]
         return await self._require_reader_conn()
-
-
-def _schedule_to_dict(schedule) -> dict[str, Any]:
-    """Serialize a ScheduleConfig (dataclass) to a JSON-safe dict."""
-    if schedule is None:
-        return {}
-    if hasattr(schedule, "__dict__"):
-        return {k: v for k, v in vars(schedule).items()}
-    if isinstance(schedule, dict):
-        return schedule
-    return {}

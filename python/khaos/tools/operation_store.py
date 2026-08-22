@@ -1,9 +1,10 @@
 """Runtime coordination for durable tool-operation idempotency.
 
-The operation store owns the in-process claim/event map and the durable
-operation-row protocol.  It does not admit calls, evaluate permissions, or
-invoke handlers.  A scheduler may keep compatibility methods that delegate to
-this owner, but it must not reimplement claim, wait, or terminalization logic.
+The operation store owns the in-process claim/event map and consumes the
+durable operation-row protocol from ``db.repositories.tool_operations``.  It
+does not admit calls, evaluate permissions, or invoke handlers.  A scheduler
+may keep compatibility methods that delegate to this owner, but it must not
+reimplement claim, wait, or terminalization logic.
 """
 from __future__ import annotations
 
