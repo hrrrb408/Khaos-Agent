@@ -176,6 +176,13 @@ def test_darwin_unix_client_does_not_infer_xpc(
         "validate_private_unix_socket",
         lambda _path, expected_uid: None,
     )
+    # Windows Python may not expose ``AF_UNIX`` even though this test is
+    # explicitly simulating the Darwin Unix transport.  The socket factory
+    # is mocked below, so provide only the protocol-family constant needed to
+    # exercise the caller-selected transport path.
+    monkeypatch.setattr(
+        authorityd_protocol.socket, "AF_UNIX", 1, raising=False
+    )
     monkeypatch.setattr(
         authorityd_protocol.socket,
         "socket",
