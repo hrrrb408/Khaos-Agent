@@ -24,7 +24,7 @@ from khaos.memory.models import (
     MemoryScope,
     memory_from_row,
 )
-from khaos.memory.ownership import MemoryOwner
+from khaos.memory.ownership import MemoryOwner, MemoryVisibility
 from khaos.memory.repository import MemoryRepository
 from khaos.time_utils import utc_now_naive
 
@@ -258,45 +258,71 @@ class MemoryStore:
             session_id,
         )
 
-    async def delete_by_id(self, memory_id: int) -> None:
-        """Delete one row only when it belongs to this owner/project."""
+    async def delete_by_id(
+        self,
+        memory_id: int,
+        *,
+        visibility: MemoryVisibility | None = None,
+    ) -> None:
+        """Delete one row inside the caller's project and visibility view."""
 
         if memory_id <= 0:
             raise ValueError("memory_id must be positive")
+        read_view = visibility or MemoryVisibility.durable()
         await self._repository.delete_by_id(
             memory_id,
             principal_id=self.principal_id,
             project_id=self.project_id,
+            visibility=read_view,
         )
         await self._audit_event(
             "memory.delete",
             str(memory_id),
             "success",
-            {"by": "id"},
+            {"by": "id", "visibility": _visibility_label(read_view)},
             None,
         )
 
-    async def list_by_scope(self, scope: MemoryScope) -> list[Memory]:
-        """List memories in one scope visible to the bound principal."""
+    async def list_by_scope(
+        self,
+        scope: MemoryScope,
+        *,
+        visibility: MemoryVisibility | None = None,
+    ) -> list[Memory]:
+        """List one scope inside an explicit durable or session view."""
 
+        read_view = visibility or MemoryVisibility.durable()
         rows = await self._repository.list(
             scope.value,
             principal_id=self.principal_id,
             project_id=self.project_id,
+            visibility=read_view,
         )
         return [memory_from_row(row) for row in rows]
 
-    async def list_all(self) -> list[Memory]:
-        """List all private and project-shared memories visible to the owner."""
+    async def list_all(
+        self,
+        *,
+        visibility: MemoryVisibility | None = None,
+    ) -> list[Memory]:
+        """List all memories inside an explicit durable or session view."""
 
+        read_view = visibility or MemoryVisibility.durable()
         rows = await self._repository.list(
             principal_id=self.principal_id,
             project_id=self.project_id,
+            visibility=read_view,
         )
         return [memory_from_row(row) for row in rows]
 
-    async def search(self, query: str, top_k: int = 5) -> list[Memory]:
-        """Search visible memories through the repository's FTS boundary."""
+    async def search(
+        self,
+        query: str,
+        top_k: int = 5,
+        *,
+        visibility: MemoryVisibility | None = None,
+    ) -> list[Memory]:
+        """Search one explicit durable or session view through FTS."""
 
         if not isinstance(query, str) or len(query) > MAX_SEARCH_QUERY_LENGTH:
             raise ValueError("memory search query is missing or too long")
@@ -304,40 +330,53 @@ class MemoryStore:
             raise ValueError(f"top_k must be between 0 and {MAX_SEARCH_TOP_K}")
         if top_k == 0 or not query.strip():
             return []
+        read_view = visibility or MemoryVisibility.durable()
         rows = await self._repository.search(
             query,
             top_k,
             principal_id=self.principal_id,
             project_id=self.project_id,
+            visibility=read_view,
         )
         memories = [memory_from_row(row) for row in rows]
         for memory in memories:
             if memory.id is not None:
-                await self.touch(memory.id)
+                await self.touch(memory.id, visibility=read_view)
         await self._audit_event(
             "memory.search",
             query[:128],
             "success",
-            {"returned": len(memories), "top_k": top_k},
+            {
+                "returned": len(memories),
+                "top_k": top_k,
+                "visibility": _visibility_label(read_view),
+            },
             None,
         )
         return memories
 
-    async def touch(self, memory_id: int) -> None:
-        """Increment access frequency within the owner/project boundary."""
+    async def touch(
+        self,
+        memory_id: int,
+        *,
+        visibility: MemoryVisibility | None = None,
+    ) -> None:
+        """Increment access frequency inside the caller's visibility view."""
 
         if memory_id <= 0:
             raise ValueError("memory_id must be positive")
+        read_view = visibility or MemoryVisibility.durable()
         await self._repository.touch(
             memory_id,
             principal_id=self.principal_id,
             project_id=self.project_id,
+            visibility=read_view,
         )
         await self._audit_event(
             "memory.touch",
             str(memory_id),
             "success",
-            {},
+            {"visibility": _visibility_label(read_view)},
             None,
         )
 
@@ -369,6 +408,16 @@ class MemoryStore:
 
 
 # Compatibility for direct imports from the former monolithic module.
+def _visibility_label(visibility: MemoryVisibility) -> str:
+    """Return a bounded audit label for a memory visibility view."""
+
+    if visibility.is_durable:
+        return "durable"
+    if visibility.namespace == "session":
+        return "session"
+    return str(visibility.namespace)
+
+
 __all__ = [
     "Memory",
     "MemoryConfidence",

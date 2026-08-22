@@ -7,7 +7,12 @@ SQLite connection and never decides principal or project authorization.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from khaos.memory.ownership import MemoryVisibility
+
+_SHARED_NAMESPACE = "shared"
 
 
 class MemorySqlRepository:
@@ -119,16 +124,15 @@ class MemorySqlRepository:
         *,
         principal_id: str,
         project_id: str,
+        visibility: MemoryVisibility | None = None,
     ) -> None:
+        clauses = ["id = ?", "project_id = ?"]
+        params: list[Any] = [memory_id, project_id]
+        clauses.extend(self._visibility_clauses(visibility, principal_id, params))
         async with self._db.transaction() as conn:
             await conn.execute(
-                """
-                DELETE FROM memories
-                WHERE id = ? AND project_id = ?
-                  AND (principal_id = ?
-                       OR (namespace = 'shared' AND principal_id = ''))
-                """,
-                (memory_id, project_id, principal_id),
+                f"DELETE FROM memories WHERE {' AND '.join(clauses)}",
+                tuple(params),
             )
 
     async def list(
@@ -137,16 +141,14 @@ class MemorySqlRepository:
         *,
         principal_id: str,
         project_id: str,
+        visibility: MemoryVisibility | None = None,
     ) -> list[dict[str, Any]]:
         clauses: list[str] = ["project_id = ?"]
         params: list[Any] = [project_id]
         if scope is not None:
             clauses.append("scope = ?")
             params.append(scope)
-        clauses.append(
-            "(principal_id = ? OR (namespace = 'shared' AND principal_id = ''))"
-        )
-        params.append(principal_id)
+        clauses.extend(self._visibility_clauses(visibility, principal_id, params))
         async with self._db.read_connection() as conn:
             cursor = await conn.execute(
                 f"""
@@ -168,13 +170,22 @@ class MemorySqlRepository:
         *,
         principal_id: str,
         project_id: str,
+        visibility: MemoryVisibility | None = None,
     ) -> list[dict[str, Any]]:
         clauses = [
             "memory_fts MATCH ?",
             "m.project_id = ?",
-            "(m.principal_id = ? OR (m.namespace = 'shared' AND m.principal_id = ''))",
         ]
-        params: list[Any] = [query, project_id, principal_id, top_k]
+        params: list[Any] = [query, project_id]
+        clauses.extend(
+            self._visibility_clauses(
+                visibility,
+                principal_id,
+                params,
+                table_alias="m",
+            )
+        )
+        params.append(top_k)
         async with self._db.read_connection() as conn:
             cursor = await conn.execute(
                 f"""
@@ -197,18 +208,60 @@ class MemorySqlRepository:
         *,
         principal_id: str,
         project_id: str,
+        visibility: MemoryVisibility | None = None,
     ) -> None:
+        clauses = ["id = ?", "project_id = ?"]
+        params: list[Any] = [memory_id, project_id]
+        clauses.extend(self._visibility_clauses(visibility, principal_id, params))
         async with self._db.transaction() as conn:
             await conn.execute(
-                """
+                f"""
                 UPDATE memories
                 SET access_freq = access_freq + 1, updated_at = datetime('now')
-                WHERE id = ? AND project_id = ?
-                  AND (principal_id = ?
-                       OR (namespace = 'shared' AND principal_id = ''))
+                WHERE {' AND '.join(clauses)}
                 """,
-                (memory_id, project_id, principal_id),
+                tuple(params),
             )
+
+    @staticmethod
+    def _visibility_clauses(
+        visibility: MemoryVisibility | None,
+        principal_id: str,
+        params: list[Any],
+        *,
+        table_alias: str = "",
+    ) -> list[str]:
+        """Build one complete ownership/namespace predicate.
+
+        The durable view deliberately includes only ``private`` and
+        ``shared`` rows with an empty session id.  Exact session views use the
+        caller's principal and one session id, so a row id cannot widen a
+        touch/delete operation into another session.
+        """
+
+        prefix = f"{table_alias}." if table_alias else ""
+        if visibility is None or visibility.namespace is None:
+            params.append(principal_id)
+            return [
+                f"{prefix}namespace IN ('private', 'shared')",
+                f"{prefix}session_id = ''",
+                f"({prefix}principal_id = ? OR ({prefix}namespace = 'shared' AND {prefix}principal_id = ''))",
+            ]
+
+        params.extend([visibility.namespace, visibility.session_id])
+        if visibility.namespace == _SHARED_NAMESPACE:
+            return [
+                f"{prefix}namespace = ?",
+                f"{prefix}session_id = ?",
+                f"{prefix}principal_id = ''",
+            ]
+
+        params.append(principal_id)
+        return [
+            f"{prefix}namespace = ?",
+            f"{prefix}session_id = ?",
+            f"{prefix}principal_id = ?",
+        ]
 
 
 __all__ = ["MemorySqlRepository"]

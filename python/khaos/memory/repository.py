@@ -6,6 +6,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any, Protocol
 
 from khaos.db.repositories.memories import MemorySqlRepository
+from khaos.memory.ownership import MemoryVisibility
 
 MemoryRow = Mapping[str, Any]
 
@@ -60,6 +61,7 @@ class MemoryRepository(Protocol):
         *,
         principal_id: str,
         project_id: str,
+        visibility: MemoryVisibility | None = None,
     ) -> None: ...
 
     async def list(
@@ -68,6 +70,7 @@ class MemoryRepository(Protocol):
         *,
         principal_id: str,
         project_id: str,
+        visibility: MemoryVisibility | None = None,
     ) -> Sequence[MemoryRow]: ...
 
     async def search(
@@ -77,6 +80,7 @@ class MemoryRepository(Protocol):
         *,
         principal_id: str,
         project_id: str,
+        visibility: MemoryVisibility | None = None,
     ) -> Sequence[MemoryRow]: ...
 
     async def touch(
@@ -85,6 +89,7 @@ class MemoryRepository(Protocol):
         *,
         principal_id: str,
         project_id: str,
+        visibility: MemoryVisibility | None = None,
     ) -> None: ...
 
 

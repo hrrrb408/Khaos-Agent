@@ -40,7 +40,8 @@ The memory subsystem is split into the following owners:
 database methods directly.  All id-based deletes and touches use the bound
 principal and project.  The RPC service routes deletion through the same store
 boundary as local callers and binds its audit sink per `RequestContext` (see
-ADR-051).
+ADR-051).  The durable/session read and mutation view is explicit in
+ADR-059; generic list/search/injection never widen into session-private rows.
 
 ## Consequences
 
