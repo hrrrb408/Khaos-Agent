@@ -14,6 +14,7 @@ from khaos.memory import (
     MemoryConfidence,
     MemoryScope,
     MemoryStore,
+    MemoryVisibility,
     SqliteMemoryRepository,
 )
 from khaos.rpc.memory_service import MemoryService
@@ -159,4 +160,106 @@ async def test_unknown_namespace_fails_closed(tmp_path):
         await store.get(MemoryScope.GLOBAL, "key", namespace="unexpected")
     with pytest.raises(ValueError, match="requires a session_id"):
         await store.get(MemoryScope.GLOBAL, "key", namespace="session")
+    await db.close()
+
+
+def test_memory_visibility_requires_a_complete_namespace_identity():
+    """Durable and session views must be unambiguous before reaching SQL."""
+
+    assert MemoryVisibility.durable().is_durable is True
+    assert MemoryVisibility.for_namespace("private").is_durable is False
+    assert MemoryVisibility.for_session("s1").session_id == "s1"
+
+    with pytest.raises(ValueError, match="requires a session_id"):
+        MemoryVisibility.for_namespace("session")
+    with pytest.raises(ValueError, match="only session memory visibility"):
+        MemoryVisibility.for_namespace("private", session_id="s1")
+    with pytest.raises(ValueError, match="cannot carry a session_id"):
+        MemoryVisibility(session_id="s1")
+
+
+async def test_durable_memory_views_exclude_session_rows(tmp_path):
+    """Durable list/search cannot widen into another session's namespace."""
+
+    db = await _db(tmp_path)
+    store = MemoryStore(
+        SqliteMemoryRepository(db), principal_id="alice", project_id="project-a"
+    )
+    await db.create_session("s1", principal_id="alice", project_id="project-a")
+    await store.set(
+        Memory(None, MemoryScope.GLOBAL, "durable", "durable-value"),
+        namespace="private",
+    )
+    session_memory = await store.set(
+        Memory(None, MemoryScope.GLOBAL, "session-only", "sessionvalue"),
+        namespace="session",
+        session_id="s1",
+    )
+    assert session_memory is not None and session_memory.id is not None
+
+    assert {memory.key for memory in await store.list_all()} == {"durable"}
+    assert await store.search("sessionvalue") == []
+
+    session_view = MemoryVisibility.for_session("s1")
+    session_rows = await store.list_all(visibility=session_view)
+    assert [memory.key for memory in session_rows] == ["session-only"]
+    assert [
+        memory.key
+        for memory in await store.search("sessionvalue", visibility=session_view)
+    ] == ["session-only"]
+    await db.close()
+
+
+async def test_session_touch_and_delete_are_bound_to_the_session_view(tmp_path):
+    """A row id cannot cross a session boundary for mutations."""
+
+    db = await _db(tmp_path)
+    store = MemoryStore(
+        SqliteMemoryRepository(db), principal_id="alice", project_id="project-a"
+    )
+    await db.create_session("s1", principal_id="alice", project_id="project-a")
+    await db.create_session("s2", principal_id="alice", project_id="project-a")
+    s1_memory = await store.set(
+        Memory(None, MemoryScope.GLOBAL, "s1", "one"),
+        namespace="session",
+        session_id="s1",
+    )
+    s2_memory = await store.set(
+        Memory(None, MemoryScope.GLOBAL, "s2", "two"),
+        namespace="session",
+        session_id="s2",
+    )
+    assert s1_memory is not None and s1_memory.id is not None
+    assert s2_memory is not None and s2_memory.id is not None
+
+    await store.touch(s2_memory.id, visibility=MemoryVisibility.for_session("s1"))
+    assert (
+        await store.get(
+            MemoryScope.GLOBAL,
+            "s2",
+            namespace="session",
+            session_id="s2",
+        )
+    ).access_freq == 0
+
+    await store.delete_by_id(
+        s2_memory.id,
+        visibility=MemoryVisibility.for_session("s1"),
+    )
+    assert await store.get(
+        MemoryScope.GLOBAL,
+        "s2",
+        namespace="session",
+        session_id="s2",
+    ) is not None
+
+    await store.touch(s1_memory.id, visibility=MemoryVisibility.for_session("s1"))
+    assert (
+        await store.get(
+            MemoryScope.GLOBAL,
+            "s1",
+            namespace="session",
+            session_id="s1",
+        )
+    ).access_freq == 1
     await db.close()

@@ -26,6 +26,7 @@ from khaos.agent.core import Message
 from khaos.agent.turn_repository import DatabaseTurnRepository
 from khaos.db.database import Database
 from khaos.memory import SqliteMemoryRepository
+from khaos.memory.ownership import MemoryVisibility
 
 
 @pytest.fixture
@@ -455,7 +456,7 @@ async def test_stress_concurrent_writes_across_domains_no_errors(db: Database):
         await repository.upsert(
             scope="stress", key=f"key-{i}", value=f"val-{i}",
             ttl=3600, confidence=1,
-            principal_id=principal, namespace="private",
+            principal_id=principal, namespace="session",
             session_id=session, project_id=project,
         )
 
@@ -501,7 +502,10 @@ async def test_stress_concurrent_writes_across_domains_no_errors(db: Database):
 
     # Verify memories were all persisted
     memories = await repository.list(
-        scope="stress", principal_id=principal, project_id=project,
+        scope="stress",
+        principal_id=principal,
+        project_id=project,
+        visibility=MemoryVisibility.for_session(session),
     )
     assert len(memories) == 200
 

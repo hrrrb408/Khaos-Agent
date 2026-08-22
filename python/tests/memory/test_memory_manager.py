@@ -61,14 +61,32 @@ async def test_inject_respects_total_budget(tmp_path):
 
 
 async def test_empty_memory_injection_returns_empty(tmp_path):
-    db, store, manager = await _manager(tmp_path)
+    db, _store, manager = await _manager(tmp_path)
 
     assert await manager.inject("s1") == ""
     await db.close()
 
 
+async def test_inject_excludes_session_private_memory(tmp_path):
+    """Generic prompt injection uses only the durable memory view."""
+
+    db, store, manager = await _manager(tmp_path)
+    await db.create_session("s1")
+    await store.set(
+        Memory(None, MemoryScope.GLOBAL, "session-secret", "do not inject"),
+        namespace="session",
+        session_id="s1",
+    )
+
+    text = await manager.inject("s1")
+
+    assert "session-secret" not in text
+    assert "do not inject" not in text
+    await db.close()
+
+
 async def test_cross_mode_transfer_formats_intent(tmp_path):
-    db, store, manager = await _manager(tmp_path, intent="finish coding task")
+    db, _store, manager = await _manager(tmp_path, intent="finish coding task")
 
     text = await manager.cross_mode_transfer(Mode.OFFICE, Mode.CODING)
 
@@ -78,7 +96,7 @@ async def test_cross_mode_transfer_formats_intent(tmp_path):
 
 
 async def test_update_from_conversation_phase1_noop(tmp_path):
-    db, store, manager = await _manager(tmp_path)
+    db, _store, manager = await _manager(tmp_path)
 
     assert await manager.update_from_conversation([], Mode.CODING) == []
     await db.close()

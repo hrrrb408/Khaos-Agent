@@ -12,7 +12,7 @@ from khaos.memory.extraction import (
 )
 from khaos.memory.manager import MemoryBudget, MemoryManager
 from khaos.memory.models import Memory, MemoryConfidence, MemoryScope
-from khaos.memory.ownership import MemoryOwner
+from khaos.memory.ownership import MemoryOwner, MemoryVisibility
 from khaos.memory.repository import MemoryRepository, SqliteMemoryRepository
 from khaos.memory.retrieval import MemoryLayers, MemoryRetriever
 from khaos.memory.store import MemoryStore
@@ -30,6 +30,7 @@ __all__ = [
     "MemoryRetriever",
     "MemoryScope",
     "MemoryStore",
+    "MemoryVisibility",
     "SqliteMemoryRepository",
     "expired_memory_ids",
     "extract_memories_from_messages",

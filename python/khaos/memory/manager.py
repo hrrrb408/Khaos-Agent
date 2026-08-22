@@ -10,6 +10,7 @@ from typing import Any
 from khaos.agent.core import SimpleTokenEngine
 from khaos.memory.extraction import extract_memories_from_messages
 from khaos.memory.models import Memory, MemoryScope
+from khaos.memory.ownership import MemoryVisibility
 from khaos.memory.retrieval import MemoryRetriever
 from khaos.memory.store import MemoryStore
 from khaos.modes import Mode
@@ -63,14 +64,27 @@ class MemoryManager:
         self.extractor = extractor or extract_memories_from_messages
 
     async def inject(self, session_id: str) -> str:
-        """Return deterministic L0/L1/L2 memory text within the total budget."""
+        """Return durable L0/L1/L2 memory text within the total budget.
+
+        Session-private rows are intentionally excluded from generic prompt
+        injection.  Callers that need them must request an explicit
+        :class:`MemoryVisibility.for_session` view rather than widening the
+        durable memory boundary by accident.
+        """
 
         del session_id
+        durable_view = MemoryVisibility.durable()
         current_mode = self._current_scope()
         layers = self.retriever.build_layers(
-            await self.store.list_by_scope(MemoryScope.GLOBAL),
-            await self.store.list_by_scope(current_mode),
-            await self.store.list_all(),
+            await self.store.list_by_scope(
+                MemoryScope.GLOBAL,
+                visibility=durable_view,
+            ),
+            await self.store.list_by_scope(
+                current_mode,
+                visibility=durable_view,
+            ),
+            await self.store.list_all(visibility=durable_view),
             current_mode,
         )
         sections = [
