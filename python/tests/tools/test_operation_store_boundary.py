@@ -2,21 +2,15 @@
 
 import inspect
 
+import pytest
 from khaos.tools.operation_store import ToolOperationStore
 from khaos.tools.result_store import ToolResultStore
 from khaos.tools.scheduler import ToolScheduler
 
 
-class _NoLifecycleDatabase:
-    """Database proxy used to prove the store only calls operation ports."""
-
-    def __getattr__(self, name: str):  # pragma: no cover - violation guard
-        raise AssertionError(f"unexpected database operation: {name}")
-
-
 def test_operation_scope_is_bound_to_tool_and_execution_identity() -> None:
     store = ToolOperationStore(
-        db=_NoLifecycleDatabase(),
+        repository=None,
         result_store=ToolResultStore(),
     )
     context = {
@@ -43,9 +37,19 @@ def test_operation_scope_is_bound_to_tool_and_execution_identity() -> None:
     assert first != second
 
 
+def test_operation_store_fails_closed_without_durable_owner() -> None:
+    store = ToolOperationStore(repository=None, result_store=ToolResultStore())
+
+    with pytest.raises(RuntimeError, match="durable tool-operation repository"):
+        store._require_repository()
+
+
 def test_operation_store_is_the_only_claim_owner() -> None:
     operation_source = inspect.getsource(ToolOperationStore)
     scheduler_source = inspect.getsource(ToolScheduler)
+    from khaos.maintenance import MaintenanceService
+
+    maintenance_source = inspect.getsource(MaintenanceService)
 
     assert "sqlite3.connect" not in operation_source
     assert ".commit(" not in operation_source
@@ -54,3 +58,5 @@ def test_operation_store_is_the_only_claim_owner() -> None:
     assert "complete_tool_operation" not in scheduler_source
     assert "self._operation_events" not in scheduler_source
     assert "self._operation_store.claim" in scheduler_source
+    assert "self._db.prune_tool_operations" not in maintenance_source
+    assert "self._operation_repository.prune_tool_operations" in maintenance_source

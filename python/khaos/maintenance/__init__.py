@@ -35,6 +35,7 @@ import time
 from typing import TYPE_CHECKING
 
 from khaos.db import Database
+from khaos.db.repositories.tool_operations import ToolOperationRepository
 
 if TYPE_CHECKING:
     from khaos.agent.approval import ApprovalBroker
@@ -98,8 +99,14 @@ class MaintenanceService:
         approval_ledger_retention_seconds: float = _DEFAULT_APPROVAL_LEDGER_RETENTION_SECONDS,
         turn_retention_seconds: float = _DEFAULT_TURN_RETENTION_SECONDS,
         tool_operation_retention_seconds: float = _DEFAULT_TOOL_OPERATION_RETENTION_SECONDS,
+        operation_repository: ToolOperationRepository | None = None,
     ) -> None:
         self._db = db
+        self._operation_repository = operation_repository or getattr(
+            db, "tool_operation_repository", None
+        )
+        if self._operation_repository is None:
+            raise TypeError("MaintenanceService requires a tool-operation repository")
         self._approval_broker = approval_broker
         self._interval = max(60.0, interval_seconds)
         self._retention = retention_seconds
@@ -219,7 +226,7 @@ class MaintenanceService:
         # rows remain replay-suppression tombstones until an explicit archive
         # and reconciliation workflow handles them.
         try:
-            pruned_operations = await self._db.prune_tool_operations(
+            pruned_operations = await self._operation_repository.prune_tool_operations(
                 older_than_seconds=self._tool_operation_retention,
                 now=now,
             )

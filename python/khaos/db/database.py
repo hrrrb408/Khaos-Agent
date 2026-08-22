@@ -260,6 +260,17 @@ class Database:
     def _conn(self) -> Any | None:
         return self._connection.writer
 
+    @property
+    def tool_operation_repository(self) -> ToolOperationRepository:
+        """Return the sole durable tool-operation SQL owner.
+
+        Runtime components that need operation idempotency receive this
+        repository explicitly.  The database facade deliberately exposes no
+        same-named forwarding methods, so callers cannot accidentally create
+        a second persistence boundary.
+        """
+        return self._tool_operation_repository
+
     @_conn.setter
     def _conn(self, value: Any | None) -> None:
         self._connection.writer = value
@@ -3474,61 +3485,10 @@ class Database:
     ) -> list[dict[str, Any]]:
         """Compatibility facade for the scheduler repository."""
         return await self._scheduler_repository.list_pending_scheduler_journal_entries()
-    # Durable tool-operation journal (security closure)
-    # ------------------------------------------------------------------
-
-    async def claim_tool_operation(
-        self, *, operation_id: str, tool_name: str, arguments_digest: str,
-        effect_id: str, owner_token: str, principal_id: str = "",
-        project_id: str = "", session_id: str = "", task_id: str = "",
-        workspace_id: str = "",
-    ) -> dict[str, Any]:
-        """Compatibility facade for the tool-operation repository."""
-        return await self._tool_operation_repository.claim_tool_operation(
-            operation_id=operation_id, tool_name=tool_name,
-            arguments_digest=arguments_digest, effect_id=effect_id,
-            owner_token=owner_token, principal_id=principal_id,
-            project_id=project_id, session_id=session_id, task_id=task_id,
-            workspace_id=workspace_id,
-        )
-
-    async def complete_tool_operation(
-        self, *, operation_id: str, owner_token: str, status: str,
-        effect_status: str, reconciliation_hint: str = "",
-        result_json: str = "",
-    ) -> int:
-        """Compatibility facade for the tool-operation repository."""
-        return await self._tool_operation_repository.complete_tool_operation(
-            operation_id=operation_id, owner_token=owner_token, status=status,
-            effect_status=effect_status, reconciliation_hint=reconciliation_hint,
-            result_json=result_json,
-        )
-
-    async def update_tool_operation_effect_id(
-        self, *, operation_id: str, owner_token: str, effect_id: str
-    ) -> int:
-        """Compatibility facade for the tool-operation repository."""
-        return await self._tool_operation_repository.update_tool_operation_effect_id(
-            operation_id=operation_id, owner_token=owner_token, effect_id=effect_id
-        )
-
-    async def mark_tool_operation_unknown(
-        self, *, operation_id: str, reconciliation_hint: str,
-        result_json: str
-    ) -> int:
-        """Compatibility facade for the tool-operation repository."""
-        return await self._tool_operation_repository.mark_tool_operation_unknown(
-            operation_id=operation_id, reconciliation_hint=reconciliation_hint,
-            result_json=result_json,
-        )
-
-    async def prune_tool_operations(
-        self, *, older_than_seconds: float, now: float, limit: int = 256
-    ) -> int:
-        """Compatibility facade for the tool-operation repository."""
-        return await self._tool_operation_repository.prune_tool_operations(
-            older_than_seconds=older_than_seconds, now=now, limit=limit
-        )
+    # Durable tool-operation persistence is intentionally not exposed as
+    # Database methods.  ToolOperationRepository is the only SQL owner; the
+    # read-only property near the connection views is the explicit injection
+    # boundary for runtime consumers.
     async def checkpoint_wal(self) -> dict[str, int]:
         """Run a bounded passive WAL checkpoint under the writer lock."""
         async with self._write_transaction_lock:

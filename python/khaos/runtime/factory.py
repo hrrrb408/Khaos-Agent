@@ -1198,6 +1198,7 @@ async def build_runtime(
         registry = runtime_registry
         scheduler = ToolScheduler(
             registry, permission_engine,
+            operation_repository=cfg.db.tool_operation_repository,
             security_middleware=SecurityMiddleware(
                 sandbox=sandbox,
                 network_guard=network_guard,

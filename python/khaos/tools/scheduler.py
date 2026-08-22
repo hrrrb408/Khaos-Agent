@@ -28,6 +28,7 @@ from khaos.coding.execution.models import (
     ResolvedSpawnPlan,
     ResourceBudget,
 )
+from khaos.db.repositories.tool_operations import ToolOperationRepository
 from khaos.exceptions import PermissionDeniedError
 from khaos.permissions import (
     ApprovalMode,
@@ -132,6 +133,7 @@ class ToolScheduler:
         runtime_id: str = "",
         network_broker_factory: NetworkBrokerFactory | None = None,
         credential_broker: CredentialBroker | None = None,
+        operation_repository: ToolOperationRepository | None = None,
     ):
         self.registry = registry
         self.admission = ToolAdmission(registry)
@@ -170,8 +172,13 @@ class ToolScheduler:
         # IDs are only one input to the server binding; a model or plugin
         # supplied top-level ``idempotency_key`` is never trusted.
         self.result_store = ToolResultStore()
+        if operation_repository is None:
+            database = getattr(permission_engine, "db", None)
+            operation_repository = getattr(
+                database, "tool_operation_repository", None
+            )
         self._operation_store = ToolOperationStore(
-            db=getattr(permission_engine, "db", None),
+            repository=operation_repository,
             result_store=self.result_store,
         )
         self._result_finalizer = ToolResultFinalizer(

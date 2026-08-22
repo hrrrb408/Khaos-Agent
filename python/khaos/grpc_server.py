@@ -2221,7 +2221,11 @@ async def serve_json_lines(
         # was REMOVED from the periodic loop — recovery is now
         # startup-only (see the call above).  Calling recovery
         # periodically was the C-05 bug.
-        maintenance = MaintenanceService(db, approval_broker=agent.approval_broker)
+        maintenance = MaintenanceService(
+            db,
+            approval_broker=agent.approval_broker,
+            operation_repository=db.tool_operation_repository,
+        )
         maintenance.start()
         # MemoryService receives explicit repository and audit ports.  The
         # service binds both to each authenticated RequestContext; it never
