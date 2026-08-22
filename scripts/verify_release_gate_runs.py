@@ -43,6 +43,13 @@ _NATIVE_ARTIFACT_CONTRACTS = {
     },
 }
 
+# Windows remains the cross-platform native proof required for a native gate.
+# macOS launchd/XPC is an optional deployment capability: community releases
+# may omit it when the repository has no Team ID/signing material.  If the
+# optional artifact is present, it is still verified with the exact same
+# provenance rules.
+_REQUIRED_NATIVE_ARTIFACTS = frozenset({"native-authority-windows-proof"})
+
 
 def _canonical_digest(value: object) -> str:
     encoded = json.dumps(
@@ -138,8 +145,13 @@ def _verify_native_artifacts(
         for artifact in artifacts
         if str(artifact.get("name") or "") in _NATIVE_ARTIFACT_CONTRACTS
     ]
-    if len(selected) != len(_NATIVE_ARTIFACT_CONTRACTS):
-        raise RuntimeError("native gate did not expose exactly two native artifacts")
+    selected_names = {str(artifact.get("name") or "") for artifact in selected}
+    missing_required = _REQUIRED_NATIVE_ARTIFACTS - selected_names
+    if missing_required:
+        raise RuntimeError(
+            "native gate is missing required artifact(s): "
+            + ", ".join(sorted(missing_required))
+        )
     artifact_ids = [str(artifact.get("id") or "") for artifact in selected]
     if not all(artifact_ids) or len(set(artifact_ids)) != len(artifact_ids):
         raise RuntimeError("native gate artifact ids are not unique")
@@ -255,10 +267,7 @@ def _gate_record(repo: str, workflow: str, commit: str) -> dict[str, Any]:
                 f"security evidence artifact {expected_name} has no digest"
             )
     if workflow == REQUIRED_GATES["native_authority"]:
-        expected_names = {
-            "native-authority-macos-proof",
-            "native-authority-windows-proof",
-        }
+        expected_names = set(_REQUIRED_NATIVE_ARTIFACTS)
         for expected_name in sorted(expected_names):
             matching = [
                 artifact for artifact in artifacts
@@ -276,6 +285,28 @@ def _gate_record(repo: str, workflow: str, commit: str) -> dict[str, Any]:
             if not isinstance(artifact.get("digest"), str) or not artifact["digest"].strip():
                 raise RuntimeError(
                     f"native authority artifact {expected_name} has no digest"
+                )
+        # A macOS native proof is optional for the community profile.  Do not
+        # silently accept malformed optional metadata: when present it must
+        # satisfy the same expiry/digest contract as the required artifact.
+        optional_macos = [
+            artifact
+            for artifact in artifacts
+            if artifact.get("name") == "native-authority-macos-proof"
+        ]
+        if len(optional_macos) > 1:
+            raise RuntimeError(
+                "native authority exposes duplicate macOS native artifacts"
+            )
+        if optional_macos:
+            artifact = optional_macos[0]
+            if (
+                artifact.get("expired") is not False
+                or not isinstance(artifact.get("digest"), str)
+                or not artifact["digest"].strip()
+            ):
+                raise RuntimeError(
+                    "native authority macOS artifact is expired or has no digest"
                 )
         native_proofs = _verify_native_artifacts(
             repo,

@@ -20,6 +20,20 @@ interpreter, then replaces itself with the requested command. A missing or
 untrusted launcher fails closed; the standalone Python boundary is available
 only with the explicit `KHAOS_DEV_MODE=1` development switch.
 
+## Authority transport profiles
+
+The authority control plane is always a separate `khaos-authorityd` process;
+the Agent never falls back to an in-process broker in a production profile.
+`KHAOS_AUTHORITY_PROFILE=community` is the personal/local profile: on macOS
+it uses a private 0600 AF_UNIX socket and kernel peer UID checks, so it needs
+no Apple Developer Team ID or signing certificate. This is a same-user
+boundary, not multi-user isolation, and its JSONL audit file is diagnostic
+rather than remote WORM evidence. `KHAOS_AUTHORITY_PROFILE=native-production`
+selects launchd/XPC on macOS and Service-SID/Named-Pipe on Windows; those
+deployments retain the stronger native identity and independent audit
+requirements. Unknown profile values fail closed, and a missing daemon,
+socket, key, policy digest, or typed resource catalog still refuses effects.
+
 The Windows backend is intentionally narrow: native commands and the trusted
 Khaos Python interpreter under `network=none` run in an OS-issued AppContainer
 with no declared network capability. Trusted Python launches the resolved base

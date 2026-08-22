@@ -300,3 +300,41 @@ def test_native_release_gate_verifies_job_platform_and_proof_semantics(
             commit=COMMIT,
             artifacts=[tampered, native_artifacts[1]],
         )
+
+
+def test_native_release_gate_allows_missing_optional_macos_proof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifacts = [_native_artifacts()[1]]
+    payload = _native_payloads()["9"]
+
+    def fake_api(_repo: str, endpoint: str) -> dict[str, object]:
+        if endpoint.endswith("/jobs?per_page=100"):
+            return {
+                "total_count": 1,
+                "jobs": [
+                    {
+                        "id": 102,
+                        "status": "completed",
+                        "conclusion": "success",
+                        "name": "Windows Service-SID Named Pipe authority",
+                        "labels": ["windows-2025"],
+                    }
+                ],
+            }
+        raise AssertionError(f"unexpected API endpoint: {endpoint}")
+
+    monkeypatch.setattr(MODULE, "_run_gh_api", fake_api)
+    monkeypatch.setattr(
+        MODULE,
+        "gh_api_bytes",
+        lambda _repo, _endpoint, **_kwargs: payload,
+    )
+
+    proofs = MODULE._verify_native_artifacts(
+        "owner/repo",
+        run_id=1,
+        commit=COMMIT,
+        artifacts=artifacts,
+    )
+    assert proofs[0]["runner_os"] == "Windows"

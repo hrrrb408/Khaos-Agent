@@ -68,6 +68,7 @@
 
 | Owner | Responsibility | Boundary |
 | --- | --- | --- |
+| `python/khaos/security/authority_transport.py` | explicit community/native-production profile selection and transport ownership | unknown profile fails closed; no in-process or platform inference fallback |
 | `packaging/macos/khaos-authorityd-xpc.m` | launchd/XPC frontend: audit token + designated code requirement + backend ownership | platform TCB; no Python fallback |
 | `rust/khaos-core/src/bin/khaos-authorityd-windows.rs` | Service-SID Named-Pipe frontend: SID validation + backend identity + deadlines | platform TCB; no same-UID fallback |
 | `rust/khaos-core/src/bin/khaos-authorityd-backend-windows.rs` | SCM host for the Python authority backend: isolated spawn + child lifecycle | platform TCB; kill-on-close Job Object and terminal wait |
@@ -81,4 +82,4 @@
   (protocol_boundary, principals, shell_semantics) with property tests.
 - The native frontends are the only platform TCB transports; both are
   fail-closed with no Python/same-UID fallback.
-- Total curated TCB owners: `29`.
+- Total curated TCB owners: `30`.

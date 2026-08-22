@@ -181,6 +181,14 @@ reimplement those higher-level policy decisions.
 
 ## OS identity contract
 
+Transport selection is owned by `python/khaos/security/authority_transport.py`
+and documented in ADR-024. `KHAOS_AUTHORITY_PROFILE=community` is the
+same-user local profile for personal macOS/POSIX installs: it keeps the
+separate daemon, private socket, kernel peer credentials, signed receipts and
+policy/resource checks, but intentionally does not claim code-signing,
+multi-user isolation, or remote WORM durability. The native rules below apply
+when `native-production` is selected.
+
 The daemon is a separate service, not merely another process in the Agent's
 UID:
 
@@ -188,7 +196,7 @@ UID:
   Unix socket, `SO_PEERCRED` validation, and bwrap `--unshare-user` with the
   configured job UID/GID.  The job identity is namespace-visible; a distinct
   host UID is not claimed unless native host mapping evidence proves it.
-- macOS production deployment must provide launchd/XPC service identity,
+- macOS `native-production` deployment must provide launchd/XPC service identity,
   signed daemon code, and Keychain/Secure Enclave access-group ACLs.
 - Windows production deployment must provide a service SID, Named Pipe ACL,
   and CNG/DPAPI-protected key reference.
@@ -201,8 +209,10 @@ native client has proved the launchd/XPC or Service-SID/Named-Pipe boundary.
 The native services are deliberately separate from the Agent and keep the
 authority backend/key boundary outside the Agent process. Missing signed
 artifacts, missing protected key, identity mismatch, stale proof, or an
-unavailable platform service still makes authority-backed execution
-unavailable; no Unix-socket, same-UID, TCP, or in-process fallback is used.
+unavailable native platform service still makes `native-production`
+authority-backed execution unavailable. The community profile has an explicit
+Unix-socket path, but neither profile permits TCP or an in-process production
+fallback.
 
 The native source and manifests are implementation inputs, not runtime
 evidence by themselves. A real macOS or Windows runner must install the
@@ -216,6 +226,8 @@ fallback.  The deployment must use object-lock compliance mode, a separate
 append-only service, or an equivalent independently administered log.  The
 local SQLite hash chain and JSONL file remain useful diagnostic evidence but
 cannot defend against a same-UID actor that can rewrite both local stores.
+The explicit community profile uses that JSONL writer by design and reports
+only local diagnostic durability; it must not be described as WORM evidence.
 
 The Windows helper uses the same ownership rule at the process boundary:
 pending spawn, active process, and orphan/quarantine records are retained until

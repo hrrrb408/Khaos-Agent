@@ -10,6 +10,7 @@ Group=khaos-authority
 WorkingDirectory=/opt/khaos
 EnvironmentFile=/etc/khaos/authorityd.env
 Environment=KHAOS_DEV_MODE=0
+Environment=KHAOS_AUTHORITY_PROFILE=native-production
 Environment=KHAOS_AUTHORITYD_SOCKET=/run/khaos-authorityd/authorityd.sock
 Environment=KHAOS_AUTHORITYD_KEY_PATH=/var/lib/khaos-authorityd/authorityd.pem
 Environment=KHAOS_AUTHORITYD_PUBLIC_KEY_PATH=/run/khaos-authorityd/authorityd.pub

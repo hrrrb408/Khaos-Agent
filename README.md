@@ -79,6 +79,17 @@ authorityd receipt 模式时，部署 `khaos-authorityd` 为独立 OS service，
 `KHAOS_AUTHORITYD_PUBLIC_KEY_PATH`、`KHAOS_EFFECTIVE_POLICY_DIGEST` 与远端审计
 endpoint；authorityd 只签发与自身编译 policy digest 相同的收据，缺少任一生产证明时会
 fail closed。完整协议见 `docs/authority-control-plane.md`。当前 API key 是单实例本地控制面认证，不是多租户隔离。
+个人 macOS 安装不需要 Apple Developer Team ID：保持独立的
+`khaos-authorityd` 进程，并设置 `KHAOS_AUTHORITY_PROFILE=community`（未设置时
+macOS 默认也是该 profile）和一个 0600 的 `KHAOS_AUTHORITYD_SOCKET`；签名收据、策略
+digest、资源范围和撤销语义仍然生效。仍需提供 authorityd signing key、typed
+resource catalog 和对应的 `KHAOS_EFFECTIVE_POLICY_DIGEST`；community 只移除
+Apple identity 与远端 WORM 前置条件。需要 launchd/XPC、Team ID、签名证书和远端 WORM
+审计时，显式改为 `KHAOS_AUTHORITY_PROFILE=native-production`。两种 profile 都没有
+in-process、TCP 或静默 fallback。
+仓库 CI 的 macOS launchd/XPC E2E 同样是显式能力：只有设置 repository variable
+`KHAOS_NATIVE_MACOS_E2E=true` 才会运行；未设置时不伪造 native proof，完整 M6
+security closure 仍保持 `NOT CLOSED`。
 安全事实的机器可读来源是 `docs/security_facts.yaml`。
 
 ## 开发

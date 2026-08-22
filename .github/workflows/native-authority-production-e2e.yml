@@ -9,8 +9,14 @@ name: Native Authority Production E2E
 # - Windows: real SCM service with a Service SID, DPAPI marker provisioned
 #   under the SYSTEM identity, backend Named-Pipe service, both probes,
 #   bound artifacts.
-# If the required secrets or runners are unavailable the jobs FAIL; a
-# skipped native job can never satisfy closure evidence.
+# The community profile does not require Apple signing material.  The macOS
+# native job is therefore opt-in through the repository variable
+# ``KHAOS_NATIVE_MACOS_E2E=true``; when it is not enabled, the workflow remains
+# successful; the native release-gate verifier permits the macOS artifact to
+# be absent, while the full M6 closure report remains NOT CLOSED until that
+# native proof is supplied.
+# If the variable is enabled and the required secrets/runners are unavailable,
+# the native job still FAILS rather than manufacturing evidence.
 
 on:
   push:
@@ -25,8 +31,28 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  native-profile:
+    name: Resolve native deployment profile
+    runs-on: ubuntu-24.04
+    outputs:
+      macos_enabled: ${{ steps.profile.outputs.macos_enabled }}
+    steps:
+      - id: profile
+        env:
+          ENABLED: ${{ vars.KHAOS_NATIVE_MACOS_E2E }}
+        run: |
+          if [ "$ENABLED" = "true" ]; then
+            echo 'macOS native authority E2E is enabled'
+            echo 'macos_enabled=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'macOS native authority E2E is not enabled; community profile remains the default'
+            echo 'macos_enabled=false' >> "$GITHUB_OUTPUT"
+          fi
+
   macos-launchd-xpc:
     name: macOS launchd/XPC authority
+    needs: native-profile
+    if: needs.native-profile.outputs.macos_enabled == 'true'
     runs-on: macos-14
     environment: security-native
     timeout-minutes: 40
@@ -473,6 +499,7 @@ jobs:
             $backendLog = 'C:\ProgramData\Khaos\authorityd-backend.log'
             $backendConfig = 'C:\ProgramData\Khaos\authorityd-backend.env'
             @(
+                'KHAOS_AUTHORITY_PROFILE=native-production'
                 "KHAOS_AUTHORITYD_BACKEND_PYTHON=$venvPython"
                 "KHAOS_AUTHORITYD_BACKEND_ENTRY=$backendEntry"
                 "KHAOS_AUTHORITYD_BACKEND_LOG=$backendLog"

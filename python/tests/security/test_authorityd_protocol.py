@@ -32,6 +32,7 @@ from khaos.security.authorityd import (
     AuthorityPolicyKernel,
     _dispatch,
     _serve_connection,
+    build_local_daemon,
     build_production_daemon,
 )
 from khaos.security.authorityd_protocol import (
@@ -660,6 +661,25 @@ def test_production_daemon_requires_independent_audit_writer(tmp_path: Path) -> 
             key_path=tmp_path / "authorityd.pem",
             audit_writer=None,
         )
+
+
+@pytest.mark.posix_host
+def test_community_daemon_keeps_policy_boundary_without_remote_worm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    key_path = tmp_path / "authorityd.pem"
+    Ed25519KeyStore.load_or_create(key_path, create=True)
+    monkeypatch.setenv("KHAOS_EFFECTIVE_POLICY_DIGEST", "policy-digest")
+    resource_order, _parent_scope, _child_scope = _typed_git_order()
+
+    daemon = build_local_daemon(
+        socket_path=tmp_path / "authorityd.sock",
+        key_path=key_path,
+        audit_writer=_MemoryWorm(),
+        resource_order=resource_order,
+    )
+
+    assert daemon.issuer_id == "khaos-authorityd-community"
 
 
 @pytest.mark.posix_host

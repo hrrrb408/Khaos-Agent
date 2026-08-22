@@ -86,6 +86,7 @@ def _backend_environment() -> dict[str, str]:
     )
     return {
         "KHAOS_DEV_MODE": "0",
+        "KHAOS_AUTHORITY_PROFILE": "native-production",
         "KHAOS_AUTHORITYD_SOCKET": "/var/run/khaos-authorityd/backend.sock",
         "KHAOS_AUTHORITYD_BACKEND_SOCKET": "/var/run/khaos-authorityd/backend.sock",
         "KHAOS_AUTHORITYD_KEY_PATH": "/var/db/khaos-authorityd/authorityd.pem",

@@ -39,6 +39,7 @@ services:
       - "host.docker.internal:host-gateway"
     environment:
       - KHAOS_DEV_MODE=0
+      - KHAOS_AUTHORITY_PROFILE=native-production
       - KHAOS_AUTHORITYD_SOCKET=/run/khaos-authorityd/authorityd.sock
       - KHAOS_AUTHORITYD_KEY_PATH=/var/lib/khaos-authorityd/authorityd.pem
       - KHAOS_AUTHORITYD_PUBLIC_KEY_PATH=/run/khaos-authorityd/authorityd.pub
@@ -108,6 +109,7 @@ services:
     environment:
       - KHAOS_MODE=office
       - KHAOS_DEV_MODE=0
+      - KHAOS_AUTHORITY_PROFILE=native-production
       - KHAOS_PROJECT_ROOT=/app
       - KHAOS_SANDBOX_LAUNCHER=/usr/local/bin/khaos-sandbox-launcher
       - KHAOS_EXECUTION_SANDBOX_LAUNCHER=/usr/local/bin/khaos-execution-sandbox-launcher

@@ -17,8 +17,8 @@
 
 ## Import reachability result
 
-- Reachable repository modules: `216`.
-- Resolved import edges: `1274`.
+- Reachable repository modules: `217`.
+- Resolved import edges: `1279`.
 - Forbidden production edges: `0`.
 - Unresolved internal edges: `0`.
 
@@ -187,6 +187,7 @@
 - `khaos.security.authority`
 - `khaos.security.authority_broker`
 - `khaos.security.authority_context`
+- `khaos.security.authority_transport`
 - `khaos.security.authorityd_protocol`
 - `khaos.security.browser_egress_proxy`
 - `khaos.security.browser_kernel_protocol_generated`

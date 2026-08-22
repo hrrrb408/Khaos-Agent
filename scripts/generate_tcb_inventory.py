@@ -167,6 +167,11 @@ TCB_OWNERS: dict[str, tuple[tuple[str, str, str], ...]] = {
     ),
     "Native transport TCB": (
         (
+            "python/khaos/security/authority_transport.py",
+            "explicit community/native-production profile selection and transport ownership",
+            "unknown profile fails closed; no in-process or platform inference fallback",
+        ),
+        (
             "packaging/macos/khaos-authorityd-xpc.m",
             "launchd/XPC frontend: audit token + designated code requirement + backend ownership",
             "platform TCB; no Python fallback",
