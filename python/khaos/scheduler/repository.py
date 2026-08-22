@@ -1,10 +1,11 @@
 """Persistence port for scheduled tasks.
 
 ``CronEngine`` owns orchestration and in-memory lifecycle state; this module
-owns the scheduler-facing persistence vocabulary.  The concrete ``Database``
-continues to own SQLite transactions and SQL.  Keeping the project scope in
-this adapter prevents a caller from accidentally issuing an unscoped read or
-write while the storage implementation is migrated independently.
+owns the scheduler-facing project scope vocabulary.  The SQL and transaction
+protocol live in ``db/repositories/scheduler.py``; ``Database`` exposes only
+the released compatibility facade while callers migrate.  Keeping the
+project scope in this adapter prevents a caller from accidentally issuing an
+unscoped read or write.
 """
 
 from __future__ import annotations
