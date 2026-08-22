@@ -210,7 +210,7 @@ async def test_approval_sweep_keeps_active():
 
 async def test_task_service_lru_eviction(tmp_path):
     """TaskService evicts the oldest manager when the cache is full."""
-    from khaos.grpc_server import TaskService
+    from khaos.rpc.task_service import TaskService
     from khaos.runtime import RequestContext
 
     db = await _make_db(tmp_path)
@@ -243,7 +243,7 @@ async def test_task_service_lru_eviction(tmp_path):
 
 async def test_task_service_keyed_by_principal_and_project(tmp_path):
     """TaskService keys by (principal_id, project_id), not just principal_id."""
-    from khaos.grpc_server import TaskService
+    from khaos.rpc.task_service import TaskService
     from khaos.runtime import RequestContext
 
     db = await _make_db(tmp_path)

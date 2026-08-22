@@ -27,13 +27,10 @@ import inspect
 
 import pytest
 
-from khaos.grpc_server import (
-    AgentService,
-    AuditService,
-    MemoryService,
-    TaskService,
-    _handle_optional_subagent,
-)
+from khaos.rpc.composition import _handle_optional_subagent
+from khaos.rpc import AuditService, MemoryService
+from khaos.rpc.agent_service import AgentService
+from khaos.rpc.task_service import TaskService
 from khaos.runtime import RequestContext
 from khaos.runtime.context import local_principal_id
 

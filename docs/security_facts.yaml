@@ -67,7 +67,7 @@ principal_boundaries:
   replay: DelegationAuthority_consumes_each_child_scope_once_and_rejects_cross_principal_or_context_replay
 production_reachability:
   roots:
-    - khaos.grpc_server:AgentService
+    - khaos.rpc.agent_service:AgentService
     - khaos.grpc_server:_dispatch
     - khaos.runtime.factory:build_production_runtime
     - khaos.tools.scheduler:ToolScheduler

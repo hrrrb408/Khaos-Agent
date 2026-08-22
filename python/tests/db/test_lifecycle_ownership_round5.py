@@ -269,7 +269,7 @@ async def test_lru_service_skips_busy_manager(tmp_path):
     """LRU-E: ``TaskService._manager`` does NOT evict a manager with
     an active task even when the cache is at capacity — the cache
     temporarily exceeds ``_MAX_MANAGERS`` instead."""
-    from khaos.grpc_server import TaskService
+    from khaos.rpc.task_service import TaskService
     from khaos.runtime import RequestContext
 
     db = await _make_db(tmp_path / "lru_e.db")
@@ -306,7 +306,7 @@ async def test_lru_service_skips_busy_manager(tmp_path):
 async def test_lru_service_evicts_idle_manager(tmp_path):
     """LRU-F: when an idle manager exists, ``TaskService._manager``
     evicts it (calling ``aclose``) to make room for the new one."""
-    from khaos.grpc_server import TaskService
+    from khaos.rpc.task_service import TaskService
     from khaos.runtime import RequestContext
 
     db = await _make_db(tmp_path / "lru_f.db")

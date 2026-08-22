@@ -20,7 +20,7 @@ PYTHON_ROOT = ROOT / "python"
 OUTPUT = ROOT / "docs" / "generated" / "production-reachability.md"
 
 PRODUCTION_ROOTS = (
-    ("khaos.grpc_server", "AgentService"),
+    ("khaos.rpc.agent_service", "AgentService"),
     ("khaos.grpc_server", "_dispatch"),
     ("khaos.runtime.factory", "build_production_runtime"),
     ("khaos.tools.scheduler", "ToolScheduler"),
