@@ -30,6 +30,7 @@ def test_backend_host_is_a_real_scm_service_with_owned_child_lifecycle() -> None
     assert 'args(["-I", "-S"])' in source
     assert ".env_clear()" in source
     assert "Command::new(&config.python)" in source
+    assert '"KHAOS_AUTHORITY_PROFILE"' in source
     assert "cmd.exe" not in source.lower()
     assert "powershell" not in source.lower()
 
@@ -58,6 +59,7 @@ def test_windows_workflow_uses_the_native_backend_host() -> None:
     assert "Test-Path -LiteralPath $venvSite -PathType Container" in source
     assert "$venvPython = (uv run --project . which python)" not in source
     assert "KHAOS_AUTHORITYD_SOCKET=unused" not in source
+    assert "KHAOS_AUTHORITY_PROFILE=native-production" in source
     assert "KHAOS_AUTHORITYD_BACKEND_PIPE=\\\\.\\pipe\\KhaosAuthorityDBackend" in source
     assert "KHAOS_AUDIT_WORM_CA_FILE=$env:KHAOS_AUDIT_WORM_CA_FILE" in source
     assert "-SkipCertificateCheck" in source

@@ -56,6 +56,7 @@ mod backend_service {
     const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
     const BACKEND_ENV_KEYS: &[&str] = &[
+        "KHAOS_AUTHORITY_PROFILE",
         "KHAOS_AUTHORITYD_NAMED_PIPE",
         "KHAOS_AUTHORITYD_BACKEND_PIPE",
         "KHAOS_AUTHORITYD_KEY_PATH",
