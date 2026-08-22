@@ -87,6 +87,9 @@ KHAOS.md / AGENTS.md
 | 文件 | 当前集中职责 | 拆分目标 |
 | --- | --- | --- |
 | `python/khaos/db/database.py` | 迁移、事务 owner、turn/event、audit、task、scheduler 等领域 facade；session/message 和 memory 只做 lease/transaction 编排 | `python/khaos/db/connection.py` 拥有物理连接生命周期；`db/repositories/sessions.py` 与 `db/repositories/memories.py` 分别拥有 session/message、memory SQL 与 row conversion；Agent turn 通过 ADR-053 的 `TurnRepository` 端口隔离，后续继续按领域拆 repository 并保留一个薄 facade |
+| `python/khaos/db/repositories/configuration.py` | user_config 与 principal_modes 的 JSON/owner-scoped SQL | `ConfigurationRepository` 唯一拥有配置与模式 SQL；`Database` 只保留公共 facade 和事务/连接端口 |
+| `python/khaos/db/repositories/permissions.py` | permissions 与 authorization_contexts 的规则/epoch SQL | `PermissionRepository` 唯一拥有权限状态写入和 authorization lock；`PermissionEngine` 只消费 facade/端口 |
+| `python/khaos/db/repositories/audit.py` | audit_log 写入、owner 查询、hash-chain replay | `AuditRepository` 唯一拥有 audit SQL 与 canonical hash recomputation；`AuditLogger` 不直接触碰连接 |
 | `python/khaos/tools/scheduler.py` | admission 后的 approval、批次并发和结果事件编排 | `ToolAdmission`、`ToolResultFinalizer`（terminal phase/audit/result delivery）、`ToolResultStore`（runtime replay cache）、`ToolOperationStore`（claim/wait/terminal idempotency）、`ApprovalCallbackRunner`（adapter 生命周期）、`ToolAuthorization`（decision/remember/binding contract）、`ToolExecutionCoordinator`（authority-bound dispatch） |
 | `python/khaos/tools/result_finalizer.py` | dispatched tool 的 terminal phase、best-effort audit、durable operation finish 和 idempotent result publish | `ToolResultFinalizer`；不做 admission、permission decision、handler dispatch 或 budget ownership |
 | `python/khaos/tools/authorization.py` | permission decision hardening、remember rule projection、approval binding/request projection | `ToolAuthorization`、`build_approval_binding`、`build_permission_request`；不注册/消费 broker，不执行工具效果 |
@@ -214,6 +217,14 @@ REQUESTED -> SNAPSHOT_BOUND -> RUNNING -> PROOF_RECORDED
   和 transaction。
 - 连接生命周期第一 seam 已落在 `python/khaos/db/connection.py`；`Database` 的 underscored
   connection views 只为迁移期兼容，后续 repository 迁移完成后删除这些 views。
+- Configuration 的第一段迁移已完成：`ConfigurationRepository` 拥有
+  `user_config` 与 `principal_modes` 的 SQL、JSON 解码和 project-scoped lookup；
+  `Database` 只编排 facade 调用。后续按同一 port 继续迁移 permission、audit、task
+  和 scheduler journal，不能把新的 SQL 放回 `Database`。
+- Permission 与 audit 的 SQL owner 已迁移到 `db/repositories/permissions.py` 和
+  `db/repositories/audit.py`；`Database` 仅保留公共 facade，hash-chain canonical
+  实现也只有一个来源。下一段继续迁移 scheduler/task/operation SQL，不能再新增
+  `Database` 内联写事务。
 - 从 `grpc_server.py` 提取 protocol/auth/service；MemoryService、SessionService、AuditService 已完成首批 seam，协议边界已落在 `python/khaos/rpc/protocol.py`。本轮已删除 `grpc_server.py` 的 protocol compatibility aliases；新代码必须直接依赖 `khaos.rpc.protocol`，不增加第二套 server authority。
 - authorityd 的 receipt、审计和 socket framing 已统一消费 `security/protocol_boundary.py` 的 canonical owner；删除 `_canonical`/`_digest` 私有包装器，后续不允许在 authority daemon 内重新实现摘要或序列化。
 - Memory 的第一阶段 seam 已完成：`MemoryStore` 只接受 `MemoryRepository`，`MemoryOwner` 统一 principal/project/namespace 规则，`SqliteMemoryRepository` 统一 SQL 适配；冲突、TTL、提取和 L0/L1/L2 检索策略均为可独立测试的纯模块。RPC `MemoryService` 通过 ADR-051 的 context-bound audit sink 绑定请求身份，root logger 仍是唯一 durable writer。

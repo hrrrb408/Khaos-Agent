@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
 import os
@@ -32,7 +31,16 @@ from khaos.db.connection import (
 # a second configuration knob and is scheduled for removal after callers
 # migrate to the canonical owner.
 _READER_DRAIN_TIMEOUT = READER_DRAIN_TIMEOUT
-from khaos.db.repositories import SessionRepository
+from khaos.db.repositories import (
+    AuditRepository,
+    ConfigurationRepository,
+    PermissionRepository,
+    SessionRepository,
+)
+from khaos.db.repositories.audit import (
+    _audit_previous_hash,  # noqa: F401 - compatibility export
+    _audit_row_hash,  # noqa: F401 - compatibility export
+)
 from khaos.time_utils import utc_now_naive
 
 # The release-pinned migration methods below are hashed byte-for-byte.  Keep
@@ -64,77 +72,6 @@ TELEGRAM_REPLAY_WINDOW = 4096
 # NEW reads, and a read still in flight after this window is a leak (logged,
 # then the connection is closed anyway; the stuck coroutine raises on its
 # next await).
-# Round-14 §4: audit_log hash-chain helpers.  The chain makes the audit
-# trail tamper-evident: each row stores sha256(prev_hash || canonical
-# fields), so a deleted/reordered/edited row breaks the link and is
-# detected by ``Database.verify_audit_chain``.  Combined with the
-# append-only BEFORE DELETE / BEFORE UPDATE triggers (added in the v8
-# migration), this gives defense in depth against a compromised process
-# rewriting its own audit trail.
-_AUDIT_GENESIS_PREV = ""
-_AUDIT_HASH_FIELDS = (
-    "action", "target", "result", "detail", "session_id",
-    "principal_id", "runtime_id", "task_id", "operation_id",
-    "policy_digest", "authority_generation", "source_transport",
-    "project_id",
-)
-
-
-def _audit_row_hash(
-    prev_hash: str,
-    action: str,
-    target: str,
-    result: str,
-    detail: str,
-    session_id: str | None,
-    principal_id: str,
-    runtime_id: str | None,
-    task_id: str | None,
-    operation_id: str | None,
-    policy_digest: str | None,
-    authority_generation: int | None,
-    source_transport: str | None,
-    project_id: str,
-) -> str:
-    """Compute the hash-chain link for one audit row.
-
-    Fields are joined with a NUL separator and ``None`` values are rendered
-    as the empty string, so the hash is deterministic across inserts.  The
-    ``prev_hash`` (previous row's link, or the genesis sentinel for the
-    first row) binds this row to its predecessor.
-    """
-    parts = [
-        prev_hash,
-        str(action), str(target), str(result), str(detail),
-        "" if session_id is None else str(session_id),
-        str(principal_id),
-        "" if runtime_id is None else str(runtime_id),
-        "" if task_id is None else str(task_id),
-        "" if operation_id is None else str(operation_id),
-        "" if policy_digest is None else str(policy_digest),
-        "" if authority_generation is None else str(authority_generation),
-        "" if source_transport is None else str(source_transport),
-        str(project_id),
-    ]
-    digest = hashlib.sha256("\0".join(parts).encode("utf-8")).hexdigest()
-    return digest
-
-
-async def _audit_previous_hash(conn: Any) -> str:
-    """Return the hash-chain link of the most recent audit row.
-
-    Returns the genesis sentinel (``''``) when the table is empty or when
-    the last row predates the v8 hash chain (``prev_hash=''``), so the
-    chain is trusted from the first post-v8 row forward.
-    """
-    cursor = await conn.execute(
-        "SELECT prev_hash FROM audit_log ORDER BY id DESC LIMIT 1"
-    )
-    row = await cursor.fetchone()
-    if row is None:
-        return _AUDIT_GENESIS_PREV
-    return str(row["prev_hash"] or "")
-
 # Batch 6.4 (round-6): the immutable migration chain lives entirely in
 # ``migrations/_registry.py``.  The version/name are derived from the
 # chain's last entry so this module and the registry can never disagree.
@@ -295,13 +232,15 @@ class Database:
         # ``DatabaseConnection`` through the explicit methods on this facade.
         self._connection = DatabaseConnection(self.path)
         self._session_repository = SessionRepository()
+        self._configuration_repository = ConfigurationRepository(self)
+        self._permission_repository = PermissionRepository(self)
+        self._audit_repository = AuditRepository(self)
         # F-01: Per-domain locks remain for logical serialization (e.g. two
         # concurrent permission grants must not race on epoch computation).
         self._operation_approval_lock = asyncio.Lock()
         self._turn_event_lock = asyncio.Lock()
         self._chat_event_lock = asyncio.Lock()
         self._webhook_replay_lock = asyncio.Lock()
-        self._authorization_lock = asyncio.Lock()
         # F-01: Global write transaction lock. Every write transaction must
         # acquire this lock, preventing cross-domain ``commit()`` 串扰 on the
         # shared single connection. Read-only queries do not need this lock.
@@ -413,8 +352,8 @@ class Database:
         - Sets ``_current_transaction_owner`` so nested ``transaction()``
           calls from the same task reuse the outer transaction;
         - Commits on clean exit, rolls back on any exception;
-        - Per-domain locks (e.g. ``_authorization_lock``) should be held
-          *outside* this manager to prevent same-domain logical races.
+        - Domain repositories own their logical locks and hold them
+          *outside* this manager to prevent same-domain races.
 
         Nested calls (same task already owns a transaction) yield the raw
         writer connection without re-acquiring the lock or re-issuing
@@ -2583,27 +2522,11 @@ class Database:
 
     async def set_config(self, key: str, value: Any) -> None:
         """Persist a JSON configuration value."""
-        async with self.transaction() as conn:
-            await conn.execute(
-                """
-                INSERT INTO user_config (key, value)
-                VALUES (?, ?)
-                ON CONFLICT(key) DO UPDATE SET
-                    value = excluded.value,
-                    updated_at = datetime('now')
-                """,
-                (key, json.dumps(value)),
-            )
+        await self._configuration_repository.set_config(key, value)
 
     async def get_config(self, key: str, default: Any = None) -> Any:
         """Read a JSON configuration value."""
-        async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
-            conn = await self._require_conn()
-            cursor = await conn.execute("SELECT value FROM user_config WHERE key = ?", (key,))
-            row = await cursor.fetchone()
-            if row is None:
-                return default
-            return json.loads(str(row["value"]))
+        return await self._configuration_repository.get_config(key, default)
 
     async def get_principal_mode(
         self,
@@ -2624,26 +2547,12 @@ class Database:
         lookup key — closes cross-project mode leakage on shared DBs.
         ``project_id=''`` (the default) preserves legacy/test behaviour.
         """
-        async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
-            conn = await self._require_conn()
-            if session_id:
-                cursor = await conn.execute(
-                    "SELECT mode FROM principal_modes "
-                    "WHERE project_id = ? AND principal_id = ? AND session_id = ?",
-                    (project_id, principal_id, session_id),
-                )
-                row = await cursor.fetchone()
-                if row is not None:
-                    return str(row["mode"])
-            cursor = await conn.execute(
-                "SELECT mode FROM principal_modes "
-                "WHERE project_id = ? AND principal_id = ? AND session_id = ''",
-                (project_id, principal_id),
-            )
-            row = await cursor.fetchone()
-            if row is not None:
-                return str(row["mode"])
-            return default
+        return await self._configuration_repository.get_principal_mode(
+            principal_id,
+            session_id,
+            default,
+            project_id=project_id,
+        )
 
     async def set_principal_mode(
         self,
@@ -2662,18 +2571,12 @@ class Database:
         PK — each project gets its own mode rows.  ``project_id=''``
         (the default) preserves legacy/test behaviour.
         """
-        async with self.transaction() as conn:
-            await conn.execute(
-                """
-                INSERT INTO principal_modes
-                    (principal_id, project_id, session_id, mode)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(project_id, principal_id, session_id) DO UPDATE SET
-                    mode = excluded.mode,
-                    updated_at = datetime('now')
-                """,
-                (principal_id, project_id, session_id, mode),
-            )
+        await self._configuration_repository.set_principal_mode(
+            principal_id,
+            mode,
+            session_id,
+            project_id=project_id,
+        )
 
     async def insert_permission_rule(
         self,
@@ -2706,64 +2609,25 @@ class Database:
         interactive-project default and are never matched by authenticated
         principals when ``principal_id='legacy'``.
         """
-        if isinstance(resource_spec, dict):
-            resource_spec_value = json.dumps(
-                resource_spec,
-                sort_keys=True,
-                separators=(",", ":"),
-                ensure_ascii=False,
-            )
-        else:
-            resource_spec_value = str(resource_spec or "")
-        async with self._authorization_lock, self.transaction() as conn:
-            row = await self._authorization_context_row(
-                conn, principal_id, project_id
-            )
-            if row is None:
-                epoch = 1
-                await conn.execute(
-                    "INSERT INTO authorization_contexts "
-                    "(principal_id, project_id, policy_digest, epoch) "
-                    "VALUES (?, ?, ?, ?)",
-                    (principal_id, project_id, policy_digest, epoch),
-                )
-            else:
-                if str(row["policy_digest"]) != policy_digest:
-                    raise ValueError(
-                        "permission grant policy digest does not match the "
-                        "authoritative authorization context"
-                    )
-                epoch = int(row["epoch"]) + 1
-                await conn.execute(
-                    "UPDATE authorization_contexts SET epoch = ?, "
-                    "updated_at = datetime('now') "
-                    "WHERE principal_id = ? AND project_id = ?",
-                    (epoch, principal_id, project_id),
-                )
-            await conn.execute(
-                "UPDATE permissions SET generation = ? "
-                "WHERE principal_id = ? AND project_id = ? "
-                "AND policy_digest = ?",
-                (epoch, principal_id, project_id, policy_digest),
-            )
-            cursor = await conn.execute(
-                """
-                    INSERT INTO permissions (
-                        pattern, permission_level, approval, mode,
-                        principal_id, project_id, policy_digest, generation,
-                        transport_class, grant_lifetime, session_id, task_id,
-                        workspace_id, expires_at, created_by,
-                        resource_type, resource_spec
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                (pattern, permission_level, approval, mode,
-                 principal_id, project_id, policy_digest, epoch,
-                 transport_class, grant_lifetime, session_id, task_id,
-                 workspace_id, expires_at, created_by,
-                 resource_type, resource_spec_value),
-            )
-            return int(cursor.lastrowid)
+        return await self._permission_repository.insert_permission_rule(
+            pattern,
+            permission_level,
+            approval,
+            mode,
+            principal_id=principal_id,
+            project_id=project_id,
+            policy_digest=policy_digest,
+            generation=generation,
+            transport_class=transport_class,
+            grant_lifetime=grant_lifetime,
+            session_id=session_id,
+            task_id=task_id,
+            workspace_id=workspace_id,
+            expires_at=expires_at,
+            created_by=created_by,
+            resource_type=resource_type,
+            resource_spec=resource_spec,
+        )
 
     async def list_permission_rules(
         self,
@@ -2781,38 +2645,12 @@ class Database:
         ``principal_id`` is ``None`` (default), all rules are returned
         — this preserves the legacy admin/inspection behaviour.
         """
-        async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
-            conn = await self._require_conn()
-            clauses: list[str] = []
-            params: list[Any] = []
-            if principal_id is not None:
-                clauses.append("principal_id = ?")
-                params.append(principal_id)
-            if project_id is not None:
-                clauses.append("project_id = ?")
-                params.append(project_id)
-            if policy_digest is not None:
-                clauses.append("policy_digest = ?")
-                params.append(policy_digest)
-            if generation is not None:
-                clauses.append("generation = ?")
-                params.append(generation)
-            where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-            cursor = await conn.execute(
-                f"""
-                SELECT id, pattern, permission_level, approval, mode,
-                       strftime('%s', granted_at) AS granted_at,
-                       principal_id, project_id, policy_digest, generation,
-                       transport_class, grant_lifetime, session_id, task_id,
-                       workspace_id, expires_at, created_by,
-                       resource_type, resource_spec
-                FROM permissions
-                {where}
-                ORDER BY granted_at DESC, id DESC
-                """,
-                tuple(params),
-            )
-            return [dict(row) for row in await cursor.fetchall()]
+        return await self._permission_repository.list_permission_rules(
+            principal_id=principal_id,
+            project_id=project_id,
+            policy_digest=policy_digest,
+            generation=generation,
+        )
 
     async def delete_permission_rule(
         self,
@@ -2830,93 +2668,30 @@ class Database:
         Returns the number of rows deleted (0 if the rule doesn't
         exist or belongs to a different principal).
         """
-        async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
-            conn = await self._require_conn()
-            if principal_id is None or project_id is None or policy_digest is None:
-                async with self.transaction() as conn:
-                    cursor = await conn.execute(
-                        "DELETE FROM permissions WHERE id = ?"
-                        + (" AND principal_id = ?" if principal_id is not None else ""),
-                        (rule_id, principal_id) if principal_id is not None else (rule_id,),
-                    )
-                    return cursor.rowcount or 0
-            async with self._authorization_lock, self.transaction() as conn:
-                row = await self._authorization_context_row(
-                    conn, principal_id, project_id
-                )
-                if row is None or str(row["policy_digest"]) != policy_digest:
-                    return 0
-                cursor = await conn.execute(
-                    "DELETE FROM permissions WHERE id = ? AND principal_id = ? "
-                    "AND project_id = ? AND policy_digest = ?",
-                    (rule_id, principal_id, project_id, policy_digest),
-                )
-                if not (cursor.rowcount or 0):
-                    return 0
-                epoch = int(row["epoch"]) + 1
-                await conn.execute(
-                    "UPDATE authorization_contexts SET epoch = ?, "
-                    "updated_at = datetime('now') "
-                    "WHERE principal_id = ? AND project_id = ?",
-                    (epoch, principal_id, project_id),
-                )
-                await conn.execute(
-                    "UPDATE permissions SET generation = ? "
-                    "WHERE principal_id = ? AND project_id = ? "
-                    "AND policy_digest = ?",
-                    (epoch, principal_id, project_id, policy_digest),
-                )
-                return cursor.rowcount or 0
+        return await self._permission_repository.delete_permission_rule(
+            rule_id,
+            principal_id=principal_id,
+            project_id=project_id,
+            policy_digest=policy_digest,
+        )
 
     async def bind_authorization_context(
         self, principal_id: str, project_id: str, policy_digest: str
     ) -> int:
         """Bind the current policy, bumping epoch when the digest changes."""
-        async with self._authorization_lock, self.transaction() as conn:
-            row = await self._authorization_context_row(
-                conn, principal_id, project_id
-            )
-            if row is None:
-                epoch = 1
-                await conn.execute(
-                    "INSERT INTO authorization_contexts "
-                    "(principal_id, project_id, policy_digest, epoch) "
-                    "VALUES (?, ?, ?, ?)",
-                    (principal_id, project_id, policy_digest, epoch),
-                )
-            elif str(row["policy_digest"]) == policy_digest:
-                epoch = int(row["epoch"])
-            else:
-                epoch = int(row["epoch"]) + 1
-                await conn.execute(
-                    "UPDATE authorization_contexts SET policy_digest = ?, "
-                    "epoch = ?, updated_at = datetime('now') "
-                    "WHERE principal_id = ? AND project_id = ?",
-                    (policy_digest, epoch, principal_id, project_id),
-                )
-            return epoch
+        return await self._permission_repository.bind_authorization_context(
+            principal_id,
+            project_id,
+            policy_digest,
+        )
 
     async def get_authorization_context(
         self, principal_id: str, project_id: str
     ) -> dict[str, Any] | None:
-        async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
-            conn = await self._require_conn()
-            async with self._authorization_lock:
-                row = await self._authorization_context_row(
-                    conn, principal_id, project_id
-                )
-            return dict(row) if row is not None else None
-
-    async def _authorization_context_row(
-        self, conn, principal_id: str, project_id: str
-    ):
-        cursor = await conn.execute(
-            "SELECT principal_id, project_id, policy_digest, epoch "
-            "FROM authorization_contexts WHERE principal_id = ? "
-            "AND project_id = ?",
-            (principal_id, project_id),
+        return await self._permission_repository.get_authorization_context(
+            principal_id,
+            project_id,
         )
-        return await cursor.fetchone()
 
     async def insert_audit_log(
         self,
@@ -2958,30 +2733,21 @@ class Database:
         :meth:`verify_audit_chain`.  This runs inside the same transaction
         as the INSERT, so concurrency cannot interleave the read and write.
         """
-        async with self.transaction() as conn:
-            prev_hash = await _audit_previous_hash(conn)
-            row_hash = _audit_row_hash(
-                prev_hash, action, target, result, detail, session_id,
-                principal_id, runtime_id, task_id, operation_id,
-                policy_digest, authority_generation, source_transport,
-                project_id,
-            )
-            cursor = await conn.execute(
-                """
-                INSERT INTO audit_log (
-                    action, target, result, detail, session_id,
-                    principal_id, runtime_id, task_id, operation_id,
-                    policy_digest, authority_generation, source_transport,
-                    project_id, prev_hash
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (action, target, result, detail, session_id,
-                 principal_id, runtime_id, task_id, operation_id,
-                 policy_digest, authority_generation, source_transport,
-                 project_id, row_hash),
-            )
-            return int(cursor.lastrowid)
+        return await self._audit_repository.insert_audit_log(
+            action,
+            target,
+            result,
+            detail,
+            session_id,
+            principal_id=principal_id,
+            runtime_id=runtime_id,
+            task_id=task_id,
+            operation_id=operation_id,
+            policy_digest=policy_digest,
+            authority_generation=authority_generation,
+            source_transport=source_transport,
+            project_id=project_id,
+        )
 
     async def list_audit_logs(
         self,
@@ -2998,30 +2764,10 @@ class Database:
         Production callers pass both; ``None`` on either (default)
         remains the admin opt-in.
         """
-        async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
-            conn = await self._require_conn()
-            clauses: list[str] = []
-            params: list[Any] = []
-            if principal_id is not None:
-                clauses.append("principal_id = ?")
-                params.append(principal_id)
-            if project_id is not None:
-                clauses.append("project_id = ?")
-                params.append(project_id)
-            where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-            cursor = await conn.execute(
-                f"""
-                SELECT id, action, target, result, detail, session_id,
-                       principal_id, runtime_id, task_id, operation_id,
-                       policy_digest, authority_generation, source_transport,
-                       project_id, prev_hash
-                FROM audit_log
-                {where}
-                ORDER BY created_at, id
-                """,
-                tuple(params),
-            )
-            return [dict(row) for row in await cursor.fetchall()]
+        return await self._audit_repository.list_audit_logs(
+            principal_id=principal_id,
+            project_id=project_id,
+        )
 
     async def get_audit_chain_head(
         self, row_id: int | None = None,
@@ -3033,50 +2779,7 @@ class Database:
         full :meth:`verify_audit_chain` replay remains the authoritative
         consistency check before an anchor is advanced.
         """
-        async with self._read_lease():
-            conn = await self._require_conn()
-            if row_id is None:
-                cursor = await conn.execute(
-                    "SELECT id, action, target, result, detail, session_id, "
-                    "principal_id, runtime_id, task_id, operation_id, "
-                    "policy_digest, authority_generation, source_transport, "
-                    "project_id, prev_hash "
-                    "FROM audit_log ORDER BY id DESC LIMIT 1"
-                )
-            else:
-                cursor = await conn.execute(
-                    "SELECT id, action, target, result, detail, session_id, "
-                    "principal_id, runtime_id, task_id, operation_id, "
-                    "policy_digest, authority_generation, source_transport, "
-                    "project_id, prev_hash "
-                    "FROM audit_log WHERE id = ?",
-                    (row_id,),
-                )
-            row = await cursor.fetchone()
-        if row is None:
-            return None
-        values = dict(row)
-        previous = str(values.get("prev_hash") or "")
-        return {
-            "id": int(values["id"]),
-            "hash": _audit_row_hash(
-                previous,
-                str(values["action"]),
-                str(values["target"]),
-                str(values["result"]),
-                str(values.get("detail") or ""),
-                values.get("session_id"),
-                str(values.get("principal_id") or "legacy"),
-                values.get("runtime_id"),
-                values.get("task_id"),
-                values.get("operation_id"),
-                values.get("policy_digest"),
-                values.get("authority_generation"),
-                values.get("source_transport"),
-                str(values.get("project_id") or ""),
-            ),
-            "prev_hash": previous,
-        }
+        return await self._audit_repository.get_audit_chain_head(row_id)
 
     async def verify_audit_chain_since(self, row_id: int) -> list[dict[str, Any]]:
         """Verify the chain from an anchored row through the current head.
@@ -3086,54 +2789,7 @@ class Database:
         this keeps per-event verification bounded while still checking every
         newly appended link before the independent head advances.
         """
-        async with self._read_lease():
-            conn = await self._require_conn()
-            previous_cursor = await conn.execute(
-                "SELECT id, action, target, result, detail, session_id, "
-                "principal_id, runtime_id, task_id, operation_id, "
-                "policy_digest, authority_generation, source_transport, "
-                "project_id, prev_hash FROM audit_log "
-                "WHERE id < ? ORDER BY id DESC LIMIT 1",
-                (row_id,),
-            )
-            previous_row = await previous_cursor.fetchone()
-            cursor = await conn.execute(
-                "SELECT id, action, target, result, detail, session_id, "
-                "principal_id, runtime_id, task_id, operation_id, "
-                "policy_digest, authority_generation, source_transport, "
-                "project_id, prev_hash FROM audit_log WHERE id >= ? ORDER BY id",
-                (row_id,),
-            )
-            rows = [dict(row) for row in await cursor.fetchall()]
-        if previous_row is None:
-            expected_prev = ""
-        else:
-            previous = dict(previous_row)
-            # ``prev_hash`` stores the computed link for that row (despite
-            # the historical column name), so it is the expected input to
-            # the anchored row. Recomputing it here would hash the previous
-            # row twice and reject every anchor after the first row.
-            expected_prev = str(previous.get("prev_hash") or "")
-        breaks: list[dict[str, Any]] = []
-        for index, row in enumerate(rows):
-            stored = str(row.get("prev_hash") or "")
-            expected = _audit_row_hash(
-                expected_prev,
-                str(row["action"]), str(row["target"]), str(row["result"]),
-                str(row.get("detail") or ""), row.get("session_id"),
-                str(row.get("principal_id") or "legacy"),
-                row.get("runtime_id"), row.get("task_id"),
-                row.get("operation_id"), row.get("policy_digest"),
-                row.get("authority_generation"), row.get("source_transport"),
-                str(row.get("project_id") or ""),
-            )
-            if not stored or stored != expected:
-                breaks.append({
-                    "id": row["id"],
-                    "reason": "hash chain suffix link does not match",
-                })
-            expected_prev = stored
-        return breaks
+        return await self._audit_repository.verify_audit_chain_since(row_id)
 
     async def verify_audit_chain(self) -> list[dict[str, Any]]:
         """Round-14 §4 / Round-15 A-2: verify the audit_log hash chain.
@@ -3146,57 +2802,7 @@ class Database:
         such an insert fail at the DB layer; this verifier is the
         defense-in-depth that catches it if the trigger is ever absent.
         """
-        async with self._read_lease():
-            conn = await self._require_conn()
-            cursor = await conn.execute(
-                "SELECT id, action, target, result, detail, session_id, "
-                "principal_id, runtime_id, task_id, operation_id, "
-                "policy_digest, authority_generation, source_transport, "
-                "project_id, prev_hash "
-                "FROM audit_log ORDER BY id"
-            )
-            rows = [dict(r) for r in await cursor.fetchall()]
-        breaks: list[dict[str, Any]] = []
-        expected_prev = ""
-        for index, row in enumerate(rows):
-            stored = str(row.get("prev_hash") or "")
-            # Only the genesis row (index 0) may carry an empty prev_hash.
-            # Round-15 A-2: a later empty prev_hash is an INSERT-reset
-            # forgery — report it as a break instead of silently resetting.
-            if stored == "":
-                if index == 0:
-                    expected_prev = ""
-                    continue
-                breaks.append({
-                    "id": row["id"],
-                    "reason": (
-                        "hash chain broken: non-genesis row carries an empty "
-                        "prev_hash (possible INSERT-reset forgery)"
-                    ),
-                })
-                # Skip recomputation for this forged row; keep checking the
-                # rest so multiple breaks are all reported.
-                expected_prev = stored
-                continue
-            if stored != _audit_row_hash(
-                expected_prev,
-                str(row["action"]), str(row["target"]), str(row["result"]),
-                str(row.get("detail") or ""), row.get("session_id"),
-                str(row.get("principal_id") or "legacy"),
-                row.get("runtime_id"), row.get("task_id"),
-                row.get("operation_id"), row.get("policy_digest"),
-                row.get("authority_generation"), row.get("source_transport"),
-                str(row.get("project_id") or ""),
-            ):
-                breaks.append({
-                    "id": row["id"],
-                    "reason": (
-                        "hash chain broken: stored prev_hash does not match "
-                        "the recomputed value from the previous link"
-                    ),
-                })
-            expected_prev = stored
-        return breaks
+        return await self._audit_repository.verify_audit_chain()
 
     async def query_audit_logs(
         self,
@@ -3227,44 +2833,15 @@ class Database:
         path on shared DBs.  Production callers pass both; ``None`` on
         either remains the admin opt-in.
         """
-        async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
-            conn = await self._require_conn()
-            clauses: list[str] = []
-            params: list[Any] = []
-            if action is not None:
-                clauses.append("action = ?")
-                params.append(action)
-            if result is not None:
-                clauses.append("result = ?")
-                params.append(result)
-            if since is not None:
-                clauses.append("created_at >= ?")
-                params.append(since)
-            if until is not None:
-                clauses.append("created_at <= ?")
-                params.append(until)
-            if principal_id is not None:
-                clauses.append("principal_id = ?")
-                params.append(principal_id)
-            if project_id is not None:
-                clauses.append("project_id = ?")
-                params.append(project_id)
-            where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-            params.append(limit)
-            cursor = await conn.execute(
-                f"""
-                SELECT id, action, target, result, detail, session_id, created_at,
-                       principal_id, runtime_id, task_id, operation_id,
-                       policy_digest, authority_generation, source_transport,
-                       project_id
-                FROM audit_log
-                {where}
-                ORDER BY created_at DESC, id DESC
-                LIMIT ?
-                """,
-                tuple(params),
-            )
-            return [dict(row) for row in await cursor.fetchall()]
+        return await self._audit_repository.query_audit_logs(
+            action,
+            result,
+            since,
+            until,
+            limit,
+            principal_id=principal_id,
+            project_id=project_id,
+        )
 
     async def insert_subagent_task(
         self,
