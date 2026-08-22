@@ -32,7 +32,7 @@ pytestmark = pytest.mark.posix_host
 from khaos.db import Database
 from khaos.exceptions import ServiceShutdownError
 from khaos.scheduler import CronEngine, ScheduleConfig, ScheduledTask, TaskStatus
-from khaos.scheduler.engine import PendingPersistence
+from khaos.scheduler.recovery import PendingPersistence
 from khaos.time_utils import utc_now_naive
 
 
@@ -70,7 +70,7 @@ async def test_acceptance_1_lease_revocation_failure_stops_tick(
     """
     # Short cancel budget so the test doesn't wait 10s for the
     # resistant executor to time out.
-    import khaos.scheduler.engine as _engine_mod
+    import khaos.scheduler.execution as _engine_mod
     monkeypatch.setattr(_engine_mod, "_CANCEL_IN_FLIGHT_TIMEOUT", 0.3)
 
     db = await _make_db(tmp_path)

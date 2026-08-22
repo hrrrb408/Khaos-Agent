@@ -1266,7 +1266,7 @@ async def test_pause_returns_cancellation_pending_and_epoch_fence_holds(
     import asyncio
 
     from khaos.db import Database
-    from khaos.scheduler import engine as engine_module
+    from khaos.scheduler import execution as engine_module
     from khaos.scheduler.models import ScheduleConfig, TaskStatus
 
     db = Database(tmp_path / "khaos.db")
@@ -1426,7 +1426,7 @@ async def test_remove_returns_cancellation_pending_and_epoch_fence_holds(
     import asyncio
 
     from khaos.db import Database
-    from khaos.scheduler import engine as engine_module
+    from khaos.scheduler import execution as engine_module
     from khaos.scheduler.models import ScheduleConfig, TaskStatus
 
     db = Database(tmp_path / "khaos.db")
@@ -2003,7 +2003,7 @@ async def test_remove_cancellation_pending_tombstone_allows_retry(
     import asyncio
 
     from khaos.db import Database
-    from khaos.scheduler import engine as engine_module
+    from khaos.scheduler import execution as engine_module
     from khaos.scheduler.models import ScheduleConfig, TaskStatus
 
     db = Database(tmp_path / "khaos.db")
@@ -2260,7 +2260,7 @@ async def test_resume_refuses_cancelled_tombstone(tmp_path) -> None:
     import asyncio
 
     from khaos.db import Database
-    from khaos.scheduler import engine as engine_module
+    from khaos.scheduler import execution as engine_module
     from khaos.scheduler.models import ScheduleConfig, TaskStatus
 
     db = Database(tmp_path / "khaos.db")
@@ -2559,7 +2559,7 @@ async def test_cancelled_tombstone_cannot_be_resurrected_via_pause_resume(
     import asyncio
 
     from khaos.db import Database
-    from khaos.scheduler import engine as engine_module
+    from khaos.scheduler import execution as engine_module
     from khaos.scheduler.models import ScheduleConfig, TaskStatus
 
     db = Database(tmp_path / "khaos.db")
@@ -2670,7 +2670,7 @@ async def test_resume_paused_with_live_executor_returns_execution_pending(
     import asyncio
 
     from khaos.db import Database
-    from khaos.scheduler import engine as engine_module
+    from khaos.scheduler import execution as engine_module
     from khaos.scheduler.models import ScheduleConfig, TaskStatus
 
     db = Database(tmp_path / "khaos.db")
@@ -2852,7 +2852,7 @@ async def test_pause_retry_with_live_executor_returns_cancellation_pending(
     import asyncio
 
     from khaos.db import Database
-    from khaos.scheduler import engine as engine_module
+    from khaos.scheduler import execution as engine_module
     from khaos.scheduler.models import ScheduleConfig, TaskStatus
 
     db = Database(tmp_path / "khaos.db")

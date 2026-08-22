@@ -38,7 +38,7 @@ pytestmark = pytest.mark.posix_host
 from khaos.db import Database
 from khaos.exceptions import ServiceShutdownError
 from khaos.scheduler import CronEngine, ScheduleConfig, TaskStatus
-from khaos.scheduler.engine import PendingPersistence
+from khaos.scheduler.recovery import PendingPersistence
 from khaos.time_utils import utc_now_naive
 
 
