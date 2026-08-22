@@ -156,7 +156,7 @@ async def test_acceptance_3_project_id_drift_returns_reason(tmp_path):
     scenario where a task somehow already exists in memory, e.g. loaded
     before the project scope was applied).
     """
-    from khaos.scheduler.engine import _task_from_row
+    from khaos.scheduler.recovery import _task_from_row
 
     db = await _make_db(tmp_path)
     engine = _make_engine(
@@ -194,7 +194,7 @@ async def test_acceptance_4_test_mode_skips_enforcement(tmp_path):
     H-02: task is injected directly (cross-project tasks are excluded
     by ``_load_tasks`` — see test_acceptance_3 for the primary defense).
     """
-    from khaos.scheduler.engine import _task_from_row
+    from khaos.scheduler.recovery import _task_from_row
 
     db = await _make_db(tmp_path)
     # Test engine: empty policy_digest and project_id.
@@ -227,7 +227,7 @@ async def test_acceptance_5_legacy_task_drift_on_production_engine(tmp_path):
     H-02: task is injected directly (legacy task has project_id="" which
     differs from the engine's "proj-prod" — _load_tasks excludes it).
     """
-    from khaos.scheduler.engine import _task_from_row
+    from khaos.scheduler.recovery import _task_from_row
 
     db = await _make_db(tmp_path)
     engine = _make_engine(

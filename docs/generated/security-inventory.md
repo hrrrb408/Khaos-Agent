@@ -95,6 +95,8 @@
 - `python/khaos/scheduler/calculator.py`: `af993de722689212943f4dddd7c5f60cd544c38fa98c9f0a7e7d2b699ddbe64c`
 - `python/khaos/scheduler/repository.py`: `ff162897c80bbf1f02de74cb6f81996328ee1b33440e4a7374322e70e9486a41`
 - `python/khaos/scheduler/due_selector.py`: `7818c8542808a0657ae53681a6221a966bd4d00871aaecd5e92c2bc2776f7721`
+- `python/khaos/scheduler/execution.py`: `f0fa37a613f2db2cd22d121ccfb78791b2e93764a679e38901f5d93ebdc299a8`
+- `python/khaos/scheduler/recovery.py`: `aa18112a5978133b3a39db16fe1d540a9d247cd9ba1a3e8409f9ba01e657a6f2`
 - `python/khaos/coding/planning/limits.py`: `f39749886151ed96b73a9e252bd6a568b0f85d295aed77282e5c8ebc64d87193`
 - `python/khaos/tools/result_codec.py`: `cf9852cb62f4daeb07a3bdfc4144492dfbcd95661a26f08e97d2d9ef99f716fb`
 - `python/khaos/tools/result_finalizer.py`: `f8d5fa676602a17f0c93cf7bb9cb92730157aa7488e68ecf759fc468eafc15a2`

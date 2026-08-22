@@ -27,9 +27,9 @@ import pytest
 from khaos.db import Database
 from khaos.exceptions import ServiceShutdownError
 from khaos.scheduler import CronEngine, ScheduleConfig, ScheduledTask, TaskStatus
-from khaos.scheduler.engine import PendingPersistence
+from khaos.scheduler.recovery import PendingPersistence
 from khaos.time_utils import utc_now_naive
-import khaos.scheduler.engine as _engine_mod
+import khaos.scheduler.execution as _engine_mod
 
 
 # ---------------------------------------------------------------------------

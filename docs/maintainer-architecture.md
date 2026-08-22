@@ -110,7 +110,7 @@ KHAOS.md / AGENTS.md
 | `python/khaos/coding/workspace/artifacts.py` | ChangeSet artifact 的 bounded no-follow read/write/copy、digest/length 校验和 exclusive publish | artifact 文件效果唯一 owner；不决定 workspace ownership、quota registration 或 lifecycle transition |
 | `python/khaos/coding/workspace/errors.py` | workspace-domain error type | `WorkspaceError` 唯一 owner；manager/application/artifact 共享同一错误边界 |
 | `python/khaos/coding/workspace/git_process.py` | trusted Git subprocess spawn/adoption, bounded pipes, termination and quarantine | `TrustedGitProcessOwner` 唯一进程生命周期 owner；`TrustedGitRunner` 只消费它并拥有 Git effect/authority 语义 |
-| `python/khaos/scheduler/engine.py` | 任务生命周期、tick 编排、executor ownership、控制操作和恢复协调 | `scheduler/repository.py` 拥有 project-scoped persistence port；`scheduler/due_selector.py` 拥有纯 due selection；后续继续拆 execution coordinator/recovery worker |
+| `python/khaos/scheduler/engine.py` | lifecycle facade：任务创建/控制、start/stop、状态机和 owner composition | `scheduler/execution.py` 唯一拥有 executor admission、tick、lease、terminal publish；`scheduler/recovery.py` 唯一拥有 persistence reconcile、journal replay、lease recovery、drift quarantine 和 task loading；`scheduler/repository.py` 只拥有 project-scoped persistence port |
 | `python/khaos/scheduler/repository.py` | scheduled-task CRUD、identity/CAS、lease、recovery 和 operation-journal 的 scheduler persistence port | `ScheduledTaskRepository` 绑定 project scope；不拥有 SQLite connection/schema 或 engine lifecycle |
 | `python/khaos/scheduler/due_selector.py` | enabled/PENDING/next-run/pending-marker/in-flight 的纯候选筛选 | `DueTaskSelector` 唯一拥有 due selection；不修改任务、不访问 DB、不启动 executor |
 | `python/khaos/memory/store.py` | 记忆领域 facade；历史上同时包含 SQL、owner mapping、TTL、冲突、FTS、访问频率和正则提取 | `memory/models.py`（值对象）、`ownership.py`（owner/namespace/visibility）、`repository.py`（SQLite adapter）、`conflict.py`、`decay.py`、`extraction.py`、`retrieval.py`；store 只编排这些端口并发出审计；所有读写都消费显式 `MemoryVisibility` |
@@ -257,7 +257,9 @@ REQUESTED -> SNAPSHOT_BOUND -> RUNNING -> PROOF_RECORDED
 
 - 拆分 approval store 与 CronEngine，显式区分 ledger、read model、recovery worker；纯 schedule
   计算已落在 `python/khaos/scheduler/calculator.py`，scheduler persistence port 与 due
-  selector 已落位，engine 不再直接调用 Database task API 或内联 due filter。
+  selector 已落位。CronEngine 现在只保留 lifecycle facade；execution owner 与 recovery
+  owner 分别位于 `python/khaos/scheduler/execution.py` 和
+  `python/khaos/scheduler/recovery.py`，不得把执行/恢复实现重新堆回 facade。
 - 删除已经没有调用者的兼容分支，更新 schema/ADR 和迁移文档。
 
 ### Phase 5：持续维护
