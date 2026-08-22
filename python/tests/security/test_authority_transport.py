@@ -181,8 +181,11 @@ def test_darwin_unix_client_does_not_infer_xpc(
         "socket",
         lambda *_args: FakeSocket(),
     )
+    # ``Path('/tmp/...')`` is not absolute under Windows path semantics even
+    # though this test is explicitly simulating macOS.  Use a portable
+    # absolute placeholder; the socket and validator are both mocked.
     client = AuthorityDaemonClient(
-        Path("/tmp/authorityd.sock"),
+        Path.cwd() / "authorityd.sock",
         expected_authority_uid=0,
         transport="unix",
     )
