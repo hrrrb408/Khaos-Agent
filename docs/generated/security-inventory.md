@@ -99,7 +99,7 @@
 - `python/khaos/tools/result_codec.py`: `cf9852cb62f4daeb07a3bdfc4144492dfbcd95661a26f08e97d2d9ef99f716fb`
 - `python/khaos/tools/result_finalizer.py`: `f8d5fa676602a17f0c93cf7bb9cb92730157aa7488e68ecf759fc468eafc15a2`
 - `python/khaos/rpc/protocol.py`: `5960a4e41b94b63a47ccadd362288f97f4747ad56d6db065f9741cebfbc768a6`
-- `python/khaos/rpc/models.py`: `955584a43523ba9875de5ec44139e8ac96a965d51b22c0e943c3da5275ed0e52`
+- `python/khaos/rpc/models.py`: `3173ba3356d970604df7540af92c1d96e8777813292bb1dab26e142bc572228e`
 - `python/khaos/rpc/agent_service.py`: `e79605357c7e73f683a6673f9d788e7944ca2177b73219b7092847185b90a0b5`
 - `python/khaos/rpc/task_service.py`: `03615243a21e7ea2ec3c0edb4ade35168825ff32362fbc19c2f9249056f34f97`
 - `python/khaos/rpc/composition.py`: `2a9cf8db360960559a0b34aebbdaa52cee46732e062c3219e346fbd5771babce`
