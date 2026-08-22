@@ -14,6 +14,7 @@ import math
 import os
 import socket
 import stat
+import sys
 import tempfile
 import time
 from dataclasses import dataclass
@@ -602,7 +603,9 @@ class AuthorityDaemonClient:
         )
         if selected_transport not in {"unix", "native"}:
             raise ValueError("authorityd transport is invalid")
-        if selected_transport == "unix" and os.name == "nt":
+        if selected_transport == "unix" and sys.platform.startswith(
+            ("win", "cygwin", "msys")
+        ):
             raise ValueError("Unix authority transport is not valid on Windows")
         if (
             (socket_path is None and native_adapter is None)

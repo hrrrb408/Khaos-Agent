@@ -76,8 +76,8 @@
 - `python/khaos/security/authority.py`: `635a96fe32200ac088bd15a9d051a7c2342f110f4f4461840aa64b7db4a6994c`
 - `python/khaos/security/authority_broker.py`: `b2f5ffc74c4837ce40912d882ed75a0c9971538ed2aa26186b8f11d3b33aeb4b`
 - `python/khaos/security/authorityd.py`: `016c80ccc7b5f2c851c02eeddfcfa5f730d39ad980d55f20228caab6c4d7482b`
-- `python/khaos/security/authorityd_protocol.py`: `dacae13e4446cc9fe09105eddc28a64b74f3527f4dee982d0440d341b36f198a`
-- `python/khaos/security/authority_transport.py`: `b069cd4c2a6695c9a8e784adaf2c6776de2dda83d16dec44f0e665e9a4ede48d`
+- `python/khaos/security/authorityd_protocol.py`: `267a67150c4d62c6f91720abaebec758d9199ade868f403b22186058e798bd70`
+- `python/khaos/security/authority_transport.py`: `76dd3186ed4ee63a6669a80f7cbca209d8c0d082cdc813187bca128ebc2a74e3`
 - `python/khaos/security/docker_profiles.py`: `2831d9e219f2070fa320e05ed7970392c1b9218c0a3247a30419dc4e700fd222`
 - `python/khaos/security/identity_isolation.py`: `6d1c27b87db25fe41dad47a6a4acfbea0139093b399f071863a98a000f6ebb88`
 - `python/khaos/security/native_authority.py`: `a35ef33253e596f424c4dfcded4e939ef2a8426c816c2b76d3addef6c526a382`

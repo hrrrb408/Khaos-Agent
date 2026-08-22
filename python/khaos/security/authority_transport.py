@@ -41,6 +41,12 @@ class AuthorityTransport(str, Enum):
     NATIVE = "native"
 
 
+def _is_windows_platform(platform_name: str) -> bool:
+    """Return whether a platform label uses the Windows transport family."""
+
+    return platform_name.startswith(("win", "cygwin", "msys"))
+
+
 @dataclass(frozen=True, slots=True)
 class AuthorityTransportConfig:
     """Validated transport selection shared by all authority entrypoints."""
@@ -67,8 +73,17 @@ class AuthorityTransportConfig:
         """
 
         current_platform = sys.platform if platform_name is None else platform_name
-        current_os = os.name if os_name is None else os_name
-        if current_os == "nt":
+        current_os = (
+            ("nt" if _is_windows_platform(current_platform) else "posix")
+            if os_name is None
+            else os_name
+        )
+        platform_is_windows = _is_windows_platform(current_platform)
+        if os_name is not None and platform_is_windows != (current_os == "nt"):
+            raise AuthorityTransportError(
+                "authority platform and OS family are inconsistent"
+            )
+        if platform_is_windows:
             supported_platform = True
         else:
             supported_platform = current_platform == "darwin" or current_platform.startswith(
@@ -93,13 +108,13 @@ class AuthorityTransportConfig:
             profile = AuthorityProfile.NATIVE_PRODUCTION
 
         if profile is AuthorityProfile.COMMUNITY:
-            if current_os == "nt":
+            if platform_is_windows:
                 raise AuthorityTransportError(
                     "the community authority profile requires a Unix socket; "
                     "Windows must use native-production"
                 )
             transport = AuthorityTransport.UNIX
-        elif current_os == "nt" or current_platform == "darwin":
+        elif platform_is_windows or current_platform == "darwin":
             transport = AuthorityTransport.NATIVE
         else:
             # Linux keeps the existing dedicated-UID Unix backend.  It is a
