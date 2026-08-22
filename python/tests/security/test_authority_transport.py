@@ -100,6 +100,24 @@ def test_community_contract_does_not_require_apple_identity(
     )
 
 
+def test_windows_native_contract_uses_platform_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "khaos.security.identity_isolation.sys_platform", lambda: "win32"
+    )
+    contract = AuthorityIdentityContract(501, 501, 501)
+
+    with pytest.raises(
+        PermissionError, match="service_sid, agent_sid, named_pipe"
+    ):
+        contract.validate(
+            production=True,
+            transport="native",
+            profile="native-production",
+        )
+
+
 def test_broker_factory_uses_unix_for_macos_community_profile(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

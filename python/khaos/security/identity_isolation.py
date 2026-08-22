@@ -56,8 +56,10 @@ class AuthorityIdentityContract:
             return
         if transport not in {None, "unix", "native"}:
             raise IdentityIsolationError("authority transport is unknown")
+        platform_name = sys_platform()
+        is_windows = platform_name.startswith(("win", "cygwin", "msys"))
         if transport == "unix" and profile == "community":
-            if os.name == "nt":
+            if is_windows:
                 raise IdentityIsolationError(
                     "the community authority profile is not supported on Windows"
                 )
@@ -66,7 +68,7 @@ class AuthorityIdentityContract:
                     "community authority job UID 0 is forbidden"
                 )
             return
-        if os.name == "nt":
+        if is_windows:
             required = {
                 "service_sid": self.service_sid,
                 "agent_sid": self.agent_sid,
@@ -74,7 +76,7 @@ class AuthorityIdentityContract:
                 "protected_key_ref": self.protected_key_ref,
                 "agent_requirement_digest": self.agent_requirement_digest,
             }
-        elif sys_platform() == "darwin":
+        elif platform_name == "darwin":
             required = {
                 "launchd_service": self.launchd_service,
                 "code_signature": self.code_signature,

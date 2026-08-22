@@ -79,7 +79,7 @@
 - `python/khaos/security/authorityd_protocol.py`: `dacae13e4446cc9fe09105eddc28a64b74f3527f4dee982d0440d341b36f198a`
 - `python/khaos/security/authority_transport.py`: `b069cd4c2a6695c9a8e784adaf2c6776de2dda83d16dec44f0e665e9a4ede48d`
 - `python/khaos/security/docker_profiles.py`: `2831d9e219f2070fa320e05ed7970392c1b9218c0a3247a30419dc4e700fd222`
-- `python/khaos/security/identity_isolation.py`: `972f94da7ea57cbac774faedd4be352332ec0b027c7faaaefd847093a6dc7ea4`
+- `python/khaos/security/identity_isolation.py`: `6d1c27b87db25fe41dad47a6a4acfbea0139093b399f071863a98a000f6ebb88`
 - `python/khaos/security/native_authority.py`: `a35ef33253e596f424c4dfcded4e939ef2a8426c816c2b76d3addef6c526a382`
 - `python/khaos/security/protocol_boundary.py`: `d346cb36e445967ae17f1cef426e917fac833f13758faa33381b5008eca75960`
 - `python/khaos/security/production_composition_probe.py`: `66bc4905c51171a6e02703fb9783a233d3375560eed0d9de453a4a3be24e46a4`
