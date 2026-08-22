@@ -131,6 +131,9 @@ def test_broker_factory_uses_unix_for_macos_community_profile(
     monkeypatch.setenv("KHAOS_DEV_MODE", "0")
     monkeypatch.delenv("KHAOS_AUTHORITY_PROFILE", raising=False)
     monkeypatch.setenv("KHAOS_AUTHORITYD_SOCKET", str(tmp_path / "authorityd.sock"))
+    # The test simulates macOS on Windows, where ``os.geteuid`` does not
+    # exist; provide the simulated same-user authority UID explicitly.
+    monkeypatch.setenv("KHAOS_AUTHORITYD_UID", "501")
     AuthorityBroker._default = None
     broker = AuthorityBroker.default()
     try:
@@ -144,6 +147,11 @@ def test_broker_factory_uses_unix_for_macos_community_profile(
 def test_darwin_unix_client_does_not_infer_xpc(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Explicitly model the macOS platform so the test remains portable to
+    # Windows runners; the transport must be selected by the caller rather
+    # than inferred from the host's native backend.
+    monkeypatch.setattr(authorityd_protocol.sys, "platform", "darwin")
+
     class FakeSocket:
         def __enter__(self) -> Self:
             return self
