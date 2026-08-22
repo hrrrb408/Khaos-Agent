@@ -231,11 +231,13 @@ class ToolOperationStore:
                 effect_id=str(row.get("effect_id") or ""),
                 arguments_digest=arguments_digest,
                 result=ToolResultCodec.deserialize_operation_result(
-                    row, call=call, tool=tool
+                    row, call=dict(call), tool=tool
                 ),
             )
 
-        orphan = ToolResultCodec.deserialize_operation_result(row, call=call, tool=tool)
+        orphan = ToolResultCodec.deserialize_operation_result(
+            row, call=dict(call), tool=tool
+        )
         orphan = replace(
             orphan,
             effect_status=EFFECT_UNKNOWN,
@@ -309,7 +311,9 @@ class ToolOperationStore:
             workspace_id=str(tool_context.get("workspace_id") or ""),
         )
         if row.get("status") != "running":
-            return ToolResultCodec.deserialize_operation_result(row, call=call, tool=tool)
+            return ToolResultCodec.deserialize_operation_result(
+                row, call=dict(call), tool=tool
+            )
         return ToolResult(
             tool_call_id=str(call["id"]),
             name=tool.name,

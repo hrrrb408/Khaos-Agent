@@ -102,11 +102,12 @@ class MaintenanceService:
         operation_repository: ToolOperationRepository | None = None,
     ) -> None:
         self._db = db
-        self._operation_repository = operation_repository or getattr(
+        repository = operation_repository or getattr(
             db, "tool_operation_repository", None
         )
-        if self._operation_repository is None:
+        if repository is None:
             raise TypeError("MaintenanceService requires a tool-operation repository")
+        self._operation_repository: ToolOperationRepository = repository
         self._approval_broker = approval_broker
         self._interval = max(60.0, interval_seconds)
         self._retention = retention_seconds
