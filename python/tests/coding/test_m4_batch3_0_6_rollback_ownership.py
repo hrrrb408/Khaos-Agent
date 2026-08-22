@@ -109,12 +109,12 @@ def _crash_after_applied(tmp_path, operation):
     finally:
         engine._build_final_attestation = original_build
         engine._rollback = original_rollback
-    run = runtime._store.get_execution_run_by_context(
+    run = runtime._store.execution_read_model.get_execution_run_by_context(
         runtime._store._conn.execute(
             "SELECT execution_context_id FROM plan_execution_runs"
         ).fetchone()[0]
     )
-    event = runtime._store.list_execution_edit_events(run.execution_run_id)[0]
+    event = runtime._store.execution_read_model.list_execution_edit_events(run.execution_run_id)[0]
     assert run.status == ExecutionRunStatus.MUTATING
     assert event["status"] == "applied"
     assert event["identity_version"] == 1
@@ -154,13 +154,13 @@ def _replace_same_content(path, content):
 
 def test_run_rollback_begin_resume_preserves_first_reason_and_single_audit(tmp_path):
     runtime, _, run = _crash_after_applied(tmp_path, PlannedEditOperation.UPDATE)
-    first = runtime._store.begin_or_resume_rollback(
+    first = runtime._store.execution_writer.begin_or_resume_rollback(
         run.execution_run_id, failure_code="first-reason",
     )
-    same = runtime._store.begin_or_resume_rollback(
+    same = runtime._store.execution_writer.begin_or_resume_rollback(
         run.execution_run_id, failure_code="first-reason",
     )
-    different = runtime._store.begin_or_resume_rollback(
+    different = runtime._store.execution_writer.begin_or_resume_rollback(
         run.execution_run_id, failure_code="different-reason",
     )
     assert first.disposition == RollbackResumeDisposition.STARTED
@@ -177,29 +177,29 @@ def test_run_rolling_back_crash_resumes_on_restart_and_second_restart_is_stable(
     runtime, workspace, run = _crash_after_applied(
         tmp_path, PlannedEditOperation.UPDATE,
     )
-    runtime._store.begin_or_resume_rollback(
+    runtime._store.execution_writer.begin_or_resume_rollback(
         run.execution_run_id, failure_code="restart-test",
     )
     restarted = _restart_runtime(tmp_path, runtime)
-    assert restarted._store.get_execution_run(run.execution_run_id).status == ExecutionRunStatus.ROLLED_BACK
+    assert restarted._store.execution_read_model.get_execution_run(run.execution_run_id).status == ExecutionRunStatus.ROLLED_BACK
     assert (workspace.worktree_path / "a.txt").read_text() == "old"
     restarted_again = _restart_runtime(tmp_path, restarted)
-    assert restarted_again._store.get_execution_run(run.execution_run_id).status == ExecutionRunStatus.ROLLED_BACK
+    assert restarted_again._store.execution_read_model.get_execution_run(run.execution_run_id).status == ExecutionRunStatus.ROLLED_BACK
 
 
 def test_rollback_started_event_resumes_without_replaying_completed_work(tmp_path):
     runtime, workspace, run = _crash_after_applied(
         tmp_path, PlannedEditOperation.UPDATE,
     )
-    runtime._store.begin_or_resume_rollback(
+    runtime._store.execution_writer.begin_or_resume_rollback(
         run.execution_run_id, failure_code="rollback-started-crash",
     )
-    runtime._store.transition_edit_event(
+    runtime._store.execution_journal_writer.transition_edit_event(
         run.execution_run_id, "e1", expected_phase="applied",
         target_phase="rollback-started", error_code="rollback-started-crash",
     )
     restarted = _restart_runtime(tmp_path, runtime)
-    event = restarted._store.list_execution_edit_events(run.execution_run_id)[0]
+    event = restarted._store.execution_read_model.list_execution_edit_events(run.execution_run_id)[0]
     assert event["status"] == "rolled-back"
     assert event["rollback_identity_digest"]
     assert (workspace.worktree_path / "a.txt").read_text() == "old"
@@ -207,20 +207,20 @@ def test_rollback_started_event_resumes_without_replaying_completed_work(tmp_pat
 
 def test_rolled_back_event_same_reason_is_idempotent_and_different_reason_conflicts(tmp_path):
     _, store, run = _phase_store(tmp_path)
-    store.begin_or_resume_rollback(run.execution_run_id, failure_code="reason-a")
-    store.transition_edit_event(
+    store.execution_writer.begin_or_resume_rollback(run.execution_run_id, failure_code="reason-a")
+    store.execution_journal_writer.transition_edit_event(
         run.execution_run_id, "e1", expected_phase="journaled",
         target_phase="rolled-back", error_code="reason-a",
     )
-    before = store.list_execution_edit_events(run.execution_run_id)[0]
-    store.transition_edit_event(
+    before = store.execution_read_model.list_execution_edit_events(run.execution_run_id)[0]
+    store.execution_journal_writer.transition_edit_event(
         run.execution_run_id, "e1", expected_phase="rolled-back",
         target_phase="rolled-back", error_code="reason-a",
     )
-    after = store.list_execution_edit_events(run.execution_run_id)[0]
+    after = store.execution_read_model.list_execution_edit_events(run.execution_run_id)[0]
     assert after["phase_version"] == before["phase_version"]
     with pytest.raises(RuntimeError, match="changed state"):
-        store.transition_edit_event(
+        store.execution_journal_writer.transition_edit_event(
             run.execution_run_id, "e1", expected_phase="rolled-back",
             target_phase="rolled-back", error_code="reason-b",
         )
@@ -241,7 +241,7 @@ def test_same_content_third_party_replacement_is_never_rolled_back(tmp_path, ope
         } else "old"
         third_party_inode = _replace_same_content(target, content)
     restarted = _restart_runtime(tmp_path, runtime)
-    current = restarted._store.get_execution_run(run.execution_run_id)
+    current = restarted._store.execution_read_model.get_execution_run(run.execution_run_id)
     assert current.status == ExecutionRunStatus.POISONED
     assert target.exists() and target.stat().st_ino == third_party_inode
     assert target.read_text() == (
@@ -296,7 +296,7 @@ def test_filesystem_applied_identity_survives_phase_return_crash(tmp_path):
     )
     runtime._store._conn.commit()
     restarted = _restart_runtime(tmp_path, runtime)
-    assert restarted._store.get_execution_run(run.execution_run_id).status == ExecutionRunStatus.ROLLED_BACK
+    assert restarted._store.execution_read_model.get_execution_run(run.execution_run_id).status == ExecutionRunStatus.ROLLED_BACK
     assert (workspace.worktree_path / "a.txt").read_text() == "old"
 
 
@@ -308,10 +308,10 @@ def test_restart_resumes_after_rollback_syscall_without_replaying(tmp_path, comp
         tmp_path, PlannedEditOperation.UPDATE,
     )
     engine = runtime._mutation_engine
-    runtime._store.begin_or_resume_rollback(
+    runtime._store.execution_writer.begin_or_resume_rollback(
         run.execution_run_id, failure_code="rollback-syscall-crash",
     )
-    current = runtime._store.get_execution_run(run.execution_run_id)
+    current = runtime._store.execution_read_model.get_execution_run(run.execution_run_id)
     journal = engine._validated_journal(current, allow_partial=True)
     baseline = engine._require_initial_attestation(current)
     recovery = engine._open_recovery(
@@ -320,7 +320,7 @@ def test_restart_resumes_after_rollback_syscall_without_replaying(tmp_path, comp
     handle = WorkspacePathHandle(workspace.worktree_path.resolve(strict=True))
     try:
         event = journal.events[0]
-        runtime._store.transition_edit_event(
+        runtime._store.execution_journal_writer.transition_edit_event(
             run.execution_run_id, event.edit_id, expected_phase="applied",
             target_phase="rollback-started",
             error_code="rollback-syscall-crash",
@@ -336,7 +336,7 @@ def test_restart_resumes_after_rollback_syscall_without_replaying(tmp_path, comp
             failure_code="rollback-syscall-crash",
         )
         if completed_phase == "rolled-back":
-            runtime._store.transition_edit_event(
+            runtime._store.execution_journal_writer.transition_edit_event(
                 run.execution_run_id, event.edit_id,
                 expected_phase="rollback-directory-synced",
                 target_phase="rolled-back",
@@ -347,9 +347,9 @@ def test_restart_resumes_after_rollback_syscall_without_replaying(tmp_path, comp
         recovery.close()
     restored_inode = (workspace.worktree_path / "a.txt").stat().st_ino
     restarted = _restart_runtime(tmp_path, runtime)
-    event = restarted._store.list_execution_edit_events(run.execution_run_id)[0]
+    event = restarted._store.execution_read_model.list_execution_edit_events(run.execution_run_id)[0]
     assert event["status"] == "rolled-back"
-    assert restarted._store.get_execution_run(run.execution_run_id).status == ExecutionRunStatus.ROLLED_BACK
+    assert restarted._store.execution_read_model.get_execution_run(run.execution_run_id).status == ExecutionRunStatus.ROLLED_BACK
     assert (workspace.worktree_path / "a.txt").stat().st_ino == restored_inode
 
 
@@ -358,17 +358,17 @@ def test_rolled_back_object_replaced_before_restart_is_not_accepted(tmp_path):
         tmp_path, PlannedEditOperation.UPDATE,
     )
     engine = runtime._mutation_engine
-    runtime._store.begin_or_resume_rollback(
+    runtime._store.execution_writer.begin_or_resume_rollback(
         run.execution_run_id, failure_code="rolled-back-replacement",
     )
-    current = runtime._store.get_execution_run(run.execution_run_id)
+    current = runtime._store.execution_read_model.get_execution_run(run.execution_run_id)
     journal = engine._validated_journal(current, allow_partial=True)
     baseline = engine._require_initial_attestation(current)
     recovery = engine._open_recovery(workspace, run.execution_run_id, journal.events)
     handle = WorkspacePathHandle(workspace.worktree_path.resolve(strict=True))
     try:
         event = journal.events[0]
-        runtime._store.transition_edit_event(
+        runtime._store.execution_journal_writer.transition_edit_event(
             run.execution_run_id, event.edit_id, expected_phase="applied",
             target_phase="rollback-started",
             error_code="rolled-back-replacement",
@@ -380,7 +380,7 @@ def test_rolled_back_object_replaced_before_restart_is_not_accepted(tmp_path):
             run_id=run.execution_run_id,
             failure_code="rolled-back-replacement",
         )
-        runtime._store.transition_edit_event(
+        runtime._store.execution_journal_writer.transition_edit_event(
             run.execution_run_id, event.edit_id,
             expected_phase="rollback-directory-synced",
             target_phase="rolled-back",
@@ -393,7 +393,7 @@ def test_rolled_back_object_replaced_before_restart_is_not_accepted(tmp_path):
         workspace.worktree_path / "a.txt", "old",
     )
     restarted = _restart_runtime(tmp_path, runtime)
-    assert restarted._store.get_execution_run(run.execution_run_id).status == ExecutionRunStatus.POISONED
+    assert restarted._store.execution_read_model.get_execution_run(run.execution_run_id).status == ExecutionRunStatus.POISONED
     assert (workspace.worktree_path / "a.txt").stat().st_ino == third_party_inode
 
 
@@ -425,15 +425,15 @@ def test_restart_completes_mixed_applied_rollback_started_and_rolled_back_events
     finally:
         engine._build_final_attestation = original_build
         engine._rollback = original_rollback
-    run = runtime._store.get_execution_run(
+    run = runtime._store.execution_read_model.get_execution_run(
         runtime._store._conn.execute(
             "SELECT execution_run_id FROM plan_execution_runs"
         ).fetchone()[0]
     )
-    runtime._store.begin_or_resume_rollback(
+    runtime._store.execution_writer.begin_or_resume_rollback(
         run.execution_run_id, failure_code="mixed-phase-crash",
     )
-    run = runtime._store.get_execution_run(run.execution_run_id)
+    run = runtime._store.execution_read_model.get_execution_run(run.execution_run_id)
     journal = engine._validated_journal(run, allow_partial=True)
     baseline = engine._require_initial_attestation(run)
     recovery = engine._open_recovery(workspace, run.execution_run_id, journal.events)
@@ -442,7 +442,7 @@ def test_restart_completes_mixed_applied_rollback_started_and_rolled_back_events
         for event, complete in (
             (journal.events[1], False), (journal.events[2], True),
         ):
-            runtime._store.transition_edit_event(
+            runtime._store.execution_journal_writer.transition_edit_event(
                 run.execution_run_id, event.edit_id, expected_phase="applied",
                 target_phase="rollback-started", error_code="mixed-phase-crash",
             )
@@ -459,7 +459,7 @@ def test_restart_completes_mixed_applied_rollback_started_and_rolled_back_events
                     run_id=run.execution_run_id,
                     failure_code="mixed-phase-crash",
                 )
-                runtime._store.transition_edit_event(
+                runtime._store.execution_journal_writer.transition_edit_event(
                     run.execution_run_id, event.edit_id,
                     expected_phase="rollback-directory-synced",
                     target_phase="rolled-back",
@@ -469,9 +469,9 @@ def test_restart_completes_mixed_applied_rollback_started_and_rolled_back_events
         handle.close()
         recovery.close()
     restarted = _restart_runtime(tmp_path, runtime)
-    assert restarted._store.get_execution_run(run.execution_run_id).status == ExecutionRunStatus.ROLLED_BACK
+    assert restarted._store.execution_read_model.get_execution_run(run.execution_run_id).status == ExecutionRunStatus.ROLLED_BACK
     assert {
-        row["status"] for row in restarted._store.list_execution_edit_events(
+        row["status"] for row in restarted._store.execution_read_model.list_execution_edit_events(
             run.execution_run_id
         )
     } == {"rolled-back"}
@@ -488,7 +488,7 @@ def test_run_rollback_begin_uses_sqlite_cas_across_connections(tmp_path):
     def begin():
         local = PlanApprovalStore(sqlite3.connect(path, check_same_thread=False))
         barrier.wait()
-        result = local.begin_or_resume_rollback(
+        result = local.execution_writer.begin_or_resume_rollback(
             run.execution_run_id, failure_code="race-reason",
         )
         results.append(result.disposition.value)

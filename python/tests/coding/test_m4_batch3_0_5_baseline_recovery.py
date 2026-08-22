@@ -65,8 +65,8 @@ def _baseline_runtime(tmp_path, *, operation=PlannedEditOperation.UPDATE,
     # The bundle digest is independent of run id; rebuild with the real run binding.
     bundle = _bundle(run, edit)
     run = replace(run, edit_bundle_digest=bundle.content_digest)
-    runtime._store.create_execution_run(run)
-    runtime._store.transition_execution_run(
+    runtime._store.execution_writer.create_execution_run(run)
+    runtime._store.execution_writer.transition_execution_run(
         run.execution_run_id, expected=("created",), target="validating",
     )
     git_state = runtime._mutation_engine._git_inspector.snapshot(
@@ -79,10 +79,10 @@ def _baseline_runtime(tmp_path, *, operation=PlannedEditOperation.UPDATE,
     baseline = runtime._mutation_engine._build_initial_attestation(
         run, context, bundle, git_state,
     )
-    runtime._store.save_initial_workspace_attestation(baseline)
+    runtime._store.execution_writer.save_initial_workspace_attestation(baseline)
     if not with_journal:
         return runtime, workspace, run, baseline, None
-    runtime._store.transition_execution_run(
+    runtime._store.execution_writer.transition_execution_run(
         run.execution_run_id, expected=("validating",), target="mutating",
     )
     recovery = runtime._mutation_engine._prepare_recovery(
@@ -93,14 +93,14 @@ def _baseline_runtime(tmp_path, *, operation=PlannedEditOperation.UPDATE,
         _hash("new") if operation == PlannedEditOperation.UPDATE else _hash("old")
     )
     after_mode = None if operation == PlannedEditOperation.DELETE else 0o644
-    runtime._store.insert_edit_event(
+    runtime._store.execution_journal_writer.insert_edit_event(
         event_id=uuid.uuid4().hex, execution_run_id=run.execution_run_id,
         edit_id="e1", ordinal=0, operation=operation.value, path="a.txt",
         destination_path=edit.destination_path, before_hash=_hash("old"),
         before_mode=0o644, recovery_artifact=artifact,
         planned_after_hash=after_hash, planned_after_mode=after_mode,
     )
-    runtime._store.transition_edit_event(
+    runtime._store.execution_journal_writer.transition_edit_event(
         run.execution_run_id, "e1", expected_phase="journaled",
         target_phase="mutation-started",
     )
@@ -135,7 +135,7 @@ def _baseline_runtime(tmp_path, *, operation=PlannedEditOperation.UPDATE,
     )
     phase = "filesystem-applied"
     for target in ("directory-synced", "applied"):
-        runtime._store.transition_edit_event(
+        runtime._store.execution_journal_writer.transition_edit_event(
             run.execution_run_id, "e1", expected_phase=phase,
             target_phase=target,
         )
@@ -167,7 +167,7 @@ def test_sqlite_journal_before_state_must_match_baseline(tmp_path, field, value)
         (value, run.execution_run_id),
     )
     assert run.execution_run_id not in runtime._mutation_engine.recover_incomplete_runs()
-    assert runtime._store.get_execution_run(run.execution_run_id).status == ExecutionRunStatus.POISONED
+    assert runtime._store.execution_read_model.get_execution_run(run.execution_run_id).status == ExecutionRunStatus.POISONED
     assert (workspace.worktree_path / "a.txt").read_text() == "new"
 
 
@@ -190,7 +190,7 @@ def test_sqlite_baseline_type_mismatch_is_rejected(tmp_path):
                     "WHERE execution_run_id=?",
                     (corrupt.attestation_digest, run.execution_run_id))
     runtime._mutation_engine.recover_incomplete_runs()
-    assert runtime._store.get_execution_run(run.execution_run_id).status == ExecutionRunStatus.POISONED
+    assert runtime._store.execution_read_model.get_execution_run(run.execution_run_id).status == ExecutionRunStatus.POISONED
     assert (workspace.worktree_path / "a.txt").read_text() == "new"
 
 
@@ -215,7 +215,7 @@ def test_recovery_artifact_must_hash_to_initial_baseline(tmp_path, operation):
         if path.name != ".git"
     }
     assert before == after
-    assert runtime._store.get_execution_run(run.execution_run_id).status == ExecutionRunStatus.POISONED
+    assert runtime._store.execution_read_model.get_execution_run(run.execution_run_id).status == ExecutionRunStatus.POISONED
 
 
 def test_rename_destination_existing_in_baseline_is_rejected(tmp_path):
@@ -224,7 +224,7 @@ def test_rename_destination_existing_in_baseline_is_rejected(tmp_path):
         destination_exists=True,
     )
     runtime._mutation_engine.recover_incomplete_runs()
-    assert runtime._store.get_execution_run(run.execution_run_id).status == ExecutionRunStatus.POISONED
+    assert runtime._store.execution_read_model.get_execution_run(run.execution_run_id).status == ExecutionRunStatus.POISONED
     assert (workspace.worktree_path / "b.txt").read_text() == "occupied"
 
 
@@ -238,14 +238,14 @@ def test_matching_corrupt_journal_and_artifact_do_not_override_baseline(tmp_path
         (corrupt_hash, run.execution_run_id),
     )
     runtime._mutation_engine.recover_incomplete_runs()
-    assert runtime._store.get_execution_run(run.execution_run_id).status == ExecutionRunStatus.POISONED
+    assert runtime._store.execution_read_model.get_execution_run(run.execution_run_id).status == ExecutionRunStatus.POISONED
     assert (workspace.worktree_path / "a.txt").read_text() == "new"
 
 
 def test_zero_journal_unchanged_workspace_terminalizes_atomically(tmp_path):
     runtime, _, run, _, _ = _baseline_runtime(tmp_path, with_journal=False)
     recovered = runtime._mutation_engine.recover_incomplete_runs()
-    current = runtime._store.get_execution_run(run.execution_run_id)
+    current = runtime._store.execution_read_model.get_execution_run(run.execution_run_id)
     assert recovered == (run.execution_run_id,)
     assert current.status == ExecutionRunStatus.FAILED
     assert current.failure_code == "no-mutation-crash"
@@ -276,7 +276,7 @@ def test_zero_journal_with_evidence_of_change_stays_poisoned(tmp_path, drift):
         admin.mkdir(parents=True)
         (admin / "index").write_bytes(b"changed-index")
     runtime._mutation_engine.recover_incomplete_runs()
-    assert runtime._store.get_execution_run(run.execution_run_id).status == ExecutionRunStatus.POISONED
+    assert runtime._store.execution_read_model.get_execution_run(run.execution_run_id).status == ExecutionRunStatus.POISONED
     assert runtime._store.list_workspace_poison_scopes("ws1")
 
 
@@ -284,7 +284,7 @@ def test_normal_startup_rollback_terminalizes_with_run_poison_removed(tmp_path):
     runtime, workspace, run, _, _ = _baseline_runtime(tmp_path)
     recovered = runtime._mutation_engine.recover_incomplete_runs()
     assert recovered == (run.execution_run_id,)
-    assert runtime._store.get_execution_run(run.execution_run_id).status == ExecutionRunStatus.ROLLED_BACK
+    assert runtime._store.execution_read_model.get_execution_run(run.execution_run_id).status == ExecutionRunStatus.ROLLED_BACK
     assert (workspace.worktree_path / "a.txt").read_text() == "old"
     assert runtime._store.list_workspace_poison_scopes("ws1") == ()
 
@@ -294,7 +294,7 @@ def test_recovered_terminal_transaction_survives_store_reopen(tmp_path):
     runtime._mutation_engine.recover_incomplete_runs()
     db_path = runtime._store._conn.execute("PRAGMA database_list").fetchone()[2]
     reopened = PlanApprovalStore(sqlite3.connect(db_path))
-    assert reopened.get_execution_run(run.execution_run_id).status == ExecutionRunStatus.FAILED
+    assert reopened.execution_read_model.get_execution_run(run.execution_run_id).status == ExecutionRunStatus.FAILED
     assert reopened.list_workspace_poison_scopes("ws1") == ()
 
 
@@ -302,21 +302,21 @@ def test_recovered_terminal_transaction_survives_store_reopen(tmp_path):
 def test_zero_journal_terminal_and_poison_are_one_transaction(tmp_path, monkeypatch, fault):
     runtime, _, run, _, _ = _baseline_runtime(tmp_path, with_journal=False)
     if fault == "audit":
-        original = runtime._store._insert_execution_audit
+        original = runtime._store.execution_writer._audit_writer
 
         def fail_audit(*args, **kwargs):
             if args[1] == "recovered-no-mutation-committed":
                 raise sqlite3.OperationalError("audit fault")
             return original(*args, **kwargs)
 
-        monkeypatch.setattr(runtime._store, "_insert_execution_audit", fail_audit)
+        monkeypatch.setattr(runtime._store.execution_writer, "_audit_writer", fail_audit)
     else:
         runtime._store._conn.execute(
             "CREATE TRIGGER fail_run_poison_delete BEFORE DELETE ON "
             "workspace_mutation_poison_scopes BEGIN SELECT RAISE(ABORT,'delete fault'); END"
         )
     runtime._mutation_engine.recover_incomplete_runs()
-    current = runtime._store.get_execution_run(run.execution_run_id)
+    current = runtime._store.execution_read_model.get_execution_run(run.execution_run_id)
     assert current.status == ExecutionRunStatus.POISONED
     assert runtime._store.list_workspace_poison_scopes("ws1")
 
@@ -325,8 +325,8 @@ def _phase_store(tmp_path):
     path = tmp_path / "phase.sqlite"
     store = PlanApprovalStore(sqlite3.connect(path, check_same_thread=False))
     run = _run(status=ExecutionRunStatus.MUTATING)
-    store.create_execution_run(run)
-    store.insert_edit_event(
+    store.execution_writer.create_execution_run(run)
+    store.execution_journal_writer.insert_edit_event(
         event_id=uuid.uuid4().hex, execution_run_id=run.execution_run_id,
         edit_id="e1", ordinal=0, operation="update", path="a.txt",
         destination_path=None, before_hash=_hash("old"), before_mode=0o644,
@@ -339,16 +339,16 @@ def _phase_store(tmp_path):
 def test_edit_phase_skip_and_backward_transition_are_rejected(tmp_path):
     _, store, run = _phase_store(tmp_path)
     with pytest.raises(RuntimeError, match="phase transition"):
-        store.transition_edit_event(
+        store.execution_journal_writer.transition_edit_event(
             run.execution_run_id, "e1", expected_phase="journaled",
             target_phase="filesystem-applied",
         )
-    store.transition_edit_event(
+    store.execution_journal_writer.transition_edit_event(
         run.execution_run_id, "e1", expected_phase="journaled",
         target_phase="mutation-started",
     )
     with pytest.raises(RuntimeError, match="phase transition"):
-        store.transition_edit_event(
+        store.execution_journal_writer.transition_edit_event(
             run.execution_run_id, "e1", expected_phase="mutation-started",
             target_phase="journaled",
         )
@@ -364,13 +364,13 @@ def test_applied_phase_cannot_rewrite_after_state(tmp_path):
                 "applied_identity_digest": "1" * 64,
                 "applied_parent_identity_digest": "2" * 64,
             }
-        store.transition_edit_event(
+        store.execution_journal_writer.transition_edit_event(
             run.execution_run_id, "e1", expected_phase=phase,
             target_phase=target, **identity,
         )
         phase = target
     with pytest.raises(RuntimeError, match="changed state"):
-        store.transition_edit_event(
+        store.execution_journal_writer.transition_edit_event(
             run.execution_run_id, "e1", expected_phase="applied",
             target_phase="applied", after_hash="f" * 64,
         )
@@ -379,7 +379,7 @@ def test_applied_phase_cannot_rewrite_after_state(tmp_path):
 def test_rolled_back_phase_requires_rollback_run(tmp_path):
     _, store, run = _phase_store(tmp_path)
     with pytest.raises(RuntimeError, match="rollback run"):
-        store.transition_edit_event(
+        store.execution_journal_writer.transition_edit_event(
             run.execution_run_id, "e1", expected_phase="journaled",
             target_phase="rolled-back",
         )
@@ -394,7 +394,7 @@ def test_edit_phase_compare_and_swap_allows_one_concurrent_winner(tmp_path):
         local = PlanApprovalStore(sqlite3.connect(path, check_same_thread=False))
         barrier.wait()
         try:
-            local.transition_edit_event(
+            local.execution_journal_writer.transition_edit_event(
                 run.execution_run_id, "e1", expected_phase="journaled",
                 target_phase="mutation-started",
             )
@@ -408,15 +408,15 @@ def test_edit_phase_compare_and_swap_allows_one_concurrent_winner(tmp_path):
     for thread in threads:
         thread.join()
     assert sorted(outcomes) == ["conflict", "ok"]
-    row = store.list_execution_edit_events(run.execution_run_id)[0]
+    row = store.execution_read_model.list_execution_edit_events(run.execution_run_id)[0]
     assert (row["status"], row["phase_version"]) == ("mutation-started", 1)
 
 
 def test_same_edit_phase_retry_is_idempotent(tmp_path):
     _, store, run = _phase_store(tmp_path)
-    store.transition_edit_event(
+    store.execution_journal_writer.transition_edit_event(
         run.execution_run_id, "e1", expected_phase="journaled",
         target_phase="journaled",
     )
-    row = store.list_execution_edit_events(run.execution_run_id)[0]
+    row = store.execution_read_model.list_execution_edit_events(run.execution_run_id)[0]
     assert (row["status"], row["phase_version"]) == ("journaled", 0)

@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Any
 
 from khaos.coding.planning.approval.models import compute_verification_digest
+from khaos.coding.planning.approval.execution_read_model import PlanExecutionReadModel
+from khaos.coding.planning.approval.read_model import PlanApprovalReadModel
 from khaos.coding.planning.execution_models import ExecutionRunStatus
 from khaos.coding.planning.git_state import GitStateInspector
 from khaos.coding.planning.security_identities import (
@@ -77,6 +79,8 @@ class TrustedVerificationRunner:
         self,
         *,
         approval_store: Any,
+        approval_read_model: PlanApprovalReadModel,
+        execution_read_model: PlanExecutionReadModel,
         plan_repository: Any,
         workspace_manager: Any,
         context_provider: Any,
@@ -136,6 +140,8 @@ class TrustedVerificationRunner:
                 "production trusted verification requires write authority"
             )
         self._approval_store = approval_store
+        self._approval_read_model = approval_read_model
+        self._execution_read_model = execution_read_model
         self._plans = plan_repository
         self._workspaces = workspace_manager
         self._context_provider = context_provider
@@ -490,7 +496,7 @@ class TrustedVerificationRunner:
         run = self._store.get_run(verification_run_id)
         if run is None:
             raise RuntimeError("verification run missing during cleanup validation")
-        execution = self._approval_store.get_execution_run(run.execution_run_id)
+        execution = self._execution_read_model.get_execution_run(run.execution_run_id)
         if execution is None:
             raise RuntimeError("execution run missing during cleanup validation")
         workspace = self._workspaces.get(execution.workspace_id)
@@ -500,7 +506,7 @@ class TrustedVerificationRunner:
             repository_id=execution.repository_id, task_id=execution.task_id,
             workspace_id=execution.workspace_id,
         )
-        attestation = self._approval_store.get_final_mutation_attestation(
+        attestation = self._execution_read_model.get_final_mutation_attestation(
             execution.execution_run_id,
         )
         if attestation is None:
@@ -861,7 +867,7 @@ class TrustedVerificationRunner:
                 self._validate_live(context)
             )
         except Exception:
-            execution = self._approval_store.get_execution_run(context.execution_run_id)
+            execution = self._execution_read_model.get_execution_run(context.execution_run_id)
             if execution is None:
                 raise
             plan = self._plans.get(execution.plan_id)
@@ -1658,7 +1664,7 @@ class TrustedVerificationRunner:
         expected_plan_digest: str | None = None,
     ) -> tuple[Any, Any, Any, Any, VerificationCatalog, tuple[Any, ...]]:
         self._require_context(context)
-        execution = self._approval_store.get_execution_run(context.execution_run_id)
+        execution = self._execution_read_model.get_execution_run(context.execution_run_id)
         if execution is None or execution.status not in {
             ExecutionRunStatus.MUTATED, ExecutionRunStatus.VERIFYING,
             ExecutionRunStatus.VERIFIED, ExecutionRunStatus.VERIFICATION_FAILED,
@@ -1675,7 +1681,7 @@ class TrustedVerificationRunner:
         plan = self._plans.get(execution.plan_id)
         if plan is None or plan.content_hash != execution.plan_content_hash:
             raise PermissionError("persisted plan snapshot mismatch")
-        request = self._approval_store.get_request(execution.approval_request_id)
+        request = self._approval_read_model.get_request(execution.approval_request_id)
         if request is None or request.binding_digest != execution.binding_digest:
             raise PermissionError("approval binding mismatch")
         if request.verification_digest != compute_verification_digest(plan.verification_requirements):
@@ -1691,7 +1697,9 @@ class TrustedVerificationRunner:
         # Docker attestations skip this check (consistent with
         # _verify_approved_attestations).
         approved_snapshot = self._load_and_verify_approved_snapshot(request, plan)
-        attestation = self._approval_store.get_final_mutation_attestation(execution.execution_run_id)
+        attestation = self._execution_read_model.get_final_mutation_attestation(
+            execution.execution_run_id
+        )
         if attestation is None or attestation.attestation_digest != context.attestation_digest:
             raise PermissionError("final mutation attestation mismatch")
         workspace = self._workspaces.get(execution.workspace_id)

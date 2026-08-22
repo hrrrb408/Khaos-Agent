@@ -353,7 +353,7 @@ def _setup_consumed_with_active_lease(runtime, *, plan_id="p_cancel"):
     plan, request, _ = _seed_approved_request(runtime, plan_id=plan_id)
     auth, ctx, guard = _authorize_and_acquire_lease(runtime, plan, request)
     # The approval request is now CONSUMED (lease-first consume).
-    req = runtime._store.get_request(request.approval_request_id)
+    req = runtime._store.approval_read_model.get_request(request.approval_request_id)
     assert req.status.value == "consumed"
     return plan, request, auth, ctx, guard
 
@@ -378,7 +378,7 @@ def test_08_task_cancel_clears_consumed_request_active_lease():
     assert count == 1, "expected 1 lease invalidated"
 
     # The approval request is STILL CONSUMED (not rolled back to REVOKED).
-    req = runtime._store.get_request(request.approval_request_id)
+    req = runtime._store.approval_read_model.get_request(request.approval_request_id)
     assert req.status.value == "consumed", (
         "approval request must stay CONSUMED — no illegal rollback"
     )

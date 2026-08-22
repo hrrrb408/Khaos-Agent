@@ -36,7 +36,7 @@ def _mutation_tombstone_crash(tmp_path, monkeypatch):
     edit = _update(tmp_path)
     runtime, workspace, plan, authorization = _setup(tmp_path, (edit,))
     monkeypatch.setattr(
-        runtime._store, "commit_terminal_seal",
+        runtime._store.execution_writer, "commit_terminal_seal",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             sqlite3.OperationalError("terminal-commit")
         ),
@@ -60,7 +60,7 @@ def test_missing_run_directory_with_valid_mutation_tombstone_recovers(tmp_path, 
     assert not (workspace.recovery_root / run_id).exists()
     assert tuple(workspace.recovery_root.glob("seal-*.json"))
     assert run_id in runtime._mutation_engine.recover_incomplete_runs()
-    assert runtime._store.get_execution_run(run_id).status == ExecutionRunStatus.MUTATED
+    assert runtime._store.execution_read_model.get_execution_run(run_id).status == ExecutionRunStatus.MUTATED
 
 
 @pytest.mark.parametrize("corruption", ["missing", "json", "digest"])
@@ -74,7 +74,7 @@ def test_missing_or_corrupt_tombstone_never_guesses_terminal(tmp_path, monkeypat
         text = tombstone.read_text(encoding="utf-8")
         tombstone.write_text(text.replace('"tombstone_digest":"', '"tombstone_digest":"bad'), encoding="utf-8")
     assert run_id not in runtime._mutation_engine.recover_incomplete_runs()
-    assert runtime._store.get_execution_run(run_id).status == ExecutionRunStatus.POISONED
+    assert runtime._store.execution_read_model.get_execution_run(run_id).status == ExecutionRunStatus.POISONED
 
 
 def test_terminal_seal_marker_status_and_audit_commit_atomically(tmp_path):
@@ -102,7 +102,7 @@ def _rollback_tombstone_crash(tmp_path, monkeypatch):
         raise OSError("rollback")
     monkeypatch.setattr(engine, "_apply_edit", fail_after_apply)
     monkeypatch.setattr(
-        runtime._store, "commit_terminal_seal",
+        runtime._store.execution_writer, "commit_terminal_seal",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             sqlite3.OperationalError("terminal-commit")
         ),
@@ -125,7 +125,7 @@ def test_missing_run_directory_with_valid_rollback_tombstone_recovers(tmp_path, 
     monkeypatch.undo()
     assert not (workspace.recovery_root / run_id).exists()
     assert run_id in runtime._mutation_engine.recover_incomplete_runs()
-    assert runtime._store.get_execution_run(run_id).status == ExecutionRunStatus.ROLLED_BACK
+    assert runtime._store.execution_read_model.get_execution_run(run_id).status == ExecutionRunStatus.ROLLED_BACK
 
 
 def test_rollback_tombstone_corruption_keeps_quarantine(tmp_path, monkeypatch):
@@ -134,7 +134,7 @@ def test_rollback_tombstone_corruption_keeps_quarantine(tmp_path, monkeypatch):
     tombstone = next(workspace.recovery_root.glob("seal-*.json"))
     tombstone.write_text("{}", encoding="utf-8")
     assert run_id not in runtime._mutation_engine.recover_incomplete_runs()
-    assert runtime._store.get_execution_run(run_id).status == ExecutionRunStatus.POISONED
+    assert runtime._store.execution_read_model.get_execution_run(run_id).status == ExecutionRunStatus.POISONED
 
 
 @pytest.mark.parametrize("field,value", [
@@ -151,12 +151,12 @@ def test_corrupt_journal_is_rejected_before_any_path_or_artifact_access(
     workspace = _workspace(tmp_path, manager)
     run_id = f"per_{uuid.uuid4().hex}"
     now = time.time()
-    runtime._store.create_execution_run(PlanExecutionRun(
+    runtime._store.execution_writer.create_execution_run(PlanExecutionRun(
         run_id, "p", "h", "r", f"a-{run_id}", f"c-{run_id}", "l",
         "task1", "ws1", "repo", "abc123", 1, "b", "d",
         ExecutionRunStatus.MUTATING, now, now, metadata={"edit_count": 1},
     ))
-    runtime._store.insert_edit_event(
+    runtime._store.execution_journal_writer.insert_edit_event(
         event_id=uuid.uuid4().hex, execution_run_id=run_id, edit_id="e1",
         ordinal=0, operation="update", path="a.txt", destination_path=None,
         before_hash=_hash("old"), before_mode=0o644,
@@ -181,18 +181,18 @@ def test_corrupt_journal_is_rejected_before_any_path_or_artifact_access(
     monkeypatch.setattr(RecoveryDirectory, "__init__", recovery)
     assert run_id not in runtime._mutation_engine.recover_incomplete_runs()
     assert not touched
-    assert runtime._store.get_execution_run(run_id).status == ExecutionRunStatus.POISONED
+    assert runtime._store.execution_read_model.get_execution_run(run_id).status == ExecutionRunStatus.POISONED
 
 
 def test_corrupt_run_id_is_rejected_before_recovery_open(tmp_path, monkeypatch):
     runtime, _, manager, _ = _real_runtime(tmp_path)
     _workspace(tmp_path, manager)
     run_id = f"per_{uuid.uuid4().hex}"; now = time.time()
-    runtime._store.create_execution_run(PlanExecutionRun(
+    runtime._store.execution_writer.create_execution_run(PlanExecutionRun(
         run_id, "p", "h", "r", "a", "c", "l", "task1", "ws1", "repo",
         "abc123", 1, "b", "d", ExecutionRunStatus.MUTATING, now, now,
     ))
-    runtime._store.insert_edit_event(
+    runtime._store.execution_journal_writer.insert_edit_event(
         event_id=uuid.uuid4().hex, execution_run_id=run_id, edit_id="e1", ordinal=0,
         operation="create", path="a.txt", destination_path=None, before_hash=None,
         before_mode=None, recovery_artifact=None, planned_after_hash=_hash("new"),
@@ -217,13 +217,13 @@ def test_duplicate_journal_ordinal_is_rejected_before_workspace_access(tmp_path,
     runtime, _, manager, _ = _real_runtime(tmp_path)
     _workspace(tmp_path, manager)
     run_id = f"per_{uuid.uuid4().hex}"; now = time.time()
-    runtime._store.create_execution_run(PlanExecutionRun(
+    runtime._store.execution_writer.create_execution_run(PlanExecutionRun(
         run_id, "p", "h", "r", "a", "c", "l", "task1", "ws1", "repo",
         "abc123", 1, "b", "d", ExecutionRunStatus.MUTATING, now, now,
         metadata={"edit_count": 2},
     ))
     for edit_id in ("e1", "e2"):
-        runtime._store.insert_edit_event(
+        runtime._store.execution_journal_writer.insert_edit_event(
             event_id=uuid.uuid4().hex, execution_run_id=run_id, edit_id=edit_id,
             ordinal=0, operation="create", path=f"{edit_id}.txt",
             destination_path=None, before_hash=None, before_mode=None,

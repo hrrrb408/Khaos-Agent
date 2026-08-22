@@ -60,7 +60,7 @@ def _authority_store(tmp_path, *, runtime_id=None, boot_id=None):
 def _assert_not_success(store, verification_run_id, execution_run_id):
     assert store.get_run(verification_run_id).status != VerificationRunStatus.PASSED
     assert (
-        store._approval_store.get_execution_run(execution_run_id).status
+        store._approval_store.execution_read_model.get_execution_run(execution_run_id).status
         != ExecutionRunStatus.VERIFIED
     )
 
@@ -546,7 +546,7 @@ def test_database_and_sidecar_inode_replacement_fail_closed(tmp_path, suffix):
     with pytest.raises(PermissionError, match="identity drift"):
         store.get_run(verification_run_id)
     assert (
-        store._approval_store.get_execution_run(execution_run_id).status
+        store._approval_store.execution_read_model.get_execution_run(execution_run_id).status
         != ExecutionRunStatus.VERIFIED
     )
 
@@ -601,7 +601,7 @@ def test_authority_finalize_records_trusted_success(tmp_path):
     )
     assert store.get_run(verification_run_id).status == VerificationRunStatus.PASSED
     assert (
-        store._approval_store.get_execution_run(execution_run_id).status
+        store._approval_store.execution_read_model.get_execution_run(execution_run_id).status
         == ExecutionRunStatus.VERIFIED
     )
     authority.close()
@@ -632,7 +632,7 @@ def test_new_boot_quarantines_unanchored_historical_success(tmp_path):
     next_store.bind_write_authority(next_authority)
     assert next_store.get_run(verification_run_id).status == VerificationRunStatus.ERRORED
     assert (
-        approval.get_execution_run(execution_run_id).status
+        approval.execution_read_model.get_execution_run(execution_run_id).status
         == ExecutionRunStatus.VERIFICATION_ERROR
     )
     next_authority.close()

@@ -48,7 +48,7 @@ def _crash_after_custom_edit(tmp_path, edit):
     finally:
         engine._build_final_attestation = original_build
         engine._rollback = original_rollback
-    run = runtime._store.get_execution_run(
+    run = runtime._store.execution_read_model.get_execution_run(
         runtime._store._conn.execute(
             "SELECT execution_run_id FROM plan_execution_runs"
         ).fetchone()[0]
@@ -111,12 +111,12 @@ def test_parent_fsync_fault_persists_filesystem_phase_and_restart_only_resyncs(
     with pytest.raises(WorkspaceMutationError):
         _invoke_rollback(runtime, workspace, run)
 
-    event = runtime._store.list_execution_edit_events(run.execution_run_id)[0]
+    event = runtime._store.execution_read_model.list_execution_edit_events(run.execution_run_id)[0]
     assert event["status"] == "rollback-filesystem-applied"
     assert event["rollback_identity_digest"]
     assert event["rollback_parent_identity_digest"]
     assert not event["rollback_directory_sync_digest"]
-    assert runtime._store.get_execution_run(run.execution_run_id).status == (
+    assert runtime._store.execution_read_model.get_execution_run(run.execution_run_id).status == (
         ExecutionRunStatus.POISONED
     )
     assert counts["syscall"] == 1
@@ -124,7 +124,7 @@ def test_parent_fsync_fault_persists_filesystem_phase_and_restart_only_resyncs(
 
     monkeypatch.setattr(SafeParentDirectory, "fsync", original_fsync)
     restarted = _restart_runtime(tmp_path, runtime)
-    final = restarted._store.list_execution_edit_events(run.execution_run_id)[0]
+    final = restarted._store.execution_read_model.list_execution_edit_events(run.execution_run_id)[0]
     assert final["status"] == "rolled-back"
     assert final["rollback_directory_sync_digest"]
     assert final["rollback_synced_at"] > 0
@@ -176,7 +176,7 @@ def test_cross_directory_rename_fsync_fault_resyncs_both_without_replay(
     monkeypatch.setattr(SafeParentDirectory, "fsync", selective_fsync)
     with pytest.raises(WorkspaceMutationError):
         _invoke_rollback(runtime, workspace, run)
-    event = runtime._store.list_execution_edit_events(run.execution_run_id)[0]
+    event = runtime._store.execution_read_model.list_execution_edit_events(run.execution_run_id)[0]
     assert event["status"] == "rollback-filesystem-applied"
     assert event["rollback_sync_mask"] == 3
     assert event["rollback_destination_parent_identity_digest"]
@@ -189,7 +189,7 @@ def test_cross_directory_rename_fsync_fault_resyncs_both_without_replay(
 
     monkeypatch.setattr(SafeParentDirectory, "fsync", tracking_fsync)
     restarted = _restart_runtime(tmp_path, runtime)
-    assert restarted._store.get_execution_run(run.execution_run_id).status == (
+    assert restarted._store.execution_read_model.get_execution_run(run.execution_run_id).status == (
         ExecutionRunStatus.ROLLED_BACK
     )
     assert calls["rename"] == 1
@@ -207,7 +207,7 @@ def test_same_directory_rename_has_one_unique_sync_requirement(tmp_path, monkeyp
     )
     with pytest.raises(WorkspaceMutationError):
         _invoke_rollback(runtime, workspace, run)
-    event = runtime._store.list_execution_edit_events(run.execution_run_id)[0]
+    event = runtime._store.execution_read_model.list_execution_edit_events(run.execution_run_id)[0]
     assert event["rollback_sync_mask"] == 1
     assert event["rollback_destination_parent_identity_digest"]
     monkeypatch.setattr(SafeParentDirectory, "fsync", original_fsync)
@@ -218,7 +218,7 @@ def test_directory_synced_phase_crash_restarts_without_syscall_replay(
     tmp_path, monkeypatch, operation,
 ):
     runtime, workspace, run = _crash_after_applied(tmp_path, operation)
-    original_transition = runtime._store.transition_edit_event
+    original_transition = runtime._store.execution_journal_writer.transition_edit_event
     syscall_name = _syscall_name(operation)
     original_syscall = getattr(WorkspacePathHandle, syscall_name)
     calls = {"syscall": 0}
@@ -234,19 +234,23 @@ def test_directory_synced_phase_crash_restarts_without_syscall_replay(
 
     monkeypatch.setattr(WorkspacePathHandle, syscall_name, counted_syscall)
     monkeypatch.setattr(
-        runtime._store, "transition_edit_event", crash_before_rolled_back,
+        runtime._store.execution_journal_writer,
+        "transition_edit_event",
+        crash_before_rolled_back,
     )
     with pytest.raises(SystemExit):
         _invoke_rollback(runtime, workspace, run)
-    event = runtime._store.list_execution_edit_events(run.execution_run_id)[0]
+    event = runtime._store.execution_read_model.list_execution_edit_events(run.execution_run_id)[0]
     assert event["status"] == "rollback-directory-synced"
     assert calls["syscall"] == 1
 
     monkeypatch.setattr(
-        runtime._store, "transition_edit_event", original_transition,
+        runtime._store.execution_journal_writer,
+        "transition_edit_event",
+        original_transition,
     )
     restarted = _restart_runtime(tmp_path, runtime)
-    assert restarted._store.get_execution_run(run.execution_run_id).status == (
+    assert restarted._store.execution_read_model.get_execution_run(run.execution_run_id).status == (
         ExecutionRunStatus.ROLLED_BACK
     )
     assert calls["syscall"] == 1
@@ -258,7 +262,7 @@ def test_fsync_success_but_sync_phase_commit_failure_retries_only_fsync(
     tmp_path, monkeypatch, failure, operation,
 ):
     runtime, workspace, run = _crash_after_applied(tmp_path, operation)
-    original_record = runtime._store.record_rollback_directory_synced
+    original_record = runtime._store.execution_journal_writer.record_rollback_directory_synced
     syscall_name = _syscall_name(operation)
     original_syscall = getattr(WorkspacePathHandle, syscall_name)
     calls = {"syscall": 0}
@@ -274,21 +278,23 @@ def test_fsync_success_but_sync_phase_commit_failure_retries_only_fsync(
 
     monkeypatch.setattr(WorkspacePathHandle, syscall_name, counted_syscall)
     monkeypatch.setattr(
-        runtime._store, "record_rollback_directory_synced", fail_sync_commit,
+        runtime._store.execution_journal_writer,
+        "record_rollback_directory_synced", fail_sync_commit,
     )
     expected = SystemExit if failure == "crash" else WorkspaceMutationError
     with pytest.raises(expected):
         _invoke_rollback(runtime, workspace, run)
-    event = runtime._store.list_execution_edit_events(run.execution_run_id)[0]
+    event = runtime._store.execution_read_model.list_execution_edit_events(run.execution_run_id)[0]
     assert event["status"] == "rollback-filesystem-applied"
     assert not event["rollback_directory_sync_digest"]
     assert calls["syscall"] == 1
 
     monkeypatch.setattr(
-        runtime._store, "record_rollback_directory_synced", original_record,
+        runtime._store.execution_journal_writer,
+        "record_rollback_directory_synced", original_record,
     )
     restarted = _restart_runtime(tmp_path, runtime)
-    assert restarted._store.get_execution_run(run.execution_run_id).status == (
+    assert restarted._store.execution_read_model.get_execution_run(run.execution_run_id).status == (
         ExecutionRunStatus.ROLLED_BACK
     )
     assert calls["syscall"] == 1
@@ -320,7 +326,7 @@ def test_fsync_retry_rejects_object_or_parent_identity_drift(
         os.link(parked / "a.txt", target)
     monkeypatch.setattr(SafeParentDirectory, "fsync", original_fsync)
     restarted = _restart_runtime(tmp_path, runtime)
-    assert restarted._store.get_execution_run(run.execution_run_id).status == (
+    assert restarted._store.execution_read_model.get_execution_run(run.execution_run_id).status == (
         ExecutionRunStatus.POISONED
     )
 
@@ -335,7 +341,7 @@ def test_run_poisoned_during_directory_sync_cannot_become_rolled_back(
 
     def fsync_then_poison(self):
         original_fsync(self)
-        runtime._store.transition_execution_run(
+        runtime._store.execution_writer.transition_execution_run(
             run.execution_run_id, expected=("rolling-back",),
             target="poisoned", failure_code="concurrent-workspace-poison",
             completed=True,
@@ -344,10 +350,10 @@ def test_run_poisoned_during_directory_sync_cannot_become_rolled_back(
     monkeypatch.setattr(SafeParentDirectory, "fsync", fsync_then_poison)
     with pytest.raises(WorkspaceMutationError):
         _invoke_rollback(runtime, workspace, run)
-    event = runtime._store.list_execution_edit_events(run.execution_run_id)[0]
+    event = runtime._store.execution_read_model.list_execution_edit_events(run.execution_run_id)[0]
     assert event["status"] == "rollback-filesystem-applied"
     assert not event["rollback_directory_sync_digest"]
-    assert runtime._store.get_execution_run(run.execution_run_id).status == (
+    assert runtime._store.execution_read_model.get_execution_run(run.execution_run_id).status == (
         ExecutionRunStatus.POISONED
     )
 
@@ -380,7 +386,7 @@ def test_legacy_incomplete_rollback_identity_is_resynced_before_terminal(
     runtime._store._conn.commit()
     monkeypatch.setattr(SafeParentDirectory, "fsync", original_fsync)
     restarted = _restart_runtime(tmp_path, runtime)
-    event = restarted._store.list_execution_edit_events(run.execution_run_id)[0]
+    event = restarted._store.execution_read_model.list_execution_edit_events(run.execution_run_id)[0]
     assert event["status"] == "rolled-back"
     assert event["rollback_directory_sync_digest"]
 
@@ -397,7 +403,7 @@ def test_directory_sync_phase_cas_is_single_transition_across_connections(
     )
     with pytest.raises(WorkspaceMutationError):
         _invoke_rollback(runtime, workspace, run)
-    runtime._store.begin_or_resume_rollback(
+    runtime._store.execution_writer.begin_or_resume_rollback(
         run.execution_run_id, failure_code="rollback-fsync-fault",
     )
     database = runtime._store._conn.execute("PRAGMA database_list").fetchone()[2]
@@ -411,7 +417,7 @@ def test_directory_sync_phase_cas_is_single_transition_across_connections(
             database, check_same_thread=False,
         ))
         barrier.wait()
-        results.append(store.record_rollback_directory_synced(
+        results.append(store.execution_journal_writer.record_rollback_directory_synced(
             run.execution_run_id, "e1", error_code="rollback-fsync-fault",
         ))
 
@@ -421,7 +427,7 @@ def test_directory_sync_phase_cas_is_single_transition_across_connections(
     for thread in threads:
         thread.join()
     assert len(set(results)) == 1
-    row = runtime._store.list_execution_edit_events(run.execution_run_id)[0]
+    row = runtime._store.execution_read_model.list_execution_edit_events(run.execution_run_id)[0]
     assert row["status"] == "rollback-directory-synced"
     assert runtime._store._conn.execute(
         "SELECT COUNT(*) FROM plan_execution_audit_events "

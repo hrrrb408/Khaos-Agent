@@ -34,15 +34,18 @@ def _connection() -> sqlite3.Connection:
 def test_read_model_owns_request_and_authorization_queries() -> None:
     connection = _connection()
     store = PlanApprovalStore(connection)
-    assert isinstance(store._read_model, PlanApprovalReadModel)
-    assert store.get_request("missing") is None
-    assert store.get_authorization("missing") is None
-    assert store.list_decisions("missing") == []
-    assert store.list_audit_events() == []
-    assert store.list_authorizations_for_plan("missing") == []
-    assert store.list_registering_or_pending() == []
-    assert store.list_requests_for_task("missing") == []
-    assert store.find_request_by_plan_binding("missing", "digest") is None
+    read_model = store.approval_read_model
+    assert isinstance(read_model, PlanApprovalReadModel)
+    assert not hasattr(store, "get_request")
+    assert not hasattr(store, "get_authorization")
+    assert read_model.get_request("missing") is None
+    assert read_model.get_authorization("missing") is None
+    assert read_model.list_decisions("missing") == []
+    assert read_model.list_audit_events() == []
+    assert read_model.list_authorizations_for_plan("missing") == []
+    assert read_model.list_registering_or_pending() == []
+    assert read_model.list_requests_for_task("missing") == []
+    assert read_model.find_request_by_plan_binding("missing", "digest") is None
 
 
 def test_read_model_never_owns_connection_lifecycle_or_writes() -> None:

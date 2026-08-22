@@ -114,7 +114,7 @@ def test_two_concurrent_approves_only_one_wins(tmp_path):
             binding={"binding_digest": "x"}, summary={}, expires_at=9999999999.0,
         )
     )
-    request0 = store0.get_request_by_broker(brid)
+    request0 = store0.approval_read_model.get_request_by_broker(brid)
     r1 = broker_decide(broker=broker0, store=store0, request=request0, approved=True, actor_id="u1")
     r2 = broker_decide(broker=broker0, store=store0, request=request0, approved=True, actor_id="u2")
     conn0.close()
@@ -250,7 +250,7 @@ def test_task_cancel_races_with_authorize(tmp_path):
         store=store0, broker=broker0, context_provider=_Ctx(), plan_repository=repo,
         policy=ApprovalPolicy(pending_ttl_seconds=3600, approved_ttl_seconds=3600),
     )
-    request = store0.get_request_by_broker(brid)
+    request = store0.approval_read_model.get_request_by_broker(brid)
     receipt = broker_decide(broker=broker0, store=store0, request=request, approved=True)
     service0.apply_broker_decision(receipt)
     conn0.close()

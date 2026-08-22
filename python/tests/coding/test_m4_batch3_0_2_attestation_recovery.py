@@ -55,7 +55,7 @@ def test_rollback_seal_fault_poison_retains_evidence(tmp_path, monkeypatch, faul
         )
     else:
         monkeypatch.setattr(
-            runtime._store, "commit_terminal_seal",
+            runtime._store.execution_writer, "commit_terminal_seal",
             lambda *args, **kwargs: (_ for _ in ()).throw(
                 sqlite3.OperationalError(fault)
             ),
@@ -185,7 +185,7 @@ def test_sealing_recovery_requires_complete_attestation(
         (workspace.worktree_path / "a.txt").write_text("drift", encoding="utf-8")
     runtime._store._conn.commit()
     assert run_id not in runtime._mutation_engine.recover_incomplete_runs()
-    assert runtime._store.get_execution_run(run_id).status == ExecutionRunStatus.POISONED
+    assert runtime._store.execution_read_model.get_execution_run(run_id).status == ExecutionRunStatus.POISONED
     assert (workspace.recovery_root / run_id).exists()
 
 
@@ -204,7 +204,7 @@ def test_sealing_recovery_rechecks_repository_state(tmp_path, monkeypatch, drift
 
     monkeypatch.setattr(inspector, "snapshot", snapshot)
     assert run_id not in runtime._mutation_engine.recover_incomplete_runs()
-    assert runtime._store.get_execution_run(run_id).status == ExecutionRunStatus.POISONED
+    assert runtime._store.execution_read_model.get_execution_run(run_id).status == ExecutionRunStatus.POISONED
 
 
 def test_valid_attested_sealing_run_recovers_to_mutated(tmp_path, monkeypatch):
@@ -213,7 +213,7 @@ def test_valid_attested_sealing_run_recovers_to_mutated(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(runtime._mutation_engine, "_seal_recovery", original_seal)
     assert run_id in runtime._mutation_engine.recover_incomplete_runs()
-    assert runtime._store.get_execution_run(run_id).status == ExecutionRunStatus.MUTATED
+    assert runtime._store.execution_read_model.get_execution_run(run_id).status == ExecutionRunStatus.MUTATED
     assert not (workspace.recovery_root / run_id).exists()
 
 
@@ -222,14 +222,14 @@ def test_recovery_artifact_symlink_replacement_is_fail_closed(tmp_path, monkeypa
         tmp_path, monkeypatch
     )
     monkeypatch.setattr(runtime._mutation_engine, "_seal_recovery", original_seal)
-    event = runtime._store.list_execution_edit_events(run_id)[0]
+    event = runtime._store.execution_read_model.list_execution_edit_events(run_id)[0]
     artifact = workspace.recovery_root / run_id / event["recovery_artifact"]
     artifact.unlink()
     outside = tmp_path / "outside-backup"
     outside.write_text("old", encoding="utf-8")
     artifact.symlink_to(outside)
     assert run_id not in runtime._mutation_engine.recover_incomplete_runs()
-    assert runtime._store.get_execution_run(run_id).status == ExecutionRunStatus.POISONED
+    assert runtime._store.execution_read_model.get_execution_run(run_id).status == ExecutionRunStatus.POISONED
     assert outside.read_text(encoding="utf-8") == "old"
 
 
@@ -289,7 +289,7 @@ def test_backup_or_journal_durability_fault_causes_zero_workspace_mutation(
         )
     else:
         monkeypatch.setattr(
-            runtime._store, "insert_edit_event",
+            runtime._store.execution_journal_writer, "insert_edit_event",
             lambda **_kwargs: (_ for _ in ()).throw(sqlite3.OperationalError("journal")),
         )
     with pytest.raises((OSError, sqlite3.Error, WorkspaceMutationError)):
