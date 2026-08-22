@@ -231,6 +231,7 @@ def _load_gate_evidence(path: Path, commit: str) -> dict[str, Any]:
         "product_integrity": "product-integrity-gate.yml",
         "native_authority": "native-authority-production-e2e.yml",
     }
+    required_native_artifacts = {"native-authority-windows-proof"}
     for name, workflow in required.items():
         record = gates.get(name)
         if not isinstance(record, dict):
@@ -266,10 +267,7 @@ def _load_gate_evidence(path: Path, commit: str) -> dict[str, Any]:
                     f"security gate evidence artifact is not valid: {expected_artifact}"
                 )
         if name == "native_authority":
-            expected_names = {
-                "native-authority-macos-proof",
-                "native-authority-windows-proof",
-            }
+            expected_names = required_native_artifacts
             for expected_name in expected_names:
                 matches = [
                     artifact for artifact in record.get("artifacts", [])
@@ -288,6 +286,26 @@ def _load_gate_evidence(path: Path, commit: str) -> dict[str, Any]:
                 ):
                     raise SystemExit(
                         f"native authority evidence artifact is not valid: {expected_name}"
+                    )
+            optional_macos = [
+                artifact
+                for artifact in record.get("artifacts", [])
+                if isinstance(artifact, dict)
+                and artifact.get("name") == "native-authority-macos-proof"
+            ]
+            if len(optional_macos) > 1:
+                raise SystemExit(
+                    "native authority evidence has duplicate macOS artifacts"
+                )
+            if optional_macos:
+                artifact = optional_macos[0]
+                if (
+                    artifact.get("expired") is not False
+                    or not isinstance(artifact.get("digest"), str)
+                    or not artifact["digest"].strip()
+                ):
+                    raise SystemExit(
+                        "native authority macOS evidence artifact is not valid"
                     )
     return evidence
 

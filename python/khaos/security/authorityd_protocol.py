@@ -14,7 +14,6 @@ import math
 import os
 import socket
 import stat
-import sys
 import tempfile
 import time
 from dataclasses import dataclass
@@ -71,6 +70,14 @@ class AuditWriter(Protocol):
 
     def append(self, record: dict[str, Any]) -> None:
         """Durably append one prepare/result record or raise."""
+
+
+class NativeAuthorityAdapter(Protocol):
+    """Minimal request surface implemented by platform-native clients."""
+
+    def request(self, payload: dict[str, object]) -> dict[str, object]:
+        """Send one signed request through the platform frontend."""
+        ...
 
 
 def _encode_receipt_timestamp(value: object, *, field: str) -> int:
@@ -584,14 +591,25 @@ class AuthorityDaemonClient:
         *,
         timeout_seconds: float = 3.0,
         expected_authority_uid: int | None = None,
-        native_adapter: object | None = None,
+        native_adapter: NativeAuthorityAdapter | None = None,
+        transport: str | None = None,
     ) -> None:
-        # Unix transport owns the socket path.  Native macOS/Windows
-        # transports are reached through the injected adapter and must not
-        # need a fake path merely to satisfy this shared client wrapper.
+        # The caller (normally AuthorityTransportConfig) selects the
+        # transport.  For direct protocol tests, preserve the intuitive
+        # shape: an injected adapter means native; a socket path means Unix.
+        selected_transport = transport or (
+            "native" if native_adapter is not None else "unix"
+        )
+        if selected_transport not in {"unix", "native"}:
+            raise ValueError("authorityd transport is invalid")
+        if selected_transport == "unix" and os.name == "nt":
+            raise ValueError("Unix authority transport is not valid on Windows")
         if (
             (socket_path is None and native_adapter is None)
             or (socket_path is not None and not socket_path.is_absolute())
+            or (selected_transport == "unix" and socket_path is None)
+            or (selected_transport == "native" and socket_path is not None)
+            or (selected_transport == "unix" and native_adapter is not None)
             or timeout_seconds <= 0
         ):
             raise ValueError("authorityd socket and timeout are invalid")
@@ -601,12 +619,13 @@ class AuthorityDaemonClient:
         self.timeout_seconds = timeout_seconds
         self.expected_authority_uid = expected_authority_uid
         self.native_adapter = native_adapter
+        self.transport = selected_transport
 
     def request(self, payload: dict[str, object]) -> dict[str, object]:
         body = canonical_json_bytes({"protocol": AUTHORITYD_PROTOCOL, **payload}) + b"\n"
         if len(body) > MAX_MESSAGE_BYTES:
             raise AuthorityControlPlaneError("authorityd request is too large")
-        if os.name == "nt" or sys.platform == "darwin":
+        if self.transport == "native":
             try:
                 adapter = self.native_adapter
                 if adapter is None:
@@ -631,10 +650,6 @@ class AuthorityDaemonClient:
                 raise AuthorityControlPlaneError("native authorityd returned an invalid response")
             return response
         try:
-            if os.name == "nt" or sys.platform == "darwin":
-                raise IdentityIsolationError(
-                    "native authorityd transport is required on this platform"
-                )
             if self.socket_path is None:
                 raise AuthorityControlPlaneError(
                     "authorityd Unix transport has no socket path"
@@ -989,6 +1004,7 @@ __all__ = [
     "AuthorizationIntent",
     "Ed25519KeyStore",
     "ExecutionAuditControlPlane",
+    "NativeAuthorityAdapter",
     "RemoteAuditUnavailableError",
     "SignedAuthorizationReceipt",
     "UnknownExecutionError",

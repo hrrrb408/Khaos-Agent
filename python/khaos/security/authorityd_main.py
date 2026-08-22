@@ -5,7 +5,16 @@ from __future__ import annotations
 import os
 from pathlib import Path, PureWindowsPath
 
-from khaos.security.authorityd import build_production_daemon, serve_unix
+from khaos.security.authority_transport import (
+    AuthorityProfile,
+    AuthorityTransportConfig,
+)
+from khaos.security.authorityd import (
+    JsonlAuditWriter,
+    build_local_daemon,
+    build_production_daemon,
+    serve_unix,
+)
 from khaos.security.identity_isolation import read_contract_from_environment
 from khaos.security.remote_audit import writer_from_environment
 from khaos.security.resource_scope import ResourceScopeError, TypedResourcePartialOrder
@@ -14,9 +23,10 @@ from khaos.security.resource_scope import ResourceScopeError, TypedResourceParti
 def main() -> int:
     if os.environ.get("KHAOS_DEV_MODE") == "1":
         raise SystemExit("authorityd refuses to run in KHAOS_DEV_MODE")
+    deployment = AuthorityTransportConfig.from_environment()
     contract = read_contract_from_environment()
-    contract.validate(production=True)
-    transport_path = _authority_transport_path()
+    deployment.validate_contract(contract)
+    transport_path = _authority_transport_path(deployment)
     key_value = os.environ.get("KHAOS_AUTHORITYD_KEY_PATH")
     if not key_value:
         raise SystemExit(
@@ -32,12 +42,30 @@ def main() -> int:
         )
     except ResourceScopeError as exc:
         raise SystemExit(f"typed resource catalog is invalid: {exc}") from exc
-    daemon = build_production_daemon(
-        socket_path=transport_path,
-        key_path=Path(key_value),
-        audit_writer=writer_from_environment(),
-        resource_order=resource_order,
-    )
+    if deployment.profile is AuthorityProfile.COMMUNITY:
+        audit_path = Path(
+            os.environ.get(
+                "KHAOS_AUTHORITYD_AUDIT_PATH",
+                str(transport_path.with_name("authorityd.audit.jsonl")),
+            )
+        ).expanduser()
+        if not audit_path.is_absolute():
+            raise SystemExit(
+                "KHAOS_AUTHORITYD_AUDIT_PATH must be an absolute path"
+            )
+        daemon = build_local_daemon(
+            socket_path=transport_path,
+            key_path=Path(key_value),
+            audit_writer=JsonlAuditWriter(audit_path),
+            resource_order=resource_order,
+        )
+    else:
+        daemon = build_production_daemon(
+            socket_path=transport_path,
+            key_path=Path(key_value),
+            audit_writer=writer_from_environment(),
+            resource_order=resource_order,
+        )
     _publish_public_key(
         Path(os.environ.get(
             "KHAOS_AUTHORITYD_PUBLIC_KEY_PATH",
@@ -53,12 +81,17 @@ def main() -> int:
 
         serve_windows_backend(daemon, production=True)
         return 0
-    serve_unix(daemon, production=True)
+    serve_unix(
+        daemon,
+        production=True,
+        transport=deployment.transport.value,
+        profile=deployment.profile.value,
+    )
     return 0
 
 
 def _authority_transport_value(*, platform_name: str | None = None) -> str:
-    """Return the platform-native authority backend transport identifier."""
+    """Return the selected authority backend transport identifier."""
     current_platform = os.name if platform_name is None else platform_name
     if current_platform == "nt":
         value = os.environ.get("KHAOS_AUTHORITYD_BACKEND_PIPE", "")
@@ -77,9 +110,13 @@ def _authority_transport_value(*, platform_name: str | None = None) -> str:
     return value
 
 
-def _authority_transport_path() -> Path:
+def _authority_transport_path(
+    deployment: AuthorityTransportConfig | None = None,
+) -> Path:
     """Build the absolute path object used by the daemon transport boundary."""
     value = _authority_transport_value()
+    if deployment is not None and not deployment.is_native:
+        value = str(deployment.socket_path())
     path = Path(value)
     if not path.is_absolute():
         raise SystemExit("authorityd transport path must be absolute")

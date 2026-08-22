@@ -14,6 +14,8 @@
     <string>khaos-authority</string>
     <key>EnvironmentVariables</key>
     <dict>
+        <key>KHAOS_AUTHORITY_PROFILE</key>
+        <string>native-production</string>
         <key>KHAOS_AUTHORITYD_SOCKET</key>
         <string>/var/run/khaos-authorityd/backend.sock</string>
         <key>KHAOS_AUTHORITYD_BACKEND_SOCKET</key>

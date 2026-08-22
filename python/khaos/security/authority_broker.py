@@ -22,15 +22,14 @@ import hmac
 import multiprocessing
 import os
 import secrets
-import sys
 import threading
 import time
 from dataclasses import dataclass
 from multiprocessing.connection import Connection
-from pathlib import Path
 from typing import Any
 
 from khaos.security.authority import AuthorityEnvelope
+from khaos.security.authority_transport import AuthorityTransportConfig
 from khaos.security.authorityd_protocol import (
     AuthorityControlPlaneError,
     AuthorityDaemonClient,
@@ -613,11 +612,12 @@ class AuthorityBroker:
     def default(cls) -> AuthorityBroker:
         """Return the process-wide control-plane broker.
 
-        Production is fail-closed: the default broker is a client of an
-        independently deployed ``khaos-authorityd`` and no local HMAC broker
-        is created.  The local broker remains available only when the test /
-        development profile is explicit (``KHAOS_DEV_MODE=1``) or when a
-        caller constructs ``AuthorityBroker()`` directly for unit tests.
+        Production is fail-closed: the default broker is always a client of
+        an independently deployed ``khaos-authorityd`` selected by
+        ``AuthorityTransportConfig``.  The local HMAC broker remains
+        available only when the test/development profile is explicit
+        (``KHAOS_DEV_MODE=1``) or when a caller constructs ``AuthorityBroker()``
+        directly for unit tests.
         """
         with cls._default_lock:
             if cls._default is None or cls._default.closed:
@@ -625,24 +625,13 @@ class AuthorityBroker:
                     cls._default = cls()
                 else:
                     try:
+                        deployment = AuthorityTransportConfig.from_environment()
                         contract = read_contract_from_environment()
-                        contract.validate(production=True)
-                        native_adapter = None
-                        if os.name == "nt" or sys.platform == "darwin":
-                            from khaos.security.native_authority import (
-                                build_native_authority_adapter,
-                            )
-
-                            native_adapter = build_native_authority_adapter(
-                                production=True,
-                                contract=contract,
-                            )
-                        else:
-                            socket_value = os.environ.get("KHAOS_AUTHORITYD_SOCKET")
-                            if not socket_value:
-                                raise AuthorityBrokerError(
-                                    "production AuthorityBroker requires KHAOS_AUTHORITYD_SOCKET"
-                                )
+                        deployment.validate_contract(contract)
+                        if (
+                            deployment.platform_name.startswith("linux")
+                            and not deployment.is_community
+                        ):
                             if (
                                 contract.agent_uid is None
                                 or contract.authority_uid is None
@@ -656,21 +645,13 @@ class AuthorityBroker:
                                 authority_uid=contract.authority_uid,
                                 job_uid=contract.job_uid,
                             )
+                        client = deployment.client(contract)
                     except (OSError, PermissionError, ValueError) as exc:
                         raise AuthorityBrokerError(
-                            "production AuthorityBroker requires native identity handles"
+                            "production AuthorityBroker transport configuration is invalid"
                         ) from exc
-                    socket_path = (
-                        None
-                        if native_adapter is not None
-                        else Path(os.environ.get("KHAOS_AUTHORITYD_SOCKET", "/"))
-                    )
                     cls._default = AuthorityDaemonBroker(
-                        AuthorityDaemonClient(
-                            socket_path,
-                            expected_authority_uid=contract.authority_uid,
-                            native_adapter=native_adapter,
-                        )
+                        client
                     )
                 atexit.register(cls._close_default)
             return cls._default

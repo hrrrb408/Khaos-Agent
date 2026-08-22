@@ -116,7 +116,8 @@ KHAOS.md / AGENTS.md
 | `python/khaos/memory/store.py` | 记忆领域 facade；历史上同时包含 SQL、owner mapping、TTL、冲突、FTS、访问频率和正则提取 | `memory/models.py`（值对象）、`ownership.py`（owner/namespace/visibility）、`repository.py`（SQLite adapter）、`conflict.py`、`decay.py`、`extraction.py`、`retrieval.py`；store 只编排这些端口并发出审计；所有读写都消费显式 `MemoryVisibility` |
 | `python/khaos/memory/manager.py` | 记忆读取、三层注入、token budget、跨模式 intent 和主动提取编排 | `MemoryRetriever` 拥有 L0/L1/L2 分类与排序；`MemoryManager` 只负责 orchestration/格式化/预算，不读 SQLite、不实现 regex |
 | `python/khaos/runtime/factory.py` | 依赖装配和兼容参数转换 | 保留为唯一 composition root；业务逻辑不得回流到 factory |
-| `python/khaos/security/authorityd.py`、`authorityd_protocol.py` | authority daemon lifecycle、签名 receipt、审计事件、socket framing；历史上各自保留 canonical/digest 包装器 | `security/protocol_boundary.py` 统一 canonical JSON/digest；authorityd 只拥有 authority 状态机和 transport 适配 |
+| `python/khaos/security/authority_transport.py` | `community`/`native-production` profile 解析、平台矩阵和 client transport construction | 唯一 transport selection owner；未知 profile fail closed；不按业务模块自行判断 `sys.platform` |
+| `python/khaos/security/authorityd.py`、`authorityd_protocol.py` | authority daemon lifecycle、签名 receipt、审计事件、socket framing；历史上各自保留 canonical/digest 包装器 | `security/protocol_boundary.py` 统一 canonical JSON/digest；authorityd 只拥有 authority 状态机和被选中的 transport 适配 |
 | `go/internal/platform/python_client.go` | Unix 拨号、deadline、context 取消、JSON framing、RPC auth 与 service calls | `rpc_transport.go` 拥有 connection lifecycle；`rpc_contract.go` 拥有版本/features；client 只拥有 auth/envelope 与 service adapter |
 | `rust/khaos-core/src/bin/khaos-exec-launcher.rs`、`authority_receipt.rs` | 参数解析、FD 校验、receipt 验证、rlimit、session 与 exec | `authority_receipt.rs` 的 `ReceiptVerifier` 拥有 receipt binding/verification；launcher 只拥有 native launch sequencing |
 

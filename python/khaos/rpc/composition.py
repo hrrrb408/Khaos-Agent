@@ -15,6 +15,7 @@ from khaos.coding.workspace.office_authority import OfficeMutationAuthority
 from khaos.db import Database
 from khaos.routing import ModelRouter
 from khaos.routing.router import create_default_router
+from khaos.runtime import RequestContext
 from khaos.rust_bridge import get_token_engine
 from khaos.skills import SkillManager
 from khaos.subagents import (
@@ -117,23 +118,31 @@ async def _build_subagent_service(
     # commitment instead of the parent's digest — never a silent
     # parent-digest reuse.
     delegation_issuer = None
-    authority_socket = os.environ.get("KHAOS_AUTHORITYD_SOCKET") or os.environ.get(
-        "KHAOS_AUTHORITYD_BACKEND_SOCKET", ""
+    authority_configured = any(
+        os.environ.get(name)
+        for name in (
+            "KHAOS_AUTHORITYD_SOCKET",
+            "KHAOS_AUTHORITYD_BACKEND_SOCKET",
+            "KHAOS_AUTHORITYD_BACKEND_PIPE",
+            "KHAOS_MACOS_AUTHORITY_XPC_CLIENT",
+            "KHAOS_WINDOWS_AUTHORITY_PIPE_CLIENT",
+        )
     )
-    if authority_socket and os.environ.get("KHAOS_DEV_MODE") != "1":
+    if authority_configured and os.environ.get("KHAOS_DEV_MODE") != "1":
         try:
-            from khaos.security.authorityd_protocol import AuthorityDaemonClient
+            from khaos.security.authority_transport import (
+                AuthorityTransportConfig,
+            )
             from khaos.security.delegation_issuer import AuthorityDelegationIssuer
             from khaos.security.identity_isolation import (
                 read_contract_from_environment,
             )
 
             contract = read_contract_from_environment()
+            deployment = AuthorityTransportConfig.from_environment()
+            deployment.validate_contract(contract)
             delegation_issuer = AuthorityDelegationIssuer(
-                AuthorityDaemonClient(
-                    Path(authority_socket),
-                    expected_authority_uid=contract.authority_uid,
-                )
+                deployment.client(contract)
             )
         except (OSError, PermissionError, ValueError) as exc:
             logger.warning("subagent delegation issuer unavailable: %s", exc)

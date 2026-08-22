@@ -74,11 +74,12 @@
 - `python/khaos/coding/planning/approval/execution_writer.py`: `0bdf12407e1bf16c8c7ab44d9c331f8c0e492d73e51b8f90e406b9d6a263612d`
 - `python/khaos/coding/planning/approval/execution_journal_writer.py`: `e4fc05a50d28387ad2d1f8a7e02b0fa1adb0d39472b362bbbc4ee53649194635`
 - `python/khaos/security/authority.py`: `635a96fe32200ac088bd15a9d051a7c2342f110f4f4461840aa64b7db4a6994c`
-- `python/khaos/security/authority_broker.py`: `08689e7723b52e25917285c267bd9a5ad71490ab4b2b69df081c6d9e2b1e75e2`
-- `python/khaos/security/authorityd.py`: `958a0ad34a3fdcf4963c3619dfbd1bd31d2180b37170be19b09b71d2c4ffba1d`
-- `python/khaos/security/authorityd_protocol.py`: `b0bd066d97d12dc7f5034b7678ac0a376e422d5a8ec3dabe98e04bb330215f1b`
+- `python/khaos/security/authority_broker.py`: `b2f5ffc74c4837ce40912d882ed75a0c9971538ed2aa26186b8f11d3b33aeb4b`
+- `python/khaos/security/authorityd.py`: `016c80ccc7b5f2c851c02eeddfcfa5f730d39ad980d55f20228caab6c4d7482b`
+- `python/khaos/security/authorityd_protocol.py`: `dacae13e4446cc9fe09105eddc28a64b74f3527f4dee982d0440d341b36f198a`
+- `python/khaos/security/authority_transport.py`: `b069cd4c2a6695c9a8e784adaf2c6776de2dda83d16dec44f0e665e9a4ede48d`
 - `python/khaos/security/docker_profiles.py`: `2831d9e219f2070fa320e05ed7970392c1b9218c0a3247a30419dc4e700fd222`
-- `python/khaos/security/identity_isolation.py`: `c60132d574fdb8efe242271b15a78eb6f8edb930eff61401053694fd18b79d18`
+- `python/khaos/security/identity_isolation.py`: `972f94da7ea57cbac774faedd4be352332ec0b027c7faaaefd847093a6dc7ea4`
 - `python/khaos/security/native_authority.py`: `a35ef33253e596f424c4dfcded4e939ef2a8426c816c2b76d3addef6c526a382`
 - `python/khaos/security/protocol_boundary.py`: `d346cb36e445967ae17f1cef426e917fac833f13758faa33381b5008eca75960`
 - `python/khaos/security/production_composition_probe.py`: `66bc4905c51171a6e02703fb9783a233d3375560eed0d9de453a4a3be24e46a4`
@@ -104,7 +105,7 @@
 - `python/khaos/rpc/models.py`: `3173ba3356d970604df7540af92c1d96e8777813292bb1dab26e142bc572228e`
 - `python/khaos/rpc/agent_service.py`: `e79605357c7e73f683a6673f9d788e7944ca2177b73219b7092847185b90a0b5`
 - `python/khaos/rpc/task_service.py`: `03615243a21e7ea2ec3c0edb4ade35168825ff32362fbc19c2f9249056f34f97`
-- `python/khaos/rpc/composition.py`: `2a9cf8db360960559a0b34aebbdaa52cee46732e062c3219e346fbd5771babce`
+- `python/khaos/rpc/composition.py`: `92de3c87b08a79933f7759ace259fe3cc94bc23062f0b9bce1eb99dce4cc22ec`
 - `rust/khaos-core/src/bin/khaos-exec-launcher.rs`: `c5eb7343002ecb7f74e1ca10df5d5edaf4de39f90ecc68064cb355b56b2fda71`
 - `rust/khaos-core/src/bin/khaos-sandbox-launcher.rs`: `9e68f6b622c7ccd29f24d76aa504da1624bf04c128f9215b57ec580b317b75ab`
 - `python/khaos/grpc_server.py`: `8018d0efe0815084c835baad5e01f7856cac47fd6408f6ac4b9aee15d718d7cd`

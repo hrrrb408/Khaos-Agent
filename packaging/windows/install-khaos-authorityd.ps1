@@ -94,6 +94,7 @@ $authoritySid = Get-KhaosServiceSid -ServiceName 'KhaosAuthorityD'
 
 $envFile = Join-Path $InstallRoot 'native-authority.env'
 @(
+    'KHAOS_AUTHORITY_PROFILE=native-production'
     "KHAOS_AUTHORITYD_NAMED_PIPE=$NamedPipe"
     "KHAOS_AUTHORITYD_BACKEND_PIPE=$BackendPipe"
     "KHAOS_AGENT_SID=$AgentSid"

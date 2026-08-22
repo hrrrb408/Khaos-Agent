@@ -1,10 +1,12 @@
 """Independent authority daemon for signed execution receipts.
 
 This service is intentionally a small control-plane reference implementation.
-Production deployment must run it under a dedicated OS identity and connect
-an append-only/WORM ``AuditWriter``; the daemon refuses to start without both
-requirements.  The local process broker is only the explicitly selected test
-profile and is never a production fallback.
+The ``native-production`` builder requires a dedicated OS identity and an
+append-only/WORM ``AuditWriter``.  The explicit ``community`` builder keeps
+the same signed receipt/policy state machine but records to a local
+append-only JSONL file; it makes no WORM or multi-user isolation claim.  The
+in-process broker remains test/development-only and is never a production
+fallback.
 """
 
 from __future__ import annotations
@@ -2346,10 +2348,11 @@ class AuthorityDaemon:
 
 
 class JsonlAuditWriter:
-    """Development adapter, disabled by ``build_production_daemon``.
+    """Local diagnostic adapter used by the explicit community profile.
 
-    This is useful for protocol tests only.  It deliberately does not claim
-    WORM semantics and cannot be passed to the production builder.
+    It deliberately does not claim WORM semantics.  The native-production
+    builder never accepts it; callers that need independently administered
+    retention must provide the remote writer instead.
     """
 
     def __init__(self, path: Path) -> None:
@@ -2387,7 +2390,7 @@ def _typed_resource_order(
     return None
 
 
-def build_production_daemon(
+def _build_policy_bound_daemon(
     *,
     socket_path: Path,
     key_path: Path,
@@ -2395,11 +2398,12 @@ def build_production_daemon(
     issuer_id: str = "khaos-authorityd",
     policy: Callable[[AuthorizationIntent], None] | None = None,
     resource_order: TypedResourcePartialOrder | None = None,
+    audit_requirement: str,
 ) -> AuthorityDaemon:
-    """Construct authorityd only with a policy-bound typed resource catalog."""
+    """Construct an authority daemon with one immutable policy boundary."""
     if audit_writer is None:
         raise AuthorityControlPlaneError(
-            "production authorityd requires an independent remote/WORM audit writer"
+            audit_requirement
         )
     expected_policy_digest = os.environ.get("KHAOS_EFFECTIVE_POLICY_DIGEST")
     if not expected_policy_digest:
@@ -2432,6 +2436,59 @@ def build_production_daemon(
         policy=selected_policy,
         require_live_grants=True,
         require_typed_principals=True,
+    )
+
+
+def build_production_daemon(
+    *,
+    socket_path: Path,
+    key_path: Path,
+    audit_writer: AuditWriter | None,
+    issuer_id: str = "khaos-authorityd",
+    policy: Callable[[AuthorizationIntent], None] | None = None,
+    resource_order: TypedResourcePartialOrder | None = None,
+) -> AuthorityDaemon:
+    """Construct the native-production daemon with remote/WORM evidence."""
+
+    return _build_policy_bound_daemon(
+        socket_path=socket_path,
+        key_path=key_path,
+        audit_writer=audit_writer,
+        issuer_id=issuer_id,
+        policy=policy,
+        resource_order=resource_order,
+        audit_requirement=(
+            "production authorityd requires an independent remote/WORM audit writer"
+        ),
+    )
+
+
+def build_local_daemon(
+    *,
+    socket_path: Path,
+    key_path: Path,
+    audit_writer: AuditWriter | None,
+    issuer_id: str = "khaos-authorityd-community",
+    policy: Callable[[AuthorizationIntent], None] | None = None,
+    resource_order: TypedResourcePartialOrder | None = None,
+) -> AuthorityDaemon:
+    """Construct the community daemon with a local append-only audit log.
+
+    This profile retains the signed receipt state machine, effective-policy
+    digest, and typed resource catalog.  The local JSONL writer is diagnostic
+    evidence rather than a remote WORM claim; deployments needing durable
+    independent audit must select ``native-production``/the production
+    builder instead.
+    """
+
+    return _build_policy_bound_daemon(
+        socket_path=socket_path,
+        key_path=key_path,
+        audit_writer=audit_writer,
+        issuer_id=issuer_id,
+        policy=policy,
+        resource_order=resource_order,
+        audit_requirement="community authorityd requires a local audit writer",
     )
 
 
@@ -2669,16 +2726,36 @@ def _require_native_execution_binding(
         )
 
 
-def serve_unix(daemon: AuthorityDaemon, *, production: bool = True) -> None:
-    """Serve requests on a private 0600 socket or agent-group 0660 socket.
+def serve_unix(
+    daemon: AuthorityDaemon,
+    *,
+    production: bool = True,
+    transport: str | None = None,
+    profile: str | None = None,
+) -> None:
+    """Serve one explicitly selected Unix authority transport.
 
-    On darwin this function only runs in *backend mode*: it serves the
-    ``KHAOS_AUTHORITYD_BACKEND_SOCKET`` consumed by the native launchd/XPC
-    frontend, never a socket the agent could reach directly.  Every peer is
-    kernel-verified through ``LOCAL_PEERCRED`` and must hold the authority
-    UID (the frontend's identity).  There is no same-user agent fallback.
+    ``transport="native"`` on macOS means the private backend socket behind
+    the launchd/XPC frontend.  ``transport="unix"`` is the community local
+    profile: the Agent connects directly through a 0600 socket and both ends
+    still require kernel peer credentials.  ``transport=None`` exists only
+    for backwards-compatible unit-test callers; production entrypoints pass
+    the value resolved by :class:`AuthorityTransportConfig`.
     """
-    backend_mode = sys.platform == "darwin"
+    selected_transport = transport or (
+        "native" if sys.platform == "darwin" else "unix"
+    )
+    if selected_transport not in {"unix", "native"}:
+        raise AuthorityControlPlaneError("authorityd Unix transport is invalid")
+    backend_mode = selected_transport == "native" and sys.platform == "darwin"
+    if selected_transport == "native" and not backend_mode:
+        raise AuthorityControlPlaneError(
+            "native Unix authority transport is only available through macOS XPC"
+        )
+    if selected_transport == "unix" and os.name == "nt":
+        raise AuthorityControlPlaneError(
+            "Windows authorityd requires the native Named Pipe backend"
+        )
     if backend_mode:
         # The backend socket must be the one the native frontend forwards to,
         # and it must live under authority ownership.  Serving any other
@@ -2703,9 +2780,16 @@ def serve_unix(daemon: AuthorityDaemon, *, production: bool = True) -> None:
             "Windows Named Pipe backend service"
         )
     contract = read_contract_from_environment()
+    authority_uid = contract.authority_uid
     if production:
-        contract.validate(production=True)
-        if contract.authority_uid is not None and os.geteuid() != contract.authority_uid:
+        contract.validate(
+            production=True,
+            transport=selected_transport,
+            profile=profile,
+        )
+        if selected_transport == "unix" and profile == "community":
+            authority_uid = authority_uid if authority_uid is not None else os.geteuid()
+        if authority_uid is not None and os.geteuid() != authority_uid:
             raise IdentityIsolationError("authorityd is not running as its dedicated UID")
     daemon.socket_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     if daemon.socket_path.exists():
@@ -2740,7 +2824,7 @@ def serve_unix(daemon: AuthorityDaemon, *, production: bool = True) -> None:
         os.chmod(daemon.socket_path, socket_mode)
         if production:
             validate_private_unix_socket(
-                daemon.socket_path, expected_uid=contract.authority_uid
+                daemon.socket_path, expected_uid=authority_uid
             )
         max_connections_value = os.environ.get("KHAOS_AUTHORITYD_MAX_CONNECTIONS", "32")
         try:
@@ -2767,13 +2851,17 @@ def serve_unix(daemon: AuthorityDaemon, *, production: bool = True) -> None:
             )
         listener.listen(max_connections)
         slots = threading.BoundedSemaphore(max_connections)
-        # Backend mode (darwin): the only legitimate peer is the native
-        # frontend, which runs as the authority UID.  Linux production keeps
-        # validating the agent UID directly.
         if backend_mode:
-            expected_peer_uid: int | None = contract.authority_uid
+            # Native macOS frontend and backend share the authority UID.
+            expected_peer_uid: int | None = authority_uid
             if expected_peer_uid is None:
                 expected_peer_uid = os.geteuid()
+        elif selected_transport == "unix" and profile == "community":
+            expected_peer_uid = (
+                contract.agent_uid
+                if contract.agent_uid is not None
+                else os.geteuid()
+            )
         else:
             expected_peer_uid = contract.agent_uid if production else None
         with ThreadPoolExecutor(
@@ -2791,7 +2879,7 @@ def serve_unix(daemon: AuthorityDaemon, *, production: bool = True) -> None:
                     expected_peer_uid,
                     connection_timeout,
                     slots,
-                    backend_mode,
+                    sys.platform == "darwin",
                 )
     finally:
         listener.close()
@@ -2804,7 +2892,7 @@ def _serve_connection(
     expected_uid: int | None,
     connection_timeout: float = 5.0,
     slots: threading.BoundedSemaphore | None = None,
-    backend_mode: bool = False,
+    use_platform_peer_credentials: bool = False,
 ) -> None:
     try:
         with connection:
@@ -2813,7 +2901,7 @@ def _serve_connection(
                 if expected_uid is not None:
                     observed_uid = (
                         peer_uid_platform(connection)
-                        if backend_mode
+                        if use_platform_peer_credentials
                         else peer_uid(connection)
                     )
                     if observed_uid != expected_uid:
@@ -2999,6 +3087,7 @@ __all__ = [
     "AuthorityDaemon",
     "AuthorityPolicyKernel",
     "JsonlAuditWriter",
+    "build_local_daemon",
     "build_production_daemon",
     "serve_unix",
 ]

@@ -91,6 +91,13 @@ production E2E.
 
 ## Consequences
 
+The native chain described by this ADR is the `native-production` authority
+profile.  Personal macOS installations may select the explicit `community`
+profile from ADR-024, which keeps the independent authority daemon and its
+signed receipt protocol but uses a private same-user Unix socket instead of
+launchd/XPC.  The native deployment and its evidence requirements remain
+unchanged when `native-production` is selected.
+
 - `serve_unix()` no longer blanket-rejects darwin; it rejects darwin *unless*
   running in backend mode behind the native frontend. Linux behavior is
   unchanged.

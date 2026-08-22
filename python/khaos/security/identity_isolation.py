@@ -36,8 +36,35 @@ class AuthorityIdentityContract:
     protected_key_ref: str | None = None
     agent_requirement_digest: str | None = None
 
-    def validate(self, *, production: bool) -> None:
+    def validate(
+        self,
+        *,
+        production: bool,
+        transport: str | None = None,
+        profile: str | None = None,
+    ) -> None:
+        """Validate the identity contract for a selected deployment.
+
+        ``transport=None`` preserves the legacy platform-native validation
+        used by callers that have not selected a profile.  The explicit
+        ``unix`` + ``community`` combination is the supported same-user
+        macOS/POSIX profile: it still requires a private socket and kernel
+        peer credentials at the daemon boundary, but it deliberately does not
+        pretend that an Apple code signature or a second OS identity exists.
+        """
         if not production:
+            return
+        if transport not in {None, "unix", "native"}:
+            raise IdentityIsolationError("authority transport is unknown")
+        if transport == "unix" and profile == "community":
+            if os.name == "nt":
+                raise IdentityIsolationError(
+                    "the community authority profile is not supported on Windows"
+                )
+            if self.job_uid == 0:
+                raise IdentityIsolationError(
+                    "community authority job UID 0 is forbidden"
+                )
             return
         if os.name == "nt":
             required = {

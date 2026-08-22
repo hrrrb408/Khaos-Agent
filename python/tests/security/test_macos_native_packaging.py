@@ -71,6 +71,7 @@ def test_renderer_publishes_a_complete_concrete_backend_contract(
     )
     assert environment["KHAOS_AUDIT_WORM_CA_FILE"] == str(ca_file)
     assert environment["KHAOS_AUTHORITYD_UID"] == "505"
+    assert environment["KHAOS_AUTHORITY_PROFILE"] == "native-production"
     assert environment["KHAOS_AUTHORITYD_LAUNCHD_SERVICE"] == "com.khaos.authorityd"
     assert environment["KHAOS_AUTHORITYD_KEYCHAIN_GROUP"] == (
         "TEAMID123.com.khaos.authority"

@@ -34,7 +34,10 @@ linux:
   browser_authority_launcher: separate_cap_sys_admin_transition_only
   production_dev_mode_fallback: forbidden
 platform_boundaries:
-  macos_authority_transport: native_launchd_or_xpc_adapter_required
+  authority_profile_selector: python/khaos/security/authority_transport.py
+  macos_authority_transport: community_private_unix_default_or_explicit_native_launchd_xpc
+  macos_community_boundary: same_user_kernel_peer_uid_private_socket_no_team_id_claim
+  macos_native_boundary: launchd_xpc_requires_explicit_native_production_profile_and_team_id
   windows_authority_transport: native_named_pipe_service_sid_adapter_required
   macos_native_client: packaging/macos/khaos-authorityd-xpc-client.c
   macos_native_service: packaging/macos/khaos-authorityd-xpc.m
@@ -97,7 +100,7 @@ closure_report:
     - exact_commit_ci_run
     - security_closure_gate_success
     - product_integrity_gate_success
-    - macos_native_authority_proof
+    - macos_native_authority_proof_for_native_production_release
     - windows_native_authority_proof
     - independent_resource_oracle
   missing_evidence_state: unknown_or_quarantined
