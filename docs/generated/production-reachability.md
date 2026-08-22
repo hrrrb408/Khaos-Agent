@@ -9,7 +9,7 @@
 
 ## Production composition roots
 
-- `khaos.grpc_server:AgentService`
+- `khaos.rpc.agent_service:AgentService`
 - `khaos.grpc_server:_dispatch`
 - `khaos.runtime.factory:build_production_runtime`
 - `khaos.tools.scheduler:ToolScheduler`
@@ -17,8 +17,8 @@
 
 ## Import reachability result
 
-- Reachable repository modules: `210`.
-- Resolved import edges: `1242`.
+- Reachable repository modules: `214`.
+- Resolved import edges: `1260`.
 - Forbidden production edges: `0`.
 - Unresolved internal edges: `0`.
 
@@ -162,10 +162,14 @@
 - `khaos.routing.router`
 - `khaos.routing.table`
 - `khaos.rpc`
+- `khaos.rpc.agent_service`
 - `khaos.rpc.audit_service`
+- `khaos.rpc.composition`
 - `khaos.rpc.memory_service`
+- `khaos.rpc.models`
 - `khaos.rpc.protocol`
 - `khaos.rpc.session_service`
+- `khaos.rpc.task_service`
 - `khaos.runtime`
 - `khaos.runtime.authority`
 - `khaos.runtime.context`

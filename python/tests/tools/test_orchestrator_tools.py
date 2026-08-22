@@ -515,7 +515,7 @@ async def test_spawn_subagent_returns_real_failure_when_spawner_rejects(
 
 async def test_build_subagent_service_exposes_owned_spawner(tmp_path):
     """The service owns and exposes the authority injected into runtimes."""
-    import khaos.grpc_server as grpc_module
+    import khaos.rpc.composition as grpc_module
     from khaos.db import Database
 
     db = Database(tmp_path / "khaos.db")
@@ -553,7 +553,7 @@ async def test_build_subagent_service_orchestrator_tools_not_initialized_after(
     directly MUST NOT return ``"Orchestrator not initialized"`` —
     i.e. the production init wired the globals.
     """
-    import khaos.grpc_server as grpc_module
+    import khaos.rpc.composition as grpc_module
     from khaos.db import Database
 
     db = Database(tmp_path / "khaos.db")

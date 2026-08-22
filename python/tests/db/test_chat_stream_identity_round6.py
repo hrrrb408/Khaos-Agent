@@ -46,7 +46,8 @@ import pytest
 
 from khaos.db import Database
 from khaos.db.database import ChatStreamTerminalError, SessionBusyError
-from khaos.grpc_server import AgentService, ChatRequest
+from khaos.rpc.agent_service import AgentService
+from khaos.rpc.models import ChatRequest
 from khaos.runtime import RequestContext
 
 

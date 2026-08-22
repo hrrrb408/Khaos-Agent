@@ -1,4 +1,4 @@
-"""Python AgentService and MemoryService.
+"""Python RPC transport and composition server.
 
 The service classes mirror the LLD gRPC surface. The JSON-line Unix socket
 server keeps the control plane local without generated protobuf dependencies.
@@ -14,13 +14,9 @@ import logging
 import os
 import socket
 import stat
-import sys
 import time
 import uuid
-from collections.abc import AsyncIterator
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 # M4 batch 3.1.13 (CRITICAL-3): fcntl-based process-level exclusive
 # lock to enforce the single-instance model.  Without this, a second
@@ -37,43 +33,19 @@ try:
 except ImportError:  # pragma: no cover — Windows
     _fcntl = None
 
-from khaos.agent.approval import ApprovalBroker
 from khaos.audit import (
-    AuditAnchorError,
     AuditLogger,
-    resolve_safe_audit_anchor_path,
-    resolve_safe_audit_log_path,
 )
-from khaos.channels import (
-    ChannelRegistry,
-    ChannelType,
-    PlatformMessage,
-    WebhookHandler,
-    WebhookRateLimiter,
-    WebhookReplayGuard,
-)
-from khaos.coding.task_manager import TaskManager
-from khaos.coding.workspace.office_authority import OfficeMutationAuthority
 from khaos.db import Database
-from khaos.db.database import SessionBusyError
 from khaos.exceptions import ServiceShutdownError
 from khaos.maintenance import MaintenanceService
-from khaos.modes import ModeManager
-from khaos.routing import ModelRouter
-from khaos.routing.router import create_default_router
-from khaos.rpc import AuditService, MemoryService, SessionService
+from khaos.rpc import AuditService as _AuditService, MemoryService as _MemoryService, SessionService as _SessionService
+from khaos.rpc.agent_service import AgentService as _AgentService
+from khaos.rpc.composition import _build_subagent_service, _handle_optional_subagent
+from khaos.rpc.models import ChatRequest as _ChatRequest, ConfirmRequest as _ConfirmRequest
+from khaos.rpc.task_service import TaskService as _TaskService
 from khaos.runtime import RequestContext
-from khaos.runtime.context import local_principal_id
-from khaos.rust_bridge import get_token_engine
-from khaos.scheduler import CronEngine
-from khaos.security.middleware import SecurityMiddleware
-from khaos.skills import SkillManager
-from khaos.subagents import (
-    SubAgentConfig,
-    SubAgentRunner,
-    SubAgentService,
-    SubAgentSpawner,
-)
+from khaos.subagents import SubAgentService
 from khaos.tools import create_runtime_registry
 
 logger = logging.getLogger(__name__)
@@ -85,12 +57,8 @@ import khaos.rpc.protocol as _rpc_protocol
 # the underlying close/orphan-drain phases still enforce terminal-state
 # contracts and surface ``ServiceShutdownError`` on failure.
 SERVER_HANDLER_DRAIN_TIMEOUT = 5.0
-CHAT_DRAIN_TIMEOUT = 10.0
 SUBAGENT_SHUTDOWN_TIMEOUT = 30.0
 
-# Lease duration for chat_streams rows.  Non-terminal events renew the lease;
-# an expired stream is eligible for recovery by a different process.
-_CHAT_STREAM_LEASE_SECONDS = 300.0
 
 def _instance_lockfile_path(db_path: str) -> Path:
     """M4 batch 3.1.14 (CRITICAL-2): compute the instance lockfile
@@ -472,7 +440,7 @@ _retained_instance_lock_fd: int | None = None
 
 
 async def _emergency_instance_cleanup(
-    agent: AgentService | None,
+    agent: _AgentService | None,
     db: Database | None,
     subagent_service: SubAgentService | None,
     maintenance: MaintenanceService | None = None,
@@ -656,1428 +624,6 @@ def _load_rpc_capability() -> str:
 # ``~/.khaos/audit/`` (validated with ``O_NOFOLLOW`` + owner/mode checks).
 
 
-@dataclass
-class ChatRequest:
-    session_id: str
-    message: str
-    mode: str = ""
-    principal_id: str = ""
-
-
-@dataclass
-class ConfirmRequest:
-    session_id: str
-    tool_call_id: str
-    approved: bool
-    remember: bool = False
-    principal_id: str = ""
-    binding_digest: str = ""
-
-
-class AgentService:
-    """Agent RPC service backed by AgentLoop."""
-
-    def __init__(self, db: Database, project_root: Path | None = None, config_path: Path | None = None, router=None, *, boot_id: str = ""):
-        self.db = db
-        self.project_root = project_root or Path.cwd()
-        self.config_path = config_path or self.project_root / "config.yaml"
-        self._router = router
-        # Round-5 Batch 5.2 (C-05): per-process boot_id used to tag
-        # chat_streams rows so recovery never recovers the current
-        # process's own active streams.  Passed through to
-        # ``append_chat_stream_event`` via the chat flow.
-        self._boot_id = boot_id
-        self.pending_confirmations: dict[str, dict] = {}
-        self.approval_broker = ApprovalBroker(db=db)
-        # Shared coding-task tracker so the TUI / TaskService can observe
-        # long-running coding turns alongside the AgentLoop.
-        # A3-6: bind the server-lifecycle TaskManager to the local-uid
-        # principal (matching the server-lifecycle AuditLogger / MemoryService
-        # above) so tasks created via the JSON-line RPC path are owned by
-        # the local user and invisible to any other authenticated principal.
-        # Per-turn runtimes constructed by ``build_runtime`` carry their own
-        # principal-scoped TaskManager via ``RuntimeConfig.principal_id``.
-        #
-        # C-1-5a: the server-level ``TaskManager(local-uid)`` singleton
-        # is REMOVED.  ``TaskService`` now holds ``db`` and constructs
-        # per-principal ``TaskManager`` instances on demand (cached for
-        # the process lifetime).  This allows API principals to
-        # ``create`` / ``list`` / ``get`` / ``cancel`` their own tasks
-        # (previously ``create`` was rejected and ``list``/``get``
-        # returned empty for API principals).  ``_build_runtime`` no
-        # longer passes a shared task_manager — ``build_runtime``
-        # constructs a per-turn manager from ``cfg.principal_id``
-        # (factory.py:502-517).
-        # H2: compile the *layered* effective policy (user ∩ project ∩
-        # platform) once at startup — never consult the raw project policy
-        # for enforcement decisions.  An untrusted repo can no longer
-        # silently disable audit by setting ``audit.enabled: false`` in
-        # its ``khaos_policy.yaml``: the effective policy's ``audit_enabled``
-        # uses OR semantics (if the user layer requires audit, the project
-        # cannot disable it).
-        from khaos.security.effective_policy import load_effective_policy
-        self._effective_policy = load_effective_policy(self.project_root)
-        logger.info(
-            "effective security policy digest: %s (audit_enabled=%s)",
-            self._effective_policy.digest,
-            self._effective_policy.audit_enabled,
-        )
-        # M4 batch 3.1.16B-1 (CRITICAL): bind the CronEngine to the
-        # effective policy digest + project_id so every scheduled task
-        # captures the security-context snapshot at creation time.  B-2
-        # will compare these against the live values at ``start()`` and
-        # ``_execute_task`` claim time to detect policy/project drift.
-        # ``project_id`` is derived from the project root via
-        # ``state_root.project_id`` (sha256(realpath(root))[:32]).
-        from khaos.db.state_root import project_id as _compute_project_id
-        # M4 batch 3.1.16A-4-1: store as a member so the RPC dispatcher
-        # can build RequestContext with the correct project_id without
-        # recomputing it per request.
-        self._bound_project_id = _compute_project_id(self.project_root)
-        _bound_project_id = self._bound_project_id
-        # H1: a single server-lifecycle AuditLogger shared by the main runtime
-        # AND every SubAgent run, so security events from both paths land in
-        # the same audit trail.  ``log_path`` comes from the effective policy
-        # (user ∩ project, OR semantics — an untrusted project cannot disable
-        # audit).  H2: ``resolve_safe_audit_log_path`` constrains the path
-        # to a trusted directory so an untrusted project cannot point audit
-        # at an arbitrary host file (symlink / FIFO / device attacks).
-        # M4 batch 3.1.16B-3: constructed BEFORE CronEngine so it can be
-        # injected into the engine for drift-quarantine audit logging.
-        self._audit_logger = (
-            AuditLogger(
-                self.db,
-                log_path=resolve_safe_audit_log_path(
-                    self._effective_policy.audit_log_path
-                ),
-                anchor_path=(
-                    resolve_safe_audit_anchor_path(_bound_project_id)
-                    if os.environ.get("KHAOS_DEV_MODE") != "1"
-                    else None
-                ),
-                # A2-6: bind the server-lifecycle AuditLogger to the
-                # local-uid principal (matching MemoryService / ModeManager
-                # above) and stamp the effective policy digest on every row
-                # so audit attribution matches the runtime that produced it.
-                # ``runtime_id`` is left None at the server level; per-runtime
-                # AuditLoggers constructed by ``build_runtime`` carry it.
-                principal_id=local_principal_id(),
-                policy_digest=self._effective_policy.digest,
-                # M4 batch 3.1.16A-5-1b: stamp the server-bound project
-                # identity on every audit row.  The dispatcher's drift
-                # check guarantees every RPC reaching a service method
-                # has ``ctx.project_id == self._bound_project_id``, so
-                # this is the canonical project identity for all server-
-                # lifecycle audit events (webhook / cron / channel
-                # mutations).  Per-runtime AuditLoggers constructed by
-                # ``build_runtime`` get the same value via
-                # ``RuntimeConfig.project_id``.
-                project_id=_bound_project_id,
-            )
-            if self._effective_policy.audit_enabled
-            else None
-        )
-        self.cron_engine = CronEngine(
-            db=db,
-            executor=self._execute_scheduled_prompt,
-            project_id=_bound_project_id,
-            policy_digest=self._effective_policy.digest,
-            # M4 batch 3.1.16B-3: inject the server-lifecycle AuditLogger
-            # so drift quarantine events land in the audit trail.
-            audit_logger=self._audit_logger,
-        )
-        self.channel_registry = ChannelRegistry()
-        self._webhook_replay_guard = WebhookReplayGuard(
-            consumer=self.db.consume_webhook_event
-        )
-        self._verified_webhook_limiter = WebhookRateLimiter()
-        # M4 batch 3.1.16A-4-4-3: the module-global ``set_channel_registry``
-        # call has been removed.  The four channel tools now receive
-        # ``channel_registry`` + ``principal_id`` (+ ``channel_admins`` for
-        # mutations) per-call via the ``channel.read`` / ``channel.manage``
-        # broker injection from ``tool_context`` (assembled by
-        # ``AgentLoop`` from ``self.channel_registry`` and
-        # ``self._effective_policy.channel_admins``).  See
-        # ``channel_tools.py`` docstring for the cross-principal mutation
-        # risk that the holder posed.
-        # B1: the OfficeMutationAuthority is a server-lifecycle object shared
-        # across every chat / webhook / cron turn.  Reusing one instance keeps
-        # the aggregate storage baseline stable across turns (closing the
-        # cross-turn quota bypass).  Per-turn runtimes borrow it (via
-        # RuntimeConfig.office_authority); RuntimeResult.aclose does NOT close
-        # it — AgentService.shutdown does.
-        self._office_authority = OfficeMutationAuthority()
-        self._accepting_work = True
-        # Readiness is distinct from object construction: the process must
-        # have verified its audit anchor and started the scheduler before the
-        # Gateway may advertise that the AgentService can accept work.
-        self._ready = False
-        self._active_chat_tasks: set[asyncio.Task] = set()
-        self._active_runtimes: dict[int, object] = {}
-        # Round-6 Batch 6.1: track active sessions to reject concurrent
-        # chat RPCs on the same session_id (Review §八 Strategy B: reject).
-        # A second chat() on a session that already has an active stream
-        # gets SessionBusyError instead of racing on shared state.
-        self._active_chat_sessions: set[str] = set()
-        self.subagent_spawner = None
-        from khaos.runtime import RuntimeCleanupAuthority
-
-        self.runtime_cleanup_authority = RuntimeCleanupAuthority()
-        self._office_shutdown_task: asyncio.Task | None = None
-        self.shutdown_failed = False
-        # M4 batch 3.1.15 (CRITICAL-1): idempotency flag for shutdown().
-        # Set to True only on clean completion.  Allows the outer
-        # emergency-cleanup path to safely re-call shutdown() without
-        # double-closing shared authorities.
-        self._shutdown_completed = False
-        # M2 (round-3): admission lock serialises ``chat``'s admission
-        # decision + owner reservation against ``shutdown``'s
-        # ``_accepting_work = False`` flip + owner snapshot.  Without it,
-        # a chat that passed the accepting_work check could be mid-await
-        # in ``_build_runtime`` while shutdown snapshotted an empty
-        # ``_active_chat_tasks`` and proceeded to dismantle shared
-        # authorities — the chat would then resume and register a runtime
-        # after shutdown believed all owners were drained.  The JSON-line
-        # server's connection-handler registry is an outer guard for the
-        # production RPC path, but ``AgentService`` is also a direct
-        # caller (cron / webhook) and its lifecycle contract must hold
-        # independently.
-        self._admission_lock = asyncio.Lock()
-
-    async def start(self) -> None:
-        """Start process-scoped background services."""
-        self._ready = False
-        if self._audit_logger is not None:
-            await self._audit_logger.verify_anchor()
-        # C-1-5a: ``TaskService`` now lazily constructs per-principal
-        # TaskManagers on first use (``_manager(ctx)``), so there's no
-        # server-level ``task_manager.load()`` at startup.
-        await self.cron_engine.start()
-        self._ready = True
-
-    def _browser_helper_health(self) -> dict[str, Any]:
-        """Check the privileged helper endpoint without performing a mutation.
-
-        The helper protocol requires a live, runtime-scoped capability before
-        ``status`` can be called.  A process-wide readiness probe does not
-        possess such a capability and must never mint a dummy one.  This check
-        therefore proves the protected socket endpoint is present and labels
-        the remaining live-RPC assertion explicitly for the per-sandbox path.
-        """
-        required = sys.platform.startswith("linux") and os.environ.get(
-            "KHAOS_DEV_MODE"
-        ) != "1"
-        socket_name = os.environ.get(
-            "KHAOS_BROWSER_KERNEL_HELPER_SOCKET",
-            "/run/khaos/browser-kernel-helper.sock",
-        )
-        result: dict[str, Any] = {
-            "required": required,
-            "configured": bool(socket_name),
-            "socket_present": False,
-            "socket_protected": False,
-            "probe": "socket_authority_only",
-            "live_rpc": False,
-        }
-        if not required:
-            result["ready"] = True
-            return result
-        try:
-            socket_path = Path(socket_name)
-            if not socket_path.is_absolute():
-                result["error"] = "relative_socket_path"
-                result["ready"] = False
-                return result
-            metadata = socket_path.lstat()
-            result["socket_present"] = stat.S_ISSOCK(metadata.st_mode)
-            parent = socket_path.parent
-            parent_metadata = parent.lstat()
-            parent_protected = (
-                stat.S_ISDIR(parent_metadata.st_mode)
-                and parent_metadata.st_uid == 0
-                and not bool(parent_metadata.st_mode & 0o022)
-            )
-            socket_protected = not bool(metadata.st_mode & 0o077)
-            result["socket_protected"] = socket_protected and parent_protected
-        except OSError as exc:
-            result["error"] = exc.__class__.__name__
-        result["ready"] = bool(
-            result["socket_present"] and result["socket_protected"]
-        )
-        return result
-
-    async def health(self) -> dict[str, Any]:
-        """Return the control-plane readiness contract for the Gateway."""
-        db_health = await self.db.health_check()
-        policy_compiled = bool(
-            isinstance(self._effective_policy.digest, str)
-            and len(self._effective_policy.digest) == 64
-        )
-        audit_required = bool(self._effective_policy.audit_enabled)
-        audit_configured = self._audit_logger is not None
-        audit_verified = not audit_required
-        audit_error = ""
-        if self._audit_logger is not None:
-            try:
-                await self._audit_logger.verify_anchor()
-                audit_verified = True
-            except (AuditAnchorError, OSError, RuntimeError, ValueError) as exc:
-                audit_error = exc.__class__.__name__
-                audit_verified = False
-        audit_health: dict[str, Any] = {
-            "required": audit_required,
-            "configured": audit_configured,
-            "verified": audit_verified,
-            "ok": audit_verified if audit_required else True,
-        }
-        if audit_error:
-            audit_health["error"] = audit_error
-        helper_health = self._browser_helper_health()
-        ready = bool(
-            self._ready
-            and db_health.get("ok") is True
-            and policy_compiled
-            and audit_health["ok"] is True
-            and helper_health["ready"] is True
-        )
-        return {
-            "status": "ready" if ready else "not_ready",
-            "ready": ready,
-            "project_id": self._bound_project_id,
-            "policy_digest": self._effective_policy.digest,
-            "checks": {
-                "agent_started": self._ready,
-                "db": db_health,
-                "audit_anchor": audit_health,
-                "policy": {"compiled": policy_compiled},
-                "browser_kernel_helper": helper_health,
-            },
-        }
-
-    async def stop_producers(self) -> None:
-        """Reject new turns and stop background producers before teardown."""
-        self._accepting_work = False
-        await self.cron_engine.stop()
-
-    async def shutdown(self) -> None:
-        """Stop process-scoped background services."""
-        # M4 batch 3.1.15 (CRITICAL-1): idempotency guard.  If a previous
-        # shutdown() completed cleanly, this is a no-op.  If a previous
-        # call raised, the flag is NOT set and re-entry is allowed (each
-        # internal step is itself idempotent — cron stop via state machine,
-        # chat drain via fresh snapshot, runtime drain via registry scan).
-        if self._shutdown_completed:
-            return
-        self._ready = False
-        # Stop producers, then cancel/wait every active turn while shared
-        # authorities and the database are still available.
-        await self.stop_producers()
-        # Take the admission lock for the accepting_work flip and owner
-        # snapshot so a concurrent ``chat`` cannot publish a runtime AFTER
-        # this snapshot.  This lock acquisition is bounded: chat only holds
-        # the lock for cheap dict mutations (reserve / publish), NOT across
-        # ``_build_runtime`` (which is slow DB I/O) — so a wedged build
-        # cannot block this shutdown from reaching the bounded drain below.
-        # See ``chat()``'s reservation pattern.
-        async with self._admission_lock:
-            # stop_producers already set _accepting_work=False outside the
-            # lock; re-assert it under the lock so chat's admission check
-            # (under the same lock) cannot observe a stale True here.
-            self._accepting_work = False
-            current = asyncio.current_task()
-            active_tasks = [
-                task for task in self._active_chat_tasks
-                if task is not current and not task.done()
-            ]
-        for task in active_tasks:
-            task.cancel()
-        if active_tasks:
-            # M1: bounded drain with hard ownership semantics.  A task that
-            # swallows CancelledError used to make ``wait_for(gather)``
-            # raise TimeoutError, which the previous code only logged before
-            # continuing to dismantle Office/Browser/Audit/DB — while the
-            # swallowing task was still running and borrowing exactly those
-            # authorities.  ``asyncio.wait`` returns the pending set so we
-            # can fail closed: if any chat is still running at the deadline,
-            # refuse teardown by raising ``ServiceShutdownError``.  The
-            # residual runtime is still registered in ``_active_runtimes``
-            # and will be closed or quarantined by the next owner.
-            _done, pending = await asyncio.wait(
-                active_tasks, timeout=CHAT_DRAIN_TIMEOUT,
-            )
-            if pending:
-                logger.error(
-                    "agent shutdown: %d chat task(s) did not terminate within "
-                    "%.2fs (swallowed cancellation or wedged); refusing to "
-                    "tear down shared authorities",
-                    len(pending), CHAT_DRAIN_TIMEOUT,
-                )
-                self.shutdown_failed = True
-                raise ServiceShutdownError(
-                    f"{len(pending)} chat task(s) did not terminate within "
-                    f"{CHAT_DRAIN_TIMEOUT}s; shared authorities cannot be "
-                    f"torn down safely"
-                )
-
-        # Defensive ownership pass: a handler cancellation must normally run
-        # chat's finally block, but retain/close anything still registered.
-        from khaos.runtime import close_runtime_or_register
-        for runtime in list(self._active_runtimes.values()):
-            try:
-                await close_runtime_or_register(runtime)
-            except Exception:
-                # close_runtime_or_register already quarantines terminal
-                # failures.  Continue so drain can retry all retained owners.
-                logger.exception("active runtime teardown failed")
-
-        remaining = await self.runtime_cleanup_authority.drain(
-            timeout_seconds=5.0
-        )
-        if remaining:
-            logger.error(
-                "server shutdown retaining %d quarantined runtime(s)", remaining
-            )
-            self.shutdown_failed = True
-            raise ServiceShutdownError(
-                f"{remaining} runtime(s) did not reach a terminal state"
-            )
-        # Fence every in-flight Office mutation after runtimes have settled.
-        await self._shutdown_office_authority()
-        # The shared AuditLogger is process-owned and is closed exactly once,
-        # after all runtime/authority shutdown events had a chance to log.
-        if self._audit_logger is not None:
-            self._audit_logger.close()
-        self.shutdown_failed = False
-        # M4 batch 3.1.15 (CRITICAL-1): mark shutdown as completed so
-        # subsequent calls are no-ops.  Set ONLY on the clean exit path.
-        self._shutdown_completed = True
-
-    async def _shutdown_office_authority(
-        self, *, attempts: int = 3, timeout_seconds: float = 5.0,
-    ) -> None:
-        """Close the shared mutation authority with bounded observable retry."""
-        last_error: BaseException | None = None
-        for attempt in range(1, attempts + 1):
-            if self._office_shutdown_task is None:
-                self._office_shutdown_task = asyncio.create_task(
-                    self._office_authority.shutdown()
-                )
-            try:
-                await asyncio.wait_for(
-                    asyncio.shield(self._office_shutdown_task),
-                    timeout=timeout_seconds,
-                )
-                self._office_shutdown_task = None
-                return
-            except TimeoutError as exc:
-                # The shielded task still owns the mutation fence.  Do not
-                # start a concurrent retry or tear down audit/database state.
-                last_error = exc
-                break
-            except Exception as exc:
-                last_error = exc
-                self._office_shutdown_task = None
-                logger.warning(
-                    "office authority shutdown attempt %d/%d failed",
-                    attempt, attempts, exc_info=True,
-                )
-        self.shutdown_failed = True
-        logger.error("shared Office authority did not reach terminal state")
-        raise ServiceShutdownError(
-            "shared Office mutation authority shutdown failed"
-        ) from last_error
-
-    async def _execute_scheduled_prompt(
-        self, task_id: str, prompt: str, principal_id: str = ""
-    ) -> str:
-        """Run a scheduled prompt through the normal office-mode agent path.
-
-        M4 batch 3.1.10 (CRITICAL): the executor signature now accepts
-        the task's ``principal_id`` so the scheduled prompt runs as the
-        creator (not the server UID).  Without this, ``chat()`` would
-        fall back to ``local-uid:{os.getuid()}`` and:
-
-          * Memory writes would be attributed to the wrong principal.
-          * BrowserContext / permission / audit decisions would bind
-            to the local server identity instead of the creator.
-          * A low-privilege remote principal could schedule a future
-            execution that runs as a higher-privilege local user.
-
-        ``CronEngine._execute_task`` calls this as a 3-arg executor;
-        the engine keeps a 2-arg fallback for older test executors.
-        """
-        # M4 batch 3.1.16A-4-1: build a cron-sourced RequestContext
-        # for this chat turn.  The ctx is constructed from the task's
-        # bound principal_id (stamped at creation time) — not the
-        # server's local-uid.
-        cron_ctx = RequestContext.for_cron(
-            principal_id,
-            project_id=self._bound_project_id,
-            policy_digest=self._effective_policy.digest,
-        )
-        contents: list[str] = []
-        async for event in self.chat(
-            cron_ctx,
-            ChatRequest(f"cron:{task_id}", prompt, "office", principal_id=principal_id)
-        ):
-            if event.get("event") == "message":
-                content = event.get("data", {}).get("content")
-                if content:
-                    contents.append(str(content))
-        return "\n".join(contents)
-
-    async def chat(self, ctx: RequestContext, request: ChatRequest) -> AsyncIterator[dict]:
-        """Stream chat events.
-
-        B1: hold the full RuntimeResult and close it in ``finally`` so the
-        per-turn ExecutionService / MemoryManager are released even when
-        ``loop.run`` raises or the client disconnects.  The shared
-        OfficeMutationAuthority is borrowed (not owned), so ``aclose`` does
-        NOT shut it down — ``AgentService.shutdown`` does.
-
-        Reservation lifecycle (round-4 audit closure):
-
-        The previous round-3 fix held ``_admission_lock`` across the whole
-        ``_build_runtime`` await.  That closed the owner-snapshot race but
-        introduced a worse problem: ``_build_runtime`` does real DB I/O
-        (mode_manager.load / switch, permission_engine.load_rules,
-        task_manager.load), so a slow or wedged build held the lock
-        indefinitely and shutdown's ``CHAT_DRAIN_TIMEOUT`` deadline never
-        started — shutdown blocked on lock acquisition before it could
-        even begin the bounded wait.
-
-        The reservation pattern splits admission from the build:
-
-          1. Under ``_admission_lock`` (cheap): check ``_accepting_work``,
-             register ``owner_task`` in ``_active_chat_tasks``.  This is
-             the reservation — shutdown's snapshot WILL see it.
-          2. OUTSIDE the lock: ``await _build_runtime(...)``.  A slow or
-             wedged build no longer blocks shutdown; the owner task is
-             already registered, so shutdown's cancel + bounded drain
-             applies to it directly.
-          3. Under ``_admission_lock`` again: if shutdown flipped
-             ``_accepting_work`` during the build, abort (the owner task
-             is about to be or has already been cancelled by shutdown).
-             Otherwise publish the runtime in ``_active_runtimes``.
-
-        The ``finally`` wraps the whole body — including the build — so a
-        build failure or cancellation still discards the owner task from
-        ``_active_chat_tasks`` (closing the round-3 M3 leak where the
-        reservation was only cleaned up after a successful build).
-        """
-        if not ctx.project_id:
-                ctx = RequestContext(
-                    principal_id=ctx.principal_id,
-                    project_id=self._bound_project_id,
-                    session_id=ctx.session_id,
-                    runtime_id=ctx.runtime_id,
-                    source_transport=ctx.source_transport,
-                    policy_digest=ctx.policy_digest,
-                    principal_kind=ctx.principal_kind,
-                    parent_principal_id=ctx.parent_principal_id,
-                    delegation_digest=ctx.delegation_digest,
-                )
-        owner_task = asyncio.current_task()
-        runtime = None
-        # F-07 (third-round review): track whether a terminal event has
-        # already been appended for this chat so every ``started``
-        # corresponds to exactly one terminal (done / error / interrupted).
-        session_id_for_terminal: str | None = None
-        stream_id_for_terminal: str | None = None
-        terminal_appended = False
-        # Round-6 Batch 6.1: each chat RPC creates a new stream_id
-        # (independent of session_id) so a session can have many streams.
-        stream_id = str(uuid.uuid4())
-        # Register the reservation BEFORE any await so shutdown's snapshot
-        # cannot miss this chat.  Cheap dict mutation under the lock; the
-        # expensive build is outside.
-        async with self._admission_lock:
-            if not self._accepting_work:
-                raise ServiceShutdownError("AgentService is shutting down")
-            session_id = request.session_id or str(uuid.uuid4())
-            # Round-6 Batch 6.1: reject concurrent chat on the same
-            # session (Review §八 Strategy B).  A session can have many
-            # sequential streams, but not concurrent ones.
-            if session_id in self._active_chat_sessions:
-                raise SessionBusyError(
-                    f"session {session_id} already has an active chat stream"
-                )
-            self._active_chat_sessions.add(session_id)
-            if owner_task is not None:
-                self._active_chat_tasks.add(owner_task)
-        try:
-            await self.db.create_session(
-                session_id,
-                request.mode or "office",
-                principal_id=ctx.principal_id,
-                project_id=ctx.project_id,
-            )
-            started_sequence = await self.db.append_chat_stream_event(
-                stream_id=stream_id,
-                session_id=session_id,
-                principal_id=ctx.principal_id,
-                project_id=ctx.project_id,
-                event_type="started",
-                data={"session_id": session_id, "stream_id": stream_id},
-                now=time.time(),
-                boot_id=self._boot_id,
-                runtime_id=stream_id,
-                # C-05: lease renewed on every non-terminal append below.
-                # Initial lease is generous so a slow _build_runtime does
-                # not get recovered by a concurrent process.
-                lease_until=time.time() + _CHAT_STREAM_LEASE_SECONDS,
-            )
-            session_id_for_terminal = session_id
-            stream_id_for_terminal = stream_id
-            yield {
-                "event": "started",
-                "data": {"session_id": session_id, "stream_id": stream_id},
-                "sequence": started_sequence,
-            }
-            # Build OUTSIDE the lock — a slow / wedged build no longer
-            # blocks shutdown from acquiring the lock and running its
-            # bounded drain.  Cancellation from shutdown propagates here.
-            # M4 batch 3.1.16A-4-1: bind session_id into ctx so
-            # downstream ModeManager / AgentLoop see the correct
-            # (principal, session) pair.
-            runtime = await self._build_runtime(
-                ctx.with_session(session_id),
-                session_id,
-                request.mode,
-            )
-            # Publish under the lock so shutdown's snapshot of
-            # _active_runtimes is consistent.  If shutdown closed
-            # admission while we were building, abort — the owner task
-            # has already been cancelled (or is about to be) and any
-            # runtime we built must be torn down.
-            async with self._admission_lock:
-                if not self._accepting_work:
-                    # shutdown began during the build; do not serve.  The
-                    # finally block below closes/quarantines the runtime
-                    # and discards the owner reservation.
-                    raise ServiceShutdownError(
-                        "AgentService began shutting down during runtime build"
-                    )
-                self._active_runtimes[id(runtime)] = runtime
-            async for message in runtime.loop.run(request.message, session_id):
-                event = _message_to_event(message)
-                event_name = str(event["event"])
-                is_terminal = event_name in {"done", "error", "interrupted"}
-                sequence = await self.db.append_chat_stream_event(
-                    stream_id=stream_id,
-                    session_id=session_id,
-                    principal_id=ctx.principal_id,
-                    project_id=ctx.project_id,
-                    event_type=event_name,
-                    data=dict(event["data"]),
-                    now=time.time(),
-                    boot_id=self._boot_id,
-                    runtime_id=stream_id,
-                    # C-05: renew lease on every non-terminal append so
-                    # the periodic recovery (if any other process runs
-                    # it) does not reclaim an active chat waiting on a
-                    # long tool call.  Terminal appends do not need a
-                    # lease.
-                    lease_until=(
-                        None if is_terminal
-                        else time.time() + _CHAT_STREAM_LEASE_SECONDS
-                    ),
-                )
-                if str(event["event"]) in {"done", "error", "interrupted"}:
-                    terminal_appended = True
-                yield {**event, "sequence": sequence}
-        except BaseException as exc:
-            # F-07: shield a terminal ``error``/``interrupted`` append so
-            # the durable ledger always has a terminal event even when
-            # ``_build_runtime`` raises, the chat task is cancelled, or
-            # the model router fails.  Subscribers polling the ledger
-            # would otherwise wait the full 30 s idle deadline instead
-            # of seeing an explicit failure.
-            if stream_id_for_terminal is not None and not terminal_appended:
-                event_type = (
-                    "interrupted"
-                    if isinstance(exc, asyncio.CancelledError)
-                    else "error"
-                )
-                try:
-                    await asyncio.shield(
-                        self.db.append_chat_stream_event(
-                            stream_id=stream_id_for_terminal,
-                            session_id=session_id_for_terminal or "",
-                            principal_id=ctx.principal_id,
-                            project_id=ctx.project_id,
-                            event_type=event_type,
-                            data={
-                                "reason": type(exc).__name__,
-                                "message": str(exc) or type(exc).__name__,
-                            },
-                            now=time.time(),
-                            boot_id=self._boot_id,
-                            runtime_id=stream_id_for_terminal,
-                            # Terminal append — no lease needed.
-                            lease_until=None,
-                        )
-                    )
-                    terminal_appended = True
-                except Exception:
-                    # The shield itself failed (DB locked, OOM, etc.).
-                    # Re-raise the original exception; a separate
-                    # recovery journal hook could pick this up later.
-                    logger.exception(
-                        "F-07: failed to append terminal %s for stream=%s",
-                        event_type,
-                        stream_id_for_terminal,
-                    )
-            raise
-        finally:
-            # Covers build failure, build cancellation, and normal exit.
-            # Without this wrap, a _build_runtime raise would leak the
-            # owner_task reference in _active_chat_tasks forever.
-            from khaos.runtime import close_runtime_or_register
-            if runtime is not None:
-                try:
-                    await close_runtime_or_register(runtime)
-                finally:
-                    self._active_runtimes.pop(id(runtime), None)
-            if owner_task is not None:
-                self._active_chat_tasks.discard(owner_task)
-            # Round-6 Batch 6.1: release the session so the next turn
-            # can start a new stream on the same session.
-            if session_id is not None:
-                self._active_chat_sessions.discard(session_id)
-
-    async def chat_events(
-        self,
-        ctx: RequestContext,
-        session_id: str = "",
-        after_sequence: int = 0,
-        stream_id: str = "",
-        after_event_id: int | None = None,
-    ) -> AsyncIterator[dict]:
-        """Replay and tail one principal's durable chat event ledger.
-
-        Batch 7.2 (round-7 §十四): the cursor is now the session-global
-        ``event_id`` (passed via ``after_sequence`` for wire-compat), NOT
-        the stream-local ``sequence``.  This fixes the cross-stream
-        missed-events bug on reconnect.
-
-        If ``stream_id`` is provided, tails that specific stream (a
-        terminal event ENDS the stream-specific tail).  Otherwise tails
-        ALL streams for the session — and a terminal event on ONE stream
-        does NOT end the session-wide subscription (a session can produce
-        future streams).
-        """
-        if not ctx.project_id:
-                ctx = RequestContext(
-                    principal_id=ctx.principal_id,
-                    project_id=self._bound_project_id,
-                    session_id=ctx.session_id,
-                    runtime_id=ctx.runtime_id,
-                    source_transport=ctx.source_transport,
-                    policy_digest=ctx.policy_digest,
-                    principal_kind=ctx.principal_kind,
-                    parent_principal_id=ctx.parent_principal_id,
-                    delegation_digest=ctx.delegation_digest,
-                )
-        if stream_id:
-            # Stream-specific tail: no need to verify session ownership
-            # separately — the DB query filters by principal+project.
-            pass
-        else:
-            session = await self.db.get_session(
-                session_id, principal_id=ctx.principal_id,
-                project_id=ctx.project_id,
-            )
-            if session is None or session.get("project_id") != ctx.project_id:
-                return
-        # Batch 7.2 §十四: cursor is the session-global event_id.
-        if after_event_id is not None and after_sequence:
-            raise ValueError(
-                "ambiguous replay cursor: use after_event_id only"
-            )
-        cursor = max(
-            0,
-            int(after_event_id if after_event_id is not None else after_sequence),
-        )
-        idle_deadline = time.monotonic() + 30.0
-        while time.monotonic() < idle_deadline:
-            events = await self.db.list_chat_stream_events(
-                stream_id=stream_id,
-                session_id=session_id,
-                principal_id=ctx.principal_id,
-                project_id=ctx.project_id,
-                after_event_id=cursor,
-            )
-            if not events:
-                await asyncio.sleep(0.05)
-                continue
-            idle_deadline = time.monotonic() + 30.0
-            for event in events:
-                cursor = int(event["event_id"])
-                yield event
-            # §十四: a terminal event only ends a STREAM-SPECIFIC tail.
-            # In session-wide mode (no stream_id), a terminal on one
-            # stream must NOT end the subscription — the session may
-            # produce future streams.
-            if stream_id and events[-1]["terminal"]:
-                return
-
-    async def switch_mode(self, ctx: RequestContext, session_id: str, target_mode: str) -> dict:
-        # M4 batch 3.1.16A-4-1: use ctx.principal_id (transport-
-        # authenticated) instead of the hardcoded ``local-uid``.
-        # Previously a remote API principal A calling SwitchMode would
-        # modify the local-uid's mode, then A's Chat runtime would
-        # load A's principal — producing inconsistent authority and
-        # UI state.  Now the switch is scoped to (ctx.principal_id,
-        # session_id), matching the Chat runtime's principal binding.
-        mode_manager = ModeManager(
-            self.db,
-            project_root=self.project_root,
-            principal_id=ctx.principal_id,
-            session_id=session_id,
-            project_id=ctx.project_id,
-        )
-        await mode_manager.load()
-        mode = ModeManager.parse(target_mode)
-        await mode_manager.switch(mode)
-        if session_id:
-            await self.db.create_session(
-                session_id, mode.value,
-                principal_id=ctx.principal_id,
-                # M4 batch 3.1.16A-5-1b: stamp the RPC-verified project
-                # identity (owner-preserving ON CONFLICT — see
-                # ``_build_runtime`` for the rationale).
-                project_id=ctx.project_id,
-            )
-        return {"current_mode": mode.value}
-
-    async def confirm_permission(self, ctx: RequestContext, request: ConfirmRequest) -> dict:
-        # Round-14 §2: ctx.principal_id is the sole authority for the
-        # resolving principal.  ConfirmRequest.principal_id is a payload
-        # field and must never be trusted for authorization — a payload
-        # value that disagrees with the transport principal is a forged
-        # approval attempt.  Previously this passed ``request.principal_id``
-        # through to ``ApprovalBroker.resolve``, relying on the dispatcher
-        # overwrite (grpc_server.py ``if "principal_id" in payload``) to
-        # mask the hole; any path that constructs a ConfirmRequest without
-        # that overwrite would have become a forging primitive.
-        if not ctx.principal_id or not request.binding_digest:
-            return {"ok": False, "error": "approval principal/binding required"}
-        if request.principal_id and request.principal_id != ctx.principal_id:
-            return {
-                "ok": False,
-                "error": "payload principal_id does not match transport principal",
-            }
-        return {
-            "ok": await self.approval_broker.resolve(
-                request.tool_call_id,
-                request.approved,
-                request.remember,
-                principal_id=ctx.principal_id,
-                session_id=request.session_id,
-                binding_digest=request.binding_digest,
-            )
-        }
-
-    async def handle_webhook(
-        self,
-        ctx: RequestContext,
-        platform: str,
-        channel_id: str,
-        headers: dict[str, str],
-        body: str,
-        query: dict[str, str] | None = None,
-    ) -> dict[str, str]:
-        """Validate and process one inbound platform webhook."""
-        channel = self.channel_registry.get(channel_id)
-        if channel is None or not channel.is_enabled:
-            return {"status": "channel_not_found_or_disabled"}
-        try:
-            channel_type = ChannelType.WEBHOOK_IN if platform == "generic" else ChannelType(platform)
-        except ValueError:
-            return {"status": "unsupported_platform"}
-        if channel.channel_type != channel_type:
-            return {"status": "channel_type_mismatch"}
-        handler = WebhookHandler(
-            channel_type,
-            secret=channel.config.secret,
-            on_message=lambda message: self._on_webhook_message(channel_id, message),
-            channel_id=channel_id,
-            replay_guard=self._webhook_replay_guard,
-            verified_limiter=self._verified_webhook_limiter,
-        )
-        return await handler.handle(headers, body.encode("utf-8"), query)
-
-    async def _on_webhook_message(self, channel_id: str, message: PlatformMessage) -> None:
-        identity = {
-            "channel_id": channel_id,
-            "platform": message.channel.value,
-            "sender": message.sender.platform_id or message.sender.id,
-            "target": message.target,
-        }
-        identity_digest = hashlib.sha256(
-            json.dumps(
-                identity, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-            ).encode("utf-8")
-        ).hexdigest()[:24]
-        session_id = f"webhook:{channel_id}:{message.channel.value}:{identity_digest}"
-        principal_id = (
-            f"webhook:{channel_id}:{message.channel.value}:"
-            f"{identity['sender'] or 'unknown'}"
-        )
-        # M4 batch 3.1.16A-4-1: build a webhook-sourced RequestContext
-        # for this chat turn.  The ctx is constructed from the derived
-        # webhook principal (not the original RPC caller's principal —
-        # webhook turns belong to the webhook sender, not the Gateway
-        # operator who dispatched the webhook event).
-        webhook_ctx = RequestContext.for_webhook(
-            principal_id,
-            project_id=self._bound_project_id,
-            policy_digest=self._effective_policy.digest,
-        )
-        async for _event in self.chat(webhook_ctx, ChatRequest(
-            session_id,
-            message.to_agent_input(),
-            principal_id=principal_id,
-        )):
-            pass
-        self.channel_registry.record_success(channel_id, received=True)
-
-    def list_channels(self, ctx: RequestContext) -> dict[str, object]:
-        return {"channels": self.channel_registry.get_health_report()}
-
-    def set_channel_enabled(self, ctx: RequestContext, channel_id: str, enabled: bool) -> dict[str, object]:
-        # C-2-4 (HIGH 4): channel mutations via REST must be gated on
-        # the admin principal allowlist compiled into the
-        # :class:`EffectiveSecurityPolicy` — symmetric to the tool
-        # path (``channel_tools._require_admin``).  Previously the
-        # REST path (Go ``POST /api/channels/{id}/enable`` → Python
-        # ``AgentService.set_channel_enabled``) bypassed admin
-        # validation entirely, so any authenticated principal could
-        # enable/disable any channel.
-        #
-        # ``channel_admins`` is sourced from
-        # ``self._effective_policy.channel_admins`` (user ∪ project,
-        # OR semantics).  An empty allowlist means NO principal can
-        # mutate channels — fail-closed until an admin is explicitly
-        # declared in ``khaos_policy.yaml``'s
-        # ``channels.admin_principals``.
-        admins = self._effective_policy.channel_admins
-        if not admins or ctx.principal_id not in admins:
-            return {
-                "ok": False,
-                "error": "principal is not a channel admin",
-                "status": "forbidden",
-            }
-        changed = self.channel_registry.enable(channel_id) if enabled else self.channel_registry.disable(channel_id)
-        return {"ok": changed, "channel_id": channel_id}
-
-    async def _build_runtime(
-        self, ctx: RequestContext, session_id: str, mode: str,
-    ):
-        """Build a per-turn runtime that borrows the shared Office authority.
-
-        B1: returns the full ``RuntimeResult`` so ``chat`` can ``aclose`` it
-        in ``finally``.  The shared ``self._office_authority`` is injected so
-        the aggregate storage baseline persists across turns (closing the
-        cross-turn quota bypass).
-
-        H1: reuses the server-lifecycle ``self._audit_logger`` so security
-        events from the main AgentLoop and every SubAgent run land in the
-        SAME audit trail (no parallel unsupervised audit path).
-
-        M4 batch 3.1.16A-4-1: takes a :class:`RequestContext` instead of
-        a bare ``principal_id`` string.  The context is the sole
-        authority for principal identity; ``RuntimeConfig`` now
-        receives ``session_id`` from ``ctx.session_id`` (previously
-        always ``""``, which broke ModeManager's (principal, session)
-        binding).  ``principal_id`` still falls back to ``local-uid``
-        for legacy callers that construct ctx via
-        :meth:`RequestContext.for_cli` without a session_id — but the
-        RPC path always provides a non-empty ctx.principal_id.
-        """
-        # Direct CLI/TUI callers may use ``RequestContext.for_cli`` without a
-        # project claim; the server-bound project is the only safe default in
-        # that local path.  An explicit claim is never rewritten: a mismatch
-        # is a fail-closed drift error before any session or audit write.
-        project_id = ctx.project_id or self._bound_project_id
-        if project_id != self._bound_project_id:
-            raise ValueError("request project_id does not match server binding")
-        await self.db.create_session(
-            session_id, mode or "office",
-            principal_id=ctx.principal_id,
-            # M4 batch 3.1.16A-5-1b: stamp the RPC-verified project
-            # identity on the session row.  ``create_session``'s
-            # ``ON CONFLICT`` clause does NOT touch ``project_id``
-            # (owner-preserving), so once a session is bound to a
-            # (principal, project) pair a later ``create_session``
-            # call from a different project cannot re-stamp it.
-            project_id=project_id,
-        )
-        from khaos.runtime import ProductionRuntimeConfig, build_production_runtime
-
-        # The server owns the physical audit chain, but each runtime must
-        # write under the authenticated request identity.  A bound sink is
-        # intentionally borrowed; the runtime cannot close or rebind it.
-        request_audit_logger = (
-            self._audit_logger.bind(
-                principal_id=ctx.principal_id,
-                project_id=project_id,
-                policy_digest=ctx.policy_digest or self._effective_policy.digest,
-                runtime_id=ctx.runtime_id or None,
-                source_transport=ctx.source_transport,
-            )
-            if self._audit_logger is not None
-            else None
-        )
-
-        return await build_production_runtime(ProductionRuntimeConfig(
-            project_root=self.project_root, config_path=self.config_path,
-            mode_override=mode or None, confirm_callback=self._wait_for_confirmation,
-            db=self.db, audit_logger=request_audit_logger,
-            # C-1-5a: do NOT pass a shared task_manager — let
-            # ``build_runtime`` construct a per-turn TaskManager from
-            # ``cfg.principal_id`` (factory.py:502-517).  Previously
-            # this passed the server-level ``TaskManager(local-uid)``
-            # singleton, which meant per-turn coding tasks landed in
-            # the local-uid cache — invisible to the API principal's
-            # ``TaskService.list``.
-            approval_broker=self.approval_broker,
-            router=self._router,
-            office_authority=self._office_authority,
-            principal_id=ctx.principal_id,
-            principal_kind=ctx.principal_kind,
-            parent_principal_id=ctx.parent_principal_id,
-            delegation_digest=ctx.delegation_digest,
-            source_transport=ctx.source_transport,
-            foreground_session=False,
-            session_id=session_id,
-            # M4 batch 3.1.16A-5-1b (CRITICAL): inject the RPC-verified
-            # project identity so ``AgentLoop._bound_project_id`` (and
-            # every component constructed by ``build_runtime``:
-            # PermissionEngine, MemoryStore, AuditLogger, TaskManager)
-            # comes from ``ctx.project_id`` (server-bound) instead of
-            # being recomputed from ``project_root``.  The dispatcher's
-            # drift check above guarantees ``ctx.project_id ==
-            # agent._bound_project_id`` here.
-            project_id=ctx.project_id,
-            # M4 batch 3.1.16A-4-4-3: inject the server-lifecycle
-            # ChannelRegistry + the effective policy's compiled
-            # ``channel_admins`` allowlist so the four channel tools
-            # receive them via the ``channel.read`` / ``channel.manage``
-            # broker injection (no module-global holder, no
-            # cross-principal mutation).
-            channel_registry=self.channel_registry,
-            channel_admins=self._effective_policy.channel_admins,
-            cron_engine=self.cron_engine,
-            subagent_spawner=self.subagent_spawner,
-            cleanup_authority=self.runtime_cleanup_authority,
-        ))
-
-    async def _wait_for_confirmation(self, request: dict) -> dict:
-        return await self.approval_broker.wait(
-            request["id"],
-            timeout=120.0,
-            binding_digest=request["binding_digest"],
-        )
-
-    def _build_security_middleware(self) -> SecurityMiddleware:
-        """Build the full security stack from the effective policy.
-
-        Wiring chain (see 批次 5 of the Codex-alignment doc):
-        policy → Sandbox(mode) + NetworkGuard(network_*) + policy-extended
-        guards + audit_logger → SecurityMiddleware → ToolScheduler.pre_check.
-
-        H2: every enforcement decision is made from the *effective* policy
-        (user ∩ project ∩ platform), not the raw project policy — an
-        untrusted repo can no longer disable audit or relax network by
-        editing its own ``khaos_policy.yaml``.
-
-        Components are optional and imported lazily so the server starts even
-        before all batches are present; a missing class simply means that
-        layer is not enforced yet.
-        """
-        eff = self._effective_policy
-        sandbox = None
-        network_guard = None
-        # Sandbox: capability constraint layer.
-        try:
-            from khaos.security.sandbox import Sandbox
-
-            sandbox = Sandbox(
-                mode=eff.mode,
-                workspace_root=self.project_root,
-                root_capabilities=eff.root_capabilities,
-            )
-        except ImportError:
-            pass
-        # NetworkGuard: network access control.
-        try:
-            from khaos.security.network_guard import NetworkGuard
-
-            network_guard = NetworkGuard(
-                network_enabled=eff.network_enabled,
-                # H3: three-state — pass None through so NetworkGuard
-                # distinguishes "no allowlist" (unrestricted) from "empty
-                # allowlist" (deny all).
-                allowed_domains=(
-                    list(eff.network_allowed_domains)
-                    if eff.network_allowed_domains is not None
-                    else None
-                ),
-                blocked_domains=list(eff.network_blocked_domains),
-            )
-        except ImportError:
-            pass
-        audit_logger = self._audit_logger
-        return SecurityMiddleware(
-            effective_policy=eff,
-            sandbox=sandbox,
-            network_guard=network_guard,
-            audit_logger=audit_logger,
-        )
-
-
-class TaskService:
-    """Coding-task RPC service with per-principal TaskManager.
-
-    C-1-5a: previously this service held a server-level
-    ``TaskManager(local-uid)`` singleton, which (a) rejected ``create``
-    from API principals (fail-closed with a "deferred to A-4-3/A-4-4"
-    error) and (b) returned empty ``list``/``get``/``cancel`` results
-    for API principals because the cache only held local-uid tasks.
-
-    Now the service holds ``db`` + ``approval_broker`` and constructs
-    a per-principal ``TaskManager`` on demand (cached for the
-    process lifetime).  Each principal gets an isolated cache loaded
-    from the DB, so ``create``/``list``/``get``/``cancel`` all work
-    correctly for any authenticated principal.  Cross-principal
-    isolation is enforced both by the manager's principal-scoped cache
-    AND by the explicit ``task.principal_id != ctx.principal_id``
-    checks (defense in depth).
-    """
-
-    def __init__(self, db, approval_broker: ApprovalBroker | None = None):
-        self.db = db
-        self.approval_broker = approval_broker
-        # Round-4 review Batch 4 (§13.2): per-(principal, project)
-        # TaskManager cache with LRU eviction.  Previously the cache was
-        # keyed by ``principal_id`` only and lived for the process
-        # lifetime — a process with many principals would grow without
-        # bound.  Now the key is ``(principal_id, project_id)`` and the
-        # cache is bounded by ``_MAX_MANAGERS`` (default 32).  When the
-        # limit is reached, the least-recently-used entry is evicted.
-        from collections import OrderedDict
-        self._managers: OrderedDict[tuple[str, str], TaskManager] = OrderedDict()
-        self._MAX_MANAGERS = 32
-        # Batch 6.5 (round-6 §十七): service-level cache lock.  Without
-        # it, two concurrent ``_manager()`` calls for the same key both
-        # observe a cache miss, both build+load a TaskManager, and one
-        # overwrites the cache — the loser (with any registered
-        # subscribers) is silently dropped, producing two managers for
-        # one ``(principal, project)``.  The lock serializes the whole
-        # miss → build → load → insert → LRU-evict sequence.
-        self._manager_cache_lock = asyncio.Lock()
-
-    async def _manager(self, ctx: RequestContext) -> TaskManager:
-        """Get or create the per-(principal, project) TaskManager.
-
-        Batch 6.5 (round-6 §十七): the entire lookup + build + LRU-evict
-        sequence is serialized under ``_manager_cache_lock`` so two
-        concurrent callers for the same key cannot race-build two
-        managers (split-brain).  Eviction uses the atomic
-        ``begin_eviction()`` CAS instead of the unlocked
-        ``can_evict()`` + ``aclose()`` two-step, closing the window in
-        which a task could go active between the check and the drain.
-        """
-        key = (ctx.principal_id, ctx.project_id)
-        async with self._manager_cache_lock:
-            manager = self._managers.get(key)
-            if manager is None:
-                # LRU eviction: drop the oldest EVICTABLE entry if at
-                # capacity.  Round-5 Batch 5.4: a manager with active
-                # tasks or live subscribers is NOT evicted.  Batch 6.5:
-                # ``can_evict()`` is a cheap unlocked pre-filter, but
-                # the authoritative decision is the ``begin_eviction()``
-                # CAS (which re-checks under the manager lock and flips
-                # ``_closing`` so no new work can arrive in the gap).
-                if len(self._managers) >= self._MAX_MANAGERS:
-                    evicted = False
-                    # Iterate oldest-first (OrderedDict insertion order).
-                    for evict_key in list(self._managers.keys()):
-                        candidate = self._managers[evict_key]
-                        if not candidate.can_evict():
-                            continue
-                        if not await candidate.begin_eviction():
-                            # Lost the CAS (went active / gained a
-                            # subscriber / already evicting) — try next.
-                            continue
-                        await candidate.aclose()
-                        self._managers.pop(evict_key, None)
-                        logger.debug(
-                            "TaskService LRU: evicted manager for %s",
-                            evict_key,
-                        )
-                        evicted = True
-                        break
-                    if not evicted:
-                        logger.warning(
-                            "TaskService LRU: cache at capacity (%d) but "
-                            "no evictable manager (all have live owners); "
-                            "temporarily exceeding limit",
-                            len(self._managers),
-                        )
-                manager = TaskManager(
-                    db=self.db, principal_id=ctx.principal_id,
-                    project_id=ctx.project_id,
-                )
-                await manager.load()
-                self._managers[key] = manager
-            else:
-                # Move to end (most-recently-used).
-                self._managers.move_to_end(key)
-            return manager
-
-    async def list(self, ctx: RequestContext, active_only: bool = False) -> list[dict]:
-        """List tasks — active ones by default, all when ``active_only`` is set.
-
-        C-1-5a: the per-principal TaskManager's cache only contains
-        tasks owned by ``ctx.principal_id``, so the caller sees exactly
-        their own tasks.  The explicit ``principal_id`` filter is
-        defense in depth.
-        """
-        manager = await self._manager(ctx)
-        if active_only:
-            return await manager.list_active(
-                principal_id=ctx.principal_id,
-            )
-        return await manager.list_all(
-            principal_id=ctx.principal_id,
-        )
-
-    async def get(self, ctx: RequestContext, task_id: str) -> dict:
-        """Return one task's state, or ``{"error": "not found"}``.
-
-        C-1-5a: a task owned by a different principal is treated as
-        ``not found`` — existence is hidden to avoid leaking that
-        another principal has work in flight.  (Defense in depth: the
-        per-principal cache already excludes foreign tasks.)
-        """
-        manager = await self._manager(ctx)
-        task = await manager.get(task_id)
-        if task is None or task.principal_id != ctx.principal_id:
-            return {"error": "task not found", "task_id": task_id}
-        return task.to_dict()
-
-    async def create(self, ctx: RequestContext, goal: str) -> dict:
-        """Create a task owned by ``ctx.principal_id``.
-
-        C-1-5a: the per-principal TaskManager stamps
-        ``ctx.principal_id`` on the new task and stores it in the
-        caller's cache.  Previously this rejected API principals with
-        a "per-principal TaskManager required" error (deferred to
-        A-4-3/A-4-4) — C-1-5a fulfills that deferral.
-        """
-        manager = await self._manager(ctx)
-        return (await manager.create(goal)).to_dict()
-
-    async def cancel(self, ctx: RequestContext, task_id: str) -> dict:
-        from khaos.coding.task_manager import TransitionResult
-
-        # C-1-5a: hide cross-principal tasks (treat as not found) so
-        # an API principal cannot enumerate or cancel another
-        # principal's tasks.  (Defense in depth.)
-        manager = await self._manager(ctx)
-        task = await manager.get(task_id)
-        if task is None or task.principal_id != ctx.principal_id:
-            return {"ok": False, "error": "task not found", "task_id": task_id}
-        result = await manager.cancel(task_id)
-        if result == TransitionResult.NOT_FOUND:
-            return {"ok": False, "error": "task not found", "task_id": task_id}
-        if result == TransitionResult.INVALID_TRANSITION:
-            return {"ok": False, "error": "task already terminal", "task_id": task_id}
-        # C-2-5 (HIGH 2): ``LEASE_INVALIDATION_FAILED`` means the
-        # task's workspace lease could not be released — the
-        # TaskManager kept the task in its pre-cancel state so the
-        # caller can retry (Batch 2.6 §4 fail-closed).  Previously
-        # this fell through to ``{"ok": True}``, silently treating a
-        # fail-closed refusal as success: the REST caller saw HTTP 200
-        # while the task was still active.  The explicit ``status``
-        # field lets the Go client distinguish this from
-        # ``INVALID_TRANSITION`` (which maps to 409, not 503).
-        if result == TransitionResult.LEASE_INVALIDATION_FAILED:
-            return {
-                "ok": False,
-                "error": "lease invalidation failed",
-                "task_id": task_id,
-                "status": "lease_invalidation_failed",
-            }
-        return {"ok": True, "task_id": task_id}
-
-    async def approve(
-        self,
-        ctx: RequestContext,
-        task_id: str,
-        principal_id: str = "",
-        session_id: str = "",
-        binding_digest: str = "",
-    ) -> dict:
-        from khaos.coding.task_manager import TaskStatus, TransitionResult
-
-        # Round-14 §2: bind the resolving principal to the transport
-        # authority unconditionally.  ``principal_id`` is a payload field
-        # and is only trusted when it agrees with ``ctx.principal_id``;
-        # an empty payload principal previously skipped the guard and
-        # fell through to downstream principal comparisons on the empty
-        # string.  Reject an empty transport principal outright so the
-        # approval cannot be attributed to nobody.  Also hide
-        # cross-principal tasks (treat as not found).
-        if not ctx.principal_id:
-            return {"ok": False, "error": "transport principal is required", "task_id": task_id}
-        if principal_id and principal_id != ctx.principal_id:
-            return {
-                "ok": False,
-                "error": "payload principal_id does not match transport principal",
-                "task_id": task_id,
-            }
-        principal_id = ctx.principal_id
-        manager = await self._manager(ctx)
-        task = await manager.get(task_id)
-        if task is None or task.principal_id != ctx.principal_id:
-            return {"ok": False, "error": "task not found", "task_id": task_id}
-        if task.status != TaskStatus.BLOCKED:
-            return {"ok": False, "error": f"task is {task.status.value}, not blocked", "task_id": task_id}
-        pending = task.metadata.get("pending_approval") or {}
-        if (
-            not self.approval_broker
-            or principal_id != pending.get("principal_id")
-            or session_id != pending.get("session_id")
-            or binding_digest != pending.get("binding_digest")
-        ):
-            return {
-                "ok": False,
-                "error": "approval principal/session/binding mismatch",
-                "task_id": task_id,
-            }
-        async def commit() -> bool:
-            result = await manager.transition(
-                task_id, expected={TaskStatus.BLOCKED},
-                target=TaskStatus.RUNNING, pending_approval=None,
-                approval_consumption={
-                    "tool_call_id": pending.get("tool_call_id", ""),
-                    "binding_digest": binding_digest,
-                    "principal_id": principal_id,
-                    "session_id": session_id,
-                    "decision": "approved",
-                    "consumed_at": time.time(),
-                },
-            )
-            return result == TransitionResult.UPDATED
-
-        resolved = await self.approval_broker.consume_task_decision_and_commit(
-            pending.get("tool_call_id", ""),
-            True,
-            principal_id=principal_id,
-            session_id=session_id,
-            binding_digest=binding_digest,
-            commit=commit,
-        )
-        return {"ok": resolved, "task_id": task_id}
-
-    async def reject(
-        self,
-        ctx: RequestContext,
-        task_id: str,
-        principal_id: str = "",
-        session_id: str = "",
-        binding_digest: str = "",
-    ) -> dict:
-        from khaos.coding.task_manager import TaskStatus, TransitionResult
-
-        # Round-14 §2: see ``approve`` — bind the resolving principal to
-        # the transport authority unconditionally.
-        if not ctx.principal_id:
-            return {"ok": False, "error": "transport principal is required", "task_id": task_id}
-        if principal_id and principal_id != ctx.principal_id:
-            return {
-                "ok": False,
-                "error": "payload principal_id does not match transport principal",
-                "task_id": task_id,
-            }
-        principal_id = ctx.principal_id
-        manager = await self._manager(ctx)
-        task = await manager.get(task_id)
-        if task is None or task.principal_id != ctx.principal_id:
-            return {"ok": False, "error": "task not found", "task_id": task_id}
-        if task.status != TaskStatus.BLOCKED:
-            return {"ok": False, "error": f"task is {task.status.value}, not blocked", "task_id": task_id}
-        pending = task.metadata.get("pending_approval") or {}
-        if (
-            not self.approval_broker
-            or principal_id != pending.get("principal_id")
-            or session_id != pending.get("session_id")
-            or binding_digest != pending.get("binding_digest")
-        ):
-            return {
-                "ok": False,
-                "error": "approval principal/session/binding mismatch",
-                "task_id": task_id,
-            }
-        async def commit() -> bool:
-            result = await manager.transition(
-                task_id, expected={TaskStatus.BLOCKED}, target=TaskStatus.FAILED,
-                error="rejected by user", pending_approval=None,
-                approval_consumption={
-                    "tool_call_id": pending.get("tool_call_id", ""),
-                    "binding_digest": binding_digest,
-                    "principal_id": principal_id,
-                    "session_id": session_id,
-                    "decision": "rejected",
-                    "consumed_at": time.time(),
-                },
-            )
-            return result == TransitionResult.UPDATED
-
-        resolved = await self.approval_broker.consume_task_decision_and_commit(
-            pending.get("tool_call_id", ""),
-            False,
-            principal_id=principal_id,
-            session_id=session_id,
-            binding_digest=binding_digest,
-            commit=commit,
-        )
-        return {"ok": resolved, "task_id": task_id}
-
-    async def artifacts(self, ctx: RequestContext, task_id: str) -> list[dict]:
-        """Return a task's produced artifacts (files + test results).
-
-        M4 batch 3.1.16A-4-2: cross-principal tasks return an empty
-        list (existence hidden) — symmetric with ``get`` / ``cancel``.
-        """
-        manager = await self._manager(ctx)
-        task = await manager.get(task_id)
-        if task is None or task.principal_id != ctx.principal_id:
-            return []
-        return ([{"type": "file", "path": path} for path in task.files_modified] + [{"type": "test_result", "data": result} for result in task.test_results])
-
-    async def events(self, ctx: RequestContext, task_id: str):
-        """Subscribe to a task's event stream.
-
-        M4 batch 3.1.16A-4-2: previously the dispatcher reached into
-        ``task_manager.subscribe`` directly, bypassing the service
-        layer — so the principal check on ``ctx`` was never enforced.
-        This wrapper hides cross-principal tasks (yields nothing) so
-        an API principal cannot subscribe to another principal's
-        task events.
-        """
-        manager = await self._manager(ctx)
-        task = await manager.get(task_id)
-        if task is None or task.principal_id != ctx.principal_id:
-            return
-        async for event in manager.subscribe(task_id):
-            yield event
-
-
 async def serve_json_lines(
     socket_path: str,
     db_path: str,
@@ -2161,7 +707,7 @@ async def serve_json_lines(
     # inner ``finally`` — if the inner cleanup raises (e.g. cron executor
     # resists cancellation), it stays False and the outer finally retains
     # the instance lock instead of releasing it.
-    agent: AgentService | None = None
+    agent: _AgentService | None = None
     db: Database | None = None
     subagent_service: SubAgentService | None = None
     # Round-5 Batch 5.2 (C-05): track maintenance so both the inner
@@ -2206,7 +752,7 @@ async def serve_json_lines(
                 "serve_json_lines: recovered %d crash-left chat stream(s) "
                 "at startup (boot_id=%s)", recovered, boot_id,
             )
-        agent = AgentService(
+        agent = _AgentService(
             db, project_root=project_root, config_path=config_path, router=router,
             boot_id=boot_id,
         )
@@ -2227,28 +773,28 @@ async def serve_json_lines(
             operation_repository=db.tool_operation_repository,
         )
         maintenance.start()
-        # MemoryService receives explicit repository and audit ports.  The
+        # _MemoryService receives explicit repository and audit ports.  The
         # service binds both to each authenticated RequestContext; it never
         # shares the server logger's local-uid attribution with API callers.
         from khaos.memory import SqliteMemoryRepository
 
-        memory = MemoryService(
+        memory = _MemoryService(
             SqliteMemoryRepository(db),
             audit_logger=agent._audit_logger,
         )
-        # C-2-3: SessionService proxies REST /api/sessions list/detail
+        # C-2-3: _SessionService proxies REST /api/sessions list/detail
         # reads to the durable ``sessions`` table, scoped to
         # ``ctx.principal_id``.  Previously the Go Gateway served these
         # from its in-memory ``sessions`` + ``sessionOwners`` maps
         # (lost on restart, blind to Python-side sessions).
-        sessions = SessionService(db)
-        audit_service = AuditService(agent._audit_logger or AuditLogger(db))
-        # C-1-5a: TaskService now takes ``db`` (not a TaskManager) and
+        sessions = _SessionService(db)
+        audit_service = _AuditService(agent._audit_logger or AuditLogger(db))
+        # C-1-5a: _TaskService now takes ``db`` (not a TaskManager) and
         # constructs per-principal managers on demand.
-        task_service = TaskService(db, agent.approval_broker)
+        task_service = _TaskService(db, agent.approval_broker)
         subagent_service: SubAgentService | None = None
         if enable_subagents:
-            # B1: share the AgentService's office authority AND approval broker so
+            # B1: share the _AgentService's office authority AND approval broker so
             # subagent runs reuse the same aggregate storage baseline (no
             # cross-run quota bypass) and the same approval authority (no parallel
             # unsupervised permission path).  The runtime borrows these instead of
@@ -2466,8 +1012,8 @@ async def serve_json_lines(
                 # ``ctx`` as their first parameter.
                 #
                 # Backward compat: methods that historically read
-                # ``principal_id`` from the payload (ChatRequest,
-                # ConfirmRequest, TaskService.approve/reject, SubAgent
+                # ``principal_id`` from the payload (_ChatRequest,
+                # _ConfirmRequest, _TaskService.approve/reject, SubAgent
                 # handlers) still work — we inject ctx.principal_id
                 # into the payload so ``**payload`` unpacking picks it
                 # up.  A-4-2 will remove this crutch and read directly
@@ -2476,9 +1022,9 @@ async def serve_json_lines(
                 # CONDITIONAL injection (M4 batch 3.1.16A-4-1): only
                 # overwrite when the Go side already sent
                 # ``principal_id``.  Methods whose signatures don't
-                # accept ``principal_id`` (TaskService.list/get/create/
-                # cancel/artifacts, MemoryService.*, AuditService.query,
-                # AgentService.switch_mode/list_channels/
+                # accept ``principal_id`` (_TaskService.list/get/create/
+                # cancel/artifacts, _MemoryService.*, _AuditService.query,
+                # _AgentService.switch_mode/list_channels/
                 # set_channel_enabled/handle_webhook) would raise
                 # TypeError on ``**payload`` unpacking if we injected
                 # unconditionally.  SubAgent handlers get their
@@ -2517,7 +1063,7 @@ async def serve_json_lines(
                 # drift detection.  The Go side may claim a
                 # ``project_id`` in the payload (caller-asserted).
                 # Compare it against ``agent._bound_project_id`` (the
-                # server-computed identity of this AgentService's
+                # server-computed identity of this _AgentService's
                 # ``project_root``).  A mismatch means the Gateway
                 # routed a request for project A to a server booted
                 # under project B — either a misconfiguration or an
@@ -2529,7 +1075,7 @@ async def serve_json_lines(
                 # them before this point, and ``ctx.project_id`` remains
                 # the server-bound value.
                 # Pop ``project_id`` from the payload so downstream
-                # ``ChatRequest(**payload)`` / ``ConfirmRequest(**payload)``
+                # ``_ChatRequest(**payload)`` / ``_ConfirmRequest(**payload)``
                 # etc. don't receive an unexpected keyword.  The
                 # verified value lives on ``ctx.project_id`` (always
                 # equal to ``agent._bound_project_id`` here).
@@ -2540,7 +1086,7 @@ async def serve_json_lines(
                 # the payload (Gateway-asserted, sourced from the
                 # Bootstrap.GetPolicyDigest handshake at startup).
                 # Compare it against ``agent._effective_policy.digest``
-                # (the server-computed digest of this AgentService's
+                # (the server-computed digest of this _AgentService's
                 # compiled EffectiveSecurityPolicy).  A mismatch means
                 # the Gateway booted against a Python server with policy
                 # A, then routed a request to a Python server with
@@ -2552,14 +1098,14 @@ async def serve_json_lines(
                 # before this point, and ``ctx.policy_digest`` remains
                 # the server-bound value.
                 # Pop ``policy_digest`` from the payload so downstream
-                # ``ChatRequest(**payload)`` / ``ConfirmRequest(**payload)``
+                # ``_ChatRequest(**payload)`` / ``_ConfirmRequest(**payload)``
                 # etc. don't receive an unexpected keyword.  The
                 # verified value lives on ``ctx.policy_digest`` (always
                 # equal to ``agent._effective_policy.digest`` here).
                 payload.pop("policy_digest", None)
                 if method == "AgentService.Chat":
                     try:
-                        async for event in agent.chat(ctx, ChatRequest(**payload)):
+                        async for event in agent.chat(ctx, _ChatRequest(**payload)):
                             writer.write((json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8"))
                             await writer.drain()
                     except Exception as exc:  # noqa: BLE001 - RPC errors must be framed
@@ -2607,7 +1153,7 @@ async def serve_json_lines(
                     response = await agent.switch_mode(ctx, payload.get("session_id", ""), payload["target_mode"])
                     writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
                 elif method == "AgentService.ConfirmPermission":
-                    response = await agent.confirm_permission(ctx, ConfirmRequest(**payload))
+                    response = await agent.confirm_permission(ctx, _ConfirmRequest(**payload))
                     writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
                 elif method == "AgentService.HandleWebhook":
                     response = await agent.handle_webhook(ctx, **payload)
@@ -2764,7 +1310,7 @@ async def serve_json_lines(
                 task.cancel()
             if active_handlers:
                 # M1: bounded drain with hard ownership semantics — same
-                # rationale as the chat drain in ``AgentService.shutdown``.  A
+                # rationale as the chat drain in ``_AgentService.shutdown``.  A
                 # handler that swallows CancelledError would have left
                 # ``wait_for(gather)`` to log+continue, dismantling shared
                 # state under a live handler.  Fail closed: pending handlers at
@@ -2797,7 +1343,7 @@ async def serve_json_lines(
             # them under a live task.  ``SubAgentRunner.run`` finally-block
             # already calls ``close_runtime_or_register``, so the cancelled
             # runtimes land in the orphan registry for the bounded drain inside
-            # ``AgentService.shutdown``.
+            # ``_AgentService.shutdown``.
             if subagent_service is not None:
                 await subagent_service.shutdown(timeout=SUBAGENT_SHUTDOWN_TIMEOUT)
             # Only after every handler/runtime is terminal may the service close
@@ -2880,170 +1426,6 @@ def _parse_json_line(line: bytes) -> dict:
     if not isinstance(request, dict):
         raise ValueError("request must be a JSON object")  # noqa: TRY004 - wire compatibility
     return request
-
-
-async def _build_subagent_service(
-    db: Database,
-    project_root: Path | None,
-    config_path: Path | None,
-    *,
-    office_authority: OfficeMutationAuthority | None = None,
-    approval_broker: Any = None,
-    audit_logger: Any = None,
-    cleanup_authority: Any = None,
-) -> SubAgentService:
-    """Build the SubAgent service bound to the server's shared security stack.
-
-    B1: previously this function constructed a *bare* ``ToolScheduler(
-    create_runtime_registry(), permission_engine)`` with no
-    ``SecurityMiddleware`` — so the subagent ran on a parallel, unsupervised
-    execution path that bypassed EffectivePolicy / Sandbox / NetworkGuard /
-    AuditLogger.  Now the runner receives ``tool_scheduler=None`` and
-    ``build_runtime`` constructs a fresh scheduler per run with the full
-    security stack compiled from the same layered effective policy as the
-    main AgentLoop.  The server-level ``approval_broker`` /
-    ``audit_logger`` / ``office_authority`` are inherited so approvals,
-    audit events and the Office storage baseline are shared with the main
-    runtime, not forked.
-
-    C-1-5b: the server-level ``ModeManager(local-uid)`` /
-    ``MemoryStore(local-uid)`` / ``MemoryManager`` singletons are REMOVED.
-    Previously they were bound to ``principal_id=f"local-uid:{os.getuid()}"``
-    and passed to ``SubAgentRunner``, which forwarded them to
-    ``RuntimeConfig`` — so ``build_runtime`` reused the local-uid-bound
-    instances instead of constructing per-turn ones scoped to
-    ``task.principal_id``.  Now ``SubAgentRunner`` receives ``None`` for
-    both, and ``build_runtime`` constructs a per-turn ``ModeManager`` +
-    ``MemoryManager`` from ``cfg.principal_id`` (= ``task.principal_id``,
-    set from the authenticated RPC payload).  This guarantees the
-    subagent's mode switches / memory scope are bound to the CALLING
-    principal, not the server's local UID.
-    """
-    root = project_root or Path.cwd()
-    resolved_config = config_path or root / "config.yaml"
-    router = load_router_from_config(resolved_config, project_root=root)
-    skill_manager = SkillManager()
-    skills_dir = root / "skills"
-    if skills_dir.is_dir():
-        skill_manager.load_from_dir(skills_dir)
-    runner = SubAgentRunner(
-        router=router,
-        db=db,
-        # C-1-5b: do NOT pass server-level ModeManager / MemoryManager —
-        # let ``build_runtime`` construct per-turn instances from
-        # ``cfg.principal_id`` (= ``task.principal_id``).  Previously
-        # these were bound to ``local-uid`` and reused across every
-        # subagent run, so an API principal's subagent saw the local
-        # user's mode state and memories.
-        mode_manager=None,
-        # B1: do NOT pass a bare ToolScheduler — let build_runtime construct
-        # one per run with the full SecurityMiddleware stack and a registry
-        # pruned to ``task.tools``.
-        tool_scheduler=None,
-        memory_manager=None,
-        skill_manager=skill_manager if len(skill_manager.registry) > 0 else None,
-        token_engine=get_token_engine(),
-        office_authority=office_authority,
-        approval_broker=approval_broker,
-        # C-1-5b: no server-level principal_id — the runner relies on
-        # ``task.principal_id`` (set from ``ctx.principal_id`` by
-        # ``SubAgentService.handle_spawn``) and ``build_runtime``'s
-        # fail-closed gate on empty principal_id.
-        principal_id="",
-        audit_logger=audit_logger,
-        cleanup_authority=cleanup_authority,
-        # B1: inherit the server's project_root / config_path so the subagent
-        # loads the SAME ``khaos_policy.yaml`` and compiles the SAME
-        # EffectivePolicy as the main AgentLoop — no second security
-        # authority rooted at the process cwd.
-        project_root=root,
-        config_path=resolved_config,
-    )
-    spawner = SubAgentSpawner(
-        SubAgentConfig(max_concurrent=3, max_spawn_depth=1, allow_nesting=False),
-        db,
-        runner=runner.run,
-        registry=create_runtime_registry(),
-    )
-    # M6.9 BATCH 4: production spawns receive authority-owned narrow child
-    # delegations when an authority daemon is deployed.  Without one the
-    # issuer stays absent and children run with a fresh transport-root
-    # commitment instead of the parent's digest — never a silent
-    # parent-digest reuse.
-    delegation_issuer = None
-    authority_socket = os.environ.get("KHAOS_AUTHORITYD_SOCKET") or os.environ.get(
-        "KHAOS_AUTHORITYD_BACKEND_SOCKET", ""
-    )
-    if authority_socket and os.environ.get("KHAOS_DEV_MODE") != "1":
-        try:
-            from khaos.security.authorityd_protocol import AuthorityDaemonClient
-            from khaos.security.delegation_issuer import AuthorityDelegationIssuer
-            from khaos.security.identity_isolation import (
-                read_contract_from_environment,
-            )
-
-            contract = read_contract_from_environment()
-            delegation_issuer = AuthorityDelegationIssuer(
-                AuthorityDaemonClient(
-                    Path(authority_socket),
-                    expected_authority_uid=contract.authority_uid,
-                )
-            )
-        except (OSError, PermissionError, ValueError) as exc:
-            logger.warning("subagent delegation issuer unavailable: %s", exc)
-            delegation_issuer = None
-    return SubAgentService(spawner, runner, delegation_issuer=delegation_issuer)
-
-
-async def _handle_optional_subagent(
-    subagent_service: SubAgentService | None,
-    action: str,
-    ctx: RequestContext,
-    payload: dict,
-) -> dict:
-    """Dispatch a SubAgent RPC action with the transport ``ctx``.
-
-    M4 batch 3.1.16A-4-2: ``ctx`` is passed directly to the SubAgent
-    handler — no longer stamped onto the payload.  The SubAgentService
-    reads ``ctx.principal_id`` directly, so a compromised Gateway that
-    sends ``principal_id: 'admin'`` in the payload cannot win.
-    """
-    if subagent_service is None:
-        return {"ok": False, "error": "subagents not enabled"}
-    if action == "spawn":
-        return await subagent_service.handle_spawn(ctx, payload)
-    if action == "collect":
-        return await subagent_service.handle_collect(ctx, payload)
-    if action == "status":
-        return await subagent_service.handle_status(ctx, payload)
-    return {"ok": False, "error": "unknown subagent action"}
-
-
-def load_router_from_config(config_path: Path, project_root: Path | None = None) -> ModelRouter:
-    """Load model router, merging user config for the project template path."""
-    expanded_config = config_path.expanduser()
-    if not expanded_config.exists():
-        return create_default_router(str(expanded_config), honor_no_config=False)
-    root = project_root or Path.cwd()
-    project_config = (root / "config.yaml").resolve()
-    resolved_config = expanded_config.resolve()
-    if resolved_config == project_config:
-        return create_default_router(
-            honor_no_config=False,
-            project_root=root,
-        )
-    return create_default_router(str(expanded_config), honor_no_config=False)
-
-
-def _message_to_event(message) -> dict:
-    event = message.event or ("done" if message.content == "done" and message.role == "system" else "message")
-    if event in {"tool_call", "permission_request", "tool_result", "error"}:
-        data = message.metadata
-    elif event == "done":
-        data = {"total_tokens": message.token_count, "stop_reason": message.stop_reason}
-    else:
-        data = {"role": message.role, "content": message.content, "token_count": message.token_count}
-    return {"event": event, "data": data}
 
 
 def main() -> None:

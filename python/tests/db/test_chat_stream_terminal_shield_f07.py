@@ -35,7 +35,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from khaos.db import Database
-from khaos.grpc_server import AgentService
+from khaos.rpc.agent_service import AgentService
 from khaos.runtime import RequestContext
 
 

@@ -16,17 +16,12 @@ import pytest
 from khaos.db import Database
 from khaos.config import ConfigError
 from khaos.agent.approval import ApprovalBinding, ApprovalBroker
-from khaos.grpc_server import (
-    AgentService,
-    ChatRequest,
-    ConfirmRequest,
-    _load_rpc_capability,
-    _parse_json_line,
-    load_router_from_config,
-    MemoryService,
-    serve_json_lines,
-    TaskService,
-)
+from khaos.grpc_server import _load_rpc_capability, _parse_json_line, serve_json_lines
+from khaos.rpc import MemoryService
+from khaos.rpc.agent_service import AgentService
+from khaos.rpc.composition import load_router_from_config
+from khaos.rpc.models import ChatRequest, ConfirmRequest
+from khaos.rpc.task_service import TaskService
 from khaos.rpc.protocol import (
     GatewayRPCAuthenticator,
     rpc_binding_claim_error as _rpc_binding_claim_error,
@@ -742,7 +737,7 @@ async def test_agent_shutdown_fails_closed_when_chat_swallows_cancel(
     await asyncio.wait_for(started.wait(), timeout=2.0)
 
     # Shrink the ceiling so the test doesn't wait the production 10s.
-    monkeypatch.setattr("khaos.grpc_server.CHAT_DRAIN_TIMEOUT", 0.5)
+    monkeypatch.setattr("khaos.rpc.agent_service.CHAT_DRAIN_TIMEOUT", 0.5)
 
     loop = asyncio.get_running_loop()
     start = loop.time()
@@ -909,7 +904,7 @@ async def test_shutdown_reaches_drain_promptly_when_build_is_slow(
         return None
 
     monkeypatch.setattr(AgentService, "_build_runtime", slow_build)
-    monkeypatch.setattr("khaos.grpc_server.CHAT_DRAIN_TIMEOUT", 2.0)
+    monkeypatch.setattr("khaos.rpc.agent_service.CHAT_DRAIN_TIMEOUT", 2.0)
 
     db = Database(tmp_path / "khaos.db")
     await db.connect()
@@ -1353,7 +1348,7 @@ async def test_build_runtime_wires_token_engine_and_skills(tmp_path):
 async def test_audit_service_query_roundtrip(tmp_path):
     """The JSON-line AuditService.Query returns persisted records."""
     from khaos.audit import AuditLogger
-    from khaos.grpc_server import AuditService
+    from khaos.rpc import AuditService
 
     db = Database(tmp_path / "khaos.db")
     await db.connect()
@@ -1667,7 +1662,7 @@ async def test_c_2_3_session_service_list_returns_only_caller_sessions(tmp_path)
     reads the durable ``sessions`` table with a principal-scoped
     WHERE clause.
     """
-    from khaos.grpc_server import SessionService
+    from khaos.rpc import SessionService
     from khaos.agent.core import Message
 
     db = Database(tmp_path / "c-2-3-list.db")
@@ -1709,7 +1704,7 @@ async def test_c_2_3_session_service_get_hides_cross_principal_as_not_found(tmp_
     ``TaskService.get`` so the REST caller cannot enumerate other
     principals' session ids via timing or response-shape differences.
     """
-    from khaos.grpc_server import SessionService
+    from khaos.rpc import SessionService
     from khaos.agent.core import Message
 
     db = Database(tmp_path / "c-2-3-get.db")
@@ -1760,7 +1755,7 @@ async def test_c_2_3_session_service_list_with_empty_principal_returns_nothing(t
     sessions).  It must pass the empty string to ``list_sessions`` so
     the SQL filter ``s.principal_id = ''`` matches nothing.
     """
-    from khaos.grpc_server import SessionService
+    from khaos.rpc import SessionService
 
     db = Database(tmp_path / "c-2-3-empty.db")
     await db.connect()

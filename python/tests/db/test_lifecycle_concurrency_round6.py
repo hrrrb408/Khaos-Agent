@@ -157,7 +157,7 @@ async def test_s17_concurrent_manager_lookup_no_split_brain(tmp_path):
     await db.run_migrations()
 
     # Import here to avoid heavy module init at collection time.
-    from khaos.grpc_server import TaskService
+    from khaos.rpc.task_service import TaskService
     from khaos.runtime.context import RequestContext
 
     svc = TaskService(db)
@@ -176,7 +176,7 @@ async def test_s17_concurrent_manager_lookup_no_split_brain(tmp_path):
 async def test_s17_manager_cache_lock_serializes_eviction():
     """§十七 item 1: the cache lock also serializes LRU eviction, so two
     concurrent capacity-pressured lookups cannot double-evict."""
-    from khaos.grpc_server import TaskService
+    from khaos.rpc.task_service import TaskService
     from khaos.runtime.context import RequestContext
 
     svc = TaskService(db=None)

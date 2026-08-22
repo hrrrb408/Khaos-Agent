@@ -960,7 +960,7 @@ async def build_runtime(
     router = cfg.router
     if router is None:
         try:
-            from khaos.grpc_server import load_router_from_config
+            from khaos.rpc.composition import load_router_from_config
 
             router = load_router_from_config(cfg.config_path or root / "config.yaml", project_root=root)
         except (OSError, ValueError, KeyError):

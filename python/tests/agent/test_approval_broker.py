@@ -6,7 +6,7 @@ import pytest
 
 from khaos.agent.approval import ApprovalBinding, ApprovalBroker, StepExecutionAuthority
 from khaos.coding.task_manager import TaskManager, TaskStatus
-from khaos.grpc_server import TaskService
+from khaos.rpc.task_service import TaskService
 from khaos.runtime import RequestContext
 
 

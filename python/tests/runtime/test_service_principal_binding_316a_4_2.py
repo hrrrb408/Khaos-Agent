@@ -35,11 +35,8 @@ from khaos.agent.approval import ApprovalBinding, ApprovalBroker
 from khaos.audit import AuditLogger
 from khaos.coding.task_manager import TaskManager, TaskStatus
 from khaos.db import Database
-from khaos.grpc_server import (
-    AuditService,
-    MemoryService,
-    TaskService,
-)
+from khaos.rpc import AuditService, MemoryService
+from khaos.rpc.task_service import TaskService
 from khaos.memory import SqliteMemoryRepository
 from khaos.runtime import RequestContext
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 from khaos.db import Database
-from khaos.grpc_server import AgentService
+from khaos.rpc.agent_service import AgentService
 
 pytestmark = pytest.mark.posix_host
 

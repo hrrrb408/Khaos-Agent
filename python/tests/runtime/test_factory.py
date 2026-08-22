@@ -36,7 +36,7 @@ async def test_factory_rejects_mock_router_outside_explicit_dev_mode(
     def unavailable(*_args, **_kwargs):
         raise ValueError("invalid model configuration")
 
-    monkeypatch.setattr("khaos.grpc_server.load_router_from_config", unavailable)
+    monkeypatch.setattr("khaos.rpc.composition.load_router_from_config", unavailable)
     with pytest.raises(ValueError, match="invalid model configuration"):
         await build_runtime(
             RuntimeConfig(
