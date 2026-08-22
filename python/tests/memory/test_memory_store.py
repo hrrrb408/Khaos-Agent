@@ -1,12 +1,18 @@
 from khaos.db import Database
-from khaos.memory import Memory, MemoryConfidence, MemoryScope, MemoryStore
+from khaos.memory import (
+    Memory,
+    MemoryConfidence,
+    MemoryScope,
+    MemoryStore,
+    SqliteMemoryRepository,
+)
 
 
 async def _store(tmp_path):
     db = Database(tmp_path / "khaos.db")
     await db.connect()
     await db.run_migrations()
-    return db, MemoryStore(db)
+    return db, MemoryStore(SqliteMemoryRepository(db))
 
 
 async def test_memory_set_and_get(tmp_path):
@@ -131,4 +137,3 @@ async def test_confidence_round_trip(tmp_path):
 
     assert (await store.get(MemoryScope.CODING, "rule")).confidence is MemoryConfidence.HIGH
     await db.close()
-

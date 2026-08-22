@@ -31,12 +31,17 @@ Coverage matrix (all on ONE shared Database):
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from khaos.db import Database
-from khaos.memory import Memory, MemoryConfidence, MemoryScope, MemoryStore
-
+from khaos.memory import (
+    Memory,
+    MemoryConfidence,
+    MemoryScope,
+    MemoryStore,
+    SqliteMemoryRepository,
+)
 
 PROJECT_ID_A = "a" * 32
 PROJECT_ID_B = "b" * 32
@@ -65,7 +70,9 @@ def _mem(key: str, value: str, *, ttl: int = 604800) -> Memory:
 
 
 def _store(db: Database, project_id: str) -> MemoryStore:
-    return MemoryStore(db, principal_id=PRINCIPAL, project_id=project_id)
+    return MemoryStore(
+        SqliteMemoryRepository(db), principal_id=PRINCIPAL, project_id=project_id
+    )
 
 
 # ───────────────────────────── tests ──────────────────────────────────
@@ -78,7 +85,6 @@ async def test_f02_1_upsert_isolation(tmp_path):
     try:
         store_a = _store(db, PROJECT_ID_A)
         store_b = _store(db, PROJECT_ID_B)
-
         await store_a.set(_mem("k", "v-a"), namespace="private")
         await store_b.set(_mem("k", "v-b"), namespace="private")
 
@@ -112,7 +118,6 @@ async def test_f02_2_get_isolation(tmp_path):
     try:
         store_a = _store(db, PROJECT_ID_A)
         store_b = _store(db, PROJECT_ID_B)
-
         await store_a.set(_mem("secret", "alpha"), namespace="private")
         await store_b.set(_mem("secret", "beta"), namespace="private")
 
@@ -190,6 +195,7 @@ async def test_f02_5_delete_by_id_isolation(tmp_path):
     try:
         store_a = _store(db, PROJECT_ID_A)
         store_b = _store(db, PROJECT_ID_B)
+        repository = SqliteMemoryRepository(db)
 
         await store_a.set(_mem("k", "v-a"), namespace="private")
         await store_b.set(_mem("k", "v-b"), namespace="private")
@@ -207,7 +213,7 @@ async def test_f02_5_delete_by_id_isolation(tmp_path):
 
         # A attempts to delete B's row by id — must be a no-op (scoped
         # by A's project_id).
-        await db.delete_memory_by_id(
+        await repository.delete_by_id(
             b_id, principal_id=PRINCIPAL, project_id=PROJECT_ID_A,
         )
 
@@ -217,7 +223,7 @@ async def test_f02_5_delete_by_id_isolation(tmp_path):
         assert got_b.id == b_id
 
         # B CAN delete its own row by id.
-        await db.delete_memory_by_id(
+        await repository.delete_by_id(
             b_id, principal_id=PRINCIPAL, project_id=PROJECT_ID_B,
         )
         got_b2 = await store_b.get(MemoryScope.GLOBAL, "k", namespace="private")
@@ -317,7 +323,7 @@ async def test_f02_9_decay_isolation(tmp_path):
         await store_b.set(_mem("k", "v-b", ttl=1), namespace="private")
 
         # Run decay for project A with a now far in the future.
-        future = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=1)
+        future = datetime.now(UTC).replace(tzinfo=None) + timedelta(hours=1)
         removed_a = await store_a.decay(now=future)
 
         assert removed_a == 1
@@ -351,8 +357,12 @@ async def test_f02_10_shared_namespace_isolation(tmp_path):
         # Both stores use principal_id='' via the shared-namespace path
         # (see MemoryStore._effective_principal), but bind to different
         # project_ids.
-        store_a = MemoryStore(db, principal_id="alice", project_id=PROJECT_ID_A)
-        store_b = MemoryStore(db, principal_id="bob", project_id=PROJECT_ID_B)
+        store_a = MemoryStore(
+            SqliteMemoryRepository(db), principal_id="alice", project_id=PROJECT_ID_A
+        )
+        store_b = MemoryStore(
+            SqliteMemoryRepository(db), principal_id="bob", project_id=PROJECT_ID_B
+        )
 
         await store_a.set(_mem("team-note", "from-A"), namespace="shared")
         await store_b.set(_mem("team-note", "from-B"), namespace="shared")

@@ -55,7 +55,7 @@
 
 - `python/khaos/audit/anchor.py`: `1109f9ab097bdd63ef9b7d2215fa4fcd636bd38d577469ac9c6dfb9bf133be5d`
 - `python/khaos/channels/webhook.py`: `dcb38668c0cf1a300d16ad5769670a51eaf6c6be24b9cc5be2315a0871a58c06`
-- `python/khaos/permissions/engine.py`: `59ad44abf72426352e8d77511392868ab45f243abbe64e6d3bb10ab15535f773`
+- `python/khaos/permissions/engine.py`: `e90ea09220bfc36937b8ec06b365c5308801f65884a4f3dfc8fb785dce14c862`
 - `python/khaos/permissions/rules.py`: `19d02b4ea1427b7c4b5075b5bbcd641cefc680ac984d27e6fdbf95a5415eae7c`
 - `python/khaos/coding/execution/authority.py`: `194fffcdceb04a008199cb3fabd98f03d57402363111855351cccf1503a073f2`
 - `python/khaos/coding/execution/identity.py`: `f5b21dd9098def1ea894b4830181fd9a6be1196b00235a404027794f8b4b0bef`
@@ -101,10 +101,10 @@
 - `python/khaos/rpc/protocol.py`: `5960a4e41b94b63a47ccadd362288f97f4747ad56d6db065f9741cebfbc768a6`
 - `rust/khaos-core/src/bin/khaos-exec-launcher.rs`: `c5eb7343002ecb7f74e1ca10df5d5edaf4de39f90ecc68064cb355b56b2fda71`
 - `rust/khaos-core/src/bin/khaos-sandbox-launcher.rs`: `9e68f6b622c7ccd29f24d76aa504da1624bf04c128f9215b57ec580b317b75ab`
-- `python/khaos/grpc_server.py`: `23a7fba3a2a32faa7b30c30836dfab5ffa17305e8275673bbdae2218aca12f56`
+- `python/khaos/grpc_server.py`: `be9e50a93fea4157e5064a1b60b88717ca442130e4368762d84106ae5b5198a5`
 - `go/internal/api/handler.go`: `9dc6af7572c331685a4fa28f8902d148da4338a19603f55aeaf2094fc38662a7`
 - `go/cmd/gateway/main.go`: `5c27479e8ef5ffa3c05008077e12e89e4f274d4255765606b3ee91d04df56481`
-- `go/internal/platform/python_client.go`: `c5d1f28a03398abefcea941cd8474c3ce6e9118ed0e8dc063615e623141c26e6`
+- `go/internal/platform/python_client.go`: `1bb725121e13cece0ea49360de7fc52b7b0f38707189c5b58fbf8037f9324390`
 - `go/internal/platform/rpc_contract.go`: `85a24e13654bb8957dace5b8a04d9c99979ddd3092d4dcfae5fae67d58721d54`
 - `scripts/generate_production_reachability.py`: `673d4385bb5ebf3bbd8a5c59fb4dd0248264ebf2c569f6adb34845c222654350`
 - `packaging/macos/khaos-authorityd-xpc.m`: `6b9d18f13fd280a8819e88a4cccc96fcda5e34f52b40cf2940d5264667200855`

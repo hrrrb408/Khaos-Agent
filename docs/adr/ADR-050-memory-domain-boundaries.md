@@ -34,11 +34,13 @@ The memory subsystem is split into the following owners:
 | `memory/store.py` | domain facade: validation, repository orchestration, and audit events |
 | `memory/manager.py` | injection formatting, token budget, cross-mode intent, and extraction orchestration |
 
-`MemoryStore(db, ...)` remains a one-release compatibility constructor.  It
-immediately wraps the database in `SqliteMemoryRepository`; the store never
-calls database methods directly.  New callers may inject a repository port.
-All id-based deletes and touches use the bound principal and project.  The
-RPC service routes deletion through the same store boundary as local callers.
+`MemoryStore` accepts only a `MemoryRepository`; the former `MemoryStore(db,
+...)` compatibility constructor has been removed.  SQLite callers construct
+`SqliteMemoryRepository` at the composition root.  The store never calls
+database methods directly.  All id-based deletes and touches use the bound
+principal and project.  The RPC service routes deletion through the same store
+boundary as local callers and binds its audit sink per `RequestContext` (see
+ADR-051).
 
 ## Consequences
 
@@ -46,12 +48,8 @@ RPC service routes deletion through the same store boundary as local callers.
 * Ownership and namespace rules have one implementation and negative tests.
 * The repository port can be replaced by a different durable backend without
   changing domain code.
-* The compatibility constructor must be removed after production callers and
-  tests inject the port; its removal is tracked in the maintainer architecture
-  handbook.
-* Context-bound audit sinks remain a follow-up for RPC principals.  The runtime
-  factory already injects its principal-bound `AuditLogger`; the optional sink
-  keeps older test construction side-effect free.
+* `MemoryService` shares one durable audit writer but never shares its
+  principal attribution; request-bound sinks cannot close the root writer.
 
 ## Verification
 
@@ -62,4 +60,3 @@ The boundary suite covers:
 * touch cannot mutate another principal/project's row;
 * mutation audit events are emitted when an audit sink is supplied;
 * unknown namespaces and session identities fail closed.
-

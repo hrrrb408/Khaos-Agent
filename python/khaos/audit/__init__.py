@@ -3,8 +3,10 @@
 from khaos.audit.anchor import AuditAnchorError, AuditChainAnchor
 from khaos.audit.logger import (
     AUDIT_LOG_TRUSTED_DIR,
+    AuditBinding,
     AuditEntry,
     AuditLogger,
+    BoundAuditLogger,
     parse_detail,
     resolve_safe_audit_anchor_path,
     resolve_safe_audit_log_path,
@@ -13,9 +15,11 @@ from khaos.audit.logger import (
 __all__ = [
     "AUDIT_LOG_TRUSTED_DIR",
     "AuditAnchorError",
+    "AuditBinding",
     "AuditChainAnchor",
     "AuditEntry",
     "AuditLogger",
+    "BoundAuditLogger",
     "parse_detail",
     "resolve_safe_audit_anchor_path",
     "resolve_safe_audit_log_path",

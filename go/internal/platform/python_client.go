@@ -11,7 +11,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
-	"path/filepath"
 	"time"
 
 	"khaos/go/internal/api"
@@ -108,9 +107,7 @@ func (c PythonClient) TaskEvents(ctx context.Context, principalID string, id str
 	if err != nil {
 		return nil, err
 	}
-	stopCancelWatch := closeOnContextDone(ctx, conn)
 	if err := c.writeRPC(conn, "TaskService.Events", map[string]any{"task_id": id}, principalID); err != nil {
-		stopCancelWatch()
 		conn.Close()
 		return nil, err
 	}
@@ -118,7 +115,6 @@ func (c PythonClient) TaskEvents(ctx context.Context, principalID string, id str
 	go func() {
 		defer close(ch)
 		defer conn.Close()
-		defer stopCancelWatch()
 		// F-06: raise the 64 KiB default so large tool outputs don't
 		// silently truncate the stream.
 		scanner := bufio.NewScanner(conn)
@@ -182,6 +178,10 @@ type PythonClient struct {
 	Capability   string
 	ProjectID    string
 	PolicyDigest string
+	// Transport owns only connection establishment and cancellation.  A nil
+	// value selects UnixRPCTransport, preserving the production default while
+	// allowing boundary tests to use an in-memory byte stream.
+	Transport RPCTransport
 	// RequireNegotiation is enabled by the production Gateway.  Unit-test
 	// adapters may leave it false to exercise the explicit development
 	// compatibility window without pretending that path is production-safe.
@@ -655,9 +655,7 @@ func (c PythonClient) Chat(ctx context.Context, req api.ChatRequest) (<-chan api
 	if err != nil {
 		return nil, err
 	}
-	stopCancelWatch := closeOnContextDone(ctx, conn)
 	if err := c.writeRPC(conn, "AgentService.Chat", req, req.PrincipalID); err != nil {
-		stopCancelWatch()
 		conn.Close()
 		return nil, err
 	}
@@ -665,7 +663,6 @@ func (c PythonClient) Chat(ctx context.Context, req api.ChatRequest) (<-chan api
 	go func() {
 		defer close(ch)
 		defer conn.Close()
-		defer stopCancelWatch()
 		// F-06: raise the 64 KiB default so large tool outputs don't
 		// silently truncate the stream.
 		scanner := bufio.NewScanner(conn)
@@ -711,11 +708,9 @@ func (c PythonClient) ChatEvents(ctx context.Context, principalID string, sessio
 	if err != nil {
 		return nil, err
 	}
-	stopCancelWatch := closeOnContextDone(ctx, conn)
 	if err := c.writeRPC(conn, "AgentService.ChatEvents", map[string]any{
 		"session_id": sessionID, "after_event_id": afterEventID,
 	}, principalID); err != nil {
-		stopCancelWatch()
 		conn.Close()
 		return nil, err
 	}
@@ -723,7 +718,6 @@ func (c PythonClient) ChatEvents(ctx context.Context, principalID string, sessio
 	go func() {
 		defer close(ch)
 		defer conn.Close()
-		defer stopCancelWatch()
 		// F-06: raise the 64 KiB default so large tool outputs don't
 		// silently truncate the stream.
 		scanner := bufio.NewScanner(conn)
@@ -770,7 +764,6 @@ func (c PythonClient) ConfirmPermission(ctx context.Context, principalID string,
 		return err
 	}
 	defer conn.Close()
-	defer closeOnContextDone(ctx, conn)()
 	return c.writeRPC(conn, "AgentService.ConfirmPermission", map[string]any{
 		"session_id":     sessionID,
 		"principal_id":   principalID,
@@ -788,7 +781,6 @@ func (c PythonClient) SwitchMode(ctx context.Context, principalID string, sessio
 		return "", err
 	}
 	defer conn.Close()
-	defer closeOnContextDone(ctx, conn)()
 	if err := c.writeRPC(conn, "AgentService.SwitchMode", map[string]any{
 		"session_id": sessionID, "target_mode": targetMode,
 	}, principalID); err != nil {
@@ -808,7 +800,6 @@ func (c PythonClient) Query(ctx context.Context, principalID string, action, res
 		return nil, err
 	}
 	defer conn.Close()
-	defer closeOnContextDone(ctx, conn)()
 	payload := map[string]any{
 		"limit": limit,
 	}
@@ -904,7 +895,6 @@ func (c PythonClient) callMap(ctx context.Context, method string, payload map[st
 		return nil, err
 	}
 	defer conn.Close()
-	defer closeOnContextDone(ctx, conn)()
 	if err := c.writeRPC(conn, method, payload, principalID); err != nil {
 		return nil, err
 	}
@@ -921,7 +911,6 @@ func (c PythonClient) callList(ctx context.Context, method string, payload map[s
 		return nil, err
 	}
 	defer conn.Close()
-	defer closeOnContextDone(ctx, conn)()
 	if err := c.writeRPC(conn, method, payload, principalID); err != nil {
 		return nil, err
 	}
@@ -932,31 +921,6 @@ func (c PythonClient) callList(ctx context.Context, method string, payload map[s
 	return response, nil
 }
 
-func (c PythonClient) dial(ctx context.Context) (net.Conn, error) {
-	if !filepath.IsAbs(c.Address) {
-		return nil, fmt.Errorf("Python AgentService requires an absolute Unix socket path")
-	}
-	conn, err := (&net.Dialer{}).DialContext(ctx, "unix", c.Address)
-	if err != nil {
-		return nil, err
-	}
-	if deadline, ok := ctx.Deadline(); ok {
-		if err := conn.SetDeadline(deadline); err != nil {
-			conn.Close()
-			return nil, err
-		}
-	}
-	return conn, nil
-}
-
-func closeOnContextDone(ctx context.Context, conn net.Conn) func() {
-	done := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = conn.Close()
-		case <-done:
-		}
-	}()
-	return func() { close(done) }
+func (c PythonClient) dial(ctx context.Context) (*RPCConnection, error) {
+	return OpenRPCConnection(ctx, c.Transport, c.Address)
 }

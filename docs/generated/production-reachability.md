@@ -17,8 +17,8 @@
 
 ## Import reachability result
 
-- Reachable repository modules: `200`.
-- Resolved import edges: `1176`.
+- Reachable repository modules: `205`.
+- Resolved import edges: `1212`.
 - Forbidden production edges: `0`.
 - Unresolved internal edges: `0`.
 
@@ -39,6 +39,7 @@
 - `khaos.agent.core`
 - `khaos.agent.error_handler`
 - `khaos.agent.events`
+- `khaos.agent.turn_repository`
 - `khaos.audit`
 - `khaos.audit.anchor`
 - `khaos.audit.logger`
@@ -120,6 +121,7 @@
 - `khaos.db.database`
 - `khaos.db.migrations._registry`
 - `khaos.db.repositories`
+- `khaos.db.repositories.memories`
 - `khaos.db.repositories.sessions`
 - `khaos.db.state_root`
 - `khaos.exceptions`
@@ -139,6 +141,8 @@
 - `khaos.modes.manager`
 - `khaos.permissions`
 - `khaos.permissions.engine`
+- `khaos.permissions.evaluator`
+- `khaos.permissions.models`
 - `khaos.permissions.resource`
 - `khaos.permissions.rules`
 - `khaos.project_context`
@@ -151,6 +155,7 @@
 - `khaos.routing.providers.base`
 - `khaos.routing.providers.openai_compatible`
 - `khaos.routing.router`
+- `khaos.routing.table`
 - `khaos.rpc`
 - `khaos.rpc.audit_service`
 - `khaos.rpc.memory_service`

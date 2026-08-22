@@ -41,7 +41,13 @@ from khaos.audit import AuditLogger
 from khaos.coding.task_manager import TaskManager, TaskStatus, TransitionResult
 from khaos.db import Database
 from khaos.exceptions import PermissionDeniedError
-from khaos.memory import Memory, MemoryConfidence, MemoryScope, MemoryStore
+from khaos.memory import (
+    Memory,
+    MemoryConfidence,
+    MemoryScope,
+    MemoryStore,
+    SqliteMemoryRepository,
+)
 from khaos.modes import Mode, ModeManager
 from khaos.permissions import ApprovalMode, PermissionEngine, PermissionRule
 
@@ -146,8 +152,8 @@ async def test_memory_private_namespace_is_principal_scoped(tmp_path):
     ``shared`` namespace (``principal_id=''``) remains visible to both
     so project-wide memories still work."""
     db = await _db(tmp_path)
-    alice_store = MemoryStore(db, principal_id="alice")
-    bob_store = MemoryStore(db, principal_id="bob")
+    alice_store = MemoryStore(SqliteMemoryRepository(db), principal_id="alice")
+    bob_store = MemoryStore(SqliteMemoryRepository(db), principal_id="bob")
 
     await alice_store.set(
         Memory(id=None, scope=MemoryScope.GLOBAL, key="alice-secret",

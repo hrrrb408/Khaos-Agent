@@ -27,7 +27,12 @@ from khaos.coding.workspace.manager import WorkspaceManager
 from khaos.coding.workspace.office_authority import OfficeMutationAuthority
 from khaos.db.state_root import project_id as compute_project_id
 from khaos.exceptions import RuntimeCloseError
-from khaos.memory import MemoryBudget, MemoryManager, MemoryStore
+from khaos.memory import (
+    MemoryBudget,
+    MemoryManager,
+    MemoryStore,
+    SqliteMemoryRepository,
+)
 from khaos.modes import ModeManager
 from khaos.permissions import PermissionEngine
 from khaos.routing.router import create_default_router
@@ -1065,7 +1070,7 @@ async def build_runtime(
     await permission_engine.load_rules()
     memory_manager = cfg.memory_manager or MemoryManager(
         MemoryStore(
-            cfg.db,
+            SqliteMemoryRepository(cfg.db),
             principal_id=cfg.principal_id,
             project_id=project_id,
             audit_logger=audit_logger,

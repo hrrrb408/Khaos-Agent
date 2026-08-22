@@ -16,6 +16,80 @@ const AUTHORITY_TIMESTAMP_SCALE: f64 = 1000.0;
 const MAX_WIRE_TIMESTAMP: u64 = (1_u64 << 53) - 1;
 const MAX_CLOCK_SKEW_SECONDS: f64 = 60.0;
 
+/// The effect identity that a native launch is authorized to perform.
+/// Binding this before parsing a receipt prevents callers from accidentally
+/// treating a valid receipt for another operation or resource as equivalent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReceiptBinding<'a> {
+    operation: &'a str,
+    resource_digest: &'a str,
+}
+
+impl<'a> ReceiptBinding<'a> {
+    /// Build a validated operation/resource binding for one native launch.
+    pub fn new(operation: &'a str, resource_digest: &'a str) -> io::Result<Self> {
+        validate_binding_text("operation", operation)?;
+        validate_binding_text("resource digest", resource_digest)?;
+        Ok(Self {
+            operation,
+            resource_digest,
+        })
+    }
+}
+
+/// Proof returned only after the signed receipt and its launch binding pass.
+/// The launcher currently needs only the success/failure result, but keeping
+/// the verified identity typed prevents future callers from re-reading raw
+/// JSON to decide what was authorized.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedReceipt {
+    pub operation: String,
+    pub resource_digest: String,
+    pub authorization_epoch: u64,
+}
+
+/// Native receipt verifier.  It owns FD reads, signature checks, time checks,
+/// and the operation/resource binding; the launcher owns only process setup
+/// after this verifier returns a proof.
+pub struct ReceiptVerifier<'a> {
+    binding: ReceiptBinding<'a>,
+    now: Option<f64>,
+}
+
+impl<'a> ReceiptVerifier<'a> {
+    /// Create a verifier using the system clock.
+    pub fn new(operation: &'a str, resource_digest: &'a str) -> io::Result<Self> {
+        Ok(Self {
+            binding: ReceiptBinding::new(operation, resource_digest)?,
+            now: None,
+        })
+    }
+
+    /// Pin the verification clock for deterministic tests or a caller-owned
+    /// clock boundary.  Production callers leave the verifier unpinned.
+    pub fn at_time(mut self, now: f64) -> Self {
+        self.now = Some(now);
+        self
+    }
+
+    /// Verify receipt and public-key bytes read from already-open descriptors.
+    pub fn verify_from_fds(
+        &self,
+        receipt_fd: RawFd,
+        public_key_fd: RawFd,
+    ) -> io::Result<VerifiedReceipt> {
+        let receipt = read_fd(receipt_fd, MAX_RECEIPT_BYTES)?;
+        let public_key = read_fd(public_key_fd, 4096)?;
+        verify_json_bound(
+            &receipt,
+            &public_key,
+            self.now,
+            Some(self.binding.operation),
+            Some(self.binding.resource_digest),
+        )
+    }
+}
+
 pub fn verify_from_fds_bound(
     receipt_fd: RawFd,
     public_key_fd: RawFd,
@@ -23,15 +97,14 @@ pub fn verify_from_fds_bound(
     expected_operation: &str,
     expected_resource_digest: &str,
 ) -> io::Result<()> {
-    let receipt = read_fd(receipt_fd, MAX_RECEIPT_BYTES)?;
-    let public_key = read_fd(public_key_fd, 4096)?;
-    verify_json_bound(
-        &receipt,
-        &public_key,
-        now,
-        Some(expected_operation),
-        Some(expected_resource_digest),
-    )
+    let verifier = ReceiptVerifier::new(expected_operation, expected_resource_digest)?;
+    let verifier = match now {
+        Some(now) => verifier.at_time(now),
+        None => verifier,
+    };
+    verifier
+        .verify_from_fds(receipt_fd, public_key_fd)
+        .map(|_| ())
 }
 
 fn verify_json_bound(
@@ -40,7 +113,7 @@ fn verify_json_bound(
     now: Option<f64>,
     expected_operation: Option<&str>,
     expected_resource_digest: Option<&str>,
-) -> io::Result<()> {
+) -> io::Result<VerifiedReceipt> {
     let mut value: Value =
         serde_json::from_slice(receipt).map_err(|error| invalid(error.to_string()))?;
     let object = value
@@ -81,13 +154,20 @@ fn verify_json_bound(
             return Err(invalid(format!("authorization receipt {field} is invalid")));
         }
     }
-    if object
+    let authorization_epoch = object
         .get("authorization_epoch")
         .and_then(Value::as_u64)
-        .is_none()
-    {
-        return Err(invalid("authorization receipt epoch is invalid"));
-    }
+        .ok_or_else(|| invalid("authorization receipt epoch is invalid"))?;
+    let operation = object
+        .get("operation")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid("authorization receipt operation is missing"))?
+        .to_owned();
+    let resource_digest = object
+        .get("resource_digest")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid("authorization receipt resource_digest is missing"))?
+        .to_owned();
     let expires_at = receipt_timestamp(object, "expires_at")?;
     let issued_at = receipt_timestamp(object, "issued_at")?;
     if expires_at <= issued_at || expires_at - issued_at > 300.0 {
@@ -140,7 +220,19 @@ fn verify_json_bound(
     let canonical = canonical_json(&value);
     verifying_key
         .verify(canonical.as_bytes(), &signature)
-        .map_err(|error| invalid(error.to_string()))
+        .map_err(|error| invalid(error.to_string()))?;
+    Ok(VerifiedReceipt {
+        operation,
+        resource_digest,
+        authorization_epoch,
+    })
+}
+
+fn validate_binding_text(label: &str, value: &str) -> io::Result<()> {
+    if value.is_empty() || value.len() > 512 || value.contains('\0') {
+        return Err(invalid(format!("receipt {label} binding is invalid")));
+    }
+    Ok(())
 }
 
 fn receipt_timestamp(object: &Map<String, Value>, field: &str) -> io::Result<f64> {
@@ -246,14 +338,23 @@ mod tests {
         value["signature"] =
             Value::String(base64::engine::general_purpose::STANDARD.encode(signature.to_bytes()));
         let public = signing.verifying_key().to_bytes();
-        assert!(verify_json_bound(
+        let verified = verify_json_bound(
             value.to_string().as_bytes(),
             &public,
             Some(1050.0),
             None,
             None,
         )
-        .is_ok());
+        .expect("complete receipt should verify");
+        assert_eq!(verified.operation, "exec.host");
+        assert_eq!(verified.resource_digest, "resource");
+        assert_eq!(verified.authorization_epoch, 1);
+    }
+
+    #[test]
+    fn binding_rejects_empty_effect_identity() {
+        assert!(ReceiptBinding::new("", "resource").is_err());
+        assert!(ReceiptBinding::new("exec.host", "").is_err());
     }
 
     #[test]

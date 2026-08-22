@@ -22,9 +22,10 @@ import json
 import time
 
 import pytest
-
 from khaos.agent.core import Message
+from khaos.agent.turn_repository import DatabaseTurnRepository
 from khaos.db.database import Database
+from khaos.memory import SqliteMemoryRepository
 
 
 @pytest.fixture
@@ -133,7 +134,6 @@ async def test_concurrent_permission_revoke_and_audit_insert(db: Database):
     principal = "bob"
     project = "proj-2"
     policy = "digest-bbb"
-    now = time.time()
 
     await db.create_session("sess-2", principal_id=principal, project_id=project)
     await db.bind_authorization_context(principal, project, policy)
@@ -289,9 +289,10 @@ async def test_concurrent_turn_terminalization_and_scheduler_write(db: Database)
     now = time.time()
 
     await db.create_session(session, principal_id=principal, project_id=project)
+    turn_repository = DatabaseTurnRepository(db)
 
     # Start a turn
-    await db.start_agent_turn(
+    await turn_repository.start_agent_turn(
         turn_id="turn-4",
         attempt_id="attempt-4",
         session_id=session,
@@ -317,7 +318,7 @@ async def test_concurrent_turn_terminalization_and_scheduler_write(db: Database)
     terminal_can_finish = asyncio.Event()
 
     async def terminalize_turn():
-        await db.append_agent_turn_event(
+        await turn_repository.append_agent_turn_event(
             turn_id="turn-4",
             expected_sequence=1,
             event_type="turn.completed",
@@ -369,7 +370,7 @@ async def test_concurrent_authorization_bind_and_memory_write(db: Database):
     principal = "eve"
     project = "proj-5"
     session = "sess-5"
-    now = time.time()
+    repository = SqliteMemoryRepository(db)
 
     await db.create_session(session, principal_id=principal, project_id=project)
 
@@ -388,7 +389,7 @@ async def test_concurrent_authorization_bind_and_memory_write(db: Database):
         await asyncio.wait_for(bind_started.wait(), timeout=5.0)
         await asyncio.sleep(0.05)
         # Memory write must not commit the bind's transaction
-        await db.upsert_memory(
+        await repository.upsert(
             scope="test", key="key-5", value="value-5",
             ttl=3600, confidence=5,
             principal_id=principal, namespace="private",
@@ -409,7 +410,7 @@ async def test_concurrent_authorization_bind_and_memory_write(db: Database):
     assert ctx["epoch"] == 2  # initial bind=1, rebind=2
 
     # Verify: memory was persisted
-    mem = await db.get_memory(
+    mem = await repository.get(
         scope="test", key="key-5",
         principal_id=principal, namespace="private", session_id=session,
         project_id=project,
@@ -435,6 +436,7 @@ async def test_stress_concurrent_writes_across_domains_no_errors(db: Database):
     session = "sess-6"
     policy = "digest-frank"
     now = time.time()
+    repository = SqliteMemoryRepository(db)
 
     await db.create_session(session, principal_id=principal, project_id=project)
     await db.bind_authorization_context(principal, project, policy)
@@ -450,7 +452,7 @@ async def test_stress_concurrent_writes_across_domains_no_errors(db: Database):
         )
 
     async def memory_write(i: int):
-        await db.upsert_memory(
+        await repository.upsert(
             scope="stress", key=f"key-{i}", value=f"val-{i}",
             ttl=3600, confidence=1,
             principal_id=principal, namespace="private",
@@ -498,9 +500,8 @@ async def test_stress_concurrent_writes_across_domains_no_errors(db: Database):
     assert sequences == list(range(1, 201)), "chat event sequences must be gapless"
 
     # Verify memories were all persisted
-    memories = await db.list_memories(
-        scope="stress", principal_id=principal, namespace="private",
-        project_id=project,
+    memories = await repository.list(
+        scope="stress", principal_id=principal, project_id=project,
     )
     assert len(memories) == 200
 
@@ -518,7 +519,6 @@ async def test_nested_transaction_inner_does_not_commit_outer(db: Database):
     principal = "grace"
     project = "proj-7"
     session = "sess-7"
-    now = time.time()
 
     await db.create_session(session, principal_id=principal, project_id=project)
 

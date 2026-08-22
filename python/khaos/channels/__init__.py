@@ -25,10 +25,13 @@ from khaos.channels.models import (
 )
 from khaos.channels.registry import (
     ChannelConfig,
+    ChannelConfigSnapshot,
     ChannelHealth,
+    ChannelHealthSnapshot,
     ChannelRegistry,
     ChannelStatus,
     RegisteredChannel,
+    RegisteredChannelSnapshot,
 )
 from khaos.channels.webhook import (
     WebhookHandler,
@@ -36,4 +39,4 @@ from khaos.channels.webhook import (
     WebhookReplayGuard,
 )
 
-__all__ = ["BotAdapter", "Channel", "ChannelConfig", "ChannelHealth", "ChannelRegistry", "ChannelStatus", "ChannelType", "ContentType", "DeliveryResult", "DiscordAdapter", "LogFileChannel", "MediaAttachment", "MemoryChannel", "Message", "MessageDirection", "MessageDispatcher", "PlatformMessage", "RegisteredChannel", "ReplyReference", "Sender", "SlackAdapter", "TelegramAdapter", "WeChatAdapter", "WebSocketChannel", "WebhookHandler", "WebhookRateLimiter", "WebhookReplayGuard"]
+__all__ = ["BotAdapter", "Channel", "ChannelConfig", "ChannelConfigSnapshot", "ChannelHealth", "ChannelHealthSnapshot", "ChannelRegistry", "ChannelStatus", "ChannelType", "ContentType", "DeliveryResult", "DiscordAdapter", "LogFileChannel", "MediaAttachment", "MemoryChannel", "Message", "MessageDirection", "MessageDispatcher", "PlatformMessage", "RegisteredChannel", "RegisteredChannelSnapshot", "ReplyReference", "Sender", "SlackAdapter", "TelegramAdapter", "WeChatAdapter", "WebSocketChannel", "WebhookHandler", "WebhookRateLimiter", "WebhookReplayGuard"]

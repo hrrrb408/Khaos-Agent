@@ -2,7 +2,13 @@ from khaos.agent import AgentConfig, AgentLoop
 from khaos.agent.compressor import ContextCompressor
 from khaos.agent.error_handler import ErrorHandler
 from khaos.db import Database
-from khaos.memory import Memory, MemoryManager, MemoryScope, MemoryStore
+from khaos.memory import (
+    Memory,
+    MemoryManager,
+    MemoryScope,
+    MemoryStore,
+    SqliteMemoryRepository,
+)
 from khaos.modes import Mode, ModeManager
 from khaos.permissions import PermissionEngine
 from khaos.routing.router import create_default_router
@@ -22,7 +28,7 @@ async def test_full_phase1_flow_with_memory_tool_compression_and_error_handler(t
     await db.create_session("s1", mode="coding")
     mode_manager = ModeManager(db, project_root=tmp_path)
     await mode_manager.switch(Mode.CODING)
-    memory_store = MemoryStore(db)
+    memory_store = MemoryStore(SqliteMemoryRepository(db))
     await memory_store.set(Memory(None, MemoryScope.GLOBAL, "user", "Ruibang"))
     memory_manager = MemoryManager(
         memory_store,
@@ -54,4 +60,3 @@ async def test_full_phase1_flow_with_memory_tool_compression_and_error_handler(t
     assert any(message.role == "tool" for message in persisted)
     assert logs[0]["action"] == "read_file"
     await db.close()
-

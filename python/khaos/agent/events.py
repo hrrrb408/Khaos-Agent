@@ -9,6 +9,8 @@ import weakref
 from dataclasses import dataclass
 from typing import Any
 
+from khaos.agent.turn_repository import TurnRepository
+
 _RECOVERY_TASKS: weakref.WeakKeyDictionary[Any, asyncio.Task[Any]] = (
     weakref.WeakKeyDictionary()
 )
@@ -27,9 +29,14 @@ class TurnCoordinator:
     """Append one ordered event stream and exactly one durable terminal."""
 
     def __init__(
-        self, db: Any, *, turn_id: str, attempt_id: str, sequence: int = 1
+        self,
+        repository: TurnRepository,
+        *,
+        turn_id: str,
+        attempt_id: str,
+        sequence: int = 1,
     ) -> None:
-        self._db = db
+        self._repository = repository
         self.turn_id = turn_id
         self.attempt_id = attempt_id
         self.sequence = sequence
@@ -39,17 +46,17 @@ class TurnCoordinator:
     @classmethod
     async def start(
         cls,
-        db: Any,
+        repository: TurnRepository,
         *,
         session_id: str,
         task_id: str | None,
         principal_id: str,
         project_id: str = "",
     ) -> TurnCoordinator:
-        await _recover_once(db)
+        await _recover_once(repository)
         turn_id = uuid.uuid4().hex
         attempt_id = uuid.uuid4().hex
-        await db.start_agent_turn(
+        await repository.start_agent_turn(
             turn_id=turn_id,
             attempt_id=attempt_id,
             session_id=session_id,
@@ -72,7 +79,7 @@ class TurnCoordinator:
             # older callers that don't pass it (ad-hoc test loops).
             project_id=project_id,
         )
-        return cls(db, turn_id=turn_id, attempt_id=attempt_id)
+        return cls(repository, turn_id=turn_id, attempt_id=attempt_id)
 
     async def emit(
         self, event_type: str, payload: dict[str, Any] | None = None
@@ -91,7 +98,7 @@ class TurnCoordinator:
             self._active_tool_calls.remove(call_id)
         elif event_type == "approval.wait" and call_id not in self._active_tool_calls:
             raise PermissionError("approval wait has no tool call")
-        self.sequence = await self._db.append_agent_turn_event(
+        self.sequence = await self._repository.append_agent_turn_event(
             turn_id=self.turn_id,
             expected_sequence=self.sequence,
             event_type=event_type,
@@ -121,7 +128,7 @@ class TurnCoordinator:
             "reason": reason,
             "unmatched_tool_calls": sorted(self._active_tool_calls),
         }
-        self.sequence = await self._db.append_agent_turn_event(
+        self.sequence = await self._repository.append_agent_turn_event(
             turn_id=self.turn_id,
             expected_sequence=self.sequence,
             event_type=event_type,
@@ -145,16 +152,16 @@ class TurnCoordinator:
         return tuple(sorted(self._active_tool_calls))
 
 
-async def _recover_once(db: Any) -> None:
-    task = _RECOVERY_TASKS.get(db)
+async def _recover_once(repository: TurnRepository) -> None:
+    task = _RECOVERY_TASKS.get(repository)
     if task is None:
         task = asyncio.create_task(
-            db.recover_inflight_agent_turns(now=time.time())
+            repository.recover_inflight_agent_turns(now=time.time())
         )
-        _RECOVERY_TASKS[db] = task
+        _RECOVERY_TASKS[repository] = task
     try:
         await asyncio.shield(task)
     except Exception:
-        if _RECOVERY_TASKS.get(db) is task:
-            del _RECOVERY_TASKS[db]
+        if _RECOVERY_TASKS.get(repository) is task:
+            del _RECOVERY_TASKS[repository]
         raise

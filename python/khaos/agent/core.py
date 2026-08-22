@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from khaos.coding.verify_fix import VerifyFixLoop
     from khaos.project_context import ProjectContextLoader
 
+from khaos.agent.turn_repository import DatabaseTurnRepository, TurnRepository
 from khaos.exceptions import CompressionCircuitOpenError
 from khaos.security.orchestration_components import TurnAdmission, TurnFinalizer
 from khaos.security.orchestration_phases import (
@@ -97,6 +98,7 @@ class AgentLoop:
         mode_manager,
         router,
         db,
+        turn_repository: TurnRepository | None = None,
         tool_scheduler=None,
         confirm_callback=None,
         context_compressor=None,
@@ -156,6 +158,11 @@ class AgentLoop:
         self.mode_manager = mode_manager
         self.router = router
         self.db = db
+        # The agent loop still uses ``db`` for message/session persistence,
+        # while durable turn events travel through one explicit port.  The
+        # default keeps legacy construction sites source-compatible; runtime
+        # tests may inject a fake repository without exposing a database.
+        self.turn_repository = turn_repository or DatabaseTurnRepository(db)
         self.tool_scheduler = tool_scheduler
         self.confirm_callback = confirm_callback
         self.compressor = context_compressor
@@ -338,7 +345,7 @@ class AgentLoop:
         from khaos.agent.events import TurnCoordinator
 
         turn = await TurnCoordinator.start(
-            self.db,
+            self.turn_repository,
             session_id=session_id,
             task_id=active_task_id,
             principal_id=self.principal_id,

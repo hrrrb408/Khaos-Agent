@@ -1596,6 +1596,13 @@ class AgentService:
         :meth:`RequestContext.for_cli` without a session_id — but the
         RPC path always provides a non-empty ctx.principal_id.
         """
+        # Direct CLI/TUI callers may use ``RequestContext.for_cli`` without a
+        # project claim; the server-bound project is the only safe default in
+        # that local path.  An explicit claim is never rewritten: a mismatch
+        # is a fail-closed drift error before any session or audit write.
+        project_id = ctx.project_id or self._bound_project_id
+        if project_id != self._bound_project_id:
+            raise ValueError("request project_id does not match server binding")
         await self.db.create_session(
             session_id, mode or "office",
             principal_id=ctx.principal_id,
@@ -1605,14 +1612,29 @@ class AgentService:
             # (owner-preserving), so once a session is bound to a
             # (principal, project) pair a later ``create_session``
             # call from a different project cannot re-stamp it.
-            project_id=ctx.project_id,
+            project_id=project_id,
         )
         from khaos.runtime import ProductionRuntimeConfig, build_production_runtime
+
+        # The server owns the physical audit chain, but each runtime must
+        # write under the authenticated request identity.  A bound sink is
+        # intentionally borrowed; the runtime cannot close or rebind it.
+        request_audit_logger = (
+            self._audit_logger.bind(
+                principal_id=ctx.principal_id,
+                project_id=project_id,
+                policy_digest=ctx.policy_digest or self._effective_policy.digest,
+                runtime_id=ctx.runtime_id or None,
+                source_transport=ctx.source_transport,
+            )
+            if self._audit_logger is not None
+            else None
+        )
 
         return await build_production_runtime(ProductionRuntimeConfig(
             project_root=self.project_root, config_path=self.config_path,
             mode_override=mode or None, confirm_callback=self._wait_for_confirmation,
-            db=self.db, audit_logger=self._audit_logger,
+            db=self.db, audit_logger=request_audit_logger,
             # C-1-5a: do NOT pass a shared task_manager — let
             # ``build_runtime`` construct a per-turn TaskManager from
             # ``cfg.principal_id`` (factory.py:502-517).  Previously
@@ -2201,12 +2223,15 @@ async def serve_json_lines(
         # periodically was the C-05 bug.
         maintenance = MaintenanceService(db, approval_broker=agent.approval_broker)
         maintenance.start()
-        # M4 batch 3.1.16A-4-2: MemoryService now holds ``db`` and
-        # constructs a per-request ``MemoryStore`` scoped to
-        # ``ctx.principal_id``.  Previously it was bound to a
-        # server-level ``MemoryStore(local-uid)`` singleton, so an API
-        # principal could read/write the local-uid's memories.
-        memory = MemoryService(db)
+        # MemoryService receives explicit repository and audit ports.  The
+        # service binds both to each authenticated RequestContext; it never
+        # shares the server logger's local-uid attribution with API callers.
+        from khaos.memory import SqliteMemoryRepository
+
+        memory = MemoryService(
+            SqliteMemoryRepository(db),
+            audit_logger=agent._audit_logger,
+        )
         # C-2-3: SessionService proxies REST /api/sessions list/detail
         # reads to the durable ``sessions`` table, scoped to
         # ``ctx.principal_id``.  Previously the Go Gateway served these

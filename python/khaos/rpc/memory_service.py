@@ -11,10 +11,10 @@ from __future__ import annotations
 
 from dataclasses import asdict
 
-from khaos.db import Database
 from khaos.memory import (
     Memory,
     MemoryConfidence,
+    MemoryRepository,
     MemoryScope,
     MemoryStore,
 )
@@ -24,15 +24,28 @@ from khaos.runtime import RequestContext
 class MemoryService:
     """Expose memory operations with context-derived ownership."""
 
-    def __init__(self, db: Database) -> None:
-        self.db = db
+    def __init__(self, repository: MemoryRepository, audit_logger=None) -> None:
+        """Create the service from explicit persistence and audit ports."""
+        self.repository = repository
+        self.audit_logger = audit_logger
 
     def _store(self, ctx: RequestContext) -> MemoryStore:
         """Build a store bound to the authenticated principal and project."""
+        audit_sink = None
+        if self.audit_logger is not None:
+            audit_sink = self.audit_logger.bind(
+                principal_id=ctx.principal_id,
+                project_id=ctx.project_id,
+                policy_digest=ctx.policy_digest or self.audit_logger.policy_digest,
+                runtime_id=ctx.runtime_id or None,
+                source_transport=ctx.source_transport,
+            )
         return MemoryStore(
-            self.db,
+            self.repository,
             principal_id=ctx.principal_id,
             project_id=ctx.project_id,
+            audit_logger=audit_sink,
+            audit_session_id=ctx.session_id or None,
         )
 
     async def get_memory(
