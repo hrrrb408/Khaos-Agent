@@ -19,6 +19,26 @@ class PlanExecutionReadModel:
 
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
+        self._verification_success_verifier: Callable[[str], Any] | None = None
+        self._authoritative_verification_reads_required = False
+
+    def install_verification_success_verifier(
+        self, verifier: Callable[[str], Any]
+    ) -> None:
+        """Bind the runtime-owned proof verifier used by VERIFIED reads."""
+        if self._verification_success_verifier is not None:
+            if self._verification_success_verifier == verifier:
+                return
+            raise PermissionError("verification success verifier already installed")
+        self._verification_success_verifier = verifier
+
+    def require_authoritative_verification_reads(self) -> None:
+        """Require proof authority whenever a VERIFIED run is read."""
+        self._authoritative_verification_reads_required = True
+
+    def reset_verification_success_verifier(self) -> None:
+        """Clear the boot-scoped verifier during runtime shutdown."""
+        self._verification_success_verifier = None
 
     def get_execution_run_by_context(self, execution_context_id: str) -> Any | None:
         row = self._conn.execute(
@@ -39,13 +59,18 @@ class PlanExecutionReadModel:
             (execution_run_id,),
         ).fetchone()
         if row is not None and row["status"] == "verified":
-            if verification_success_verifier is None:
-                if authoritative_verification_reads_required:
+            verifier = verification_success_verifier or self._verification_success_verifier
+            requires_authority = (
+                authoritative_verification_reads_required
+                or self._authoritative_verification_reads_required
+            )
+            if verifier is None:
+                if requires_authority:
                     raise PermissionError(
                         "VERIFIED execution cannot be trusted without authority"
                     )
             else:
-                verification_success_verifier(execution_run_id)
+                verifier(execution_run_id)
         return self.row_to_execution_run(row) if row is not None else None
 
     def list_incomplete_execution_runs(self) -> tuple[Any, ...]:

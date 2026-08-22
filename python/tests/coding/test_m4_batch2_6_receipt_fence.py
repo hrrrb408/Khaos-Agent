@@ -282,7 +282,7 @@ def test_03_broker_signature_normal_approve_passes():
     assert row["signer_key_id"]
 
     # The approval request is now APPROVED.
-    req = store.get_request(request.approval_request_id)
+    req = store.approval_read_model.get_request(request.approval_request_id)
     assert req.status.value == "approved"
 
 

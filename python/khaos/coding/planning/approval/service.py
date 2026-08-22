@@ -39,6 +39,7 @@ from khaos.coding.planning.approval.repository import (
     PersistedPlanRepository,
     PlanRepository,
 )
+from khaos.coding.planning.approval.read_model import PlanApprovalReadModel
 from khaos.coding.planning.approval.store import (
     ApprovalTransitionResult,
     PlanApprovalStore,
@@ -165,6 +166,7 @@ class PlanApprovalService:
         broker: Any,
         context_provider: ContextProvider,
         *,
+        approval_read_model: PlanApprovalReadModel | None = None,
         runtime_capability: Any = None,
         plan_repository: PlanRepository | None = None,
         planning_service: Any | None = None,
@@ -183,7 +185,10 @@ class PlanApprovalService:
             raise TypeError("production PlanApprovalService requires PersistedPlanRepository")
         if planning_service is None or getattr(planning_service, "_unsafe_test_only", False):
             raise TypeError("production PlanApprovalService requires deep planning validator")
+        if approval_read_model is None:
+            raise TypeError("production PlanApprovalService requires approval read model")
         self._store = store
+        self._approval_read_model = approval_read_model
         self._boot_context = verified_boot_context
         self._broker = broker
         self._context_provider = context_provider
@@ -308,7 +313,9 @@ class PlanApprovalService:
                 "content; use a new plan_id or explicit revision"
             )
 
-        existing = self._store.find_request_by_plan_binding(plan.plan_id, ctx.binding_digest)
+        existing = self._approval_read_model.find_request_by_plan_binding(
+            plan.plan_id, ctx.binding_digest
+        )
         if existing is not None and not existing.status.is_terminal:
             return existing
         if existing is not None and existing.status == PlanApprovalStatus.PENDING:
@@ -484,7 +491,7 @@ class PlanApprovalService:
                 f"receipt namespace {receipt.namespace!r} is not plan-execution"
             )
 
-        request = self._store.get_request_by_broker(receipt.broker_request_id)
+        request = self._approval_read_model.get_request_by_broker(receipt.broker_request_id)
         if request is None:
             raise UnknownBrokerRequestError(receipt.broker_request_id)
         if receipt.approval_request_id != request.approval_request_id:
@@ -616,7 +623,7 @@ class PlanApprovalService:
                 "receipt token not found in outbox (forged or unknown receipt)"
             )
 
-        return self._store.get_request(request.approval_request_id)  # type: ignore[return-value]
+        return self._approval_read_model.get_request(request.approval_request_id)  # type: ignore[return-value]
 
     # ------------------------------------------------------------------
     # Reconciliation (§7) — recover registering/pending rows at startup
@@ -636,7 +643,7 @@ class PlanApprovalService:
         self._verify_boot()
         now = float(self._clock() if now is None else now)
         counts = {"re_registered": 0, "staled": 0, "left_pending": 0}
-        for request in self._store.list_registering_or_pending():
+        for request in self._approval_read_model.list_registering_or_pending():
             if request.status == PlanApprovalStatus.REGISTERING:
                 # Attempt re-registration. We can't rebuild the original
                 # binding/summary without the plan, so mark stale if the plan
@@ -737,7 +744,7 @@ class PlanApprovalService:
         :meth:`PlanApprovalStore.invalidate_request_and_authorizations` — no
         request=revoked + auth=active window.
         """
-        request = self._store.get_request(approval_request_id)
+        request = self._approval_read_model.get_request(approval_request_id)
         if request is None:
             raise PlanApprovalError(f"unknown approval request {approval_request_id}")
         now = float(self._clock())
@@ -769,7 +776,7 @@ class PlanApprovalService:
             raise ApprovalConflictError(
                 f"cannot revoke request in status {request.status.value}"
             )
-        return self._store.get_request(approval_request_id)  # type: ignore[return-value]
+        return self._approval_read_model.get_request(approval_request_id)  # type: ignore[return-value]
 
     def invalidate_for_task(
         self, *, task_id: str, actor_id: str = "system", reason: str = "task terminal"
@@ -780,7 +787,7 @@ class PlanApprovalService:
         """
         count = 0
         now = float(self._clock())
-        for request in self._store.list_requests_for_task(task_id):
+        for request in self._approval_read_model.list_requests_for_task(task_id):
             if request.status in (PlanApprovalStatus.PENDING, PlanApprovalStatus.APPROVED, PlanApprovalStatus.REGISTERING, PlanApprovalStatus.NOT_REQUIRED):
                 audit = PlanApprovalAuditEvent(
                     event_id=new_event_id(),

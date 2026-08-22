@@ -50,7 +50,7 @@ def test_transition_run_cannot_enter_passed(tmp_path, source):
             "verify1", expected=(source,), target=VerificationRunStatus.PASSED,
         )
     assert store.get_run("verify1").status == source
-    assert approval.get_execution_run("run1").status == ExecutionRunStatus.VERIFYING
+    assert approval.execution_read_model.get_execution_run("run1").status == ExecutionRunStatus.VERIFYING
 
 
 def test_finish_step_and_run_cannot_write_success(tmp_path):
@@ -63,7 +63,7 @@ def test_finish_step_and_run_cannot_write_success(tmp_path):
         store.finish_step_and_run(step)
     assert store.list_steps("verify1")[0].status == VerificationStepStatus.RUNNING
     assert store.get_run("verify1").status == VerificationRunStatus.RUNNING
-    assert approval.get_execution_run("run1").status == ExecutionRunStatus.VERIFYING
+    assert approval.execution_read_model.get_execution_run("run1").status == ExecutionRunStatus.VERIFYING
 
 
 @pytest.mark.parametrize("table,status", [
@@ -79,7 +79,7 @@ def test_direct_sql_success_state_is_rejected(tmp_path, table, status):
         )
     approval._conn.rollback()
     assert store.get_run("verify1").status == VerificationRunStatus.RUNNING
-    assert approval.get_execution_run("run1").status == ExecutionRunStatus.VERIFYING
+    assert approval.execution_read_model.get_execution_run("run1").status == ExecutionRunStatus.VERIFYING
 
 
 @pytest.mark.parametrize("table,status,key", [
@@ -110,7 +110,7 @@ def test_independent_sqlite_connection_cannot_bypass_success_guard(
     finally:
         attacker.close()
     assert store.get_run("verify1").status == VerificationRunStatus.RUNNING
-    assert approval.get_execution_run("run1").status == ExecutionRunStatus.VERIFYING
+    assert approval.execution_read_model.get_execution_run("run1").status == ExecutionRunStatus.VERIFYING
 
 
 def test_finalize_success_second_state_failure_rolls_back_both(tmp_path):
@@ -136,7 +136,7 @@ def test_finalize_success_second_state_failure_rolls_back_both(tmp_path):
             cleanup_proof=proof,
         )
     assert store.get_run(verification_run_id).status == VerificationRunStatus.FINALIZING
-    assert store._approval_store.get_execution_run(execution_run_id).status == ExecutionRunStatus.VERIFYING
+    assert store._approval_store.execution_read_model.get_execution_run(execution_run_id).status == ExecutionRunStatus.VERIFYING
 
 
 def test_finalize_success_rejects_proof_from_another_run(tmp_path):
@@ -157,7 +157,7 @@ def test_finalize_success_rejects_proof_from_another_run(tmp_path):
             workspace_id="dvw-bound", cleanup_proof=foreign,
         )
     assert store.get_run(verification_run_id).status == VerificationRunStatus.FINALIZING
-    assert store._approval_store.get_execution_run(execution_run_id).status == ExecutionRunStatus.VERIFYING
+    assert store._approval_store.execution_read_model.get_execution_run(execution_run_id).status == ExecutionRunStatus.VERIFYING
 
 
 def test_cleanup_proof_insert_is_run_scoped_idempotent(tmp_path):
@@ -240,7 +240,7 @@ def _completed_verification(tmp_path):
     assert result.status == VerificationRunStatus.PASSED
     store = runtime._verification_store
     run = store.get_run(result.verification_run_id)
-    execution = runtime._store.get_execution_run(mutation.execution_run_id)
+    execution = runtime._store.execution_read_model.get_execution_run(mutation.execution_run_id)
     assert execution.status == ExecutionRunStatus.VERIFIED
     artifact = store.list_artifacts_for_run(run.verification_run_id)[0]
     store._conn.execute(
@@ -326,7 +326,7 @@ def test_finalizing_recovery_rejects_artifact_attacks(tmp_path, attack):
     assert time.monotonic() - started < 2.0
     assert len(backend.calls) == calls_before
     assert runtime._verification_store.get_run(run.verification_run_id).status == VerificationRunStatus.ERRORED
-    assert runtime._store.get_execution_run(execution.execution_run_id).status == ExecutionRunStatus.VERIFICATION_ERROR
+    assert runtime._store.execution_read_model.get_execution_run(execution.execution_run_id).status == ExecutionRunStatus.VERIFICATION_ERROR
 
 
 def test_artifact_basename_swap_during_read_is_rejected(tmp_path, monkeypatch):
@@ -354,7 +354,7 @@ def test_artifact_basename_swap_during_read_is_rejected(tmp_path, monkeypatch):
     assert swapped
     assert len(backend.calls) == calls_before
     assert runtime._verification_store.get_run(run.verification_run_id).status == VerificationRunStatus.ERRORED
-    assert runtime._store.get_execution_run(execution.execution_run_id).status == ExecutionRunStatus.VERIFICATION_ERROR
+    assert runtime._store.execution_read_model.get_execution_run(execution.execution_run_id).status == ExecutionRunStatus.VERIFICATION_ERROR
 
 
 def test_artifact_parent_path_symlink_swap_is_rejected(tmp_path):
@@ -368,7 +368,7 @@ def test_artifact_parent_path_symlink_swap_is_rejected(tmp_path):
     runtime._verification_runner._recover_finalizing_runs()
     assert len(backend.calls) == calls_before
     assert runtime._verification_store.get_run(run.verification_run_id).status == VerificationRunStatus.ERRORED
-    assert runtime._store.get_execution_run(execution.execution_run_id).status == ExecutionRunStatus.VERIFICATION_ERROR
+    assert runtime._store.execution_read_model.get_execution_run(execution.execution_run_id).status == ExecutionRunStatus.VERIFICATION_ERROR
 
 
 def test_artifact_id_cannot_escape_storage_root(tmp_path):

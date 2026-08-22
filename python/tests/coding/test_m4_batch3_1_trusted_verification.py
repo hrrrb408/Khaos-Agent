@@ -361,11 +361,11 @@ def _execution_run(run_id="run1"):
 def _mutated_store(tmp_path):
     approval = PlanApprovalStore(sqlite3.connect(tmp_path / "state.sqlite"))
     run = _execution_run()
-    approval.create_execution_run(run)
-    approval.transition_execution_run(run.execution_run_id, expected=("created",), target="validating")
-    approval.transition_execution_run(run.execution_run_id, expected=("validating",), target="mutating")
-    approval.transition_execution_run(run.execution_run_id, expected=("mutating",), target="sealing")
-    approval.transition_execution_run(run.execution_run_id, expected=("sealing",), target="mutated")
+    approval.execution_writer.create_execution_run(run)
+    approval.execution_writer.transition_execution_run(run.execution_run_id, expected=("created",), target="validating")
+    approval.execution_writer.transition_execution_run(run.execution_run_id, expected=("validating",), target="mutating")
+    approval.execution_writer.transition_execution_run(run.execution_run_id, expected=("mutating",), target="sealing")
+    approval.execution_writer.transition_execution_run(run.execution_run_id, expected=("sealing",), target="mutated")
     return approval, VerificationExecutionStore(approval)
 
 
@@ -398,7 +398,7 @@ def test_verification_store_cas_and_atomic_execution_status(tmp_path, target):
     store.transition_run("verify1", expected=(VerificationRunStatus.VALIDATING,), target=VerificationRunStatus.PREPARING_SANDBOX)
     store.transition_run("verify1", expected=(VerificationRunStatus.PREPARING_SANDBOX,), target=VerificationRunStatus.RUNNING)
     if target == VerificationRunStatus.RUNNING:
-        assert approval.get_execution_run("run1").status == ExecutionRunStatus.VERIFYING
+        assert approval.execution_read_model.get_execution_run("run1").status == ExecutionRunStatus.VERIFYING
         return
     if target == VerificationRunStatus.PASSED:
         with pytest.raises(RuntimeError, match="finalize_success"):
@@ -407,7 +407,7 @@ def test_verification_store_cas_and_atomic_execution_status(tmp_path, target):
                 target=target,
             )
         assert store.get_run("verify1").status == VerificationRunStatus.RUNNING
-        assert approval.get_execution_run("run1").status == ExecutionRunStatus.VERIFYING
+        assert approval.execution_read_model.get_execution_run("run1").status == ExecutionRunStatus.VERIFYING
         return
     store.transition_run("verify1", expected=(VerificationRunStatus.RUNNING,), target=target)
     expected = {
@@ -416,7 +416,7 @@ def test_verification_store_cas_and_atomic_execution_status(tmp_path, target):
         VerificationRunStatus.TIMED_OUT: ExecutionRunStatus.VERIFICATION_ERROR,
         VerificationRunStatus.CANCELLED: ExecutionRunStatus.CANCELLED,
     }[target]
-    assert approval.get_execution_run("run1").status == expected
+    assert approval.execution_read_model.get_execution_run("run1").status == expected
 
 
 def test_verification_store_idempotency_digest_conflict_and_crash_recovery(tmp_path):
@@ -432,7 +432,7 @@ def test_verification_store_idempotency_digest_conflict_and_crash_recovery(tmp_p
     store.transition_run("verify1", expected=(VerificationRunStatus.PREPARING_SANDBOX,), target=VerificationRunStatus.RUNNING)
     assert store.recover_interrupted() == 1
     assert store.get_run_by_execution("run1").status == VerificationRunStatus.ERRORED
-    assert approval.get_execution_run("run1").status == ExecutionRunStatus.VERIFICATION_ERROR
+    assert approval.execution_read_model.get_execution_run("run1").status == ExecutionRunStatus.VERIFICATION_ERROR
 
 
 @pytest.mark.parametrize("bad", ["jump", "backward", "wrong-cas", "double-terminal"])
@@ -638,7 +638,7 @@ def test_runtime_phase_context_runner_is_idempotent_and_canonical_workspace_unch
     assert first.status == VerificationRunStatus.PASSED
     assert second.idempotent
     assert len(backend.calls) == 1
-    assert runtime._store.get_execution_run(result.execution_run_id).status == ExecutionRunStatus.VERIFIED
+    assert runtime._store.execution_read_model.get_execution_run(result.execution_run_id).status == ExecutionRunStatus.VERIFIED
     canonical_after = {
         path.relative_to(workspace.worktree_path).as_posix(): path.read_bytes()
         for path in workspace.worktree_path.rglob("*") if path.is_file()
@@ -1167,7 +1167,7 @@ def test_finalize_success_atomic_transaction(tmp_path):
     ver = vstore.get_run_by_execution(result.execution_run_id)
     assert ver.status == VerificationRunStatus.PASSED
     # §6: Execution Run must be VERIFIED.
-    execution = runtime._store.get_execution_run(result.execution_run_id)
+    execution = runtime._store.execution_read_model.get_execution_run(result.execution_run_id)
     assert execution.status == ExecutionRunStatus.VERIFIED
     # §6: All steps must be PASSED (no RUNNING/CREATED left).
     steps = vstore.list_steps(ver.verification_run_id)
@@ -1359,7 +1359,7 @@ def test_finish_step_and_run_rejects_weak_success_path(tmp_path):
         store.finish_step_and_run(finished)
     assert store.list_steps("verify1")[0].status == VerificationStepStatus.RUNNING
     assert store.get_run_by_execution("run1").status == VerificationRunStatus.RUNNING
-    assert approval.get_execution_run("run1").status == ExecutionRunStatus.VERIFYING
+    assert approval.execution_read_model.get_execution_run("run1").status == ExecutionRunStatus.VERIFYING
 
 
 def test_fail_step_and_run_is_atomic(tmp_path):
@@ -1370,7 +1370,7 @@ def test_fail_step_and_run_is_atomic(tmp_path):
     store.fail_step_and_run(failed)
     assert store.list_steps("verify1")[0].status == VerificationStepStatus.FAILED
     assert store.get_run_by_execution("run1").status == VerificationRunStatus.FAILED
-    assert approval.get_execution_run("run1").status == ExecutionRunStatus.VERIFICATION_FAILED
+    assert approval.execution_read_model.get_execution_run("run1").status == ExecutionRunStatus.VERIFICATION_FAILED
 
 
 def test_timeout_step_and_run_is_atomic(tmp_path):
@@ -1381,7 +1381,7 @@ def test_timeout_step_and_run_is_atomic(tmp_path):
     store.timeout_step_and_run(timed)
     assert store.list_steps("verify1")[0].status == VerificationStepStatus.TIMED_OUT
     assert store.get_run_by_execution("run1").status == VerificationRunStatus.TIMED_OUT
-    assert approval.get_execution_run("run1").status == ExecutionRunStatus.VERIFICATION_ERROR
+    assert approval.execution_read_model.get_execution_run("run1").status == ExecutionRunStatus.VERIFICATION_ERROR
 
 
 def test_abort_step_and_run_is_atomic(tmp_path):
@@ -1390,7 +1390,7 @@ def test_abort_step_and_run_is_atomic(tmp_path):
     store.abort_step_and_run("step-1", verification_run_id="verify1", failure_code="backend-crash")
     assert store.list_steps("verify1")[0].status == VerificationStepStatus.ABORTED
     assert store.get_run_by_execution("run1").status == VerificationRunStatus.ERRORED
-    assert approval.get_execution_run("run1").status == ExecutionRunStatus.VERIFICATION_ERROR
+    assert approval.execution_read_model.get_execution_run("run1").status == ExecutionRunStatus.VERIFICATION_ERROR
     assert store.assert_no_running_steps_in_terminal_run() == 0
 
 
@@ -1404,7 +1404,7 @@ def test_direct_sql_cannot_force_verification_passed(tmp_path):
         )
     approval._conn.rollback()
     assert store.get_run("verify1").status == VerificationRunStatus.RUNNING
-    assert approval.get_execution_run("run1").status == ExecutionRunStatus.VERIFYING
+    assert approval.execution_read_model.get_execution_run("run1").status == ExecutionRunStatus.VERIFYING
 
 
 def test_artifact_reserved_to_sealed_protocol(tmp_path):
@@ -2201,7 +2201,7 @@ def _running_step_and_run(tmp_path):
     )
     store.create_steps((step,))
     store.mark_step_running(step.step_run_id)
-    assert approval.get_execution_run("run1").status == ExecutionRunStatus.VERIFYING
+    assert approval.execution_read_model.get_execution_run("run1").status == ExecutionRunStatus.VERIFYING
     return approval, store, run, step
 
 
@@ -2216,7 +2216,7 @@ def test_cancel_step_and_run_atomic(tmp_path):
     assert steps[0].status == VerificationStepStatus.CANCELLED
     assert steps[0].failure_code == "user-cancelled"
     assert store.get_run_by_execution("run1").status == VerificationRunStatus.CANCELLED
-    assert approval.get_execution_run("run1").status == ExecutionRunStatus.CANCELLED
+    assert approval.execution_read_model.get_execution_run("run1").status == ExecutionRunStatus.CANCELLED
 
 
 def test_cancel_step_and_run_with_full_step_details(tmp_path):
@@ -2253,7 +2253,7 @@ def test_poison_step_and_run_atomic(tmp_path):
     assert steps[0].status == VerificationStepStatus.ERRORED
     assert steps[0].failure_code == "workspace-poisoned"
     assert store.get_run_by_execution("run1").status == VerificationRunStatus.POISONED
-    assert approval.get_execution_run("run1").status == ExecutionRunStatus.POISONED
+    assert approval.execution_read_model.get_execution_run("run1").status == ExecutionRunStatus.POISONED
 
 
 def test_cleanup_fail_step_and_run_atomic(tmp_path):
@@ -2267,7 +2267,7 @@ def test_cleanup_fail_step_and_run_atomic(tmp_path):
     assert steps[0].status == VerificationStepStatus.ERRORED
     assert steps[0].failure_code == "disposable-workspace-cleanup-failed"
     assert store.get_run_by_execution("run1").status == VerificationRunStatus.ERRORED
-    assert approval.get_execution_run("run1").status == ExecutionRunStatus.VERIFICATION_ERROR
+    assert approval.execution_read_model.get_execution_run("run1").status == ExecutionRunStatus.VERIFICATION_ERROR
 
 
 def test_cleanup_fail_step_and_run_rejects_already_terminal(tmp_path):
@@ -2511,7 +2511,7 @@ def test_fault_matrix_crash_after_create_before_id_commit(tmp_path):
     vstore = runtime._verification_store
     ver = vstore.get_run_by_execution(result.execution_run_id)
     assert ver.status == VerificationRunStatus.ERRORED
-    assert runtime._store.get_execution_run(result.execution_run_id).status == ExecutionRunStatus.VERIFICATION_ERROR
+    assert runtime._store.execution_read_model.get_execution_run(result.execution_run_id).status == ExecutionRunStatus.VERIFICATION_ERROR
 
 
 def test_fault_matrix_crash_after_id_commit_before_start(tmp_path):
@@ -2526,7 +2526,7 @@ def test_fault_matrix_crash_after_id_commit_before_start(tmp_path):
     vstore = runtime._verification_store
     ver = vstore.get_run_by_execution(result.execution_run_id)
     assert ver.status == VerificationRunStatus.ERRORED
-    assert runtime._store.get_execution_run(result.execution_run_id).status == ExecutionRunStatus.VERIFICATION_ERROR
+    assert runtime._store.execution_read_model.get_execution_run(result.execution_run_id).status == ExecutionRunStatus.VERIFICATION_ERROR
     # Sandbox instance must be TERMINATED with lifecycle failure_code.
     instances = vstore._conn.execute(
         "SELECT state, failure_code FROM verification_sandbox_instances"
@@ -2711,7 +2711,7 @@ def test_fault_matrix_cancel_atomic_transaction(tmp_path):
     # All three must be terminal in the same state.
     assert store.list_steps(run.verification_run_id)[0].status == VerificationStepStatus.CANCELLED
     assert store.get_run_by_execution("run1").status == VerificationRunStatus.CANCELLED
-    assert approval.get_execution_run("run1").status == ExecutionRunStatus.CANCELLED
+    assert approval.execution_read_model.get_execution_run("run1").status == ExecutionRunStatus.CANCELLED
     # No RUNNING steps remain.
     assert store.assert_no_running_steps_in_terminal_run() == 0
 
@@ -2737,7 +2737,7 @@ def test_fault_matrix_reconcile_sandbox_instance_atomic(tmp_path):
     assert instance.failure_code == "crash-reconciled"
     assert store.list_steps("verify1")[0].status == VerificationStepStatus.ABORTED
     assert store.get_run_by_execution("run1").status == VerificationRunStatus.ERRORED
-    assert approval.get_execution_run("run1").status == ExecutionRunStatus.VERIFICATION_ERROR
+    assert approval.execution_read_model.get_execution_run("run1").status == ExecutionRunStatus.VERIFICATION_ERROR
 
 
 def test_fault_matrix_disposable_workspace_unknown_file_cleanup_fail(tmp_path):
@@ -3259,7 +3259,7 @@ def _artifact_runtime(tmp_path, *, backend=None):
     if backend is None:
         backend = _FaultMatrixBackend(_profile())
     runtime, result = _fault_matrix_runtime(tmp_path, backend=backend)
-    execution = runtime._store.get_execution_run(result.execution_run_id)
+    execution = runtime._store.execution_read_model.get_execution_run(result.execution_run_id)
     now = time.time()
     runtime._verification_store.create_run(VerificationExecutionRun(
         verification_run_id="verify1",
@@ -3285,7 +3285,7 @@ def _artifact_runtime(tmp_path, *, backend=None):
 
 def _ensure_verification_run(runtime, execution_run_id, *, verification_run_id="verify1"):
     """Create a minimal CREATED verification run bound to an execution."""
-    execution = runtime._store.get_execution_run(execution_run_id)
+    execution = runtime._store.execution_read_model.get_execution_run(execution_run_id)
     now = time.time()
     runtime._verification_store.create_run(VerificationExecutionRun(
         verification_run_id=verification_run_id,
@@ -4537,7 +4537,7 @@ def test_approval_request_persists_snapshot_fields(tmp_path):
         approved_verification_plan_digest="snap-digest-1",
     )
     store.insert_request(request)
-    loaded = store.get_request("apr-snap-test")
+    loaded = store.approval_read_model.get_request("apr-snap-test")
     assert loaded is not None
     assert loaded.approved_verification_plan_id == "avp-snap-1"
     assert loaded.approved_verification_plan_digest == "snap-digest-1"

@@ -79,7 +79,7 @@ def test_02_forged_actor_rejected():
     receipt = broker_decide(broker=broker, store=store, request=request, approved=True, actor_id="legit-user")
     updated = service.apply_broker_decision(receipt)
     # The decision record's actor is the one the broker authenticated.
-    decisions = store.list_decisions(request.approval_request_id)
+    decisions = store.approval_read_model.list_decisions(request.approval_request_id)
     assert decisions[-1].actor_id == "legit-user"
 
 
@@ -163,8 +163,8 @@ def test_07_atomic_decision_commit():
     updated = service.apply_broker_decision(receipt)
     assert updated.status is PlanApprovalStatus.APPROVED
     # All four artifacts exist together.
-    assert store.list_decisions(request.approval_request_id)
-    assert store.list_audit_events(approval_request_id=request.approval_request_id)
+    assert store.approval_read_model.list_decisions(request.approval_request_id)
+    assert store.approval_read_model.list_audit_events(approval_request_id=request.approval_request_id)
     # Receipt consumed.
     receipt_row = store.get_receipt_by_token(receipt.one_time_token)
     assert receipt_row is not None
@@ -180,9 +180,9 @@ def test_08_fault_injection_full_rollback():
     request = service.request_approval(plan)
     receipt = broker_decide(broker=broker, store=store, request=request, approved=True)
     # Snapshot pre-state.
-    pre_status = store.get_request(request.approval_request_id).status
-    pre_decisions = store.list_decisions(request.approval_request_id)
-    pre_audit = store.list_audit_events(approval_request_id=request.approval_request_id)
+    pre_status = store.approval_read_model.get_request(request.approval_request_id).status
+    pre_decisions = store.approval_read_model.list_decisions(request.approval_request_id)
+    pre_audit = store.approval_read_model.list_audit_events(approval_request_id=request.approval_request_id)
 
     # Sabotage: force the audit insert to fail by making the table name
     # unreachable. We monkeypatch the store's connection to raise on the
@@ -196,10 +196,10 @@ def test_08_fault_injection_full_rollback():
         conn.execute("ALTER TABLE _audit_hidden RENAME TO plan_approval_audit_events")
 
     # Everything restored.
-    post = store.get_request(request.approval_request_id)
+    post = store.approval_read_model.get_request(request.approval_request_id)
     assert post.status is pre_status  # still PENDING
-    assert store.list_decisions(request.approval_request_id) == pre_decisions
-    assert store.list_audit_events(approval_request_id=request.approval_request_id) == pre_audit
+    assert store.approval_read_model.list_decisions(request.approval_request_id) == pre_decisions
+    assert store.approval_read_model.list_audit_events(approval_request_id=request.approval_request_id) == pre_audit
     # Receipt NOT consumed.
     receipt_row = store.get_receipt_by_token(receipt.one_time_token)
     assert int(receipt_row["consumed"]) == 0
@@ -222,7 +222,7 @@ def test_09_repeated_mint_no_multiple_active_authorizations():
     # Same authorization returned.
     assert auth1.authorization_id == auth2.authorization_id
     # Exactly one row in the table.
-    rows = store.list_authorizations_for_plan(plan.plan_id)
+    rows = store.approval_read_model.list_authorizations_for_plan(plan.plan_id)
     active = [r for r in rows if r.status is AuthorizationStatus.ACTIVE]
     assert len(active) == 1
 
@@ -240,7 +240,7 @@ def test_10_consume_authorization_consumes_request():
         expected_workspace_id=plan.workspace_id, expected_repository_id=plan.repository_id,
             owner_execution_id="exec_test",
     )
-    assert store.get_request(request.approval_request_id).status is PlanApprovalStatus.CONSUMED
+    assert store.approval_read_model.get_request(request.approval_request_id).status is PlanApprovalStatus.CONSUMED
 
 
 def test_11_request_consumed_then_mint_rejected():
@@ -274,7 +274,7 @@ def test_12_not_required_single_execution():
         expected_workspace_id=plan.workspace_id, expected_repository_id=plan.repository_id,
             owner_execution_id="exec_test",
     )
-    assert store.get_request(request.approval_request_id).status is PlanApprovalStatus.CONSUMED
+    assert store.approval_read_model.get_request(request.approval_request_id).status is PlanApprovalStatus.CONSUMED
     with pytest.raises((ApprovalMissingError, AuthorizationAlreadyConsumedError)):
         gate.authorize_execution(plan_id=plan.plan_id, approval_request_id=request.approval_request_id)
 
@@ -345,8 +345,8 @@ def test_13_revoke_mint_race(tmp_path):
     # Invariant: no request=revoked AND authorization=active simultaneously.
     final_conn = sqlite3.connect(str(db))
     final_store = PlanApprovalStore(final_conn)
-    active = [a for a in final_store.list_authorizations_for_plan(plan.plan_id) if a.status is AuthorizationStatus.ACTIVE]
-    final_req = final_store.get_request(request.approval_request_id)
+    active = [a for a in final_store.approval_read_model.list_authorizations_for_plan(plan.plan_id) if a.status is AuthorizationStatus.ACTIVE]
+    final_req = final_store.approval_read_model.get_request(request.approval_request_id)
     if final_req.status is PlanApprovalStatus.REVOKED:
         assert len(active) == 0
     final_conn.close()
@@ -361,7 +361,7 @@ def test_14_revoked_request_zero_active_authorizations():
     gate = make_gate(store=store, context=ctx, plan_repository=repo)
     gate.authorize_execution(plan_id=plan.plan_id, approval_request_id=request.approval_request_id)
     service.revoke(request.approval_request_id, actor_id="admin")
-    active = [a for a in store.list_authorizations_for_plan(plan.plan_id) if a.status is AuthorizationStatus.ACTIVE]
+    active = [a for a in store.approval_read_model.list_authorizations_for_plan(plan.plan_id) if a.status is AuthorizationStatus.ACTIVE]
     assert len(active) == 0
 
 
@@ -374,7 +374,7 @@ def test_15_mint_then_revoke_revokes_authorization():
     gate = make_gate(store=store, context=ctx, plan_repository=repo)
     auth = gate.authorize_execution(plan_id=plan.plan_id, approval_request_id=request.approval_request_id)
     service.revoke(request.approval_request_id, actor_id="admin")
-    refreshed = store.get_authorization(auth.authorization_id)
+    refreshed = store.approval_read_model.get_authorization(auth.authorization_id)
     assert refreshed.status is AuthorizationStatus.REVOKED
 
 
@@ -561,7 +561,7 @@ def test_23_broker_registration_failure_leaves_no_pending_orphan(tmp_path):
     assert row is not None
     assert row["status"] == "registration-failed"
     # And reconcile won't surface it as pending.
-    pending = [r for r in store.list_registering_or_pending() if r.plan_id == plan.plan_id]
+    pending = [r for r in store.approval_read_model.list_registering_or_pending() if r.plan_id == plan.plan_id]
     assert len(pending) == 0
 
 
@@ -585,7 +585,7 @@ def test_25_early_callback_safe_retry():
     # Reconcile is safe to call repeatedly.
     service.reconcile()
     service.reconcile()
-    assert store.get_request(request.approval_request_id).status is PlanApprovalStatus.PENDING
+    assert store.approval_read_model.get_request(request.approval_request_id).status is PlanApprovalStatus.PENDING
 
 
 def test_26_restart_recovers_pending_request(tmp_path):

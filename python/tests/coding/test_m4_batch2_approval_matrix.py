@@ -391,7 +391,7 @@ def test_30_task_cancelled_invalidates_approval():
     approve_and_apply(service=service, broker=broker, store=store, request=request, plan=plan)
     count = service.invalidate_for_task(task_id="task1", reason="task cancelled")
     assert count == 1
-    assert store.get_request(request.approval_request_id).status is PlanApprovalStatus.STALE
+    assert store.approval_read_model.get_request(request.approval_request_id).status is PlanApprovalStatus.STALE
 
 
 def test_32_needs_approval_without_request_refuses_authorization():
@@ -583,7 +583,7 @@ def test_48_audit_event_complete():
     plan = make_plan(risks=(high_risk(),), plan_id="plan_audit")
     service, store, ctx, broker, repo = make_service()
     request = service.request_approval(plan)
-    events = store.list_audit_events(approval_request_id=request.approval_request_id)
+    events = store.approval_read_model.list_audit_events(approval_request_id=request.approval_request_id)
     assert len(events) >= 1
     ev = events[0]
     assert ev.event_type.startswith("plan-approval:")

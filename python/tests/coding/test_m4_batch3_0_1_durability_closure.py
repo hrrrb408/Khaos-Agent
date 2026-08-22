@@ -74,7 +74,7 @@ def test_post_mutation_parent_fsync_fault_rolls_back_current_edit(tmp_path, monk
 def test_durable_phase_journal_fault_uses_disk_state_for_rollback(tmp_path, monkeypatch, phase):
     edit = _operation_edit(tmp_path, PlannedEditOperation.UPDATE)
     runtime, workspace, plan, authorization = _setup(tmp_path, (edit,))
-    original = runtime._store.update_edit_event
+    original = runtime._store.execution_journal_writer.update_edit_event
     failed = False
 
     def fault(run_id, edit_id, **kwargs):
@@ -84,7 +84,9 @@ def test_durable_phase_journal_fault_uses_disk_state_for_rollback(tmp_path, monk
             raise sqlite3.OperationalError(f"{phase}-journal")
         return original(run_id, edit_id, **kwargs)
 
-    monkeypatch.setattr(runtime._store, "update_edit_event", fault)
+    monkeypatch.setattr(
+        runtime._store.execution_journal_writer, "update_edit_event", fault
+    )
     expected_error = (
         WorkspaceMutationError if phase == "filesystem-applied"
         else sqlite3.OperationalError
@@ -113,7 +115,7 @@ def test_recovery_seal_crash_boundaries_are_deterministic(tmp_path, boundary):
         "task1", "ws1", "repo", "abc123", 1, "binding", "bundle",
         status, now, now,
     )
-    runtime._store.create_execution_run(run)
+    runtime._store.execution_writer.create_execution_run(run)
     recovery = workspace.recovery_root / run_id
     if boundary != "deleted-before-terminal":
         recovery.mkdir(parents=True)
@@ -124,14 +126,14 @@ def test_recovery_seal_crash_boundaries_are_deterministic(tmp_path, boundary):
         if boundary == "partial-delete":
             (recovery / "artifact").unlink()
     if boundary == "before-sealing":
-        runtime._store.insert_edit_event(
+        runtime._store.execution_journal_writer.insert_edit_event(
             event_id=uuid.uuid4().hex, execution_run_id=run_id, edit_id="e1",
             ordinal=0, operation="create", path="a.txt", destination_path=None,
             before_hash=None, before_mode=None, recovery_artifact=None,
             planned_after_hash=_hash("new"),
         )
     recovered = runtime._mutation_engine.recover_incomplete_runs()
-    current = runtime._store.get_execution_run(run_id)
+    current = runtime._store.execution_read_model.get_execution_run(run_id)
     if boundary == "before-sealing":
         assert current.status == ExecutionRunStatus.POISONED
     else:
@@ -293,7 +295,7 @@ def test_rollback_does_not_destroy_third_party_content(tmp_path, monkeypatch, op
         PlannedEditOperation.CREATE if operation == "create" else PlannedEditOperation.RENAME,
     )
     runtime, workspace, plan, authorization = _setup(tmp_path, (edit,))
-    original = runtime._store.update_edit_event; injected = False
+    original = runtime._store.execution_journal_writer.update_edit_event; injected = False
     def fault(run_id, edit_id, **kwargs):
         nonlocal injected
         if kwargs.get("status") == "filesystem-applied" and not injected:
@@ -304,7 +306,9 @@ def test_rollback_does_not_destroy_third_party_content(tmp_path, monkeypatch, op
                 (workspace.worktree_path / "a.txt").write_text("third-party")
             raise sqlite3.OperationalError("phase")
         return original(run_id, edit_id, **kwargs)
-    monkeypatch.setattr(runtime._store, "update_edit_event", fault)
+    monkeypatch.setattr(
+        runtime._store.execution_journal_writer, "update_edit_event", fault
+    )
     with pytest.raises(WorkspaceMutationError, match="rollback failed"):
         _apply(runtime, plan, authorization, _bundle(plan, (edit,)))
     assert (workspace.worktree_path / "a.txt").read_text() == "third-party"
@@ -317,14 +321,14 @@ def test_scoped_recovery_does_not_clear_unrelated_poison(tmp_path):
     runtime.mutation_fence.poison("ws1", "lease-release", owner="lease:l1")
     runtime._store.add_workspace_poison_scope("ws1", owner="lease:l1", reason="lease-release")
     run_id = f"per_{uuid.uuid4().hex}"; now = time.time()
-    runtime._store.create_execution_run(PlanExecutionRun(
+    runtime._store.execution_writer.create_execution_run(PlanExecutionRun(
         run_id, "p", "h", "r", f"a-{run_id}", f"c-{run_id}", "l", "task1",
         "ws1", "repo", "abc123", 1, "b", "d", ExecutionRunStatus.SEALING,
         now, now,
     ))
     recovered = runtime._mutation_engine.recover_incomplete_runs()
     assert run_id not in recovered
-    assert runtime._store.get_execution_run(run_id).status == ExecutionRunStatus.POISONED
+    assert runtime._store.execution_read_model.get_execution_run(run_id).status == ExecutionRunStatus.POISONED
     scopes = runtime._store.list_workspace_poison_scopes("ws1")
     assert any(owner == "lease:l1" for _, owner, _ in scopes)
     assert runtime.mutation_fence.is_poisoned("ws1")
@@ -334,7 +338,7 @@ def test_recovery_root_symlink_is_fail_closed(tmp_path):
     runtime, _, manager, _ = _real_runtime(tmp_path)
     workspace = _workspace(tmp_path, manager)
     run_id = f"per_{uuid.uuid4().hex}"; now = time.time()
-    runtime._store.create_execution_run(PlanExecutionRun(
+    runtime._store.execution_writer.create_execution_run(PlanExecutionRun(
         run_id, "p", "h", "r", f"a-{run_id}", f"c-{run_id}", "l", "task1",
         "ws1", "repo", "abc123", 1, "b", "d", ExecutionRunStatus.MUTATING,
         now, now,
@@ -343,7 +347,7 @@ def test_recovery_root_symlink_is_fail_closed(tmp_path):
     outside = tmp_path / "outside-recovery"; outside.mkdir()
     (container / run_id).symlink_to(outside, target_is_directory=True)
     assert run_id not in runtime._mutation_engine.recover_incomplete_runs()
-    assert runtime._store.get_execution_run(run_id).status == ExecutionRunStatus.POISONED
+    assert runtime._store.execution_read_model.get_execution_run(run_id).status == ExecutionRunStatus.POISONED
 
 
 def test_no_execution_side_channels_or_base_repository_changes(tmp_path):

@@ -34,10 +34,7 @@ import time
 import uuid
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    from khaos.coding.planning.execution_models import RollbackResumeState
+from typing import Any
 
 from khaos.coding.planning.approval.execution_journal_writer import (
     PlanExecutionJournalWriter,
@@ -95,24 +92,14 @@ class PlanApprovalStore:
         self._execution_writer = PlanExecutionWriter(
             self._conn,
             self._execution_read_model,
-            audit_writer=lambda *args, **kwargs: self._insert_execution_audit(
-                *args, **kwargs
-            ),
         )
-        self._execution_journal_writer = PlanExecutionJournalWriter(
-            self._conn,
-            audit_writer=lambda *args, **kwargs: self._insert_execution_audit(
-                *args, **kwargs
-            ),
-        )
+        self._execution_journal_writer = PlanExecutionJournalWriter(self._conn)
         # Batch 2.6 §1: a name-mangled writer handle that ONLY the runtime
         # can install (via _install_runtime_receipt_writer). It is NOT a
         # sink closure and NOT exposed as a public attribute. Ordinary
         # callers cannot read or replace it.
         self.__runtime_receipt_writer = None  # type: ignore[assignment]
         self.__runtime_receipt_token = None
-        self.__verification_success_verifier = None
-        self.__authoritative_verification_reads_required = False
         # Public-only verifier registry. Unknown keys fail closed; prior-boot
         # public keys remain loadable across signing-key rotation.
         self.__receipt_verifiers: dict[str, Any] = {}
@@ -121,6 +108,31 @@ class PlanApprovalStore:
                 self.__receipt_verifiers[verifier.key_id] = verifier
         except Exception as exc:
             logger.debug("could not load persisted receipt verifiers", exc_info=exc)
+
+    @property
+    def approval_read_model(self) -> PlanApprovalReadModel:
+        """Return the read-only owner for approval ledger queries.
+
+        The store deliberately exposes the owner object instead of forwarding
+        query methods.  Callers must depend on the read boundary explicitly;
+        approval CAS and lease mutations remain on this store.
+        """
+        return self._read_model
+
+    @property
+    def execution_read_model(self) -> PlanExecutionReadModel:
+        """Return the read-only owner for planned-execution records."""
+        return self._execution_read_model
+
+    @property
+    def execution_writer(self) -> PlanExecutionWriter:
+        """Return the sole transactional writer for execution runs/proofs."""
+        return self._execution_writer
+
+    @property
+    def execution_journal_writer(self) -> PlanExecutionJournalWriter:
+        """Return the sole transactional writer for edit journals."""
+        return self._execution_journal_writer
 
     def _install_runtime_receipt_writer(
         self, writer: Any, *, runtime_token: object, runtime_capability: Any = None
@@ -162,17 +174,13 @@ class PlanApprovalStore:
 
     def _install_verification_success_verifier(self, verifier: Any) -> None:
         """Install Runtime-owned validation for authoritative VERIFIED reads."""
-        if self.__verification_success_verifier is not None:
-            if self.__verification_success_verifier == verifier:
-                return
-            raise PermissionError("verification success verifier already installed")
-        self.__verification_success_verifier = verifier
+        self._execution_read_model.install_verification_success_verifier(verifier)
 
     def _require_authoritative_verification_reads(self) -> None:
-        self.__authoritative_verification_reads_required = True
+        self._execution_read_model.require_authoritative_verification_reads()
 
     def _reset_verification_success_verifier(self) -> None:
-        self.__verification_success_verifier = None
+        self._execution_read_model.reset_verification_success_verifier()
 
     def _persist_receipt_verifier(self, verifier: Any, *, runtime_token: object) -> None:
         """Persist public verification material only."""
@@ -368,17 +376,6 @@ class PlanApprovalStore:
             ),
         )
         self._conn.commit()
-
-    def get_request(self, approval_request_id: str) -> PlanApprovalRequest | None:
-        return self._read_model.get_request(approval_request_id)
-
-    def get_request_by_broker(self, broker_request_id: str) -> PlanApprovalRequest | None:
-        return self._read_model.get_request_by_broker(broker_request_id)
-
-    @staticmethod
-    def _row_to_request(row: sqlite3.Row) -> PlanApprovalRequest:
-        """Compatibility conversion alias; the read model owns conversion."""
-        return PlanApprovalReadModel.row_to_request(row)
 
     # ------------------------------------------------------------------
     # Atomic status CAS (internal helper — does NOT write decision/audit)
@@ -864,9 +861,6 @@ class PlanApprovalStore:
         )
         self._conn.commit()
 
-    def list_decisions(self, approval_request_id: str) -> list[PlanApprovalDecision]:
-        return self._read_model.list_decisions(approval_request_id)
-
     def insert_audit_event(self, event: PlanApprovalAuditEvent) -> None:
         self._conn.execute(
             """
@@ -885,14 +879,6 @@ class PlanApprovalStore:
             ),
         )
         self._conn.commit()
-
-    def list_audit_events(
-        self, *, approval_request_id: str | None = None, plan_id: str | None = None
-    ) -> list[PlanApprovalAuditEvent]:
-        return self._read_model.list_audit_events(
-            approval_request_id=approval_request_id,
-            plan_id=plan_id,
-        )
 
     # ------------------------------------------------------------------
     # Execution authorizations
@@ -925,14 +911,6 @@ class PlanApprovalStore:
             "direct PlanApprovalStore.consume_authorization is disabled; "
             "use PlanExecutionGate.acquire_lease / require_authorization"
         )
-
-    def get_authorization(self, authorization_id: str) -> PlanExecutionAuthorization | None:
-        return self._read_model.get_authorization(authorization_id)
-
-    @staticmethod
-    def _row_to_authorization(row: sqlite3.Row) -> PlanExecutionAuthorization:
-        """Compatibility conversion alias; the read model owns conversion."""
-        return PlanApprovalReadModel.row_to_authorization(row)
 
     def _verify_persisted_boot_context(
         self, *, server_epoch: int, boot_id: str,
@@ -1292,15 +1270,6 @@ class PlanApprovalStore:
             self._conn.rollback()
             raise
 
-    def list_authorizations_for_plan(self, plan_id: str) -> list[PlanExecutionAuthorization]:
-        return self._read_model.list_authorizations_for_plan(plan_id)
-
-    def list_registering_or_pending(self) -> list[PlanApprovalRequest]:
-        return self._read_model.list_registering_or_pending()
-
-    def list_requests_for_task(self, task_id: str) -> list[PlanApprovalRequest]:
-        return self._read_model.list_requests_for_task(task_id)
-
     def refresh_expiry(self, approval_request_id: str, new_expiry: float) -> None:
         conn = self._conn
         conn.execute(
@@ -1308,11 +1277,6 @@ class PlanApprovalStore:
             (float(new_expiry), approval_request_id),
         )
         conn.commit()
-
-    def find_request_by_plan_binding(
-        self, plan_id: str, binding_digest: str
-    ) -> PlanApprovalRequest | None:
-        return self._read_model.find_request_by_plan_binding(plan_id, binding_digest)
 
     # ------------------------------------------------------------------
     # Persisted server epoch (Batch 2.2 §3)
@@ -2244,251 +2208,6 @@ class PlanApprovalStore:
     # ------------------------------------------------------------------
     # Batch 3 execution journal
     # ------------------------------------------------------------------
-
-    def create_execution_run(self, run: Any) -> Any:
-        """Compatibility delegate; execution writer owns the transaction."""
-        return self._execution_writer.create_execution_run(run)
-
-    def transition_execution_run(
-        self, execution_run_id: str, *, expected: tuple[str, ...], target: str,
-        failure_code: str = "", completed: bool = False,
-    ) -> None:
-        self._execution_writer.transition_execution_run(
-            execution_run_id,
-            expected=expected,
-            target=target,
-            failure_code=failure_code,
-            completed=completed,
-        )
-
-    def begin_or_resume_rollback(
-        self, execution_run_id: str, *, failure_code: str,
-        now: float | None = None,
-    ) -> RollbackResumeState:
-        return self._execution_writer.begin_or_resume_rollback(
-            execution_run_id,
-            failure_code=failure_code,
-            now=now,
-        )
-
-    def insert_edit_event(
-        self, *, event_id: str, execution_run_id: str, edit_id: str,
-        ordinal: int, operation: str, path: str, destination_path: str | None,
-        before_hash: str | None, before_mode: int | None,
-        recovery_artifact: str | None, planned_after_hash: str = "",
-        planned_after_mode: int | None = None,
-    ) -> None:
-        self._execution_journal_writer.insert_edit_event(
-            event_id=event_id,
-            execution_run_id=execution_run_id,
-            edit_id=edit_id,
-            ordinal=ordinal,
-            operation=operation,
-            path=path,
-            destination_path=destination_path,
-            before_hash=before_hash,
-            before_mode=before_mode,
-            recovery_artifact=recovery_artifact,
-            planned_after_hash=planned_after_hash,
-            planned_after_mode=planned_after_mode,
-        )
-
-    def transition_edit_event(
-        self, execution_run_id: str, edit_id: str, *, expected_phase: str,
-        target_phase: str,
-        after_hash: str | None = None, after_mode: int | None = None,
-        error_code: str = "",
-        applied_identity_digest: str | None = None,
-        applied_parent_identity_digest: str | None = None,
-        applied_destination_identity_digest: str | None = None,
-    ) -> None:
-        self._execution_journal_writer.transition_edit_event(
-            execution_run_id,
-            edit_id,
-            expected_phase=expected_phase,
-            target_phase=target_phase,
-            after_hash=after_hash,
-            after_mode=after_mode,
-            error_code=error_code,
-            applied_identity_digest=applied_identity_digest,
-            applied_parent_identity_digest=applied_parent_identity_digest,
-            applied_destination_identity_digest=applied_destination_identity_digest,
-        )
-
-    def record_rollback_filesystem_applied(
-        self, execution_run_id: str, edit_id: str, *,
-        rollback_identity_digest: str,
-        rollback_parent_identity_digest: str,
-        rollback_destination_parent_identity_digest: str,
-        rollback_sync_mask: int,
-        error_code: str,
-        expected_phase: str = "rollback-started",
-    ) -> None:
-        self._execution_journal_writer.record_rollback_filesystem_applied(
-            execution_run_id,
-            edit_id,
-            rollback_identity_digest=rollback_identity_digest,
-            rollback_parent_identity_digest=rollback_parent_identity_digest,
-            rollback_destination_parent_identity_digest=(
-                rollback_destination_parent_identity_digest
-            ),
-            rollback_sync_mask=rollback_sync_mask,
-            error_code=error_code,
-            expected_phase=expected_phase,
-        )
-
-    @staticmethod
-    def _rollback_directory_sync_digest(
-        *, execution_run_id: str, edit_id: str,
-        parent_identity_digest: str,
-        destination_parent_identity_digest: str,
-        sync_mask: int,
-    ) -> str:
-        return PlanExecutionJournalWriter._rollback_directory_sync_digest(
-            execution_run_id=execution_run_id,
-            edit_id=edit_id,
-            parent_identity_digest=parent_identity_digest,
-            destination_parent_identity_digest=destination_parent_identity_digest,
-            sync_mask=sync_mask,
-        )
-
-    def record_rollback_directory_synced(
-        self, execution_run_id: str, edit_id: str, *, error_code: str,
-    ) -> str:
-        return self._execution_journal_writer.record_rollback_directory_synced(
-            execution_run_id, edit_id, error_code=error_code
-        )
-
-    def update_edit_event(
-        self, execution_run_id: str, edit_id: str, *, status: str,
-        after_hash: str | None = None, after_mode: int | None = None,
-        error_code: str = "",
-        applied_identity_digest: str | None = None,
-        applied_parent_identity_digest: str | None = None,
-        applied_destination_identity_digest: str | None = None,
-    ) -> None:
-        self._execution_journal_writer.update_edit_event(
-            execution_run_id,
-            edit_id,
-            status=status,
-            after_hash=after_hash,
-            after_mode=after_mode,
-            error_code=error_code,
-            applied_identity_digest=applied_identity_digest,
-            applied_parent_identity_digest=applied_parent_identity_digest,
-            applied_destination_identity_digest=applied_destination_identity_digest,
-        )
-
-    def mark_execution_recovery_sealed(
-        self, execution_run_id: str, *, seal_digest: str
-    ) -> None:
-        self._execution_writer.mark_execution_recovery_sealed(
-            execution_run_id, seal_digest=seal_digest
-        )
-
-    def mark_execution_rollback_sealed(
-        self, execution_run_id: str, *, seal_digest: str
-    ) -> None:
-        self._execution_writer.mark_execution_rollback_sealed(
-            execution_run_id, seal_digest=seal_digest
-        )
-
-    def save_final_mutation_attestation(self, attestation: Any) -> None:
-        self._execution_writer.save_final_mutation_attestation(attestation)
-
-    def save_initial_workspace_attestation(self, attestation: Any) -> None:
-        self._execution_writer.save_initial_workspace_attestation(attestation)
-
-    def get_initial_workspace_attestation(self, run_id: str) -> Any | None:
-        return self._execution_read_model.get_initial_workspace_attestation(run_id)
-
-    def get_final_mutation_attestation(self, execution_run_id: str) -> Any | None:
-        return self._execution_read_model.get_final_mutation_attestation(execution_run_id)
-
-    def save_rollback_final_attestation(self, attestation: Any) -> None:
-        self._execution_writer.save_rollback_final_attestation(attestation)
-
-    def get_rollback_final_attestation(self, execution_run_id: str) -> Any | None:
-        return self._execution_read_model.get_rollback_final_attestation(execution_run_id)
-
-    def commit_terminal_seal(
-        self, execution_run_id: str, *, expected_status: str, terminal_status: str,
-        seal_digest: str, tombstone_digest: str, rollback: bool,
-        failure_code: str = "",
-    ) -> None:
-        self._execution_writer.commit_terminal_seal(
-            execution_run_id,
-            expected_status=expected_status,
-            terminal_status=terminal_status,
-            seal_digest=seal_digest,
-            tombstone_digest=tombstone_digest,
-            rollback=rollback,
-            failure_code=failure_code,
-        )
-
-    def commit_recovered_terminal_state(self, *, workspace_id: str, poison_owner: str,
-                                        **kwargs: Any) -> None:
-        self._execution_writer.commit_recovered_terminal_state(
-            workspace_id=workspace_id, poison_owner=poison_owner, **kwargs
-        )
-
-    def commit_recovered_no_mutation(
-        self, *, execution_run_id: str, workspace_id: str,
-        poison_owner: str, expected_status: str, terminal_status: str,
-        baseline_digest: str, failure_code: str = "no-mutation-crash",
-    ) -> None:
-        self._execution_writer.commit_recovered_no_mutation(
-            execution_run_id=execution_run_id,
-            workspace_id=workspace_id,
-            poison_owner=poison_owner,
-            expected_status=expected_status,
-            terminal_status=terminal_status,
-            baseline_digest=baseline_digest,
-            failure_code=failure_code,
-        )
-
-    def _insert_execution_audit(
-        self, execution_run_id: str, event_type: str, *, operation: str = "",
-        path: str = "", before_hash: str = "", after_hash: str = "",
-        result: str, error_code: str = "", correlation_id: str,
-    ) -> None:
-        self._execution_writer._insert_execution_audit(
-            execution_run_id,
-            event_type,
-            operation=operation,
-            path=path,
-            before_hash=before_hash,
-            after_hash=after_hash,
-            result=result,
-            error_code=error_code,
-            correlation_id=correlation_id,
-        )
-
-    def get_execution_run_by_context(self, execution_context_id: str) -> Any | None:
-        return self._execution_read_model.get_execution_run_by_context(execution_context_id)
-
-    def get_execution_run(self, execution_run_id: str) -> Any | None:
-        return self._execution_read_model.get_execution_run(
-            execution_run_id,
-            verification_success_verifier=self.__verification_success_verifier,
-            authoritative_verification_reads_required=(
-                self.__authoritative_verification_reads_required
-            ),
-        )
-
-    def list_incomplete_execution_runs(self) -> tuple[Any, ...]:
-        return self._execution_read_model.list_incomplete_execution_runs()
-
-    def list_execution_edit_events(self, execution_run_id: str) -> tuple[sqlite3.Row, ...]:
-        return self._execution_read_model.list_execution_edit_events(execution_run_id)
-
-    def execution_journal_progress(self, execution_run_id: str) -> tuple[int, int]:
-        return self._execution_read_model.execution_journal_progress(execution_run_id)
-
-    @staticmethod
-    def _row_to_execution_run(row: sqlite3.Row) -> Any:
-        """Compatibility conversion alias; execution read model owns it."""
-        return PlanExecutionReadModel.row_to_execution_run(row)
 
 
 def new_authorization_id() -> str:

@@ -56,20 +56,23 @@ def _insert_run(connection: sqlite3.Connection, *, status: str = "mutating") -> 
     connection.commit()
 
 
-def test_store_delegates_execution_reads_to_dedicated_owner() -> None:
+def test_store_exposes_dedicated_execution_read_owner_without_delegates() -> None:
     connection = _connection()
     store = PlanApprovalStore(connection)
 
-    assert isinstance(store._execution_read_model, PlanExecutionReadModel)
-    assert store.get_execution_run_by_context("missing") is None
-    assert store.get_execution_run("missing") is None
-    assert store.list_incomplete_execution_runs() == ()
-    assert store.list_execution_edit_events("missing") == ()
+    read_model = store.execution_read_model
+    assert isinstance(read_model, PlanExecutionReadModel)
+    assert not hasattr(store, "get_execution_run")
+    assert not hasattr(store, "create_execution_run")
+    assert read_model.get_execution_run_by_context("missing") is None
+    assert read_model.get_execution_run("missing") is None
+    assert read_model.list_incomplete_execution_runs() == ()
+    assert read_model.list_execution_edit_events("missing") == ()
     with pytest.raises(RuntimeError, match="execution run not found"):
-        store.execution_journal_progress("missing")
-    assert store.get_initial_workspace_attestation("missing") is None
-    assert store.get_final_mutation_attestation("missing") is None
-    assert store.get_rollback_final_attestation("missing") is None
+        read_model.execution_journal_progress("missing")
+    assert read_model.get_initial_workspace_attestation("missing") is None
+    assert read_model.get_final_mutation_attestation("missing") is None
+    assert read_model.get_rollback_final_attestation("missing") is None
 
 
 def test_execution_read_model_never_owns_lifecycle_or_writes() -> None:

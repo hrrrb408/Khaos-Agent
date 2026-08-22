@@ -16,6 +16,12 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 from khaos.coding.planning.approval.models import compute_plan_binding_digest
+from khaos.coding.planning.approval.execution_journal_writer import (
+    PlanExecutionJournalWriter,
+)
+from khaos.coding.planning.approval.execution_read_model import PlanExecutionReadModel
+from khaos.coding.planning.approval.execution_writer import PlanExecutionWriter
+from khaos.coding.planning.approval.read_model import PlanApprovalReadModel
 from khaos.coding.planning.contracts import PlanOperation, PlanStatus
 from khaos.coding.planning.execution_models import (
     AttestedPathState,
@@ -70,7 +76,7 @@ class WorkspaceMutationError(RuntimeError):
         self.code = code
 
 
-def _resolve_avp_digest(store: Any, context: Any) -> str:
+def _resolve_avp_digest(read_model: PlanApprovalReadModel, context: Any) -> str:
     """Batch 3.1.5 §2: resolve the approved verification plan digest bound to
     the execution's approval request, so the binding digest re-computation
     embeds the same snapshot digest that was frozen at approval time.
@@ -86,7 +92,7 @@ def _resolve_avp_digest(store: Any, context: Any) -> str:
     if not approval_request_id:
         return ""
     try:
-        request = store.get_request(approval_request_id)
+        request = read_model.get_request(approval_request_id)
     except Exception:  # noqa: BLE001 - missing authority data fails closed
         return ""
     if request is None:
@@ -100,6 +106,10 @@ class WorkspaceMutationEngine:
     def __init__(
         self, *, store: Any, plan_repository: Any, workspace_manager: Any,
         context_provider: Any, guard: Any, mutation_fence: Any,
+        approval_read_model: PlanApprovalReadModel,
+        execution_read_model: PlanExecutionReadModel,
+        execution_writer: PlanExecutionWriter,
+        execution_journal_writer: PlanExecutionJournalWriter,
         runtime_capability: Any, call_authority: object,
     ) -> None:
         from khaos.coding.planning.approval.runtime import _consume_runtime_capability
@@ -113,6 +123,10 @@ class WorkspaceMutationEngine:
                 "WorkspaceMutationEngine requires ApprovalRuntime authority"
             ) from exc
         self._store = store
+        self._approval_read_model = approval_read_model
+        self._execution_read_model = execution_read_model
+        self._execution_writer = execution_writer
+        self._execution_journal_writer = execution_journal_writer
         self._plans = plan_repository
         self._workspaces = workspace_manager
         self._context_provider = context_provider
@@ -150,7 +164,7 @@ class WorkspaceMutationEngine:
         """Implementation protected by the engine's single-session lock."""
         self._guard.require_active_execution_context(context)
         normalized = bundle.normalized()
-        existing = self._store.get_execution_run_by_context(
+        existing = self._execution_read_model.get_execution_run_by_context(
             context.execution_context_id
         )
         if existing is not None:
@@ -186,12 +200,12 @@ class WorkspaceMutationEngine:
             status=ExecutionRunStatus.CREATED, started_at=now, updated_at=now,
             metadata={"edit_count": len(normalized.ordered_edits)},
         )
-        run = self._store.create_execution_run(run)
+        run = self._execution_writer.create_execution_run(run)
         if run.edit_bundle_digest != normalized.content_digest:
             raise WorkspaceMutationError(
                 "authorization-run-conflict", "authorization already has another run"
             )
-        self._store.transition_execution_run(
+        self._execution_writer.transition_execution_run(
             run.execution_run_id, expected=("created",), target="validating"
         )
 
@@ -207,7 +221,7 @@ class WorkspaceMutationEngine:
         initial = self._build_initial_attestation(
             run, context, normalized, before_git,
         )
-        self._store.save_initial_workspace_attestation(initial)
+        self._execution_writer.save_initial_workspace_attestation(initial)
         recovery: RecoveryDirectory | None = None
         changed: list[str] = []
         path_handle = WorkspacePathHandle(root)
@@ -215,7 +229,7 @@ class WorkspaceMutationEngine:
         try:
             recovery = self._prepare_recovery(workspace, run.execution_run_id)
             self._active_recovery = recovery
-            self._store.transition_execution_run(
+            self._execution_writer.transition_execution_run(
                 run.execution_run_id, expected=("validating",), target="mutating"
             )
             for ordinal, edit in enumerate(normalized.ordered_edits):
@@ -241,7 +255,7 @@ class WorkspaceMutationEngine:
                 _backup, _original_mode = self._journal_edit(
                     run.execution_run_id, ordinal, edit, root, recovery
                 )
-                self._store.update_edit_event(
+                self._execution_journal_writer.update_edit_event(
                     run.execution_run_id, edit.edit_id,
                     status="mutation-started",
                 )
@@ -258,7 +272,7 @@ class WorkspaceMutationEngine:
                 after_hash, after_mode, _ = self._current_target(
                     path_handle, edit.destination_path or edit.path
                 )
-                self._store.update_edit_event(
+                self._execution_journal_writer.update_edit_event(
                     run.execution_run_id, edit.edit_id, status="applied",
                     after_hash=after_hash or "", after_mode=after_mode,
                 )
@@ -309,8 +323,8 @@ class WorkspaceMutationEngine:
             attestation = self._build_final_attestation(
                 run, context, normalized, workspace, path_handle, after_git,
             )
-            self._store.save_final_mutation_attestation(attestation)
-            self._store.transition_execution_run(
+            self._execution_writer.save_final_mutation_attestation(attestation)
+            self._execution_writer.transition_execution_run(
                 run.execution_run_id, expected=("mutating",), target="sealing",
             )
             journal = self._validated_journal(run)
@@ -324,7 +338,7 @@ class WorkspaceMutationEngine:
                 recovery, run, "mutation", attestation.attestation_digest,
                 journal_digest,
             )
-            self._store.commit_terminal_seal(
+            self._execution_writer.commit_terminal_seal(
                 run.execution_run_id, expected_status="sealing",
                 terminal_status="mutated",
                 seal_digest=self._recovery_seal_digest(run.execution_run_id),
@@ -341,22 +355,22 @@ class WorkspaceMutationEngine:
         except Exception as exc:
             code = getattr(exc, "code", "mutation-failed")
             if recovery is None:
-                self._store.transition_execution_run(
+                self._execution_writer.transition_execution_run(
                     run.execution_run_id, expected=("validating",), target="failed",
                     failure_code=code, completed=True,
                 )
                 raise
-            current_run = self._store.get_execution_run(run.execution_run_id)
+            current_run = self._execution_read_model.get_execution_run(run.execution_run_id)
             if current_run is not None and current_run.status == ExecutionRunStatus.SEALING:
                 self._poison_run(workspace.id, run.execution_run_id, code)
-                self._store.transition_execution_run(
+                self._execution_writer.transition_execution_run(
                     run.execution_run_id, expected=("sealing",), target="poisoned",
                     failure_code=code, completed=True,
                 )
                 raise
-            if not self._store.list_execution_edit_events(run.execution_run_id):
+            if not self._execution_read_model.list_execution_edit_events(run.execution_run_id):
                 self._seal_recovery(recovery, workspace.id, run.execution_run_id)
-                self._store.transition_execution_run(
+                self._execution_writer.transition_execution_run(
                     run.execution_run_id, expected=(current_run.status.value,),
                     target="failed", failure_code=code, completed=True,
                 )
@@ -401,7 +415,9 @@ class WorkspaceMutationEngine:
                 raise WorkspaceMutationError(code, code)
         if compute_plan_binding_digest(
             plan,
-            approved_verification_plan_digest=_resolve_avp_digest(self._store, context),
+            approved_verification_plan_digest=_resolve_avp_digest(
+                self._approval_read_model, context
+            ),
         ) != context.binding_digest:
             raise WorkspaceMutationError("plan-binding-drift", "plan binding drifted")
         if not bundle.ordered_edits or len(bundle.ordered_edits) > MAX_BUNDLE_FILES:
@@ -582,7 +598,7 @@ class WorkspaceMutationEngine:
             if backup_hash != before_hash:
                 raise WorkspaceMutationError("backup-hash-mismatch", "backup verification failed")
         try:
-            self._store.insert_edit_event(
+            self._execution_journal_writer.insert_edit_event(
                 event_id=uuid.uuid4().hex, execution_run_id=run_id,
                 edit_id=edit.edit_id, ordinal=ordinal,
                 operation=edit.operation.value, path=edit.path,
@@ -749,7 +765,7 @@ class WorkspaceMutationEngine:
                     ) if edit.operation == PlannedEditOperation.RENAME else ""
                 ),
             }
-        self._store.update_edit_event(
+        self._execution_journal_writer.update_edit_event(
             run_id, edit.edit_id, status=phase, **kwargs,
         )
 
@@ -758,7 +774,7 @@ class WorkspaceMutationEngine:
         poison_after: bool = False, recovered: bool = False,
     ) -> None:
         try:
-            resume = self._store.begin_or_resume_rollback(
+            resume = self._execution_writer.begin_or_resume_rollback(
                 run_id, failure_code=failure_code,
             )
             if resume.disposition.value == "terminal":
@@ -766,7 +782,7 @@ class WorkspaceMutationEngine:
             if resume.disposition.value == "sealing":
                 return
             failure_code = resume.failure_code
-            current_run = self._store.get_execution_run(run_id)
+            current_run = self._execution_read_model.get_execution_run(run_id)
             baseline = self._require_initial_attestation(current_run)
             journal = self._validated_journal(current_run, allow_partial=True)
             self._validate_recovery_artifacts(journal, baseline, recovery)
@@ -790,7 +806,7 @@ class WorkspaceMutationEngine:
                     self._verify_rolled_back_event(
                         handle, event, baseline_paths,
                     )
-                    self._store.transition_edit_event(
+                    self._execution_journal_writer.transition_edit_event(
                         run_id, event.edit_id, expected_phase="rolled-back",
                         target_phase="rolled-back", error_code=failure_code,
                     )
@@ -803,14 +819,14 @@ class WorkspaceMutationEngine:
                             "identity-evidence-missing",
                             "mutation may have occurred before identity persistence",
                         )
-                    self._store.transition_edit_event(
+                    self._execution_journal_writer.transition_edit_event(
                         run_id, event.edit_id, expected_phase=phase,
                         target_phase="rolled-back", error_code=failure_code,
                     )
                     continue
                 if phase in {"filesystem-applied", "directory-synced", "applied"}:
                     self._assert_applied_identity(handle, event)
-                    self._store.transition_edit_event(
+                    self._execution_journal_writer.transition_edit_event(
                         run_id, event.edit_id, expected_phase=phase,
                         target_phase="rollback-started", error_code=failure_code,
                     )
@@ -849,7 +865,7 @@ class WorkspaceMutationEngine:
                         handle, event, baseline_paths,
                     )
                     self._sync_rollback_directories(handle, event)
-                    self._store.record_rollback_directory_synced(
+                    self._execution_journal_writer.record_rollback_directory_synced(
                         run_id, event.edit_id, error_code=failure_code,
                     )
                     event = self._reload_recovery_event(run_id, event.edit_id)
@@ -859,7 +875,7 @@ class WorkspaceMutationEngine:
                         handle, event, baseline_paths,
                     )
                     self._verify_rollback_parent_identities(handle, event)
-                self._store.transition_edit_event(
+                self._execution_journal_writer.transition_edit_event(
                     run_id, event.edit_id,
                     expected_phase="rollback-directory-synced",
                     target_phase="rolled-back", error_code=failure_code,
@@ -867,18 +883,18 @@ class WorkspaceMutationEngine:
             target = "cancelled" if failure_code == "execution-context-invalid" else "rolled-back"
             if poison_after:
                 self._poison_run(workspace_id, run_id, failure_code)
-                self._store.transition_execution_run(
+                self._execution_writer.transition_execution_run(
                     run_id, expected=("rolling-back",), target="poisoned",
                     failure_code=failure_code, completed=True,
                 )
                 if owns_handle:
                     handle.close()
                 return
-            current_run = self._store.get_execution_run(run_id)
+            current_run = self._execution_read_model.get_execution_run(run_id)
             journal = self._validated_journal(current_run, allow_partial=True)
             events, journal_digest = journal.events, journal.canonical_digest
             workspace = self._workspaces.get(workspace_id)
-            rollback_attestation = self._store.get_rollback_final_attestation(
+            rollback_attestation = self._execution_read_model.get_rollback_final_attestation(
                 run_id
             )
             if rollback_attestation is None:
@@ -886,14 +902,14 @@ class WorkspaceMutationEngine:
                     current_run, workspace, handle, events, journal_digest,
                     failure_code, baseline,
                 )
-                self._store.save_rollback_final_attestation(
+                self._execution_writer.save_rollback_final_attestation(
                     rollback_attestation
                 )
             else:
                 self._validate_rollback_sealing_recovery(
                     current_run, workspace, events, journal_digest,
                 )
-            self._store.transition_execution_run(
+            self._execution_writer.transition_execution_run(
                 run_id, expected=("rolling-back",), target="rollback-sealing",
                 failure_code=failure_code,
             )
@@ -915,13 +931,13 @@ class WorkspaceMutationEngine:
                 "failure_code": failure_code,
             }
             if recovered:
-                self._store.commit_recovered_terminal_state(
+                self._execution_writer.commit_recovered_terminal_state(
                     workspace_id=workspace_id, poison_owner=f"run:{run_id}",
                     attestation_digest=rollback_attestation.attestation_digest,
                     **terminal_args,
                 )
             else:
-                self._store.commit_terminal_seal(**terminal_args)
+                self._execution_writer.commit_terminal_seal(**terminal_args)
             try:
                 recovery.delete_tombstone(tombstone_name)
             except OSError:
@@ -937,8 +953,8 @@ class WorkspaceMutationEngine:
             reason = f"rollback-failed:{type(rollback_error).__name__}"
             self._poison_run(workspace_id, run_id, reason)
             try:
-                current = self._store.get_execution_run(run_id)
-                self._store.transition_execution_run(
+                current = self._execution_read_model.get_execution_run(run_id)
+                self._execution_writer.transition_execution_run(
                     run_id, expected=("rolling-back", "rollback-sealing"),
                     target="poisoned",
                     failure_code=current.failure_code if current else failure_code,
@@ -961,7 +977,7 @@ class WorkspaceMutationEngine:
             phase: str, identity: MutationObjectIdentity | None = None,
         ) -> None:
             if phase == "directory-synced":
-                self._store.record_rollback_directory_synced(
+                self._execution_journal_writer.record_rollback_directory_synced(
                     run_id, event.edit_id, error_code=failure_code,
                 )
                 return
@@ -976,7 +992,7 @@ class WorkspaceMutationEngine:
             parent_digest, destination_parent_digest, sync_mask = (
                 self._rollback_parent_evidence(identity, event)
             )
-            self._store.record_rollback_filesystem_applied(
+            self._execution_journal_writer.record_rollback_filesystem_applied(
                 run_id, event.edit_id,
                 rollback_identity_digest=digest,
                 rollback_parent_identity_digest=parent_digest,
@@ -1230,7 +1246,7 @@ class WorkspaceMutationEngine:
         parent_digest, destination_digest, sync_mask = (
             self._rollback_parent_evidence(identity, event)
         )
-        self._store.record_rollback_filesystem_applied(
+        self._execution_journal_writer.record_rollback_filesystem_applied(
             event.execution_run_id, event.edit_id,
             rollback_identity_digest=event.rollback_identity_digest,
             rollback_parent_identity_digest=parent_digest,
@@ -1245,7 +1261,7 @@ class WorkspaceMutationEngine:
     def _reload_recovery_event(
         self, execution_run_id: str, edit_id: str,
     ) -> ValidatedRecoveryEvent:
-        run = self._store.get_execution_run(execution_run_id)
+        run = self._execution_read_model.get_execution_run(execution_run_id)
         journal = self._validated_journal(run, allow_partial=True)
         for event in journal.events:
             if event.edit_id == edit_id:
@@ -1570,7 +1586,7 @@ class WorkspaceMutationEngine:
 
     def _require_initial_attestation(self, run: PlanExecutionRun) -> InitialWorkspaceAttestation:
         try:
-            value = self._store.get_initial_workspace_attestation(run.execution_run_id)
+            value = self._execution_read_model.get_initial_workspace_attestation(run.execution_run_id)
         except RuntimeError as exc:
             raise WorkspaceMutationError("initial-attestation-invalid", "initial baseline invalid") from exc
         if value is None or (value.plan_id, value.bundle_digest, value.context_id,
@@ -1657,7 +1673,7 @@ class WorkspaceMutationEngine:
         journal_digest: str,
     ) -> FinalMutationAttestation:
         try:
-            attestation = self._store.get_final_mutation_attestation(
+            attestation = self._execution_read_model.get_final_mutation_attestation(
                 run.execution_run_id
             )
         except RuntimeError as exc:
@@ -1710,7 +1726,7 @@ class WorkspaceMutationEngine:
         journal_digest: str,
     ) -> RollbackFinalAttestation:
         try:
-            attestation = self._store.get_rollback_final_attestation(
+            attestation = self._execution_read_model.get_rollback_final_attestation(
                 run.execution_run_id
             )
         except RuntimeError as exc:
@@ -1786,10 +1802,10 @@ class WorkspaceMutationEngine:
     def _validated_journal(self, run: PlanExecutionRun, *, allow_partial: bool = False) -> ValidatedRecoveryJournal:
         try:
             safe_run = SafeRecoveryRunId.parse(run.execution_run_id)
-            rows = self._store.list_execution_edit_events(run.execution_run_id)
+            rows = self._execution_read_model.list_execution_edit_events(run.execution_run_id)
             if not rows:
                 raise UnsafePersistedIdentifier("execution journal is missing")
-            persisted_count, actual_count = self._store.execution_journal_progress(
+            persisted_count, actual_count = self._execution_read_model.execution_journal_progress(
                 run.execution_run_id
             )
             if persisted_count != actual_count or actual_count != len(rows):
@@ -1913,7 +1929,7 @@ class WorkspaceMutationEngine:
                 has_sync_evidence = bool(rollback_parent_fields[2])
                 if has_sync_evidence:
                     expected_sync_digest = (
-                        self._store._rollback_directory_sync_digest(
+                        self._execution_journal_writer._rollback_directory_sync_digest(
                             execution_run_id=run.execution_run_id,
                             edit_id=row["edit_id"],
                             parent_identity_digest=rollback_parent_fields[0],
@@ -2067,7 +2083,7 @@ class WorkspaceMutationEngine:
     ) -> RecoveryDirectory:
         """Terminalize only a proven crash before the first durable edit."""
         baseline = self._require_initial_attestation(run)
-        persisted_count, actual_count = self._store.execution_journal_progress(
+        persisted_count, actual_count = self._execution_read_model.execution_journal_progress(
             run.execution_run_id
         )
         if persisted_count != 0 or actual_count != 0:
@@ -2125,7 +2141,7 @@ class WorkspaceMutationEngine:
             "cancelled" if run.failure_code == "execution-context-invalid"
             else "failed"
         )
-        self._store.commit_recovered_no_mutation(
+        self._execution_writer.commit_recovered_no_mutation(
             execution_run_id=run.execution_run_id,
             workspace_id=run.workspace_id, poison_owner=owner,
             expected_status=run.status.value, terminal_status=terminal,
@@ -2136,7 +2152,7 @@ class WorkspaceMutationEngine:
     def recover_incomplete_runs(self) -> tuple[str, ...]:
         """Startup scan: quarantine incomplete runs; recover only intact journals."""
         recovered: list[str] = []
-        for run in self._store.list_incomplete_execution_runs():
+        for run in self._execution_read_model.list_incomplete_execution_runs():
             reason = "startup-incomplete-execution"
             owner = f"run:{run.execution_run_id}"
             self._poison_run(run.workspace_id, run.execution_run_id, reason)
@@ -2148,7 +2164,7 @@ class WorkspaceMutationEngine:
                 run.workspace_id, owner=f"recovery:{run.execution_run_id}"
             ):
                 try:
-                    if not self._store.list_execution_edit_events(
+                    if not self._execution_read_model.list_execution_edit_events(
                         run.execution_run_id
                     ):
                         recovery = self._recover_zero_journal_run(
@@ -2190,7 +2206,7 @@ class WorkspaceMutationEngine:
                                 recovery, run, "mutation",
                                 attestation.attestation_digest, journal_digest,
                             )
-                        self._store.commit_recovered_terminal_state(
+                        self._execution_writer.commit_recovered_terminal_state(
                             execution_run_id=run.execution_run_id,
                             workspace_id=run.workspace_id, poison_owner=owner,
                             expected_status="sealing",
@@ -2223,7 +2239,7 @@ class WorkspaceMutationEngine:
                                 recovery, run, final_status,
                                 attestation.attestation_digest, journal_digest,
                             )
-                        self._store.commit_recovered_terminal_state(
+                        self._execution_writer.commit_recovered_terminal_state(
                             execution_run_id=run.execution_run_id,
                             workspace_id=run.workspace_id, poison_owner=owner,
                             expected_status="rollback-sealing",
@@ -2247,12 +2263,12 @@ class WorkspaceMutationEngine:
                     self._fence.clear_poison(run.workspace_id, owner=owner)
                     recovered.append(run.execution_run_id)
                 except Exception as exc:  # noqa: BLE001 - recovery evidence failure is quarantined
-                    current = self._store.get_execution_run(run.execution_run_id)
+                    current = self._execution_read_model.get_execution_run(run.execution_run_id)
                     if current is not None and current.status not in {
                         ExecutionRunStatus.POISONED, ExecutionRunStatus.MUTATED,
                     }:
                         try:
-                            self._store.transition_execution_run(
+                            self._execution_writer.transition_execution_run(
                                 run.execution_run_id,
                                 expected=(current.status.value,), target="poisoned",
                                 failure_code=getattr(exc, "code", "recovery-evidence-invalid"),
@@ -2349,7 +2365,7 @@ class WorkspaceMutationEngine:
         return resolved
 
     def _recovery_seal_digest(self, run_id: str) -> str:
-        events = self._store.list_execution_edit_events(run_id)
+        events = self._execution_read_model.list_execution_edit_events(run_id)
         payload = "|".join(
             f"{row['edit_id']}:{row['status']}:{row['before_hash'] or ''}:"
             f"{row['after_hash'] or ''}" for row in events

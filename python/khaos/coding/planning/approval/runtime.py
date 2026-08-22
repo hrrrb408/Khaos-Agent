@@ -397,6 +397,7 @@ class ApprovalRuntime:
             self.gate = PlanExecutionGate(
                 store=self._store, context_provider=self._context_provider,
                 plan_repository=self._plan_repository, planning_service=self._planning_service,
+                approval_read_model=self._store.approval_read_model,
                 runtime_capability=gate_capability,
                 lease_authority=self._lease_authority,
             )
@@ -404,6 +405,7 @@ class ApprovalRuntime:
                 store=self._store, broker=self._broker,
                 context_provider=self._context_provider,
                 plan_repository=self._plan_repository, planning_service=self._planning_service,
+                approval_read_model=self._store.approval_read_model,
                 runtime_capability=service_capability,
             )
             self.service.reconcile()
@@ -421,6 +423,10 @@ class ApprovalRuntime:
                 workspace_manager=self._workspace_manager,
                 context_provider=self._context_provider, guard=self.guard,
                 mutation_fence=self._mutation_fence,
+                approval_read_model=self._store.approval_read_model,
+                execution_read_model=self._store.execution_read_model,
+                execution_writer=self._store.execution_writer,
+                execution_journal_writer=self._store.execution_journal_writer,
                 runtime_capability=mutation_capability,
                 call_authority=self._mutation_call_authority,
             )
@@ -1010,6 +1016,8 @@ class ApprovalRuntime:
         try:
             self._verification_runner = TrustedVerificationRunner(
                 approval_store=self._store,
+                approval_read_model=self._store.approval_read_model,
+                execution_read_model=self._store.execution_read_model,
                 plan_repository=self._plan_repository,
                 workspace_manager=self._workspace_manager,
                 context_provider=self._context_provider, backend=backend,
@@ -1058,10 +1066,12 @@ class ApprovalRuntime:
         self.require_ready()
         if self._verification_store is None:
             raise PermissionError("trusted verification is not configured")
-        run = self._store.get_execution_run(execution_run_id)
+        run = self._store.execution_read_model.get_execution_run(execution_run_id)
         if run is None:
             raise KeyError(execution_run_id)
-        attestation = self._store.get_final_mutation_attestation(execution_run_id)
+        attestation = self._store.execution_read_model.get_final_mutation_attestation(
+            execution_run_id
+        )
         if attestation is None:
             raise PermissionError("verification continuation requires final attestation")
         pending_owner = f"verification-pending:{execution_run_id}"

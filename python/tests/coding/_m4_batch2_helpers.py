@@ -253,6 +253,7 @@ class UnsafeTestPlanExecutionGate(PlanExecutionGate):
         # Skip the production __init__ (which requires RuntimeCapability).
         # Replicate the old test-mode construction directly.
         self._store = store
+        self._approval_read_model = store.approval_read_model
         self._context_provider = context_provider
         self._policy = policy or GatePolicy()
         self._clock = clock or _time.time
@@ -289,6 +290,7 @@ class UnsafeTestPlanApprovalService(PlanApprovalService):
         # Skip the production __init__ (which requires RuntimeCapability).
         from khaos.coding.planning.approval.service import ApprovalPolicy
         self._store = store
+        self._approval_read_model = store.approval_read_model
         self._broker = broker
         self._context_provider = context_provider
         self._policy = policy or ApprovalPolicy()

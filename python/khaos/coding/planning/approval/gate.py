@@ -43,6 +43,7 @@ from khaos.coding.planning.approval.repository import (
     PersistedPlanRepository,
     PlanRepository,
 )
+from khaos.coding.planning.approval.read_model import PlanApprovalReadModel
 from khaos.coding.planning.approval.store import (
     PlanApprovalStore,
     new_authorization_id,
@@ -116,6 +117,7 @@ class PlanExecutionGate:
         *,
         runtime_capability: Any = None,
         lease_authority: object | None = None,
+        approval_read_model: PlanApprovalReadModel | None = None,
         plan_repository: PlanRepository | None = None,
         planning_service: Any | None = None,
         policy: GatePolicy | None = None,
@@ -133,7 +135,10 @@ class PlanExecutionGate:
             raise TypeError("production PlanExecutionGate requires PersistedPlanRepository")
         if planning_service is None or getattr(planning_service, "_unsafe_test_only", False):
             raise TypeError("production PlanExecutionGate requires deep planning validator")
+        if approval_read_model is None:
+            raise TypeError("production PlanExecutionGate requires approval read model")
         self._store = store
+        self._approval_read_model = approval_read_model
         self._context_provider = context_provider
         self._policy = policy or GatePolicy()
         self._clock = clock
@@ -233,7 +238,7 @@ class PlanExecutionGate:
         # approved_verification_plan_digest can enter the binding digest
         # re-computation.  The request's snapshot digest binds the supply-chain
         # snapshot into the authorization — any drift invalidates the mint.
-        request = self._store.get_request(approval_request_id)
+        request = self._approval_read_model.get_request(approval_request_id)
         if request is None:
             raise ApprovalMissingError(f"unknown approval request {approval_request_id}")
         avp_digest = request.approved_verification_plan_digest or ""
@@ -447,7 +452,7 @@ class PlanExecutionGate:
             raise PermissionError("execution lease acquisition requires runtime mutation fence authority")
 
         # --- LIVE validation (before the atomic transaction) ---
-        auth = self._store.get_authorization(authorization_id)
+        auth = self._approval_read_model.get_authorization(authorization_id)
         if auth is None:
             raise AuthorizationMismatchError("unknown authorization id")
         if auth.plan_id != expected_plan_id or auth.task_id != expected_task_id:
@@ -468,7 +473,7 @@ class PlanExecutionGate:
         # invalidates the consume.
         consume_avp_digest = ""
         if auth.approval_request_id:
-            consume_request = self._store.get_request(auth.approval_request_id)
+            consume_request = self._approval_read_model.get_request(auth.approval_request_id)
             if consume_request is not None:
                 consume_avp_digest = consume_request.approved_verification_plan_digest or ""
         try:
@@ -533,7 +538,7 @@ class PlanExecutionGate:
         )
         if not ok:
             # The consume failed. Re-read to classify the cause.
-            refreshed = self._store.get_authorization(authorization_id)
+            refreshed = self._approval_read_model.get_authorization(authorization_id)
             if refreshed is not None and refreshed.status == AuthorizationStatus.CONSUMED:
                 raise AuthorizationAlreadyConsumedError("authorization already consumed")
             # Check if a conflicting lease blocked us.

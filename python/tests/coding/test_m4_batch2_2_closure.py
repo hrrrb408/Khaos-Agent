@@ -107,7 +107,7 @@ def test_04_idempotent_receipt_still_verifies():
     # receipt2 has a fresh token + outbox row; applying it consumes that row
     # and returns UNCHANGED (request already approved).
     service.apply_broker_decision(receipt2)
-    assert store.get_request(request.approval_request_id).status is PlanApprovalStatus.APPROVED
+    assert store.approval_read_model.get_request(request.approval_request_id).status is PlanApprovalStatus.APPROVED
 
 
 def test_05_store_no_direct_insert_authorization():
@@ -358,8 +358,8 @@ def test_17_stale_invalidation_race_with_mint():
     t1.start(); t2.start()
     t1.join(); t2.join()
     # No invariant violation.
-    active = [a for a in store.list_authorizations_for_plan(plan.plan_id) if a.status is AuthorizationStatus.ACTIVE]
-    final_req = store.get_request(auth.approval_request_id)
+    active = [a for a in store.approval_read_model.list_authorizations_for_plan(plan.plan_id) if a.status is AuthorizationStatus.ACTIVE]
+    final_req = store.approval_read_model.get_request(auth.approval_request_id)
     if final_req.status is PlanApprovalStatus.STALE:
         assert len(active) == 0
 
@@ -368,7 +368,7 @@ def test_18_request_stale_zero_active_auth():
     """18. request=stale → active authorization count = 0."""
     plan, service, store, ctx, repo, gate, auth = _setup_approved_and_minted("p_stale_zero")
     service.invalidate_for_task(task_id=plan.task_id)
-    active = [a for a in store.list_authorizations_for_plan(plan.plan_id) if a.status is AuthorizationStatus.ACTIVE]
+    active = [a for a in store.approval_read_model.list_authorizations_for_plan(plan.plan_id) if a.status is AuthorizationStatus.ACTIVE]
     assert len(active) == 0
 
 
@@ -376,7 +376,7 @@ def test_19_request_revoked_zero_active_auth():
     """19. request=revoked → active authorization count = 0."""
     plan, service, store, ctx, repo, gate, auth = _setup_approved_and_minted("p_revoked_zero")
     service.revoke(auth.approval_request_id, actor_id="admin")
-    active = [a for a in store.list_authorizations_for_plan(plan.plan_id) if a.status is AuthorizationStatus.ACTIVE]
+    active = [a for a in store.approval_read_model.list_authorizations_for_plan(plan.plan_id) if a.status is AuthorizationStatus.ACTIVE]
     assert len(active) == 0
 
 

@@ -95,15 +95,15 @@ def test_01_lease_conflict_does_not_consume_authorization():
             expected_workspace_id=plan2.workspace_id, expected_repository_id=plan2.repository_id,
             owner_execution_id="exec2",
         )
-    refreshed = store.get_authorization(auth2.authorization_id)
+    refreshed = store.approval_read_model.get_authorization(auth2.authorization_id)
     assert refreshed.status is AuthorizationStatus.ACTIVE
 
 
 def test_02_lease_insert_fault_full_rollback():
     """2. If the lease INSERT faults, authorization + request unchanged."""
     plan, service, store, ctx, broker, repo, gate, auth, request = _setup_with_auth("p_insert_fault")
-    pre_auth_status = store.get_authorization(auth.authorization_id).status
-    pre_req_status = store.get_request(request.approval_request_id).status
+    pre_auth_status = store.approval_read_model.get_authorization(auth.authorization_id).status
+    pre_req_status = store.approval_read_model.get_request(request.approval_request_id).status
     # Sabotage: rename the lease table so INSERT fails.
     conn = store._conn  # noqa: SLF001
     conn.execute("ALTER TABLE plan_execution_leases RENAME TO _leases_hidden")
@@ -118,8 +118,8 @@ def test_02_lease_insert_fault_full_rollback():
     finally:
         conn.execute("ALTER TABLE _leases_hidden RENAME TO plan_execution_leases")
     # Full rollback.
-    assert store.get_authorization(auth.authorization_id).status is pre_auth_status
-    assert store.get_request(request.approval_request_id).status is pre_req_status
+    assert store.approval_read_model.get_authorization(auth.authorization_id).status is pre_auth_status
+    assert store.approval_read_model.get_request(request.approval_request_id).status is pre_req_status
 
 
 def test_06_no_lease_public_consume_path():
@@ -412,9 +412,9 @@ def test_27_task_cancel_vs_lease_acquire_concurrency(tmp_path):
     # Invariant: if the request was staled, no active lease or auth remains.
     final_conn = sqlite3.connect(str(db))
     final_store = PlanApprovalStore(final_conn)
-    req = final_store.get_request(request.approval_request_id)
+    req = final_store.approval_read_model.get_request(request.approval_request_id)
     if req.status in (PlanApprovalStatus.STALE, PlanApprovalStatus.REVOKED):
-        active_auths = [a for a in final_store.list_authorizations_for_plan(plan.plan_id) if a.status is AuthorizationStatus.ACTIVE]
+        active_auths = [a for a in final_store.approval_read_model.list_authorizations_for_plan(plan.plan_id) if a.status is AuthorizationStatus.ACTIVE]
         assert len(active_auths) == 0
     final_conn.close()
 

@@ -427,7 +427,7 @@ def test_durable_preparation_faults_leave_source_unchanged(tmp_path, monkeypatch
     engine = runtime._mutation_engine
     if failure == "journal":
         monkeypatch.setattr(
-            runtime._store, "insert_edit_event",
+            runtime._store.execution_journal_writer, "insert_edit_event",
             lambda **kwargs: (_ for _ in ()).throw(sqlite3.OperationalError("journal")),
         )
     elif failure == "backup":
@@ -469,7 +469,7 @@ def test_rollback_failure_poison_quarantines_workspace(tmp_path, monkeypatch):
     with pytest.raises(WorkspaceMutationError, match="rollback failed"):
         _apply(runtime, plan, authorization, _bundle(plan, edits))
     assert runtime.mutation_fence.is_poisoned(workspace.id)
-    assert runtime._store.get_execution_run_by_context(
+    assert runtime._store.execution_read_model.get_execution_run_by_context(
         runtime._store._conn.execute(
             "SELECT execution_context_id FROM plan_execution_runs LIMIT 1"
         ).fetchone()[0]
@@ -630,14 +630,14 @@ def test_startup_recovery_uses_verified_artifact_or_keeps_poisoned(tmp_path, cor
         "task1", "ws1", "repo", "abc123", 1, "binding", "bundle",
         ExecutionRunStatus.MUTATING, now, now,
     )
-    runtime._store.create_execution_run(run)
+    runtime._store.execution_writer.create_execution_run(run)
     recovery = workspace.recovery_root / run_id
     recovery.mkdir(parents=True)
     os.chmod(recovery.parent, 0o700)
     os.chmod(recovery, 0o700)
     backup = recovery / f"artifact-{uuid.uuid4().hex}.bak"
     backup.write_text("corrupt" if corrupt else "original", encoding="utf-8")
-    runtime._store.insert_edit_event(
+    runtime._store.execution_journal_writer.insert_edit_event(
         event_id=uuid.uuid4().hex, execution_run_id=run_id, edit_id="e1",
         ordinal=0, operation="update", path="a.txt", destination_path=None,
         before_hash=_hash("original"), before_mode=0o644,
@@ -650,7 +650,7 @@ def test_startup_recovery_uses_verified_artifact_or_keeps_poisoned(tmp_path, cor
     )
     runtime._store._conn.commit()
     recovered = runtime._mutation_engine.recover_incomplete_runs()
-    current = runtime._store.get_execution_run(run_id)
+    current = runtime._store.execution_read_model.get_execution_run(run_id)
     assert run_id not in recovered
     assert current.status == ExecutionRunStatus.POISONED
     assert runtime.mutation_fence.is_poisoned("ws1")
