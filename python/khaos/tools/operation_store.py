@@ -2,19 +2,20 @@
 
 The operation store owns the in-process claim/event map and consumes the
 durable operation-row protocol from ``db.repositories.tool_operations``.  It
-does not admit calls, evaluate permissions, or invoke handlers.  A scheduler
-may keep compatibility methods that delegate to this owner, but it must not
-reimplement claim, wait, or terminalization logic.
+does not admit calls, evaluate permissions, or invoke handlers.  The durable
+repository is injected explicitly so a missing owner fails closed instead of
+silently falling back to process-local idempotency.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 import uuid
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from typing import Any, cast
+from typing import Any
 
+from khaos.db.repositories.tool_operations import ToolOperationRepository
 from khaos.exceptions import PermissionDeniedError
 from khaos.security.protocol_boundary import canonical_digest
 from khaos.tools.result_codec import ToolResultCodec
@@ -44,12 +45,25 @@ class OperationClaim:
 class ToolOperationStore:
     """Own operation identity, claim, wait, and terminal result protocols."""
 
-    def __init__(self, *, db: Any, result_store: ToolResultStore) -> None:
-        self._db = db
+    def __init__(
+        self,
+        *,
+        repository: ToolOperationRepository | None,
+        result_store: ToolResultStore,
+    ) -> None:
+        self._repository = repository
         self._result_store = result_store
         self._events: dict[str, asyncio.Event] = {}
         self._claims: dict[str, OperationClaim] = {}
         self._lock = asyncio.Lock()
+
+    def _require_repository(self) -> ToolOperationRepository:
+        """Return the durable owner or fail closed before an effect edge."""
+        if self._repository is None:
+            raise RuntimeError(
+                "durable tool-operation repository is required for idempotency"
+            )
+        return self._repository
 
     def scope(
         self,
@@ -180,97 +194,74 @@ class ToolOperationStore:
 
         owner_token = uuid.uuid4().hex
         effect_id = uuid.uuid4().hex
-        claim_method = getattr(self._db, "claim_tool_operation", None)
-        if callable(claim_method):
-            claim_operation = cast(
-                Callable[..., Awaitable[dict[str, Any]]], claim_method
+        row = await self._require_repository().claim_tool_operation(
+            operation_id=operation_id,
+            tool_name=tool.name,
+            arguments_digest=arguments_digest,
+            effect_id=effect_id,
+            owner_token=owner_token,
+            principal_id=str(tool_context.get("principal_id") or ""),
+            project_id=str(tool_context.get("project_id") or ""),
+            session_id=str(session_id or tool_context.get("session_id") or ""),
+            task_id=str(tool_context.get("task_id") or ""),
+            workspace_id=str(tool_context.get("workspace_id") or ""),
+        )
+        if row.get("state") == "conflict":
+            raise PermissionDeniedError(
+                str(
+                    row.get("conflict_reason")
+                    or "idempotency operation identity conflict"
+                )
             )
-            row = await claim_operation(
+        if row.get("state") == "claimed":
+            event = asyncio.Event()
+            self._events[operation_id] = event
+            claim = OperationClaim(
                 operation_id=operation_id,
-                tool_name=tool.name,
-                arguments_digest=arguments_digest,
-                effect_id=effect_id,
                 owner_token=owner_token,
-                principal_id=str(tool_context.get("principal_id") or ""),
-                project_id=str(tool_context.get("project_id") or ""),
-                session_id=str(session_id or tool_context.get("session_id") or ""),
-                task_id=str(tool_context.get("task_id") or ""),
-                workspace_id=str(tool_context.get("workspace_id") or ""),
+                effect_id=str(row["effect_id"]),
+                arguments_digest=arguments_digest,
             )
-            if row.get("state") == "conflict":
-                raise PermissionDeniedError(
-                    str(
-                        row.get("conflict_reason")
-                        or "idempotency operation identity conflict"
-                    )
-                )
-            if row.get("state") == "claimed":
-                event = asyncio.Event()
-                self._events[operation_id] = event
-                claim = OperationClaim(
-                    operation_id=operation_id,
-                    owner_token=owner_token,
-                    effect_id=str(row["effect_id"]),
-                    arguments_digest=arguments_digest,
-                )
-                self._claims[operation_id] = claim
-                return claim
-            if row.get("status") != "running":
-                return OperationClaim(
-                    operation_id=operation_id,
-                    owner_token="",
-                    effect_id=str(row.get("effect_id") or ""),
-                    arguments_digest=arguments_digest,
-                    result=ToolResultCodec.deserialize_operation_result(
-                        row, call=call, tool=tool
-                    ),
-                )
-
-            orphan = ToolResultCodec.deserialize_operation_result(
-                row, call=call, tool=tool
-            )
-            orphan = replace(
-                orphan,
-                effect_status=EFFECT_UNKNOWN,
-                success=False,
-                error="durable operation was running without a live owner",
-                retry_safe=False,
-                warning=(
-                    "previous execution ownership was lost; reconcile before retry"
-                ),
-                reconciliation_hint=(
-                    str(row.get("reconciliation_hint") or "")
-                    or "inspect the external side effect using effect_id"
-                ),
-            )
-            mark_unknown = getattr(self._db, "mark_tool_operation_unknown", None)
-            if callable(mark_unknown):
-                mark_operation_unknown = cast(
-                    Callable[..., Awaitable[object]], mark_unknown
-                )
-                await mark_operation_unknown(
-                    operation_id=operation_id,
-                    reconciliation_hint=orphan.reconciliation_hint,
-                    result_json=ToolResultCodec.serialize_operation_result(orphan),
-                )
+            self._claims[operation_id] = claim
+            return claim
+        if row.get("status") != "running":
             return OperationClaim(
                 operation_id=operation_id,
                 owner_token="",
                 effect_id=str(row.get("effect_id") or ""),
                 arguments_digest=arguments_digest,
-                result=orphan,
+                result=ToolResultCodec.deserialize_operation_result(
+                    row, call=dict(call), tool=tool
+                ),
             )
 
-        event = asyncio.Event()
-        self._events[operation_id] = event
-        claim = OperationClaim(
-            operation_id=operation_id,
-            owner_token=owner_token,
-            effect_id=effect_id,
-            arguments_digest=arguments_digest,
+        orphan = ToolResultCodec.deserialize_operation_result(
+            row, call=dict(call), tool=tool
         )
-        self._claims[operation_id] = claim
-        return claim
+        orphan = replace(
+            orphan,
+            effect_status=EFFECT_UNKNOWN,
+            success=False,
+            error="durable operation was running without a live owner",
+            retry_safe=False,
+            warning="previous execution ownership was lost; reconcile before retry",
+            reconciliation_hint=(
+                str(row.get("reconciliation_hint") or "")
+                or "inspect the external side effect using effect_id"
+            ),
+        )
+        await self._require_repository().mark_tool_operation_unknown(
+            operation_id=operation_id,
+            reconciliation_hint=orphan.reconciliation_hint,
+            result_json=ToolResultCodec.serialize_operation_result(orphan),
+        )
+        return OperationClaim(
+            operation_id=operation_id,
+            owner_token="",
+            effect_id=str(row.get("effect_id") or ""),
+            arguments_digest=arguments_digest,
+            result=orphan,
+        )
 
     async def wait(
         self,
@@ -307,27 +298,22 @@ class ToolOperationStore:
         )
         if result is not None:
             return result
-        claim_method = getattr(self._db, "claim_tool_operation", None)
-        if callable(claim_method):
-            claim_operation = cast(
-                Callable[..., Awaitable[dict[str, Any]]], claim_method
+        row = await self._require_repository().claim_tool_operation(
+            operation_id=claim.operation_id,
+            tool_name=tool.name,
+            arguments_digest=canonical_digest(call.get("arguments", {})),
+            effect_id=uuid.uuid4().hex,
+            owner_token=uuid.uuid4().hex,
+            principal_id=str(tool_context.get("principal_id") or ""),
+            project_id=str(tool_context.get("project_id") or ""),
+            session_id=str(session_id or tool_context.get("session_id") or ""),
+            task_id=str(tool_context.get("task_id") or ""),
+            workspace_id=str(tool_context.get("workspace_id") or ""),
+        )
+        if row.get("status") != "running":
+            return ToolResultCodec.deserialize_operation_result(
+                row, call=dict(call), tool=tool
             )
-            row = await claim_operation(
-                operation_id=claim.operation_id,
-                tool_name=tool.name,
-                arguments_digest=canonical_digest(call.get("arguments", {})),
-                effect_id=uuid.uuid4().hex,
-                owner_token=uuid.uuid4().hex,
-                principal_id=str(tool_context.get("principal_id") or ""),
-                project_id=str(tool_context.get("project_id") or ""),
-                session_id=str(session_id or tool_context.get("session_id") or ""),
-                task_id=str(tool_context.get("task_id") or ""),
-                workspace_id=str(tool_context.get("workspace_id") or ""),
-            )
-            if row.get("status") != "running":
-                return ToolResultCodec.deserialize_operation_result(
-                    row, call=call, tool=tool
-                )
         return ToolResult(
             tool_call_id=str(call["id"]),
             name=tool.name,
@@ -353,13 +339,9 @@ class ToolOperationStore:
         if claim is None:
             return result
         journal_error = ""
-        complete_method = getattr(self._db, "complete_tool_operation", None)
-        if callable(complete_method) and claim.owner_token:
+        if claim.owner_token:
             try:
-                complete_operation = cast(
-                    Callable[..., Awaitable[object]], complete_method
-                )
-                updated = await complete_operation(
+                updated = await self._require_repository().complete_tool_operation(
                     operation_id=claim.operation_id,
                     owner_token=claim.owner_token,
                     status=terminal_status,
@@ -435,18 +417,13 @@ class ToolOperationStore:
         """Persist a handler-provided external effect identity before finalize."""
         if not claim.owner_token or not effect_id:
             return
-        update_method = getattr(self._db, "update_tool_operation_effect_id", None)
-        if callable(update_method):
-            update_effect_id = cast(
-                Callable[..., Awaitable[object]], update_method
-            )
-            updated = await update_effect_id(
-                operation_id=claim.operation_id,
-                owner_token=claim.owner_token,
-                effect_id=effect_id,
-            )
-            if not updated:
-                raise RuntimeError("durable tool operation lost ownership")
+        updated = await self._require_repository().update_tool_operation_effect_id(
+            operation_id=claim.operation_id,
+            owner_token=claim.owner_token,
+            effect_id=effect_id,
+        )
+        if not updated:
+            raise RuntimeError("durable tool operation lost ownership")
 
 
 __all__ = ["OperationClaim", "ToolOperationStore"]

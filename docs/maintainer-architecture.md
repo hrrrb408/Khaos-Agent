@@ -63,7 +63,7 @@ KHAOS.md / AGENTS.md
 | 领域状态/效果 | 当前入口 | 权威 writer | 观察者/适配器 | 备注 |
 | --- | --- | --- | --- | --- |
 | Turn/event/terminal | `python/khaos/agent/events.py`、`agent/core.py` | `TurnCoordinator` + `Database` 事件事务 | Gateway/TUI/message adapter | `Message` 是兼容投影，不应成为新终态来源 |
-| Tool invocation | `python/khaos/tools/registry.py`、`tools/scheduler.py` | `ToolScheduler`（调度）+ `tools/result_finalizer.py`（terminal/audit/result delivery）+ `tools/result_store.py`（runtime result replay） | tool handler、event renderer | handler 不接收 `approved=True` 作为权限证明；跨重启 replay 仍由 durable operation row 决定 |
+| Tool invocation | `python/khaos/tools/registry.py`、`tools/scheduler.py` | `ToolScheduler`（调度）+ `tools/result_finalizer.py`（terminal/audit/result delivery）+ `tools/result_store.py`（runtime result replay）+ `db/repositories/tool_operations.py`（durable operation SQL） | tool handler、event renderer | handler 不接收 `approved=True` 作为权限证明；跨重启 replay 仍由 injected `ToolOperationRepository` 的 durable row 决定 |
 | Effective policy | `python/khaos/security/effective_policy.py` | 启动期 immutable policy compiler | runtime、authorityd、execution selector | 原始 YAML 不是运行时权限对象 |
 | Ordinary approval | `python/khaos/agent/approval.py`、permissions/、`tools/approval_callback.py`、`tools/authorization.py` | `ToolAuthorization` 拥有 policy decision hardening/remember projection；broker/durable consume path 拥有 one-shot capability；`ApprovalCallbackRunner` 只拥有 adapter 生命周期 | Gateway confirm、TUI dialog | one-shot、principal/context/args/expiry 绑定；回调线程未终止时不得报告 CLOSED |
 | Plan/change approval | `coding/planning/approval/` | `approval/schema.py`（schema/migration）+ approval runtime/store + signed receipt | plan UI、verification | 不能与普通 tool approval 静默合并；schema owner 不执行业务状态转换 |
@@ -91,7 +91,7 @@ KHAOS.md / AGENTS.md
 | `python/khaos/db/repositories/permissions.py` | permissions 与 authorization_contexts 的规则/epoch SQL | `PermissionRepository` 唯一拥有权限状态写入和 authorization lock；`PermissionEngine` 只消费 facade/端口 |
 | `python/khaos/db/repositories/audit.py` | audit_log 写入、owner 查询、hash-chain replay | `AuditRepository` 唯一拥有 audit SQL 与 canonical hash recomputation；`AuditLogger` 不直接触碰连接 |
 | `python/khaos/db/repositories/scheduler.py` | scheduled_tasks 的 owner scope、lease/CAS、recovery 与 scheduler-operation journal SQL | `SchedulerRepository` 唯一拥有 scheduler/task SQL；`Database` 只保留兼容 facade，`scheduler/repository.py` 只做 project scope adapter |
-| `python/khaos/db/repositories/tool_operations.py` | durable tool_operations claim、terminal、effect identity、orphan quarantine 与 bounded prune SQL | `ToolOperationRepository` 唯一拥有 durable operation SQL；runtime `ToolOperationStore` 只拥有 in-process waiters/result projection |
+| `python/khaos/db/repositories/tool_operations.py` | durable tool_operations claim、terminal、effect identity、orphan quarantine 与 bounded prune SQL | `ToolOperationRepository` 唯一拥有 durable operation SQL；`Database.tool_operation_repository` 是只读注入边界，runtime `ToolOperationStore` 只拥有 in-process waiters/result projection；Database 同名 SQL facade 已删除 |
 | `python/khaos/tools/scheduler.py` | admission 后的 approval、批次并发和结果事件编排 | `ToolAdmission`、`ToolResultFinalizer`（terminal phase/audit/result delivery）、`ToolResultStore`（runtime replay cache）、`ToolOperationStore`（claim/wait/terminal idempotency）、`ApprovalCallbackRunner`（adapter 生命周期）、`ToolAuthorization`（decision/remember/binding contract）、`ToolExecutionCoordinator`（authority-bound dispatch） |
 | `python/khaos/tools/result_finalizer.py` | dispatched tool 的 terminal phase、best-effort audit、durable operation finish 和 idempotent result publish | `ToolResultFinalizer`；不做 admission、permission decision、handler dispatch 或 budget ownership |
 | `python/khaos/tools/authorization.py` | permission decision hardening、remember rule projection、approval binding/request projection | `ToolAuthorization`、`build_approval_binding`、`build_permission_request`；不注册/消费 broker，不执行工具效果 |
@@ -243,14 +243,14 @@ REQUESTED -> SNAPSHOT_BOUND -> RUNNING -> PROOF_RECORDED
 - `ToolScheduler` 的调用 admission 已收敛到 `python/khaos/tools/admission.py`；结果/事件值对象已收敛到 `python/khaos/tools/scheduler_models.py`，结果归一化与 durable JSON 编解码已收敛到 `python/khaos/tools/result_codec.py`，runtime 幂等结果 replay cache 已收敛到 `python/khaos/tools/result_store.py`，terminal phase/audit/result delivery 已收敛到 `python/khaos/tools/result_finalizer.py`，原子预算已收敛到 `python/khaos/tools/budget.py`；`tools.scheduler` 仅保留一个迁移周期的兼容导出。
 - approval callback 的 schema、deadline、容量和 worker 关闭语义已收敛到 `python/khaos/tools/approval_callback.py`；scheduler 不再直接拥有 callback executor。
 - `ToolAuthorization` 已收敛 permission decision hardening、interactive remember projection，以及 `ApprovalBinding`/`PermissionRequest` 的 digest/字段投影；scheduler 只保留 broker 注册、确认事件和 capability consume 编排，后续由 `ToolExecutionCoordinator` 接管效果准备与 dispatch。
-- `ToolOperationStore` 已收敛 durable operation claim/wait/finalize 与 runtime waiter map；scheduler 的旧幂等方法仅为兼容委托，后续删除并由 `ToolExecutionCoordinator` 直接消费该 owner。
+- `ToolOperationStore` 已收敛 durable operation claim/wait/finalize 与 runtime waiter map；它通过显式 `ToolOperationRepository` 注入消费 durable owner，缺失 owner 时在效果边界前 fail closed。`ToolScheduler` 不再保留幂等/terminal SQL 兼容委托。
 - `ToolExecutionCoordinator` 已收敛单步 authority context 注入、broker invoke/timeout 和 effect outcome normalization；scheduler 不再直接调用 invocation broker，后续继续迁移 terminalization/result projection。
 - ChangeSet artifact 的 descriptor/no-follow IO、digest 校验和 exclusive publish 已收敛到 `workspace/artifacts.py`；`WorkspaceManager` 只保留 lifecycle/quota 编排，workspace 错误类型由 `workspace/errors.py` 统一拥有。
 - Trusted Git 的 process owner 已从 Git command/effect runner 独立到 `workspace/git_process.py`；Git runner 不再定义进程状态机，Windows/native 失败可分别归类为 argv/authority 或 process terminal evidence。
 - Plan approval 的 DDL 与 post-schema migration 已收敛到 `coding/planning/approval/schema.py`；`PlanApprovalStore` 的 `APPROVAL_SCHEMA` 仅为兼容导出，后续删除。
 - Plan approval request/decision/audit/authorization 的只读 SQL 与 row conversion 已收敛到 `coding/planning/approval/read_model.py`；execution run/journal/attestation 读取与 digest 校验已收敛到 `coding/planning/approval/execution_read_model.py`。`PlanApprovalStore` 的两组读取方法仅为兼容委托，后续在调用迁移完成后删除。
 - Plan execution run/attestation/terminal recovery 写事务已收敛到 `coding/planning/approval/execution_writer.py`，edit journal/rollback proof 写事务已收敛到 `coding/planning/approval/execution_journal_writer.py`；`PlanApprovalStore` 的公开写方法仅保留一周期兼容委托。
-- `ToolScheduler` 已拆出 admission、execution、terminal/result delivery 四段；每段只能消费上述类型，不能重新定义平行的 `ToolResult`、预算或 effect 状态。下一步只处理 capability consume 与跨模块 port，不再把终态逻辑塞回 scheduler。
+- `ToolScheduler` 已拆出 admission、execution、terminal/result delivery 四段；每段只能消费上述类型，不能重新定义平行的 `ToolResult`、预算或 effect 状态。durable operation SQL 已完成最终 port 迁移；后续只处理 capability consume 与跨模块 port，不再把终态逻辑塞回 scheduler。
 - 将 file/Git/process 入口收敛为可注入 port，并为每个 port 提供 fail-closed contract tests。
 
 ### Phase 4：计划、验证和调度

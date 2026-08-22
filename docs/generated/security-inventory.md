@@ -101,7 +101,7 @@
 - `python/khaos/rpc/protocol.py`: `5960a4e41b94b63a47ccadd362288f97f4747ad56d6db065f9741cebfbc768a6`
 - `rust/khaos-core/src/bin/khaos-exec-launcher.rs`: `c5eb7343002ecb7f74e1ca10df5d5edaf4de39f90ecc68064cb355b56b2fda71`
 - `rust/khaos-core/src/bin/khaos-sandbox-launcher.rs`: `9e68f6b622c7ccd29f24d76aa504da1624bf04c128f9215b57ec580b317b75ab`
-- `python/khaos/grpc_server.py`: `be9e50a93fea4157e5064a1b60b88717ca442130e4368762d84106ae5b5198a5`
+- `python/khaos/grpc_server.py`: `8d5c1294910397e2c1c2a4ea2dec0be9474cfdc52ff978dbb8ec20240425f82b`
 - `go/internal/api/handler.go`: `9dc6af7572c331685a4fa28f8902d148da4338a19603f55aeaf2094fc38662a7`
 - `go/cmd/gateway/main.go`: `5c27479e8ef5ffa3c05008077e12e89e4f274d4255765606b3ee91d04df56481`
 - `go/internal/platform/python_client.go`: `1bb725121e13cece0ea49360de7fc52b7b0f38707189c5b58fbf8037f9324390`

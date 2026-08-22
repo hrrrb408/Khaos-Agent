@@ -493,6 +493,8 @@ async def test_s253_maintenance_run_once_calls_prune(tmp_path):
     db.prune_approval_ledger = AsyncMock(
         return_value={"operation_approvals": 3, "operation_approval_events": 3}
     )
+    db.tool_operation_repository = MagicMock()
+    db.tool_operation_repository.prune_tool_operations = AsyncMock(return_value=0)
     broker = MagicMock()
     broker.sweep_expired = AsyncMock(return_value={"tool": 0, "plan": 0, "operation": 0})
     svc = MaintenanceService(db, approval_broker=broker, interval_seconds=60)

@@ -44,9 +44,10 @@ async def test_tool_operation_prune_keeps_effectful_tombstones(tmp_path):
     db = Database(tmp_path / "tool-operations.db")
     await db.connect()
     await db.run_migrations()
+    repository = db.tool_operation_repository
 
     for operation_id in ("no-effect", "applied", "unknown"):
-        claimed = await db.claim_tool_operation(
+        claimed = await repository.claim_tool_operation(
             operation_id=operation_id,
             tool_name="effect",
             arguments_digest=operation_id,
@@ -65,7 +66,7 @@ async def test_tool_operation_prune_keeps_effectful_tombstones(tmp_path):
             "applied": "applied",
             "unknown": "unknown",
         }[operation_id]
-        assert await db.complete_tool_operation(
+        assert await repository.complete_tool_operation(
             operation_id=operation_id,
             owner_token=f"owner-{operation_id}",
             status=terminal_status,
@@ -79,7 +80,7 @@ async def test_tool_operation_prune_keeps_effectful_tombstones(tmp_path):
             ("2000-01-01T00:00:00",),
         )
 
-    assert await db.prune_tool_operations(
+    assert await repository.prune_tool_operations(
         older_than_seconds=60, now=1_900_000_000, limit=10
     ) == 1
     conn = await db._require_conn()

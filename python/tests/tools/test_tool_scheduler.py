@@ -982,7 +982,11 @@ async def test_scheduler_keeps_effect_facts_when_operation_finalization_fails(
     async def fail_complete(**_kwargs):
         raise RuntimeError("database commit unavailable")
 
-    monkeypatch.setattr(db, "complete_tool_operation", fail_complete)
+    monkeypatch.setattr(
+        db.tool_operation_repository,
+        "complete_tool_operation",
+        fail_complete,
+    )
     scheduler = ToolScheduler(
         _effect_registry(write),
         PermissionEngine(
@@ -1327,7 +1331,7 @@ async def test_scheduler_does_not_replay_orphaned_running_operation(tmp_path):
         normalized, session_id="session", tool_context=context
     )
     arguments_digest = _canonical_digest(call["arguments"])
-    claimed = await db.claim_tool_operation(
+    claimed = await db.tool_operation_repository.claim_tool_operation(
         operation_id=operation_id,
         tool_name="effect",
         arguments_digest=arguments_digest,
