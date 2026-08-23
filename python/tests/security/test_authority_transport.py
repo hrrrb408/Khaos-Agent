@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import socket
 from pathlib import Path
 from typing import Self
 
@@ -162,6 +163,9 @@ def test_darwin_unix_client_does_not_infer_xpc(
         def settimeout(self, _timeout: float) -> None:
             return None
 
+        def setblocking(self, _flag: bool) -> None:
+            return None
+
         def connect(self, _path: str) -> None:
             return None
 
@@ -170,6 +174,17 @@ def test_darwin_unix_client_does_not_infer_xpc(
 
         def recv(self, _size: int) -> bytes:
             return b'{"ok":true,"transport":"unix"}\n'
+
+        def close(self) -> None:
+            return None
+
+    class FakeSocketModule:
+        AF_UNIX = getattr(socket, "AF_UNIX", 1)
+        SOCK_STREAM = socket.SOCK_STREAM
+
+        @staticmethod
+        def socket(*_args: object) -> FakeSocket:
+            return FakeSocket()
 
     monkeypatch.setattr(
         authorityd_protocol,
@@ -180,14 +195,10 @@ def test_darwin_unix_client_does_not_infer_xpc(
     # explicitly simulating the Darwin Unix transport.  The socket factory
     # is mocked below, so provide only the protocol-family constant needed to
     # exercise the caller-selected transport path.
-    monkeypatch.setattr(
-        authorityd_protocol.socket, "AF_UNIX", 1, raising=False
-    )
-    monkeypatch.setattr(
-        authorityd_protocol.socket,
-        "socket",
-        lambda *_args: FakeSocket(),
-    )
+    # Replace only the protocol module's socket facade.  Mutating the shared
+    # stdlib socket module would also replace asyncio/uvloop's self-pipe
+    # sockets during fixture teardown.
+    monkeypatch.setattr(authorityd_protocol, "socket", FakeSocketModule)
     # ``Path('/tmp/...')`` is not absolute under Windows path semantics even
     # though this test is explicitly simulating macOS.  Use a portable
     # absolute placeholder; the socket and validator are both mocked.

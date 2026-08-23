@@ -768,6 +768,16 @@ class Database:
                 await self._apply_v13_upgrades()
             finally:
                 self._conn = original_conn
+            # Memory V2 operational surfaces are a new append-only schema
+            # boundary.  v13 remains frozen; v14 adds profile/provider
+            # lifecycle state, rebuildable CodeGraph storage, benchmark
+            # evidence, and the explicit supersession timestamp.
+            original_conn = self._conn
+            self._conn = _MigrationConnection(conn)
+            try:
+                await self._apply_v14_upgrades()
+            finally:
+                self._conn = original_conn
             # Batch 6.4 §10.4: backfill the historical ledger rows (v1–v5)
             # so the chain is complete from this point on.  Idempotent —
             # uses INSERT OR IGNORE keyed on the version PK.
@@ -1363,6 +1373,32 @@ class Database:
         await self._execute_schema_statements(
             conn,
             migration_path.read_text(encoding="utf-8"),
+        )
+
+    async def _apply_v14_upgrades(self) -> None:
+        """Add Memory V2 operational storage without editing the v13 schema."""
+
+        conn = await self._require_conn()
+        migration_path = _MIGRATIONS_DIR / "0014_memory_v2_operational_surfaces.sql"
+        await self._execute_schema_statements(
+            conn,
+            migration_path.read_text(encoding="utf-8"),
+        )
+        await self._ensure_memory_nodes_superseded_at()
+
+    async def _ensure_memory_nodes_superseded_at(self) -> None:
+        """Add the temporal supersession marker to existing v13 databases."""
+
+        conn = await self._require_conn()
+        cursor = await conn.execute("PRAGMA table_info(memory_nodes)")
+        columns = {str(row[1]) for row in await cursor.fetchall()}
+        if "superseded_at" not in columns:
+            await conn.execute(
+                "ALTER TABLE memory_nodes ADD COLUMN superseded_at TEXT"
+            )
+        await conn.execute(
+            "UPDATE memory_nodes SET superseded_at = updated_at "
+            "WHERE status = 'SUPERSEDED' AND superseded_at IS NULL"
         )
 
     async def _ensure_tool_operations_table(self) -> None:

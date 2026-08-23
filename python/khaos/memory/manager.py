@@ -19,7 +19,10 @@ from khaos.memory.core import (
     SourceType,
     TrustHint,
 )
-from khaos.memory.extraction import extract_memories_from_messages
+from khaos.memory.extraction import (
+    extract_candidates_from_event,
+    extract_memories_from_messages,
+)
 from khaos.memory.models import Memory, MemoryScope
 from khaos.memory.ownership import MemoryVisibility
 from khaos.memory.retrieval import MemoryRetriever
@@ -46,6 +49,10 @@ class MemoryManager:
         extractor: MemoryExtractor | None = None,
         broker: MemoryBroker | None = None,
         runtime_context_factory: Callable[[str], RuntimeMemoryContext] | None = None,
+        provider_manager: Any = None,
+        profile: Any = None,
+        transfer_service: Any = None,
+        codegraph: Any = None,
     ) -> None:
         self.store = store
         self.budget = budget or MemoryBudget()
@@ -56,6 +63,10 @@ class MemoryManager:
         self.extractor = extractor or extract_memories_from_messages
         self.broker = broker
         self.runtime_context_factory = runtime_context_factory
+        self.provider_manager = provider_manager
+        self.profile = profile
+        self.transfer_service = transfer_service
+        self.codegraph = codegraph
         self.context_assembler = ContextAssembler(self.token_engine)
 
     async def inject(self, session_id: str) -> str:
@@ -186,6 +197,17 @@ class MemoryManager:
             },
         )
         await self.broker.record_event(event)
+        for candidate in extract_candidates_from_event(event, profile=self.profile):
+            try:
+                await self.broker.propose_memory(candidate, runtime)
+            except (TypeError, ValueError, RuntimeError):
+                # Extraction is proactive convenience, never a reason to
+                # break message persistence or the agent turn.
+                logger.warning(
+                    "memory candidate admission failed for event %s",
+                    event.event_id,
+                    exc_info=True,
+                )
 
     def _current_scope(self) -> MemoryScope:
         if self.mode_getter is None:
@@ -303,6 +325,12 @@ class MemoryManager:
     async def aclose(self) -> None:
         """Close provider resources when a provider exposes a lifecycle hook."""
 
+        if self.provider_manager is not None:
+            registry = getattr(self.provider_manager, "registry", None)
+            close_registry = getattr(registry, "close", None)
+            if callable(close_registry):
+                await close_registry()
+                return
         close = getattr(self.broker.provider, "aclose", None) if self.broker else None
         if callable(close):
             await close()

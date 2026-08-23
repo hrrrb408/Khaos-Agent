@@ -5,6 +5,18 @@ while the names historically imported from ``khaos.memory`` stay stable.
 """
 
 from khaos.memory.conflict import ConflictDecision, ConflictResolver
+from khaos.memory.adapters import AMLAdapterError, MemoryAMLAdapter, aml_add, aml_search
+from khaos.memory.benchmarks import (
+    BenchmarkCase,
+    BenchmarkReport,
+    BenchmarkRun,
+    MemoryBenchmarkHarness,
+)
+from khaos.memory.conformance import (
+    ProviderConformanceReport,
+    ProviderConformanceSuite,
+    run_provider_conformance,
+)
 from khaos.memory.core import (
     ContextAssembler,
     EntityRef,
@@ -19,6 +31,7 @@ from khaos.memory.core import (
     MemoryEvent,
     MemoryEventType,
     MemoryForgetRequest,
+    MemoryForgetResult,
     MemoryHit,
     MemoryProvider,
     MemorySearchRequest,
@@ -35,9 +48,12 @@ from khaos.memory.core import (
     UsagePolicy,
     VerificationAuthority,
     VerificationReceipt,
+    candidate_digest,
+    memory_digest,
 )
 from khaos.memory.decay import expired_memory_ids
 from khaos.memory.extraction import (
+    extract_candidates_from_event,
     extract_memories_from_messages,
     extract_memories_from_text,
 )
@@ -49,6 +65,29 @@ from khaos.memory.maintenance import (
 from khaos.memory.manager import MemoryBudget, MemoryManager
 from khaos.memory.models import Memory, MemoryConfidence, MemoryScope
 from khaos.memory.ownership import MemoryOwner, MemoryVisibility
+from khaos.memory.observability import MemoryObservability, MetricSummary
+from khaos.memory.codegraph import CodeGraphBuildReport, CodeGraphNode, CodeGraphService
+from khaos.memory.profiles import (
+    CODING_PROFILE,
+    PERSONAL_PROFILE,
+    MemoryProfile,
+    MemoryProfileError,
+    MemoryProfileRegistry,
+    MemoryProfileStore,
+)
+from khaos.memory.providers import (
+    MemoryHttpProvider,
+    MemoryProviderManager,
+    MemoryProviderRegistry,
+    NativeMemoryProvider,
+    ProviderHandle,
+    ProviderLifecycleError,
+    ProviderLifecycleState,
+    ProviderManifest,
+    ProviderStatus,
+    build_native_registry,
+)
+from khaos.memory.transfer import MemoryTransferError, MemoryTransferService
 from khaos.memory.repository import MemoryRepository, SqliteMemoryRepository
 from khaos.memory.retrieval import MemoryLayers, MemoryRetriever
 from khaos.memory.store import MemoryStore
@@ -56,8 +95,19 @@ from khaos.memory.store import MemoryStore
 __all__ = [
     "ConflictDecision",
     "ConflictResolver",
+    "MemoryAMLAdapter",
+    "AMLAdapterError",
+    "aml_add",
+    "aml_search",
+    "BenchmarkCase",
+    "BenchmarkReport",
+    "BenchmarkRun",
+    "MemoryBenchmarkHarness",
     "ConsistencyReport",
     "ContextAssembler",
+    "CodeGraphBuildReport",
+    "CodeGraphNode",
+    "CodeGraphService",
     "EntityRef",
     "EvidenceRef",
     "EvidenceResolution",
@@ -73,10 +123,19 @@ __all__ = [
     "MemoryEvent",
     "MemoryEventType",
     "MemoryForgetRequest",
+    "MemoryForgetResult",
     "MemoryHit",
     "MemoryLayers",
     "MemoryMaintenanceService",
     "MemoryManager",
+    "MemoryObservability",
+    "MemoryHttpProvider",
+    "MemoryProviderManager",
+    "MemoryProviderRegistry",
+    "MemoryProfile",
+    "MemoryProfileError",
+    "MemoryProfileRegistry",
+    "MemoryProfileStore",
     "MemoryOwner",
     "MemoryProvider",
     "MemoryRepository",
@@ -87,6 +146,15 @@ __all__ = [
     "MemoryStore",
     "MemoryType",
     "MemoryVisibility",
+    "MetricSummary",
+    "NativeMemoryProvider",
+    "ProviderHandle",
+    "ProviderLifecycleError",
+    "ProviderLifecycleState",
+    "ProviderManifest",
+    "ProviderStatus",
+    "ProviderConformanceReport",
+    "ProviderConformanceSuite",
     "MemoryWriteRequest",
     "MemoryWriteResult",
     "ProviderHealth",
@@ -100,7 +168,16 @@ __all__ = [
     "UsagePolicy",
     "VerificationAuthority",
     "VerificationReceipt",
+    "CODING_PROFILE",
+    "PERSONAL_PROFILE",
+    "MemoryTransferError",
+    "MemoryTransferService",
+    "candidate_digest",
+    "memory_digest",
+    "build_native_registry",
+    "run_provider_conformance",
     "expired_memory_ids",
     "extract_memories_from_messages",
     "extract_memories_from_text",
+    "extract_candidates_from_event",
 ]

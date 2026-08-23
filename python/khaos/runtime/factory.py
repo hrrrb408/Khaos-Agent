@@ -35,8 +35,15 @@ from khaos.memory import (
     RuntimeMemoryContext,
     SqliteMemoryRepository,
 )
+from khaos.memory.codegraph import CodeGraphService
 from khaos.memory.ledger import SqliteEventLedger
-from khaos.memory.providers import NativeMemoryProvider
+from khaos.memory.observability import MemoryObservability
+from khaos.memory.profiles import MemoryProfileRegistry, MemoryProfileStore
+from khaos.memory.providers import (
+    MemoryProviderManager,
+    build_native_registry,
+)
+from khaos.memory.transfer import MemoryTransferService
 from khaos.modes import ModeManager
 from khaos.permissions import PermissionEngine
 from khaos.routing.router import create_default_router
@@ -1079,10 +1086,34 @@ async def build_runtime(
         audit_logger=audit_logger,
     )
     if cfg.memory_manager is None:
-        memory_broker = MemoryBroker(
-            NativeMemoryProvider(cfg.db),
-            SqliteEventLedger(cfg.db),
+        from khaos.config import load_config
+
+        memory_config = load_config(
+            cfg.config_path or root / "config.yaml",
+            strict_env=False,
         )
+        profile_registry = MemoryProfileRegistry.from_config(memory_config)
+        profile_store = MemoryProfileStore(cfg.db)
+        memory_settings = memory_config.get("memory", {})
+        if not isinstance(memory_settings, dict):
+            raise ValueError("memory configuration must be a mapping")
+        default_profile_id = (
+            "coding" if mode_manager.current_mode.value == "coding" else "personal"
+        )
+        configured_profile_id = memory_settings.get("profile", default_profile_id)
+        if not isinstance(configured_profile_id, str):
+            raise ValueError("memory.profile must be a string")
+        persisted_profile_id = await profile_store.get(
+            principal_id=cfg.principal_id,
+            project_id=project_id,
+        )
+        profile = profile_registry.get(persisted_profile_id or configured_profile_id)
+        memory_registry = build_native_registry(
+            cfg.db,
+            network_allowed=bool(effective_policy.network_enabled),
+            config=memory_config,
+        )
+        target_provider = await memory_registry.activate(profile.provider)
 
         def memory_context(session_id: str) -> RuntimeMemoryContext:
             return RuntimeMemoryContext(
@@ -1095,14 +1126,56 @@ async def build_runtime(
                 environment_fingerprint="runtime:default",
             )
 
+        codegraph = CodeGraphService(cfg.db) if profile.codegraph else None
+        observability = MemoryObservability(cfg.db)
+        memory_broker = MemoryBroker(
+            target_provider.provider,
+            SqliteEventLedger(cfg.db),
+            profile=profile,
+            codegraph=codegraph,
+            observability=observability,
+        )
+        provider_manager = MemoryProviderManager(
+            memory_registry,
+            memory_broker,
+            database=cfg.db,
+        )
+        await provider_manager.persist()
+        transfer_service = MemoryTransferService(memory_broker)
         memory_manager = MemoryManager(
             memory_store,
-            budget=MemoryBudget(),
+            budget=profile.budget(MemoryBudget()),
             mode_getter=lambda: mode_manager.current_mode,
             intent_getter=lambda: getattr(mode_manager, "_intent_buffer", ""),
             broker=memory_broker,
             runtime_context_factory=memory_context,
+            provider_manager=provider_manager,
+            profile=profile,
+            transfer_service=transfer_service,
+            codegraph=codegraph,
         )
+        # Keep the profile and registry available to the TUI/RPC composition
+        # without creating a second provider path.  All operations still
+        # enter through the same Broker instance above.
+        memory_manager.profile_registry = profile_registry
+        memory_manager.profile_store = profile_store
+        memory_manager.observability = observability
+        if codegraph is not None and profile.maintenance_overrides.get(
+            "build_on_start", True
+        ):
+            try:
+                report = await codegraph.build(memory_context(cfg.session_id or ""), root)
+                logger.info(
+                    "memory codegraph ready: files=%d nodes=%d edges=%d",
+                    report.files,
+                    report.nodes,
+                    report.edges,
+                )
+            except (OSError, RuntimeError, ValueError) as exc:
+                # CodeGraph is a rebuildable derived index.  A failed graph
+                # build must not discard the canonical event-ledger path, but
+                # the failure is explicit and the CLI/TUI can rebuild it.
+                logger.warning("memory codegraph build failed: %s", type(exc).__name__)
     else:
         memory_manager = cfg.memory_manager
     skill_manager = cfg.skill_manager or SkillManager()

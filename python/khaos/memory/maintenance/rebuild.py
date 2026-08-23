@@ -44,16 +44,52 @@ class MemoryMaintenanceService:
         """Replay canonical candidate events and rebuild provider indexes."""
 
         started = monotonic()
+        await self.broker.record_audit(
+            "MEMORY_REBUILD_STARTED",
+            runtime,
+            detail={"from_ledger": from_ledger, "limit": limit},
+        )
         replayed = 0
         if from_ledger:
             replayed = await self.broker.rebuild_from_ledger(runtime, limit=limit)
         indexed = await self.broker.rebuild()
         consistency = await self.verify(runtime)
+        duration_ms = max(0, int((monotonic() - started) * 1000))
+        await self.broker.record_audit(
+            "MEMORY_REBUILD_FINISHED",
+            runtime,
+            detail={
+                "replayed_nodes": replayed,
+                "indexed_nodes": indexed,
+                "consistent": consistency.consistent,
+                "duration_ms": duration_ms,
+            },
+        )
+        observability = getattr(self.broker, "observability", None)
+        record = getattr(observability, "record", None)
+        if callable(record):
+            try:
+                await record(
+                    "memory.rebuild.duration_ms",
+                    duration_ms,
+                    runtime,
+                    unit="ms",
+                    provider_id=self.broker.provider.provider_id,
+                    profile_id=(
+                        self.broker.profile.profile_id
+                        if self.broker.profile is not None
+                        else ""
+                    ),
+                    operation="rebuild",
+                    metadata={"consistent": consistency.consistent},
+                )
+            except Exception:  # noqa: BLE001 - metrics are non-authoritative
+                pass
         return RebuildReport(
             replayed_nodes=replayed,
             indexed_nodes=indexed,
             consistency=consistency,
-            duration_ms=max(0, int((monotonic() - started) * 1000)),
+            duration_ms=duration_ms,
         )
 
     async def verify(self, runtime: RuntimeMemoryContext) -> ConsistencyReport:
