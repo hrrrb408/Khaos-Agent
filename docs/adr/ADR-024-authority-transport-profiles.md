@@ -59,5 +59,10 @@ profile marker.
 - A missing authority daemon, key, socket, policy digest, or typed resource
   catalog still fails closed.  There is no implicit in-process, TCP, or
   platform fallback.
+- Authority daemon startup never replaces an apparently live Unix endpoint:
+  an existing socket is connect-probed, only an `ECONNREFUSED` stale inode may
+  be removed, and a bind race fails closed.  Explicit revocation of an unknown
+  grant is also rejected; retries for a grant already recorded in a terminal
+  tombstone remain idempotent.
 - Native macOS evidence is now an optional deployment capability for the
   community profile, not a prerequisite for ordinary local functionality.

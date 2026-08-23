@@ -18,12 +18,14 @@ import struct
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 
 import pytest
 from khaos.security.authorityd import (
     AuthorityControlPlaneError,
     AuthorityDaemon,
+    _prepare_unix_socket_path,
     serve_unix,
 )
 from khaos.security.authorityd_protocol import (
@@ -100,6 +102,35 @@ def _connect_when_listening(path: Path, *, timeout: float = 5.0) -> socket.socke
             if time.monotonic() >= deadline:
                 raise
             time.sleep(0.05)
+
+
+@pytest.mark.posix_host
+def test_unix_startup_refuses_a_live_authority_socket() -> None:
+    """A second authorityd cannot replace an accepting first instance."""
+    socket_path = Path(f"/tmp/khaos-authorityd-live-{uuid.uuid4().hex[:12]}.sock")
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(socket_path))
+    listener.listen(1)
+    try:
+        with pytest.raises(AuthorityControlPlaneError, match="already serving"):
+            _prepare_unix_socket_path(socket_path)
+        assert socket_path.exists()
+    finally:
+        listener.close()
+        socket_path.unlink(missing_ok=True)
+
+
+@pytest.mark.posix_host
+def test_unix_startup_removes_only_a_refused_stale_socket() -> None:
+    """A stale inode is recoverable, while a live endpoint is not."""
+    socket_path = Path(f"/tmp/khaos-authorityd-stale-{uuid.uuid4().hex[:12]}.sock")
+    stale_listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    stale_listener.bind(str(socket_path))
+    stale_listener.close()
+    assert socket_path.exists()
+
+    _prepare_unix_socket_path(socket_path)
+    assert not socket_path.exists()
 
 
 def test_darwin_backend_mode_rejects_foreign_socket(
