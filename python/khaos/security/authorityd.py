@@ -12,6 +12,7 @@ fallback.
 from __future__ import annotations
 
 import base64
+import errno
 import hashlib
 import json
 import logging
@@ -1075,6 +1076,15 @@ class AuthorityDaemon:
         with self._lock:
             record = self._grants.get(grant_id)
             if record is None:
+                if grant_id not in self._grant_terminal:
+                    raise AuthorityControlPlaneError(
+                        "authority grant is unknown"
+                    )
+                # Revoke remains idempotent for a grant that this daemon has
+                # already terminalized.  A missing live record without a
+                # tombstone is different: reporting success would let a
+                # caller believe that the intended grant was invalidated even
+                # though this authority instance never owned it.
                 return
             events = self._commit_grant_revocation_locked(
                 grant_id,
@@ -2792,24 +2802,34 @@ def serve_unix(
         if authority_uid is not None and os.geteuid() != authority_uid:
             raise IdentityIsolationError("authorityd is not running as its dedicated UID")
     daemon.socket_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if daemon.socket_path.exists():
-        info = daemon.socket_path.lstat()
-        if not stat.S_ISSOCK(info.st_mode):
-            raise AuthorityControlPlaneError("authorityd socket path is not a socket")
-        daemon.socket_path.unlink()
+    _prepare_unix_socket_path(daemon.socket_path)
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         # bind() creates the socket inode with 0777 & ~umask, so an
         # ambient 022 umask would briefly expose a 0755 socket before
         # the chmod below.  Force the restrictive mode at creation time:
         # the socket must never be observable with a mode looser than
-        # the configured one, and only the explicit agent-group mode
-        # (0660) may widen it before listen().
+        # the configured one.  The explicit agent-group mode (0660) is only
+        # applied after the endpoint is marked live, but before workers accept
+        # any queued request.
         previous_umask = os.umask(0o177)
         try:
-            listener.bind(str(daemon.socket_path))
+            try:
+                listener.bind(str(daemon.socket_path))
+            except OSError as exc:
+                if exc.errno == errno.EADDRINUSE:
+                    raise AuthorityControlPlaneError(
+                        "authorityd socket became active during startup"
+                    ) from exc
+                raise
         finally:
             os.umask(previous_umask)
+        # Mark the endpoint as live immediately after bind.  The inode is
+        # still 0600 from the restrictive umask, and no worker accepts a
+        # connection until the identity/mode/configuration checks below have
+        # completed.  This closes the bind-to-listen interval in which a
+        # second daemon could misclassify the socket as stale and unlink it.
+        listener.listen(1)
         configured_mode = os.environ.get("KHAOS_AUTHORITYD_SOCKET_MODE", "0600")
         try:
             socket_mode = int(configured_mode, 8)
@@ -2886,6 +2906,58 @@ def serve_unix(
         daemon.socket_path.unlink(missing_ok=True)
 
 
+def _prepare_unix_socket_path(socket_path: Path) -> None:
+    """Reject a live endpoint and remove only a proven-stale socket.
+
+    Unconditionally unlinking an existing socket lets a second authorityd
+    instance replace the first instance's endpoint.  Requests can then land
+    on a daemon that does not own the grant state, producing false-success
+    revocations and a split authority.  A successful connect proves that an
+    owner is accepting; only ``ECONNREFUSED`` is evidence of a stale inode.
+    The bind step still treats an ``EADDRINUSE`` race as a hard failure.
+    """
+    try:
+        info = socket_path.lstat()
+    except FileNotFoundError:
+        return
+    if not stat.S_ISSOCK(info.st_mode):
+        raise AuthorityControlPlaneError("authorityd socket path is not a socket")
+
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        probe.settimeout(0.5)
+        try:
+            probe.connect(str(socket_path))
+        except FileNotFoundError:
+            # The previous owner removed the stale inode concurrently.  The
+            # subsequent bind is the authoritative availability check.
+            return
+        except ConnectionRefusedError:
+            pass
+        except OSError as exc:
+            raise AuthorityControlPlaneError(
+                "could not determine whether authorityd socket is live"
+            ) from exc
+        else:
+            # Make the probe connection observable as EOF to the existing
+            # server so it cannot retain a handler slot until its read
+            # timeout expires.
+            try:
+                probe.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+            raise AuthorityControlPlaneError(
+                "authorityd socket is already serving"
+            )
+    finally:
+        probe.close()
+
+    try:
+        socket_path.unlink()
+    except FileNotFoundError:
+        pass
+
+
 def _serve_connection(
     daemon: AuthorityDaemon,
     connection: socket.socket,
@@ -2919,7 +2991,13 @@ def _serve_connection(
                     "error": str(exc),
                     "error_code": "remote_audit_unavailable",
                 }
-            except (AuthorityControlPlaneError, OSError, ValueError, TypeError) as exc:
+            except (
+                AuthorityControlPlaneError,
+                ProtocolBoundaryError,
+                OSError,
+                ValueError,
+                TypeError,
+            ) as exc:
                 response = {"ok": False, "error": str(exc)}
             try:
                 connection.sendall(canonical_json_bytes(response) + b"\n")

@@ -37,6 +37,7 @@ from khaos.security.authorityd import (
 )
 from khaos.security.authorityd_protocol import (
     AUTHORITYD_PROTOCOL,
+    MAX_MESSAGE_BYTES,
     AuthorityControlPlaneError,
     AuthorizationIntent,
     Ed25519KeyStore,
@@ -333,6 +334,97 @@ def test_authorityd_prepare_and_complete_are_two_phase(tmp_path: Path) -> None:
         daemon.complete(receipt, result="success", result_digest="again")
 
 
+def test_claim_is_one_shot_and_a_second_claim_is_rejected(tmp_path: Path) -> None:
+    daemon = AuthorityDaemon(
+        socket_path=tmp_path / "authorityd.sock",
+        signing_key=Ed25519KeyStore.load_or_create(tmp_path / "key.pem", create=True),
+        audit_writer=_MemoryWorm(),
+        issuer_id="test-authorityd",
+        policy=lambda _intent: None,
+    )
+    receipt = daemon.prepare(_intent())
+
+    daemon.claim(receipt)
+    with pytest.raises(AuthorityControlPlaneError, match="not claimable"):
+        daemon.claim(receipt)
+
+
+def test_tampered_receipt_is_rejected_at_the_daemon_boundary(tmp_path: Path) -> None:
+    daemon = AuthorityDaemon(
+        socket_path=tmp_path / "authorityd.sock",
+        signing_key=Ed25519KeyStore.load_or_create(tmp_path / "key.pem", create=True),
+        audit_writer=_MemoryWorm(),
+        issuer_id="test-authorityd",
+        policy=lambda _intent: None,
+    )
+    receipt = daemon.prepare(_intent())
+    tampered = replace(receipt, operation="network.connect")
+
+    with pytest.raises(AuthorityControlPlaneError, match="unknown or revoked"):
+        daemon.claim(tampered)
+    assert daemon.pending_count == 1
+
+
+def test_unknown_grant_revoke_is_not_reported_as_success(tmp_path: Path) -> None:
+    daemon = AuthorityDaemon(
+        socket_path=tmp_path / "authorityd.sock",
+        signing_key=Ed25519KeyStore.load_or_create(tmp_path / "key.pem", create=True),
+        audit_writer=_MemoryWorm(),
+        issuer_id="test-authorityd",
+        policy=lambda _intent: None,
+        require_live_grants=True,
+    )
+
+    with pytest.raises(AuthorityControlPlaneError, match="grant is unknown"):
+        daemon.revoke_grant("missing-grant")
+
+    grant_id, _parent = _live_grant_parent(daemon, nonce="revoke-idempotency-parent")
+    daemon.revoke_grant(grant_id)
+    # A tombstoned grant is intentionally idempotent for retrying callers.
+    daemon.revoke_grant(grant_id)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        {"protocol": 99, "operation": "ping"},
+        {"protocol": AUTHORITYD_PROTOCOL, "operation": "unknown"},
+        {
+            "protocol": AUTHORITYD_PROTOCOL,
+            "operation": "prepare",
+            "intent": [],
+        },
+        {
+            "protocol": AUTHORITYD_PROTOCOL,
+            "operation": "claim",
+            "receipt": "not-a-mapping",
+        },
+        {
+            "protocol": AUTHORITYD_PROTOCOL,
+            "operation": "attest",
+            "proof_fields": [],
+            "challenge_nonce": "x",
+            "request_raw_hex": "00",
+            "request_digest": "0" * 64,
+        },
+    ],
+)
+def test_malformed_authority_requests_fail_closed(
+    tmp_path: Path, payload: object
+) -> None:
+    daemon = AuthorityDaemon(
+        socket_path=tmp_path / "authorityd.sock",
+        signing_key=Ed25519KeyStore.load_or_create(tmp_path / "key.pem", create=True),
+        audit_writer=_MemoryWorm(),
+        issuer_id="test-authorityd",
+        policy=lambda _intent: None,
+    )
+
+    with pytest.raises(AuthorityControlPlaneError):
+        _dispatch(daemon, payload)
+
+
 def test_receipt_wire_timestamps_are_integer_milliseconds(tmp_path: Path) -> None:
     key = Ed25519KeyStore.load_or_create(
         tmp_path / "khaos-authorityd-wire-key.pem", create=True
@@ -570,6 +662,40 @@ def test_incomplete_authorityd_connection_is_bounded(tmp_path: Path) -> None:
         worker.join(timeout=1)
     assert not worker.is_alive()
     assert b'"ok":false' in response
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        b"\xff\n",
+        b"x" * MAX_MESSAGE_BYTES,
+    ],
+    ids=["invalid-utf8", "oversized-frame"],
+)
+def test_authorityd_connection_rejects_malformed_frames(
+    tmp_path: Path, frame: bytes
+) -> None:
+    daemon = AuthorityDaemon(
+        socket_path=tmp_path / "authorityd.sock",
+        signing_key=Ed25519KeyStore.load_or_create(tmp_path / "key.pem", create=True),
+        audit_writer=_MemoryWorm(),
+        issuer_id="test-authorityd",
+        policy=lambda _intent: None,
+    )
+    client, server = socketpair()
+    worker = threading.Thread(
+        target=_serve_connection,
+        args=(daemon, server, None, 1.0),
+    )
+    worker.start()
+    try:
+        client.sendall(frame)
+        response = json.loads(client.recv(4096).decode("utf-8"))
+    finally:
+        client.close()
+        worker.join(timeout=1)
+    assert not worker.is_alive()
+    assert response["ok"] is False
 
 
 def test_authorityd_socket_round_trip_accepts_versioned_intent_payload(
