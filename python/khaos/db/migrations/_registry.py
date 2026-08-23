@@ -422,6 +422,16 @@ MIGRATIONS: tuple[MigrationSpec, ...] = (
             "_ensure_tool_operations_table",
         ),
     ),
+    MigrationSpec(
+        version=13,
+        name="memory_v2_temporal_provenance_infrastructure",
+        # Memory V2 keeps the historical ``memories`` projection available
+        # for compatibility, while the event ledger and derived graph become
+        # the canonical source for the new Broker path.
+        sha256="ebef2081c36a81dcfbf3e2ccb60d9a2464347c97bd93259524890d21e12a72a7",
+        sql_files=("0013_memory_v2.sql",),
+        migrator_symbols=("_apply_v13_upgrades",),
+    ),
 )
 
 

@@ -759,6 +759,15 @@ class Database:
                 await self._apply_v12_upgrades()
             finally:
                 self._conn = original_conn
+            # Memory V2: canonical event ledger and rebuildable derived
+            # representation are a new versioned boundary.  The migration
+            # is deliberately separate from the frozen V1 memories table.
+            original_conn = self._conn
+            self._conn = _MigrationConnection(conn)
+            try:
+                await self._apply_v13_upgrades()
+            finally:
+                self._conn = original_conn
             # Batch 6.4 §10.4: backfill the historical ledger rows (v1–v5)
             # so the chain is complete from this point on.  Idempotent —
             # uses INSERT OR IGNORE keyed on the version PK.
@@ -1346,6 +1355,15 @@ class Database:
     async def _apply_v12_upgrades(self) -> None:
         """Security closure: add the durable tool-operation journal."""
         await self._ensure_tool_operations_table()
+
+    async def _apply_v13_upgrades(self) -> None:
+        """Create the Memory V2 canonical ledger and derived projections."""
+        conn = await self._require_conn()
+        migration_path = _MIGRATIONS_DIR / "0013_memory_v2.sql"
+        await self._execute_schema_statements(
+            conn,
+            migration_path.read_text(encoding="utf-8"),
+        )
 
     async def _ensure_tool_operations_table(self) -> None:
         """Create the crash/replay-safe tool operation journal."""

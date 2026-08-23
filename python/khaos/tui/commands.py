@@ -28,6 +28,7 @@ class TuiContext:
 
     loop: Any = None
     mode_manager: Any = None
+    memory_manager: Any = None
     memory_store: Any = None
     registry: Any = None
     router: Any = None
@@ -76,8 +77,12 @@ Khaos TUI — slash commands:
   /skills list              List skills
   /skills load <name>       Force-load a skill into the prompt
   /skills unload <name>     Remove a skill from the forced set
-  /memory list              List memories (all scopes)
+  /memory list              List Broker-admitted current memories
+  /memory show <id>         Show one memory with provenance
   /memory search <query>    Full-text search memories
+  /memory forget <id>      Revoke a memory (soft by default)
+  /memory rebuild           Replay the canonical event ledger
+  /memory verify            Verify rebuildable indexes
   /tools [mode]             List available tools (optionally per mode)
   /model <name>             Show or set the active model (set is advisory)
   /tasks                    List active coding tasks (all tasks with -a)
@@ -215,6 +220,10 @@ def _cmd_skills(args: list[str], ctx: TuiContext) -> CommandResult:
 
 
 async def _cmd_memory(args: list[str], ctx: TuiContext) -> CommandResult:
+    manager = ctx.memory_manager
+    broker = getattr(manager, "broker", None) if manager is not None else None
+    if broker is not None:
+        return await _cmd_memory_v2(args, ctx, manager, broker)
     if ctx.memory_store is None:
         return CommandResult(handled=True, message="memory store not configured")
     if not args or args[0] == "list":
@@ -239,6 +248,94 @@ async def _cmd_memory(args: list[str], ctx: TuiContext) -> CommandResult:
             lines.append(f"  ({memory.scope.value}) {memory.key}: {memory.value}")
         return CommandResult(handled=True, message="\n".join(lines))
     return CommandResult(handled=True, message="usage: /memory [list|search <query>]")
+
+
+async def _cmd_memory_v2(
+    args: list[str],
+    ctx: TuiContext,
+    manager: Any,
+    broker: Any,
+) -> CommandResult:
+    """Expose V2 inspection and maintenance without a provider bypass."""
+
+    from khaos.memory import MemoryBudget, MemoryMaintenanceService
+
+    runtime_builder = getattr(manager, "runtime_context", None)
+    if not callable(runtime_builder):
+        return CommandResult(handled=True, message="memory runtime context not configured")
+    runtime = runtime_builder(ctx.session_id)
+    action = args[0].lower() if args else "list"
+    if action in {"list", "search"}:
+        query = " ".join(args[1:]) if action == "search" else ""
+        if action == "search" and not query:
+            return CommandResult(handled=True, message="usage: /memory search <query>")
+        resolution = await broker.search(query, runtime, MemoryBudget(max_hits=100))
+        hits = [*resolution.primary_hits, *resolution.supporting_hits]
+        if not hits:
+            return CommandResult(
+                handled=True,
+                message="no memories match the requested view." if query else "no memories stored.",
+            )
+        lines = [f"memories{f' matching {query!r}' if query else ''}:"]
+        lines.extend(_format_memory_hit(hit) for hit in hits)
+        return CommandResult(handled=True, message="\n".join(lines))
+    if action == "show" and len(args) == 2:
+        hit = await broker.get(args[1], runtime, include_historical=True)
+        if hit is None:
+            return CommandResult(handled=True, message=f"memory not found: {args[1]}")
+        return CommandResult(handled=True, message=_format_memory_hit(hit, detailed=True))
+    if action == "forget" and len(args) in {2, 3}:
+        mode = args[2] if len(args) == 3 else "soft"
+        try:
+            result = await broker.forget((args[1],), runtime, mode=mode)
+        except (RuntimeError, ValueError) as exc:
+            return CommandResult(handled=True, message=f"memory forget failed: {exc}")
+        return CommandResult(
+            handled=True,
+            message=f"forgot {len(result.forgotten_ids)} memory(s) with mode={result.mode}.",
+        )
+    if action == "rebuild" and len(args) == 1:
+        report = await MemoryMaintenanceService(broker).rebuild(runtime)
+        return CommandResult(
+            handled=True,
+            message=(
+                f"memory rebuild: replayed={report.replayed_nodes}, "
+                f"indexed={report.indexed_nodes}, "
+                f"consistent={report.consistency.consistent}."
+            ),
+        )
+    if action == "verify" and len(args) == 1:
+        report = await MemoryMaintenanceService(broker).verify(runtime)
+        return CommandResult(
+            handled=True,
+            message=f"memory indexes: supported={report.supported}, consistent={report.consistent}.",
+        )
+    return CommandResult(
+        handled=True,
+        message=(
+            "usage: /memory [list|show <id>|search <query>|forget <id> [soft|hard|compliance]|"
+            "rebuild|verify]"
+        ),
+    )
+
+
+def _format_memory_hit(hit: Any, *, detailed: bool = False) -> str:
+    """Render Broker-admitted metadata for a user, not for model injection."""
+
+    line = (
+        f"  {hit.memory_id or hit.external_id} [{hit.status}] "
+        f"({hit.scope}) {hit.key or '-'}: {hit.content}"
+    )
+    if not detailed:
+        return line
+    return "\n".join(
+        (
+            line,
+            f"    type={hit.memory_type} authority={hit.authority_hint} confidence={hit.confidence_hint}",
+            f"    namespace={hit.namespace} source={hit.source_ref or 'unknown'}",
+            f"    events={', '.join(hit.event_ids) or 'none'}",
+        )
+    )
 
 
 def _cmd_tools(args: list[str], ctx: TuiContext) -> CommandResult:

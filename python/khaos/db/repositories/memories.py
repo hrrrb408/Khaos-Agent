@@ -21,6 +21,12 @@ class MemorySqlRepository:
     def __init__(self, db: Any) -> None:
         self._db = db
 
+    @property
+    def database(self) -> Any:
+        """Return the shared Database port for V2 composition only."""
+
+        return self._db
+
     async def get(
         self,
         scope: str,

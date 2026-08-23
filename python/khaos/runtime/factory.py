@@ -28,11 +28,15 @@ from khaos.coding.workspace.office_authority import OfficeMutationAuthority
 from khaos.db.state_root import project_id as compute_project_id
 from khaos.exceptions import RuntimeCloseError
 from khaos.memory import (
+    MemoryBroker,
     MemoryBudget,
     MemoryManager,
     MemoryStore,
+    RuntimeMemoryContext,
     SqliteMemoryRepository,
 )
+from khaos.memory.ledger import SqliteEventLedger
+from khaos.memory.providers import NativeMemoryProvider
 from khaos.modes import ModeManager
 from khaos.permissions import PermissionEngine
 from khaos.routing.router import create_default_router
@@ -1068,17 +1072,39 @@ async def build_runtime(
         audit_logger=audit_logger,
     )
     await permission_engine.load_rules()
-    memory_manager = cfg.memory_manager or MemoryManager(
-        MemoryStore(
-            SqliteMemoryRepository(cfg.db),
-            principal_id=cfg.principal_id,
-            project_id=project_id,
-            audit_logger=audit_logger,
-        ),
-        budget=MemoryBudget(),
-        mode_getter=lambda: mode_manager.current_mode,
-        intent_getter=lambda: getattr(mode_manager, "_intent_buffer", ""),
+    memory_store = MemoryStore(
+        SqliteMemoryRepository(cfg.db),
+        principal_id=cfg.principal_id,
+        project_id=project_id,
+        audit_logger=audit_logger,
     )
+    if cfg.memory_manager is None:
+        memory_broker = MemoryBroker(
+            NativeMemoryProvider(cfg.db),
+            SqliteEventLedger(cfg.db),
+        )
+
+        def memory_context(session_id: str) -> RuntimeMemoryContext:
+            return RuntimeMemoryContext(
+                principal_id=cfg.principal_id,
+                project_id=project_id,
+                session_id=session_id or cfg.session_id or None,
+                task_id=None,
+                workspace_id=None,
+                mode=mode_manager.current_mode.value,
+                environment_fingerprint="runtime:default",
+            )
+
+        memory_manager = MemoryManager(
+            memory_store,
+            budget=MemoryBudget(),
+            mode_getter=lambda: mode_manager.current_mode,
+            intent_getter=lambda: getattr(mode_manager, "_intent_buffer", ""),
+            broker=memory_broker,
+            runtime_context_factory=memory_context,
+        )
+    else:
+        memory_manager = cfg.memory_manager
     skill_manager = cfg.skill_manager or SkillManager()
     skills_dir = root / "skills"
     if len(skill_manager.registry) == 0 and skills_dir.is_dir():
