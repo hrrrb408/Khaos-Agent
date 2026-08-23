@@ -475,6 +475,7 @@ class KhaosApp(App):
         return TuiContext(
             loop=self.agent_loop,
             mode_manager=self.mode_manager,
+            memory_manager=self.memory_manager,
             memory_store=self.memory_manager.store if self.memory_manager else None,
             registry=create_runtime_registry(),
             router=self.router,

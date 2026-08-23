@@ -4,10 +4,21 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass
 from typing import Any
 
 from khaos.agent.core import SimpleTokenEngine
+from khaos.memory.core import (
+    ContextAssembler,
+    MemoryAuthority,
+    MemoryBroker,
+    MemoryBudget,
+    MemoryCandidate,
+    MemoryEvent,
+    MemoryEventType,
+    RuntimeMemoryContext,
+    SourceType,
+    TrustHint,
+)
 from khaos.memory.extraction import extract_memories_from_messages
 from khaos.memory.models import Memory, MemoryScope
 from khaos.memory.ownership import MemoryVisibility
@@ -18,27 +29,6 @@ from khaos.modes import Mode
 logger = logging.getLogger(__name__)
 
 MemoryExtractor = Callable[[list[Any], MemoryScope], list[Memory]]
-
-
-@dataclass
-class MemoryBudget:
-    """Token budget for memory injection layers."""
-
-    total_tokens: int = 2048
-    l0_max_tokens: int = 512
-    l1_max_tokens: int = 1024
-    l2_max_tokens: int = 512
-
-    def __post_init__(self) -> None:
-        values = {
-            "total_tokens": self.total_tokens,
-            "l0_max_tokens": self.l0_max_tokens,
-            "l1_max_tokens": self.l1_max_tokens,
-            "l2_max_tokens": self.l2_max_tokens,
-        }
-        invalid = [name for name, value in values.items() if value < 0]
-        if invalid:
-            raise ValueError(f"memory budgets must be non-negative: {invalid}")
 
 
 class MemoryManager:
@@ -54,6 +44,8 @@ class MemoryManager:
         *,
         retriever: MemoryRetriever | None = None,
         extractor: MemoryExtractor | None = None,
+        broker: MemoryBroker | None = None,
+        runtime_context_factory: Callable[[str], RuntimeMemoryContext] | None = None,
     ) -> None:
         self.store = store
         self.budget = budget or MemoryBudget()
@@ -62,6 +54,9 @@ class MemoryManager:
         self.intent_getter = intent_getter
         self.retriever = retriever or MemoryRetriever()
         self.extractor = extractor or extract_memories_from_messages
+        self.broker = broker
+        self.runtime_context_factory = runtime_context_factory
+        self.context_assembler = ContextAssembler(self.token_engine)
 
     async def inject(self, session_id: str) -> str:
         """Return durable L0/L1/L2 memory text within the total budget.
@@ -72,7 +67,15 @@ class MemoryManager:
         durable memory boundary by accident.
         """
 
-        del session_id
+        if self.broker is not None:
+            runtime = self._runtime_context(session_id)
+            query = self.intent_getter() if self.intent_getter is not None else ""
+            resolution = await self.broker.search(query, runtime, self.budget)
+            return self.context_assembler.build(
+                resolution,
+                self.budget,
+                query=query,
+            )
         durable_view = MemoryVisibility.durable()
         current_mode = self._current_scope()
         layers = self.retriever.build_layers(
@@ -120,6 +123,8 @@ class MemoryManager:
     ) -> list[Memory]:
         """Extract and persist declarative user facts with conflict policy."""
 
+        if self.broker is not None:
+            return await self._update_v2_from_conversation(messages, mode)
         del mode
         candidates = self.extractor(messages, MemoryScope.GLOBAL)
         persisted: list[Memory] = []
@@ -131,6 +136,57 @@ class MemoryManager:
             logger.info("proactive memory extracted %d fact(s)", len(persisted))
         return persisted
 
+    async def record_message(
+        self,
+        message: Any,
+        *,
+        session_id: str,
+        task_id: str | None = None,
+    ) -> None:
+        """Append a live message event without making it model-visible."""
+
+        if self.broker is None:
+            return
+        role = str(getattr(message, "role", ""))
+        event_type = {
+            "user": MemoryEventType.USER_MESSAGE,
+            "assistant": MemoryEventType.ASSISTANT_MESSAGE,
+            "tool": MemoryEventType.TOOL_RESULT,
+        }.get(role, MemoryEventType.ASSISTANT_MESSAGE)
+        source_type = (
+            SourceType.USER
+            if role == "user"
+            else SourceType.TOOL
+            if role == "tool"
+            else SourceType.SYSTEM
+        )
+        runtime = self._runtime_context(session_id, task_id=task_id)
+        event = MemoryEvent.create(
+            event_type,
+            principal_id=runtime.principal_id,
+            project_id=runtime.project_id,
+            session_id=session_id,
+            task_id=task_id,
+            workspace_id=runtime.workspace_id,
+            repo_id=runtime.repo_id,
+            branch=runtime.branch,
+            commit_sha=runtime.commit_sha,
+            source_type=source_type,
+            trust_hint=(
+                TrustHint.USER_STATED
+                if role == "user"
+                else TrustHint.TOOL_OBSERVED
+                if role == "tool"
+                else TrustHint.AGENT_INFERRED
+            ),
+            payload={
+                "role": role,
+                "content": str(getattr(message, "content", "")),
+                "token_count": int(getattr(message, "token_count", 0) or 0),
+            },
+        )
+        await self.broker.record_event(event)
+
     def _current_scope(self) -> MemoryScope:
         if self.mode_getter is None:
             return MemoryScope.GLOBAL
@@ -138,6 +194,70 @@ class MemoryManager:
         if isinstance(mode, Mode):
             return MemoryScope(mode.value)
         return MemoryScope(str(mode))
+
+    def _runtime_context(
+        self,
+        session_id: str,
+        *,
+        task_id: str | None = None,
+    ) -> RuntimeMemoryContext:
+        if self.runtime_context_factory is not None:
+            return self.runtime_context_factory(session_id)
+        return RuntimeMemoryContext(
+            principal_id=self.store.principal_id,
+            project_id=self.store.project_id,
+            session_id=session_id,
+            task_id=task_id,
+            workspace_id=None,
+            mode=self._current_scope().value,
+            environment_fingerprint="runtime:default",
+        )
+
+    def runtime_context(self, session_id: str) -> RuntimeMemoryContext:
+        """Return the host-bound context used by Broker-backed UI commands."""
+
+        return self._runtime_context(session_id)
+
+    async def _update_v2_from_conversation(
+        self,
+        messages: list[Any],
+        mode: Mode,
+    ) -> list[Memory]:
+        """Promote only explicit user facts through the V2 Broker."""
+
+        del mode
+        runtime = self._runtime_context("")
+        persisted: list[Memory] = []
+        for message in messages:
+            if getattr(message, "role", "") != "user":
+                continue
+            event = MemoryEvent.create(
+                MemoryEventType.USER_MESSAGE,
+                principal_id=runtime.principal_id,
+                project_id=runtime.project_id,
+                session_id=runtime.session_id,
+                task_id=runtime.task_id,
+                workspace_id=runtime.workspace_id,
+                source_type=SourceType.USER,
+                trust_hint=TrustHint.USER_STATED,
+                payload={"role": "user", "content": str(getattr(message, "content", ""))},
+            )
+            await self.broker.record_event(event)
+            for extracted in self.extractor([message], MemoryScope.GLOBAL):
+                candidate = MemoryCandidate(
+                    memory_type="USER_MEMORY",
+                    claim=f"{extracted.key}: {extracted.value}",
+                    key=extracted.key,
+                    authority=MemoryAuthority.USER_STATED,
+                    confidence=extracted.confidence.value / 3.0,
+                    source_event_ids=(event.event_id,),
+                    scope=extracted.scope.value,
+                    namespace="private",
+                )
+                decision = await self.broker.propose_memory(candidate, runtime)
+                if decision.accepted and decision.memory_id:
+                    persisted.append(extracted)
+        return persisted
 
     def _format_section(
         self,
@@ -179,6 +299,13 @@ class MemoryManager:
             else:
                 high = middle - 1
         return best
+
+    async def aclose(self) -> None:
+        """Close provider resources when a provider exposes a lifecycle hook."""
+
+        close = getattr(self.broker.provider, "aclose", None) if self.broker else None
+        if callable(close):
+            await close()
 
 
 __all__ = ["MemoryBudget", "MemoryManager"]

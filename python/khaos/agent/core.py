@@ -1085,6 +1085,23 @@ class AgentLoop:
         await self.db.insert_message_fts(
             session_id, message.role, message.content, message.token_count, rowid=rowid
         )
+        # Memory V2 observes the durable message after the canonical session
+        # write.  Event-ledger failure is deliberately isolated from the
+        # AgentLoop: memory is allowed to become unavailable, but that must
+        # never relax or break the execution/approval path.
+        record_event = getattr(self.memory_manager, "record_message", None)
+        if callable(record_event):
+            try:
+                await record_event(
+                    message,
+                    session_id=session_id,
+                    task_id=self.task_id,
+                )
+            except Exception:
+                logger.warning(
+                    "memory event observation failed; continuing turn",
+                    exc_info=True,
+                )
 
     def _budget_exceeded(self, total_tokens: int) -> bool:
         """Return whether the current turn has crossed its hard token budget."""
