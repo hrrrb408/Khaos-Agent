@@ -428,6 +428,9 @@ class MemorySearchRequest:
     runtime: RuntimeMemoryContext
     limit: int = 32
     include_historical: bool = False
+    profile_id: str = ""
+    filters: Mapping[str, Any] = field(default_factory=dict)
+    source_kinds: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -456,6 +459,9 @@ class ProviderHealth:
     provider_id: str
     healthy: bool
     detail: str = ""
+    lifecycle: str = "healthy"
+    generation: int = 0
+    last_error: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -472,6 +478,14 @@ class MemoryCapabilities:
     profile: bool = False
     bulk_import: bool = False
     forget: bool = True
+    update: bool = False
+    graph_expand: bool = False
+    vector_search: bool = False
+    export_data: bool = False
+    import_data: bool = False
+    compact: bool = False
+    bulk_rebuild: bool = False
+    stream_events: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -537,6 +551,12 @@ class ForgetResult:
     mode: str
 
 
+# The design document uses ``MemoryForgetResult`` in its public SPI while the
+# original V2 implementation exported the shorter ``ForgetResult`` name.
+# Keeping one value object with both names avoids a compatibility fork.
+MemoryForgetResult = ForgetResult
+
+
 class MemoryProvider(Protocol):
     """Provider SPI implemented below the Khaos Broker."""
 
@@ -545,17 +565,27 @@ class MemoryProvider(Protocol):
     async def add(self, request: MemoryWriteRequest) -> MemoryWriteResult:
         """Persist an already-admitted candidate."""
 
+        ...
+
     async def search(self, request: MemorySearchRequest) -> list[MemoryHit]:
         """Return scoped evidence candidates."""
+
+        ...
 
     async def forget(self, request: MemoryForgetRequest) -> ForgetResult:
         """Apply the provider's forget semantics."""
 
+        ...
+
     async def health(self) -> ProviderHealth:
         """Return a bounded health snapshot."""
 
+        ...
+
     def capabilities(self) -> MemoryCapabilities:
         """Return capability declarations without performing I/O."""
+
+        ...
 
 
 __all__ = [
@@ -571,6 +601,7 @@ __all__ = [
     "MemoryEvent",
     "MemoryEventType",
     "MemoryForgetRequest",
+    "MemoryForgetResult",
     "MemoryHit",
     "MemoryProvider",
     "MemorySearchRequest",

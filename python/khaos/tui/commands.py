@@ -10,6 +10,7 @@ from __future__ import annotations
 import shlex
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from khaos.runtime.context import local_principal_id
@@ -30,6 +31,9 @@ class TuiContext:
     mode_manager: Any = None
     memory_manager: Any = None
     memory_store: Any = None
+    memory_provider_manager: Any = None
+    memory_profile_registry: Any = None
+    memory_transfer: Any = None
     registry: Any = None
     router: Any = None
     db: Any = None
@@ -80,9 +84,17 @@ Khaos TUI — slash commands:
   /memory list              List Broker-admitted current memories
   /memory show <id>         Show one memory with provenance
   /memory search <query>    Full-text search memories
+  /memory source <id>       Show the canonical source record
+  /memory evidence <id>     Show evidence and graph edges
+  /memory conflicts <query> Inspect conflicting historical facts
   /memory forget <id>      Revoke a memory (soft by default)
+  /memory provider          Show provider lifecycle status
+  /memory provider set <id> Switch provider after replay and health checks
   /memory rebuild           Replay the canonical event ledger
   /memory verify            Verify rebuildable indexes
+  /memory gc                Run conservative compaction
+  /memory export <path>     Export a scope-bound package
+  /memory import <path>     Import a scope-bound package
   /tools [mode]             List available tools (optionally per mode)
   /model <name>             Show or set the active model (set is advisory)
   /tasks                    List active coding tasks (all tasks with -a)
@@ -310,13 +322,95 @@ async def _cmd_memory_v2(
             handled=True,
             message=f"memory indexes: supported={report.supported}, consistent={report.consistent}.",
         )
+    if action == "source" and len(args) == 2:
+        source = await broker.source(runtime, args[1])
+        return CommandResult(
+            handled=True,
+            message="source not found." if source is None else _render_mapping(source),
+            payload=source,
+        )
+    if action == "evidence" and len(args) == 2:
+        evidence = await broker.evidence(runtime, args[1])
+        return CommandResult(
+            handled=True,
+            message="no evidence." if not evidence else _render_sequence(evidence),
+            payload=evidence,
+        )
+    if action == "conflicts" and len(args) >= 2:
+        conflicts = await broker.conflicts(
+            " ".join(args[1:]),
+            runtime,
+            MemoryBudget(max_hits=100),
+        )
+        return CommandResult(
+            handled=True,
+            message="no conflicts." if not conflicts else "\n".join(
+                _format_memory_hit(hit, detailed=True) for hit in conflicts
+            ),
+            payload=conflicts,
+        )
+    if action == "provider":
+        provider_manager = ctx.memory_provider_manager or getattr(
+            manager, "provider_manager", None
+        )
+        if provider_manager is None:
+            return CommandResult(handled=True, message="memory provider manager not configured")
+        if len(args) == 1:
+            statuses = await provider_manager.statuses()
+            return CommandResult(
+                handled=True,
+                message="\n".join(
+                    f"{item.provider_id}: state={item.state} active={item.active} "
+                    f"healthy={item.healthy} ({item.detail})"
+                    for item in statuses
+                ) or "no memory providers registered.",
+                payload=statuses,
+            )
+        if len(args) == 3 and args[1] == "set":
+            status = await provider_manager.set_provider(args[2], runtime)
+            return CommandResult(
+                handled=True,
+                message=(
+                    f"memory provider={status.provider_id} state={status.state} "
+                    f"healthy={status.healthy}."
+                ),
+                payload=status,
+            )
+    if action == "gc" and len(args) == 1:
+        removed = await broker.compact(runtime)
+        return CommandResult(handled=True, message=f"memory gc removed={removed}.")
+    if action == "export" and len(args) == 2:
+        transfer = ctx.memory_transfer or getattr(manager, "transfer_service", None)
+        if transfer is None:
+            return CommandResult(handled=True, message="memory transfer service not configured")
+        result = await transfer.export(runtime, Path(args[1]))
+        return CommandResult(handled=True, message=f"memory export: {result}", payload=result)
+    if action == "import" and len(args) == 2:
+        transfer = ctx.memory_transfer or getattr(manager, "transfer_service", None)
+        if transfer is None:
+            return CommandResult(handled=True, message="memory transfer service not configured")
+        result = await transfer.import_package(runtime, Path(args[1]))
+        return CommandResult(handled=True, message=f"memory import: {result}", payload=result)
     return CommandResult(
         handled=True,
         message=(
-            "usage: /memory [list|show <id>|search <query>|forget <id> [soft|hard|compliance]|"
-            "rebuild|verify]"
+            "usage: /memory [list|show <id>|search <query>|source <id>|evidence <id>|"
+            "conflicts <query>|forget <id> [soft|hard|compliance]|provider [set <id>]|"
+            "rebuild|verify|gc|export <path>|import <path>]"
         ),
     )
+
+
+def _render_mapping(value: Any) -> str:
+    """Render bounded provenance mappings deterministically for the TUI."""
+
+    return "\n".join(f"  {key}: {value[key]}" for key in sorted(value))
+
+
+def _render_sequence(values: list[Any]) -> str:
+    """Render bounded evidence rows without invoking model formatting."""
+
+    return "\n".join(f"  {index + 1}. {value}" for index, value in enumerate(values))
 
 
 def _format_memory_hit(hit: Any, *, detailed: bool = False) -> str:

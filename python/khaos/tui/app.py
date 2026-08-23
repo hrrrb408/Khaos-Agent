@@ -477,6 +477,21 @@ class KhaosApp(App):
             mode_manager=self.mode_manager,
             memory_manager=self.memory_manager,
             memory_store=self.memory_manager.store if self.memory_manager else None,
+            memory_provider_manager=(
+                getattr(self.memory_manager, "provider_manager", None)
+                if self.memory_manager
+                else None
+            ),
+            memory_profile_registry=(
+                getattr(self.memory_manager, "profile_registry", None)
+                if self.memory_manager
+                else None
+            ),
+            memory_transfer=(
+                getattr(self.memory_manager, "transfer_service", None)
+                if self.memory_manager
+                else None
+            ),
             registry=create_runtime_registry(),
             router=self.router,
             db=self.db,

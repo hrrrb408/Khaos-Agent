@@ -45,6 +45,7 @@ class NativeMemoryProvider:
 
     def __init__(self, db: Any) -> None:
         self._db = db
+        self._started = True
 
     @property
     def database(self) -> Any:
@@ -64,19 +65,56 @@ class NativeMemoryProvider:
             temporal_search=True,
             historical_query=True,
             profile=False,
-            bulk_import=False,
+            bulk_import=True,
             forget=True,
+            update=True,
+            graph_expand=False,
+            vector_search=False,
+            export_data=True,
+            import_data=True,
+            compact=True,
+            bulk_rebuild=True,
+            stream_events=True,
         )
+
+    async def install(self) -> None:
+        """Native storage is installed by the shared database migration."""
+
+    async def validate(self) -> None:
+        """Ensure the canonical tables are available before mounting."""
+
+        async with self._db.read_connection() as conn:
+            row = await (
+                await conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='memory_nodes'"
+                )
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("memory V2 schema is not migrated")
+
+    async def mount(self) -> None:
+        """The shared Database owns the SQLite connection lifecycle."""
+
+    async def start(self) -> None:
+        self._started = True
+
+    async def stop(self) -> None:
+        self._started = False
+
+    async def unmount(self) -> None:
+        """No provider-local handles exist after the shared DB is closed."""
 
     async def health(self) -> ProviderHealth:
         """Check that the canonical tables are available."""
 
+        if not self._started:
+            return ProviderHealth(self.provider_id, False, "provider_stopped", "stopped")
         try:
             async with self._db.read_connection() as conn:
                 await (await conn.execute("SELECT 1 FROM memory_events LIMIT 1")).fetchone()
-            return ProviderHealth(self.provider_id, True)
+            return ProviderHealth(self.provider_id, True, lifecycle="healthy")
         except Exception as exc:  # noqa: BLE001 - health must not escape
-            return ProviderHealth(self.provider_id, False, type(exc).__name__)
+            return ProviderHealth(self.provider_id, False, type(exc).__name__, "failed")
 
     async def add(self, request: MemoryWriteRequest) -> MemoryWriteResult:
         """Persist a candidate as a new version, never overwriting content."""
@@ -126,12 +164,14 @@ class NativeMemoryProvider:
                 await conn.execute(
                     """
                     UPDATE memory_nodes
-                    SET status = 'SUPERSEDED', valid_to = ?, superseded_by = ?,
+                    SET status = 'SUPERSEDED', valid_to = ?, superseded_at = ?,
+                        superseded_by = ?,
                         updated_at = ?
                     WHERE memory_id = ?
                     """,
                     (
                         valid_from.astimezone(UTC).isoformat(),
+                        now.astimezone(UTC).isoformat(),
                         memory_id,
                         now.astimezone(UTC).isoformat(),
                         str(existing["memory_id"]),
@@ -209,13 +249,27 @@ class NativeMemoryProvider:
                 except sqlite3.OperationalError:
                     # FTS syntax is an index concern.  A malformed user query
                     # must not fail open or turn into SQL; bounded LIKE is a
-                    # safe, slower fallback for the same scope.
-                    like = f"%{query[:256]}%"
+                    # safe, slower fallback for the same scope.  Match terms
+                    # independently so a harmless multi-term query does not
+                    # become an accidental exact-phrase search.
+                    terms = [term[:256] for term in query.split() if term][:32]
+                    if not terms:
+                        terms = [query[:256]]
+                    like_clauses = [
+                        "(n.key LIKE ? OR n.content LIKE ?)" for _ in terms
+                    ]
+                    like_params = [
+                        value
+                        for term in terms
+                        for value in (f"%{term}%", f"%{term}%")
+                    ]
                     cursor = await conn.execute(
-                        "SELECT n.* FROM memory_nodes n WHERE (n.key LIKE ? OR n.content LIKE ?) AND "
+                        "SELECT n.* FROM memory_nodes n WHERE ("
+                        + " OR ".join(like_clauses)
+                        + ") AND "
                         + " AND ".join(clauses)
                         + " ORDER BY n.updated_at DESC LIMIT ?",
-                        [like, like, *params, request.limit],
+                        [*like_params, *params, request.limit],
                     )
                     rows = await cursor.fetchall()
             else:
@@ -275,6 +329,117 @@ class NativeMemoryProvider:
             )
             row = await cursor.fetchone()
             return await self._row_to_hit(conn, row) if row is not None else None
+
+    async def get_source(self, runtime: Any, memory_id: str) -> dict[str, Any] | None:
+        """Return the canonical node metadata for scoped provenance inspection."""
+
+        clauses, params = _scope_predicate(runtime, include_historical=True)
+        async with self._db.read_connection() as conn:
+            row = await (
+                await conn.execute(
+                    "SELECT n.* FROM memory_nodes n WHERE n.memory_id = ? AND "
+                    + " AND ".join(clauses),
+                    [memory_id, *params],
+                )
+            ).fetchone()
+            return dict(row) if row is not None else None
+
+    async def get_evidence(self, runtime: Any, memory_id: str) -> list[dict[str, Any]]:
+        """Return evidence rows only when their node is in the caller scope."""
+
+        source = await self.get_source(runtime, memory_id)
+        if source is None:
+            return []
+        async with self._db.read_connection() as conn:
+            rows = await (
+                await conn.execute(
+                    "SELECT * FROM memory_evidence WHERE memory_id = ? "
+                    "ORDER BY observed_at, evidence_id LIMIT 128",
+                    (memory_id,),
+                )
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    async def record_observation(
+        self,
+        memory_id: str,
+        runtime: Any,
+        *,
+        success: bool | None = None,
+        contradiction: bool = False,
+        user_confirmed: bool = False,
+    ) -> bool:
+        """Record outcome telemetry without making retrieval frequency trust."""
+
+        clauses, params = _scope_predicate(runtime, include_historical=True)
+        assignments: list[str] = []
+        values: list[Any] = []
+        if success is True:
+            assignments.append("verified_success_count = verified_success_count + 1")
+        elif success is False:
+            assignments.append("verified_failure_count = verified_failure_count + 1")
+        if contradiction:
+            assignments.append("contradiction_count = contradiction_count + 1")
+        if user_confirmed:
+            assignments.append("user_confirm_count = user_confirm_count + 1")
+        if not assignments:
+            return False
+        assignments.append("updated_at = ?")
+        values.append(utc_now().astimezone(UTC).isoformat())
+        async with self._db.transaction() as conn:
+            cursor = await conn.execute(
+                "UPDATE memory_nodes SET " + ", ".join(assignments) +
+                " WHERE memory_id = ? AND " + " AND ".join(clauses),
+                [*values, memory_id, *params],
+            )
+            return cursor.rowcount > 0
+
+    async def promote(
+        self,
+        memory_id: str,
+        runtime: Any,
+        *,
+        authority: str,
+        status: MemoryStatus,
+    ) -> bool:
+        """Promote a scoped node after the Broker has validated the authority."""
+
+        if status not in {MemoryStatus.ACTIVE, MemoryStatus.VERIFIED}:
+            raise ValueError("promotion status must be ACTIVE or VERIFIED")
+        clauses, params = _scope_predicate(runtime, include_historical=True)
+        async with self._db.transaction() as conn:
+            cursor = await conn.execute(
+                "UPDATE memory_nodes SET status = ?, authority = ?, updated_at = ? "
+                "WHERE memory_id = ? AND " + " AND ".join(clauses),
+                (
+                    status.value,
+                    authority,
+                    utc_now().astimezone(UTC).isoformat(),
+                    memory_id,
+                    *params,
+                ),
+            )
+            return cursor.rowcount > 0
+
+    async def compact(self, runtime: Any, *, limit: int = 256) -> int:
+        """Remove only rejected derived rows; canonical events remain intact."""
+
+        if limit <= 0 or limit > 10_000:
+            raise ValueError("compact limit is outside the bounded range")
+        clauses, params = _scope_predicate(runtime, include_historical=True)
+        async with self._db.transaction() as conn:
+            rows = await (
+                await conn.execute(
+                    "SELECT memory_id FROM memory_nodes WHERE status = 'REJECTED' AND "
+                    + " AND ".join(clauses) + " LIMIT ?",
+                    [*params, limit],
+                )
+            ).fetchall()
+            for row in rows:
+                memory_id = str(row["memory_id"])
+                await conn.execute("DELETE FROM memory_evidence WHERE memory_id = ?", (memory_id,))
+                await conn.execute("DELETE FROM memory_nodes WHERE memory_id = ?", (memory_id,))
+            return len(rows)
 
     async def record_retrieval(
         self,
@@ -458,11 +623,31 @@ class NativeMemoryProvider:
         maintenance report rather than being interpreted permissively.
         """
 
+        project_ids = {
+            str(event.get("project_id", ""))
+            for event in events
+            if str(event.get("project_id", ""))
+        }
+        if not project_ids:
+            return 0
         async with self._db.transaction() as conn:
-            await conn.execute("DELETE FROM memory_edges")
-            await conn.execute("DELETE FROM memory_entities")
-            await conn.execute("DELETE FROM memory_evidence")
-            await conn.execute("DELETE FROM memory_nodes")
+            placeholders = ",".join("?" for _ in project_ids)
+            await conn.execute(
+                "DELETE FROM memory_edges WHERE project_id IN (" + placeholders + ")",
+                tuple(project_ids),
+            )
+            await conn.execute(
+                "DELETE FROM memory_entities WHERE project_id IN (" + placeholders + ")",
+                tuple(project_ids),
+            )
+            await conn.execute(
+                "DELETE FROM memory_evidence WHERE project_id IN (" + placeholders + ")",
+                tuple(project_ids),
+            )
+            await conn.execute(
+                "DELETE FROM memory_nodes WHERE project_id IN (" + placeholders + ")",
+                tuple(project_ids),
+            )
 
         replayed = 0
         candidate_events = [
@@ -539,8 +724,8 @@ class NativeMemoryProvider:
             for related_id in related_ids:
                 await conn.execute(
                     "UPDATE memory_nodes SET status='SUPERSEDED', valid_to=?, "
-                    "superseded_by=?, updated_at=? WHERE memory_id = ?",
-                    (occurred_at, memory_id, occurred_at, related_id),
+                    "superseded_at=?, superseded_by=?, updated_at=? WHERE memory_id = ?",
+                    (occurred_at, occurred_at, memory_id, occurred_at, related_id),
                 )
 
     async def verify_indexes(self) -> dict[str, int | bool]:
@@ -688,6 +873,14 @@ class NativeMemoryProvider:
             provider_metadata={
                 "canonical_record": True,
                 "broker_authority": str(row["authority"]),
+                "superseded_by": str(row["superseded_by"] or ""),
+                "superseded_at": str(row["superseded_at"] or ""),
+                "retrieval_count": int(row["retrieval_count"]),
+                "application_count": int(row["application_count"]),
+                "verified_success_count": int(row["verified_success_count"]),
+                "verified_failure_count": int(row["verified_failure_count"]),
+                "contradiction_count": int(row["contradiction_count"]),
+                "user_confirm_count": int(row["user_confirm_count"]),
             },
             authority_hint=str(row["authority"]),
             confidence_hint=float(row["confidence"]),

@@ -432,6 +432,20 @@ MIGRATIONS: tuple[MigrationSpec, ...] = (
         sql_files=("0013_memory_v2.sql",),
         migrator_symbols=("_apply_v13_upgrades",),
     ),
+    MigrationSpec(
+        version=14,
+        name="memory_v2_operational_surfaces",
+        # Filled from the release-time manifest after the v14 schema and
+        # supersession-column migrator are finalized.  The checksum is a
+        # literal so a future edit must create v15 instead of silently
+        # changing an already-applied schema contract.
+        sha256="2ce1c79380510e75549f44c46844e246b8a7fdc24a9f63dfa9fd1198123d9db2",
+        sql_files=("0014_memory_v2_operational_surfaces.sql",),
+        migrator_symbols=(
+            "_apply_v14_upgrades",
+            "_ensure_memory_nodes_superseded_at",
+        ),
+    ),
 )
 
 

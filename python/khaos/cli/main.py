@@ -6,11 +6,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import secrets
 import subprocess
 import sys
 import uuid
+from dataclasses import asdict, is_dataclass
+from enum import Enum
 from pathlib import Path
 
 import yaml
@@ -270,6 +273,35 @@ def build_command_parser() -> argparse.ArgumentParser:
         dest="tables",
         help="Backfill only this table (repeatable). Default: all 8 A-5-1a tables.",
     )
+
+    memory_parser = subparsers.add_parser(
+        "memory",
+        help="Inspect and maintain the canonical Memory V2 system",
+    )
+    memory_parser.add_argument("--project-root", default=None)
+    memory_parser.add_argument("--db", default=None)
+    memory_parser.add_argument("--config", default=None)
+    memory_parser.add_argument("--profile", default=None)
+    memory_parser.add_argument("--mode", choices=["office", "coding"], default=None)
+    memory_parser.add_argument("--json", action="store_true", dest="as_json")
+    memory_parser.add_argument("--limit", type=int, default=10_000)
+    memory_sub = memory_parser.add_subparsers(dest="memory_command")
+    memory_sub.add_parser("status", help="Show profile, provider, and index health")
+    providers_parser = memory_sub.add_parser("providers", help="List registered providers")
+    providers_parser.add_argument(
+        "providers_command", nargs="?", choices=["list"], default="list"
+    )
+    provider_parser = memory_sub.add_parser("provider", help="Manage the active provider")
+    provider_parser.add_argument("provider_command", choices=["set", "list"])
+    provider_parser.add_argument("provider_id", nargs="?")
+    memory_sub.add_parser("rebuild", help="Replay the event ledger and rebuild indexes")
+    memory_sub.add_parser("verify", help="Verify rebuildable indexes")
+    memory_sub.add_parser("gc", help="Run bounded conservative memory compaction")
+    export_parser = memory_sub.add_parser("export", help="Export a scope-bound memory package")
+    export_parser.add_argument("path", type=Path)
+    import_parser = memory_sub.add_parser("import", help="Import a scope-bound memory package")
+    import_parser.add_argument("path", type=Path)
+    import_parser.add_argument("--no-rebuild", action="store_true")
 
     return parser
 
@@ -574,6 +606,217 @@ def cmd_migrate(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _open_memory_cli(args: argparse.Namespace) -> dict[str, object]:
+    """Open one fully composed Memory V2 context for CLI operations."""
+
+    from khaos.memory import (
+        MemoryBroker,
+        MemoryBudget,
+        MemoryProfileRegistry,
+        MemoryProfileStore,
+        MemoryTransferService,
+        RuntimeMemoryContext,
+    )
+    from khaos.memory.codegraph import CodeGraphService
+    from khaos.memory.ledger import SqliteEventLedger
+    from khaos.memory.observability import MemoryObservability
+    from khaos.memory.providers import MemoryProviderManager, build_native_registry
+    from khaos.security.effective_policy import load_effective_policy
+
+    root = Path(args.project_root or Path.cwd()).expanduser().resolve()
+    db_path = open_state_db_safely(resolve_state_db_path(root, args.db))
+    db = Database(db_path)
+    await db.connect()
+    try:
+        await db.run_migrations()
+        config = load_config(args.config or root / "config.yaml", strict_env=False)
+        profiles = MemoryProfileRegistry.from_config(config)
+        principal_id = local_principal_id()
+        project = compute_project_id(root)
+        profile_store = MemoryProfileStore(db)
+        settings = config.get("memory", {})
+        if not isinstance(settings, dict):
+            raise ValueError("memory configuration must be a mapping")
+        default_profile = (
+            args.profile
+            or settings.get("profile")
+            or ("coding" if args.mode == "coding" else "personal")
+        )
+        persisted = await profile_store.get(
+            principal_id=principal_id,
+            project_id=project,
+        )
+        profile = profiles.get(persisted or default_profile)
+        effective_policy = load_effective_policy(root)
+        registry = build_native_registry(
+            db,
+            network_allowed=bool(effective_policy.network_enabled),
+            config=config,
+        )
+        handle = await registry.activate(profile.provider)
+        mode = args.mode or ("coding" if profile.profile_id == "coding" else "office")
+        runtime = RuntimeMemoryContext(
+            principal_id=principal_id,
+            project_id=project,
+            session_id=None,
+            task_id=None,
+            workspace_id=None,
+            repo_id=None,
+            commit_sha=None,
+            branch=None,
+            mode=mode,
+            environment_fingerprint="cli:memory",
+        )
+        codegraph = CodeGraphService(db) if profile.codegraph else None
+        observability = MemoryObservability(db)
+        broker = MemoryBroker(
+            handle.provider,
+            SqliteEventLedger(db),
+            profile=profile,
+            codegraph=codegraph,
+            observability=observability,
+        )
+        provider_manager = MemoryProviderManager(registry, broker, database=db)
+        await provider_manager.persist()
+        transfer = MemoryTransferService(broker)
+        return {
+            "db": db,
+            "root": root,
+            "profile": profile,
+            "profiles": profiles,
+            "profile_store": profile_store,
+            "registry": registry,
+            "provider_manager": provider_manager,
+            "broker": broker,
+            "transfer": transfer,
+            "runtime": runtime,
+            "budget": profile.budget(MemoryBudget()),
+            "codegraph": codegraph,
+        }
+    except BaseException:
+        await db.close()
+        raise
+
+
+def _memory_print(value: object, *, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(value, ensure_ascii=False, sort_keys=True, default=_json_default))
+    elif isinstance(value, str):
+        print(value)
+    else:
+        print(json.dumps(value, ensure_ascii=False, indent=2, default=_json_default))
+
+
+def _json_default(value: object) -> object:
+    """Serialize Memory V2 dataclasses/enums without leaking object reprs."""
+
+    if is_dataclass(value):
+        return asdict(value)
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, (set, frozenset, tuple)):
+        return list(value)
+    return str(value)
+
+
+def cmd_memory(args: argparse.Namespace) -> int:
+    """Run one bounded Memory V2 operation through the Broker."""
+
+    async def _run() -> int:
+        context = await _open_memory_cli(args)
+        try:
+            action = args.memory_command or "status"
+            broker = context["broker"]
+            runtime = context["runtime"]
+            profile = context["profile"]
+            manager = context["provider_manager"]
+            if action == "status":
+                health = await broker.health()
+                verifier = getattr(broker.provider, "verify_indexes", None)
+                indexes = await verifier() if callable(verifier) else {}
+                _memory_print(
+                    {
+                        "profile": profile.to_mapping(),
+                        "provider": broker.provider.provider_id,
+                        "health": health,
+                        "indexes": indexes,
+                    },
+                    as_json=args.as_json,
+                )
+                return 0
+            if action == "providers" or (
+                action == "provider"
+                and getattr(args, "provider_command", "") == "list"
+            ):
+                statuses = await manager.statuses()
+                _memory_print(
+                    [
+                        {
+                            "provider_id": item.provider_id,
+                            "state": item.state,
+                            "active": item.active,
+                            "healthy": item.healthy,
+                            "detail": item.detail,
+                            "capabilities": item.capabilities,
+                        }
+                        for item in statuses
+                    ],
+                    as_json=args.as_json,
+                )
+                return 0
+            if action == "provider":
+                if not args.provider_id:
+                    raise ValueError("usage: khaos memory provider set <provider-id>")
+                status = await manager.set_provider(args.provider_id, runtime)
+                _memory_print(status, as_json=args.as_json)
+                return 0
+            if action == "rebuild":
+                from khaos.memory.maintenance import MemoryMaintenanceService
+
+                report = await MemoryMaintenanceService(broker).rebuild(
+                    runtime,
+                    limit=args.limit,
+                )
+                _memory_print(report, as_json=args.as_json)
+                return 0
+            if action == "verify":
+                from khaos.memory.maintenance import MemoryMaintenanceService
+
+                report = await MemoryMaintenanceService(broker).verify(runtime)
+                _memory_print(report, as_json=args.as_json)
+                return 0 if report.consistent else 1
+            if action == "gc":
+                removed = await broker.compact(runtime, limit=min(args.limit, 10_000))
+                _memory_print({"removed": removed}, as_json=args.as_json)
+                return 0
+            if action == "export":
+                result = await context["transfer"].export(
+                    runtime,
+                    args.path,
+                    limit=min(args.limit, 200_000),
+                )
+                _memory_print(result, as_json=args.as_json)
+                return 0
+            if action == "import":
+                result = await context["transfer"].import_package(
+                    runtime,
+                    args.path,
+                    rebuild=not args.no_rebuild,
+                )
+                _memory_print(result, as_json=args.as_json)
+                return 0
+            raise ValueError(f"unknown memory command: {action}")
+        finally:
+            await context["registry"].close()
+            await context["db"].close()
+
+    try:
+        return asyncio.run(_run())
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"memory command failed: {exc}", file=sys.stderr)
+        return 2
+
+
 def _project_root() -> Path:
     """Return the repository root from the installed source layout."""
     return Path(__file__).resolve().parents[3]
@@ -673,7 +916,7 @@ def main() -> None:
       2. Legacy flags such as ``--message`` for scriptable SSE output.
     """
     argv = sys.argv[1:]
-    command_names = {"start", "chat", "test", "config", "version", "migrate"}
+    command_names = {"start", "chat", "test", "config", "version", "migrate", "memory"}
     if not argv:
         parser = build_command_parser()
         parser.print_help()
@@ -695,6 +938,8 @@ def main() -> None:
             cmd_version()
         elif args.command == "migrate":
             raise SystemExit(cmd_migrate(args))
+        elif args.command == "memory":
+            raise SystemExit(cmd_memory(args))
         return
 
     parser = build_parser()

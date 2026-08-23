@@ -17,8 +17,8 @@
 
 ## Import reachability result
 
-- Reachable repository modules: `229`.
-- Resolved import edges: `1429`.
+- Reachable repository modules: `241`.
+- Resolved import edges: `1610`.
 - Forbidden production edges: `0`.
 - Unresolved internal edges: `0`.
 
@@ -133,7 +133,13 @@
 - `khaos.grpc_server`
 - `khaos.maintenance`
 - `khaos.memory`
+- `khaos.memory.adapters`
+- `khaos.memory.adapters.aml`
+- `khaos.memory.benchmarks`
+- `khaos.memory.benchmarks.harness`
+- `khaos.memory.codegraph`
 - `khaos.memory.conflict`
+- `khaos.memory.conformance`
 - `khaos.memory.core`
 - `khaos.memory.core.authority`
 - `khaos.memory.core.broker`
@@ -148,12 +154,18 @@
 - `khaos.memory.maintenance.rebuild`
 - `khaos.memory.manager`
 - `khaos.memory.models`
+- `khaos.memory.observability`
 - `khaos.memory.ownership`
+- `khaos.memory.profiles`
 - `khaos.memory.providers`
+- `khaos.memory.providers.http`
+- `khaos.memory.providers.lifecycle`
+- `khaos.memory.providers.manager`
 - `khaos.memory.providers.native`
 - `khaos.memory.repository`
 - `khaos.memory.retrieval`
 - `khaos.memory.store`
+- `khaos.memory.transfer`
 - `khaos.modes`
 - `khaos.modes.manager`
 - `khaos.permissions`

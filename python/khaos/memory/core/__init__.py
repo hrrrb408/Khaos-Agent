@@ -1,9 +1,42 @@
 """Memory V2 trust-kernel contracts and broker-facing helpers."""
 
-from khaos.memory.core.authority import VerificationAuthority, VerificationReceipt
+from khaos.memory.core.authority import (
+    VerificationAuthority,
+    VerificationReceipt,
+    candidate_digest,
+    memory_digest,
+)
 from khaos.memory.core.broker import MemoryBroker
 from khaos.memory.core.context import ContextAssembler
-from khaos.memory.core.contracts import *
+from khaos.memory.core.contracts import (
+    EntityRef,
+    EvidenceRef,
+    EvidenceResolution,
+    ForgetResult,
+    MemoryAuthority,
+    MemoryBudget,
+    MemoryCandidate,
+    MemoryCapabilities,
+    MemoryDecision,
+    MemoryEvent,
+    MemoryEventType,
+    MemoryForgetRequest,
+    MemoryForgetResult,
+    MemoryHit,
+    MemoryProvider,
+    MemorySearchRequest,
+    MemoryStatus,
+    MemoryType,
+    MemoryWriteRequest,
+    MemoryWriteResult,
+    ProviderHealth,
+    RelationCandidate,
+    RuntimeMemoryContext,
+    Sensitivity,
+    SourceType,
+    TrustHint,
+    UsagePolicy,
+)
 from khaos.memory.core.policy import (
     MemoryPolicy,
     ScreeningAction,
@@ -24,6 +57,7 @@ __all__ = [
     "EvidenceRef",
     "EvidenceResolution",
     "ForgetResult",
+    "MemoryForgetResult",
     "MemoryAuthority",
     "MemoryBroker",
     "MemoryBudget",
@@ -52,6 +86,8 @@ __all__ = [
     "UsagePolicy",
     "VerificationAuthority",
     "VerificationReceipt",
+    "candidate_digest",
+    "memory_digest",
     "applicability_matches",
     "candidate_status",
     "looks_like_instruction",

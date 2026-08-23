@@ -79,6 +79,11 @@ class EffectiveConfig(dict[str, Any]):
 # make future credential/header fields fail open when the schema grows.
 _PROJECT_FORBIDDEN_PREFIXES = (
     "models.providers",
+    # A repository must not be able to install or redirect a memory provider
+    # to a host/network endpoint.  Memory profiles may remain project-scoped,
+    # but provider manifests and their endpoint/credential selectors are
+    # trusted user/managed configuration only.
+    "memory.providers",
     "gateway",
     "agent.socket",
 )

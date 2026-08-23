@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Sequence
+import asyncio
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
-from typing import Any
+from time import monotonic
+from typing import Any, cast
 
 from khaos.memory.core.authority import VerificationAuthority
 from khaos.memory.core.contracts import (
@@ -26,6 +28,7 @@ from khaos.memory.core.contracts import (
     MemoryEventType,
     MemoryForgetRequest,
     MemoryHit,
+    MemoryBudget,
     MemoryProvider,
     MemorySearchRequest,
     MemoryStatus,
@@ -47,6 +50,7 @@ from khaos.memory.core.policy import (
     usage_allows_injection,
 )
 from khaos.memory.ledger import SqliteEventLedger
+from khaos.memory.profiles import MemoryProfile
 
 logger = logging.getLogger(__name__)
 
@@ -61,11 +65,27 @@ class MemoryBroker:
         *,
         policy: MemoryPolicy | None = None,
         verification_authority: VerificationAuthority | None = None,
+        profile: MemoryProfile | None = None,
+        codegraph: Any = None,
+        observability: Any = None,
+        provider_registry: Any = None,
     ) -> None:
         self.provider = provider
         self.ledger = ledger
-        self.policy = policy or MemoryPolicy()
+        self.profile = profile
+        self.policy = (profile.policy(policy) if profile is not None else policy) or MemoryPolicy()
         self.verification_authority = verification_authority or VerificationAuthority()
+        self.codegraph = codegraph
+        self.observability = observability
+        self._provider_registry = provider_registry
+        self._provider_lock = asyncio.Lock()
+
+    def bind_provider_registry(self, registry: Any) -> None:
+        """Bind the lifecycle authority used by production provider switching."""
+
+        if self._provider_registry is not None and self._provider_registry is not registry:
+            raise RuntimeError("memory provider registry is already bound")
+        self._provider_registry = registry
 
     async def record_event(self, event: MemoryEvent) -> str:
         """Append a canonical event before any derived-memory write."""
@@ -269,40 +289,91 @@ class MemoryBroker:
 
         if not isinstance(query, str) or len(query) > self.policy.max_search_query_length:
             raise ValueError("memory search query is missing or too long")
+        started = monotonic()
         limit = min(
             max(int(getattr(budget, "max_hits", 32)), 0),
             self.policy.max_search_hits,
         )
         if limit == 0:
+            await self._record_metric(
+                "memory.search.latency_ms",
+                (monotonic() - started) * 1000,
+                runtime,
+                unit="ms",
+                operation="search",
+            )
             return EvidenceResolution(())
         request = MemorySearchRequest(
             query=query,
             runtime=runtime,
             limit=limit,
             include_historical=include_historical,
+            profile_id=self.profile.profile_id if self.profile is not None else "",
+            filters={"mode": runtime.mode},
+            source_kinds=("memory", "codegraph") if self.codegraph is not None else ("memory",),
         )
         await self._audit(
             "MEMORY_SEARCH_REQUESTED",
             runtime,
             detail={"query_hash": _hash_query(query), "limit": limit},
         )
-        try:
-            raw_hits = await self.provider.search(request)
-        except Exception as exc:
-            logger.exception("memory provider search failed")
-            await self._audit(
-                "MEMORY_PROVIDER_FAILED",
-                runtime,
-                detail={"operation": "search", "error": type(exc).__name__},
+        raw_hits: list[MemoryHit] = []
+        provider_error: str | None = None
+        source_tasks: list[asyncio.Future[Any] | asyncio.Task[Any] | Any] = [
+            self.provider.search(request)
+        ]
+        if self.codegraph is not None and self.profile is not None and self.profile.codegraph:
+            source_tasks.append(
+                self.codegraph.search(
+                    query,
+                    runtime,
+                    limit=limit,
+                    max_hops=self.profile.max_graph_hops,
+                )
             )
-            return EvidenceResolution((), provider_error=type(exc).__name__)
-        if not isinstance(raw_hits, Sequence) or isinstance(raw_hits, (str, bytes)):
-            await self._audit(
-                "MEMORY_PROVIDER_FAILED",
+        results = await asyncio.gather(*source_tasks, return_exceptions=True)
+        for index, result in enumerate(results):
+            if isinstance(result, Exception):
+                error_name = type(result).__name__
+                logger.error("memory source search failed: %s", type(result).__name__)
+                if index == 0:
+                    provider_error = error_name
+                    await self._audit(
+                        "MEMORY_PROVIDER_FAILED",
+                        runtime,
+                        detail={"operation": "search", "error": error_name},
+                    )
+                else:
+                    await self._audit(
+                        "MEMORY_PROVIDER_FAILED",
+                        runtime,
+                        detail={"operation": "codegraph_search", "error": error_name},
+                    )
+                continue
+            if not isinstance(result, Sequence) or isinstance(result, (str, bytes)):
+                error_name = "malformed_result"
+                if index == 0:
+                    provider_error = error_name
+                await self._audit(
+                    "MEMORY_PROVIDER_FAILED",
+                    runtime,
+                    detail={
+                        "operation": "search" if index == 0 else "codegraph_search",
+                        "error": error_name,
+                    },
+                )
+                continue
+            raw_hits.extend(hit for hit in result if isinstance(hit, MemoryHit))
+        if not raw_hits and provider_error is not None:
+            await self._record_metric(
+                "memory.search.latency_ms",
+                (monotonic() - started) * 1000,
                 runtime,
-                detail={"operation": "search", "error": "malformed_result"},
+                unit="ms",
+                operation="search",
+                metadata={"provider_error": provider_error},
             )
-            return EvidenceResolution((), provider_error="malformed_result")
+            return EvidenceResolution((), provider_error=provider_error)
 
         accepted: list[MemoryHit] = []
         filtered = 0
@@ -319,6 +390,14 @@ class MemoryBroker:
             )
         except Exception as exc:
             logger.exception("memory revocation ledger read failed")
+            await self._record_metric(
+                "memory.search.latency_ms",
+                (monotonic() - started) * 1000,
+                runtime,
+                unit="ms",
+                operation="search",
+                metadata={"provider_error": type(exc).__name__},
+            )
             return EvidenceResolution((), provider_error=type(exc).__name__)
         for raw_hit in bounded_raw_hits:
             try:
@@ -392,12 +471,52 @@ class MemoryBroker:
                 runtime,
                 detail={"count": len(primary) + len(supporting)},
             )
+        await self._record_metric(
+            "memory.search.latency_ms",
+            (monotonic() - started) * 1000,
+            runtime,
+            unit="ms",
+            operation="search",
+            metadata={
+                "accepted": len(primary) + len(supporting),
+                "conflicts": len(conflicts),
+                "filtered": filtered,
+            },
+        )
         return EvidenceResolution(
             tuple(primary),
             tuple(supporting),
             tuple(conflicts),
             latest_valid_fact=latest,
+            provider_error=provider_error,
         )
+
+    async def resolve_evidence(
+        self,
+        query: str,
+        runtime: RuntimeMemoryContext,
+        budget: MemoryBudget,
+        *,
+        required_types: Sequence[str] = (),
+        include_historical: bool = False,
+    ) -> EvidenceResolution:
+        """Resolve localization and evidence completion as one bounded call."""
+
+        resolution = await self.search(
+            query,
+            runtime,
+            budget,
+            include_historical=include_historical,
+        )
+        required = {str(value) for value in required_types}
+        if not required:
+            return resolution
+        available = {
+            enum_value(hit.memory_type)
+            for hit in (*resolution.primary_hits, *resolution.supporting_hits)
+        }
+        missing = tuple(sorted(required - available))
+        return replace(resolution, missing_requirements=missing)
 
     async def forget(
         self,
@@ -447,13 +566,129 @@ class MemoryBroker:
         )
         return result
 
+    async def promote_memory(
+        self,
+        memory_id: str,
+        runtime: RuntimeMemoryContext,
+        *,
+        verification_run_id: str | None = None,
+        verification_proof: str | None = None,
+        user_approved: bool = False,
+    ) -> MemoryDecision:
+        """Promote a persisted candidate only through trusted evidence."""
+
+        getter = _async_method(self.provider, "get_by_id")
+        promoter = _async_method(self.provider, "promote")
+        if getter is None or promoter is None:
+            return self._decision(False, MemoryStatus.REJECTED, "provider_promotion_unsupported")
+        raw_hit = await getter(runtime, memory_id)
+        if not isinstance(raw_hit, MemoryHit):
+            return self._decision(False, MemoryStatus.REJECTED, "memory_not_found")
+        hit = self._normalize_hit(raw_hit)
+        if hit is None or not scope_matches(hit, runtime):
+            return self._decision(False, MemoryStatus.REJECTED, "memory_out_of_scope")
+        verified = user_approved or self.verification_authority.validate_memory(
+            hit,
+            token=verification_proof,
+            verification_run_id=verification_run_id,
+        )
+        if not verified:
+            await self._audit(
+                "MEMORY_WRITE_REJECTED",
+                runtime,
+                memory_id=memory_id,
+                detail={"reason": "verification_authority_missing"},
+            )
+            return self._decision(False, MemoryStatus.QUARANTINED, "verification_authority_missing")
+        authority = (
+            MemoryAuthority.USER_STATED.value
+            if user_approved
+            else MemoryAuthority.VERIFICATION_CONFIRMED.value
+        )
+        promoted = await promoter(
+            memory_id,
+            runtime,
+            authority=authority,
+            status=MemoryStatus.VERIFIED,
+        )
+        if not promoted:
+            return self._decision(False, MemoryStatus.REJECTED, "memory_not_found")
+        await self._append_state_event(
+            MemoryEventType.MEMORY_PROMOTED,
+            runtime,
+            memory_id,
+            hit.event_ids,
+            detail={
+                "promotion": "user_approved" if user_approved else "verification_authority",
+                "verification_run_id": verification_run_id or "",
+            },
+        )
+        await self._audit(
+            "MEMORY_PROMOTED",
+            runtime,
+            memory_id=memory_id,
+            detail={"verification_run_id": verification_run_id or ""},
+        )
+        return self._decision(True, MemoryStatus.VERIFIED, "promotion_authorized", memory_id=memory_id)
+
+    async def record_observation(
+        self,
+        memory_id: str,
+        runtime: RuntimeMemoryContext,
+        *,
+        success: bool | None = None,
+        contradiction: bool = False,
+        user_confirmed: bool = False,
+    ) -> bool:
+        """Record outcome telemetry without changing authority implicitly."""
+
+        recorder = _async_method(self.provider, "record_observation")
+        if not callable(recorder):
+            return False
+        updated = bool(
+            await recorder(
+                memory_id,
+                runtime,
+                success=success,
+                contradiction=contradiction,
+                user_confirmed=user_confirmed,
+            )
+        )
+        if updated:
+            await self._audit(
+                "MEMORY_OBSERVATION_RECORDED",
+                runtime,
+                memory_id=memory_id,
+                detail={
+                    "success": success,
+                    "contradiction": contradiction,
+                    "user_confirmed": user_confirmed,
+                },
+            )
+        return updated
+
+    async def compact(self, runtime: RuntimeMemoryContext, *, limit: int = 256) -> int:
+        """Run conservative cleanup without deleting canonical evidence."""
+
+        compact = _async_method(self.provider, "compact")
+        if not callable(compact):
+            return 0
+        await self._audit("MEMORY_REBUILD_STARTED", runtime, detail={"operation": "compact"})
+        removed = int(await compact(runtime, limit=limit))
+        await self._audit(
+            "MEMORY_REBUILD_FINISHED",
+            runtime,
+            detail={"operation": "compact", "removed": removed},
+        )
+        return removed
+
     async def _owned_forget_targets(
         self,
         request: MemoryForgetRequest,
     ) -> tuple[str, ...]:
         """Return selectors proven to be in the provider's runtime scope."""
 
-        getter = getattr(self.provider, "get_by_id", None)
+        getter = _async_method(self.provider, "get_by_id")
         if not callable(getter):
             return request.memory_ids
         owned: list[str] = []
@@ -477,7 +712,7 @@ class MemoryBroker:
     ) -> MemoryHit | None:
         """Resolve a current key through the same Broker admission gates."""
 
-        getter = getattr(self.provider, "get_current", None)
+        getter = _async_method(self.provider, "get_current")
         if not callable(getter):
             resolution = await self.search(key, runtime, _KeyBudget(), include_historical=False)
             return next((hit for hit in resolution.primary_hits if hit.key == key), None)
@@ -528,7 +763,7 @@ class MemoryBroker:
 
         if not memory_id:
             return None
-        getter = getattr(self.provider, "get_by_id", None)
+        getter = _async_method(self.provider, "get_by_id")
         if not callable(getter):
             return None
         raw_hit = await getter(runtime, memory_id)
@@ -569,13 +804,128 @@ class MemoryBroker:
 
         return self.provider.capabilities()
 
+    async def set_provider(
+        self,
+        provider: MemoryProvider,
+        runtime: RuntimeMemoryContext,
+        *,
+        provider_id: str | None = None,
+    ) -> None:
+        """Atomically replace the active provider after recording the change."""
+
+        async with self._provider_lock:
+            if self._provider_registry is not None:
+                ready = getattr(self._provider_registry, "is_ready", None)
+                if not callable(ready) or not ready(provider):
+                    raise RuntimeError(
+                        "provider must be started and health-checked by the registry"
+                    )
+            health = await provider.health()
+            if not health.healthy:
+                raise RuntimeError(f"target memory provider is unhealthy: {health.detail}")
+            previous = self.provider.provider_id
+            self.provider = provider
+            await self.record_event(
+                MemoryEvent.create(
+                    MemoryEventType.PROVIDER_CHANGED,
+                    principal_id=runtime.principal_id,
+                    project_id=runtime.project_id,
+                    session_id=runtime.session_id,
+                    task_id=runtime.task_id,
+                    workspace_id=runtime.workspace_id,
+                    repo_id=runtime.repo_id,
+                    branch=runtime.branch,
+                    commit_sha=runtime.commit_sha,
+                    source_type=SourceType.SYSTEM,
+                    trust_hint=TrustHint.TOOL_OBSERVED,
+                    payload={
+                        "from_provider": previous,
+                        "to_provider": provider_id or provider.provider_id,
+                    },
+                )
+            )
+            await self._audit(
+                "MEMORY_PROVIDER_CHANGED",
+                runtime,
+                detail={"from_provider": previous, "to_provider": provider.provider_id},
+            )
+
+    async def source(
+        self,
+        runtime: RuntimeMemoryContext,
+        memory_id: str,
+    ) -> dict[str, Any] | None:
+        """Return user-facing provenance for a memory or CodeGraph node."""
+
+        if self.codegraph is not None and memory_id.startswith("codegraph:"):
+            source = await self.codegraph.source(runtime, memory_id.removeprefix("codegraph:"))
+            return source
+        getter = _async_method(self.provider, "get_source")
+        if callable(getter):
+            return await getter(runtime, memory_id)
+        hit = await self.get(memory_id, runtime, include_historical=True)
+        if hit is None:
+            return None
+        return {
+            "memory_id": hit.memory_id,
+            "memory_type": enum_value(hit.memory_type),
+            "source_ref": hit.source_ref,
+            "event_ids": list(hit.event_ids),
+            "evidence_refs": [ref.source_ref for ref in hit.evidence_refs],
+        }
+
+    async def evidence(
+        self,
+        runtime: RuntimeMemoryContext,
+        memory_id: str,
+    ) -> list[dict[str, Any]]:
+        """Return bounded evidence rows behind a memory or graph node."""
+
+        if self.codegraph is not None and memory_id.startswith("codegraph:"):
+            return await self.codegraph.evidence(runtime, memory_id.removeprefix("codegraph:"))
+        getter = _async_method(self.provider, "get_evidence")
+        if callable(getter):
+            return await getter(runtime, memory_id)
+        hit = await self.get(memory_id, runtime, include_historical=True)
+        return [
+            {
+                "source_type": enum_value(ref.source_type),
+                "source_ref": ref.source_ref,
+                "event_id": ref.event_id,
+                "verification_run_id": ref.verification_run_id,
+                "commit_sha": ref.commit_sha,
+            }
+            for ref in (hit.evidence_refs if hit is not None else ())
+        ]
+
+    async def conflicts(
+        self,
+        query: str,
+        runtime: RuntimeMemoryContext,
+        budget: MemoryBudget,
+    ) -> tuple[MemoryHit, ...]:
+        """Return only conflict candidates for inspection and maintenance."""
+
+        return (await self.search(query, runtime, budget, include_historical=True)).conflicts
+
     async def rebuild(self) -> int:
         """Rebuild provider indexes from canonical tables when supported."""
 
-        rebuild = getattr(self.provider, "rebuild_indexes", None)
+        rebuild = _async_method(self.provider, "rebuild_indexes")
         if not callable(rebuild):
             raise TypeError("provider does not support index rebuild")
         return int(await rebuild())
+
+    async def record_audit(
+        self,
+        action: str,
+        runtime: RuntimeMemoryContext,
+        *,
+        detail: dict[str, Any] | None = None,
+    ) -> None:
+        """Expose bounded operational audit without exposing the provider."""
+
+        await self._audit(action, runtime, detail=detail)
 
     async def rebuild_from_ledger(
         self,
@@ -587,7 +937,7 @@ class MemoryBroker:
 
         if limit <= 0 or limit > 100_000:
             raise ValueError("memory rebuild limit must be between 1 and 100000")
-        replay = getattr(self.provider, "rebuild_from_events", None)
+        replay = _async_method(self.provider, "rebuild_from_events")
         if not callable(replay):
             raise TypeError("provider does not support ledger replay")
         events = await self.ledger.list(
@@ -655,7 +1005,7 @@ class MemoryBroker:
         memory_id: str = "",
         detail: dict[str, Any] | None = None,
     ) -> None:
-        recorder = getattr(self.provider, "record_audit", None)
+        recorder = _async_method(self.provider, "record_audit")
         if callable(recorder):
             await recorder(
                 action=action,
@@ -664,6 +1014,35 @@ class MemoryBroker:
                 detail=detail,
             )
 
+    async def _record_metric(
+        self,
+        metric_name: str,
+        value: float,
+        runtime: RuntimeMemoryContext,
+        *,
+        unit: str,
+        operation: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Best-effort metric recording that cannot alter Broker decisions."""
+
+        recorder = _async_method(self.observability, "record")
+        if not callable(recorder):
+            return
+        try:
+            await recorder(
+                metric_name,
+                value,
+                runtime,
+                unit=unit,
+                provider_id=self.provider.provider_id,
+                profile_id=self.profile.profile_id if self.profile else "",
+                operation=operation,
+                metadata=metadata,
+            )
+        except Exception:  # noqa: BLE001 - observability is non-authoritative
+            logger.warning("memory metric recording failed", exc_info=True)
+
     async def _revoked_ids(
         self,
         runtime: RuntimeMemoryContext,
@@ -671,7 +1050,7 @@ class MemoryBroker:
     ) -> set[str]:
         """Read bounded revocation markers before admitting provider hits."""
 
-        resolver = getattr(self.ledger, "revoked_ids", None)
+        resolver = _async_method(self.ledger, "revoked_ids")
         if callable(resolver):
             return set(await resolver(runtime, list(memory_ids)))
         if not memory_ids:
@@ -825,10 +1204,19 @@ def _hit_sort_key(hit: MemoryHit) -> tuple[int, float, float, str]:
         MemoryAuthority.REPOSITORY_OBSERVED.value: 1,
         MemoryAuthority.AGENT_INFERRED.value: 0,
         MemoryAuthority.EXTERNAL_UNTRUSTED.value: -1,
-    }.get(enum_value(hit.authority_hint), 0)
+    }.get(enum_value(hit.authority_hint or ""), 0)
     confidence = float(hit.confidence_hint or 0.0)
     valid_from = hit.valid_from.timestamp() if hit.valid_from is not None else float("-inf")
     return (-authority_rank, -confidence, -valid_from, hit.memory_id or "")
+
+
+def _async_method(owner: object, name: str) -> Callable[..., Awaitable[Any]] | None:
+    """Return an optional provider extension with an explicit async type."""
+
+    method = getattr(owner, name, None)
+    if not callable(method):
+        return None
+    return cast(Callable[..., Awaitable[Any]], method)
 
 
 def _partition_hits(hits: list[MemoryHit]) -> tuple[list[MemoryHit], list[MemoryHit], list[MemoryHit]]:
