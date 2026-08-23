@@ -75,7 +75,7 @@
 - `python/khaos/coding/planning/approval/execution_journal_writer.py`: `e4fc05a50d28387ad2d1f8a7e02b0fa1adb0d39472b362bbbc4ee53649194635`
 - `python/khaos/security/authority.py`: `635a96fe32200ac088bd15a9d051a7c2342f110f4f4461840aa64b7db4a6994c`
 - `python/khaos/security/authority_broker.py`: `b2f5ffc74c4837ce40912d882ed75a0c9971538ed2aa26186b8f11d3b33aeb4b`
-- `python/khaos/security/authorityd.py`: `016c80ccc7b5f2c851c02eeddfcfa5f730d39ad980d55f20228caab6c4d7482b`
+- `python/khaos/security/authorityd.py`: `74aad6800cba9f618730beff73a40e7a6bf47e108a080972600c30a48bdcf20b`
 - `python/khaos/security/authorityd_protocol.py`: `267a67150c4d62c6f91720abaebec758d9199ade868f403b22186058e798bd70`
 - `python/khaos/security/authority_transport.py`: `76dd3186ed4ee63a6669a80f7cbca209d8c0d082cdc813187bca128ebc2a74e3`
 - `python/khaos/security/docker_profiles.py`: `2831d9e219f2070fa320e05ed7970392c1b9218c0a3247a30419dc4e700fd222`
