@@ -16,7 +16,12 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Protocol
 
-from khaos.memory.core.contracts import MemoryCapabilities, MemoryProvider, ProviderHealth, canonical_json
+from khaos.memory.core.contracts import (
+    MemoryCapabilities,
+    MemoryProvider,
+    ProviderHealth,
+    canonical_json,
+)
 
 
 class ProviderLifecycleError(RuntimeError):
@@ -78,7 +83,7 @@ class ProviderManifest:
             raise ProviderLifecycleError("provider metadata is not JSON serializable") from exc
 
     @classmethod
-    def from_mapping(cls, data: Mapping[str, Any]) -> "ProviderManifest":
+    def from_mapping(cls, data: Mapping[str, Any]) -> ProviderManifest:
         """Parse a manifest and fail closed on unknown or malformed fields."""
 
         allowed = {

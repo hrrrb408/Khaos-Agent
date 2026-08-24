@@ -778,6 +778,14 @@ class Database:
                 await self._apply_v14_upgrades()
             finally:
                 self._conn = original_conn
+            # Memory V2 production closure: explicit projection generations,
+            # compliance tombstones, and resumable maintenance cursors.
+            original_conn = self._conn
+            self._conn = _MigrationConnection(conn)
+            try:
+                await self._apply_v15_upgrades()
+            finally:
+                self._conn = original_conn
             # Batch 6.4 §10.4: backfill the historical ledger rows (v1–v5)
             # so the chain is complete from this point on.  Idempotent —
             # uses INSERT OR IGNORE keyed on the version PK.
@@ -1385,6 +1393,16 @@ class Database:
             migration_path.read_text(encoding="utf-8"),
         )
         await self._ensure_memory_nodes_superseded_at()
+
+    async def _apply_v15_upgrades(self) -> None:
+        """Add atomic projection, privacy, and resumable maintenance state."""
+
+        conn = await self._require_conn()
+        migration_path = _MIGRATIONS_DIR / "0015_memory_v2_closure.sql"
+        await self._execute_schema_statements(
+            conn,
+            migration_path.read_text(encoding="utf-8"),
+        )
 
     async def _ensure_memory_nodes_superseded_at(self) -> None:
         """Add the temporal supersession marker to existing v13 databases."""

@@ -446,6 +446,16 @@ MIGRATIONS: tuple[MigrationSpec, ...] = (
             "_ensure_memory_nodes_superseded_at",
         ),
     ),
+    MigrationSpec(
+        version=15,
+        name="memory_v2_production_closure",
+        # Filled from the release-time manifest after the v15 migrator is
+        # finalized.  The literal is intentionally pinned so later changes
+        # require a new migration version.
+        sha256="403f49122b9ba57221e4ea6ada0e2ed3ff7b728f340482438f467d150499e657",
+        sql_files=("0015_memory_v2_closure.sql",),
+        migrator_symbols=("_apply_v15_upgrades",),
+    ),
 )
 
 

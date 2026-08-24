@@ -2,8 +2,14 @@
 
 from khaos.memory.maintenance.rebuild import (
     ConsistencyReport,
+    MaintenanceReport,
     MemoryMaintenanceService,
     RebuildReport,
 )
 
-__all__ = ["ConsistencyReport", "MemoryMaintenanceService", "RebuildReport"]
+__all__ = [
+    "ConsistencyReport",
+    "MaintenanceReport",
+    "MemoryMaintenanceService",
+    "RebuildReport",
+]

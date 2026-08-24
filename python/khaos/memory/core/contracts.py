@@ -41,7 +41,16 @@ class MemoryEventType(str, Enum):
     MEMORY_PROMOTED = "MEMORY_PROMOTED"
     MEMORY_SUPERSEDED = "MEMORY_SUPERSEDED"
     MEMORY_REVOKED = "MEMORY_REVOKED"
+    SKILL_CANDIDATE_CREATED = "SKILL_CANDIDATE_CREATED"
+    SKILL_PROMOTED = "SKILL_PROMOTED"
+    MEMORY_CONFLICT_DETECTED = "MEMORY_CONFLICT_DETECTED"
+    MEMORY_REBUILD_STARTED = "MEMORY_REBUILD_STARTED"
+    MEMORY_REBUILD_FINISHED = "MEMORY_REBUILD_FINISHED"
+    MEMORY_REBUILD_FAILED = "MEMORY_REBUILD_FAILED"
     PROVIDER_CHANGED = "PROVIDER_CHANGED"
+    PROVIDER_SWITCH_REQUESTED = "PROVIDER_SWITCH_REQUESTED"
+    PROVIDER_SWITCH_COMMITTED = "PROVIDER_SWITCH_COMMITTED"
+    PROVIDER_SWITCH_FAILED = "PROVIDER_SWITCH_FAILED"
 
 
 class SourceType(str, Enum):
@@ -128,6 +137,61 @@ class UsagePolicy(str, Enum):
     NEVER_PERSONALIZE = "NEVER_PERSONALIZE"
     HUMAN_APPROVAL_REQUIRED = "HUMAN_APPROVAL_REQUIRED"
     NO_MODEL_INJECTION = "NO_MODEL_INJECTION"
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryObjectIdentity:
+    """The complete identity of one memory object.
+
+    A provider id or a database-local ``memory_id`` is never sufficient for
+    an authority decision.  Every destructive, export, and provenance
+    operation carries this tuple so a colliding id from another provider,
+    project, principal, namespace, or session cannot be reused.
+    """
+
+    memory_id: str
+    provider_id: str
+    project_id: str
+    namespace: str
+    principal_id: str
+    session_id: str | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("memory_id", "provider_id", "project_id", "namespace"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"memory identity {name} must be non-empty")
+        if self.namespace not in {"private", "session", "project", "shared"}:
+            raise ValueError(f"unsupported memory identity namespace: {self.namespace}")
+        if self.namespace in {"private", "session"} and not self.principal_id.strip():
+            raise ValueError("private/session memory identity requires principal_id")
+        if self.namespace == "session" and not self.session_id:
+            raise ValueError("session memory identity requires session_id")
+
+    @classmethod
+    def from_hit(cls, hit: MemoryHit) -> MemoryObjectIdentity:
+        """Build an identity from a Broker-normalized hit."""
+
+        memory_id = hit.memory_id or hit.external_id
+        if not memory_id:
+            raise ValueError("memory hit has no canonical id")
+        return cls(
+            memory_id=memory_id,
+            provider_id=hit.provider_id,
+            project_id=hit.project_id,
+            namespace=hit.namespace,
+            principal_id=hit.principal_id,
+            session_id=hit.session_id,
+        )
+
+    def matches_runtime(self, runtime: RuntimeMemoryContext) -> bool:
+        """Return whether this identity is owned by the runtime scope."""
+
+        if self.project_id != runtime.project_id:
+            return False
+        if self.namespace in {"private", "session"} and self.principal_id != runtime.principal_id:
+            return False
+        return self.namespace != "session" or self.session_id == runtime.session_id
 
 
 def enum_value(value: Enum | str) -> str:
@@ -296,6 +360,9 @@ class MemoryBudget:
     l1_max_tokens: int = 1024
     l2_max_tokens: int = 512
     max_hits: int = 32
+    max_graph_hops: int = 2
+    max_candidate_nodes: int = 64
+    max_evidence_expansions: int = 64
 
     def __post_init__(self) -> None:
         values = {
@@ -304,6 +371,9 @@ class MemoryBudget:
             "l1_max_tokens": self.l1_max_tokens,
             "l2_max_tokens": self.l2_max_tokens,
             "max_hits": self.max_hits,
+            "max_graph_hops": self.max_graph_hops,
+            "max_candidate_nodes": self.max_candidate_nodes,
+            "max_evidence_expansions": self.max_evidence_expansions,
         }
         invalid = [name for name, value in values.items() if value < 0]
         if invalid:
@@ -363,6 +433,7 @@ class MemoryCandidate:
     sensitivity: Sensitivity | str = Sensitivity.INTERNAL
     usage_policy: UsagePolicy | str = UsagePolicy.PROJECT_ONLY
     verification_run_id: str | None = None
+    verification_result_digest: str | None = None
     verification_proof: str | None = None
 
     def __post_init__(self) -> None:
@@ -408,6 +479,7 @@ class MemoryWriteRequest:
     authority: MemoryAuthority
     provider_id: str
     candidate_event_id: str | None = None
+    supersede_memory_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -418,6 +490,7 @@ class MemoryWriteResult:
     status: MemoryStatus
     superseded_memory_ids: tuple[str, ...] = ()
     created: bool = True
+    evidence_added: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -440,6 +513,9 @@ class MemoryForgetRequest:
     memory_ids: tuple[str, ...]
     runtime: RuntimeMemoryContext
     mode: str = "soft"
+    namespace: str | None = None
+    scope: str | None = None
+    identities: tuple[MemoryObjectIdentity, ...] = ()
 
     def __post_init__(self) -> None:
         """Reject ambiguous or unbounded forget requests at the boundary."""
@@ -450,6 +526,12 @@ class MemoryForgetRequest:
             raise ValueError("forget request is oversized")
         if any(not isinstance(memory_id, str) or not memory_id for memory_id in self.memory_ids):
             raise ValueError("forget memory ids must be non-empty strings")
+        if self.namespace is not None and self.namespace not in {"private", "session", "project", "shared"}:
+            raise ValueError("forget namespace is unsupported")
+        if self.scope is not None and not self.scope.strip():
+            raise ValueError("forget scope must be non-empty when provided")
+        if self.identities and len(self.identities) != len(self.memory_ids):
+            raise ValueError("forget identities must align with memory_ids")
 
 
 @dataclass(frozen=True, slots=True)
@@ -518,6 +600,9 @@ class MemoryHit:
     environment: Mapping[str, Any] = field(default_factory=dict)
     event_ids: tuple[str, ...] = ()
     evidence_refs: tuple[EvidenceRef, ...] = ()
+    source_rank: int = 0
+    source_kind: str = "memory"
+    retrieval_features: Mapping[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -588,11 +673,31 @@ class MemoryProvider(Protocol):
         ...
 
 
+class MemoryAuditSink(Protocol):
+    """Trust-Kernel audit port used by Broker safety decisions."""
+
+    async def log(
+        self,
+        action: str,
+        target: str,
+        result: str,
+        detail: dict[str, Any] | None = None,
+        session_id: str | None = None,
+        *,
+        task_id: str | None = None,
+        source_transport: str | None = None,
+    ) -> int:
+        """Persist one attributed decision in the canonical audit chain."""
+
+        ...
+
+
 __all__ = [
     "EntityRef",
     "EvidenceRef",
     "EvidenceResolution",
     "ForgetResult",
+    "MemoryAuditSink",
     "MemoryAuthority",
     "MemoryBudget",
     "MemoryCandidate",
@@ -603,6 +708,7 @@ __all__ = [
     "MemoryForgetRequest",
     "MemoryForgetResult",
     "MemoryHit",
+    "MemoryObjectIdentity",
     "MemoryProvider",
     "MemorySearchRequest",
     "MemoryStatus",

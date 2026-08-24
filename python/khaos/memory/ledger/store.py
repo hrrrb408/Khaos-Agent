@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Sequence
 from typing import Any
 
@@ -10,6 +11,7 @@ from khaos.memory.core.contracts import (
     RuntimeMemoryContext,
     as_utc,
     enum_value,
+    payload_digest,
 )
 
 
@@ -95,7 +97,10 @@ class SqliteEventLedger:
                 (event_id, runtime.project_id, runtime.principal_id),
             )
             row = await cursor.fetchone()
-            return dict(row) if row is not None else None
+            if row is None:
+                return None
+            value = dict(row)
+            return await self._redact_if_tombstoned(value, runtime)
 
     async def list(
         self,
@@ -105,11 +110,18 @@ class SqliteEventLedger:
         limit: int = 100,
         include_all_sessions: bool = False,
         include_all_principals: bool = False,
+        after_recorded_at: str | None = None,
+        after_event_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        """List bounded events in recorded order for one project scope."""
+        """List one stable cursor page in recorded order.
 
-        if limit < 0 or limit > 100_000:
-            raise ValueError("event ledger limit must be between 0 and 100000")
+        ``after_recorded_at`` + ``after_event_id`` is a strict lexicographic
+        cursor.  It is intentionally not an offset: inserting or deleting a
+        derived row cannot make a rebuild skip or repeat a canonical event.
+        """
+
+        if limit <= 0 or limit > 10_000:
+            raise ValueError("event ledger page size must be between 1 and 10000")
         clauses = ["project_id = ?"]
         params: list[Any] = [runtime.project_id]
         if not include_all_principals:
@@ -124,6 +136,13 @@ class SqliteEventLedger:
             placeholders = ",".join("?" for _ in event_types)
             clauses.append(f"event_type IN ({placeholders})")
             params.extend(event_types)
+        if (after_recorded_at is None) != (after_event_id is None):
+            raise ValueError("ledger cursor requires recorded_at and event_id together")
+        if after_recorded_at is not None and after_event_id is not None:
+            clauses.append(
+                "(recorded_at > ? OR (recorded_at = ? AND event_id > ?))"
+            )
+            params.extend((after_recorded_at, after_recorded_at, after_event_id))
         params.append(limit)
         async with self._db.read_connection() as conn:
             cursor = await conn.execute(
@@ -132,14 +151,61 @@ class SqliteEventLedger:
                 + " ORDER BY recorded_at, event_id LIMIT ?",
                 tuple(params),
             )
-            return [dict(row) for row in await cursor.fetchall()]
+            values = [dict(row) for row in await cursor.fetchall()]
+            return [
+                await self._redact_if_tombstoned(value, runtime)
+                for value in values
+            ]
+
+    async def _redact_if_tombstoned(
+        self,
+        row: dict[str, Any],
+        runtime: RuntimeMemoryContext,
+    ) -> dict[str, Any]:
+        """Return content-free event data after a compliance redaction."""
+
+        event_id = str(row.get("event_id") or "")
+        if not event_id:
+            return row
+        try:
+            async with self._db.read_connection() as conn:
+                tombstone = await (
+                    await conn.execute(
+                        "SELECT 1 FROM memory_privacy_tombstones "
+                        "WHERE event_id = ? AND project_id = ? AND ("
+                        "(principal_id = ? AND (session_id = ? OR session_id = '')) "
+                        "OR (principal_id = '' AND session_id = '')"
+                        ")",
+                        (
+                            event_id,
+                            runtime.project_id,
+                            runtime.principal_id,
+                            runtime.session_id or "",
+                        ),
+                    )
+                ).fetchone()
+        except sqlite3.OperationalError as exc:
+            # Older pre-v15 databases are migrated before production use; a
+            # missing table here is retained as a compatibility read result.
+            if "no such table: memory_privacy_tombstones" in str(exc).lower():
+                return row
+            raise
+        if tombstone is None:
+            return row
+        redacted = dict(row)
+        redacted["payload_json"] = "{}"
+        redacted["payload_hash"] = payload_digest({})
+        redacted["payload_redacted"] = True
+        return redacted
 
     async def revoked_ids(
         self,
         runtime: RuntimeMemoryContext,
         memory_ids: Sequence[str],
+        *,
+        provider_id: str | None = None,
     ) -> set[str]:
-        """Resolve only returned memory IDs against project revocation events."""
+        """Resolve ids against complete, provider-bound revocation identity."""
 
         if not memory_ids:
             return set()
@@ -149,7 +215,8 @@ class SqliteEventLedger:
         async with self._db.read_connection() as conn:
             cursor = await conn.execute(
                 "SELECT payload_json FROM memory_events "
-                "WHERE project_id = ? AND event_type = 'MEMORY_REVOKED' "
+                "WHERE project_id = ? "
+                "AND event_type = 'MEMORY_REVOKED' "
                 "AND ("
                 + " OR ".join("payload_json LIKE ?" for _ in patterns)
                 + ")",
@@ -164,7 +231,33 @@ class SqliteEventLedger:
             except (TypeError, ValueError):
                 continue
             memory_id = value.get("memory_id") if isinstance(value, dict) else None
-            if isinstance(memory_id, str):
+            payload_project = value.get("project_id") if isinstance(value, dict) else None
+            payload_principal = value.get("principal_id") if isinstance(value, dict) else None
+            payload_session = value.get("session_id") if isinstance(value, dict) else None
+            payload_provider = value.get("provider_id") if isinstance(value, dict) else None
+            payload_namespace = value.get("namespace") if isinstance(value, dict) else None
+            if (
+                isinstance(memory_id, str)
+                and payload_project == runtime.project_id
+                and (not provider_id or payload_provider == provider_id)
+                and payload_namespace in {"private", "session", "project", "shared"}
+                and (
+                    (
+                        payload_namespace in {"project", "shared"}
+                        and payload_principal == ""
+                        and payload_session == ""
+                    )
+                    or (
+                        payload_principal == runtime.principal_id
+                        and payload_namespace != "session"
+                    )
+                    or (
+                        payload_principal == runtime.principal_id
+                        and payload_namespace == "session"
+                        and payload_session == (runtime.session_id or "")
+                    )
+                )
+            ):
                 revoked.add(memory_id)
         return revoked
 

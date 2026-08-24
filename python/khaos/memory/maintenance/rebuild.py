@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from time import monotonic
+from typing import Any, cast
 
 from khaos.memory.core.broker import MemoryBroker
 from khaos.memory.core.contracts import RuntimeMemoryContext
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,6 +29,17 @@ class RebuildReport:
 
     replayed_nodes: int
     indexed_nodes: int
+    consistency: ConsistencyReport
+    duration_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class MaintenanceReport:
+    """Complete bounded maintenance result for one runtime scope."""
+
+    deduplicated_evidence: int
+    lifecycle_tiers: dict[str, int]
+    rebuild: RebuildReport | None
     consistency: ConsistencyReport
     duration_ms: int
 
@@ -69,7 +85,7 @@ class MemoryMaintenanceService:
         record = getattr(observability, "record", None)
         if callable(record):
             try:
-                await record(
+                await cast(Callable[..., Awaitable[Any]], record)(
                     "memory.rebuild.duration_ms",
                     duration_ms,
                     runtime,
@@ -83,8 +99,8 @@ class MemoryMaintenanceService:
                     operation="rebuild",
                     metadata={"consistent": consistency.consistent},
                 )
-            except Exception:  # noqa: BLE001 - metrics are non-authoritative
-                pass
+            except Exception:
+                logger.debug("memory rebuild metric recording failed", exc_info=True)
         return RebuildReport(
             replayed_nodes=replayed,
             indexed_nodes=indexed,
@@ -99,12 +115,87 @@ class MemoryMaintenanceService:
         verifier = getattr(self.broker.provider, "verify_indexes", None)
         if not callable(verifier):
             return ConsistencyReport(False, False, {})
-        counts = dict(await verifier())
+        counts = dict(await cast(Callable[..., Awaitable[Any]], verifier)())
         return ConsistencyReport(
             supported=True,
             consistent=bool(counts.get("consistent", False)),
             counts=counts,
         )
 
+    async def maintain(
+        self,
+        runtime: RuntimeMemoryContext,
+        *,
+        rebuild: bool = True,
+        limit: int = 10_000,
+    ) -> MaintenanceReport:
+        """Run deduplication, lifecycle refresh, rebuild, and verification."""
 
-__all__ = ["ConsistencyReport", "MemoryMaintenanceService", "RebuildReport"]
+        if limit <= 0 or limit > 10_000:
+            raise ValueError("maintenance limit is outside the bounded range")
+        started = monotonic()
+        await self.broker.record_audit(
+            "MEMORY_MAINTENANCE_STARTED",
+            runtime,
+            detail={"rebuild": rebuild, "limit": limit},
+        )
+        overrides = (
+            dict(self.broker.profile.maintenance_overrides)
+            if self.broker.profile is not None
+            else {}
+        )
+        deduplicate = getattr(self.broker.provider, "deduplicate_evidence", None)
+        deduplicated = (
+            int(
+                await cast(Callable[..., Awaitable[Any]], deduplicate)(
+                    runtime,
+                    limit=min(limit, 10_000),
+                )
+            )
+            if callable(deduplicate)
+            and overrides.get("deduplicate_evidence", True)
+            else 0
+        )
+        refresh = getattr(self.broker.provider, "refresh_lifecycle", None)
+        tiers = (
+            dict(
+                await cast(Callable[..., Awaitable[Any]], refresh)(
+                    runtime,
+                    limit=limit,
+                )
+            )
+            if callable(refresh) and overrides.get("refresh_lifecycle", True)
+            else {}
+        )
+        rebuild_report = (
+            await self.rebuild(runtime, limit=limit)
+            if rebuild and overrides.get("rebuild", True)
+            else None
+        )
+        consistency = rebuild_report.consistency if rebuild_report is not None else await self.verify(runtime)
+        duration_ms = max(0, int((monotonic() - started) * 1000))
+        await self.broker.record_audit(
+            "MEMORY_MAINTENANCE_FINISHED",
+            runtime,
+            detail={
+                "deduplicated_evidence": deduplicated,
+                "lifecycle_tiers": tiers,
+                "consistent": consistency.consistent,
+                "duration_ms": duration_ms,
+            },
+        )
+        return MaintenanceReport(
+            deduplicated_evidence=deduplicated,
+            lifecycle_tiers=tiers,
+            rebuild=rebuild_report,
+            consistency=consistency,
+            duration_ms=duration_ms,
+        )
+
+
+__all__ = [
+    "ConsistencyReport",
+    "MaintenanceReport",
+    "MemoryMaintenanceService",
+    "RebuildReport",
+]

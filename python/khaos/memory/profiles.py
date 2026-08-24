@@ -74,7 +74,7 @@ class MemoryProfile:
             raise MemoryProfileError("user_profile must be none, light, or strong")
 
     @classmethod
-    def from_mapping(cls, profile_id: str, data: Mapping[str, Any]) -> "MemoryProfile":
+    def from_mapping(cls, profile_id: str, data: Mapping[str, Any]) -> MemoryProfile:
         """Build a profile while rejecting unknown top-level fields."""
 
         allowed = {
@@ -145,12 +145,29 @@ class MemoryProfile:
         current = base or MemoryBudget()
         values = {
             name: getattr(current, name)
-            for name in ("total_tokens", "l0_max_tokens", "l1_max_tokens", "l2_max_tokens", "max_hits")
+            for name in (
+                "total_tokens",
+                "l0_max_tokens",
+                "l1_max_tokens",
+                "l2_max_tokens",
+                "max_hits",
+                "max_graph_hops",
+                "max_candidate_nodes",
+                "max_evidence_expansions",
+            )
         }
         for key, value in self.retrieval_overrides.items():
             if key not in values:
                 raise MemoryProfileError(f"unknown retrieval override: {key}")
             values[key] = min(int(value), int(getattr(current, key)))
+        values["max_graph_hops"] = min(values["max_graph_hops"], self.max_graph_hops)
+        values["max_candidate_nodes"] = min(
+            values["max_candidate_nodes"], self.max_candidate_nodes
+        )
+        values["max_evidence_expansions"] = min(
+            values["max_evidence_expansions"],
+            max(1, self.max_candidate_nodes),
+        )
         return MemoryBudget(**values)
 
     def to_mapping(self) -> dict[str, Any]:
@@ -240,7 +257,7 @@ class MemoryProfileRegistry:
         return tuple(self._profiles[key] for key in sorted(self._profiles))
 
     @classmethod
-    def from_config(cls, config: Mapping[str, Any] | None) -> "MemoryProfileRegistry":
+    def from_config(cls, config: Mapping[str, Any] | None) -> MemoryProfileRegistry:
         """Load ``memory.profiles`` from YAML/TOML-shaped configuration."""
 
         registry = cls()
@@ -259,7 +276,7 @@ class MemoryProfileRegistry:
         return registry
 
     @classmethod
-    def from_file(cls, path: Path) -> "MemoryProfileRegistry":
+    def from_file(cls, path: Path) -> MemoryProfileRegistry:
         """Load a YAML or TOML configuration file without network access."""
 
         if not path.is_file():

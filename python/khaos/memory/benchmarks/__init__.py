@@ -5,6 +5,8 @@ from khaos.memory.benchmarks.harness import (
     BenchmarkReport,
     BenchmarkRun,
     MemoryBenchmarkHarness,
+    OnlineMemoryBenchmark,
+    OnlineMemoryTask,
 )
 
 __all__ = [
@@ -12,4 +14,6 @@ __all__ = [
     "BenchmarkReport",
     "BenchmarkRun",
     "MemoryBenchmarkHarness",
+    "OnlineMemoryBenchmark",
+    "OnlineMemoryTask",
 ]

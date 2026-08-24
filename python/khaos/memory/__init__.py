@@ -4,14 +4,23 @@ Persistence and policy modules remain importable for composition and tests,
 while the names historically imported from ``khaos.memory`` stay stable.
 """
 
-from khaos.memory.conflict import ConflictDecision, ConflictResolver
 from khaos.memory.adapters import AMLAdapterError, MemoryAMLAdapter, aml_add, aml_search
+from khaos.memory.audit import MemoryAuditSinkAdapter, TrustKernelMemoryAuditSink
 from khaos.memory.benchmarks import (
     BenchmarkCase,
     BenchmarkReport,
     BenchmarkRun,
     MemoryBenchmarkHarness,
+    OnlineMemoryBenchmark,
+    OnlineMemoryTask,
 )
+from khaos.memory.codegraph import (
+    CodeGraphBuildReport,
+    CodeGraphNode,
+    CodeGraphService,
+    repository_id_for_root,
+)
+from khaos.memory.conflict import ConflictDecision, ConflictResolver
 from khaos.memory.conformance import (
     ProviderConformanceReport,
     ProviderConformanceSuite,
@@ -33,6 +42,7 @@ from khaos.memory.core import (
     MemoryForgetRequest,
     MemoryForgetResult,
     MemoryHit,
+    MemoryObjectIdentity,
     MemoryProvider,
     MemorySearchRequest,
     MemoryStatus,
@@ -46,12 +56,12 @@ from khaos.memory.core import (
     SourceType,
     TrustHint,
     UsagePolicy,
-    VerificationAuthority,
     VerificationReceipt,
     candidate_digest,
     memory_digest,
 )
 from khaos.memory.decay import expired_memory_ids
+from khaos.memory.events import MemoryEventBridge
 from khaos.memory.extraction import (
     extract_candidates_from_event,
     extract_memories_from_messages,
@@ -59,14 +69,14 @@ from khaos.memory.extraction import (
 )
 from khaos.memory.maintenance import (
     ConsistencyReport,
+    MaintenanceReport,
     MemoryMaintenanceService,
     RebuildReport,
 )
 from khaos.memory.manager import MemoryBudget, MemoryManager
 from khaos.memory.models import Memory, MemoryConfidence, MemoryScope
-from khaos.memory.ownership import MemoryOwner, MemoryVisibility
 from khaos.memory.observability import MemoryObservability, MetricSummary
-from khaos.memory.codegraph import CodeGraphBuildReport, CodeGraphNode, CodeGraphService
+from khaos.memory.ownership import MemoryOwner, MemoryVisibility
 from khaos.memory.profiles import (
     CODING_PROFILE,
     PERSONAL_PROFILE,
@@ -74,6 +84,11 @@ from khaos.memory.profiles import (
     MemoryProfileError,
     MemoryProfileRegistry,
     MemoryProfileStore,
+)
+from khaos.memory.projection import (
+    MemoryProjectionReducer,
+    ProjectionRecord,
+    stable_memory_id,
 )
 from khaos.memory.providers import (
     MemoryHttpProvider,
@@ -87,33 +102,36 @@ from khaos.memory.providers import (
     ProviderStatus,
     build_native_registry,
 )
-from khaos.memory.transfer import MemoryTransferError, MemoryTransferService
 from khaos.memory.repository import MemoryRepository, SqliteMemoryRepository
 from khaos.memory.retrieval import MemoryLayers, MemoryRetriever
+from khaos.memory.runtime import MemoryHost, MemoryRuntime, MemoryRuntimeBinding
 from khaos.memory.store import MemoryStore
+from khaos.memory.transfer import MemoryTransferError, MemoryTransferService
 
 __all__ = [
-    "ConflictDecision",
-    "ConflictResolver",
-    "MemoryAMLAdapter",
+    "CODING_PROFILE",
+    "PERSONAL_PROFILE",
     "AMLAdapterError",
-    "aml_add",
-    "aml_search",
     "BenchmarkCase",
     "BenchmarkReport",
     "BenchmarkRun",
-    "MemoryBenchmarkHarness",
-    "ConsistencyReport",
-    "ContextAssembler",
     "CodeGraphBuildReport",
     "CodeGraphNode",
     "CodeGraphService",
+    "ConflictDecision",
+    "ConflictResolver",
+    "ConsistencyReport",
+    "ContextAssembler",
     "EntityRef",
     "EvidenceRef",
     "EvidenceResolution",
     "ForgetResult",
+    "MaintenanceReport",
     "Memory",
+    "MemoryAMLAdapter",
+    "MemoryAuditSinkAdapter",
     "MemoryAuthority",
+    "MemoryBenchmarkHarness",
     "MemoryBroker",
     "MemoryBudget",
     "MemoryCandidate",
@@ -121,43 +139,54 @@ __all__ = [
     "MemoryConfidence",
     "MemoryDecision",
     "MemoryEvent",
+    "MemoryEventBridge",
     "MemoryEventType",
     "MemoryForgetRequest",
     "MemoryForgetResult",
     "MemoryHit",
+    "MemoryHost",
+    "MemoryHttpProvider",
     "MemoryLayers",
     "MemoryMaintenanceService",
     "MemoryManager",
+    "MemoryObjectIdentity",
     "MemoryObservability",
-    "MemoryHttpProvider",
-    "MemoryProviderManager",
-    "MemoryProviderRegistry",
+    "MemoryOwner",
     "MemoryProfile",
     "MemoryProfileError",
     "MemoryProfileRegistry",
     "MemoryProfileStore",
-    "MemoryOwner",
+    "MemoryProjectionReducer",
     "MemoryProvider",
+    "MemoryProviderManager",
+    "MemoryProviderRegistry",
     "MemoryRepository",
     "MemoryRetriever",
+    "MemoryRuntime",
+    "MemoryRuntimeBinding",
     "MemoryScope",
     "MemorySearchRequest",
     "MemoryStatus",
     "MemoryStore",
+    "MemoryTransferError",
+    "MemoryTransferService",
     "MemoryType",
     "MemoryVisibility",
+    "MemoryWriteRequest",
+    "MemoryWriteResult",
     "MetricSummary",
     "NativeMemoryProvider",
+    "OnlineMemoryBenchmark",
+    "OnlineMemoryTask",
+    "ProjectionRecord",
+    "ProviderConformanceReport",
+    "ProviderConformanceSuite",
     "ProviderHandle",
+    "ProviderHealth",
     "ProviderLifecycleError",
     "ProviderLifecycleState",
     "ProviderManifest",
     "ProviderStatus",
-    "ProviderConformanceReport",
-    "ProviderConformanceSuite",
-    "MemoryWriteRequest",
-    "MemoryWriteResult",
-    "ProviderHealth",
     "RebuildReport",
     "RelationCandidate",
     "RuntimeMemoryContext",
@@ -165,19 +194,19 @@ __all__ = [
     "SourceType",
     "SqliteMemoryRepository",
     "TrustHint",
+    "TrustKernelMemoryAuditSink",
     "UsagePolicy",
-    "VerificationAuthority",
     "VerificationReceipt",
-    "CODING_PROFILE",
-    "PERSONAL_PROFILE",
-    "MemoryTransferError",
-    "MemoryTransferService",
-    "candidate_digest",
-    "memory_digest",
+    "aml_add",
+    "aml_search",
     "build_native_registry",
-    "run_provider_conformance",
+    "candidate_digest",
     "expired_memory_ids",
+    "extract_candidates_from_event",
     "extract_memories_from_messages",
     "extract_memories_from_text",
-    "extract_candidates_from_event",
+    "memory_digest",
+    "repository_id_for_root",
+    "run_provider_conformance",
+    "stable_memory_id",
 ]

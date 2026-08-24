@@ -15,6 +15,7 @@ from khaos.subagents.spawner import SubAgentTask
 if TYPE_CHECKING:
     from khaos.coding.context import CodingContextBuilder
     from khaos.memory.manager import MemoryManager
+    from khaos.memory.runtime import MemoryHost
     from khaos.skills.manager import SkillManager
 
 logger = logging.getLogger(__name__)
@@ -58,6 +59,7 @@ class SubAgentRunner:
         project_root: Path | None = None,     # B1: 继承项目根（不可变）
         config_path: Path | None = None,      # B1: 继承 config 路径
         cleanup_authority: Any | None = None,
+        memory_host: MemoryHost | None = None,
     ):
         self.router = router
         self.db = db
@@ -105,6 +107,7 @@ class SubAgentRunner:
         self.project_root = project_root
         self.config_path = config_path
         self.cleanup_authority = cleanup_authority
+        self.memory_host = memory_host
 
     async def run(self, task: SubAgentTask) -> str:
         """执行子任务并返回结果字符串。
@@ -208,6 +211,7 @@ class SubAgentRunner:
             "project_root": project_root,
             "config_path": self.config_path,
             "cleanup_authority": self.cleanup_authority,
+            "memory_host": self.memory_host,
         }
         if runtime_config_type is RuntimeConfig:
             # Explicit legacy/test adapters may inject these components; the

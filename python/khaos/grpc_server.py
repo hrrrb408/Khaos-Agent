@@ -39,10 +39,13 @@ from khaos.audit import (
 from khaos.db import Database
 from khaos.exceptions import ServiceShutdownError
 from khaos.maintenance import MaintenanceService
-from khaos.rpc import AuditService as _AuditService, MemoryService as _MemoryService, SessionService as _SessionService
+from khaos.rpc import AuditService as _AuditService
+from khaos.rpc import MemoryService as _MemoryService
+from khaos.rpc import SessionService as _SessionService
 from khaos.rpc.agent_service import AgentService as _AgentService
 from khaos.rpc.composition import _build_subagent_service, _handle_optional_subagent
-from khaos.rpc.models import ChatRequest as _ChatRequest, ConfirmRequest as _ConfirmRequest
+from khaos.rpc.models import ChatRequest as _ChatRequest
+from khaos.rpc.models import ConfirmRequest as _ConfirmRequest
 from khaos.rpc.task_service import TaskService as _TaskService
 from khaos.runtime import RequestContext
 from khaos.subagents import SubAgentService
@@ -76,7 +79,6 @@ def _instance_lockfile_path(db_path: str) -> Path:
     different DB paths get different lockfiles, but the lockfiles all
     live under ``~/.khaos/run/`` which the user controls.
     """
-    import hashlib
     real_db = str(Path(db_path).resolve())
     digest = hashlib.sha256(real_db.encode("utf-8")).hexdigest()[:32]
     return Path.home() / ".khaos" / "run" / f"{digest}.instance.lock"
@@ -781,6 +783,9 @@ async def serve_json_lines(
         memory = _MemoryService(
             SqliteMemoryRepository(db),
             audit_logger=agent._audit_logger,
+            memory_host=agent.memory_host,
+            broker=agent.memory_host.broker if agent.memory_host is not None else None,
+            require_host=True,
         )
         # C-2-3: _SessionService proxies REST /api/sessions list/detail
         # reads to the durable ``sessions`` table, scoped to
@@ -815,6 +820,7 @@ async def serve_json_lines(
                 # AgentLoop — no parallel unsupervised audit path.
                 audit_logger=agent._audit_logger,
                 cleanup_authority=agent.runtime_cleanup_authority,
+                memory_host=agent.memory_host,
             )
             agent.subagent_spawner = subagent_service.spawner
 

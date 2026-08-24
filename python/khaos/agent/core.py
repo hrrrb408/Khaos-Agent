@@ -192,6 +192,8 @@ class AgentLoop:
         self.skill_generator = skill_generator
         self.workspace_manager = workspace_manager
         self.active_workspace = None
+        self._active_session_id = ""
+        self._active_task_id: str | None = None
         self.execution_service = execution_service
         if approval_broker is None:
             from khaos.agent.approval import ApprovalBroker
@@ -309,6 +311,8 @@ class AgentLoop:
         """
         # A task_id passed to run() overrides the instance default for this turn.
         active_task_id = task_id or self.task_id
+        self._active_task_id = active_task_id
+        self._active_session_id = session_id
         is_coding = self.mode_manager.current_mode.value == "coding"
         if is_coding and self._verify_fix_factory is not None:
             self.verify_fix_loop = self._verify_fix_factory()
@@ -318,7 +322,14 @@ class AgentLoop:
             if active_task_id is None:
                 task = await self.task_manager.create(user_input)
                 active_task_id = task.id
+                self._active_task_id = active_task_id
                 await self.task_manager.update_status(active_task_id, "running")
+                await self._record_memory_runtime_event(
+                    "TASK_CREATED",
+                    session_id=session_id,
+                    task_id=active_task_id,
+                    payload={"task_id": active_task_id, "title": user_input[:512]},
+                )
                 if self.workspace_manager is not None and self.project_root is not None:
                     root = Path(self.project_root).expanduser().resolve()
                     if (root / ".git").exists():
@@ -335,6 +346,18 @@ class AgentLoop:
                             workspace_id=self.active_workspace.id,
                             worktree_path=str(self.active_workspace.worktree_path),
                             base_sha=self.active_workspace.base_sha,
+                        )
+                        await self._record_memory_runtime_event(
+                            "WORKSPACE_CREATED",
+                            session_id=session_id,
+                            task_id=active_task_id,
+                            payload={
+                                "workspace_id": self.active_workspace.id,
+                                "worktree_path": str(self.active_workspace.worktree_path),
+                                "base_sha": self.active_workspace.base_sha,
+                            },
+                            workspace_id=self.active_workspace.id,
+                            commit_sha=getattr(self.active_workspace, "base_sha", None),
                         )
             else:
                 task = await self.task_manager.get(active_task_id)
@@ -373,7 +396,7 @@ class AgentLoop:
                 token_count=self.token_engine.count_tokens(user_input),
                 created_at=time.time(),
             )
-            await self._persist_message(session_id, user_msg)
+            await self._persist_message(session_id, user_msg, task_id=active_task_id)
             messages.append(user_msg)
             total_tokens += user_msg.token_count
             orchestration_phase = orchestration_phase.transition(
@@ -486,6 +509,20 @@ class AgentLoop:
                                         ),
                                     },
                                 )
+                                await self._record_memory_runtime_event(
+                                    "TOOL_CALL",
+                                    session_id=session_id,
+                                    task_id=active_task_id,
+                                    workspace_id=getattr(self.active_workspace, "id", None),
+                                    payload={
+                                        "tool_call_id": str(tool_call.get("id") or ""),
+                                        "name": str(tool_call.get("name") or ""),
+                                        "operation_id": str(tool_call.get("_idempotency_key") or ""),
+                                        "arguments": tool_call.get("arguments") or {},
+                                    },
+                                    source_type="TOOL",
+                                    trust_hint="TOOL_OBSERVED",
+                                )
                                 yield Message(
                                     role="assistant",
                                     content="",
@@ -543,9 +580,14 @@ class AgentLoop:
                     token_count=self.token_engine.count_tokens(assistant_content),
                     created_at=time.time(),
                     stop_reason=stop_reason,
+                    metadata={
+                        "tool_calls": list(tool_calls)[:32],
+                        "turn_id": turn.turn_id,
+                        "attempt_id": turn.attempt_id,
+                    },
                 )
                 messages.append(assistant_msg)
-                await self._persist_message(session_id, assistant_msg)
+                await self._persist_message(session_id, assistant_msg, task_id=active_task_id)
                 turn_count += 1
                 # Phase 6.3: 结束本轮 token / 费用统计（无论是否继续工具循环）。
                 if self.cost_tracker is not None:
@@ -733,6 +775,19 @@ class AgentLoop:
                                 "expires_at": request.expires_at,
                             },
                         )
+                        await self._record_memory_runtime_event(
+                            "APPROVAL_REQUESTED",
+                            session_id=session_id,
+                            task_id=active_task_id,
+                            workspace_id=request.workspace_id,
+                            payload={
+                                "tool_call_id": request.tool_call_id,
+                                "name": request.name,
+                                "target": request.target,
+                                "binding_digest": request.binding_digest,
+                                "expires_at": request.expires_at,
+                            },
+                        )
                         if self.task_manager is not None and active_task_id:
                             await self.task_manager.update_status(
                                 active_task_id,
@@ -815,7 +870,6 @@ class AgentLoop:
                             created_at=time.time(),
                         )
                         messages.append(tool_msg)
-                        await self._persist_message(session_id, tool_msg)
                         turn_event = await turn.emit(
                             "tool.result",
                             {
@@ -835,6 +889,13 @@ class AgentLoop:
                             "attempt_id": turn.attempt_id,
                             "event_sequence": turn_event.sequence,
                         })
+                        await self._persist_message(
+                            session_id,
+                            tool_msg,
+                            task_id=active_task_id,
+                            workspace_id=getattr(self.active_workspace, "id", None),
+                            commit_sha=getattr(self.active_workspace, "base_sha", None),
+                        )
                         if self.cost_tracker is not None:
                             self.cost_tracker.add_tool_tokens(tool_msg.token_count)
                         total_tokens += tool_msg.token_count
@@ -885,7 +946,25 @@ class AgentLoop:
                                         created_at=time.time(),
                                     )
                                     messages.append(fix_msg)
-                                    await self._persist_message(session_id, fix_msg)
+                                    await self._persist_message(
+                                        session_id,
+                                        fix_msg,
+                                        task_id=active_task_id,
+                                        workspace_id=getattr(self.active_workspace, "id", None),
+                                    )
+                                    await self._record_memory_runtime_event(
+                                        "VERIFICATION_RESULT",
+                                        session_id=session_id,
+                                        task_id=active_task_id,
+                                        workspace_id=getattr(self.active_workspace, "id", None),
+                                        payload={
+                                            "result": False,
+                                            "tool_name": result.name,
+                                            "failure_context": failure_context,
+                                            "attempt": self.verify_fix_loop.attempt_count,
+                                        },
+                                        source_type="VERIFICATION",
+                                    )
                                     if self.task_manager is not None and active_task_id:
                                         await self.task_manager.update_status(
                                             active_task_id,
@@ -1064,8 +1143,19 @@ class AgentLoop:
                     logger.exception(
                         "failed to persist interrupted turn: %s", turn.turn_id
                     )
+            self._active_task_id = None
 
-    async def _persist_message(self, session_id: str, message: Message) -> None:
+    async def _persist_message(
+        self,
+        session_id: str,
+        message: Message,
+        *,
+        task_id: str | None = None,
+        workspace_id: str | None = None,
+        repo_id: str | None = None,
+        commit_sha: str | None = None,
+        branch: str | None = None,
+    ) -> None:
         """Persist and index a message as one logical core-loop operation.
 
         M4 batch 3.1.16A-4-3: stamp ``self.principal_id`` on the row so
@@ -1095,13 +1185,63 @@ class AgentLoop:
                 await record_event(
                     message,
                     session_id=session_id,
-                    task_id=self.task_id,
+                    task_id=(
+                        task_id
+                        if task_id is not None
+                        else getattr(self, "_active_task_id", None)
+                    ),
+                    workspace_id=workspace_id,
+                    repo_id=repo_id,
+                    commit_sha=commit_sha,
+                    branch=branch,
                 )
             except Exception:
                 logger.warning(
                     "memory event observation failed; continuing turn",
                     exc_info=True,
                 )
+
+    async def _record_memory_runtime_event(
+        self,
+        event_type: str,
+        *,
+        session_id: str,
+        task_id: str | None,
+        payload: dict[str, Any],
+        workspace_id: str | None = None,
+        repo_id: str | None = None,
+        commit_sha: str | None = None,
+        branch: str | None = None,
+        source_type: str = "SYSTEM",
+        trust_hint: str = "AGENT_INFERRED",
+    ) -> None:
+        """Publish runtime provenance without affecting agent execution."""
+
+        recorder = getattr(
+            getattr(self, "memory_manager", None),
+            "record_runtime_event",
+            None,
+        )
+        if not callable(recorder):
+            return
+        try:
+            await recorder(
+                event_type,
+                session_id=session_id,
+                task_id=task_id,
+                workspace_id=workspace_id,
+                repo_id=repo_id,
+                commit_sha=commit_sha,
+                branch=branch,
+                payload=payload,
+                source_type=source_type,
+                trust_hint=trust_hint,
+            )
+        except Exception:
+            logger.warning(
+                "memory runtime event observation failed; continuing turn",
+                exc_info=True,
+            )
 
     def _budget_exceeded(self, total_tokens: int) -> bool:
         """Return whether the current turn has crossed its hard token budget."""
@@ -1136,6 +1276,19 @@ class AgentLoop:
             task.status,
             skill_candidates=[candidate.__dict__ for candidate in candidates],
         )
+        if candidates:
+            await self._record_memory_runtime_event(
+                "SKILL_CANDIDATE_CREATED",
+                session_id=getattr(self, "_active_session_id", ""),
+                task_id=task_id,
+                workspace_id=getattr(self.active_workspace, "id", None),
+                commit_sha=getattr(self.active_workspace, "base_sha", None),
+                payload={
+                    "task_id": task_id,
+                    "candidates": [candidate.__dict__ for candidate in candidates],
+                },
+                source_type="TASK",
+            )
 
     async def _finalize_task(self, task_id: str, stop_reason: str | None) -> None:
         """Apply terminal task semantics and run successful-task observation."""
@@ -1154,6 +1307,24 @@ class AgentLoop:
         else:
             await self.task_manager.update_status(task_id, TaskStatus.COMPLETED)
         await self._analyze_task_skill(task_id)
+        task = await self.task_manager.get(task_id)
+        await self._record_memory_runtime_event(
+            "TASK_TRANSITION",
+            session_id=getattr(self, "_active_session_id", ""),
+            task_id=task_id,
+            workspace_id=getattr(getattr(self, "active_workspace", None), "id", None),
+            commit_sha=getattr(getattr(self, "active_workspace", None), "base_sha", None),
+            payload={
+                "task_id": task_id,
+                "status": getattr(
+                    getattr(task, "status", None),
+                    "value",
+                    getattr(task, "status", ""),
+                ),
+                "rationale": stop_reason or "task completed",
+            },
+            source_type="TASK",
+        )
     async def _build_context(self, session_id: str, user_input: str = "") -> list[Message]:
         """Build the P0-A context from mode prompt and persisted messages.
 
@@ -1476,6 +1647,44 @@ class AgentLoop:
             elif name == "test_run":
                 await self.task_manager.add_test_result(
                     task_id, {"success": result.success, "output": output}
+                )
+            event_type = {
+                "read_file": "FILE_OBSERVED",
+                "list_directory": "FILE_OBSERVED",
+                "write_file": "PATCH_APPLIED",
+                "patch": "PATCH_APPLIED",
+                "multi_edit": "PATCH_APPLIED",
+                "test_run": "VERIFICATION_RESULT",
+                "git_commit": "COMMIT_OBSERVED",
+                "commit": "COMMIT_OBSERVED",
+                "execute_plan": "PLAN_CREATED",
+            }.get(name)
+            if event_type:
+                event_payload = {
+                    "tool_name": name,
+                    "success": bool(result.success),
+                    "arguments": args,
+                    "output_summary": str(output or result.error)[:2048],
+                }
+                if event_type == "PLAN_CREATED":
+                    event_payload["plan"] = args.get(
+                        "plan_json", args.get("plan", "")
+                    )
+                await self._record_memory_runtime_event(
+                    event_type,
+                    session_id=getattr(self, "_active_session_id", ""),
+                    task_id=task_id,
+                    workspace_id=getattr(self.active_workspace, "id", None),
+                    commit_sha=getattr(self.active_workspace, "base_sha", None),
+                    payload=event_payload,
+                    source_type=(
+                        "VERIFICATION"
+                        if event_type == "VERIFICATION_RESULT"
+                        else "TASK"
+                        if event_type == "PLAN_CREATED"
+                        else "TOOL"
+                    ),
+                    trust_hint="TOOL_OBSERVED",
                 )
         except Exception as exc:  # noqa: BLE001 — observability must not break the loop
             logger.warning("task tracking failed: %s", exc)

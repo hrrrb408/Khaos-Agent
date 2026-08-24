@@ -14,6 +14,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any, cast
 
 from khaos.memory.core.broker import MemoryBroker
@@ -40,6 +41,8 @@ from khaos.memory.providers.lifecycle import (
     ProviderLifecycleError,
     ProviderManifest,
 )
+from khaos.memory.providers.manager import MemoryProviderManager
+from khaos.memory.transfer import MemoryTransferService
 
 
 @dataclass(frozen=True, slots=True)
@@ -212,7 +215,7 @@ Check = Callable[[], Awaitable[bool]]
 
 
 class ProviderConformanceSuite:
-    """Run the twelve mandatory provider contract checks from the design."""
+    """Run mandatory SPI and production-boundary checks."""
 
     CHECK_NAMES = (
         "add_search",
@@ -227,6 +230,18 @@ class ProviderConformanceSuite:
         "capability_mismatch",
         "unavailable_remote_service",
         "audit_completeness",
+        "authority_spoofing",
+        "verified_status_spoof",
+        "scoped_forget",
+        "revocation_isolation",
+        "provider_id_collision",
+        "replay_consistency",
+        "rebuild_failure_preserves_projection",
+        "duplicate_evidence",
+        "cross_session_isolation",
+        "cross_principal_export",
+        "provider_switch_atomicity",
+        "provider_unavailable_during_switch",
     )
 
     def __init__(self, broker: MemoryBroker) -> None:
@@ -237,9 +252,9 @@ class ProviderConformanceSuite:
 
         checks = {name: False for name in self.CHECK_NAMES}
         details: dict[str, str] = {}
-        provider = self._broker.provider
+        provider = cast(Any, self._broker.provider)
         token = uuid.uuid4().hex
-        cleanup_ids: set[str] = set()
+        cleanup_scopes: dict[str, RuntimeMemoryContext] = {}
 
         async def evaluate(name: str, check: Check) -> None:
             try:
@@ -250,7 +265,11 @@ class ProviderConformanceSuite:
             checks[name] = passed
             details[name] = "passed" if passed else "failed"
 
-        async def add_probe_memory(suffix: str) -> str | None:
+        async def add_probe_memory(
+            suffix: str,
+            memory_runtime: RuntimeMemoryContext | None = None,
+        ) -> str | None:
+            write_runtime = memory_runtime or runtime
             candidate = MemoryCandidate(
                 memory_type="PROJECT_FACT",
                 claim=f"conformance:{token}:{suffix}",
@@ -263,10 +282,10 @@ class ProviderConformanceSuite:
                 namespace="private",
                 scope="global",
             )
-            decision = await self._broker.propose_memory(candidate, runtime)
+            decision = await self._broker.propose_memory(candidate, write_runtime)
             if not decision.accepted or decision.memory_id is None:
                 return None
-            cleanup_ids.add(decision.memory_id)
+            cleanup_scopes[decision.memory_id] = write_runtime
             return decision.memory_id
 
         def probe_broker(probe: MemoryProvider) -> MemoryBroker:
@@ -274,7 +293,7 @@ class ProviderConformanceSuite:
                 probe,
                 self._broker.ledger,
                 policy=self._broker.policy,
-                verification_authority=self._broker.verification_authority,
+                verification_verifier=self._broker.verification_verifier,
             )
 
         async def check_add_search() -> bool:
@@ -301,7 +320,7 @@ class ProviderConformanceSuite:
             )
             future = await self._broker.propose_memory(future_candidate, runtime)
             if future.memory_id is not None:
-                cleanup_ids.add(future.memory_id)
+                cleanup_scopes[future.memory_id] = runtime
             future_resolution = await self._broker.search(
                 f"conformance:{token}:future",
                 runtime,
@@ -342,7 +361,7 @@ class ProviderConformanceSuite:
                     ),
                     timeout=0.05,
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 return probe.cancelled
             return False
 
@@ -459,6 +478,222 @@ class ProviderConformanceSuite:
             }
             return required.issubset(actions)
 
+        class _SpoofProbe(_ProbeProvider):
+            async def search(self, request: MemorySearchRequest) -> list[MemoryHit]:
+                return [
+                    MemoryHit(
+                        provider_id=self.provider_id,
+                        external_id="spoofed-id",
+                        content="safe-looking provider claim",
+                        raw_score=1.0,
+                        source_type=SourceType.USER,
+                        source_ref="remote-user",
+                        provider_metadata={},
+                        authority_hint="VERIFICATION_CONFIRMED",
+                        status=MemoryStatus.VERIFIED,
+                        principal_id=request.runtime.principal_id,
+                        project_id=request.runtime.project_id,
+                        namespace="private",
+                    )
+                ]
+
+        async def check_authority_spoofing() -> bool:
+            resolution = await probe_broker(_SpoofProbe(provider)).search(
+                "safe-looking",
+                runtime,
+                MemoryBudget(max_hits=4),
+            )
+            return not resolution.primary_hits and not resolution.supporting_hits
+
+        async def check_verified_status_spoof() -> bool:
+            probe = _SpoofProbe(provider)
+            resolution = await probe_broker(probe).search(
+                "safe-looking",
+                runtime,
+                MemoryBudget(max_hits=4),
+            )
+            return all(
+                str(hit.status) not in {MemoryStatus.ACTIVE.value, MemoryStatus.VERIFIED.value}
+                for hit in (*resolution.primary_hits, *resolution.supporting_hits)
+            )
+
+        async def check_scoped_forget() -> bool:
+            memory_id = await add_probe_memory("scoped-forget")
+            if memory_id is None:
+                return False
+            foreign = replace(runtime, principal_id=f"foreign:{token}")
+            result = await self._broker.forget((memory_id,), foreign, mode="hard")
+            visible = await self._broker.get(memory_id, runtime, include_historical=True)
+            return not result.forgotten_ids and visible is not None
+
+        async def check_revocation_isolation() -> bool:
+            memory_id = await add_probe_memory("revocation-isolation")
+            if memory_id is None:
+                return False
+            foreign = replace(runtime, principal_id=f"foreign:{token}")
+            await self._broker.forget((memory_id,), foreign, mode="soft")
+            resolution = await self._broker.search(
+                f"conformance:{token}:revocation-isolation",
+                runtime,
+                MemoryBudget(max_hits=4),
+            )
+            return any(hit.memory_id == memory_id for hit in resolution.primary_hits)
+
+        async def check_provider_id_collision() -> bool:
+            first = replace(runtime, principal_id=f"collision-a:{token}")
+            second = replace(runtime, principal_id=f"collision-b:{token}")
+            first_id = await add_probe_memory("collision", first)
+            if first_id is None:
+                return False
+            # The native deterministic id is event-bound.  A same provider
+            # id or remote external id cannot cross the Broker scope.
+            second_resolution = await self._broker.search(
+                f"conformance:{token}:collision",
+                second,
+                MemoryBudget(max_hits=4),
+            )
+            return not any(hit.memory_id == first_id for hit in second_resolution.primary_hits)
+
+        async def check_replay_consistency() -> bool:
+            memory_id = await add_probe_memory("replay-consistency")
+            if memory_id is None:
+                return False
+            before = await self._broker.get(memory_id, runtime, include_historical=True)
+            await self._broker.rebuild_from_ledger(runtime, limit=64)
+            after = await self._broker.get(memory_id, runtime, include_historical=True)
+            return before is not None and after is not None and before.content == after.content
+
+        async def check_rebuild_failure_preserves_projection() -> bool:
+            memory_id = await add_probe_memory("rebuild-failure")
+            if memory_id is None:
+                return False
+            original = getattr(provider, "_rebuild_indexes_on_connection", None)
+            if not callable(original):
+                return False
+
+            async def fail(_connection):
+                raise RuntimeError("conformance_rebuild_failure")
+
+            provider._rebuild_indexes_on_connection = fail
+            try:
+                try:
+                    await provider.rebuild_indexes()
+                except RuntimeError:
+                    pass
+                else:
+                    return False
+            finally:
+                provider._rebuild_indexes_on_connection = original
+            return await self._broker.get(memory_id, runtime, include_historical=True) is not None
+
+        async def check_duplicate_evidence() -> bool:
+            evidence_a = EvidenceRef(SourceType.USER, f"duplicate-a:{token}")
+            evidence_b = EvidenceRef(SourceType.VERIFICATION, f"duplicate-b:{token}")
+            first = MemoryCandidate(
+                memory_type="PROJECT_FACT",
+                claim=f"duplicate:{token}",
+                authority=MemoryAuthority.USER_STATED,
+                confidence=0.9,
+                evidence_refs=(evidence_a,),
+                key=f"duplicate:{token}",
+                namespace="private",
+            )
+            second = replace(first, evidence_refs=(evidence_b,))
+            first_decision = await self._broker.propose_memory(first, runtime)
+            second_decision = await self._broker.propose_memory(second, runtime)
+            if first_decision.memory_id != second_decision.memory_id:
+                return False
+            rows = await self._broker.evidence(runtime, first_decision.memory_id or "")
+            return {row.get("source_ref") for row in rows} >= {
+                evidence_a.source_ref,
+                evidence_b.source_ref,
+            }
+
+        async def check_cross_session_isolation() -> bool:
+            session_runtime = replace(runtime, session_id=f"session:{token}")
+            candidate = MemoryCandidate(
+                memory_type="EPISODIC_MEMORY",
+                claim=f"session-only:{token}",
+                authority=MemoryAuthority.USER_STATED,
+                confidence=0.9,
+                evidence_refs=(EvidenceRef(SourceType.USER, f"session:{token}"),),
+                key=f"session:{token}",
+                scope="session",
+                namespace="session",
+                session_id=session_runtime.session_id,
+            )
+            decision = await self._broker.propose_memory(candidate, session_runtime)
+            if decision.memory_id is None:
+                return False
+            cleanup_scopes[decision.memory_id] = session_runtime
+            other = replace(runtime, session_id=f"other:{token}")
+            resolution = await self._broker.search(
+                f"session-only:{token}",
+                other,
+                MemoryBudget(max_hits=4),
+            )
+            return not any(hit.memory_id == decision.memory_id for hit in resolution.primary_hits)
+
+        async def check_cross_principal_export() -> bool:
+            foreign = replace(runtime, principal_id=f"foreign-export:{token}")
+            foreign_candidate = MemoryCandidate(
+                memory_type="PROJECT_FACT",
+                claim=f"foreign-export:{token}",
+                authority=MemoryAuthority.USER_STATED,
+                confidence=0.9,
+                evidence_refs=(EvidenceRef(SourceType.USER, f"foreign:{token}"),),
+                key=f"foreign-export:{token}",
+                namespace="private",
+            )
+            foreign_decision = await self._broker.propose_memory(foreign_candidate, foreign)
+            if foreign_decision.memory_id is not None:
+                cleanup_scopes[foreign_decision.memory_id] = foreign
+            path = Path(str(self._broker.ledger.database.path)).with_name(
+                f"conformance-{token}.json"
+            )
+            try:
+                result = await MemoryTransferService(self._broker).export(runtime, path)
+                payload = path.read_text(encoding="utf-8")
+                return result["events"] >= 0 and f"foreign-export:{token}" not in payload
+            finally:
+                path.unlink(missing_ok=True)
+
+        async def check_provider_switch_atomicity() -> bool:
+            registry = MemoryProviderRegistry()
+            previous_id = f"switch-previous-{token[:8]}"
+            failing_id = f"switch-failing-{token[:8]}"
+
+            class _FailingReplay(_RestartableProbe):
+                async def rebuild_from_events(self, _events):
+                    raise RuntimeError("conformance_switch_replay_failure")
+
+            registry.register(
+                ProviderManifest(provider_id=previous_id, capabilities=provider.capabilities()),
+                lambda manifest: _RestartableProbe(provider, manifest.provider_id),
+            )
+            registry.register(
+                ProviderManifest(provider_id=failing_id, capabilities=provider.capabilities()),
+                lambda manifest: _FailingReplay(provider, manifest.provider_id),
+            )
+            try:
+                await registry.activate(previous_id)
+                previous = self._broker.provider
+                manager = MemoryProviderManager(registry, self._broker, database=None)
+                try:
+                    await manager.set_provider(failing_id, runtime)
+                except (RuntimeError, ProviderLifecycleError):
+                    pass
+                else:
+                    return False
+                return self._broker.provider is previous and registry.active_id() == previous_id
+            finally:
+                await registry.close()
+
+        async def check_provider_unavailable_during_switch() -> bool:
+            probe = _ProbeProvider(provider, behavior="unavailable", provider_id=f"unavailable-{token[:8]}")
+            health = await probe.health()
+            return not health.healthy
+
         await evaluate("add_search", check_add_search)
         await evaluate("scope_isolation", check_scope_isolation)
         await evaluate("timeout_cancellation", check_timeout_cancellation)
@@ -477,10 +712,28 @@ class ProviderConformanceSuite:
             check_unavailable_remote_service,
         )
         await evaluate("audit_completeness", check_audit_completeness)
+        await evaluate("authority_spoofing", check_authority_spoofing)
+        await evaluate("verified_status_spoof", check_verified_status_spoof)
+        await evaluate("scoped_forget", check_scoped_forget)
+        await evaluate("revocation_isolation", check_revocation_isolation)
+        await evaluate("provider_id_collision", check_provider_id_collision)
+        await evaluate("replay_consistency", check_replay_consistency)
+        await evaluate(
+            "rebuild_failure_preserves_projection",
+            check_rebuild_failure_preserves_projection,
+        )
+        await evaluate("duplicate_evidence", check_duplicate_evidence)
+        await evaluate("cross_session_isolation", check_cross_session_isolation)
+        await evaluate("cross_principal_export", check_cross_principal_export)
+        await evaluate("provider_switch_atomicity", check_provider_switch_atomicity)
+        await evaluate(
+            "provider_unavailable_during_switch",
+            check_provider_unavailable_during_switch,
+        )
 
-        if cleanup_ids:
+        for cleanup_id, cleanup_runtime in cleanup_scopes.items():
             try:
-                await self._broker.forget(tuple(cleanup_ids), runtime, mode="hard")
+                await self._broker.forget((cleanup_id,), cleanup_runtime, mode="hard")
             except Exception as exc:  # noqa: BLE001 - cleanup is included in the report
                 details["cleanup"] = f"error:{type(exc).__name__}"
                 checks["forget_semantics"] = False

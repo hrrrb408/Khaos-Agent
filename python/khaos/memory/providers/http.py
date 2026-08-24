@@ -139,7 +139,12 @@ class MemoryHttpProvider:
                 "workspace_id": request.runtime.workspace_id,
                 "mode": request.runtime.mode,
                 "environment_fingerprint": request.runtime.environment_fingerprint,
+                "repo_id": request.runtime.repo_id,
+                "branch": request.runtime.branch,
+                "commit_sha": request.runtime.commit_sha,
+                "capabilities": sorted(request.runtime.available_capabilities),
             },
+            "supersede_memory_ids": list(request.supersede_memory_ids),
         }
         data = await self._json_request("POST", "/memory/add", payload)
         memory_id = data.get("memory_id", data.get("id"))
@@ -152,7 +157,7 @@ class MemoryHttpProvider:
             status = request.status
         superseded = data.get("superseded_memory_ids", ())
         if not isinstance(superseded, list | tuple):
-            raise ValueError("remote provider returned malformed superseded ids")
+            raise TypeError("remote provider returned malformed superseded ids")
         return MemoryWriteResult(
             memory_id=memory_id,
             status=status,
@@ -175,59 +180,100 @@ class MemoryHttpProvider:
                     "project_id": request.runtime.project_id,
                     "session_id": request.runtime.session_id,
                     "mode": request.runtime.mode,
+                    "task_id": request.runtime.task_id,
+                    "workspace_id": request.runtime.workspace_id,
+                    "repo_id": request.runtime.repo_id,
+                    "branch": request.runtime.branch,
+                    "commit_sha": request.runtime.commit_sha,
                 },
             },
         )
         raw_hits = data.get("hits", data.get("results", data))
         if not isinstance(raw_hits, list):
-            raise ValueError("remote provider returned a non-list search result")
+            raise TypeError("remote provider returned a non-list search result")
         hits: list[MemoryHit] = []
         for raw in raw_hits[: request.limit]:
             if not isinstance(raw, Mapping):
-                raise ValueError("remote provider returned a malformed hit")
-            hits.append(
-                MemoryHit(
-                    provider_id=self.provider_id,
-                    external_id=_optional_string(raw.get("external_id", raw.get("id"))),
-                    memory_id=_optional_string(raw.get("memory_id", raw.get("id"))),
-                    content=str(raw.get("content", raw.get("value", ""))),
-                    raw_score=_optional_float(raw.get("score")),
-                    source_type=_optional_source(raw.get("source_type")),
-                    source_ref=_optional_string(raw.get("source_ref")),
-                    provider_metadata=dict(raw.get("metadata", {}))
-                    if isinstance(raw.get("metadata", {}), Mapping)
-                    else {},
-                    authority_hint=_optional_string(raw.get("authority")),
-                    confidence_hint=_optional_float(raw.get("confidence")),
-                    memory_type=str(raw.get("memory_type", "PROJECT_FACT")),
-                    status=str(raw.get("status", "ACTIVE")),
-                    principal_id=str(raw.get("principal_id", request.runtime.principal_id)),
-                    project_id=str(raw.get("project_id", request.runtime.project_id)),
-                    namespace=str(raw.get("namespace", "private")),
-                    scope=str(raw.get("scope", "global")),
-                    session_id=_optional_string(raw.get("session_id")),
-                    key=_optional_string(raw.get("key")),
-                    event_ids=tuple(str(value) for value in raw.get("event_ids", ())),
-                )
-            )
+                raise TypeError("remote provider returned a malformed hit")
+            hits.append(_hit_from_mapping(self.provider_id, raw, request.runtime))
         return hits
+
+    async def get_by_id(self, runtime: Any, memory_id: str) -> MemoryHit | None:
+        """Resolve one remote object with the full caller scope attached."""
+
+        if not memory_id:
+            return None
+        data = await self._json_request(
+            "POST",
+            "/memory/get",
+            {
+                "memory_id": memory_id,
+                "runtime": {
+                    "principal_id": runtime.principal_id,
+                    "project_id": runtime.project_id,
+                    "session_id": runtime.session_id,
+                    "task_id": runtime.task_id,
+                    "workspace_id": runtime.workspace_id,
+                    "mode": runtime.mode,
+                    "repo_id": runtime.repo_id,
+                    "branch": runtime.branch,
+                    "commit_sha": runtime.commit_sha,
+                },
+            },
+        )
+        raw = data.get("hit", data.get("memory"))
+        if raw is None:
+            return None
+        if not isinstance(raw, Mapping):
+            raise TypeError("remote provider returned a malformed memory")
+        return _hit_from_mapping(self.provider_id, raw, runtime)
 
     async def forget(self, request: MemoryForgetRequest) -> ForgetResult:
         data = await self._json_request(
             "POST",
             "/memory/forget",
-            {"memory_ids": list(request.memory_ids), "mode": request.mode},
+            {
+                "memory_ids": list(request.memory_ids),
+                "mode": request.mode,
+                "namespace": request.namespace,
+                "scope": request.scope,
+                "identities": [
+                    {
+                        "memory_id": identity.memory_id,
+                        "provider_id": identity.provider_id,
+                        "project_id": identity.project_id,
+                        "namespace": identity.namespace,
+                        "principal_id": identity.principal_id,
+                        "session_id": identity.session_id,
+                    }
+                    for identity in request.identities
+                ],
+                "runtime": {
+                    "principal_id": request.runtime.principal_id,
+                    "project_id": request.runtime.project_id,
+                    "session_id": request.runtime.session_id,
+                    "task_id": request.runtime.task_id,
+                    "workspace_id": request.runtime.workspace_id,
+                    "mode": request.runtime.mode,
+                    "repo_id": request.runtime.repo_id,
+                    "branch": request.runtime.branch,
+                    "commit_sha": request.runtime.commit_sha,
+                },
+            },
         )
         forgotten = data.get("forgotten_ids", ())
         if not isinstance(forgotten, list | tuple):
-            raise ValueError("remote provider returned malformed forgotten ids")
-        return ForgetResult(tuple(str(value) for value in forgotten), request.mode)
+            raise TypeError("remote provider returned malformed forgotten ids")
+        forgotten_ids = tuple(str(value) for value in forgotten)
+        if any(value not in request.memory_ids for value in forgotten_ids):
+            raise RuntimeError("remote provider returned an out-of-request memory id")
+        return ForgetResult(forgotten_ids, request.mode)
 
     async def rebuild_from_events(self, events: list[Mapping[str, Any]]) -> int:
         """Import canonical event data through the remote provider contract."""
 
-        if len(events) > 100_000:
-            raise ValueError("remote memory rebuild event batch is oversized")
+        if not isinstance(events, list):
+            raise TypeError("remote memory rebuild events must be a list")
         data = await self._json_request("POST", "/memory/import", {"events": events})
         value = data.get("replayed", data.get("count", 0))
         try:
@@ -264,7 +310,7 @@ class MemoryHttpProvider:
         except (httpx.HTTPError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
             raise RuntimeError(f"remote memory provider request failed: {type(exc).__name__}") from exc
         if not isinstance(data, dict):
-            raise ValueError("remote memory provider response must be a JSON object")
+            raise TypeError("remote memory provider response must be a JSON object")
         return data
 
 
@@ -285,6 +331,47 @@ def _optional_source(value: Any) -> SourceType | str | None:
     if value is None:
         return None
     return str(value)
+
+
+def _hit_from_mapping(
+    provider_id: str,
+    raw: Mapping[str, Any],
+    runtime: Any,
+) -> MemoryHit:
+    """Decode one bounded provider hit without assigning local authority.
+
+    Scope fields are deliberately not defaulted from the request runtime.  A
+    remote response that omits its object identity is unverifiable and must
+    be rejected by the Broker rather than being upgraded into an owned row.
+    """
+
+    event_ids = raw.get("event_ids", ())
+    if not isinstance(event_ids, (list, tuple)):
+        raise TypeError("remote provider returned malformed event ids")
+    metadata = raw.get("metadata", {})
+    if not isinstance(metadata, Mapping):
+        metadata = {}
+    return MemoryHit(
+        provider_id=provider_id,
+        external_id=_optional_string(raw.get("external_id", raw.get("id"))),
+        memory_id=_optional_string(raw.get("memory_id", raw.get("id"))),
+        content=str(raw.get("content", raw.get("value", ""))),
+        raw_score=_optional_float(raw.get("score")),
+        source_type=_optional_source(raw.get("source_type")),
+        source_ref=_optional_string(raw.get("source_ref")),
+        provider_metadata=dict(metadata),
+        authority_hint=_optional_string(raw.get("authority")),
+        confidence_hint=_optional_float(raw.get("confidence")),
+        memory_type=str(raw.get("memory_type", "PROJECT_FACT")),
+        status=str(raw.get("status", "ACTIVE")),
+        principal_id=str(raw.get("principal_id", "")),
+        project_id=str(raw.get("project_id", "")),
+        namespace=str(raw.get("namespace", "")),
+        scope=str(raw.get("scope", "global")),
+        session_id=_optional_string(raw.get("session_id")),
+        key=_optional_string(raw.get("key")),
+        event_ids=tuple(str(value) for value in event_ids),
+    )
 
 
 __all__ = ["MemoryHttpProvider"]

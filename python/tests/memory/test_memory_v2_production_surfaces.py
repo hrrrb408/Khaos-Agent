@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
-
 from khaos.db import Database
 from khaos.memory import (
     AMLAdapterError,
@@ -21,7 +21,6 @@ from khaos.memory import (
     MemoryEventType,
     MemoryObservability,
     MemoryProfileStore,
-    MemoryStatus,
     MemoryTransferError,
     MemoryTransferService,
     RuntimeMemoryContext,
@@ -31,7 +30,6 @@ from khaos.memory import (
     aml_search,
 )
 from khaos.memory.conformance import run_provider_conformance
-from khaos.memory.core.contracts import MemoryCapabilities, ProviderHealth
 from khaos.memory.ledger import SqliteEventLedger
 from khaos.memory.providers import (
     MemoryProviderManager,
@@ -184,7 +182,7 @@ async def test_codegraph_is_rebuildable_scoped_and_source_inspectable(tmp_path):
         encoding="utf-8",
     )
     db, broker = await _broker(tmp_path, profile=CODING_PROFILE)
-    runtime = _runtime()
+    runtime = replace(_runtime(), repo_id="repo:test", commit_sha="commit:test")
     graph = CodeGraphService(db)
     broker.codegraph = graph
     report = await graph.build(runtime, source_root)
@@ -203,7 +201,7 @@ async def test_codegraph_is_rebuildable_scoped_and_source_inspectable(tmp_path):
 
 
 async def test_aml_adapter_and_convenience_functions_use_broker_policy(tmp_path):
-    db, broker = await _broker(tmp_path)
+    _db, broker = await _broker(tmp_path)
     runtime = _runtime()
     item = {
         "claim": "editor: vim",
@@ -260,15 +258,17 @@ async def test_benchmark_observability_and_finite_metrics_are_bounded(tmp_path):
 
 
 async def test_provider_conformance_reports_each_mandatory_check(tmp_path):
-    db, broker = await _broker(tmp_path)
+    _db, broker = await _broker(tmp_path)
     report = await run_provider_conformance(broker, _runtime())
     assert report.passed is True
-    assert len(report.checks) == 12
+    from khaos.memory.conformance import ProviderConformanceSuite
+
+    assert len(report.checks) == len(ProviderConformanceSuite.CHECK_NAMES)
     assert all(report.checks.values())
 
 
 async def test_transfer_package_is_digest_bound_and_idempotent(tmp_path):
-    db, broker = await _broker(tmp_path)
+    _db, broker = await _broker(tmp_path)
     runtime = _runtime()
     _, candidate = await _event_and_candidate(broker, runtime)
     decision = await broker.propose_memory(candidate, runtime)

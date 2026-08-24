@@ -4,22 +4,33 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 
 from khaos.memory.core.broker import MemoryBroker
-from khaos.memory.core.contracts import MemoryCapabilities, RuntimeMemoryContext
+from khaos.memory.core.contracts import (
+    MemoryCapabilities,
+    MemoryEventType,
+    RuntimeMemoryContext,
+    SourceType,
+    TrustHint,
+)
+from khaos.memory.events import MemoryEventBridge
+from khaos.memory.providers.http import MemoryHttpProvider
 from khaos.memory.providers.lifecycle import (
     MemoryProviderRegistry,
     ProviderLifecycleError,
     ProviderLifecycleState,
     ProviderManifest,
 )
-from khaos.memory.providers.http import MemoryHttpProvider
 from khaos.memory.providers.native import NativeMemoryProvider
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,39 +114,132 @@ class MemoryProviderManager:
                     health.detail,
                     handle.provider.capabilities(),
                 )
+            bridge = MemoryEventBridge(self.broker)
+            await bridge.record(
+                MemoryEventType.PROVIDER_SWITCH_REQUESTED,
+                runtime,
+                {"from_provider": previous_id, "to_provider": provider_id},
+                source_type=SourceType.SYSTEM,
+                trust_hint=TrustHint.TOOL_OBSERVED,
+            )
             target = await self.registry.start(provider_id)
             try:
-                await self.registry.activate(provider_id)
-                await self.broker.set_provider(target.provider, runtime, provider_id=provider_id)
+                shared_projection = self.broker._shares_projection(target.provider)
                 replay = getattr(target.provider, "rebuild_from_events", None)
-                if callable(replay):
-                    await self.broker.rebuild_from_ledger(runtime, limit=100_000)
+                if callable(replay) and not shared_projection:
+                    events = await self.broker._read_all_replay_events(
+                        runtime, page_size=10_000
+                    )
+                    await cast(Callable[..., Awaitable[Any]], replay)(events)
                 elif not target.provider.capabilities().import_data:
                     raise ProviderLifecycleError(
                         f"provider {provider_id} cannot import canonical memory data"
                     )
                 rebuild = getattr(target.provider, "rebuild_indexes", None)
-                if callable(rebuild):
-                    await self.broker.rebuild()
+                if callable(rebuild) and not shared_projection:
+                    await cast(Callable[..., Awaitable[Any]], rebuild)()
                 health = await target.provider.health()
                 if not health.healthy:
                     raise ProviderLifecycleError(
                         f"provider {provider_id} failed smoke health check: {health.detail}"
                     )
-                if previous_id in {manifest.provider_id for manifest in self.registry.manifests()}:
-                    await self.registry.stop(previous_id)
+                # Activate the prepared handle before publishing the Broker
+                # pointer.  The pointer remains the serving commit point;
+                # registry state can therefore be restored if it fails.
+                await self.registry.activate(provider_id)
+                await self.broker.set_provider(
+                    target.provider,
+                    runtime,
+                    provider_id=provider_id,
+                    prepared=True,
+                    emit_event=False,
+                )
+                # Persist and audit the serving-state commit before stopping
+                # the old provider.  If either commit step fails, the old
+                # pointer and provider remain recoverable and no
+                # PROVIDER_CHANGED event is emitted.
                 await self.persist()
-            except BaseException:
-                self.broker.provider = previous
-                try:
-                    await self.registry.stop(provider_id)
-                except ProviderLifecycleError:
-                    pass
+                await self.broker.record_audit(
+                    "MEMORY_PROVIDER_SWITCH_COMMITTED",
+                    runtime,
+                    detail={"from_provider": previous_id, "to_provider": provider_id},
+                )
+                await bridge.record(
+                    MemoryEventType.PROVIDER_SWITCH_COMMITTED,
+                    runtime,
+                    {"from_provider": previous_id, "to_provider": provider_id},
+                    source_type=SourceType.SYSTEM,
+                    trust_hint=TrustHint.TOOL_OBSERVED,
+                )
+                if previous_id in {manifest.provider_id for manifest in self.registry.manifests()}:
+                    try:
+                        await self.registry.stop(previous_id)
+                    except ProviderLifecycleError:
+                        # The target is already the committed serving provider;
+                        # a stale old handle is safe to collect on the next
+                        # lifecycle sweep.
+                        pass
+            except BaseException as exc:
+                rollback_ok = self.broker.provider is previous
                 if self.registry.handle(previous_id) is not None:
                     try:
                         await self.registry.activate(previous_id)
                     except ProviderLifecycleError:
+                        rollback_ok = False
+                # Restore the serving pointer through the Broker's same
+                # provider/projection locks.  Direct assignment here would
+                # let a concurrent search observe a half-rolled-back switch
+                # and would bypass the registry readiness check.
+                if self.broker.provider is not previous:
+                    try:
+                        await self.broker.set_provider(
+                            previous,
+                            runtime,
+                            provider_id=previous_id,
+                            prepared=True,
+                            emit_event=False,
+                        )
+                    except Exception as rollback_error:
+                        # Preserve the original switch error; the Broker
+                        # pointer remains the last committed value.  Keep
+                        # that provider alive below so no in-flight search is
+                        # stranded on a stopped serving object.
+                        logger.warning(
+                            "provider switch pointer rollback failed: %s",
+                            type(rollback_error).__name__,
+                            exc_info=True,
+                        )
+                        rollback_ok = False
+                if rollback_ok:
+                    try:
+                        await self.registry.stop(provider_id)
+                    except ProviderLifecycleError:
                         pass
+                elif self.broker.provider is not previous:
+                    try:
+                        await self.registry.activate(provider_id)
+                    except ProviderLifecycleError:
+                        pass
+                try:
+                    await bridge.record(
+                        MemoryEventType.PROVIDER_SWITCH_FAILED,
+                        runtime,
+                        {
+                            "from_provider": previous_id,
+                            "to_provider": provider_id,
+                            "error": type(exc).__name__,
+                        },
+                        source_type=SourceType.SYSTEM,
+                        trust_hint=TrustHint.TOOL_OBSERVED,
+                    )
+                except Exception as bridge_error:
+                    # The original switch failure is the authoritative error;
+                    # a secondary ledger failure must not hide it.
+                    logger.warning(
+                        "provider switch failure audit failed: %s",
+                        type(bridge_error).__name__,
+                        exc_info=True,
+                    )
                 raise
             handle = self.registry.handle(provider_id)
             if handle is None:

@@ -164,7 +164,7 @@ def extract_candidates_from_event(
                 key=f"failure:{payload.get('tool_name', 'tool')}",
                 scope="coding",
                 namespace="project",
-                authority=MemoryAuthority.TOOL_OBSERVED,
+                authority=MemoryAuthority.AGENT_INFERRED,
                 confidence=0.65,
                 source_event_ids=(event.event_id,),
                 evidence_refs=(evidence,),
@@ -188,7 +188,7 @@ def extract_candidates_from_event(
                 key=f"decision:{payload.get('task_id', event.task_id or 'task')}",
                 scope="coding",
                 namespace="project",
-                authority=MemoryAuthority.TOOL_OBSERVED,
+                authority=MemoryAuthority.AGENT_INFERRED,
                 confidence=0.6,
                 source_event_ids=(event.event_id,),
                 evidence_refs=(evidence,),
@@ -207,7 +207,7 @@ def extract_candidates_from_event(
                 key=f"approval:{payload.get('tool_name', event.event_id)}",
                 scope="coding",
                 namespace="project",
-                authority=MemoryAuthority.TOOL_OBSERVED,
+                authority=MemoryAuthority.AGENT_INFERRED,
                 confidence=0.7,
                 source_event_ids=(event.event_id,),
                 evidence_refs=(evidence,),
@@ -215,6 +215,40 @@ def extract_candidates_from_event(
                 usage_policy=UsagePolicy.PROJECT_ONLY,
             ),
         ) if getattr(profile, "constraint_memory", True) else ()
+    if event_type == MemoryEventType.SKILL_CANDIDATE_CREATED.value:
+        if getattr(profile, "skill_memory", True) is False:
+            return ()
+        raw_candidates = payload.get("candidates", ())
+        if not isinstance(raw_candidates, (list, tuple)):
+            return ()
+        candidates: list[MemoryCandidate] = []
+        for raw in raw_candidates[:64]:
+            if not isinstance(raw, dict):
+                continue
+            name = str(raw.get("name", "")).strip()
+            description = str(raw.get("description", "")).strip()
+            body = str(raw.get("body", "")).strip()
+            if not name or not (description or body):
+                continue
+            candidates.append(
+                MemoryCandidate(
+                    memory_type=MemoryType.SKILL_MEMORY,
+                    claim=(body or description)[:64 * 1024],
+                    key=f"skill:{name[:256]}",
+                    scope="coding",
+                    namespace="project",
+                    authority=MemoryAuthority.AGENT_INFERRED,
+                    confidence=max(
+                        0.0,
+                        min(1.0, float(raw.get("confidence", 0.0) or 0.0)),
+                    ),
+                    source_event_ids=(event.event_id,),
+                    evidence_refs=(evidence,),
+                    preconditions=preconditions,
+                    usage_policy=UsagePolicy.PROJECT_ONLY,
+                )
+            )
+        return tuple(candidates)
     return ()
 
 
@@ -227,7 +261,16 @@ def _event_source_type(event_type: str) -> SourceType:
         MemoryEventType.TASK_TRANSITION.value,
         MemoryEventType.PLAN_CREATED.value,
         MemoryEventType.APPROVAL_DECIDED.value,
+        MemoryEventType.SKILL_CANDIDATE_CREATED.value,
     }:
+        if event_type in {
+            MemoryEventType.TASK_TRANSITION.value,
+            MemoryEventType.PLAN_CREATED.value,
+            MemoryEventType.SKILL_CANDIDATE_CREATED.value,
+        }:
+            return SourceType.TASK
+        if event_type == MemoryEventType.APPROVAL_DECIDED.value:
+            return SourceType.SYSTEM
         return SourceType.TOOL
     if event_type == MemoryEventType.VERIFICATION_RESULT.value:
         return SourceType.VERIFICATION

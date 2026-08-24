@@ -1,10 +1,9 @@
 """Principal- and project-scoped memory RPC service.
 
-The service owns no transport state.  The caller supplies an immutable
-``RequestContext`` and this module constructs a short-lived ``MemoryStore``
-from that context for each operation.  Keeping that binding here makes it
-harder for a future RPC handler to accidentally reuse a server-level store
-with the wrong principal.
+The service owns no provider or authority state.  Production composition
+injects one application-scoped ``MemoryHost``; request identity is still
+bound into a fresh immutable runtime context for each operation.  The legacy
+``MemoryStore`` adapter is retained only for explicitly non-production callers.
 """
 
 from __future__ import annotations
@@ -18,19 +17,15 @@ from khaos.memory import (
     MemoryBroker,
     MemoryCandidate,
     MemoryConfidence,
-    MemoryEvent,
-    MemoryEventType,
     MemoryHit,
     MemoryRepository,
     MemoryScope,
     MemoryStore,
     RuntimeMemoryContext,
-    SourceType,
-    TrustHint,
 )
 from khaos.memory.core.contracts import utc_now
-from khaos.memory.ledger import SqliteEventLedger
-from khaos.memory.providers import NativeMemoryProvider
+from khaos.memory.events import MemoryEventBridge
+from khaos.memory.runtime import MemoryHost
 from khaos.runtime import RequestContext
 
 
@@ -42,18 +37,26 @@ class MemoryService:
         repository: MemoryRepository,
         audit_logger=None,
         broker: MemoryBroker | None = None,
+        memory_host: MemoryHost | None = None,
+        *,
+        require_host: bool = False,
     ) -> None:
         """Create the service from explicit persistence and audit ports."""
         self.repository = repository
         self.audit_logger = audit_logger
-        if broker is None:
-            database = getattr(repository, "database", None)
-            if database is not None:
-                broker = MemoryBroker(
-                    NativeMemoryProvider(database),
-                    SqliteEventLedger(database),
-                )
+        self.memory_host = memory_host
+        if require_host and memory_host is None:
+            raise RuntimeError("production MemoryService requires the canonical MemoryHost")
+        if broker is None and memory_host is not None:
+            broker = memory_host.broker
+        if require_host and (memory_host is None or broker is not memory_host.broker):
+            raise RuntimeError("production MemoryService broker must belong to MemoryHost")
+        # No provider or Broker is constructed here.  The gRPC composition
+        # passes ``require_host=True``; the MemoryStore branch is limited to
+        # explicit legacy/unit callers and is never reachable from production
+        # transport composition.
         self.broker = broker
+        self.event_bridge = MemoryEventBridge(broker) if broker is not None else None
 
     def _store(self, ctx: RequestContext) -> MemoryStore:
         """Build a store bound to the authenticated principal and project."""
@@ -107,16 +110,14 @@ class MemoryService:
         memory_scope = MemoryScope(scope)
         if self.broker is not None:
             runtime = self._runtime(ctx, scope)
-            source_event = MemoryEvent.create(
-                MemoryEventType.USER_MESSAGE,
-                principal_id=runtime.principal_id,
-                project_id=runtime.project_id,
-                session_id=runtime.session_id,
-                source_type=SourceType.USER,
-                trust_hint=TrustHint.USER_STATED,
-                payload={"key": key, "value": value, "scope": scope},
+            if self.event_bridge is None:
+                raise RuntimeError("MemoryService has no canonical event bridge")
+            source_event = await self.event_bridge.user_message(
+                runtime,
+                content=value,
+                key=key,
+                scope=scope,
             )
-            await self.broker.record_event(source_event)
             valid_from = utc_now()
             candidate = MemoryCandidate(
                 memory_type="USER_MEMORY",
@@ -137,23 +138,11 @@ class MemoryService:
                     "error": decision.reason,
                     "status": decision.status.value,
                 }
-            # Keep the old table as a compatibility projection for released
-            # clients.  It is not read by the V2 model-context path.
-            projection = await self._store(ctx).set(
-                Memory(
-                    id=None,
-                    scope=memory_scope,
-                    key=key,
-                    value=value,
-                    ttl=ttl,
-                    confidence=MemoryConfidence(confidence),
-                )
-            )
             return {
                 "ok": True,
                 "id": decision.memory_id,
                 "memory_id": decision.memory_id,
-                "legacy_id": projection.id if projection is not None else None,
+                "legacy_id": None,
                 "status": decision.status.value,
             }
         memory = await self._store(ctx).set(
@@ -180,18 +169,14 @@ class MemoryService:
         if self.broker is not None:
             runtime = self._runtime(ctx, "global")
             canonical_id = str(memory_id)
-            if canonical_id and not canonical_id.isdigit():
-                legacy_hit = None
-                getter = getattr(self.broker.provider, "get_by_id", None)
-                if callable(getter):
-                    legacy_hit = await getter(runtime, canonical_id)
+            legacy_hit = await self.broker.get(canonical_id, runtime)
+            if legacy_hit is not None:
                 await self.broker.forget((canonical_id,), runtime, mode="soft")
-                if legacy_hit is not None and legacy_hit.key:
-                    await self._store(ctx).delete(
-                        MemoryScope(legacy_hit.scope),
-                        legacy_hit.key,
-                    )
-                return {"ok": True}
+            # Forget is intentionally non-enumerating: an unknown or foreign
+            # id has the same public result as an owned id.  Most importantly,
+            # a production Broker must never fall through to the legacy
+            # integer-id store after canonical composition has been selected.
+            return {"ok": True}
         # Keep deletion on the same MemoryStore boundary as every other
         # operation so ownership and audit behavior cannot drift between RPC
         # methods and local runtime callers.
@@ -214,6 +199,9 @@ class MemoryService:
 
     def _runtime(self, ctx: RequestContext, scope: str) -> RuntimeMemoryContext:
         """Bind RPC identity before the request reaches the Broker."""
+
+        if self.broker is not None and (not ctx.principal_id or not ctx.project_id):
+            raise PermissionError("Memory V2 RPC context requires principal and project identity")
 
         return RuntimeMemoryContext(
             principal_id=ctx.principal_id or "legacy-principal",

@@ -90,9 +90,13 @@ Khaos TUI — slash commands:
   /memory forget <id>      Revoke a memory (soft by default)
   /memory provider          Show provider lifecycle status
   /memory provider set <id> Switch provider after replay and health checks
+  /memory profile           Show the active validated profile
   /memory rebuild           Replay the canonical event ledger
+  /memory maintain          Run bounded maintenance and consistency checks
   /memory verify            Verify rebuildable indexes
   /memory gc                Run conservative compaction
+  /memory benchmark <query> Run a live Broker benchmark (3 repetitions)
+  /memory conformance       Run mandatory provider conformance checks
   /memory export <path>     Export a scope-bound package
   /memory import <path>     Import a scope-bound package
   /tools [mode]             List available tools (optionally per mode)
@@ -277,6 +281,40 @@ async def _cmd_memory_v2(
         return CommandResult(handled=True, message="memory runtime context not configured")
     runtime = runtime_builder(ctx.session_id)
     action = args[0].lower() if args else "list"
+    if action == "status" and len(args) == 1:
+        health = await broker.health()
+        provider_manager = ctx.memory_provider_manager or getattr(
+            manager, "provider_manager", None
+        )
+        statuses = await provider_manager.statuses() if provider_manager is not None else ()
+        profile = getattr(manager, "profile", None)
+        return CommandResult(
+            handled=True,
+            message=(
+                f"memory provider={broker.provider.provider_id} "
+                f"healthy={health.healthy}; "
+                f"profile={getattr(profile, 'profile_id', 'unknown')}; "
+                f"providers={len(statuses)}"
+            ),
+            payload={"health": health, "profile": profile, "providers": statuses},
+        )
+    if action == "profile" and len(args) <= 2:
+        registry = ctx.memory_profile_registry or getattr(manager, "profile_registry", None)
+        if registry is None:
+            return CommandResult(handled=True, message="memory profile registry not configured")
+        if len(args) == 2 and args[1] == "list":
+            profiles = registry.list()
+            return CommandResult(
+                handled=True,
+                message="\n".join(profile.profile_id for profile in profiles),
+                payload=profiles,
+            )
+        profile = getattr(manager, "profile", None)
+        return CommandResult(
+            handled=True,
+            message="profile not selected." if profile is None else _render_mapping(profile.to_mapping()),
+            payload=profile,
+        )
     if action in {"list", "search"}:
         query = " ".join(args[1:]) if action == "search" else ""
         if action == "search" and not query:
@@ -315,6 +353,17 @@ async def _cmd_memory_v2(
                 f"indexed={report.indexed_nodes}, "
                 f"consistent={report.consistency.consistent}."
             ),
+        )
+    if action == "maintain" and len(args) == 1:
+        report = await MemoryMaintenanceService(broker).maintain(runtime)
+        return CommandResult(
+            handled=True,
+            message=(
+                f"memory maintenance: deduplicated={report.deduplicated_evidence}, "
+                f"tiers={report.lifecycle_tiers}, "
+                f"consistent={report.consistency.consistent}."
+            ),
+            payload=report,
         )
     if action == "verify" and len(args) == 1:
         report = await MemoryMaintenanceService(broker).verify(runtime)
@@ -379,6 +428,37 @@ async def _cmd_memory_v2(
     if action == "gc" and len(args) == 1:
         removed = await broker.compact(runtime)
         return CommandResult(handled=True, message=f"memory gc removed={removed}.")
+    if action == "benchmark" and len(args) >= 2:
+        from khaos.memory import BenchmarkCase, MemoryBenchmarkHarness
+
+        query = " ".join(args[1:])
+        report = await MemoryBenchmarkHarness(broker).run(
+            [BenchmarkCase("tui-query", query)],
+            runtime,
+            repetitions=3,
+        )
+        return CommandResult(
+            handled=True,
+            message=(
+                f"memory benchmark: status={report.status} "
+                f"recall={report.metrics.get('recall', 0.0):.3f} "
+                f"p95={report.metrics.get('latency_p95_ms', 0.0):.2f}ms."
+            ),
+            payload=report,
+        )
+    if action == "conformance" and len(args) == 1:
+        from khaos.memory import run_provider_conformance
+
+        report = await run_provider_conformance(broker, runtime)
+        return CommandResult(
+            handled=True,
+            message=(
+                f"memory conformance: provider={report.provider_id} "
+                f"passed={report.passed} "
+                f"checks={sum(report.checks.values())}/{len(report.checks)}."
+            ),
+            payload=report,
+        )
     if action == "export" and len(args) == 2:
         transfer = ctx.memory_transfer or getattr(manager, "transfer_service", None)
         if transfer is None:
@@ -396,7 +476,8 @@ async def _cmd_memory_v2(
         message=(
             "usage: /memory [list|show <id>|search <query>|source <id>|evidence <id>|"
             "conflicts <query>|forget <id> [soft|hard|compliance]|provider [set <id>]|"
-            "rebuild|verify|gc|export <path>|import <path>]"
+            "profile [list]|rebuild|maintain|verify|gc|benchmark <query>|"
+            "conformance|export <path>|import <path>]"
         ),
     )
 
