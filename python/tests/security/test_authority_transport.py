@@ -120,6 +120,7 @@ def test_windows_native_contract_uses_platform_identity(
         )
 
 
+@pytest.mark.posix_host
 def test_broker_factory_uses_unix_for_macos_community_profile(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -156,6 +157,7 @@ def test_broker_factory_uses_unix_for_macos_community_profile(
         AuthorityBroker._default = None
 
 
+@pytest.mark.posix_host
 def test_community_paths_cannot_be_controlled_by_a_project(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -188,6 +190,7 @@ def test_community_profile_status_vocabulary_is_explicit() -> None:
     }
 
 
+@pytest.mark.posix_host
 def test_production_client_rejects_a_project_selected_trust_root(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

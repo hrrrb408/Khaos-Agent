@@ -266,6 +266,7 @@ def test_public_key_load_is_binary_safe(tmp_path: Path) -> None:
     )
 
 
+@pytest.mark.posix_host
 def test_community_client_verifies_receipts_against_local_trust_anchor(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
