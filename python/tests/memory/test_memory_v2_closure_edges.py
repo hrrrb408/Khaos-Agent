@@ -9,7 +9,7 @@ from pathlib import Path
 
 import httpx
 import pytest
-from khaos.coding.execution import HostExecutionBackend
+from khaos.coding.execution.models import ExecutionResult
 from khaos.coding.verification import VerificationPipeline
 from khaos.coding.verification.models import VerificationPlan, VerificationStep
 from khaos.db import Database
@@ -43,6 +43,26 @@ from khaos.memory.providers import (
     NativeMemoryProvider,
     ProviderManifest,
 )
+
+
+class _PassingVerificationExecution:
+    """Portable execution seam for testing pipeline-to-memory promotion.
+
+    HostExecutionBackend intentionally requires POSIX directory binding.  The
+    production execution contract is covered by its platform-specific suites;
+    this regression isolates the Memory V2 verification receipt flow and must
+    therefore remain runnable on every Product Integrity runner.
+    """
+
+    async def execute(self, _request) -> ExecutionResult:
+        return ExecutionResult(
+            execution_id="verification-test",
+            status="passed",
+            return_code=0,
+            stdout="memory-v2-ok\n",
+            stderr="",
+            duration_ms=1,
+        )
 
 
 def _runtime(
@@ -360,7 +380,9 @@ async def test_verification_pipeline_records_digest_and_promotes_candidate(tmp_p
     database, broker = await _broker(tmp_path)
     runtime = replace(_runtime(), task_id=None, workspace_id=None)
     try:
-        pipeline = VerificationPipeline(backend=HostExecutionBackend())
+        pipeline = VerificationPipeline(
+            execution_service=_PassingVerificationExecution(),
+        )
         plan = VerificationPlan(
             (
                 VerificationStep(
