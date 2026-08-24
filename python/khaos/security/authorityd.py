@@ -53,6 +53,11 @@ from khaos.security.identity_isolation import (
     read_contract_from_environment,
     validate_private_unix_socket,
 )
+from khaos.security.local_trust import (
+    LocalTrustRootError,
+    local_authority_root,
+    validate_trusted_local_path,
+)
 from khaos.security.principals import (
     PRINCIPAL_DELEGATION_FAMILY,
     DelegationAuthority,
@@ -2789,6 +2794,18 @@ def serve_unix(
             "native authorityd transport is required on this platform; use the "
             "Windows Named Pipe backend service"
         )
+    if selected_transport == "unix" and profile == "community":
+        try:
+            validate_trusted_local_path(
+                daemon.socket_path,
+                kind="socket",
+                root=local_authority_root(),
+                allow_missing=True,
+            )
+        except LocalTrustRootError as exc:
+            raise AuthorityControlPlaneError(
+                "community authorityd socket is outside the trusted local root"
+            ) from exc
     contract = read_contract_from_environment()
     authority_uid = contract.authority_uid
     if production:
@@ -2837,14 +2854,19 @@ def serve_unix(
             raise AuthorityControlPlaneError(
                 "KHAOS_AUTHORITYD_SOCKET_MODE must be octal"
             ) from exc
-        if socket_mode not in {0o600, 0o660}:
+        allowed_socket_modes = {0o600} if profile == "community" else {0o600, 0o660}
+        if socket_mode not in allowed_socket_modes:
             raise AuthorityControlPlaneError(
-                "authorityd socket mode must be 0600 or 0660"
+                "community authorityd socket mode must be 0600"
+                if profile == "community"
+                else "authorityd socket mode must be 0600 or 0660"
             )
         os.chmod(daemon.socket_path, socket_mode)
         if production:
             validate_private_unix_socket(
-                daemon.socket_path, expected_uid=authority_uid
+                daemon.socket_path,
+                expected_uid=authority_uid,
+                require_private=profile == "community",
             )
         max_connections_value = os.environ.get("KHAOS_AUTHORITYD_MAX_CONNECTIONS", "32")
         try:

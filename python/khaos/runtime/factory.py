@@ -970,6 +970,25 @@ def _load_production_resource_order(
         raise PermissionError(
             "production runtime requires KHAOS_TYPED_RESOURCE_CATALOG_PATH"
         )
+    from khaos.security.authority_transport import AuthorityTransportConfig
+    from khaos.security.local_trust import (
+        LocalTrustRootError,
+        local_authority_root,
+        validate_trusted_local_path,
+    )
+
+    deployment = AuthorityTransportConfig.from_environment()
+    if deployment.is_community:
+        try:
+            validate_trusted_local_path(
+                Path(catalog_path),
+                kind="file",
+                root=local_authority_root(),
+            )
+        except LocalTrustRootError as exc:
+            raise PermissionError(
+                "Community production catalog must be under the trusted local authority root"
+            ) from exc
     try:
         loaded = TypedResourcePartialOrder.from_json_file(
             Path(catalog_path),

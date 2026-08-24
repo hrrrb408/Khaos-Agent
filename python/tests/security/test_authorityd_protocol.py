@@ -45,6 +45,7 @@ from khaos.security.authorityd_protocol import (
     SignedAuthorizationReceipt,
     derive_resource_digest,
 )
+from khaos.security.local_trust import ensure_local_authority_root
 from khaos.security.principals import transport_root_delegation_digest
 
 # Canonical transport-root commitment for the standard typed-principal test
@@ -263,6 +264,47 @@ def test_public_key_load_is_binary_safe(tmp_path: Path) -> None:
         )
         == payload
     )
+
+
+def test_community_client_verifies_receipts_against_local_trust_anchor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "home" / ".khaos" / "authorityd"
+    root.parent.parent.mkdir()
+    ensure_local_authority_root(root)
+    monkeypatch.setattr(
+        authorityd_protocol_module, "local_authority_root", lambda: root
+    )
+    key_path = root / "authorityd.pem"
+    public_key_path = root / "authorityd.pub"
+    key = Ed25519KeyStore.load_or_create(key_path, create=True)
+    public_key_path.write_bytes(
+        key.public_key().public_bytes(
+            serialization.Encoding.Raw,
+            serialization.PublicFormat.Raw,
+        )
+    )
+    daemon = AuthorityDaemon(
+        socket_path=root / "authorityd.sock",
+        signing_key=key,
+        audit_writer=_MemoryWorm(),
+        issuer_id="test-community-authorityd",
+        policy=lambda _intent: None,
+    )
+    receipt = daemon.prepare(_intent())
+    client = authorityd_protocol_module.AuthorityDaemonClient(
+        root / "authorityd.sock",
+        public_key_path=public_key_path,
+        trusted_local_root=root,
+        transport="unix",
+    )
+
+    assert client._verify_receipt(receipt.to_dict()).signature == receipt.signature
+    with pytest.raises(
+        AuthorityControlPlaneError,
+        match="trusted local authority key",
+    ):
+        client._verify_receipt(replace(receipt, operation="network.connect").to_dict())
 
 
 def test_typed_kernel_keeps_native_execution_binding_exact() -> None:

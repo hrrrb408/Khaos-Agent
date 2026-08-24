@@ -2,6 +2,12 @@
 
 Status: **NOT CLOSED (evidence incomplete)**
 
+This generic M6 report is intentionally separate from the profile-scoped
+Memory V2 result in `docs/memory-v2-production-closure-report.md`. Community
+Local Profile PASS does not certify the optional macOS Signed Distribution
+Profile and does not waive this report's independent native/WORM evidence
+requirements.
+
 This report is evidence-bound. A local green test run is not a closure claim.
 
 - Exact commit: `94c39b9e0601cb49b4d7519d24748725adcce980` (review baseline)

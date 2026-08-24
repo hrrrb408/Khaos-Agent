@@ -79,17 +79,26 @@ authorityd receipt 模式时，部署 `khaos-authorityd` 为独立 OS service，
 `KHAOS_AUTHORITYD_PUBLIC_KEY_PATH`、`KHAOS_EFFECTIVE_POLICY_DIGEST` 与远端审计
 endpoint；authorityd 只签发与自身编译 policy digest 相同的收据，缺少任一生产证明时会
 fail closed。完整协议见 `docs/authority-control-plane.md`。当前 API key 是单实例本地控制面认证，不是多租户隔离。
-个人 macOS 安装不需要 Apple Developer Team ID：保持独立的
-`khaos-authorityd` 进程，并设置 `KHAOS_AUTHORITY_PROFILE=community`（未设置时
-macOS 默认也是该 profile）和一个 0600 的 `KHAOS_AUTHORITYD_SOCKET`；签名收据、策略
-digest、资源范围和撤销语义仍然生效。仍需提供 authorityd signing key、typed
-resource catalog 和对应的 `KHAOS_EFFECTIVE_POLICY_DIGEST`；community 只移除
-Apple identity 与远端 WORM 前置条件。需要 launchd/XPC、Team ID、签名证书和远端 WORM
-审计时，显式改为 `KHAOS_AUTHORITY_PROFILE=native-production`。两种 profile 都没有
-in-process、TCP 或静默 fallback。
-仓库 CI 的 macOS launchd/XPC E2E 同样是显式能力：只有设置 repository variable
-`KHAOS_NATIVE_MACOS_E2E=true` 才会运行；未设置时不伪造 native proof，完整 M6
-security closure 仍保持 `NOT CLOSED`。
+个人 macOS 安装的默认生产部署是 `Community Local Profile`，不需要 Apple Developer
+Team ID、证书、notarization 或签名 launchd/XPC。保持独立的 `khaos-authorityd` 进程，
+让 socket、Ed25519 key、public key、typed catalog 和本地 audit 都位于 owner-only 的
+`~/.khaos/authorityd/` 下；默认 socket 是 `authorityd.sock`，并强制 0600、同 UID
+peer credentials、签名收据、策略 digest、资源范围、审批、验证、审计和撤销语义。
+Community 仍需提供 typed resource catalog 与对应的 `KHAOS_EFFECTIVE_POLICY_DIGEST`，
+但不把 Apple identity 或远端 WORM 当作本地安全成立的前置条件。项目目录不能选择或
+替换 Community authority 状态路径；没有 in-process、TCP、host 或静默 fallback。
+
+需要 launchd/XPC、Team ID、签名证书、Keychain ACL、notarization 和远端 WORM 审计时，
+显式使用 `KHAOS_AUTHORITY_PROFILE=native-production`，这是可选的
+`macOS Signed Distribution Profile`。该 profile 未启用时状态为
+`OPTIONAL_PROFILE_NOT_ENABLED`/`NOT CERTIFIED`，不会把 Community Local Profile 或
+Memory V2 closure 判为失败；一旦通过 `KHAOS_NATIVE_MACOS_E2E=true` 启用而缺少签名
+材料，则 fail closed。
+
+Memory V2 的 canonical Core 以 PR #216 (`ec02d5386f32cf3b06b3828149b6b587c4c9fa7a`)
+为完成基线，本轮只补 deployment-profile / local-trust closure，不重做 Memory Core。
+最终状态和证据见 `docs/memory-v2-production-closure-report.md`、ADR-066，以及
+`native-authority-production-e2e.yml` 产出的 `deployment-profile-results.json`。
 安全事实的机器可读来源是 `docs/security_facts.yaml`。
 
 ## 开发

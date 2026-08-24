@@ -40,6 +40,17 @@ key, receipt TTL/nonce/replay state, revocation state, resource scope, and
 effective-policy digest.  The difference is the OS identity boundary and the
 audit durability claim, not the authority protocol or effect lifecycle.
 
+The Community Local Profile has a fixed local trust root at
+`~/.khaos/authorityd/`. Socket, signing key, public key, typed resource
+catalog, and local audit paths must be owner-held descendants of that root;
+symlinks, group/other writable paths, project-controlled authority state, and
+non-private sockets are rejected. The client verifies Community receipts with
+the daemon's published Ed25519 public key before returning them to callers.
+The complete chain remains local user/runtime identity -> protected state
+directory -> peer credentials -> Runtime Authority -> Ed25519 key -> policy /
+catalog digest -> approval / verification / audit. Apple code signing is not
+part of this chain.
+
 The native profile remains available for signed releases and deployments that
 need process identity stronger than same-user local IPC.  Its existing
 launchd/XPC and Windows Service-SID code, packaging, challenge-response
@@ -52,6 +63,11 @@ profile marker.
   process of that user.  The private socket and kernel peer UID prevent
   cross-user access, but they do not provide code-signing or multi-user
   isolation.
+- The same-UID limitation is an explicit Community threat-model boundary, not
+  a hidden claim of runtime impersonation resistance. Cross-user access,
+  repository-selected authority paths, symlink replacement, unauthenticated
+  RPC, policy/catalog injection, and missing approval/verification/audit
+  postconditions remain fail-closed conditions.
 - A local JSONL audit file is crash-durable diagnostic evidence, not an
   independent WORM authority.  Deployments requiring tamper-resistant audit
   retention must use `native-production` (or a separately provisioned remote
@@ -66,3 +82,7 @@ profile marker.
   tombstone remain idempotent.
 - Native macOS evidence is now an optional deployment capability for the
   community profile, not a prerequisite for ordinary local functionality.
+- Profile evidence uses the statuses `pass`, `fail`, `blocked_external`,
+  `not_applicable`, `not_run`, and `optional_profile_not_enabled`. The optional
+  signed distribution profile is `NOT CERTIFIED` when not enabled; it becomes a
+  required fail-closed gate only after explicit enablement.

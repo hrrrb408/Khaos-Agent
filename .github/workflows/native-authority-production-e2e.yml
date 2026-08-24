@@ -13,8 +13,9 @@ name: Native Authority Production E2E
 # native job is therefore opt-in through the repository variable
 # ``KHAOS_NATIVE_MACOS_E2E=true``; when it is not enabled, the workflow remains
 # successful; the native release-gate verifier permits the macOS artifact to
-# be absent, while the full M6 closure report remains NOT CLOSED until that
-# native proof is supplied.
+# be absent. The profile-results job below emits the machine-readable
+# deployment-profile status; it does not turn a missing signed artifact into
+# a signed PASS.
 # If the variable is enabled and the required secrets/runners are unavailable,
 # the native job still FAILS rather than manufacturing evidence.
 
@@ -48,6 +49,31 @@ jobs:
             echo 'macOS native authority E2E is not enabled; community profile remains the default'
             echo 'macos_enabled=false' >> "$GITHUB_OUTPUT"
           fi
+
+  community-local-profile:
+    name: Community Local Profile (no Apple signing)
+    runs-on: ubuntu-24.04
+    env:
+      KHAOS_AUTHORITY_PROFILE: community
+      KHAOS_DEV_MODE: "0"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.11"
+      - name: Install contract dependencies
+        run: |
+          python -m pip install --require-hashes -r python/bootstrap-requirements.txt
+          uv sync --frozen --extra test
+      - name: Run Community Local Profile security gate
+        run: |
+          PYTHONPATH=python uv run pytest -q \
+            python/tests/security/test_local_trust.py \
+            python/tests/security/test_authority_transport.py \
+            python/tests/security/test_authorityd_protocol.py \
+            python/tests/security/test_identity_isolation.py
 
   macos-launchd-xpc:
     name: macOS launchd/XPC authority
@@ -615,3 +641,100 @@ jobs:
         with:
           name: native-authority-windows-proof
           path: native-evidence/
+
+  profile-results:
+    name: Publish deployment profile results
+    if: always()
+    needs:
+      - native-profile
+      - community-local-profile
+      - macos-launchd-xpc
+      - windows-service-named-pipe
+    runs-on: ubuntu-24.04
+    outputs:
+      community_profile: ${{ steps.results.outputs.community_profile }}
+      macos_signed_distribution: ${{ steps.results.outputs.macos_signed_distribution }}
+      signed_profile_enabled: ${{ steps.results.outputs.signed_profile_enabled }}
+    steps:
+      - id: results
+        name: Resolve profile-scoped statuses
+        env:
+          GITHUB_SHA_VALUE: ${{ github.sha }}
+          GITHUB_RUN_ID_VALUE: ${{ github.run_id }}
+          COMMUNITY_RESULT: ${{ needs.community-local-profile.result }}
+          PROFILE_RESOLUTION_RESULT: ${{ needs.native-profile.result }}
+          MACOS_ENABLED: ${{ needs.native-profile.outputs.macos_enabled }}
+          MACOS_RESULT: ${{ needs.macos-launchd-xpc.result }}
+          WINDOWS_RESULT: ${{ needs.windows-service-named-pipe.result }}
+        run: |
+          set -eu
+          if [ "$COMMUNITY_RESULT" = "success" ]; then
+            community_profile=pass
+          else
+            community_profile=fail
+          fi
+
+          if [ "$PROFILE_RESOLUTION_RESULT" != "success" ]; then
+            signed_profile_enabled=false
+            macos_signed_distribution=blocked_external
+          elif [ "$MACOS_ENABLED" != "true" ]; then
+            signed_profile_enabled=false
+            macos_signed_distribution=optional_profile_not_enabled
+          else
+            signed_profile_enabled=true
+            if [ "$MACOS_RESULT" = "success" ]; then
+              macos_signed_distribution=pass
+            else
+              macos_signed_distribution=fail
+            fi
+          fi
+
+          mkdir -p profile-evidence
+          PROFILE_JSON="$PWD/profile-evidence/deployment-profile-results.json" \
+            COMMUNITY_PROFILE="$community_profile" \
+            SIGNED_PROFILE="$macos_signed_distribution" \
+            SIGNED_ENABLED="$signed_profile_enabled" \
+            python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          result = {
+              "schema_version": 1,
+              "evidence_scope": "native-authority-production-e2e",
+              "github_sha": os.environ["GITHUB_SHA_VALUE"],
+              "github_run_id": os.environ["GITHUB_RUN_ID_VALUE"],
+              "profiles": {
+                  "community_local": {
+                      "status": os.environ["COMMUNITY_PROFILE"],
+                      "required_for_this_workflow": True,
+                  },
+                  "macos_signed_distribution": {
+                      "status": os.environ["SIGNED_PROFILE"],
+                      "enabled": os.environ["SIGNED_ENABLED"] == "true",
+                      "requires": [
+                          "KHAOS_NATIVE_MACOS_E2E=true",
+                          "KHAOS_MACOS_TEAM_ID",
+                          "KHAOS_MACOS_CODESIGN_CERTIFICATE",
+                      ],
+                  },
+              },
+          }
+          Path(os.environ["PROFILE_JSON"]).write_text(
+              json.dumps(result, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
+          echo "community_profile=$community_profile" >> "$GITHUB_OUTPUT"
+          echo "macos_signed_distribution=$macos_signed_distribution" >> "$GITHUB_OUTPUT"
+          echo "signed_profile_enabled=$signed_profile_enabled" >> "$GITHUB_OUTPUT"
+
+          test "$community_profile" = pass
+          test "$macos_signed_distribution" = pass \
+            || test "$macos_signed_distribution" = optional_profile_not_enabled
+      - name: Upload deployment profile results
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: deployment-profile-results
+          path: profile-evidence/deployment-profile-results.json

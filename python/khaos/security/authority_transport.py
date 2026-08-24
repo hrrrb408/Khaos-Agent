@@ -18,6 +18,12 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from khaos.security.local_trust import (
+    LocalTrustRootError,
+    local_authority_root,
+    validate_trusted_local_path,
+)
+
 if TYPE_CHECKING:
     from khaos.security.authorityd_protocol import AuthorityDaemonClient
     from khaos.security.identity_isolation import AuthorityIdentityContract
@@ -25,6 +31,17 @@ if TYPE_CHECKING:
 
 class AuthorityTransportError(ValueError):
     """The authority deployment profile or transport is invalid."""
+
+
+class ClosureStatus(str, Enum):
+    """Machine-readable status vocabulary for deployment-profile evidence."""
+
+    PASS = "pass"
+    FAIL = "fail"
+    BLOCKED_EXTERNAL = "blocked_external"
+    NOT_APPLICABLE = "not_applicable"
+    NOT_RUN = "not_run"
+    OPTIONAL_PROFILE_NOT_ENABLED = "optional_profile_not_enabled"
 
 
 class AuthorityProfile(str, Enum):
@@ -153,6 +170,8 @@ class AuthorityTransportConfig:
         """Return the configured absolute Unix socket for this transport."""
 
         value = os.environ.get("KHAOS_AUTHORITYD_SOCKET", "").strip()
+        if not value and self.is_community:
+            value = str(local_authority_root() / "authorityd.sock")
         if not value:
             raise AuthorityTransportError(
                 "KHAOS_AUTHORITYD_SOCKET is required for the Unix authority transport"
@@ -162,6 +181,41 @@ class AuthorityTransportConfig:
             raise AuthorityTransportError(
                 "KHAOS_AUTHORITYD_SOCKET must be an absolute path"
             )
+        if self.is_community and os.environ.get("KHAOS_DEV_MODE") != "1":
+            try:
+                path = validate_trusted_local_path(
+                    path,
+                    kind="socket",
+                    root=local_authority_root(),
+                    allow_missing=True,
+                )
+            except LocalTrustRootError as exc:
+                raise AuthorityTransportError(str(exc)) from exc
+        return path
+
+    def public_key_path(self) -> Path | None:
+        """Return the receipt trust anchor for a Unix authority transport."""
+
+        value = os.environ.get("KHAOS_AUTHORITYD_PUBLIC_KEY_PATH", "").strip()
+        if not value and self.is_community:
+            value = str(local_authority_root() / "authorityd.pub")
+        if not value:
+            return None
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            raise AuthorityTransportError(
+                "KHAOS_AUTHORITYD_PUBLIC_KEY_PATH must be an absolute path"
+            )
+        if self.is_community and os.environ.get("KHAOS_DEV_MODE") != "1":
+            try:
+                path = validate_trusted_local_path(
+                    path,
+                    kind="file",
+                    root=local_authority_root(),
+                    allow_missing=True,
+                )
+            except LocalTrustRootError as exc:
+                raise AuthorityTransportError(str(exc)) from exc
         return path
 
     def expected_authority_uid(
@@ -205,6 +259,12 @@ class AuthorityTransportConfig:
         return AuthorityDaemonClient(
             socket_path,
             expected_authority_uid=self.expected_authority_uid(contract),
+            public_key_path=self.public_key_path(),
+            trusted_local_root=(
+                local_authority_root()
+                if self.is_community and os.environ.get("KHAOS_DEV_MODE") != "1"
+                else None
+            ),
             transport=self.transport.value,
         )
 
@@ -214,4 +274,5 @@ __all__ = [
     "AuthorityTransport",
     "AuthorityTransportConfig",
     "AuthorityTransportError",
+    "ClosureStatus",
 ]
