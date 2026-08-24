@@ -24,15 +24,26 @@ only with the explicit `KHAOS_DEV_MODE=1` development switch.
 
 The authority control plane is always a separate `khaos-authorityd` process;
 the Agent never falls back to an in-process broker in a production profile.
-`KHAOS_AUTHORITY_PROFILE=community` is the personal/local profile: on macOS
-it uses a private 0600 AF_UNIX socket and kernel peer UID checks, so it needs
-no Apple Developer Team ID or signing certificate. This is a same-user
-boundary, not multi-user isolation, and its JSONL audit file is diagnostic
-rather than remote WORM evidence. `KHAOS_AUTHORITY_PROFILE=native-production`
-selects launchd/XPC on macOS and Service-SID/Named-Pipe on Windows; those
-deployments retain the stronger native identity and independent audit
-requirements. Unknown profile values fail closed, and a missing daemon,
-socket, key, policy digest, or typed resource catalog still refuses effects.
+`KHAOS_AUTHORITY_PROFILE=community` is the `Community Local Profile`: on macOS
+it uses the owner-only `~/.khaos/authorityd/` trust root, a private 0600
+AF_UNIX socket, kernel peer UID checks, an authority-owned Ed25519 key, and
+signed receipt verification. It needs no Apple Developer Team ID, signing
+certificate, notarization, or signed launchd/XPC. This is a same-user boundary,
+not multi-user or code-signing isolation, and its JSONL audit file is local
+diagnostic evidence rather than remote WORM evidence. Project-controlled or
+symlinked socket/key/catalog/audit paths are rejected.
+`KHAOS_AUTHORITY_PROFILE=native-production` selects launchd/XPC on macOS and
+Service-SID/Named-Pipe on Windows; those deployments retain the stronger native
+audit requirements. Unknown profile values fail closed, and a missing daemon,
+socket, key, policy digest, typed resource catalog, approval, verification, or
+audit postcondition still refuses effects.
+
+The signed macOS distribution path is optional. When it is not enabled, its
+machine-readable result is `optional_profile_not_enabled` (also reported as
+`NOT CERTIFIED`); this is not a failure of the Community Local Profile or
+Memory V2 closure. If `KHAOS_NATIVE_MACOS_E2E=true` enables it, missing Team ID,
+certificate, protected-key material, or native launchd/XPC proof fails closed;
+the workflow never manufactures a signed result.
 
 The Windows backend is intentionally narrow: native commands and the trusted
 Khaos Python interpreter under `network=none` run in an OS-issued AppContainer

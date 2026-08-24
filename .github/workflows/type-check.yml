@@ -56,6 +56,9 @@ jobs:
         # executable-identity modules to the same hard type gate.  Keep the
         # scheduler here as well: it freezes the evidence-bound authority
         # before process dispatch and must not regress to dynamic-call errors.
+        # Round-24: Community Local Trust Root and explicit authority-profile
+        # construction are now part of the same hard gate; profile boundary
+        # code must not drift into dynamically typed fail-open paths.
         run: |
           uv run pyright \
             python/khaos/runtime/authority.py \
@@ -72,6 +75,12 @@ jobs:
             python/khaos/coding/execution/resource_owner.py \
             python/khaos/coding/intelligence/lsp/client.py \
             python/khaos/security/browser_egress_proxy.py \
+            python/khaos/security/local_trust.py \
+            python/khaos/security/authority_transport.py \
+            python/khaos/security/authorityd_main.py \
+            python/khaos/security/authorityd_protocol.py \
+            python/khaos/security/identity_isolation.py \
+            python/khaos/runtime/factory.py \
             python/khaos/tools/registry.py \
             python/khaos/tools/scheduler.py \
             python/khaos/agent/approval.py

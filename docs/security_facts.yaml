@@ -37,7 +37,30 @@ platform_boundaries:
   authority_profile_selector: python/khaos/security/authority_transport.py
   macos_authority_transport: community_private_unix_default_or_explicit_native_launchd_xpc
   macos_community_boundary: same_user_kernel_peer_uid_private_socket_no_team_id_claim
+  community_local_trust_root: ~/.khaos/authorityd
+  community_local_trust_chain:
+    - local_user_runtime_identity
+    - owner_only_trusted_state_directory
+    - protected_local_capability_and_af_unix_peer_uid
+    - runtime_authority
+    - local_ed25519_authority_key
+    - effective_policy_and_typed_catalog_digest
+    - approval_verification_and_audit
+  community_authority_paths: socket_key_public_key_catalog_local_audit_must_be_owner_held_no_symlink_descendants
+  community_socket_mode: "0600"
+  community_receipt_verification: client_verifies_against_published_ed25519_key
+  community_apple_signing_requirement: not_required
+  community_same_uid_residual: explicit_profile_boundary_not_multi_user_or_code_signing_isolation
   macos_native_boundary: launchd_xpc_requires_explicit_native_production_profile_and_team_id
+  macos_signed_distribution_profile: optional_native_production_team_id_certificate_keychain_launchd_xpc_notarization
+  macos_signed_distribution_disabled_status: optional_profile_not_enabled_or_not_certified
+  profile_status_vocabulary:
+    - pass
+    - fail
+    - blocked_external
+    - not_applicable
+    - not_run
+    - optional_profile_not_enabled
   windows_authority_transport: native_named_pipe_service_sid_adapter_required
   macos_native_client: packaging/macos/khaos-authorityd-xpc-client.c
   macos_native_service: packaging/macos/khaos-authorityd-xpc.m
@@ -96,6 +119,9 @@ tcb_boundaries:
 closure_report:
   generator: scripts/build_m6_closure_report.py
   checked_in_template: docs/m6-security-closure-report.md
+  memory_v2_report: docs/memory-v2-production-closure-report.md
+  memory_v2_baseline: PR_216_ec02d5386f32cf3b06b3828149b6b587c4c9fa7a
+  memory_v2_z_boundary: profile_scoped_community_pass_signed_optional
   closed_requires:
     - exact_commit_ci_run
     - security_closure_gate_success
@@ -104,6 +130,7 @@ closure_report:
     - windows_native_authority_proof
     - independent_resource_oracle
   missing_evidence_state: unknown_or_quarantined
+  signed_profile_missing_state: optional_profile_not_enabled_not_certified
 upstream_security_watch:
   generator: scripts/watch_upstream_codex_security.py
   fixed_sha: 711a5f8b3a6eb40134146ae9ec22fdcdda5e3170

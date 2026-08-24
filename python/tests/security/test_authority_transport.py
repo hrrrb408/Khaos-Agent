@@ -7,12 +7,13 @@ from pathlib import Path
 from typing import Self
 
 import pytest
-from khaos.security import authorityd_protocol
+from khaos.security import authority_transport, authorityd_protocol
 from khaos.security.authority_transport import (
     AuthorityProfile,
     AuthorityTransport,
     AuthorityTransportConfig,
     AuthorityTransportError,
+    ClosureStatus,
 )
 from khaos.security.authorityd_protocol import AuthorityDaemonClient
 from khaos.security.identity_isolation import AuthorityIdentityContract
@@ -119,6 +120,7 @@ def test_windows_native_contract_uses_platform_identity(
         )
 
 
+@pytest.mark.posix_host
 def test_broker_factory_uses_unix_for_macos_community_profile(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -131,7 +133,17 @@ def test_broker_factory_uses_unix_for_macos_community_profile(
     )
     monkeypatch.setenv("KHAOS_DEV_MODE", "0")
     monkeypatch.delenv("KHAOS_AUTHORITY_PROFILE", raising=False)
-    monkeypatch.setenv("KHAOS_AUTHORITYD_SOCKET", str(tmp_path / "authorityd.sock"))
+    trusted_root = tmp_path / "home" / ".khaos" / "authorityd"
+    trusted_root.parent.parent.mkdir()
+    monkeypatch.setattr(
+        authority_transport, "local_authority_root", lambda: trusted_root
+    )
+    monkeypatch.setattr(
+        authorityd_protocol, "local_authority_root", lambda: trusted_root
+    )
+    monkeypatch.setenv(
+        "KHAOS_AUTHORITYD_SOCKET", str(trusted_root / "authorityd.sock")
+    )
     # The test simulates macOS on Windows, where ``os.geteuid`` does not
     # exist; provide the simulated same-user authority UID explicitly.
     monkeypatch.setenv("KHAOS_AUTHORITYD_UID", "501")
@@ -143,6 +155,54 @@ def test_broker_factory_uses_unix_for_macos_community_profile(
     finally:
         broker.close()
         AuthorityBroker._default = None
+
+
+@pytest.mark.posix_host
+def test_community_paths_cannot_be_controlled_by_a_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trusted_root = tmp_path / "home" / ".khaos" / "authorityd"
+    trusted_root.parent.parent.mkdir()
+    monkeypatch.setattr(
+        authority_transport, "local_authority_root", lambda: trusted_root
+    )
+    monkeypatch.setenv("KHAOS_DEV_MODE", "0")
+    monkeypatch.delenv("KHAOS_AUTHORITY_PROFILE", raising=False)
+    monkeypatch.setenv(
+        "KHAOS_AUTHORITYD_SOCKET", str(tmp_path / "repository" / "authorityd.sock")
+    )
+
+    config = AuthorityTransportConfig.from_environment(
+        platform_name="darwin", os_name="posix"
+    )
+    with pytest.raises(AuthorityTransportError, match="trusted authority directory"):
+        config.socket_path()
+
+
+def test_community_profile_status_vocabulary_is_explicit() -> None:
+    assert {status.value for status in ClosureStatus} == {
+        "pass",
+        "fail",
+        "blocked_external",
+        "not_applicable",
+        "not_run",
+        "optional_profile_not_enabled",
+    }
+
+
+@pytest.mark.posix_host
+def test_production_client_rejects_a_project_selected_trust_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("KHAOS_DEV_MODE", "0")
+    project_root = tmp_path / "repository" / ".khaos" / "authorityd"
+    with pytest.raises(ValueError, match="system home root"):
+        AuthorityDaemonClient(
+            tmp_path / "authorityd.sock",
+            public_key_path=tmp_path / "authorityd.pub",
+            trusted_local_root=project_root,
+            transport="unix",
+        )
 
 
 def test_darwin_unix_client_does_not_infer_xpc(
@@ -189,7 +249,7 @@ def test_darwin_unix_client_does_not_infer_xpc(
     monkeypatch.setattr(
         authorityd_protocol,
         "validate_private_unix_socket",
-        lambda _path, expected_uid: None,
+        lambda _path, expected_uid, **_kwargs: None,
     )
     # Windows Python may not expose ``AF_UNIX`` even though this test is
     # explicitly simulating the Darwin Unix transport.  The socket factory

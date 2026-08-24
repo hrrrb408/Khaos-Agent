@@ -34,6 +34,28 @@ release-ready merely because the maintainer can approve it.
    helper changes while the corresponding real-kernel or supply-chain job is
    skipped, cancelled, or unavailable.
 
+## Deployment profile evidence
+
+Memory V2 production closure is profile-scoped. The Community Local Profile is
+allowed to reach `PASS` without Apple membership, Team ID, signing
+certificate, notarization, or signed launchd/XPC. Its required evidence still
+includes the independent authorityd process, owner-only local trust root,
+private peer-authenticated socket, Ed25519 receipt verification, effective
+policy and typed catalog binding, approval, verification, and audit.
+
+The macOS Signed Distribution Profile is optional and explicit. When it is not
+enabled, record `OPTIONAL_PROFILE_NOT_ENABLED` / `NOT CERTIFIED`; do not turn
+that state into a Memory or Community failure. When
+`KHAOS_NATIVE_MACOS_E2E=true` enables the profile, missing Team ID, certificate,
+protected key, launchd/XPC proof, notarization, or artifact provenance is a
+fail-closed failure. The workflow publishes both profile results in
+`deployment-profile-results.json`.
+
+The finite status vocabulary is `PASS`, `FAIL`, `BLOCKED_EXTERNAL`,
+`NOT_APPLICABLE`, `NOT_RUN`, and `OPTIONAL_PROFILE_NOT_ENABLED`. Generic M6
+closure has its own stricter evidence contract and must not be silently
+upgraded by a Community result.
+
 ## Evidence boundary
 
 Local Python/Go/Rust tests prove source-level contracts only. Linux namespace,

@@ -32,6 +32,11 @@ from khaos.security.identity_isolation import (
     IdentityIsolationError,
     validate_private_unix_socket,
 )
+from khaos.security.local_trust import (
+    LocalTrustRootError,
+    local_authority_root,
+    validate_trusted_local_path,
+)
 from khaos.security.principals import DelegationScope, PrincipalKind
 from khaos.security.protocol_boundary import canonical_digest, canonical_json_bytes
 
@@ -594,6 +599,8 @@ class AuthorityDaemonClient:
         expected_authority_uid: int | None = None,
         native_adapter: NativeAuthorityAdapter | None = None,
         transport: str | None = None,
+        public_key_path: Path | None = None,
+        trusted_local_root: Path | None = None,
     ) -> None:
         # The caller (normally AuthorityTransportConfig) selects the
         # transport.  For direct protocol tests, preserve the intuitive
@@ -618,11 +625,45 @@ class AuthorityDaemonClient:
             raise ValueError("authorityd socket and timeout are invalid")
         if expected_authority_uid is not None and expected_authority_uid < 0:
             raise ValueError("authorityd UID is invalid")
+        if public_key_path is not None and not public_key_path.is_absolute():
+            raise ValueError("authorityd public key path must be absolute")
+        if trusted_local_root is not None and not trusted_local_root.is_absolute():
+            raise ValueError("authorityd trusted root must be absolute")
+        if (
+            trusted_local_root is not None
+            and os.environ.get("KHAOS_DEV_MODE") != "1"
+            and trusted_local_root != local_authority_root()
+        ):
+            raise ValueError(
+                "production Community authorityd trusted root must be the system home root"
+            )
         self.socket_path = socket_path
         self.timeout_seconds = timeout_seconds
         self.expected_authority_uid = expected_authority_uid
         self.native_adapter = native_adapter
         self.transport = selected_transport
+        self.public_key_path = public_key_path
+        self.trusted_local_root = trusted_local_root
+
+    def _verify_receipt(self, value: object) -> SignedAuthorizationReceipt:
+        """Parse and verify a receipt against the configured local trust anchor."""
+
+        receipt = SignedAuthorizationReceipt.from_dict(value)
+        if self.public_key_path is not None:
+            try:
+                if self.trusted_local_root is not None:
+                    validate_trusted_local_path(
+                        self.public_key_path,
+                        kind="file",
+                        root=self.trusted_local_root,
+                    )
+                public_key = Ed25519KeyStore.load_public_key(self.public_key_path)
+                receipt.verify(public_key)
+            except (AuthorityControlPlaneError, LocalTrustRootError) as exc:
+                raise AuthorityControlPlaneError(
+                    "authorityd receipt does not match the trusted local authority key"
+                ) from exc
+        return receipt
 
     def request(self, payload: dict[str, object]) -> dict[str, object]:
         body = canonical_json_bytes({"protocol": AUTHORITYD_PROTOCOL, **payload}) + b"\n"
@@ -657,8 +698,21 @@ class AuthorityDaemonClient:
                 raise AuthorityControlPlaneError(
                     "authorityd Unix transport has no socket path"
                 )
+            if self.trusted_local_root is not None:
+                try:
+                    validate_trusted_local_path(
+                        self.socket_path,
+                        kind="socket",
+                        root=self.trusted_local_root,
+                    )
+                except LocalTrustRootError as exc:
+                    raise AuthorityControlPlaneError(
+                        "authorityd local socket is outside the trusted local root"
+                    ) from exc
             validate_private_unix_socket(
-                self.socket_path, expected_uid=self.expected_authority_uid
+                self.socket_path,
+                expected_uid=self.expected_authority_uid,
+                require_private=self.trusted_local_root is not None,
             )
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
                 connection.settimeout(self.timeout_seconds)
@@ -686,7 +740,7 @@ class AuthorityDaemonClient:
 
     def prepare(self, intent: AuthorizationIntent) -> SignedAuthorizationReceipt:
         response = self.request({"operation": "prepare", "intent": intent.payload()})
-        return SignedAuthorizationReceipt.from_dict(response.get("receipt"))
+        return self._verify_receipt(response.get("receipt"))
 
     def grant(
         self,
@@ -732,8 +786,12 @@ class AuthorityDaemonClient:
             }
         )
         try:
-            grant_id = str(response["grant_id"])
-            expires_at = float(response["expires_at"])
+            grant_value = response["grant_id"]
+            expires_value = response["expires_at"]
+            if not isinstance(expires_value, (int, float, str)):
+                raise TypeError("authorityd grant expiry is not numeric")
+            grant_id = str(grant_value)
+            expires_at = float(expires_value)
         except (KeyError, TypeError, ValueError) as exc:
             raise AuthorityControlPlaneError("authorityd returned malformed grant") from exc
         return grant_id, expires_at
@@ -841,7 +899,7 @@ class AuthorityDaemonClient:
                 "resource_digest": resource_digest,
             }
         )
-        return SignedAuthorizationReceipt.from_dict(response.get("receipt"))
+        return self._verify_receipt(response.get("receipt"))
 
     def revoke(self, receipt: SignedAuthorizationReceipt) -> None:
         self.request({"operation": "revoke", "receipt": receipt.to_dict()})

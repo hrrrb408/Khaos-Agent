@@ -219,6 +219,48 @@ evidence by themselves. A real macOS or Windows runner must install the
 platform service and produce the native probe artifact before M6 can claim
 cross-platform production closure.
 
+## Community Local Trust Root and profile-scoped closure
+
+`community` is a deliberate `Community Local Profile`, not an unsigned
+shortcut around the Trust Kernel. Its local trust chain is:
+
+```text
+local user/runtime identity
+  -> owner-only ~/.khaos/authorityd state directory
+  -> protected local socket/key/catalog/audit paths
+  -> AF_UNIX peer UID check and 0600 socket
+  -> Runtime Authority / independent khaos-authorityd process
+  -> authority-owned Ed25519 signing key and public verification key
+  -> effective-policy digest + typed resource catalog
+  -> approval -> verification -> signed receipt -> audited effect
+```
+
+The daemon rejects a Community socket, signing key, public key, typed catalog,
+or local audit path that is outside `~/.khaos/authorityd`, a symlink, not
+owner-held, or exposed through group/other write permissions. The client
+validates the socket before connecting and verifies every Community receipt
+against the published Ed25519 key. Production authorityd remains a separate
+process and requires the existing policy, typed resource, grant, approval,
+verification, and audit gates; it never falls back to the in-process broker,
+TCP, host execution, or repository-controlled configuration.
+
+This boundary intentionally protects a personal same-UID local deployment,
+not code-signing or multi-user identity. A same-UID hostile process is an
+explicit residual risk of `community`, not an unrecorded security claim; a
+different OS user, a project-controlled path, a world-writable runtime
+directory, an unauthenticated RPC peer, or a missing approval/audit/verification
+postcondition is rejected. The Apple Signing Root is an additional chain for
+`native-production`, not the root of Community local security.
+
+Closure status is profile-scoped: `pass`, `fail`, `blocked_external`,
+`not_applicable`, `not_run`, and `optional_profile_not_enabled`. The
+Community result can be `PASS` without Apple membership. The optional signed
+distribution result is `OPTIONAL_PROFILE_NOT_ENABLED`/`NOT CERTIFIED` when its
+Team ID, certificate, Keychain, launchd/XPC, or notarization workflow is not
+enabled; if explicitly enabled and any required secret or native proof is
+missing, it fails closed. The historical Memory V2 A-Y evidence from PR #216
+is preserved; the new Z result is no longer coupled to optional Apple signing.
+
 ## Independent audit prerequisite
 
 `RemoteWormAuditWriter` requires an HTTPS append-only endpoint and has no local

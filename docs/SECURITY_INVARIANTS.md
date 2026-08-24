@@ -118,6 +118,22 @@ class for each invariant remains explicit below.
     ERROR_PIPE_CONNECTED race; client and backend IO are overlapped with
     hard deadlines and CancelIoEx.
 
+15. **Community Local Profile has an independent local trust root.**
+    Production Community authority state is an owner-held, no-symlink
+    descendant of `~/.khaos/authorityd/`; its AF_UNIX socket is exactly 0600,
+    peer credentials are checked, and project-controlled or world-writable
+    socket/key/catalog/audit paths fail closed. The client verifies authorityd
+    receipts against the published Ed25519 key. This root is independent of
+    Apple signing, while the same-UID impersonation limitation remains an
+    explicit profile residual rather than a hidden multi-user claim.
+
+16. **Deployment closure status is profile-scoped.** Community may be PASS
+    without Apple membership. The signed macOS distribution profile is
+    `OPTIONAL_PROFILE_NOT_ENABLED`/`NOT CERTIFIED` until explicit enablement;
+    once enabled, absent signing/native evidence is FAIL. `NOT_RUN`,
+    `BLOCKED_EXTERNAL`, and optional states must never be rewritten as green
+    generic M6 or Memory V2 evidence.
+
 ## Orchestration phase evidence
 
 The Agent turn and tool dispatch pipelines expose immutable phase snapshots,

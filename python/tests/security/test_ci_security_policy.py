@@ -52,6 +52,30 @@ def test_security_workflows_have_read_only_token_and_no_soft_failures():
         assert "persist-credentials: false" in text, workflow.name
 
 
+def test_native_authority_workflow_publishes_profile_scoped_results():
+    """Community and optional signed evidence must be machine-readable."""
+    workflow = (WORKFLOWS / "native-authority-production-e2e.yml").read_text(
+        encoding="utf-8"
+    )
+    for required in (
+        "community-local-profile",
+        "KHAOS_AUTHORITY_PROFILE: community",
+        "KHAOS_DEV_MODE: \"0\"",
+        "profile-results:",
+        "deployment-profile-results.json",
+        "community_local",
+        "macos_signed_distribution",
+        "optional_profile_not_enabled",
+        "KHAOS_NATIVE_MACOS_E2E=true",
+        "KHAOS_MACOS_TEAM_ID",
+        "KHAOS_MACOS_CODESIGN_CERTIFICATE",
+    ):
+        assert required in workflow
+    assert 'test "$community_profile" = pass' in workflow
+    assert 'test "$macos_signed_distribution" = pass' in workflow
+    assert 'test "$macos_signed_distribution" = optional_profile_not_enabled' in workflow
+
+
 def test_release_provenance_binds_exact_required_gates_and_forbids_replacement():
     """Release evidence must name exact successful gate runs, immutably."""
     workflow = (WORKFLOWS / "release-provenance.yml").read_text(encoding="utf-8")

@@ -59,6 +59,12 @@ The closure evidence is maintained by:
 * `khaos.memory.conformance.ProviderConformanceSuite`
 * migration source-integrity and full Python/Go/Rust test gates
 
-Native kernel/browser/process tests remain host-capability gates.  An unavailable
+Native kernel/browser/process tests remain host-capability gates. An unavailable
 native environment is recorded as unavailable/skipped and cannot be reported as
-green closure evidence.
+green closure evidence. Deployment-profile interpretation is defined separately
+by ADR-066: Community Local Profile can reach PASS without Apple signing, while
+the optional macOS Signed Distribution Profile is
+`OPTIONAL_PROFILE_NOT_ENABLED`/`NOT CERTIFIED` until explicitly enabled. The
+final profile-scoped result is recorded in
+`docs/memory-v2-production-closure-report.md`; this ADR does not make Memory
+Core depend on an optional Apple identity.

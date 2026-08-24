@@ -172,6 +172,11 @@ TCB_OWNERS: dict[str, tuple[tuple[str, str, str], ...]] = {
             "unknown profile fails closed; no in-process or platform inference fallback",
         ),
         (
+            "python/khaos/security/local_trust.py",
+            "Community Local Trust Root path and ownership admission",
+            "fixed ~/.khaos/authorityd root; no symlink, project path, or non-private socket",
+        ),
+        (
             "packaging/macos/khaos-authorityd-xpc.m",
             "launchd/XPC frontend: audit token + designated code requirement + backend ownership",
             "platform TCB; no Python fallback",

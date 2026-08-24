@@ -169,7 +169,12 @@ def read_contract_from_environment() -> AuthorityIdentityContract:
     )
 
 
-def validate_private_unix_socket(path: Path, *, expected_uid: int | None) -> None:
+def validate_private_unix_socket(
+    path: Path,
+    *,
+    expected_uid: int | None,
+    require_private: bool = False,
+) -> None:
     """Check the daemon socket's local ownership before connecting."""
     if os.name == "nt":
         raise IdentityIsolationError("Unix socket transport is not valid on Windows")
@@ -178,9 +183,12 @@ def validate_private_unix_socket(path: Path, *, expected_uid: int | None) -> Non
     except OSError as exc:
         raise IdentityIsolationError("authority socket is unavailable") from exc
     mode = stat.S_IMODE(info.st_mode)
-    if not stat.S_ISSOCK(info.st_mode) or mode not in {0o600, 0o660}:
+    allowed_modes = {0o600} if require_private else {0o600, 0o660}
+    if not stat.S_ISSOCK(info.st_mode) or mode not in allowed_modes:
         raise IdentityIsolationError(
-            "authority socket must be 0600 or 0660 with no other access"
+            "authority socket must be 0600"
+            if require_private
+            else "authority socket must be 0600 or 0660 with no other access"
         )
     if expected_uid is not None and info.st_uid != expected_uid:
         raise IdentityIsolationError("authority socket owner is not the authority UID")
@@ -188,10 +196,13 @@ def validate_private_unix_socket(path: Path, *, expected_uid: int | None) -> Non
 
 def peer_uid(connection: socket.socket) -> int:
     """Return SO_PEERCRED UID on Linux; fail closed elsewhere."""
-    if not hasattr(socket, "SO_PEERCRED"):
+    peer_credential_option = getattr(socket, "SO_PEERCRED", None)
+    if not isinstance(peer_credential_option, int):
         raise IdentityIsolationError("SO_PEERCRED is unavailable")
     try:
-        raw = connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+        raw = connection.getsockopt(
+            socket.SOL_SOCKET, peer_credential_option, 12
+        )
     except OSError as exc:
         raise IdentityIsolationError("could not read authority peer credentials") from exc
     if len(raw) < 12:
