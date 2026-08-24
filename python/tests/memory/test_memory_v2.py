@@ -189,8 +189,28 @@ async def test_verification_authority_cannot_be_forged(tmp_path):
     forged = await broker.propose_memory(candidate, runtime)
     assert forged.status is MemoryStatus.QUARANTINED
 
-    receipt = broker.verification_authority.issue(candidate, "run-1")
-    confirmed = replace(candidate, verification_proof=receipt.token)
+    from khaos.coding.verification import VerificationPipeline
+
+    pipeline = VerificationPipeline()
+    issuer = pipeline.memory_receipt_issuer(broker.verification_verifier)
+    candidate_for_receipt = replace(
+        candidate,
+        verification_result_digest="result-1",
+    )
+    receipt = issuer.issue(
+        candidate_for_receipt,
+        "run-1",
+        result_digest="result-1",
+        principal_id=runtime.principal_id,
+        project_id=runtime.project_id,
+        session_id=runtime.session_id,
+        task_id=runtime.task_id,
+        workspace_id=runtime.workspace_id,
+    )
+    confirmed = replace(
+        candidate_for_receipt,
+        verification_proof=receipt.token,
+    )
     accepted = await broker.propose_memory(confirmed, runtime)
     assert accepted.status is MemoryStatus.VERIFIED
     await db.close()

@@ -287,6 +287,10 @@ def build_command_parser() -> argparse.ArgumentParser:
     memory_parser.add_argument("--limit", type=int, default=10_000)
     memory_sub = memory_parser.add_subparsers(dest="memory_command")
     memory_sub.add_parser("status", help="Show profile, provider, and index health")
+    profile_parser = memory_sub.add_parser("profile", help="Show validated memory profiles")
+    profile_parser.add_argument(
+        "profile_command", nargs="?", choices=["current", "list"], default="current"
+    )
     providers_parser = memory_sub.add_parser("providers", help="List registered providers")
     providers_parser.add_argument(
         "providers_command", nargs="?", choices=["list"], default="list"
@@ -294,9 +298,31 @@ def build_command_parser() -> argparse.ArgumentParser:
     provider_parser = memory_sub.add_parser("provider", help="Manage the active provider")
     provider_parser.add_argument("provider_command", choices=["set", "list"])
     provider_parser.add_argument("provider_id", nargs="?")
+    search_parser = memory_sub.add_parser("search", help="Search admitted memory evidence")
+    search_parser.add_argument("query")
+    show_parser = memory_sub.add_parser("show", help="Inspect one admitted memory")
+    show_parser.add_argument("memory_id")
+    source_parser = memory_sub.add_parser("source", help="Inspect memory provenance")
+    source_parser.add_argument("memory_id")
+    evidence_parser = memory_sub.add_parser("evidence", help="Inspect memory evidence")
+    evidence_parser.add_argument("memory_id")
+    conflicts_parser = memory_sub.add_parser("conflicts", help="List unresolved conflicts")
+    conflicts_parser.add_argument("query")
+    forget_parser = memory_sub.add_parser("forget", help="Revoke owned memory objects")
+    forget_parser.add_argument("memory_ids", nargs="+")
+    forget_parser.add_argument("--mode", dest="forget_mode", choices=["soft", "hard", "compliance"], default="soft")
+    forget_parser.add_argument("--namespace", choices=["private", "session", "project", "shared"])
+    forget_parser.add_argument("--scope")
     memory_sub.add_parser("rebuild", help="Replay the event ledger and rebuild indexes")
     memory_sub.add_parser("verify", help="Verify rebuildable indexes")
+    memory_sub.add_parser("maintain", help="Run complete bounded maintenance")
     memory_sub.add_parser("gc", help="Run bounded conservative memory compaction")
+    benchmark_parser = memory_sub.add_parser("benchmark", help="Run a live retrieval benchmark")
+    benchmark_parser.add_argument("query")
+    benchmark_parser.add_argument("--expected", action="append", default=[])
+    benchmark_parser.add_argument("--forbidden", action="append", default=[])
+    benchmark_parser.add_argument("--repetitions", type=int, default=3)
+    memory_sub.add_parser("conformance", help="Run provider conformance checks")
     export_parser = memory_sub.add_parser("export", help="Export a scope-bound memory package")
     export_parser.add_argument("path", type=Path)
     import_parser = memory_sub.add_parser("import", help="Import a scope-bound memory package")
@@ -609,51 +635,54 @@ def cmd_migrate(args: argparse.Namespace) -> int:
 async def _open_memory_cli(args: argparse.Namespace) -> dict[str, object]:
     """Open one fully composed Memory V2 context for CLI operations."""
 
-    from khaos.memory import (
-        MemoryBroker,
-        MemoryBudget,
-        MemoryProfileRegistry,
-        MemoryProfileStore,
-        MemoryTransferService,
-        RuntimeMemoryContext,
+    from khaos.audit import (
+        AuditLogger,
+        resolve_safe_audit_anchor_path,
+        resolve_safe_audit_log_path,
     )
-    from khaos.memory.codegraph import CodeGraphService
-    from khaos.memory.ledger import SqliteEventLedger
-    from khaos.memory.observability import MemoryObservability
-    from khaos.memory.providers import MemoryProviderManager, build_native_registry
+    from khaos.memory import MemoryBudget, RuntimeMemoryContext
+    from khaos.runtime import build_memory_host
     from khaos.security.effective_policy import load_effective_policy
 
     root = Path(args.project_root or Path.cwd()).expanduser().resolve()
     db_path = open_state_db_safely(resolve_state_db_path(root, args.db))
     db = Database(db_path)
     await db.connect()
+    audit_logger = None
+    host = None
     try:
         await db.run_migrations()
-        config = load_config(args.config or root / "config.yaml", strict_env=False)
-        profiles = MemoryProfileRegistry.from_config(config)
         principal_id = local_principal_id()
         project = compute_project_id(root)
-        profile_store = MemoryProfileStore(db)
-        settings = config.get("memory", {})
-        if not isinstance(settings, dict):
-            raise ValueError("memory configuration must be a mapping")
-        default_profile = (
-            args.profile
-            or settings.get("profile")
-            or ("coding" if args.mode == "coding" else "personal")
-        )
-        persisted = await profile_store.get(
+        effective_policy = load_effective_policy(root)
+        if effective_policy.audit_enabled:
+            audit_logger = AuditLogger(
+                db,
+                log_path=resolve_safe_audit_log_path(effective_policy.audit_log_path),
+                anchor_path=(
+                    resolve_safe_audit_anchor_path(project)
+                    if os.environ.get("KHAOS_DEV_MODE") != "1"
+                    else None
+                ),
+                principal_id=principal_id,
+                policy_digest=effective_policy.digest,
+                project_id=project,
+            )
+            await audit_logger.verify_anchor()
+        host = await build_memory_host(
+            db=db,
+            project_root=root,
+            config_path=Path(args.config or root / "config.yaml"),
+            mode=args.mode or "office",
+            profile_id=args.profile,
             principal_id=principal_id,
             project_id=project,
+            audit_logger=audit_logger,
+            effective_policy=effective_policy,
         )
-        profile = profiles.get(persisted or default_profile)
-        effective_policy = load_effective_policy(root)
-        registry = build_native_registry(
-            db,
-            network_allowed=bool(effective_policy.network_enabled),
-            config=config,
-        )
-        handle = await registry.activate(profile.provider)
+        profile = host.profile
+        if profile is None:
+            raise RuntimeError("canonical memory host has no active profile")
         mode = args.mode or ("coding" if profile.profile_id == "coding" else "office")
         runtime = RuntimeMemoryContext(
             principal_id=principal_id,
@@ -666,34 +695,31 @@ async def _open_memory_cli(args: argparse.Namespace) -> dict[str, object]:
             branch=None,
             mode=mode,
             environment_fingerprint="cli:memory",
+            environment={"source_transport": "cli"},
         )
-        codegraph = CodeGraphService(db) if profile.codegraph else None
-        observability = MemoryObservability(db)
-        broker = MemoryBroker(
-            handle.provider,
-            SqliteEventLedger(db),
-            profile=profile,
-            codegraph=codegraph,
-            observability=observability,
-        )
-        provider_manager = MemoryProviderManager(registry, broker, database=db)
-        await provider_manager.persist()
-        transfer = MemoryTransferService(broker)
+        broker = host.broker
         return {
             "db": db,
             "root": root,
             "profile": profile,
-            "profiles": profiles,
-            "profile_store": profile_store,
-            "registry": registry,
-            "provider_manager": provider_manager,
+            "profiles": host.profile_registry,
+            "profile_store": host.profile_store,
+            "registry": host.provider_manager.registry,
+            "provider_manager": host.provider_manager,
             "broker": broker,
-            "transfer": transfer,
+            "transfer": host.transfer_service,
             "runtime": runtime,
             "budget": profile.budget(MemoryBudget()),
-            "codegraph": codegraph,
+            "codegraph": host.codegraph,
+            "host": host,
+            "audit_logger": audit_logger,
         }
     except BaseException:
+        if host is not None:
+            await host.close()
+        close_audit = getattr(audit_logger, "close", None)
+        if callable(close_audit):
+            close_audit()
         await db.close()
         raise
 
@@ -744,6 +770,15 @@ def cmd_memory(args: argparse.Namespace) -> int:
                     as_json=args.as_json,
                 )
                 return 0
+            if action == "profile":
+                if args.profile_command == "list":
+                    _memory_print(
+                        [item.to_mapping() for item in context["profiles"].list()],
+                        as_json=args.as_json,
+                    )
+                else:
+                    _memory_print(profile, as_json=args.as_json)
+                return 0
             if action == "providers" or (
                 action == "provider"
                 and getattr(args, "provider_command", "") == "list"
@@ -770,6 +805,47 @@ def cmd_memory(args: argparse.Namespace) -> int:
                 status = await manager.set_provider(args.provider_id, runtime)
                 _memory_print(status, as_json=args.as_json)
                 return 0
+            if action == "search":
+                resolution = await broker.search(
+                    args.query,
+                    runtime,
+                    context["budget"],
+                )
+                _memory_print(resolution, as_json=args.as_json)
+                return 0
+            if action == "show":
+                hit = await broker.get(args.memory_id, runtime, include_historical=True)
+                _memory_print(hit, as_json=args.as_json)
+                return 0 if hit is not None else 1
+            if action == "source":
+                source = await broker.source(runtime, args.memory_id)
+                _memory_print(source, as_json=args.as_json)
+                return 0 if source is not None else 1
+            if action == "evidence":
+                evidence = await broker.evidence(runtime, args.memory_id)
+                _memory_print(evidence, as_json=args.as_json)
+                return 0
+            if action == "conflicts":
+                conflicts = await broker.conflicts(
+                    args.query,
+                    runtime,
+                    context["budget"],
+                )
+                _memory_print(conflicts, as_json=args.as_json)
+                return 0
+            if action == "forget":
+                from khaos.memory import MemoryForgetRequest
+
+                request = MemoryForgetRequest(
+                    tuple(args.memory_ids),
+                    runtime,
+                    mode=args.forget_mode,
+                    namespace=args.namespace,
+                    scope=args.scope,
+                )
+                result = await broker.forget(request)
+                _memory_print(result, as_json=args.as_json)
+                return 0
             if action == "rebuild":
                 from khaos.memory.maintenance import MemoryMaintenanceService
 
@@ -785,6 +861,15 @@ def cmd_memory(args: argparse.Namespace) -> int:
                 report = await MemoryMaintenanceService(broker).verify(runtime)
                 _memory_print(report, as_json=args.as_json)
                 return 0 if report.consistent else 1
+            if action == "maintain":
+                from khaos.memory.maintenance import MemoryMaintenanceService
+
+                report = await MemoryMaintenanceService(broker).maintain(
+                    runtime,
+                    limit=min(args.limit, 10_000),
+                )
+                _memory_print(report, as_json=args.as_json)
+                return 0 if report.consistency.consistent else 1
             if action == "gc":
                 removed = await broker.compact(runtime, limit=min(args.limit, 10_000))
                 _memory_print({"removed": removed}, as_json=args.as_json)
@@ -805,9 +890,39 @@ def cmd_memory(args: argparse.Namespace) -> int:
                 )
                 _memory_print(result, as_json=args.as_json)
                 return 0
+            if action == "benchmark":
+                from khaos.memory.benchmarks import (
+                    BenchmarkCase,
+                    MemoryBenchmarkHarness,
+                )
+
+                report = await MemoryBenchmarkHarness(broker).run(
+                    [
+                        BenchmarkCase(
+                            "cli",
+                            args.query,
+                            tuple(args.expected),
+                            tuple(args.forbidden),
+                        )
+                    ],
+                    runtime,
+                    repetitions=args.repetitions,
+                )
+                _memory_print(report, as_json=args.as_json)
+                return 0 if report.status == "COMPLETED" and report.security_violations == 0 else 1
+            if action == "conformance":
+                from khaos.memory.conformance import run_provider_conformance
+
+                report = await run_provider_conformance(broker, runtime)
+                _memory_print(report, as_json=args.as_json)
+                return 0 if report.passed else 1
             raise ValueError(f"unknown memory command: {action}")
         finally:
-            await context["registry"].close()
+            await context["host"].close()
+            audit_logger = context.get("audit_logger")
+            close_audit = getattr(audit_logger, "close", None)
+            if callable(close_audit):
+                close_audit()
             await context["db"].close()
 
     try:

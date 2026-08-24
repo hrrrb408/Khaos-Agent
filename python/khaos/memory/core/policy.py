@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
-from typing import Any
+from typing import Any, ClassVar
 
 from khaos.memory.core.contracts import (
     MemoryAuthority,
@@ -35,6 +36,89 @@ class ScreeningResult:
 
     action: ScreeningAction
     reason: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class SupersessionDecision:
+    """Broker-owned decision for replacing a temporal version."""
+
+    allowed: bool
+    reason: str
+
+
+class SupersessionPolicy:
+    """Compare authority and lifecycle before any version is superseded.
+
+    Native and remote providers receive explicit ids only after this policy
+    returns ``allowed``.  A provider's same-key behaviour is therefore never
+    an implicit write authority.
+    """
+
+    _RANK: ClassVar[dict[str, int]] = {
+        MemoryAuthority.EXTERNAL_UNTRUSTED.value: 0,
+        MemoryAuthority.AGENT_INFERRED.value: 1,
+        MemoryAuthority.REPOSITORY_OBSERVED.value: 2,
+        MemoryAuthority.TOOL_OBSERVED.value: 3,
+        MemoryAuthority.USER_STATED.value: 4,
+        MemoryAuthority.VERIFICATION_CONFIRMED.value: 5,
+        MemoryAuthority.SYSTEM_POLICY.value: 6,
+    }
+
+    _BLOCKED_CANDIDATE_STATUSES: ClassVar[set[str]] = {
+        MemoryStatus.CANDIDATE.value,
+        MemoryStatus.QUARANTINED.value,
+        MemoryStatus.REJECTED.value,
+    }
+
+    def decide(
+        self,
+        existing: MemoryHit,
+        *,
+        candidate_authority: MemoryAuthority,
+        candidate_status: MemoryStatus,
+        user_correction: bool = False,
+    ) -> SupersessionDecision:
+        """Return a conservative temporal replacement decision."""
+
+        if candidate_status.value in self._BLOCKED_CANDIDATE_STATUSES:
+            return SupersessionDecision(False, "candidate_not_promotable")
+        existing_status = enum_value(existing.status)
+        if existing_status in {
+            MemoryStatus.REVOKED.value,
+            MemoryStatus.REJECTED.value,
+            MemoryStatus.SUPERSEDED.value,
+        }:
+            return SupersessionDecision(False, "existing_not_current")
+        incoming = candidate_authority.value
+        current = enum_value(existing.authority_hint or MemoryAuthority.AGENT_INFERRED)
+        # User correction is an explicit host decision, not an inference from
+        # a matching key.  It is the only lower/equal-authority replacement.
+        if incoming == MemoryAuthority.USER_STATED.value and user_correction:
+            return SupersessionDecision(True, "explicit_user_correction")
+        if incoming == MemoryAuthority.VERIFICATION_CONFIRMED.value:
+            return SupersessionDecision(True, "trusted_verification")
+        if current in {
+            MemoryAuthority.USER_STATED.value,
+            MemoryAuthority.VERIFICATION_CONFIRMED.value,
+            MemoryAuthority.SYSTEM_POLICY.value,
+        } and incoming in {
+            MemoryAuthority.AGENT_INFERRED.value,
+            MemoryAuthority.REPOSITORY_OBSERVED.value,
+            MemoryAuthority.TOOL_OBSERVED.value,
+        }:
+            return SupersessionDecision(False, "lower_authority_cannot_supersede")
+        if incoming == MemoryAuthority.REPOSITORY_OBSERVED.value and current in {
+            MemoryAuthority.USER_STATED.value,
+            MemoryAuthority.VERIFICATION_CONFIRMED.value,
+        }:
+            return SupersessionDecision(False, "repository_cannot_supersede_trusted_fact")
+        if self._RANK.get(incoming, 0) < self._RANK.get(current, 0):
+            return SupersessionDecision(False, "incoming_authority_is_lower")
+        if incoming == MemoryAuthority.USER_STATED.value:
+            return SupersessionDecision(True, "same_or_higher_user_authority")
+        if incoming == current:
+            return SupersessionDecision(True, "same_authority_temporal_update")
+        return SupersessionDecision(False, "unresolved_conflict_preserved")
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,13 +152,22 @@ _INSTRUCTION_PATTERNS = (
     re.compile(r"\b(?:bypass|disable)\s+(?:sandbox|approval|security)\b", re.IGNORECASE),
     re.compile(r"\b(?:send|print|reveal|exfiltrate)\s+(?:the\s+)?(?:api\s+key|token|credential|secret)\b", re.IGNORECASE),
     re.compile(r"\bremember\s+this\s+permanently\b", re.IGNORECASE),
+    re.compile(r"忽略(?:之前|先前|上面)的(?:指令|规则|要求)"),
+    re.compile(r"无视(?:系统|开发者)?(?:指令|规则|提示)"),
+    re.compile(r"(?:执行|运行)\s*(?:curl|wget|bash|sh|powershell)", re.IGNORECASE),
+    re.compile(r"绕过(?:沙箱|审批|安全|权限)"),
+    re.compile(r"(?:泄露|打印|输出|发送).{0,8}(?:API.?Key|密钥|令牌|凭证|秘密)", re.IGNORECASE),
+    re.compile(r"永久(?:记住|保存)"),
 )
 
 
 def looks_like_instruction(text: str) -> bool:
     """Detect common persistent prompt-injection language."""
 
-    return any(pattern.search(text) for pattern in _INSTRUCTION_PATTERNS)
+    normalized = unicodedata.normalize("NFKC", text).casefold()
+    normalized = re.sub(r"[\u200b-\u200f\u2060\ufeff]", "", normalized)
+    normalized = re.sub(r"\s+", " ", normalized)
+    return any(pattern.search(normalized) for pattern in _INSTRUCTION_PATTERNS)
 
 
 def screen_text(
@@ -102,6 +195,7 @@ def reclassify_provider_authority(
     authority_hint: str | None,
     *,
     canonical_record: bool,
+    local_evidence: bool = False,
 ) -> MemoryAuthority:
     """Convert a provider hint into Khaos authority without escalation."""
 
@@ -110,11 +204,11 @@ def reclassify_provider_authority(
         return MemoryAuthority.SYSTEM_POLICY
     if canonical_record and source == SourceType.VERIFICATION.value:
         return MemoryAuthority.VERIFICATION_CONFIRMED
-    if source == SourceType.USER.value:
+    if local_evidence and source == SourceType.USER.value:
         return MemoryAuthority.USER_STATED
-    if source == SourceType.TOOL.value:
+    if local_evidence and source == SourceType.TOOL.value:
         return MemoryAuthority.TOOL_OBSERVED
-    if source == SourceType.REPOSITORY.value:
+    if local_evidence and source == SourceType.REPOSITORY.value:
         return MemoryAuthority.REPOSITORY_OBSERVED
     if source == SourceType.EXTERNAL.value:
         return MemoryAuthority.EXTERNAL_UNTRUSTED
@@ -234,6 +328,8 @@ def candidate_status(
         MemoryType.SKILL_MEMORY.value,
         MemoryType.FAILURE_MEMORY.value,
         MemoryType.NEGATIVE_MEMORY.value,
+        MemoryType.DECISION_MEMORY.value,
+        MemoryType.CONSTRAINT_MEMORY.value,
     } and not verified and authority != MemoryAuthority.USER_STATED.value:
         return MemoryStatus.CANDIDATE, "promotion_requires_verification_or_user_approval"
     if verified:
@@ -245,6 +341,8 @@ __all__ = [
     "MemoryPolicy",
     "ScreeningAction",
     "ScreeningResult",
+    "SupersessionDecision",
+    "SupersessionPolicy",
     "applicability_matches",
     "candidate_status",
     "looks_like_instruction",

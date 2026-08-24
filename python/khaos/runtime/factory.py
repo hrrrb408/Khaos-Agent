@@ -6,11 +6,11 @@ import asyncio
 import logging
 import os
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from khaos.agent import AgentConfig, AgentLoop
 from khaos.agent.compressor import ContextCompressor
@@ -30,15 +30,23 @@ from khaos.exceptions import RuntimeCloseError
 from khaos.memory import (
     MemoryBroker,
     MemoryBudget,
+    MemoryHost,
     MemoryManager,
+    MemoryRuntimeBinding,
     MemoryStore,
     RuntimeMemoryContext,
     SqliteMemoryRepository,
 )
-from khaos.memory.codegraph import CodeGraphService
+from khaos.memory.audit import TrustKernelMemoryAuditSink
+from khaos.memory.codegraph import CodeGraphService, repository_id_for_root
+from khaos.memory.core.authority import VerificationReceiptVerifier
 from khaos.memory.ledger import SqliteEventLedger
 from khaos.memory.observability import MemoryObservability
-from khaos.memory.profiles import MemoryProfileRegistry, MemoryProfileStore
+from khaos.memory.profiles import (
+    MemoryProfileError,
+    MemoryProfileRegistry,
+    MemoryProfileStore,
+)
 from khaos.memory.providers import (
     MemoryProviderManager,
     build_native_registry,
@@ -147,6 +155,7 @@ class RuntimeConfig:
     coding_context_builder: Any = None
     agent_config: AgentConfig | None = None
     memory_manager: MemoryManager | None = None
+    memory_host: MemoryHost | None = None
     skill_manager: SkillManager | None = None
     tool_scheduler: ToolScheduler | None = None
     workspace_manager: WorkspaceManager | None = None
@@ -183,6 +192,14 @@ class RuntimeConfig:
     # passed).  ``session_id`` is the chat session that owns this runtime.
     session_id: str = ""
     runtime_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    task_id: str = ""
+    workspace_id: str = ""
+    repo_id: str = ""
+    commit_sha: str = ""
+    branch: str = ""
+    available_capabilities: frozenset[str] = field(default_factory=frozenset)
+    environment_fingerprint: str = ""
+    environment: dict[str, Any] = field(default_factory=dict)
     # B1: when set, ``build_runtime`` constructs the ToolScheduler's registry
     # by pruning the full runtime registry down to exactly these tool names.
     # SubAgent tasks declare a tool subset (``task.tools``); without this
@@ -240,6 +257,7 @@ class ProductionRuntimeConfig:
     task_manager: TaskManager | None = None
     coding_context_builder: Any = None
     agent_config: AgentConfig | None = None
+    memory_host: MemoryHost | None = None
     skill_manager: SkillManager | None = None
     cleanup_authority: RuntimeCleanupAuthority | None = None
     approval_broker: Any = None
@@ -253,6 +271,14 @@ class ProductionRuntimeConfig:
     foreground_session: bool = False
     session_id: str = ""
     runtime_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    task_id: str = ""
+    workspace_id: str = ""
+    repo_id: str = ""
+    commit_sha: str = ""
+    branch: str = ""
+    available_capabilities: frozenset[str] = field(default_factory=frozenset)
+    environment_fingerprint: str = ""
+    environment: dict[str, Any] = field(default_factory=dict)
     tool_allowlist: list[str] | None = None
     channel_registry: Any = None
     channel_admins: frozenset[str] = field(default_factory=frozenset)
@@ -274,6 +300,7 @@ class ProductionRuntimeConfig:
             task_manager=self.task_manager,
             coding_context_builder=self.coding_context_builder,
             agent_config=self.agent_config,
+            memory_host=self.memory_host,
             skill_manager=self.skill_manager,
             cleanup_authority=self.cleanup_authority,
             approval_broker=self.approval_broker,
@@ -287,6 +314,14 @@ class ProductionRuntimeConfig:
             foreground_session=self.foreground_session,
             session_id=self.session_id,
             runtime_id=self.runtime_id,
+            task_id=self.task_id,
+            workspace_id=self.workspace_id,
+            repo_id=self.repo_id,
+            commit_sha=self.commit_sha,
+            branch=self.branch,
+            available_capabilities=self.available_capabilities,
+            environment_fingerprint=self.environment_fingerprint,
+            environment=dict(self.environment),
             tool_allowlist=self.tool_allowlist,
             channel_registry=self.channel_registry,
             channel_admins=self.channel_admins,
@@ -364,6 +399,12 @@ class RuntimeResult:
     _close_task: Any = field(default=None, init=False)
     _closed: bool = field(default=False, init=False)
     _close_failed: bool = field(default=False, init=False)
+    # MemoryHost is attached after construction so the long-standing
+    # positional RuntimeResult API remains unchanged.  The private fields
+    # are not constructor parameters and therefore cannot create a second
+    # composition path for direct callers.
+    _memory_host: MemoryHost | None = field(default=None, init=False, repr=False)
+    _owns_memory_host: bool = field(default=False, init=False, repr=False)
     # P2-1 (close false-success): the typed terminal state machine.  The
     # legacy booleans ``_closed`` / ``_close_failed`` remain as backward-compat
     # property aliases below; new code reads ``close_state``.  ``OPEN`` means a
@@ -396,6 +437,26 @@ class RuntimeResult:
     composition_manifest: dict[str, object] | None = field(
         init=False, default=None
     )
+
+    @property
+    def memory_host(self) -> MemoryHost | None:
+        """Return the canonical host attached by the runtime factory."""
+
+        return self._memory_host
+
+    @memory_host.setter
+    def memory_host(self, value: MemoryHost | None) -> None:
+        self._memory_host = value
+
+    @property
+    def owns_memory_host(self) -> bool:
+        """Return whether this runtime owns the shared MemoryHost lifecycle."""
+
+        return self._owns_memory_host
+
+    @owns_memory_host.setter
+    def owns_memory_host(self, value: bool) -> None:
+        self._owns_memory_host = value
 
     @property
     def close_state(self) -> CloseState:
@@ -460,12 +521,19 @@ class RuntimeResult:
             owned = getattr(component, "owned_runtime_resources", None)
             if callable(owned):
                 resources.extend(
-                    f"{name}:{item}" for item in owned(self.runtime_id)
+                    f"{name}:{item}"
+                    for item in cast(
+                        Callable[..., Iterable[str]],
+                        owned,
+                    )(self.runtime_id)
                 )
                 continue
             owned = getattr(component, "owned_resources", None)
             if callable(owned):
-                resources.extend(f"{name}:{item}" for item in owned())
+                resources.extend(
+                    f"{name}:{item}"
+                    for item in cast(Callable[..., Iterable[str]], owned)()
+                )
             elif not runtime_state_closed:
                 resources.append(name)
         if not runtime_state_closed and not resources:
@@ -500,7 +568,9 @@ class RuntimeResult:
             if not callable(proof) or not callable(owned):
                 logger.error("runtime child %s has no complete terminal proof API", name)
                 return False
-            if not bool(terminal) or not bool(proof()) or tuple(owned()):
+            if not bool(terminal) or not bool(proof()) or tuple(
+                cast(Callable[..., Iterable[str]], owned)()
+            ):
                 logger.error("runtime child %s lacks terminal proof", name)
                 return False
         return True
@@ -725,6 +795,12 @@ class RuntimeResult:
                         logger.debug(
                             "memory manager close failed", exc_info=True
                         )
+            if self.memory_host is not None and self.owns_memory_host:
+                try:
+                    await self.memory_host.close()
+                except Exception:
+                    failed = True
+                    logger.debug("memory host close failed", exc_info=True)
             if self.execution_service is not None:
                 try:
                     await self.tool_scheduler.aclose()
@@ -761,7 +837,7 @@ class RuntimeResult:
                 try:
                     close = getattr(self.credential_broker, "aclose", None)
                     if callable(close):
-                        await close()
+                        await cast(Callable[..., Awaitable[Any]], close)()
                     else:
                         self.credential_broker.close()
                 except Exception:
@@ -909,6 +985,116 @@ def _load_production_resource_order(
             "production typed resource catalog does not match the effective policy"
         )
     return loaded
+
+
+async def build_memory_host(
+    *,
+    db: Any,
+    project_root: Path,
+    config_path: Path,
+    mode: str,
+    principal_id: str,
+    project_id: str,
+    profile_id: str | None = None,
+    repo_id: str | None = None,
+    commit_sha: str | None = None,
+    audit_logger: AuditLogger | None,
+    effective_policy: EffectiveSecurityPolicy,
+) -> MemoryHost:
+    """Build the canonical application-scoped Memory V2 composition.
+
+    Every long-lived production entry point uses this function.  It is the
+    only place that selects the profile/provider and constructs the Broker;
+    per-turn runtimes receive the resulting ``MemoryHost`` as a borrowed
+    dependency and therefore cannot silently create a second authority path.
+    """
+
+    from khaos.config import load_config
+
+    memory_config = load_config(config_path, strict_env=False)
+    profile_registry = MemoryProfileRegistry.from_config(memory_config)
+    profile_store = MemoryProfileStore(db)
+    memory_settings = memory_config.get("memory", {})
+    if not isinstance(memory_settings, dict):
+        raise TypeError("memory configuration must be a mapping")
+    default_profile_id = "coding" if mode == "coding" else "personal"
+    configured_profile_id = profile_id or memory_settings.get("profile", default_profile_id)
+    if not isinstance(configured_profile_id, str):
+        raise TypeError("memory.profile must be a string")
+    persisted_profile_id = await profile_store.get(
+        principal_id=principal_id,
+        project_id=project_id,
+    )
+    profile = profile_registry.get(persisted_profile_id or configured_profile_id)
+    memory_registry = build_native_registry(
+        db,
+        network_allowed=bool(effective_policy.network_enabled),
+        config=memory_config,
+    )
+    target_provider = await memory_registry.activate(profile.provider)
+    capabilities = target_provider.provider.capabilities()
+    if profile.vector and not capabilities.vector_search:
+        raise MemoryProfileError(
+            f"memory profile {profile.profile_id!r} requires vector search, "
+            f"but provider {profile.provider!r} does not provide it"
+        )
+    if profile.fts and not (capabilities.keyword_search or capabilities.exact_search):
+        raise MemoryProfileError(
+            f"memory profile {profile.profile_id!r} requires keyword/exact search, "
+            f"but provider {profile.provider!r} provides neither"
+        )
+    codegraph = CodeGraphService(db) if profile.codegraph else None
+    observability = MemoryObservability(db)
+    broker = MemoryBroker(
+        target_provider.provider,
+        SqliteEventLedger(db),
+        profile=profile,
+        codegraph=codegraph,
+        observability=observability,
+        verification_verifier=VerificationReceiptVerifier(),
+        audit_sink=TrustKernelMemoryAuditSink(
+            audit_logger,
+            required=bool(effective_policy.audit_enabled),
+        ),
+        audit_required=bool(effective_policy.audit_enabled),
+    )
+    provider_manager = MemoryProviderManager(
+        memory_registry,
+        broker,
+        database=db,
+    )
+    await provider_manager.persist()
+    transfer_service = MemoryTransferService(broker)
+    host = MemoryHost(
+        broker,
+        provider_manager=provider_manager,
+        profile=profile,
+        profile_registry=profile_registry,
+        profile_store=profile_store,
+        transfer_service=transfer_service,
+        codegraph=codegraph,
+        owns_lifecycle=True,
+    )
+    if codegraph is not None and profile.maintenance_overrides.get("build_on_start", True):
+        # The graph is derived evidence.  A failed initial build is visible
+        # to maintenance/health and must not prevent the canonical ledger
+        # host from starting.
+        try:
+            runtime = MemoryRuntimeBinding(
+                principal_id=principal_id,
+                project_id=project_id,
+                session_id=None,
+                task_id=None,
+                workspace_id=None,
+                mode=mode,
+                environment_fingerprint="memory-host",
+                repo_id=repo_id or repository_id_for_root(project_root),
+                commit_sha=commit_sha or "working-tree",
+            ).context()
+            await codegraph.build(runtime, project_root)
+        except (OSError, RuntimeError, ValueError) as exc:
+            logger.warning("memory codegraph build failed: %s", type(exc).__name__)
+    return host
 
 
 async def build_runtime(
@@ -1085,63 +1271,61 @@ async def build_runtime(
         project_id=project_id,
         audit_logger=audit_logger,
     )
-    if cfg.memory_manager is None:
-        from khaos.config import load_config
 
-        memory_config = load_config(
-            cfg.config_path or root / "config.yaml",
-            strict_env=False,
-        )
-        profile_registry = MemoryProfileRegistry.from_config(memory_config)
-        profile_store = MemoryProfileStore(cfg.db)
-        memory_settings = memory_config.get("memory", {})
-        if not isinstance(memory_settings, dict):
-            raise ValueError("memory configuration must be a mapping")
-        default_profile_id = (
-            "coding" if mode_manager.current_mode.value == "coding" else "personal"
-        )
-        configured_profile_id = memory_settings.get("profile", default_profile_id)
-        if not isinstance(configured_profile_id, str):
-            raise ValueError("memory.profile must be a string")
-        persisted_profile_id = await profile_store.get(
+    def memory_context(
+        session_id: str,
+        *,
+        task_id: str | None = None,
+        workspace_id: str | None = None,
+        repo_id: str | None = None,
+        commit_sha: str | None = None,
+        branch: str | None = None,
+    ) -> RuntimeMemoryContext:
+        """Bind the complete host/runtime identity before Broker access."""
+
+        binding = MemoryRuntimeBinding(
             principal_id=cfg.principal_id,
             project_id=project_id,
+            session_id=session_id or cfg.session_id or None,
+            task_id=task_id or cfg.task_id or None,
+            workspace_id=workspace_id or cfg.workspace_id or None,
+            mode=mode_manager.current_mode.value,
+            available_capabilities=cfg.available_capabilities,
+            environment_fingerprint=cfg.environment_fingerprint or "runtime:default",
+            repo_id=(
+                repo_id
+                or cfg.repo_id
+                or (repository_id_for_root(root) if mode_manager.current_mode.value == "coding" else None)
+            ),
+            commit_sha=(
+                commit_sha
+                or cfg.commit_sha
+                or ("working-tree" if mode_manager.current_mode.value == "coding" else None)
+            ),
+            branch=branch or cfg.branch or None,
+            environment={
+                **cfg.environment,
+                "source_transport": cfg.source_transport,
+                "runtime_id": cfg.runtime_id,
+            },
         )
-        profile = profile_registry.get(persisted_profile_id or configured_profile_id)
-        memory_registry = build_native_registry(
-            cfg.db,
-            network_allowed=bool(effective_policy.network_enabled),
-            config=memory_config,
-        )
-        target_provider = await memory_registry.activate(profile.provider)
+        return binding.context()
 
-        def memory_context(session_id: str) -> RuntimeMemoryContext:
-            return RuntimeMemoryContext(
-                principal_id=cfg.principal_id,
-                project_id=project_id,
-                session_id=session_id or cfg.session_id or None,
-                task_id=None,
-                workspace_id=None,
-                mode=mode_manager.current_mode.value,
-                environment_fingerprint="runtime:default",
-            )
-
-        codegraph = CodeGraphService(cfg.db) if profile.codegraph else None
-        observability = MemoryObservability(cfg.db)
-        memory_broker = MemoryBroker(
-            target_provider.provider,
-            SqliteEventLedger(cfg.db),
-            profile=profile,
-            codegraph=codegraph,
-            observability=observability,
-        )
-        provider_manager = MemoryProviderManager(
-            memory_registry,
-            memory_broker,
-            database=cfg.db,
-        )
-        await provider_manager.persist()
-        transfer_service = MemoryTransferService(memory_broker)
+    memory_host = cfg.memory_host
+    owns_memory_host = False
+    if cfg.memory_manager is None and cfg.memory_host is not None:
+        # Shared application composition: use the already initialized host;
+        # this branch never constructs a provider, registry, or Broker.
+        memory_host = cfg.memory_host
+        profile = memory_host.profile
+        if profile is None:
+            raise ValueError("memory host has no resolved profile")
+        profile_registry = memory_host.profile_registry
+        profile_store = memory_host.profile_store
+        memory_broker = memory_host.broker
+        provider_manager = memory_host.provider_manager
+        transfer_service = memory_host.transfer_service
+        codegraph = memory_host.codegraph
         memory_manager = MemoryManager(
             memory_store,
             budget=profile.budget(MemoryBudget()),
@@ -1153,31 +1337,60 @@ async def build_runtime(
             profile=profile,
             transfer_service=transfer_service,
             codegraph=codegraph,
+            owns_provider_manager=False,
+        )
+        memory_manager.profile_registry = profile_registry
+        memory_manager.profile_store = profile_store
+        memory_manager.observability = getattr(memory_broker, "observability", None)
+    elif cfg.memory_manager is None:
+        memory_host = await build_memory_host(
+            db=cfg.db,
+            project_root=root,
+            config_path=cfg.config_path or root / "config.yaml",
+            mode=mode_manager.current_mode.value,
+            principal_id=cfg.principal_id,
+            project_id=project_id,
+            repo_id=cfg.repo_id,
+            commit_sha=cfg.commit_sha,
+            audit_logger=audit_logger,
+            effective_policy=effective_policy,
+        )
+        owns_memory_host = True
+        profile = memory_host.profile
+        if profile is None:
+            raise RuntimeError("canonical memory host has no active profile")
+        profile_registry = memory_host.profile_registry
+        profile_store = memory_host.profile_store
+        memory_broker = memory_host.broker
+        provider_manager = memory_host.provider_manager
+        transfer_service = memory_host.transfer_service
+        codegraph = memory_host.codegraph
+        memory_manager = MemoryManager(
+            memory_store,
+            budget=profile.budget(MemoryBudget()),
+            mode_getter=lambda: mode_manager.current_mode,
+            intent_getter=lambda: getattr(mode_manager, "_intent_buffer", ""),
+            broker=memory_broker,
+            runtime_context_factory=memory_context,
+            provider_manager=provider_manager,
+            profile=profile,
+            transfer_service=transfer_service,
+            codegraph=codegraph,
+            owns_provider_manager=False,
         )
         # Keep the profile and registry available to the TUI/RPC composition
         # without creating a second provider path.  All operations still
         # enter through the same Broker instance above.
         memory_manager.profile_registry = profile_registry
         memory_manager.profile_store = profile_store
-        memory_manager.observability = observability
-        if codegraph is not None and profile.maintenance_overrides.get(
-            "build_on_start", True
-        ):
-            try:
-                report = await codegraph.build(memory_context(cfg.session_id or ""), root)
-                logger.info(
-                    "memory codegraph ready: files=%d nodes=%d edges=%d",
-                    report.files,
-                    report.nodes,
-                    report.edges,
-                )
-            except (OSError, RuntimeError, ValueError) as exc:
-                # CodeGraph is a rebuildable derived index.  A failed graph
-                # build must not discard the canonical event-ledger path, but
-                # the failure is explicit and the CLI/TUI can rebuild it.
-                logger.warning("memory codegraph build failed: %s", type(exc).__name__)
+        memory_manager.observability = getattr(memory_broker, "observability", None)
     else:
         memory_manager = cfg.memory_manager
+
+    if cfg.memory_manager is not None:
+        memory_host = getattr(cfg.memory_manager, "memory_host", None)
+    if memory_host is not None:
+        memory_manager.memory_host = memory_host
     skill_manager = cfg.skill_manager or SkillManager()
     skills_dir = root / "skills"
     if len(skill_manager.registry) == 0 and skills_dir.is_dir():
@@ -1463,6 +1676,8 @@ async def build_runtime(
         # P1-1: stamp the authority seal so callers can verify the runtime
         # was built under a known (principal, project, policy, runtime) tuple.
     )._with_seal(authority_seal)
+    runtime.memory_host = memory_host
+    runtime.owns_memory_host = owns_memory_host
     runtime.composition_manifest = composition_manifest
     return runtime
 

@@ -39,6 +39,7 @@ from khaos.coding.workspace.office_authority import OfficeMutationAuthority
 from khaos.db import Database
 from khaos.db.database import SessionBusyError
 from khaos.exceptions import ServiceShutdownError
+from khaos.memory import MemoryEventBridge, RuntimeMemoryContext
 from khaos.modes import ModeManager
 from khaos.rpc.models import ChatRequest, ConfirmRequest
 from khaos.runtime import RequestContext
@@ -209,6 +210,10 @@ class AgentService:
         # gets SessionBusyError instead of racing on shared state.
         self._active_chat_sessions: set[str] = set()
         self.subagent_spawner = None
+        # One application-scoped MemoryHost is created during startup and
+        # borrowed by every main turn, RPC memory service, and subagent.
+        # RuntimeResult never owns this shared host; AgentService does.
+        self.memory_host = None
         from khaos.runtime import RuntimeCleanupAuthority
 
         self.runtime_cleanup_authority = RuntimeCleanupAuthority()
@@ -238,10 +243,27 @@ class AgentService:
         self._ready = False
         if self._audit_logger is not None:
             await self._audit_logger.verify_anchor()
+        from khaos.runtime import build_memory_host
+
+        host = await build_memory_host(
+            db=self.db,
+            project_root=self.project_root,
+            config_path=self.config_path,
+            mode="office",
+            principal_id=local_principal_id(),
+            project_id=self._bound_project_id,
+            audit_logger=self._audit_logger,
+            effective_policy=self._effective_policy,
+        )
         # C-1-5a: ``TaskService`` now lazily constructs per-principal
         # TaskManagers on first use (``_manager(ctx)``), so there's no
         # server-level ``task_manager.load()`` at startup.
-        await self.cron_engine.start()
+        try:
+            await self.cron_engine.start()
+        except BaseException:
+            await host.close()
+            raise
+        self.memory_host = host
         self._ready = True
 
     def _browser_helper_health(self) -> dict[str, Any]:
@@ -432,6 +454,9 @@ class AgentService:
             )
         # Fence every in-flight Office mutation after runtimes have settled.
         await self._shutdown_office_authority()
+        if self.memory_host is not None:
+            await self.memory_host.close()
+            self.memory_host = None
         # The shared AuditLogger is process-owned and is closed exactly once,
         # after all runtime/authority shutdown events had a chance to log.
         if self._audit_logger is not None:
@@ -827,8 +852,28 @@ class AgentService:
             project_id=ctx.project_id,
         )
         await mode_manager.load()
+        previous_mode = mode_manager.current_mode.value
         mode = ModeManager.parse(target_mode)
         await mode_manager.switch(mode)
+        if self.memory_host is not None:
+            try:
+                runtime = RuntimeMemoryContext(
+                    principal_id=ctx.principal_id,
+                    project_id=ctx.project_id,
+                    session_id=session_id or ctx.session_id or None,
+                    task_id=None,
+                    workspace_id=None,
+                    mode=mode.value,
+                    environment_fingerprint="rpc:mode",
+                    environment={"source_transport": ctx.source_transport},
+                )
+                await MemoryEventBridge(self.memory_host.broker).record(
+                    "MODE_CHANGED",
+                    runtime,
+                    {"from_mode": previous_mode, "to_mode": mode.value},
+                )
+            except Exception:
+                logger.warning("mode memory event observation failed", exc_info=True)
         if session_id:
             await self.db.create_session(
                 session_id, mode.value,
@@ -857,8 +902,7 @@ class AgentService:
                 "ok": False,
                 "error": "payload principal_id does not match transport principal",
             }
-        return {
-            "ok": await self.approval_broker.resolve(
+        approved = await self.approval_broker.resolve(
                 request.tool_call_id,
                 request.approved,
                 request.remember,
@@ -866,7 +910,36 @@ class AgentService:
                 session_id=request.session_id,
                 binding_digest=request.binding_digest,
             )
-        }
+        if self.memory_host is not None:
+            try:
+                runtime = RuntimeMemoryContext(
+                    principal_id=ctx.principal_id,
+                    project_id=ctx.project_id,
+                    session_id=request.session_id or ctx.session_id or None,
+                    task_id=getattr(request, "task_id", None),
+                    workspace_id=getattr(request, "workspace_id", None),
+                    mode="coding",
+                    environment_fingerprint="rpc:approval",
+                    environment={
+                        "source_transport": ctx.source_transport,
+                        "runtime_id": ctx.runtime_id,
+                    },
+                )
+                await MemoryEventBridge(self.memory_host.broker).record_and_admit(
+                    "APPROVAL_DECIDED",
+                    runtime,
+                    {
+                        "decision": "approved" if approved and request.approved else "rejected",
+                        "tool_call_id": request.tool_call_id,
+                        "binding_digest": request.binding_digest,
+                        "remember": bool(request.remember),
+                    },
+                    profile=self.memory_host.profile,
+                    source_type="SYSTEM",
+                )
+            except Exception:
+                logger.warning("approval memory event observation failed", exc_info=True)
+        return {"ok": approved}
 
     async def handle_webhook(
         self,
@@ -1034,6 +1107,7 @@ class AgentService:
             approval_broker=self.approval_broker,
             router=self._router,
             office_authority=self._office_authority,
+            memory_host=self.memory_host,
             principal_id=ctx.principal_id,
             principal_kind=ctx.principal_kind,
             parent_principal_id=ctx.parent_principal_id,

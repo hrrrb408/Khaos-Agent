@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
-from collections.abc import Callable
-from typing import Any
+from collections.abc import Awaitable, Callable
+from typing import Any, cast
 
 from khaos.agent.core import SimpleTokenEngine
 from khaos.memory.core import (
@@ -19,6 +20,7 @@ from khaos.memory.core import (
     SourceType,
     TrustHint,
 )
+from khaos.memory.events import MemoryEventBridge
 from khaos.memory.extraction import (
     extract_candidates_from_event,
     extract_memories_from_messages,
@@ -48,11 +50,12 @@ class MemoryManager:
         retriever: MemoryRetriever | None = None,
         extractor: MemoryExtractor | None = None,
         broker: MemoryBroker | None = None,
-        runtime_context_factory: Callable[[str], RuntimeMemoryContext] | None = None,
+        runtime_context_factory: Callable[..., RuntimeMemoryContext] | None = None,
         provider_manager: Any = None,
         profile: Any = None,
         transfer_service: Any = None,
         codegraph: Any = None,
+        owns_provider_manager: bool = True,
     ) -> None:
         self.store = store
         self.budget = budget or MemoryBudget()
@@ -67,7 +70,13 @@ class MemoryManager:
         self.profile = profile
         self.transfer_service = transfer_service
         self.codegraph = codegraph
+        self.owns_provider_manager = owns_provider_manager
+        self.profile_registry: Any = None
+        self.profile_store: Any = None
+        self.observability: Any = None
+        self.memory_host: Any = None
         self.context_assembler = ContextAssembler(self.token_engine)
+        self.event_bridge = MemoryEventBridge(broker) if broker is not None else None
 
     async def inject(self, session_id: str) -> str:
         """Return durable L0/L1/L2 memory text within the total budget.
@@ -153,6 +162,10 @@ class MemoryManager:
         *,
         session_id: str,
         task_id: str | None = None,
+        workspace_id: str | None = None,
+        repo_id: str | None = None,
+        commit_sha: str | None = None,
+        branch: str | None = None,
     ) -> None:
         """Append a live message event without making it model-visible."""
 
@@ -171,17 +184,32 @@ class MemoryManager:
             if role == "tool"
             else SourceType.SYSTEM
         )
-        runtime = self._runtime_context(session_id, task_id=task_id)
-        event = MemoryEvent.create(
-            event_type,
-            principal_id=runtime.principal_id,
-            project_id=runtime.project_id,
-            session_id=session_id,
+        runtime = self._runtime_context(
+            session_id,
             task_id=task_id,
-            workspace_id=runtime.workspace_id,
-            repo_id=runtime.repo_id,
-            branch=runtime.branch,
-            commit_sha=runtime.commit_sha,
+            workspace_id=workspace_id,
+            repo_id=repo_id,
+            commit_sha=commit_sha,
+            branch=branch,
+        )
+        if self.event_bridge is None:
+            raise RuntimeError("MemoryManager has no canonical event bridge")
+        metadata = getattr(message, "metadata", {})
+        message_metadata = dict(metadata) if isinstance(metadata, dict) else {}
+        payload = {
+            "role": role,
+            "content": str(getattr(message, "content", "")),
+            "token_count": int(getattr(message, "token_count", 0) or 0),
+            **message_metadata,
+            "metadata": message_metadata,
+        }
+        tool_calls = getattr(message, "tool_calls", ())
+        if tool_calls:
+            payload["tool_calls"] = list(tool_calls)[:32]
+        event = await self.event_bridge.record(
+            event_type,
+            runtime,
+            payload,
             source_type=source_type,
             trust_hint=(
                 TrustHint.USER_STATED
@@ -190,24 +218,18 @@ class MemoryManager:
                 if role == "tool"
                 else TrustHint.AGENT_INFERRED
             ),
-            payload={
-                "role": role,
-                "content": str(getattr(message, "content", "")),
-                "token_count": int(getattr(message, "token_count", 0) or 0),
-            },
         )
-        await self.broker.record_event(event)
-        for candidate in extract_candidates_from_event(event, profile=self.profile):
-            try:
-                await self.broker.propose_memory(candidate, runtime)
-            except (TypeError, ValueError, RuntimeError):
-                # Extraction is proactive convenience, never a reason to
-                # break message persistence or the agent turn.
-                logger.warning(
-                    "memory candidate admission failed for event %s",
-                    event.event_id,
-                    exc_info=True,
+        if role == "assistant" and tool_calls:
+            for call in list(tool_calls)[:32]:
+                if not isinstance(call, dict):
+                    continue
+                await self.event_bridge.tool_call(
+                    runtime,
+                    tool_call_id=str(call.get("id", call.get("tool_call_id", ""))),
+                    name=str(call.get("name", "")),
+                    arguments=call.get("arguments", {}),
                 )
+        await self._admit_event_candidates(event, runtime)
 
     def _current_scope(self) -> MemoryScope:
         if self.mode_getter is None:
@@ -222,17 +244,43 @@ class MemoryManager:
         session_id: str,
         *,
         task_id: str | None = None,
+        workspace_id: str | None = None,
+        repo_id: str | None = None,
+        commit_sha: str | None = None,
+        branch: str | None = None,
     ) -> RuntimeMemoryContext:
         if self.runtime_context_factory is not None:
-            return self.runtime_context_factory(session_id)
+            factory = self.runtime_context_factory
+            parameters = inspect.signature(factory).parameters
+            supports_kwargs = any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                or name in parameters
+                for name, parameter in parameters.items()
+            )
+            if supports_kwargs:
+                return factory(
+                    session_id,
+                    task_id=task_id,
+                    workspace_id=workspace_id,
+                    repo_id=repo_id,
+                    commit_sha=commit_sha,
+                    branch=branch,
+                )
+            # This branch is deliberately limited to explicitly injected
+            # test adapters.  The production factory always exposes the full
+            # binding and therefore cannot silently drop provenance fields.
+            return factory(session_id)
         return RuntimeMemoryContext(
             principal_id=self.store.principal_id,
             project_id=self.store.project_id,
             session_id=session_id,
             task_id=task_id,
-            workspace_id=None,
+            workspace_id=workspace_id,
             mode=self._current_scope().value,
             environment_fingerprint="runtime:default",
+            repo_id=repo_id,
+            commit_sha=commit_sha,
+            branch=branch,
         )
 
     def runtime_context(self, session_id: str) -> RuntimeMemoryContext:
@@ -250,21 +298,20 @@ class MemoryManager:
         del mode
         runtime = self._runtime_context("")
         persisted: list[Memory] = []
+        broker = self.broker
+        event_bridge = self.event_bridge
+        if broker is None or event_bridge is None:
+            raise RuntimeError("MemoryManager has no canonical memory broker")
         for message in messages:
             if getattr(message, "role", "") != "user":
                 continue
-            event = MemoryEvent.create(
+            event = await event_bridge.record(
                 MemoryEventType.USER_MESSAGE,
-                principal_id=runtime.principal_id,
-                project_id=runtime.project_id,
-                session_id=runtime.session_id,
-                task_id=runtime.task_id,
-                workspace_id=runtime.workspace_id,
+                runtime,
+                {"role": "user", "content": str(getattr(message, "content", ""))},
                 source_type=SourceType.USER,
                 trust_hint=TrustHint.USER_STATED,
-                payload={"role": "user", "content": str(getattr(message, "content", ""))},
             )
-            await self.broker.record_event(event)
             for extracted in self.extractor([message], MemoryScope.GLOBAL):
                 candidate = MemoryCandidate(
                     memory_type="USER_MEMORY",
@@ -276,10 +323,72 @@ class MemoryManager:
                     scope=extracted.scope.value,
                     namespace="private",
                 )
-                decision = await self.broker.propose_memory(candidate, runtime)
+
+                decision = await broker.propose_memory(candidate, runtime)
                 if decision.accepted and decision.memory_id:
                     persisted.append(extracted)
         return persisted
+
+    async def record_runtime_event(
+        self,
+        event_type: MemoryEventType | str,
+        *,
+        session_id: str,
+        payload: dict[str, Any],
+        task_id: str | None = None,
+        workspace_id: str | None = None,
+        repo_id: str | None = None,
+        commit_sha: str | None = None,
+        branch: str | None = None,
+        source_type: SourceType | str = SourceType.SYSTEM,
+        trust_hint: TrustHint | str = TrustHint.AGENT_INFERRED,
+    ) -> MemoryEvent | None:
+        """Publish a bounded domain event through the canonical bridge."""
+
+        if self.event_bridge is None:
+            return None
+        runtime = self._runtime_context(
+            session_id,
+            task_id=task_id,
+            workspace_id=workspace_id,
+            repo_id=repo_id,
+            commit_sha=commit_sha,
+            branch=branch,
+        )
+        event = await self.event_bridge.record(
+            event_type,
+            runtime,
+            payload,
+            source_type=source_type,
+            trust_hint=trust_hint,
+        )
+        await self._admit_event_candidates(event, runtime)
+        return event
+
+    async def _admit_event_candidates(
+        self,
+        event: MemoryEvent,
+        runtime: RuntimeMemoryContext,
+    ) -> None:
+        """Admit only bounded candidates derived from one canonical event."""
+
+        if self.broker is None:
+            return
+        max_mutations = int(getattr(self.profile, "max_mutations_per_event", 16))
+        if max_mutations <= 0:
+            return
+        candidates = extract_candidates_from_event(event, profile=self.profile)
+        for candidate in candidates[:max_mutations]:
+            try:
+                await self.broker.propose_memory(candidate, runtime)
+            except (TypeError, ValueError, RuntimeError):
+                # Extraction is proactive convenience, never a reason to
+                # break message persistence or the agent turn.
+                logger.warning(
+                    "memory candidate admission failed for event %s",
+                    event.event_id,
+                    exc_info=True,
+                )
 
     def _format_section(
         self,
@@ -325,15 +434,15 @@ class MemoryManager:
     async def aclose(self) -> None:
         """Close provider resources when a provider exposes a lifecycle hook."""
 
-        if self.provider_manager is not None:
+        if self.provider_manager is not None and self.owns_provider_manager:
             registry = getattr(self.provider_manager, "registry", None)
             close_registry = getattr(registry, "close", None)
             if callable(close_registry):
-                await close_registry()
+                await cast(Callable[..., Awaitable[Any]], close_registry)()
                 return
         close = getattr(self.broker.provider, "aclose", None) if self.broker else None
         if callable(close):
-            await close()
+            await cast(Callable[..., Awaitable[Any]], close)()
 
 
 __all__ = ["MemoryBudget", "MemoryManager"]

@@ -267,36 +267,48 @@ class CodeGraphService:
     ) -> list[MemoryHit]:
         """Search paths/symbols and optionally expand their graph neighborhood."""
 
-        if limit <= 0:
+        if limit <= 0 or not runtime.repo_id or not runtime.commit_sha:
             return []
         bounded_hops = min(max(max_hops, 0), 4)
         terms = tuple(term.casefold() for term in query.split() if term)
         if not terms:
             return []
         like = f"%{query[:256]}%"
+        snapshot_clauses, snapshot_params = _snapshot_scope(runtime)
         async with self._db.read_connection() as conn:
             rows = await (
                 await conn.execute(
                     "SELECT n.* FROM memory_code_nodes n "
-                    "WHERE n.project_id = ? AND "
+                    "WHERE " + " AND ".join(snapshot_clauses) + " AND "
                     "(lower(n.path) LIKE lower(?) OR lower(n.qualified_name) LIKE lower(?) "
                     "OR lower(n.display_name) LIKE lower(?)) "
                     "ORDER BY CASE n.node_kind WHEN 'symbol' THEN 0 WHEN 'function' THEN 0 "
                     "WHEN 'method' THEN 0 ELSE 1 END, n.path, n.line_start LIMIT ?",
-                    (runtime.project_id, like, like, like, min(limit, 64)),
+                    (*snapshot_params, like, like, like, min(limit, 64)),
                 )
             ).fetchall()
             selected_ids = [str(row["node_id"]) for row in rows]
             if bounded_hops and selected_ids:
-                selected_ids = await self._expand_ids(conn, selected_ids, runtime, bounded_hops, limit)
+                selected_ids = await self._expand_ids(
+                    conn, selected_ids, runtime, bounded_hops, limit
+                )
             if not selected_ids:
                 return []
             placeholders = ",".join("?" for _ in selected_ids)
             node_rows = await (
                 await conn.execute(
                     "SELECT * FROM memory_code_nodes WHERE project_id = ? "
-                    f"AND node_id IN ({placeholders}) ORDER BY path, line_start LIMIT ?",
-                    (runtime.project_id, *selected_ids, limit),
+                    f"AND node_id IN ({placeholders}) "
+                    + ("AND repo_id = ? " if runtime.repo_id else "")
+                    + ("AND commit_sha = ? " if runtime.commit_sha else "")
+                    + "ORDER BY path, line_start LIMIT ?",
+                    (
+                        runtime.project_id,
+                        *selected_ids,
+                        *((runtime.repo_id,) if runtime.repo_id else ()),
+                        *((runtime.commit_sha,) if runtime.commit_sha else ()),
+                        limit,
+                    ),
                 )
             ).fetchall()
         hits: list[MemoryHit] = []
@@ -314,6 +326,7 @@ class CodeGraphService:
                     source_ref=f"{row['path']}:{row['line_start']}",
                     provider_metadata={
                         "canonical_record": False,
+                        "host_owned_observation": True,
                         "codegraph_node_id": str(row["node_id"]),
                         "node_kind": str(row["node_kind"]),
                         "content_hash": str(row["content_hash"]),
@@ -330,6 +343,9 @@ class CodeGraphService:
                     usage_policy=UsagePolicy.PROJECT_ONLY,
                     applicability={"mode": "coding"},
                     environment=runtime.environment,
+                    source_kind="codegraph",
+                    source_rank=0,
+                    retrieval_features={"symbol_score": score},
                 )
             )
         return hits
@@ -351,9 +367,18 @@ class CodeGraphService:
             rows = await (
                 await conn.execute(
                     "SELECT from_node_id, to_node_id FROM memory_code_edges "
-                    "WHERE project_id = ? AND (from_node_id = ? OR to_node_id = ?) "
-                    "LIMIT ?",
-                    (runtime.project_id, node_id, node_id, limit),
+                    "WHERE project_id = ? "
+                    + ("AND repo_id = ? " if runtime.repo_id else "")
+                    + ("AND commit_sha = ? " if runtime.commit_sha else "")
+                    + "AND (from_node_id = ? OR to_node_id = ?) LIMIT ?",
+                    (
+                        runtime.project_id,
+                        *((runtime.repo_id,) if runtime.repo_id else ()),
+                        *((runtime.commit_sha,) if runtime.commit_sha else ()),
+                        node_id,
+                        node_id,
+                        limit,
+                    ),
                 )
             ).fetchall()
             for row in rows:
@@ -370,11 +395,20 @@ class CodeGraphService:
     async def source(self, runtime: RuntimeMemoryContext, node_id: str) -> dict[str, Any] | None:
         """Return one scoped source node for user-facing provenance inspection."""
 
+        if not runtime.repo_id or not runtime.commit_sha:
+            return None
         async with self._db.read_connection() as conn:
             row = await (
                 await conn.execute(
-                    "SELECT * FROM memory_code_nodes WHERE project_id = ? AND node_id = ?",
-                    (runtime.project_id, node_id),
+                    "SELECT * FROM memory_code_nodes WHERE project_id = ? AND node_id = ? "
+                    + ("AND repo_id = ? " if runtime.repo_id else "")
+                    + ("AND commit_sha = ?" if runtime.commit_sha else ""),
+                    (
+                        runtime.project_id,
+                        node_id,
+                        *((runtime.repo_id,) if runtime.repo_id else ()),
+                        *((runtime.commit_sha,) if runtime.commit_sha else ()),
+                    ),
                 )
             ).fetchone()
             return dict(row) if row is not None else None
@@ -382,12 +416,22 @@ class CodeGraphService:
     async def evidence(self, runtime: RuntimeMemoryContext, node_id: str) -> list[dict[str, Any]]:
         """Return bounded graph edges for a scoped node."""
 
+        if not runtime.repo_id or not runtime.commit_sha:
+            return []
         async with self._db.read_connection() as conn:
             rows = await (
                 await conn.execute(
                     "SELECT * FROM memory_code_edges WHERE project_id = ? "
-                    "AND (from_node_id = ? OR to_node_id = ?) ORDER BY relation LIMIT 128",
-                    (runtime.project_id, node_id, node_id),
+                    + ("AND repo_id = ? " if runtime.repo_id else "")
+                    + ("AND commit_sha = ? " if runtime.commit_sha else "")
+                    + "AND (from_node_id = ? OR to_node_id = ?) ORDER BY relation LIMIT 128",
+                    (
+                        runtime.project_id,
+                        *((runtime.repo_id,) if runtime.repo_id else ()),
+                        *((runtime.commit_sha,) if runtime.commit_sha else ()),
+                        node_id,
+                        node_id,
+                    ),
                 )
             ).fetchall()
             return [dict(row) for row in rows]
@@ -444,6 +488,24 @@ def _repo_id(root: Path) -> str:
     return hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:32]
 
 
+def repository_id_for_root(root: Path) -> str:
+    """Return the stable repository identity used by runtime bindings."""
+
+    return _repo_id(root.expanduser().resolve())
+
+
+def _snapshot_scope(runtime: RuntimeMemoryContext) -> tuple[list[str], list[Any]]:
+    clauses = ["n.project_id = ?"]
+    params: list[Any] = [runtime.project_id]
+    if runtime.repo_id:
+        clauses.append("n.repo_id = ?")
+        params.append(runtime.repo_id)
+    if runtime.commit_sha:
+        clauses.append("n.commit_sha = ?")
+        params.append(runtime.commit_sha)
+    return clauses, params
+
+
 def _node_content(row: Any) -> str:
     kind = str(row["node_kind"])
     return (
@@ -458,4 +520,9 @@ def _node_score(row: Any, terms: tuple[str, ...]) -> float:
     return min(1.0, 0.45 + 0.15 * matches + (0.15 if str(row["node_kind"]) != "file" else 0.0))
 
 
-__all__ = ["CodeGraphBuildReport", "CodeGraphNode", "CodeGraphService"]
+__all__ = [
+    "CodeGraphBuildReport",
+    "CodeGraphNode",
+    "CodeGraphService",
+    "repository_id_for_root",
+]

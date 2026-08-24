@@ -13,6 +13,7 @@ from typing import Any
 
 from khaos.coding.workspace.office_authority import OfficeMutationAuthority
 from khaos.db import Database
+from khaos.memory.runtime import MemoryHost
 from khaos.routing import ModelRouter
 from khaos.routing.router import create_default_router
 from khaos.runtime import RequestContext
@@ -38,6 +39,7 @@ async def _build_subagent_service(
     approval_broker: Any = None,
     audit_logger: Any = None,
     cleanup_authority: Any = None,
+    memory_host: MemoryHost | None = None,
 ) -> SubAgentService:
     """Build the SubAgent service bound to the server's shared security stack.
 
@@ -92,6 +94,7 @@ async def _build_subagent_service(
         token_engine=get_token_engine(),
         office_authority=office_authority,
         approval_broker=approval_broker,
+        memory_host=memory_host,
         # C-1-5b: no server-level principal_id — the runner relies on
         # ``task.principal_id`` (set from ``ctx.principal_id`` by
         # ``SubAgentService.handle_spawn``) and ``build_runtime``'s

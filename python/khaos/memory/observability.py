@@ -116,7 +116,7 @@ class MemoryObservability:
 def _percentile(values: list[float], quantile: float) -> float:
     if not values:
         return 0.0
-    index = min(len(values) - 1, max(0, int(round((len(values) - 1) * quantile))))
+    index = min(len(values) - 1, max(0, round((len(values) - 1) * quantile)))
     return values[index]
 
 

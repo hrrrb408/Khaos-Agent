@@ -17,8 +17,8 @@
 
 ## Import reachability result
 
-- Reachable repository modules: `241`.
-- Resolved import edges: `1610`.
+- Reachable repository modules: `245`.
+- Resolved import edges: `1668`.
 - Forbidden production edges: `0`.
 - Unresolved internal edges: `0`.
 
@@ -135,6 +135,7 @@
 - `khaos.memory`
 - `khaos.memory.adapters`
 - `khaos.memory.adapters.aml`
+- `khaos.memory.audit`
 - `khaos.memory.benchmarks`
 - `khaos.memory.benchmarks.harness`
 - `khaos.memory.codegraph`
@@ -147,6 +148,7 @@
 - `khaos.memory.core.contracts`
 - `khaos.memory.core.policy`
 - `khaos.memory.decay`
+- `khaos.memory.events`
 - `khaos.memory.extraction`
 - `khaos.memory.ledger`
 - `khaos.memory.ledger.store`
@@ -157,6 +159,7 @@
 - `khaos.memory.observability`
 - `khaos.memory.ownership`
 - `khaos.memory.profiles`
+- `khaos.memory.projection`
 - `khaos.memory.providers`
 - `khaos.memory.providers.http`
 - `khaos.memory.providers.lifecycle`
@@ -164,6 +167,7 @@
 - `khaos.memory.providers.native`
 - `khaos.memory.repository`
 - `khaos.memory.retrieval`
+- `khaos.memory.runtime`
 - `khaos.memory.store`
 - `khaos.memory.transfer`
 - `khaos.modes`
