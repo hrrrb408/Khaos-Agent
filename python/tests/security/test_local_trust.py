@@ -27,6 +27,8 @@ from khaos.security.local_trust import (
     validate_trusted_local_path,
 )
 
+pytestmark = pytest.mark.posix_host
+
 
 def _root(tmp_path: Path) -> Path:
     root = tmp_path / "home" / ".khaos" / "authorityd"

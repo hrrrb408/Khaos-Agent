@@ -25,22 +25,25 @@ class LocalTrustRootError(PermissionError):
     """The Community authority filesystem trust root is unsafe."""
 
 
+def _require_posix() -> None:
+    if os.name != "posix":
+        raise LocalTrustRootError(
+            "Community Local Trust Root requires POSIX owner metadata and AF_UNIX"
+        )
+
+
 def local_authority_root() -> Path:
     """Return the default owner-only directory for Community authority state."""
 
-    if os.name == "posix":
-        import pwd
+    _require_posix()
+    import pwd
 
-        try:
-            home = Path(pwd.getpwuid(os.getuid()).pw_dir)
-        except (KeyError, OSError) as exc:
-            raise LocalTrustRootError(
-                "the current user's system home directory is unavailable"
-            ) from exc
-    else:
-        # Community is not a Windows transport, but keeping a deterministic
-        # fallback makes this value safe for isolated import-time tests.
-        home = Path.home()
+    try:
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except (KeyError, OSError) as exc:
+        raise LocalTrustRootError(
+            "the current user's system home directory is unavailable"
+        ) from exc
     return home / ".khaos" / "authorityd"
 
 
@@ -84,6 +87,7 @@ def ensure_local_authority_root(root: Path | None = None) -> Path:
     repository choose the authority state directory.
     """
 
+    _require_posix()
     selected = (root or local_authority_root()).expanduser()
     if not selected.is_absolute():
         raise LocalTrustRootError("Community authority root must be absolute")
