@@ -11,12 +11,22 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
+import re
+import zipfile
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from khaos.security.evidence_provenance import gh_api_bytes
+from khaos.security.local_closure import (
+    ClosureEvidence,
+    LocalEvidenceError,
+    VerifiedGitHubProvenance,
+    _VERIFIER_SEAL,
+    issue_verified_github_provenance,
+)
 from khaos.security.security_evidence import (
     MAX_ARTIFACT_BYTES,
     parse_proof_archive,
@@ -27,6 +37,25 @@ REQUIRED_GATES = {
     "product_integrity": "product-integrity-gate.yml",
     "native_authority": "native-authority-production-e2e.yml",
 }
+COMMUNITY_LOCAL_GATES = {
+    "security_closure": "security-closure-gate.yml",
+    "product_integrity": "product-integrity-gate.yml",
+    "community_local": "community-local-closure.yml",
+}
+COMMUNITY_LOCAL_ARTIFACT = "local-security-evidence-{}"
+SECURITY_EVIDENCE_TESTS = frozenset(
+    {
+        "workspace_escape",
+        "approval_replay",
+        "schema_injection",
+        "browser_direct_ip",
+        "browser_dns_rebinding",
+        "helper_confused_deputy",
+        "process_tree_escape",
+        "resource_ownership_closure",
+    }
+)
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 _NATIVE_ARTIFACT_CONTRACTS = {
     "native-authority-macos-proof": {
@@ -119,6 +148,131 @@ def _artifact_records(repo: str, run_id: int) -> list[dict[str, Any]]:
             }
         )
     return sorted(records, key=lambda item: str(item.get("name") or ""))
+
+
+def _reject_duplicate_json_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise RuntimeError(f"security evidence contains duplicate JSON key {key}")
+        value[key] = item
+    return value
+
+
+def _verify_security_artifact(
+    payload: bytes,
+    *,
+    commit: str,
+) -> dict[str, Any]:
+    """Verify the exact Security Closure manifest and commit attestation."""
+    if len(payload) > MAX_ARTIFACT_BYTES:
+        raise RuntimeError("security evidence artifact exceeds the download limit")
+    try:
+        with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+            names = [name for name in archive.namelist() if not name.endswith("/")]
+            expected_names = {"commit-attestation.txt", "security-evidence.json"}
+            if len(names) != len(expected_names) or set(names) != expected_names:
+                raise RuntimeError(
+                    "security evidence artifact must contain only the manifest and commit attestation"
+                )
+            if archive.getinfo("commit-attestation.txt").file_size != len(commit) + 1:
+                raise RuntimeError("security evidence commit attestation size is not exact")
+            with archive.open("commit-attestation.txt", "r") as stream:
+                attestation = stream.read(128)
+            with archive.open("security-evidence.json", "r") as stream:
+                manifest_bytes = stream.read(MAX_ARTIFACT_BYTES + 1)
+        if attestation != f"{commit}\n".encode("ascii"):
+            raise RuntimeError("security evidence commit attestation is not exact")
+        if len(manifest_bytes) > MAX_ARTIFACT_BYTES:
+            raise RuntimeError("security evidence manifest exceeds the download limit")
+        manifest = json.loads(
+            manifest_bytes.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_json_pairs,
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, zipfile.BadZipFile) as exc:
+        raise RuntimeError(f"security evidence artifact is invalid: {exc}") from exc
+    if not isinstance(manifest, dict):
+        raise RuntimeError("security evidence manifest is not an object")
+    required_fields = {
+        "commit",
+        "production_mode",
+        "python_uid",
+        "python_cap_eff",
+        "host_fallback",
+        "browser_helper_authenticated",
+        "policy_digest",
+        "schema_digest",
+        "launcher_digest",
+        "helper_digest",
+        "run_id",
+        "job",
+        "tests",
+    }
+    if set(manifest) != required_fields:
+        raise RuntimeError("security evidence manifest fields are not exact")
+    if (
+        manifest.get("commit") != commit
+        or manifest.get("production_mode") is not True
+        or type(manifest.get("python_uid")) is not int
+        or manifest.get("python_uid") == 0
+        or manifest.get("host_fallback") is not False
+        or manifest.get("browser_helper_authenticated") is not True
+    ):
+        raise RuntimeError("security evidence manifest is not fail-closed")
+    try:
+        if int(str(manifest.get("python_cap_eff")), 16) != 0:
+            raise RuntimeError("security evidence CapEff is not zero")
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("security evidence CapEff is malformed") from exc
+    for field_name in (
+        "policy_digest",
+        "schema_digest",
+        "launcher_digest",
+        "helper_digest",
+    ):
+        value = manifest.get(field_name)
+        if not isinstance(value, str) or not _SHA256_RE.fullmatch(value):
+            raise RuntimeError(f"security evidence {field_name} is not a SHA-256 digest")
+    if not manifest.get("run_id") or not manifest.get("job"):
+        raise RuntimeError("security evidence producer identity is incomplete")
+    tests = manifest.get("tests")
+    if not isinstance(tests, dict) or set(tests) != SECURITY_EVIDENCE_TESTS:
+        raise RuntimeError("security evidence test set is not exact")
+    for name, record in tests.items():
+        if not isinstance(record, dict):
+            raise RuntimeError(f"security evidence test {name} is malformed")
+        if set(record) != {
+            "commit",
+            "run_id",
+            "job",
+            "test",
+            "result",
+            "environment",
+            "digest",
+        }:
+            raise RuntimeError(f"security evidence test {name} fields are not exact")
+        digest = record.get("digest")
+        unsigned = dict(record)
+        unsigned.pop("digest", None)
+        if (
+            record.get("commit") != commit
+            or record.get("test") != name
+            or record.get("result") != "blocked"
+            or not record.get("run_id")
+            or not record.get("job")
+            or not isinstance(record.get("environment"), dict)
+            or record["environment"].get("production_mode") is not True
+            or not isinstance(digest, str)
+            or not _SHA256_RE.fullmatch(digest)
+            or _canonical_digest(unsigned) != digest
+        ):
+            raise RuntimeError(f"security evidence test {name} provenance is invalid")
+    return {
+        "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+        "commit_attestation_verified": True,
+        "policy_digest": manifest["policy_digest"],
+        "tests": sorted(tests),
+    }
 
 
 def _runner_os_from_labels(labels: object) -> str:
@@ -235,6 +389,63 @@ def _verify_native_artifacts(
     return proofs
 
 
+def _verify_local_artifact(
+    repo: str,
+    *,
+    run_id: int,
+    commit: str,
+    artifacts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Verify the producer-owned Community Local JSON artifact in its zip."""
+    expected_name = COMMUNITY_LOCAL_ARTIFACT.format(commit)
+    matching = [artifact for artifact in artifacts if artifact.get("name") == expected_name]
+    if len(matching) != 1:
+        raise RuntimeError(f"local closure run {run_id} is missing exact artifact {expected_name}")
+    artifact = matching[0]
+    if artifact.get("expired") is not False:
+        raise RuntimeError(f"local closure artifact {expected_name} is expired or unverifiable")
+    artifact_id = artifact.get("id")
+    if artifact_id is None or not str(artifact_id):
+        raise RuntimeError(f"local closure artifact {expected_name} has no id")
+    payload = gh_api_bytes(
+        repo,
+        f"actions/artifacts/{artifact_id}/zip",
+        timeout_seconds=60.0,
+        max_output_bytes=MAX_ARTIFACT_BYTES,
+    )
+    if len(payload) > MAX_ARTIFACT_BYTES:
+        raise RuntimeError(f"local closure artifact {expected_name} exceeds the download limit")
+    digest = hashlib.sha256(payload).hexdigest()
+    api_digest = str(artifact.get("digest") or "").removeprefix("sha256:")
+    if not api_digest or api_digest != digest:
+        raise RuntimeError(f"local closure artifact {expected_name} digest does not match GitHub metadata")
+    try:
+        with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+            names = [name for name in archive.namelist() if not name.endswith("/")]
+            if names != ["local-security-evidence.json"]:
+                raise RuntimeError("local closure artifact contains unexpected files")
+            with archive.open(names[0], "r") as stream:
+                raw = stream.read(MAX_ARTIFACT_BYTES + 1)
+        if len(raw) > MAX_ARTIFACT_BYTES:
+            raise RuntimeError("local closure evidence JSON exceeds the download limit")
+        value = json.loads(raw.decode("utf-8"))
+        evidence = ClosureEvidence.from_payload(value)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, zipfile.BadZipFile, LocalEvidenceError) as exc:
+        raise RuntimeError(f"local closure artifact evidence is invalid: {exc}") from exc
+    if evidence.commit != commit or evidence.profile.value != "community-local":
+        raise RuntimeError("local closure artifact profile or commit is not exact")
+    if str(evidence.workflow.get("run_id")) != str(run_id):
+        raise RuntimeError("local closure evidence is not bound to its producer run")
+    return {
+        "artifact_id": artifact_id,
+        "artifact_name": expected_name,
+        "artifact_sha256": digest,
+        "local_evidence_digest": evidence.evidence_digest,
+        "policy_digest": evidence.policy_digest,
+        "proof_names": [proof.name for proof in evidence.proofs],
+    }
+
+
 def _gate_record(repo: str, workflow: str, commit: str) -> dict[str, Any]:
     payload = _run_gh_api(
         repo,
@@ -247,6 +458,7 @@ def _gate_record(repo: str, workflow: str, commit: str) -> dict[str, Any]:
     )
     run_id = int(run.get("database_id") or run["id"])
     artifacts = _artifact_records(repo, run_id)
+    security_proof: dict[str, Any] | None = None
     if workflow == REQUIRED_GATES["security_closure"]:
         expected_name = f"security-evidence-{commit}"
         matching = [
@@ -266,6 +478,27 @@ def _gate_record(repo: str, workflow: str, commit: str) -> dict[str, Any]:
             raise RuntimeError(
                 f"security evidence artifact {expected_name} has no digest"
             )
+        payload = gh_api_bytes(
+            repo,
+            f"actions/artifacts/{artifact['id']}/zip",
+            timeout_seconds=60.0,
+            max_output_bytes=MAX_ARTIFACT_BYTES,
+        )
+        artifact_digest = hashlib.sha256(payload).hexdigest()
+        advertised_digest = str(artifact["digest"]).removeprefix("sha256:")
+        if artifact_digest != advertised_digest:
+            raise RuntimeError(
+                f"security evidence artifact {expected_name} digest does not match GitHub metadata"
+            )
+        security_proof = _verify_security_artifact(payload, commit=commit)
+    local_proof: dict[str, Any] | None = None
+    if workflow == COMMUNITY_LOCAL_GATES["community_local"]:
+        local_proof = _verify_local_artifact(
+            repo,
+            run_id=run_id,
+            commit=commit,
+            artifacts=artifacts,
+        )
     if workflow == REQUIRED_GATES["native_authority"]:
         expected_names = set(_REQUIRED_NATIVE_ARTIFACTS)
         for expected_name in sorted(expected_names):
@@ -329,9 +562,15 @@ def _gate_record(repo: str, workflow: str, commit: str) -> dict[str, Any]:
         "created_at": run.get("created_at"),
         "updated_at": run.get("updated_at"),
         "artifacts": artifacts,
+        "security_proof": security_proof or {},
         "native_proofs": native_proofs,
     }
     record["run_evidence_digest"] = _canonical_digest(record)
+    record["evidence_digest"] = record["run_evidence_digest"]
+    if local_proof is not None:
+        record["local_proof"] = local_proof
+        record["run_evidence_digest"] = _canonical_digest(record)
+        record["evidence_digest"] = record["run_evidence_digest"]
     return record
 
 
@@ -360,24 +599,109 @@ def _verify_main_ancestry(repo: str, commit: str) -> dict[str, Any]:
     }
 
 
-def verify_release_gates(repo: str, commit: str) -> dict[str, Any]:
-    """Return commit-bound evidence for every required aggregate gate."""
+def verify_release_gates(
+    repo: str,
+    commit: str,
+    *,
+    profile: str = "legacy-native",
+) -> dict[str, Any]:
+    """Return profile-aware evidence for every required aggregate gate."""
     main_ancestry = _verify_main_ancestry(repo, commit)
+    if profile == "community-local":
+        required_gates = COMMUNITY_LOCAL_GATES
+    elif profile in {"legacy-native", "macos-signed-distribution", "windows-native"}:
+        required_gates = REQUIRED_GATES
+    else:
+        raise ValueError(f"unknown release evidence profile: {profile}")
     gates = {
         name: _gate_record(repo, workflow, commit)
-        for name, workflow in REQUIRED_GATES.items()
+        for name, workflow in required_gates.items()
     }
+    if profile == "community-local":
+        security_proof = gates["security_closure"].get("security_proof")
+        local_proof = gates["community_local"].get("local_proof")
+        if not isinstance(security_proof, dict) or not security_proof.get(
+            "commit_attestation_verified"
+        ):
+            raise RuntimeError("security gate commit attestation was not verified")
+        if not isinstance(local_proof, dict) or security_proof.get(
+            "policy_digest"
+        ) != local_proof.get("policy_digest"):
+            raise RuntimeError(
+                "security and Community Local evidence use different policy digests"
+            )
     evidence = {
         "schema": "khaos.release-gate-evidence.v1",
+        "profile": profile,
         "commit": commit,
         "verified_at": datetime.now(UTC).isoformat(timespec="seconds").replace(
             "+00:00", "Z"
         ),
         "main_ancestry": main_ancestry,
         "gates": gates,
+        "github_provenance": {
+            "status": "VERIFIED",
+            "repository": repo,
+            "commit": commit,
+            "event": "push",
+            "branch": "main",
+            "run_attempt": 1,
+            "workflows": {
+                name: record["run_id"] for name, record in sorted(gates.items())
+            },
+        },
     }
     evidence["evidence_digest"] = _canonical_digest(evidence)
     return evidence
+
+
+def verify_release_gates_for_closure(
+    repo: str,
+    commit: str,
+    *,
+    profile: str = "community-local",
+) -> VerifiedGitHubProvenance:
+    """Verify GitHub live and issue the non-serializable closure capability.
+
+    The JSON returned by :func:`verify_release_gates` remains useful as an
+    audit record, but it is deliberately not accepted by the closure
+    evaluator.  Only this live API verification path can issue the typed
+    capability consumed by that evaluator.
+    """
+    evidence = verify_release_gates(repo, commit, profile=profile)
+    gates = evidence.get("gates")
+    provenance = evidence.get("github_provenance")
+    if not isinstance(gates, dict) or not isinstance(provenance, dict):
+        raise RuntimeError("release verification did not produce typed provenance inputs")
+    gate_digests: dict[str, str] = {}
+    for name, record in gates.items():
+        if not isinstance(name, str) or not isinstance(record, dict):
+            raise RuntimeError("release verification gate record is malformed")
+        digest = record.get("evidence_digest")
+        if not isinstance(digest, str):
+            raise RuntimeError(f"release verification gate {name} has no evidence digest")
+        gate_digests[name] = digest
+    local_record = gates.get("community_local")
+    if not isinstance(local_record, dict) or not isinstance(
+        local_record.get("local_proof"), dict
+    ):
+        raise RuntimeError("release verification has no Community Local evidence binding")
+    local_evidence_digest = local_record["local_proof"].get("local_evidence_digest")
+    if not isinstance(local_evidence_digest, str):
+        raise RuntimeError("release verification has no local evidence digest")
+    return issue_verified_github_provenance(
+        live_verifier_receipt=_VERIFIER_SEAL,
+        profile=profile,
+        repository=str(provenance.get("repository") or ""),
+        commit=str(provenance.get("commit") or ""),
+        event=str(provenance.get("event") or ""),
+        branch=str(provenance.get("branch") or ""),
+        run_attempt=provenance.get("run_attempt"),
+        main_ancestry=evidence["main_ancestry"],
+        gate_evidence_digests=gate_digests,
+        release_evidence_digest=str(evidence.get("evidence_digest") or ""),
+        local_evidence_digest=local_evidence_digest,
+    )
 
 
 def _parse_args() -> argparse.Namespace:
@@ -385,12 +709,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--repo", required=True)
     parser.add_argument("--commit", required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--profile", default="legacy-native")
     return parser.parse_args()
 
 
 def main() -> int:
     args = _parse_args()
-    evidence = verify_release_gates(args.repo, args.commit)
+    evidence = verify_release_gates(args.repo, args.commit, profile=args.profile)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(
         json.dumps(evidence, indent=2, sort_keys=True) + "\n", encoding="utf-8"

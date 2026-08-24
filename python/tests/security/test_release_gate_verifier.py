@@ -10,6 +10,7 @@ import zipfile
 from pathlib import Path
 
 import pytest
+from khaos.security.local_closure import COMMUNITY_LOCAL_REQUIRED_PROOFS, canonical_digest
 
 ROOT = Path(__file__).resolve().parents[3]
 SPEC = importlib.util.spec_from_file_location(
@@ -38,13 +39,58 @@ def _run(*, run_id: int, attempt: int) -> dict[str, object]:
     }
 
 
-def _security_artifact(*, expired: bool = False, digest: str = "sha256:ok") -> dict[str, object]:
+def _security_archive(*, attestation_commit: str = COMMIT) -> bytes:
+    tests: dict[str, object] = {}
+    for name in MODULE.SECURITY_EVIDENCE_TESTS:
+        record: dict[str, object] = {
+            "commit": COMMIT,
+            "run_id": "1",
+            "job": "core-security",
+            "test": name,
+            "result": "blocked",
+            "environment": {"runner_os": "Linux", "production_mode": True},
+        }
+        record["digest"] = canonical_digest(record)
+        tests[name] = record
+    manifest = {
+        "commit": COMMIT,
+        "production_mode": True,
+        "python_uid": 10001,
+        "python_cap_eff": "0",
+        "host_fallback": False,
+        "browser_helper_authenticated": True,
+        "policy_digest": "b" * 64,
+        "schema_digest": "c" * 64,
+        "launcher_digest": "d" * 64,
+        "helper_digest": "e" * 64,
+        "run_id": "1",
+        "job": "core-security",
+        "tests": tests,
+    }
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, value in (
+            ("commit-attestation.txt", f"{attestation_commit}\n".encode()),
+            ("security-evidence.json", json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()),
+        ):
+            info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_DEFLATED
+            archive.writestr(info, value)
+    return output.getvalue()
+
+
+def _security_artifact(*, expired: bool = False, digest: str | None = None) -> dict[str, object]:
+    archive = _security_archive()
     return {
         "id": 7,
         "name": f"security-evidence-{COMMIT}",
-        "size_in_bytes": 42,
+        "size_in_bytes": len(archive),
         "expired": expired,
-        "digest": digest,
+        "digest": (
+            f"sha256:{hashlib.sha256(archive).hexdigest()}"
+            if digest is None
+            else digest
+        ),
     }
 
 
@@ -137,6 +183,65 @@ def _native_payloads() -> dict[str, bytes]:
     }
 
 
+def _local_evidence_payload(run_id: int = 1) -> dict[str, object]:
+    policy = "b" * 64
+    workflow = {
+        "repository": "hrrrb408/Khaos-Agent",
+        "workflow": "Community Local Security Closure",
+        "run_id": str(run_id),
+        "run_attempt": 1,
+        "event": "push",
+        "ref": "refs/heads/main",
+        "head_sha": COMMIT,
+        "runner_os": "Ubuntu",
+    }
+    proofs = [
+        {
+            "name": name,
+            "status": "PASS",
+            "profile": "community-local",
+            "commit": COMMIT,
+            "policy_digest": policy,
+            "artifact_digest": canonical_digest({"proof": name}),
+            "provenance": dict(workflow, job=name),
+        }
+        for name in COMMUNITY_LOCAL_REQUIRED_PROOFS
+    ]
+    payload: dict[str, object] = {
+        "schema": "khaos.local-security-evidence.v1",
+        "profile": "community-local",
+        "commit": COMMIT,
+        "policy_digest": policy,
+        "security_facts_digest": "c" * 64,
+        "production_reachability_digest": "d" * 64,
+        "production_composition_digest": "e" * 64,
+        "workflow": workflow,
+        "proofs": proofs,
+        "profile_status": {
+            "apple_developer_program": "NOT_APPLICABLE",
+            "apple_team_id": "NOT_APPLICABLE",
+            "signed_xpc": "NOT_APPLICABLE",
+            "notarization": "NOT_APPLICABLE",
+            "macos_signed_distribution": "OPTIONAL_PROFILE_NOT_ENABLED",
+            "hostile_same_uid_isolation": "NOT_CLAIMED",
+            "independent_review": "NOT_CLAIMED",
+        },
+        "residual_risks": ["same UID is not claimed"],
+    }
+    payload["evidence_digest"] = canonical_digest(payload)
+    return payload
+
+
+def _local_archive(payload: dict[str, object]) -> bytes:
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "local-security-evidence.json",
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(),
+        )
+    return output.getvalue()
+
+
 def test_release_selector_never_replaces_attempt_one_with_rerun():
     selected = MODULE._select_successful_run(
         [_run(run_id=1, attempt=1), _run(run_id=2, attempt=2)],
@@ -207,12 +312,22 @@ def test_security_gate_records_exact_artifact_and_attempt(monkeypatch: pytest.Mo
         return {"artifacts": [_security_artifact(), *_native_artifacts()]}
 
     monkeypatch.setattr(MODULE, "_run_gh_api", fake_api)
+    monkeypatch.setattr(MODULE, "gh_api_bytes", lambda *_args, **_kwargs: _security_archive())
     record = MODULE._gate_record("owner/repo", "security-closure-gate.yml", COMMIT)
     assert record["run_attempt"] == 1
+    assert record["security_proof"]["commit_attestation_verified"] is True
     assert any(
         artifact["name"] == f"security-evidence-{COMMIT}"
         for artifact in record["artifacts"]
     )
+
+
+def test_security_gate_rejects_tampered_commit_attestation() -> None:
+    with pytest.raises(RuntimeError, match="commit attestation"):
+        MODULE._verify_security_artifact(
+            _security_archive(attestation_commit="f" * 40),
+            commit=COMMIT,
+        )
 
 
 def test_release_evidence_requires_main_ancestry(monkeypatch: pytest.MonkeyPatch):
@@ -233,7 +348,11 @@ def test_release_evidence_requires_main_ancestry(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setattr(
         MODULE,
         "gh_api_bytes",
-        lambda *args, **kwargs: b"native-artifact",
+        lambda _repo, endpoint, **_kwargs: {
+            "7": _security_archive(),
+            "8": _native_payloads()["8"],
+            "9": _native_payloads()["9"],
+        }[endpoint.split("/")[2]],
     )
     evidence = MODULE.verify_release_gates("owner/repo", COMMIT)
     assert evidence["main_ancestry"]["behind_by"] == 0
@@ -338,3 +457,35 @@ def test_native_release_gate_allows_missing_optional_macos_proof(
         artifacts=artifacts,
     )
     assert proofs[0]["runner_os"] == "Windows"
+
+
+def test_community_local_artifact_requires_exact_digest_and_producer_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _local_evidence_payload()
+    archive = _local_archive(payload)
+    artifact = {
+        "id": 22,
+        "name": f"local-security-evidence-{COMMIT}",
+        "size_in_bytes": len(archive),
+        "expired": False,
+        "digest": f"sha256:{hashlib.sha256(archive).hexdigest()}",
+    }
+    monkeypatch.setattr(MODULE, "gh_api_bytes", lambda *_args, **_kwargs: archive)
+
+    proof = MODULE._verify_local_artifact(
+        "hrrrb408/Khaos-Agent",
+        run_id=1,
+        commit=COMMIT,
+        artifacts=[artifact],
+    )
+    assert proof["local_evidence_digest"] == payload["evidence_digest"]
+
+    artifact["digest"] = "sha256:" + "0" * 64
+    with pytest.raises(RuntimeError, match="digest does not match"):
+        MODULE._verify_local_artifact(
+            "hrrrb408/Khaos-Agent",
+            run_id=1,
+            commit=COMMIT,
+            artifacts=[artifact],
+        )

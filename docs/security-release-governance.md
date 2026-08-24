@@ -36,25 +36,37 @@ release-ready merely because the maintainer can approve it.
 
 ## Deployment profile evidence
 
+The machine-facing Community Local decision is `CLOSED` or `NOT_CLOSED` and is
+generated only by `python/khaos/security/local_closure.py` from producer-owned
+exact-SHA evidence plus a non-serializable capability issued by the live
+GitHub release verifier. A saved JSON release record is audit evidence only;
+it is not accepted by the evaluator as that capability. It is separate from
+the older generic M6 closure report;
+the generic report must not import native-profile requirements into Community
+Local or turn a local test result into release closure.
+
 Memory V2 production closure is profile-scoped. The Community Local Profile is
-allowed to reach `PASS` without Apple membership, Team ID, signing
+allowed to reach `CLOSED` without Apple membership, Team ID, signing
 certificate, notarization, or signed launchd/XPC. Its required evidence still
 includes the independent authorityd process, owner-only local trust root,
 private peer-authenticated socket, Ed25519 receipt verification, effective
 policy and typed catalog binding, approval, verification, and audit.
 
 The macOS Signed Distribution Profile is optional and explicit. When it is not
-enabled, record `OPTIONAL_PROFILE_NOT_ENABLED` / `NOT CERTIFIED`; do not turn
+enabled, record `OPTIONAL_PROFILE_NOT_ENABLED`; do not turn
 that state into a Memory or Community failure. When
 `KHAOS_NATIVE_MACOS_E2E=true` enables the profile, missing Team ID, certificate,
 protected key, launchd/XPC proof, notarization, or artifact provenance is a
 fail-closed failure. The workflow publishes both profile results in
 `deployment-profile-results.json`.
 
-The finite status vocabulary is `PASS`, `FAIL`, `BLOCKED_EXTERNAL`,
-`NOT_APPLICABLE`, `NOT_RUN`, and `OPTIONAL_PROFILE_NOT_ENABLED`. Generic M6
-closure has its own stricter evidence contract and must not be silently
-upgraded by a Community result.
+The finite transport status vocabulary is `PASS`, `FAIL`, `BLOCKED_EXTERNAL`,
+`NOT_APPLICABLE`, `NOT_RUN`, and `OPTIONAL_PROFILE_NOT_ENABLED`. The local
+closure vocabulary additionally uses `CLOSED`, `NOT_CLOSED`, `REJECTED`, and
+`NOT_CLAIMED`. Hostile same-UID isolation and second-maintainer independent
+review are explicitly `NOT_CLAIMED`; neither blocks Community Local closure.
+Generic M6 closure has its own stricter evidence contract and must not be
+silently upgraded by a Community result.
 
 ## Evidence boundary
 

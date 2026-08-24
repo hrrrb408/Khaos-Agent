@@ -61,6 +61,16 @@ platform_boundaries:
     - not_applicable
     - not_run
     - optional_profile_not_enabled
+  local_closure_status_vocabulary:
+    - CLOSED
+    - NOT_CLOSED
+    - BLOCKED_EXTERNAL
+    - NOT_APPLICABLE
+    - NOT_RUN
+    - OPTIONAL_PROFILE_NOT_ENABLED
+    - REJECTED
+    - UNKNOWN
+    - NOT_CLAIMED
   windows_authority_transport: native_named_pipe_service_sid_adapter_required
   macos_native_client: packaging/macos/khaos-authorityd-xpc-client.c
   macos_native_service: packaging/macos/khaos-authorityd-xpc.m
@@ -102,6 +112,15 @@ production_reachability:
   forbidden_modules:
     - khaos.coding.execution.host
     - khaos.coding.verification.pipeline
+    - khaos.runtime.testing
+    - khaos.security.mock_authority
+    - khaos.coding.execution.testing_sandbox
+  forbidden_components:
+    - HostExecutionBackend
+    - HostBackend
+    - mock authority
+    - testing sandbox
+    - injectable development security composition
   unresolved_internal_imports: fail_closed
   generated_artifact: docs/generated/production-reachability.md
   evidence_class: machine_checked_repository_graph_not_native_kernel_evidence
@@ -117,6 +136,7 @@ tcb_boundaries:
   closed_postcondition: terminal_proof_and_empty_owner_registry
   property_tests: python/tests/security/test_protocol_boundary.py
 closure_report:
+  scope: generic_m6_only
   generator: scripts/build_m6_closure_report.py
   checked_in_template: docs/m6-security-closure-report.md
   memory_v2_report: docs/memory-v2-production-closure-report.md
@@ -131,6 +151,56 @@ closure_report:
     - independent_resource_oracle
   missing_evidence_state: unknown_or_quarantined
   signed_profile_missing_state: optional_profile_not_enabled_not_certified
+local_security_closure:
+  scope: community_local_profile_only
+  evaluator: python/khaos/security/local_closure.py
+  report_generator: scripts/build_local_security_closure_report.py
+  checked_in_contract: docs/local-security-profile.md
+  evidence_schema: khaos.local-security-evidence.v1
+  release_evidence_schema: khaos.release-gate-evidence.v1
+  mandatory_proofs:
+    - community_authority
+    - platform_kernel
+    - production_reachability
+    - production_composition
+    - workspace_escape
+    - approval_replay
+    - approval_substitution
+    - process_tree_escape
+    - resource_owner_closure
+    - network_isolation
+  mandatory_gates:
+    - security_closure
+    - product_integrity
+  mandatory_binding:
+    - exact_commit_sha
+    - effective_policy_digest
+    - security_facts_digest
+    - production_reachability_digest
+    - production_composition_digest
+    - producer_artifact_digest
+    - security_evidence_manifest_verified
+    - commit_attestation_verified
+    - github_repository
+    - github_push_event
+    - protected_main_branch
+    - original_run_attempt
+    - protected_main_ancestry
+  community_local_prerequisites:
+    apple_developer_program: not_required
+    apple_team_id: not_required
+    signed_xpc: not_required
+    notarization: not_required
+  optional_profiles:
+    macos_signed_distribution: OPTIONAL_PROFILE_NOT_ENABLED
+    windows_native: native_or_fail_closed
+  explicit_non_claims:
+    hostile_same_uid_isolation: NOT_CLAIMED
+    second_maintainer_independent_review: NOT_CLAIMED
+  local_artifact_status_without_exact_ci: CLOSURE_PENDING_EXACT_SHA_CI_EVIDENCE
+  handwritten_status_or_boolean: rejected
+  local_json_or_mock_artifact_can_close: false
+  closure_capability: live_github_verifier_issues_non_serializable_typed_provenance
 upstream_security_watch:
   generator: scripts/watch_upstream_codex_security.py
   fixed_sha: 711a5f8b3a6eb40134146ae9ec22fdcdda5e3170

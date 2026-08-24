@@ -31,11 +31,14 @@ the security boundary holds; Product Integrity proves the product as a whole is
 not regressed. The detailed checks below are diagnostic dependencies of the
 aggregates — they remain visible but are no longer direct merge authorities.
 
-Release provenance has one additional exact-commit gate: the `Native Authority
-Production E2E` workflow must have a completed successful `push` run for the
-same protected `main` commit, with both macOS and Windows proof artifacts live
-and digest-bound. A green Linux aggregate cannot substitute for those
-platform-native proofs.
+Release provenance has one additional Community Local exact-commit gate: the
+`Community Local Security Closure` workflow must have a completed successful
+`push` run for the same protected `main` commit with the
+`local-security-evidence-${commit}` artifact live and digest-bound. A green
+aggregate without that producer artifact cannot close Community Local.
+`Native Authority Production E2E` remains a separate platform workflow;
+macOS Signed Distribution is optional and reports
+`OPTIONAL_PROFILE_NOT_ENABLED` when it is not enabled.
 
 The aggregate job also downloads per-test evidence emitted only after the
 owning job succeeds. Every fragment binds `commit`, Actions `run_id`, `job`,
