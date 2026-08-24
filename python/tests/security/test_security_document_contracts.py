@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
+import subprocess
+import sys
 
 import yaml
 
@@ -66,3 +69,27 @@ def test_closure_report_generator_has_no_manual_status_switch() -> None:
     assert "VerifiedGitHubProvenance" in source
     assert "--release-evidence" not in source
     assert "github_provenance_verified" not in source
+
+
+def test_closure_report_rejects_wrong_head_without_error_path_crash() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts/build_local_security_closure_report.py"),
+            "--repo-root",
+            str(ROOT),
+            "--profile",
+            "community-local",
+            "--commit",
+            "0" * 40,
+        ],
+        env={**os.environ, "PYTHONPATH": str(ROOT / "python")},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "Status: NOT_CLOSED" in result.stdout
+    assert "TypeError" not in result.stdout
+    assert "Traceback" not in result.stdout

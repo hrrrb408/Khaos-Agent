@@ -79,7 +79,6 @@ def _decision_without_evidence(
         missing_requirements=(reason,),
         rejected_evidence=(),
         residual_risks=(),
-        provenance_verified=False,
     )
 
 
