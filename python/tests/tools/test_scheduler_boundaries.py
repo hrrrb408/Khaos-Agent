@@ -1,6 +1,7 @@
 """Contract tests for the scheduler's extracted value and budget boundaries."""
 
 import pytest
+from khaos.security.orchestration_phases import OrchestrationPhaseError
 from khaos.security.orchestration_phases import ToolPhase
 from khaos.tools.admission import AdmittedToolCall, RejectedToolCall, ToolAdmission
 from khaos.tools.budget import (
@@ -84,6 +85,36 @@ def test_tool_admission_owns_normalization_and_validation() -> None:
     )
     assert isinstance(rejected, RejectedToolCall)
     assert rejected.error == "Invalid tool arguments"
+
+
+def test_admitted_arguments_are_immutable_and_scheduler_drift_is_rejected() -> None:
+    registry = ToolRegistry()
+    registry.register(
+        ToolDefinition(
+            name="read",
+            description="read",
+            parameters={
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "required": ["value"],
+            },
+            modes=["all"],
+            permission_level="read",
+            parallel=True,
+        )
+    )
+    admitted = ToolAdmission(registry).admit(
+        {"id": "call-immutable", "name": "read", "arguments": {"value": "ok"}}
+    )
+    assert isinstance(admitted, AdmittedToolCall)
+
+    with pytest.raises(TypeError):
+        admitted.call["arguments"]["value"] = "changed"  # type: ignore[index]
+
+    state = admitted.scheduler_state()
+    state["arguments"]["value"] = "changed"
+    with pytest.raises(OrchestrationPhaseError, match="arguments changed"):
+        admitted.assert_unchanged(state)
 
 
 @pytest.mark.asyncio
