@@ -55,3 +55,53 @@ Subsequent entries must identify the exact commit, test command, result count,
 and whether a failure is a regression, an existing defect, or infrastructure
 limitation. A closure status may only be emitted by the evidence-bound verifier
 after exact-commit and GitHub provenance checks succeed.
+
+## Implementation and validation evidence
+
+The implementation was kept in three atomic commits after the baseline
+freeze:
+
+- `109ef26` — profile-aware Community Local evidence schema, live GitHub
+  provenance capability, exact Security Evidence/attestation verification,
+  producer workflow, closure report consumer, and documentation/type-check
+  contract.
+- `87953c9` — production runtime composition rejection for HostBackend,
+  testing sandbox, mock authority, and testing runtime objects, with static
+  reachability and runtime negative tests.
+- `2ffcf1f` — immutable admitted tool-call snapshots carried through
+  scheduler authority preparation and execution, with argument-drift and raw
+  production-call regressions.
+
+Validation after the implementation commits:
+
+- `PYTHONPATH=python uv run --extra test pytest -q -rs`: `4782 passed, 29
+  skipped, 1 warning`; no failures. The skips are existing real Linux
+  kernel/bwrap, Windows, Docker nightly, stale Rust extension, and unavailable
+  authorityd conditions; no security test was removed or converted to a
+  skip/xfail.
+- Focused host-authority/adversarial matrix: `242 passed, 1 skipped`; the one
+  skip is `no deployed authorityd: production runtime cannot be built`.
+- Strict security Pyright project: `0 errors, 0 warnings, 0 informations`.
+- `go test ./...`: pass; `go test -race ./...`: pass.
+- `cargo test --locked`: pass; `cargo clippy --locked --all-targets -- -D
+  warnings`: pass.
+- Security inventory, production reachability, governance, and `git diff
+  --check`: pass; production reachability reports zero forbidden and zero
+  unresolved edges.
+
+The managed sandbox initially produced an EPERM while creating a real POSIX
+authorityd UDS. The same test boundary was rerun with approved host access;
+the remaining authorityd skip is a separate unavailable-deployment condition.
+It was not treated as a code pass.
+
+## Current closure state
+
+The local evaluator and report are intentionally `NOT_CLOSED` because this
+branch has no producer-owned exact successful `push` runs on protected
+`main`, no verified GitHub artifact provenance, and no exact release-gate
+capability. The machine blocker is
+`CLOSURE_PENDING_EXACT_SHA_CI_EVIDENCE`. Community Local explicitly reports
+Apple Developer Program, Apple Team ID, Signed XPC, and notarization as
+`NOT_APPLICABLE`; macOS Signed Distribution is
+`OPTIONAL_PROFILE_NOT_ENABLED`; hostile same-UID isolation and independent
+second-maintainer review are `NOT_CLAIMED` and non-blocking.
