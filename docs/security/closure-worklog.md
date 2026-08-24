@@ -71,6 +71,8 @@ freeze:
 - `2ffcf1f` — immutable admitted tool-call snapshots carried through
   scheduler authority preparation and execution, with argument-drift and raw
   production-call regressions.
+- `b1a4fd2` — append-only validation record for the implementation commits.
+- `917d6f2` — fail-closed exact-HEAD report error-path fix and regression.
 
 Validation after the implementation commits:
 
@@ -81,6 +83,9 @@ Validation after the implementation commits:
   skip/xfail.
 - Focused host-authority/adversarial matrix: `242 passed, 1 skipped`; the one
   skip is `no deployed authorityd: production runtime cannot be built`.
+- Final-HEAD focused matrix after the report/error-path and provenance-digest
+  fixes: `244 passed, 1 skipped`; the same authorityd deployment limitation
+  remains the only skip.
 - Strict security Pyright project: `0 errors, 0 warnings, 0 informations`.
 - `go test ./...`: pass; `go test -race ./...`: pass.
 - `cargo test --locked`: pass; `cargo clippy --locked --all-targets -- -D
