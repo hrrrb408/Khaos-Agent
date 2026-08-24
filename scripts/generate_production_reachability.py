@@ -32,10 +32,16 @@ PRODUCTION_ROOTS = (
 FORBIDDEN_MODULES = (
     "khaos.coding.execution.host",
     "khaos.coding.verification.pipeline",
+    "khaos.runtime.testing",
+    "khaos.security.mock_authority",
+    "khaos.coding.execution.testing_sandbox",
 )
 FORBIDDEN_SYMBOLS = {
     ("khaos.coding.execution.host", "HostExecutionBackend"),
+    ("khaos.coding.execution.host", "HostBackend"),
     ("khaos.coding.verification.pipeline", "HostExecutionBackend"),
+    ("khaos.security.mock_authority", "MockAuthority"),
+    ("khaos.coding.execution.testing_sandbox", "TestingSandbox"),
 }
 
 

@@ -925,6 +925,47 @@ def _enforce_no_security_injection(cfg: RuntimeConfig) -> None:
             )
 
 
+def _enforce_no_testing_composition(cfg: RuntimeConfig) -> None:
+    """Reject test/mock/dev component instances at the production boundary.
+
+    Structural production configuration intentionally borrows a small set of
+    server-owned lifecycle objects.  A borrowed slot is not permission to
+    install a mock authority or testing sandbox.  Inspect only direct config
+    values here; the runtime composition manifest performs the bounded object
+    graph check after construction.
+    """
+    borrowed_fields = {
+        "audit_logger",
+        "approval_broker",
+        "office_authority",
+        "credential_broker",
+        "cleanup_authority",
+        "memory_host",
+        "task_manager",
+        "mode_manager",
+        "router",
+        "confirm_callback",
+    }
+    for field_info in dataclass_fields(ProductionRuntimeConfig):
+        if field_info.name not in borrowed_fields:
+            continue
+        value = getattr(cfg, field_info.name, None)
+        if value is None:
+            continue
+        type_name = f"{type(value).__module__}.{type(value).__qualname__}".lower()
+        if (
+            type_name.startswith("unittest.mock.")
+            or ".tests." in type_name
+            or "testing_sandbox" in type_name
+            or "mockauthority" in type_name
+            or "devadapter" in type_name.replace("_", "")
+        ):
+            raise PermissionError(
+                f"production component {field_info.name} uses forbidden testing/mock "
+                f"composition: {type(value).__module__}.{type(value).__qualname__}"
+            )
+
+
 def _enforce_borrowed_authority_match(
     cfg: RuntimeConfig, seal: RuntimeAuthoritySeal
 ) -> None:
@@ -1162,6 +1203,7 @@ async def build_runtime(
     # it.  The borrowed AuditLogger digest match runs later, after the
     # effective policy is loaded.
     if is_production_mode():
+        _enforce_no_testing_composition(cfg)
         _enforce_no_security_injection(cfg)
     root = cfg.project_root.expanduser().resolve()
     mode_manager = cfg.mode_manager or ModeManager(
