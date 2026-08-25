@@ -229,7 +229,17 @@ def test_read_only_platform_profiles_do_not_mount_workspace_writable(tmp_path: P
     assert linux_argv[worktree_index - 1] == "--ro-bind"
 
 
-def test_linux_profile_isolates_proc_ipc_uts_and_parent_lifetime(tmp_path: Path):
+def test_linux_profile_isolates_proc_ipc_uts_and_parent_lifetime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.delenv("KHAOS_DEV_MODE", raising=False)
+    monkeypatch.setattr(
+        "khaos.coding.execution.platform._resolve_bwrap_path",
+        lambda: "/usr/bin/bwrap",
+    )
+    monkeypatch.setenv("KHAOS_AGENT_UID", str(os.geteuid()))
+    monkeypatch.setenv("KHAOS_AUTHORITYD_UID", "65533")
+    monkeypatch.setenv("KHAOS_JOB_UID", "65534")
     argv = LinuxBubblewrapBackend().argv_prefix(tmp_path)
 
     assert ("--proc", "/proc") == argv[
@@ -257,6 +267,16 @@ def test_linux_profile_isolates_proc_ipc_uts_and_parent_lifetime(tmp_path: Path)
         argv[index:index + 3] for index in range(len(argv) - 2)
     )
     assert "--clearenv" in argv
+
+
+def test_linux_dev_profile_keeps_bwrap_reaper(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Development bwrap must not claim the production PID-1 composition."""
+    monkeypatch.setenv("KHAOS_DEV_MODE", "1")
+
+    argv = LinuxBubblewrapBackend().argv_prefix(tmp_path)
+
+    assert "--unshare-pid" in argv
+    assert "--as-pid-1" not in argv
 
 
 def test_linux_profile_requires_landlock_allowlists_after_mount_setup(tmp_path: Path):

@@ -1797,18 +1797,30 @@ class LinuxBubblewrapBackend:
             if network_mode == "shared" or network_namespace
             else "--unshare-net"
         )
-        prefix.extend((
+        namespace_options = [
             network_option,
             *linux_job_namespace_args(),
-            # Keep the reviewed native launcher as PID 1 inside the private
-            # namespace.  Without --as-pid-1, bubblewrap itself becomes the
-            # namespace init and the launcher cannot own/reap payload
-            # descendants; a killed bwrap then leaves a host-visible init
-            # zombie even when the cgroup is empty.
-            "--unshare-pid", "--as-pid-1", "--unshare-ipc", "--unshare-uts",
-            "--new-session", "--die-with-parent",
-            "--chdir", str(sandbox_cwd),
-        ))
+            "--unshare-pid",
+        ]
+        if not _development_mode():
+            # Production's native launcher is the reviewed owner of the
+            # payload process tree.  Make it PID 1 so it can reap adopted
+            # descendants; otherwise bubblewrap's own namespace init can
+            # become a host-visible zombie after a production cancellation.
+            # Development bwrap keeps its native reaper because the generic
+            # dev lifecycle contract and its test runner use that composition.
+            namespace_options.append("--as-pid-1")
+        namespace_options.extend(
+            (
+                "--unshare-ipc",
+                "--unshare-uts",
+                "--new-session",
+                "--die-with-parent",
+                "--chdir",
+                str(sandbox_cwd),
+            )
+        )
+        prefix.extend(namespace_options)
         return tuple(prefix)
 
     async def execute(self, request):

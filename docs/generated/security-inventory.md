@@ -61,11 +61,11 @@
 - `python/khaos/coding/execution/identity.py`: `f5b21dd9098def1ea894b4830181fd9a6be1196b00235a404027794f8b4b0bef`
 - `python/khaos/coding/execution/models.py`: `bc6cee60bd4b1e73edaabc75e41b46810b5a5d571425ee587f188c64d85d71e0`
 - `python/khaos/coding/execution/native_launcher.py`: `87bb0b0dea2ad42c0d7bdb12f08abf9c15df2fff3ba2d6a2ecbbf05356f43132`
-- `python/khaos/coding/execution/platform.py`: `08f118005adb0cf8b8ae2352aa713c69fd827d693ca6a618c6a3d02d71ae321d`
+- `python/khaos/coding/execution/platform.py`: `7425a3503c849afc9d965b3b6477922b7e0a0920518fb084451979a47cae404e`
 - `python/khaos/coding/execution/resource_owner.py`: `9304e64dda07b968159333fab1abae603ca19b43c972a2794c77b65dd06b52e8`
 - `python/khaos/coding/execution/service.py`: `bfce34ed38e3c77ab93ae68ab6a83e12c4de31ec6a3ed0dd8fc8b4d33c089ac6`
 - `python/khaos/coding/execution/binding.py`: `99f3d8eb14d80a837ecf0f0d076d556ccdb366b8798c9e0fde6c69d0bb1a5501`
-- `python/khaos/coding/execution/supervisor.py`: `fd93b143aa1720f7e3e47ba97f935ae867a191aef52dc23fdb5d18d436d807fa`
+- `python/khaos/coding/execution/supervisor.py`: `2bd742f69eed4eb0204df4c6337094ca2a88ad3ec62fc582edaaabc58ed0679f`
 - `python/khaos/coding/workspace/manager.py`: `661dabc96409c278a1ae05a0841b30a5c749a3218cce2ad7c4e4679ce0feeb28`
 - `python/khaos/coding/workspace/artifacts.py`: `f670450ac283ac822fec16edb445ca2f70b5afab3be6aeb1cea747843758d3de`
 - `python/khaos/coding/workspace/trusted_git.py`: `12f6dc96fa2769d26835f1e6d7abb880594703684412792fd5c8d1e2ec85753f`
@@ -108,7 +108,7 @@
 - `python/khaos/rpc/task_service.py`: `03615243a21e7ea2ec3c0edb4ade35168825ff32362fbc19c2f9249056f34f97`
 - `python/khaos/rpc/composition.py`: `0643e3b2e77eba735c47d6f3294fe8f8d22d33b7caa052d205f121c4bb8fe934`
 - `rust/khaos-core/src/bin/khaos-exec-launcher.rs`: `c5eb7343002ecb7f74e1ca10df5d5edaf4de39f90ecc68064cb355b56b2fda71`
-- `rust/khaos-core/src/bin/khaos-sandbox-launcher.rs`: `1898e9ecccef8b12912b25ff0d9c2951a5cc5c2b833d7c7916d0059ada936510`
+- `rust/khaos-core/src/bin/khaos-sandbox-launcher.rs`: `ff2cd158b0c909c20880c3c56a07615d11af7db24d6df84505a9259820bd6190`
 - `python/khaos/grpc_server.py`: `be342341e784ff1bd08ca1cc1e683a95e1a2c44704a5a46c9c378c5f636478d8`
 - `go/internal/api/handler.go`: `9dc6af7572c331685a4fa28f8902d148da4338a19603f55aeaf2094fc38662a7`
 - `go/cmd/gateway/main.go`: `5c27479e8ef5ffa3c05008077e12e89e4f274d4255765606b3ee91d04df56481`
