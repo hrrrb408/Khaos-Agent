@@ -22,6 +22,7 @@ from khaos.coding.execution.platform import (
     UnsupportedBackend,
     _create_linux_cgroup,
     _linux_sandbox_launcher,
+    _linux_processes_postorder,
     _mountinfo_has_cgroup_v2_path,
     _read_windows_output,
     _remove_windows_python_runtime,
@@ -349,6 +350,19 @@ def test_linux_cgroup_process_kill_proves_empty_before_return(tmp_path: Path):
     _kill_linux_cgroup_processes(group)
 
     assert (group / "cgroup.kill").read_text(encoding="ascii") == "1"
+
+
+def test_linux_cgroup_tree_termination_orders_children_before_namespace_init():
+    """A cgroup kill must leave namespace init alive long enough to reap."""
+    from khaos.coding.execution.platform import _linux_processes_postorder
+
+    ordered = _linux_processes_postorder(
+        (100, 101, 102, 103),
+        {100: 1, 101: 100, 102: 101, 103: 100},
+        protected={100},
+    )
+
+    assert ordered == (102, 101, 103)
 
 
 @pytest.mark.asyncio

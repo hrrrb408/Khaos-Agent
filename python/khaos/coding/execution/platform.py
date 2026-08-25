@@ -11,6 +11,7 @@ import math
 import os
 import re
 import secrets
+import signal
 import shutil
 import stat
 import subprocess
@@ -2224,13 +2225,18 @@ def _remove_linux_cgroup(group: Path) -> None:
 
 
 def _kill_linux_cgroup_processes(group: Path) -> None:
-    """Kill every process in a cgroup and prove that it became empty.
+    """Terminate a cgroup tree in reap-safe order and prove it became empty.
 
     This is deliberately separate from ``_remove_linux_cgroup`` because the
     process supervisor must perform kernel-level tree termination *before*
     it drains captured output.  Removing the cgroup belongs to the backend's
     final lease release and must happen only after the supervisor has reached
-    a terminal process result.
+    a terminal process result.  ``cgroup.kill`` alone is not sufficient for a
+    PID namespace: killing namespace init at the same instant as its children
+    can orphan zombie tasks into the container's outer init after the cgroup
+    already reports ``populated=0``.  Keep namespace init alive while its
+    descendants are terminated and reaped, then terminate init and apply the
+    kernel kill fence as a final bounded backstop.
     """
     import time
 
@@ -2239,17 +2245,179 @@ def _kill_linux_cgroup_processes(group: Path) -> None:
     kill_file = group / "cgroup.kill"
     if not kill_file.is_file():
         raise OSError(f"cgroup.kill is unavailable: {group}")
+
+    process_ids: tuple[int, ...] = ()
+    process_file = group / "cgroup.procs"
+    if process_file.is_file():
+        process_ids = _read_linux_cgroup_process_ids(process_file)
+        namespace_init = tuple(
+            pid for pid in process_ids if _linux_process_is_namespace_init(pid)
+        )
+        if namespace_init:
+            parents = {
+                pid: parent
+                for pid in process_ids
+                if (parent := _linux_process_parent(pid)) is not None
+            }
+            ordered = _linux_processes_postorder(
+                process_ids,
+                parents,
+                protected=set(namespace_init),
+            )
+            for pid in ordered:
+                _signal_linux_process(pid, signal.SIGTERM)
+                _wait_linux_process_gone((pid,), time.monotonic() + 0.25)
+            survivors = tuple(
+                pid for pid in ordered if Path(f"/proc/{pid}").exists()
+            )
+            if survivors:
+                for pid in survivors:
+                    _signal_linux_process(pid, signal.SIGKILL)
+                _wait_linux_process_gone(survivors, time.monotonic() + 2.0)
+            # Rescan after descendants had a chance to be reaped.  This
+            # closes the race where a payload creates a child during the
+            # first snapshot, while retaining the namespace init as reaper.
+            late_processes = _read_linux_cgroup_process_ids(process_file)
+            process_ids = tuple(sorted(set(process_ids).union(late_processes)))
+            late_descendants = tuple(
+                pid for pid in late_processes if pid not in namespace_init
+            )
+            for pid in late_descendants:
+                _signal_linux_process(pid, signal.SIGKILL)
+            if late_descendants:
+                _wait_linux_process_gone(late_descendants, time.monotonic() + 2.0)
+            for pid in namespace_init:
+                if Path(f"/proc/{pid}").exists():
+                    _signal_linux_process(pid, signal.SIGTERM)
+            _wait_linux_process_gone(namespace_init, time.monotonic() + 1.0)
+            remaining_init = tuple(
+                pid for pid in namespace_init if Path(f"/proc/{pid}").exists()
+            )
+            for pid in remaining_init:
+                _signal_linux_process(pid, signal.SIGKILL)
+            if remaining_init:
+                _wait_linux_process_gone(remaining_init, time.monotonic() + 2.0)
+
     kill_file.write_text("1", encoding="ascii")
     events_file = group / "cgroup.events"
     if not events_file.is_file():
         raise OSError(f"cgroup.events is unavailable: {group}")
     deadline = time.monotonic() + 5.0
+    cgroup_empty = False
     while time.monotonic() < deadline:
         content = events_file.read_text(encoding="ascii")
         if "populated 0" in content or "populated=0" in content:
-            return
+            cgroup_empty = True
+            break
         time.sleep(0.1)
-    raise TimeoutError(f"cgroup remained populated: {group}")
+    if not cgroup_empty:
+        raise TimeoutError(f"cgroup remained populated: {group}")
+    survivors = tuple(pid for pid in process_ids if Path(f"/proc/{pid}").exists())
+    if survivors:
+        raise TimeoutError(
+            "owned Linux process tree survived cgroup termination: "
+            + ",".join(str(pid) for pid in survivors)
+        )
+    return
+
+
+def _read_linux_cgroup_process_ids(process_file: Path) -> tuple[int, ...]:
+    try:
+        values = process_file.read_text(encoding="ascii").split()
+    except OSError as exc:
+        raise OSError(f"cannot read delegated cgroup process list: {process_file}") from exc
+    process_ids: list[int] = []
+    for value in values:
+        try:
+            pid = int(value, 10)
+        except ValueError as exc:
+            raise OSError(f"delegated cgroup process list is malformed: {process_file}") from exc
+        if pid <= 0:
+            raise OSError(f"delegated cgroup process list contains invalid PID: {pid}")
+        process_ids.append(pid)
+    return tuple(sorted(set(process_ids)))
+
+
+def _linux_process_parent(pid: int) -> int | None:
+    try:
+        stat_content = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+    except (OSError, UnicodeError):
+        return None
+    closing_name = stat_content.rfind(")")
+    if closing_name < 0:
+        return None
+    fields = stat_content[closing_name + 2 :].split()
+    if len(fields) < 2:
+        return None
+    try:
+        parent = int(fields[1], 10)
+    except ValueError:
+        return None
+    return parent if parent > 0 else None
+
+
+def _linux_process_is_namespace_init(pid: int) -> bool:
+    try:
+        status = Path(f"/proc/{pid}/status").read_text(encoding="ascii")
+    except (OSError, UnicodeError):
+        return False
+    for line in status.splitlines():
+        if not line.startswith("NSpid:"):
+            continue
+        values = line.removeprefix("NSpid:").split()
+        return bool(values) and values[-1] == "1"
+    return False
+
+
+def _linux_processes_postorder(
+    process_ids: tuple[int, ...],
+    parents: dict[int, int],
+    *,
+    protected: set[int],
+) -> tuple[int, ...]:
+    """Return cgroup members deepest-first, excluding namespace init."""
+    members = set(process_ids)
+    children: dict[int, list[int]] = {}
+    for pid, parent in parents.items():
+        if pid in members and parent in members:
+            children.setdefault(parent, []).append(pid)
+    ordered: list[int] = []
+    visited: set[int] = set()
+
+    def visit(pid: int) -> None:
+        if pid in visited:
+            return
+        visited.add(pid)
+        for child in sorted(children.get(pid, ())):
+            visit(child)
+        if pid not in protected:
+            ordered.append(pid)
+
+    roots = sorted(pid for pid in members if parents.get(pid) not in members)
+    for root in roots:
+        visit(root)
+    for pid in sorted(members):
+        visit(pid)
+    return tuple(ordered)
+
+
+def _signal_linux_process(pid: int, sig: signal.Signals) -> None:
+    try:
+        os.kill(pid, sig)
+    except ProcessLookupError:
+        return
+    except PermissionError as exc:
+        raise PermissionError(f"cannot terminate owned Linux process {pid}") from exc
+
+
+def _wait_linux_process_gone(pids: tuple[int, ...], deadline: float) -> bool:
+    import time
+
+    while time.monotonic() < deadline:
+        if all(not Path(f"/proc/{pid}").exists() for pid in pids):
+            return True
+        time.sleep(0.05)
+    return all(not Path(f"/proc/{pid}").exists() for pid in pids)
 
 
 def _validated_profile(request):

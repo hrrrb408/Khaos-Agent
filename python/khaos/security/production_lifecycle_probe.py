@@ -95,6 +95,21 @@ def _cgroup_is_gone(path: Path) -> bool:
     return not path.exists()
 
 
+def _proc_diagnostic(pid: int) -> dict[str, str]:
+    """Capture bounded survivor state for a failed external-oracle check."""
+    diagnostic: dict[str, str] = {"pid": str(pid)}
+    try:
+        status = Path(f"/proc/{pid}/status").read_text(encoding="ascii")
+    except (OSError, UnicodeError) as exc:
+        diagnostic["status_read_error"] = f"{type(exc).__name__}: {exc}"
+        return diagnostic
+    for line in status.splitlines():
+        key, separator, value = line.partition(":")
+        if separator and key in {"Name", "State", "PPid", "NSpid"}:
+            diagnostic[key] = " ".join(value.split())
+    return diagnostic
+
+
 def _temporary_home_paths() -> frozenset[Path]:
     """Snapshot producer-visible temporary execution homes."""
     root = Path(tempfile.gettempdir())
@@ -117,10 +132,14 @@ def _wait_external_terminal(pids: tuple[int, ...], cgroup: Path) -> tuple[bool, 
             return True, "external /proc tree and cgroup path disappeared"
         time.sleep(_ORACLE_POLL)
     survivors = [str(pid) for pid in pids if Path(f"/proc/{pid}").exists()]
+    survivor_diagnostics = [
+        _proc_diagnostic(int(pid)) for pid in survivors
+    ]
     return False, (
         "external oracle timeout: "
         f"surviving_pids={','.join(survivors) or 'none'} "
-        f"cgroup_present={cgroup.exists()}"
+        f"cgroup_present={cgroup.exists()} "
+        f"survivor_state={json.dumps(survivor_diagnostics, sort_keys=True)}"
     )
 
 
