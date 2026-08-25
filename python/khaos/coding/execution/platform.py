@@ -1800,7 +1800,12 @@ class LinuxBubblewrapBackend:
         prefix.extend((
             network_option,
             *linux_job_namespace_args(),
-            "--unshare-pid", "--unshare-ipc", "--unshare-uts",
+            # Keep the reviewed native launcher as PID 1 inside the private
+            # namespace.  Without --as-pid-1, bubblewrap itself becomes the
+            # namespace init and the launcher cannot own/reap payload
+            # descendants; a killed bwrap then leaves a host-visible init
+            # zombie even when the cgroup is empty.
+            "--unshare-pid", "--as-pid-1", "--unshare-ipc", "--unshare-uts",
             "--new-session", "--die-with-parent",
             "--chdir", str(sandbox_cwd),
         ))

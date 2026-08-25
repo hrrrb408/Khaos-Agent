@@ -242,6 +242,7 @@ def test_linux_profile_isolates_proc_ipc_uts_and_parent_lifetime(tmp_path: Path)
     assert "--unshare-ipc" in argv
     assert "--unshare-uts" in argv
     assert "--unshare-net" in argv
+    assert argv.index("--as-pid-1") == argv.index("--unshare-pid") + 1
     assert "--new-session" in argv
     assert "--die-with-parent" in argv
     assert ("--ro-bind", "/", "/") not in tuple(

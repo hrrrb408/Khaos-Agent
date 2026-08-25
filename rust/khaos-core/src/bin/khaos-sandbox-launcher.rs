@@ -514,7 +514,7 @@ mod linux {
         Err(io::Error::last_os_error())
     }
 
-    // Bubblewrap makes the command it starts PID 1 in the private PID
+    // Bubblewrap's --as-pid-1 makes this launcher PID 1 in the private PID
     // namespace.  A normal payload is not a PID-namespace init and will not
     // reap grandchildren that become orphaned during teardown; those
     // unreaped children can remain visible in the host /proc tree even after
