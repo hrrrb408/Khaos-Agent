@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68.0", "wheel"]
+requires = ["setuptools>=84.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -34,7 +34,7 @@ tui = [
 # WebSocket bypass closure) was only added in 1.48.  Older builds fail
 # closed at runtime via a ``hasattr`` probe in ``_install_route_guard``.
 browser = [
-    "playwright>=1.48",
+    "playwright>=1.62.0",
 ]
 tree-sitter = [
     "tree-sitter==0.26.0",
