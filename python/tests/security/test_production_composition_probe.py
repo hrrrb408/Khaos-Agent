@@ -60,6 +60,18 @@ def test_production_producers_share_one_runtime_composition_digest_recipe() -> N
     )
 
 
+def test_production_probe_binds_and_restores_temp_root(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("TMPDIR", "/tmp/original-khaos-probe-root")
+    production_composition_probe.tempfile.tempdir = None
+
+    with production_composition_probe._production_probe_temp_root(tmp_path):
+        assert production_composition_probe.tempfile.gettempdir() == str(tmp_path)
+
+    assert production_composition_probe.os.environ["TMPDIR"] == (
+        "/tmp/original-khaos-probe-root"
+    )
+
+
 def test_identity_oracle_retries_transient_empty_namespace_maps(monkeypatch) -> None:
     attempts = 0
     expected = object()

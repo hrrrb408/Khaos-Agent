@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from collections.abc import Iterator
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -427,7 +429,24 @@ def _require_production_socket(path: Path, authority_uid: int) -> dict[str, obje
     }
 
 
-async def _build_runtime_manifest() -> dict[str, object]:
+@contextmanager
+def _production_probe_temp_root(workspace_parent: Path) -> Iterator[None]:
+    """Make capability probes use the verified production workspace."""
+    previous_environment = os.environ.get("TMPDIR")
+    previous_tempdir = tempfile.tempdir
+    os.environ["TMPDIR"] = str(workspace_parent)
+    tempfile.tempdir = str(workspace_parent)
+    try:
+        yield
+    finally:
+        tempfile.tempdir = previous_tempdir
+        if previous_environment is None:
+            os.environ.pop("TMPDIR", None)
+        else:
+            os.environ["TMPDIR"] = previous_environment
+
+
+async def _build_runtime_manifest(workspace_parent: Path) -> dict[str, object]:
     """Build and verify the same structural production Runtime factory uses."""
     if not Path("/app/khaos_policy.yaml").is_file():
         raise SystemExit(
@@ -437,37 +456,40 @@ async def _build_runtime_manifest() -> dict[str, object]:
     from khaos.runtime import ProductionRuntimeConfig, build_production_runtime
     from khaos.security.production_composition_manifest import verify_runtime_composition
 
-    with tempfile.TemporaryDirectory(prefix="khaos-runtime-composition-") as temporary:
-        database = Database(Path(temporary) / "composition.db")
-        await database.connect()
-        await database.run_migrations()
-        runtime = None
-        try:
-            runtime = await build_production_runtime(
-                ProductionRuntimeConfig(
-                    project_root=Path("/app"),
-                    config_path=Path("/app/config.yaml"),
-                    db=database,
-                    principal_id=_COMPOSE_PRINCIPAL_ID,
-                    principal_kind=_COMPOSE_PRINCIPAL_KIND,
-                    parent_principal_id=_COMPOSE_PARENT_PRINCIPAL_ID,
-                    source_transport="cron",
-                    project_id="compose",
-                    runtime_id=_COMPOSE_RUNTIME_ID,
+    with _production_probe_temp_root(workspace_parent):
+        with tempfile.TemporaryDirectory(
+            prefix="khaos-runtime-composition-", dir=workspace_parent
+        ) as temporary:
+            database = Database(Path(temporary) / "composition.db")
+            await database.connect()
+            await database.run_migrations()
+            runtime = None
+            try:
+                runtime = await build_production_runtime(
+                    ProductionRuntimeConfig(
+                        project_root=Path("/app"),
+                        config_path=Path("/app/config.yaml"),
+                        db=database,
+                        principal_id=_COMPOSE_PRINCIPAL_ID,
+                        principal_kind=_COMPOSE_PRINCIPAL_KIND,
+                        parent_principal_id=_COMPOSE_PARENT_PRINCIPAL_ID,
+                        source_transport="cron",
+                        project_id="compose",
+                        runtime_id=_COMPOSE_RUNTIME_ID,
+                    )
                 )
-            )
-            manifest = verify_runtime_composition(runtime)
-            payload = manifest.to_payload()
-            if not manifest.valid or manifest.forbidden_detected:
-                raise SystemExit(
-                    "production runtime composition is invalid: "
-                    + "; ".join(manifest.errors)
-                )
-            return payload
-        finally:
-            if runtime is not None:
-                await runtime.aclose()
-            await database.close()
+                manifest = verify_runtime_composition(runtime)
+                payload = manifest.to_payload()
+                if not manifest.valid or manifest.forbidden_detected:
+                    raise SystemExit(
+                        "production runtime composition is invalid: "
+                        + "; ".join(manifest.errors)
+                    )
+                return payload
+            finally:
+                if runtime is not None:
+                    await runtime.aclose()
+                await database.close()
 
 
 def _runtime_diagnostics(
@@ -607,7 +629,7 @@ def main() -> int:
     )
     if os.getuid() != int(os.environ.get("KHAOS_AGENT_UID", str(os.getuid()))):
         raise SystemExit("production composition probe is running as the wrong Agent UID")
-    runtime_manifest = asyncio.run(_build_runtime_manifest())
+    runtime_manifest = asyncio.run(_build_runtime_manifest(workspace_parent))
     from khaos.coding.execution.platform import _linux_sandbox_launcher
 
     sandbox_launcher = _linux_sandbox_launcher()
