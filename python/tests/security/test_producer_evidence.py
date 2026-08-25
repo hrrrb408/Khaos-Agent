@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -159,6 +160,7 @@ def test_producer_digest_and_authority_identity_tampering_are_rejected(
         validate_producer_proof(tampered, expected_commit=COMMIT)
 
 
+@pytest.mark.posix_host
 def test_missing_authorityd_does_not_fake_production_pass(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -167,7 +169,7 @@ def test_missing_authorityd_does_not_fake_production_pass(
     monkeypatch.setenv("KHAOS_AUTHORITYD_SOCKET", "/does/not/exist.sock")
     monkeypatch.setenv("KHAOS_AUTHORITYD_PUBLIC_KEY_PATH", "/does/not/exist.pub")
     monkeypatch.setenv("KHAOS_AUTHORITYD_UID", "10003")
-    monkeypatch.setenv("KHAOS_AGENT_UID", str(__import__("os").getuid()))
+    monkeypatch.setenv("KHAOS_AGENT_UID", str(os.getuid()))
     with pytest.raises(LocalEvidenceError, match="endpoint is unavailable"):
         # The identity is intentionally complete-looking; only the live
         # authority endpoint may make this production proof constructible.

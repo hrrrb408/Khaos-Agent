@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from khaos.security import production_composition_probe
 from khaos.security.identity_isolation import IdentityIsolationError
 
@@ -51,6 +53,7 @@ def test_production_probe_uses_the_named_volume_for_io_limits() -> None:
     assert 'dir=workspace_parent' in source
 
 
+@pytest.mark.posix_host
 def test_production_probes_share_a_safe_anchor_database_path(tmp_path: Path) -> None:
     database_path = production_composition_probe._composition_probe_database_path(tmp_path)
 

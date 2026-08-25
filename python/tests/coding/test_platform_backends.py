@@ -229,6 +229,7 @@ def test_read_only_platform_profiles_do_not_mount_workspace_writable(tmp_path: P
     assert linux_argv[worktree_index - 1] == "--ro-bind"
 
 
+@pytest.mark.posix_host
 def test_linux_profile_isolates_proc_ipc_uts_and_parent_lifetime(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
