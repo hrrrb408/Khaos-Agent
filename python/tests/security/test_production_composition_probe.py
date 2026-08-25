@@ -60,6 +60,13 @@ def test_production_composition_diagnostics_use_artifact_filename_stem() -> None
     assert 'output_dir / f"{diagnostic_stem}.junit.xml"' in source
 
 
+def test_lifecycle_producer_reuses_verified_production_workspace() -> None:
+    from khaos.security import production_lifecycle_probe
+
+    source = Path(production_lifecycle_probe.__file__).read_text(encoding="utf-8")
+    assert "_build_runtime_manifest(workspace_parent)" in source
+
+
 def test_production_producers_share_one_runtime_composition_digest_recipe() -> None:
     from khaos.security import production_lifecycle_probe
 

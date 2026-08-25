@@ -404,7 +404,7 @@ async def _run() -> int:
         raise SystemExit("production lifecycle probe requires /app/data")
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    runtime_manifest = await _build_runtime_manifest()
+    runtime_manifest = await _build_runtime_manifest(workspace_parent)
     cases = [
         await _run_case(
             name="cancellation",
