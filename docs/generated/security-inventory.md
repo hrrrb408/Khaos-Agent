@@ -22,9 +22,9 @@
 - Docker base/service images found with immutable digests:
   - `Dockerfile:2`: `sha256:e51d0265072d2d9d5d320f6a44dde6b9ef13653b035098febd68cce8fa7c0bc4`
   - `Dockerfile:13`: `sha256:b18992999dbe963a45a8a4da40ac2b1975be1a776d939d098c647482bcad5cba`
-  - `Dockerfile:89`: `sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818`
-  - `Dockerfile:106`: `sha256:1699c10032ca2582ec89a24a1312d986a3f094aed3d5c1147b19880afe40e052`
-  - `Dockerfile:113`: `sha256:6baf43584bcb78f2e5847d1de515f23499913ac9f12bdf834811a3145eb11ca1`
+  - `Dockerfile:90`: `sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818`
+  - `Dockerfile:107`: `sha256:1699c10032ca2582ec89a24a1312d986a3f094aed3d5c1147b19880afe40e052`
+  - `Dockerfile:114`: `sha256:6baf43584bcb78f2e5847d1de515f23499913ac9f12bdf834811a3145eb11ca1`
 - Lockfile fingerprints:
   - `uv.lock`: `5ff3e1c42dfc336fa6724875cc2c34bcd770e2621e020a45d4b938c66475200a`
   - `python/bootstrap-requirements.txt`: `72082c05288cd1b6f61b0304a4f90f01bbcae2ec6d6262d56de5a9ff03dc5acd`

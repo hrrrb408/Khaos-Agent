@@ -19,6 +19,7 @@ RUN apt-get -o Acquire::Retries=5 update \
     && apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
     gcc \
     bubblewrap \
+    git \
     libcap2-bin \
     && rm -rf /var/lib/apt/lists/*
 

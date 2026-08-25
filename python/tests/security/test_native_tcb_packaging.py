@@ -208,6 +208,17 @@ def test_production_compose_has_independent_authorityd_sidecar() -> None:
     assert "SYS_ADMIN" not in agent.get("cap_add", [])
 
 
+def test_production_agent_image_contains_trusted_system_git() -> None:
+    """Production runtime construction must have the trusted Git executable."""
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    python_stage = dockerfile.split(" AS kernel-helper", 1)[0]
+    install_block = python_stage.split(
+        "apt-get -o Acquire::Retries=5 install", 1
+    )[1].split("&& rm -rf /var/lib/apt/lists/*", 1)[0]
+
+    assert "\n    git \\\n" in install_block
+
+
 def test_compose_security_probe_supplies_only_disposable_outer_profiles() -> None:
     script = (ROOT / "scripts/compose-security-e2e.sh").read_text(encoding="utf-8")
 
