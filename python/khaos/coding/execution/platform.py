@@ -2361,10 +2361,18 @@ def _terminate_linux_cgroup_descendants(
         for pid in observed
         if pid != direct_pid and Path(f"/proc/{pid}").exists()
     )
-    if survivors:
+    # A namespace-init task can be a zombie until the still-live direct
+    # bubblewrap parent reaps it.  That is the exact reason this callback is
+    # ordered before the parent signal.  Defer only that parent-owned reap;
+    # any other survivor is an unproven descendant and must fail closed.
+    deferred_init = (
+        set(namespace_init) if direct_pid is not None else set()
+    )
+    unproven_survivors = tuple(pid for pid in survivors if pid not in deferred_init)
+    if unproven_survivors:
         raise TimeoutError(
             "owned Linux descendants survived ordered termination: "
-            + ",".join(str(pid) for pid in survivors)
+            + ",".join(str(pid) for pid in unproven_survivors)
         )
     return observed
 
