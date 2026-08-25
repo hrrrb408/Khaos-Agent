@@ -536,9 +536,7 @@ mod linux {
 
     fn install_pid_namespace_signal_handlers() -> io::Result<()> {
         for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT] {
-            let previous = unsafe {
-                libc::signal(signal, record_signal as *const () as usize)
-            };
+            let previous = unsafe { libc::signal(signal, record_signal as *const () as usize) };
             if previous == libc::SIG_ERR {
                 return Err(io::Error::last_os_error());
             }
