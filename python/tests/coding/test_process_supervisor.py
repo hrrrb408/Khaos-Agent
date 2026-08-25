@@ -147,6 +147,7 @@ async def test_supervisor_runs_backend_termination_callback_before_draining_outp
     """
     supervisor = ProcessSupervisor(termination_grace_seconds=0.1)
     callback_called = asyncio.Event()
+    callback_saw_live_process: list[bool] = []
     request = ExecutionRequest(
         (sys.executable, "-c", "import time; time.sleep(30)"),
         tmp_path,
@@ -155,6 +156,8 @@ async def test_supervisor_runs_backend_termination_callback_before_draining_outp
     )
 
     async def terminate_backend_tree() -> None:
+        active = supervisor._active["backend-termination-callback"]
+        callback_saw_live_process.append(active.process.returncode is None)
         callback_called.set()
 
     running = asyncio.create_task(
@@ -166,6 +169,7 @@ async def test_supervisor_runs_backend_termination_callback_before_draining_outp
 
     assert result.status == "timed-out"
     assert callback_called.is_set()
+    assert callback_saw_live_process == [True]
     assert supervisor.active_execution_ids == ()
 
 

@@ -297,9 +297,10 @@ class ProcessSupervisor:
         the payload's host directory/rlimit launcher arguments.
 
         ``termination_callback`` is an optional backend-owned kernel cleanup
-        hook.  It runs after the direct child is reaped and before captured
-        output is drained, which lets a namespace backend terminate
-        descendants that are not in the supervisor's process group.
+        hook.  It runs before the direct child is signalled, so a namespace
+        backend can terminate descendants while the direct launcher is still
+        alive to reap namespace-init children; the direct child is then
+        reaped before captured output is drained.
         """
         execution_id = request.correlation_id
         if not execution_id:
@@ -1247,6 +1248,16 @@ class ProcessSupervisor:
             if process_wait_task is not None:
                 active.process_wait_task = process_wait_task
             self._record_process_exit(active, process_wait_task)
+            callback_error: BaseException | None = None
+            if active.termination_callback is not None:
+                try:
+                    await active.termination_callback()
+                except BaseException as exc:  # noqa: BLE001 - cleanup continues
+                    # Even if backend-owned descendant cleanup is not proven,
+                    # still terminate and reap the direct launcher.  The
+                    # caller receives the cleanup error and the backend keeps
+                    # its lease quarantined instead of reporting CLOSED.
+                    callback_error = exc
             if not _has_terminal_process_proof(active):
                 # Cancelling the deadline race's wait and creating a second
                 # ``process.wait()`` can race the asyncio subprocess
@@ -1275,14 +1286,8 @@ class ProcessSupervisor:
                     raise RuntimeError(
                         "subprocess wait completed without terminal process proof"
                     )
-            # A native sandbox may have descendants that are outside the
-            # supervisor's process group (for example after bwrap creates a
-            # PID namespace).  Invoke the backend-owned kernel terminator
-            # even when the launcher itself has already exited; otherwise
-            # those descendants can retain stdout/stderr pipes forever and
-            # prevent the supervisor from reaching a terminal result.
-            if active.termination_callback is not None:
-                await active.termination_callback()
+            if callback_error is not None:
+                raise callback_error
 
 
 async def _no_resource_violation() -> None:
