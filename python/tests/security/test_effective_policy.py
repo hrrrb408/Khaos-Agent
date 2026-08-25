@@ -168,6 +168,36 @@ def test_digest_differs_for_different_policies(tmp_path):
     assert eff1.digest != eff2.digest
 
 
+def test_policy_digest_is_relocation_stable_while_resource_catalog_stays_root_bound(
+    tmp_path,
+):
+    """Producer policy identity must not depend on /app vs checkout paths.
+
+    The effective policy still carries concrete absolute capabilities, and
+    its typed resource catalog must remain bound to each actual workspace.
+    """
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    first_root.mkdir()
+    second_root.mkdir()
+
+    first = compile_effective_policy(
+        _policy("workspace-write", allowed_paths=["."]),
+        workspace_root=first_root,
+    )
+    second = compile_effective_policy(
+        _policy("workspace-write", allowed_paths=["."]),
+        workspace_root=second_root,
+    )
+
+    assert first.digest == second.digest
+    assert first.root_capabilities == frozenset({first_root.resolve()})
+    assert second.root_capabilities == frozenset({second_root.resolve()})
+    assert first.resource_order is not None
+    assert second.resource_order is not None
+    assert first.resource_order.catalog_digest != second.resource_order.catalog_digest
+
+
 def test_immutable_frozen_sets(tmp_path):
     eff = compile_effective_policy(_policy("read-only"), workspace_root=tmp_path)
     with pytest.raises(AttributeError):
