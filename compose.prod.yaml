@@ -106,6 +106,7 @@ services:
       # production composition without real resource enforcement fails closed.
       - "${KHAOS_EXECUTION_CGROUP_SOURCE:?KHAOS_EXECUTION_CGROUP_SOURCE must point to a delegated cgroup v2 subtree}:/run/khaos-execution-cgroup:rw"
       - ./config.yaml:/app/config.yaml:ro
+      - ./khaos_policy.yaml:/app/khaos_policy.yaml:ro
     environment:
       - KHAOS_MODE=office
       - KHAOS_DEV_MODE=0

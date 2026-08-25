@@ -21,11 +21,19 @@ from typing import Any
 
 from khaos.security.evidence_provenance import gh_api_bytes
 from khaos.security.local_closure import (
+    COMMUNITY_LOCAL_REQUIRED_PROOFS,
     ClosureEvidence,
     LocalEvidenceError,
     VerifiedGitHubProvenance,
     _VERIFIER_SEAL,
     issue_verified_github_provenance,
+)
+from khaos.security.producer_evidence import (
+    PROCESS_TREE_PROOF,
+    PRODUCTION_COMPOSITION_PROOF,
+    PRODUCER_EVIDENCE_SCHEMA,
+    RESOURCE_OWNER_PROOF,
+    validate_producer_proof,
 )
 from khaos.security.security_evidence import (
     MAX_ARTIFACT_BYTES,
@@ -43,6 +51,26 @@ COMMUNITY_LOCAL_GATES = {
     "community_local": "community-local-closure.yml",
 }
 COMMUNITY_LOCAL_ARTIFACT = "local-security-evidence-{}"
+PRODUCER_ARTIFACTS = {
+    "ordinary": "community-local-test-producer-evidence-{}",
+    PRODUCTION_COMPOSITION_PROOF: "production-composition-evidence-{}",
+    "lifecycle": "production-lifecycle-evidence-{}",
+}
+PRODUCER_PROOF_ARTIFACT = {
+    "community_authority": "ordinary",
+    "platform_kernel": "ordinary",
+    "production_reachability": "ordinary",
+    "workspace_escape": "ordinary",
+    "approval_replay": "ordinary",
+    "approval_substitution": "ordinary",
+    "network_isolation": "ordinary",
+    PRODUCTION_COMPOSITION_PROOF: PRODUCTION_COMPOSITION_PROOF,
+    PROCESS_TREE_PROOF: "lifecycle",
+    RESOURCE_OWNER_PROOF: "lifecycle",
+}
+PRODUCTION_PROOFS = frozenset(
+    {PRODUCTION_COMPOSITION_PROOF, PROCESS_TREE_PROOF, RESOURCE_OWNER_PROOF}
+)
 SECURITY_EVIDENCE_TESTS = frozenset(
     {
         "workspace_escape",
@@ -123,7 +151,12 @@ def _select_successful_run(
         raise RuntimeError(
             f"no successful completed attempt-1 {workflow} run exists for exact commit {commit}"
         )
-    return max(candidates, key=_run_sort_key)
+    if len(candidates) != 1:
+        raise RuntimeError(
+            f"multiple successful completed attempt-1 {workflow} runs exist "
+            f"for exact commit {commit}"
+        )
+    return candidates[0]
 
 
 def _artifact_records(repo: str, run_id: int) -> list[dict[str, Any]]:
@@ -443,7 +476,375 @@ def _verify_local_artifact(
         "local_evidence_digest": evidence.evidence_digest,
         "policy_digest": evidence.policy_digest,
         "proof_names": [proof.name for proof in evidence.proofs],
+        "proof_payloads": [
+            dict(item)
+            for item in value.get("proofs", [])
+            if isinstance(item, dict)
+        ],
     }
+
+
+def _producer_archive_files(payload: bytes) -> dict[str, bytes]:
+    """Read a producer artifact without trusting ZIP paths or metadata."""
+    if len(payload) > MAX_ARTIFACT_BYTES:
+        raise RuntimeError("producer evidence artifact exceeds the download limit")
+    files: dict[str, bytes] = {}
+    try:
+        with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+            for info in archive.infolist():
+                name = info.filename
+                if name.endswith("/"):
+                    continue
+                path = Path(name)
+                if path.is_absolute() or ".." in path.parts or not name:
+                    raise RuntimeError(f"producer artifact contains unsafe path: {name}")
+                if name in files:
+                    raise RuntimeError(f"producer artifact contains duplicate path: {name}")
+                file_type = (info.external_attr >> 16) & 0o170000
+                if file_type == 0o120000:
+                    raise RuntimeError(f"producer artifact contains a symlink: {name}")
+                if info.file_size > MAX_ARTIFACT_BYTES:
+                    raise RuntimeError(f"producer artifact file is too large: {name}")
+                with archive.open(info, "r") as stream:
+                    raw = stream.read(MAX_ARTIFACT_BYTES + 1)
+                if len(raw) > MAX_ARTIFACT_BYTES:
+                    raise RuntimeError(f"producer artifact file is too large: {name}")
+                files[name] = raw
+    except (OSError, zipfile.BadZipFile) as exc:
+        raise RuntimeError(f"producer evidence artifact is invalid: {exc}") from exc
+    return files
+
+
+def _producer_job(
+    jobs: list[dict[str, Any]],
+    *,
+    workflow_name: str,
+    job_name: str,
+) -> dict[str, Any]:
+    """Bind a proof to exactly one successful GitHub producer job."""
+    candidates = [
+        job
+        for job in jobs
+        if job.get("status") == "completed"
+        and job.get("conclusion") == "success"
+        and job.get("name") == job_name
+    ]
+    if len(candidates) != 1:
+        raise RuntimeError(
+            f"producer job {job_name!r} is not unique in workflow {workflow_name!r}"
+        )
+    job = candidates[0]
+    observed_workflow = job.get("workflow_name")
+    if observed_workflow is not None and observed_workflow != workflow_name:
+        raise RuntimeError(
+            f"producer job {job_name!r} belongs to workflow {observed_workflow!r}, "
+            f"not {workflow_name!r}"
+        )
+    return job
+
+
+def _diagnostic_file_prefix(proof_type: str) -> str:
+    if proof_type == PRODUCTION_COMPOSITION_PROOF:
+        return "production-composition-proof"
+    if proof_type in {PROCESS_TREE_PROOF, RESOURCE_OWNER_PROOF}:
+        return "production-lifecycle"
+    return f"{proof_type}"
+
+
+def _verify_producer_diagnostics(
+    proof: dict[str, object], files: dict[str, bytes]
+) -> None:
+    diagnostics = proof.get("diagnostics")
+    if not isinstance(diagnostics, dict):
+        raise RuntimeError(f"producer {proof.get('proof_type')} diagnostics are missing")
+    proof_type = str(proof.get("proof_type") or "")
+    allowed_diagnostic_names = {proof_type}
+    if proof_type in {PROCESS_TREE_PROOF, RESOURCE_OWNER_PROOF}:
+        allowed_diagnostic_names.add("production_lifecycle")
+    if diagnostics.get("proof_name") not in allowed_diagnostic_names:
+        raise RuntimeError(
+            f"producer {proof_type} diagnostics proof name is not exact"
+        )
+    prefix = _diagnostic_file_prefix(proof_type)
+    expected = {
+        f"junit-{prefix}.xml",
+        f"stdout-{prefix}.log",
+        f"stderr-{prefix}.log",
+    }
+    # The production producers use ``<proof>.junit.xml`` while the ordinary
+    # matrix uses ``junit-<proof>.xml``.  Accept only these two exact naming
+    # forms, never an arbitrary file selected by the bundle.
+    if proof_type == PRODUCTION_COMPOSITION_PROOF:
+        expected = {
+            "production-composition-proof.junit.xml",
+            "production-composition-proof.stdout.log",
+            "production-composition-proof.stderr.log",
+        }
+    elif proof_type in {PROCESS_TREE_PROOF, RESOURCE_OWNER_PROOF}:
+        expected = {
+            "production-lifecycle.junit.xml",
+            "production-lifecycle.stdout.log",
+            "production-lifecycle.stderr.log",
+        }
+    elif prefix:
+        expected = {
+            f"junit-{prefix}.xml",
+            f"stdout-{prefix}.log",
+            f"stderr-{prefix}.log",
+        }
+    if not expected.issubset(files):
+        missing = ",".join(sorted(expected - set(files)))
+        raise RuntimeError(f"producer {proof_type} diagnostics are incomplete: {missing}")
+    digest_fields = {
+        "junit_digest": next(name for name in expected if name.endswith(".xml")),
+        "stdout_digest": next(
+            name
+            for name in expected
+            if name.startswith("stdout-") or name.endswith(".stdout.log")
+        ),
+        "stderr_digest": next(
+            name
+            for name in expected
+            if name.startswith("stderr-") or name.endswith(".stderr.log")
+        ),
+    }
+    for field, filename in digest_fields.items():
+        supplied = diagnostics.get(field)
+        actual = hashlib.sha256(files[filename]).hexdigest()
+        if supplied != actual:
+            raise RuntimeError(
+                f"producer {proof_type} {field} does not match {filename}"
+            )
+    if (
+        diagnostics.get("returncode") != 0
+        or diagnostics.get("test_count", 0) <= 0
+        or diagnostics.get("passed") != diagnostics.get("test_count")
+        or diagnostics.get("skipped") != 0
+        or diagnostics.get("failed") != 0
+        or diagnostics.get("errors") != 0
+    ):
+        raise RuntimeError(
+            f"producer {proof_type} is not a passing diagnostic: "
+            + json.dumps(
+                {
+                    key: diagnostics.get(key)
+                    for key in (
+                        "returncode",
+                        "test_count",
+                        "passed",
+                        "skipped",
+                        "failed",
+                        "errors",
+                        "skipped_reasons",
+                        "failure_details",
+                        "error_details",
+                    )
+                },
+                sort_keys=True,
+            )
+        )
+
+
+def _verify_external_producers(
+    repo: str,
+    *,
+    security_record: dict[str, Any],
+    local_record: dict[str, Any],
+    commit: str,
+) -> list[dict[str, Any]]:
+    """Re-verify every producer proof against live run/job/artifact bytes."""
+    security_run_id = int(security_record["run_id"])
+    security_workflow = str(
+        security_record.get("workflow_name") or "Security Closure Gate"
+    )
+    raw_jobs = _run_gh_api(
+        repo, f"actions/runs/{security_run_id}/jobs?per_page=100"
+    ).get("jobs")
+    if not isinstance(raw_jobs, list) or len(raw_jobs) > 100:
+        raise RuntimeError("Security Closure producer jobs are missing or paginated")
+    jobs = [job for job in raw_jobs if isinstance(job, dict)]
+    artifacts = security_record.get("artifacts")
+    if not isinstance(artifacts, list):
+        raise RuntimeError("Security Closure producer artifact list is missing")
+    artifact_by_name: dict[str, dict[str, Any]] = {}
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            continue
+        name = str(artifact.get("name") or "")
+        if name in artifact_by_name:
+            raise RuntimeError(f"duplicate Security Closure artifact {name}")
+        artifact_by_name[name] = artifact
+
+    local_payloads = local_record.get("proof_payloads")
+    if not isinstance(local_payloads, list):
+        raise RuntimeError("Community Local artifact does not expose proof provenance")
+    if len(local_payloads) != len(COMMUNITY_LOCAL_REQUIRED_PROOFS):
+        raise RuntimeError("Community Local proof provenance count is not exact")
+    local_by_type: dict[str, dict[str, object]] = {}
+    for value in local_payloads:
+        if not isinstance(value, dict):
+            raise RuntimeError("Community Local proof provenance is malformed")
+        proof_type = value.get("proof_type", value.get("name"))
+        if not isinstance(proof_type, str) or proof_type in local_by_type:
+            raise RuntimeError(f"duplicate Community Local proof provenance {proof_type}")
+        local_by_type[proof_type] = value
+
+    expected_names = {
+        pattern.format(commit)
+        for pattern in PRODUCER_ARTIFACTS.values()
+    }
+    for name in expected_names:
+        if name not in artifact_by_name:
+            raise RuntimeError(f"Security Closure is missing producer artifact {name}")
+
+    downloaded: dict[str, tuple[dict[str, Any], dict[str, bytes], str]] = {}
+    for artifact_name in expected_names:
+        artifact = artifact_by_name[artifact_name]
+        if artifact.get("expired") is not False:
+            raise RuntimeError(f"producer artifact {artifact_name} is expired or unverifiable")
+        artifact_id = str(artifact.get("id") or "")
+        if not artifact_id:
+            raise RuntimeError(f"producer artifact {artifact_name} has no id")
+        workflow_run = artifact.get("workflow_run")
+        if not isinstance(workflow_run, dict) or str(workflow_run.get("id")) != str(security_run_id):
+            raise RuntimeError(f"producer artifact {artifact_name} is not bound to Security Closure run")
+        advertised = str(artifact.get("digest") or "").removeprefix("sha256:")
+        if not _SHA256_RE.fullmatch(advertised):
+            raise RuntimeError(f"producer artifact {artifact_name} has no valid digest")
+        raw = gh_api_bytes(
+            repo,
+            f"actions/artifacts/{artifact_id}/zip",
+            timeout_seconds=60.0,
+            max_output_bytes=MAX_ARTIFACT_BYTES,
+        )
+        digest = hashlib.sha256(raw).hexdigest()
+        if digest != advertised:
+            raise RuntimeError(f"producer artifact {artifact_name} digest mismatch")
+        downloaded[artifact_name] = (
+            artifact,
+            _producer_archive_files(raw),
+            digest,
+        )
+
+    parsed_by_artifact: dict[str, dict[str, tuple[dict[str, object], dict[str, Any]]]] = {}
+    seen_proofs: set[str] = set()
+    production_identity_digest: str | None = None
+    for artifact_name, (artifact, files, _archive_digest) in downloaded.items():
+        proof_files = [
+            (name, raw)
+            for name, raw in files.items()
+            if name.startswith("proof-") or name.endswith("proof.json")
+        ]
+        parsed: dict[str, tuple[dict[str, object], dict[str, Any]]] = {}
+        for filename, raw in proof_files:
+            try:
+                value = json.loads(raw.decode("utf-8"))
+                proof = validate_producer_proof(value, expected_commit=commit)
+            except (UnicodeDecodeError, json.JSONDecodeError, LocalEvidenceError) as exc:
+                raise RuntimeError(
+                    f"producer proof {artifact_name}/{filename} is invalid: {exc}"
+                ) from exc
+            if proof.get("result") != "PASS":
+                raise RuntimeError(f"producer proof {proof.get('proof_type')} is not PASS")
+            proof_name = str(proof.get("proof_type") or "")
+            if proof_name in seen_proofs or proof_name in parsed:
+                raise RuntimeError(f"duplicate producer proof {proof_name}")
+            seen_proofs.add(proof_name)
+            workflow = proof.get("workflow")
+            if not isinstance(workflow, dict):
+                raise RuntimeError(f"producer proof {proof_name} workflow is malformed")
+            if (
+                workflow.get("repository") != repo
+                or workflow.get("workflow") != security_workflow
+                or workflow.get("run_id") != str(security_run_id)
+                or workflow.get("run_attempt") != 1
+                or workflow.get("event") != "push"
+                or workflow.get("ref") != "refs/heads/main"
+                or workflow.get("head_sha") != commit
+            ):
+                raise RuntimeError(f"producer proof {proof_name} provenance is not exact-main")
+            job = _producer_job(
+                jobs,
+                workflow_name=security_workflow,
+                job_name=str(workflow.get("job") or ""),
+            )
+            _verify_producer_diagnostics(proof, files)
+            expected_production = proof_name in PRODUCTION_PROOFS
+            if proof.get("production_claim") is not expected_production:
+                raise RuntimeError(f"producer proof {proof_name} has incorrect ownership")
+            if expected_production:
+                production_identity = {
+                    key: proof.get(key)
+                    for key in (
+                        "runtime_composition_digest",
+                        "production_composition_manifest_digest",
+                        "launcher_digest",
+                        "authority_profile",
+                        "authority_proof_identity",
+                        "authority_proof_digest",
+                        "host_backend_absent",
+                        "dev_fallback_absent",
+                        "production_mode",
+                    )
+                }
+                current_identity_digest = _canonical_digest(production_identity)
+                if (
+                    production_identity_digest is not None
+                    and production_identity_digest != current_identity_digest
+                ):
+                    raise RuntimeError(
+                        "production producer proofs do not share one runtime composition identity"
+                    )
+                production_identity_digest = current_identity_digest
+            parsed[proof_name] = (proof, job)
+        expected_in_artifact = {
+            item
+            for item, contract in PRODUCER_PROOF_ARTIFACT.items()
+            if PRODUCER_ARTIFACTS[contract].format(commit) == artifact_name
+        }
+        if set(parsed) != expected_in_artifact:
+            raise RuntimeError(
+                f"producer artifact {artifact_name} proof set is not exact: "
+                f"expected={sorted(expected_in_artifact)} actual={sorted(parsed)}"
+            )
+        parsed_by_artifact[artifact_name] = parsed
+
+    results: list[dict[str, Any]] = []
+    for proof_type in COMMUNITY_LOCAL_REQUIRED_PROOFS:
+        local_proof = local_by_type.get(proof_type)
+        if local_proof is None:
+            raise RuntimeError(f"Community Local is missing proof {proof_type}")
+        artifact_key = PRODUCER_PROOF_ARTIFACT.get(proof_type)
+        if artifact_key is None:
+            raise RuntimeError(f"no producer artifact contract for {proof_type}")
+        artifact_name = PRODUCER_ARTIFACTS[artifact_key].format(commit)
+        artifact, _files, archive_digest = downloaded[artifact_name]
+        proof, job = parsed_by_artifact[artifact_name][proof_type]
+        if (
+            local_proof.get("producer_artifact_name") != artifact_name
+            or local_proof.get("producer_evidence_digest") != proof.get("evidence_digest")
+            or local_proof.get("artifact_digest") != archive_digest
+        ):
+            raise RuntimeError(f"Community Local proof {proof_type} rewrote producer provenance")
+        workflow = proof["workflow"]
+        assert isinstance(workflow, dict)
+        results.append(
+            {
+                "proof_type": proof_type,
+                "artifact_name": artifact_name,
+                "artifact_id": artifact.get("id"),
+                "artifact_sha256": archive_digest,
+                "producer_evidence_digest": proof.get("evidence_digest"),
+                "job_id": job.get("id"),
+                "job": workflow.get("job"),
+                "workflow": workflow.get("workflow"),
+                "runner_os": workflow.get("runner_os"),
+                "policy_digest": proof.get("policy_digest"),
+            }
+        )
+    if set(seen_proofs) != set(COMMUNITY_LOCAL_REQUIRED_PROOFS):
+        raise RuntimeError("live producer proof set is not exact")
+    return results
 
 
 def _gate_record(repo: str, workflow: str, commit: str) -> dict[str, Any]:
@@ -551,6 +952,7 @@ def _gate_record(repo: str, workflow: str, commit: str) -> dict[str, Any]:
         native_proofs = []
     record = {
         "workflow": workflow,
+        "workflow_name": str(run.get("name") or workflow),
         "run_id": run_id,
         "run_attempt": int(run["run_attempt"]),
         "head_sha": run.get("head_sha"),
@@ -575,11 +977,22 @@ def _gate_record(repo: str, workflow: str, commit: str) -> dict[str, Any]:
 
 
 def _verify_main_ancestry(repo: str, commit: str) -> dict[str, Any]:
-    """Prove the release commit is an ancestor of protected ``main``."""
+    """Prove the release commit is the current protected ``main`` tip."""
     payload = _run_gh_api(repo, f"compare/{commit}...main")
+    ref_payload = _run_gh_api(repo, "git/ref/heads/main")
+    ref_object = ref_payload.get("object")
+    main_sha = ref_object.get("sha") if isinstance(ref_object, dict) else None
+    if main_sha != commit:
+        raise RuntimeError(
+            f"release commit {commit} is not the exact protected main SHA ({main_sha})"
+        )
     try:
-        behind_by = int(payload.get("behind_by"))
-        ahead_by = int(payload.get("ahead_by"))
+        raw_behind = payload.get("behind_by")
+        raw_ahead = payload.get("ahead_by")
+        if not isinstance(raw_behind, (int, str)) or not isinstance(raw_ahead, (int, str)):
+            raise RuntimeError("GitHub main ancestry comparison is incomplete")
+        behind_by = int(raw_behind)
+        ahead_by = int(raw_ahead)
     except (TypeError, ValueError) as exc:
         raise RuntimeError("GitHub main ancestry comparison is incomplete") from exc
     # The comparison uses the release commit as BASE and main as HEAD.  A
@@ -595,6 +1008,7 @@ def _verify_main_ancestry(repo: str, commit: str) -> dict[str, Any]:
         "status": payload.get("status"),
         "ahead_by": ahead_by,
         "behind_by": behind_by,
+        "main_sha": main_sha,
         "url": payload.get("html_url"),
     }
 
@@ -630,6 +1044,24 @@ def verify_release_gates(
             raise RuntimeError(
                 "security and Community Local evidence use different policy digests"
             )
+        producer_proofs = _verify_external_producers(
+            repo,
+            security_record=gates["security_closure"],
+            local_record=gates["community_local"],
+            commit=commit,
+        )
+        gates["community_local"]["producer_proofs"] = producer_proofs
+        gates["community_local"]["run_evidence_digest"] = _canonical_digest(
+            gates["community_local"]
+        )
+        gates["community_local"]["evidence_digest"] = gates["community_local"][
+            "run_evidence_digest"
+        ]
+        producer_policies = {
+            str(proof["policy_digest"]) for proof in producer_proofs
+        }
+        if producer_policies != {str(local_proof["policy_digest"])}:
+            raise RuntimeError("producer proofs do not share the Community Local policy digest")
     evidence = {
         "schema": "khaos.release-gate-evidence.v1",
         "profile": profile,
@@ -686,6 +1118,9 @@ def verify_release_gates_for_closure(
         local_record.get("local_proof"), dict
     ):
         raise RuntimeError("release verification has no Community Local evidence binding")
+    run_attempt = provenance.get("run_attempt")
+    if type(run_attempt) is not int:
+        raise RuntimeError("release verification provenance attempt is malformed")
     local_evidence_digest = local_record["local_proof"].get("local_evidence_digest")
     if not isinstance(local_evidence_digest, str):
         raise RuntimeError("release verification has no local evidence digest")
@@ -696,7 +1131,7 @@ def verify_release_gates_for_closure(
         commit=str(provenance.get("commit") or ""),
         event=str(provenance.get("event") or ""),
         branch=str(provenance.get("branch") or ""),
-        run_attempt=provenance.get("run_attempt"),
+        run_attempt=run_attempt,
         main_ancestry=evidence["main_ancestry"],
         gate_evidence_digests=gate_digests,
         release_evidence_digest=str(evidence.get("evidence_digest") or ""),

@@ -51,6 +51,15 @@ def test_production_probe_uses_the_named_volume_for_io_limits() -> None:
     assert 'dir=workspace_parent' in source
 
 
+def test_production_producers_share_one_runtime_composition_digest_recipe() -> None:
+    from khaos.security import production_lifecycle_probe
+
+    manifest = {"schema": "runtime-manifest", "components": {"backend": "linux"}}
+    assert production_composition_probe._runtime_composition_digest(manifest) == (
+        production_lifecycle_probe._runtime_composition_digest(manifest)
+    )
+
+
 def test_identity_oracle_retries_transient_empty_namespace_maps(monkeypatch) -> None:
     attempts = 0
     expected = object()

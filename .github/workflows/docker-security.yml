@@ -126,6 +126,24 @@ jobs:
           echo "KHAOS_PRODUCTION_DATA_SOURCE=/mnt/khaos-compose-workspace" >> "$GITHUB_ENV"
       - name: Run Compose development and production E2E
         run: bash scripts/compose-security-e2e.sh
+      - name: Upload production composition producer evidence
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: production-composition-evidence-${{ github.sha }}
+          path: |
+            producer-evidence/production-composition-proof.json
+            producer-evidence/production-composition-proof.junit.xml
+            producer-evidence/production-composition-proof.stdout.log
+            producer-evidence/production-composition-proof.stderr.log
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload production lifecycle producer evidence
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: production-lifecycle-evidence-${{ github.sha }}
+          path: producer-evidence/production-lifecycle-evidence/
+          if-no-files-found: error
+          retention-days: 14
       - name: Remove block-backed production workspace
         if: always()
         run: |

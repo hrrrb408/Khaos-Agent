@@ -10,10 +10,12 @@ audit file.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import hashlib
 import json
 import os
+import stat
 import tempfile
 import time
 from pathlib import Path
@@ -39,6 +41,13 @@ from khaos.security.identity_isolation import (
     read_linux_process_identity,
 )
 from khaos.security.principals import PrincipalKind, transport_root_delegation_digest
+from khaos.security.local_closure import LocalEvidenceError, canonical_digest
+from khaos.security.producer_evidence import (
+    PRODUCTION_COMPOSITION_PROOF,
+    build_runtime_producer_proof,
+    sha256_file,
+    write_producer_proof,
+)
 
 _IDENTITY_ORACLE_TIMEOUT_SECONDS = 15.0
 _IDENTITY_ORACLE_RETRY_SECONDS = 0.01
@@ -48,6 +57,24 @@ _COMPOSE_PRINCIPAL_KIND = PrincipalKind.AUTOMATION.value
 _COMPOSE_PARENT_PRINCIPAL_ID = "automation:compose-security-e2e"
 _COMPOSE_SESSION_ID = "compose-session"
 _COMPOSE_RUNTIME_ID = "compose-agent"
+_PRODUCTION_EXECUTION_CHAIN = (
+    "khaos.runtime.factory.RuntimeResult",
+    "khaos.coding.execution.service.ExecutionService",
+    "khaos.coding.execution.platform.LinuxBubblewrapBackend",
+    "khaos.coding.execution.supervisor.ProcessSupervisor",
+    "khaos.coding.execution.native_launcher",
+    "linux-kernel-pid-and-user-namespace",
+)
+
+
+def _runtime_composition_digest(runtime_manifest: dict[str, object]) -> str:
+    """Return the one canonical digest for the production execution chain."""
+    return canonical_digest(
+        {
+            "manifest": runtime_manifest,
+            "execution_chain": list(_PRODUCTION_EXECUTION_CHAIN),
+        }
+    )
 
 
 def _resource_digest(command: tuple[str, ...], workspace: Path) -> str:
@@ -211,10 +238,11 @@ def _probe_request(
     command: tuple[str, ...],
     workspace: Path,
     policy_digest: str,
+    timeout_seconds: float = 15.0,
 ) -> ExecutionRequest:
     """Build the same immutable authority pair used by approved execution."""
     environment = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}
-    budget = ResourceBudget(timeout_seconds=15.0, output_bytes=32 * 1024)
+    budget = ResourceBudget(timeout_seconds=timeout_seconds, output_bytes=32 * 1024)
     profile = PermissionProfile(
         filesystem=FileSystemAccess.READ_ONLY,
         workspace_roots=(workspace,),
@@ -358,9 +386,194 @@ async def _run_exact_effect(
         await service.close()
 
 
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("/tmp/production-composition-proof.json"),
+    )
+    return parser.parse_args()
+
+
+def _require_production_socket(path: Path, authority_uid: int) -> dict[str, object]:
+    """Return identity facts for the real authorityd endpoint."""
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise SystemExit(f"production authority socket is unavailable: {exc}") from exc
+    if not stat.S_ISSOCK(info.st_mode) or path.is_symlink():
+        raise SystemExit("production authority endpoint is not a non-symlink Unix socket")
+    if info.st_uid != authority_uid or info.st_mode & 0o007:
+        raise SystemExit("production authority socket ownership or mode is unsafe")
+    public_key_path = Path(os.environ["KHAOS_AUTHORITYD_PUBLIC_KEY_PATH"])
+    try:
+        key_info = public_key_path.lstat()
+    except OSError as exc:
+        raise SystemExit(f"production authority public key is unavailable: {exc}") from exc
+    if (
+        not stat.S_ISREG(key_info.st_mode)
+        or public_key_path.is_symlink()
+        or key_info.st_uid != authority_uid
+        or key_info.st_nlink != 1
+        or key_info.st_mode & 0o022
+    ):
+        raise SystemExit("production authority public key ownership or mode is unsafe")
+    return {
+        "socket_path": str(path),
+        "socket_owner_uid": int(info.st_uid),
+        "public_key_digest": sha256_file(public_key_path),
+        "authority_profile": os.environ.get("KHAOS_AUTHORITY_PROFILE", ""),
+    }
+
+
+async def _build_runtime_manifest() -> dict[str, object]:
+    """Build and verify the same structural production Runtime factory uses."""
+    if not Path("/app/khaos_policy.yaml").is_file():
+        raise SystemExit(
+            "production composition probe requires the mounted project policy"
+        )
+    from khaos.db.database import Database
+    from khaos.runtime import ProductionRuntimeConfig, build_production_runtime
+    from khaos.security.production_composition_manifest import verify_runtime_composition
+
+    with tempfile.TemporaryDirectory(prefix="khaos-runtime-composition-") as temporary:
+        database = Database(Path(temporary) / "composition.db")
+        await database.connect()
+        await database.run_migrations()
+        runtime = None
+        try:
+            runtime = await build_production_runtime(
+                ProductionRuntimeConfig(
+                    project_root=Path("/app"),
+                    config_path=Path("/app/config.yaml"),
+                    db=database,
+                    principal_id=_COMPOSE_PRINCIPAL_ID,
+                    principal_kind=_COMPOSE_PRINCIPAL_KIND,
+                    parent_principal_id=_COMPOSE_PARENT_PRINCIPAL_ID,
+                    source_transport="cron",
+                    project_id="compose",
+                    runtime_id=_COMPOSE_RUNTIME_ID,
+                )
+            )
+            manifest = verify_runtime_composition(runtime)
+            payload = manifest.to_payload()
+            if not manifest.valid or manifest.forbidden_detected:
+                raise SystemExit(
+                    "production runtime composition is invalid: "
+                    + "; ".join(manifest.errors)
+                )
+            return payload
+        finally:
+            if runtime is not None:
+                await runtime.aclose()
+            await database.close()
+
+
+def _runtime_diagnostics(
+    *,
+    proof_name: str,
+    output_dir: Path,
+    result: ExecutionResult,
+    oracle_detail: str,
+) -> dict[str, object]:
+    """Persist bounded producer diagnostics for the exact-effect oracle."""
+    import xml.etree.ElementTree as element_tree
+
+    passed = result.status == "passed" and not oracle_detail
+    junit = output_dir / f"{proof_name}.junit.xml"
+    suite = element_tree.Element(
+        "testsuite",
+        {
+            "name": proof_name,
+            "tests": "1",
+            "failures": "0" if passed else "1",
+            "errors": "0",
+        },
+    )
+    case = element_tree.SubElement(suite, "testcase", {"name": proof_name})
+    if not passed:
+        element_tree.SubElement(
+            case,
+            "failure",
+            {"message": (oracle_detail or result.stderr or result.status)[:512]},
+        )
+    element_tree.ElementTree(suite).write(
+        junit, encoding="utf-8", xml_declaration=True
+    )
+    stdout = output_dir / f"{proof_name}.stdout.log"
+    stderr = output_dir / f"{proof_name}.stderr.log"
+    stdout.write_text(result.stdout[-16_000:], encoding="utf-8")
+    stderr.write_text(
+        (result.stderr or oracle_detail)[-16_000:], encoding="utf-8"
+    )
+    from khaos.security.producer_evidence import diagnostics_from_junit
+
+    return diagnostics_from_junit(
+        proof_name=proof_name,
+        junit=junit,
+        returncode=0 if passed else (result.return_code or 1),
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+
+def _write_composition_proof(
+    *,
+    output: Path,
+    policy_digest: str,
+    authority_identity: dict[str, object],
+    runtime_manifest: dict[str, object],
+    launcher_digest: str,
+    result: ExecutionResult,
+    output_dir: Path,
+) -> None:
+    manifest_digest = canonical_digest(runtime_manifest)
+    diagnostics = _runtime_diagnostics(
+        proof_name=PRODUCTION_COMPOSITION_PROOF,
+        output_dir=output_dir,
+        result=result,
+        oracle_detail="",
+    )
+    workflow = {
+        "repository": os.environ.get("GITHUB_REPOSITORY", ""),
+        "workflow": os.environ.get("GITHUB_WORKFLOW", ""),
+        "run_id": os.environ.get("GITHUB_RUN_ID", ""),
+        "run_attempt": int(os.environ.get("GITHUB_RUN_ATTEMPT", "0")),
+        "event": os.environ.get("GITHUB_EVENT_NAME", ""),
+        "ref": os.environ.get("GITHUB_REF", ""),
+        "head_sha": os.environ.get("GITHUB_SHA", ""),
+        "runner_os": os.environ.get("RUNNER_OS", ""),
+        "job": os.environ.get("GITHUB_JOB", ""),
+    }
+    identity = {
+        "runtime_composition_digest": _runtime_composition_digest(runtime_manifest),
+        "production_composition_manifest_digest": manifest_digest,
+        "launcher_digest": launcher_digest,
+        "authority_proof_identity": authority_identity,
+        "authority_proof_digest": canonical_digest(authority_identity),
+        "host_backend_absent": True,
+        "dev_fallback_absent": os.environ.get("KHAOS_DEV_MODE") == "0",
+        "production_mode": os.environ.get("KHAOS_DEV_MODE") == "0",
+        "authority_profile": os.environ.get("KHAOS_AUTHORITY_PROFILE", ""),
+    }
+    proof = build_runtime_producer_proof(
+        proof_type=PRODUCTION_COMPOSITION_PROOF,
+        commit=os.environ.get("GITHUB_SHA", ""),
+        policy_digest=policy_digest,
+        workflow=workflow,
+        diagnostics=diagnostics,
+        production_identity=identity,
+    )
+    write_producer_proof(output, proof)
+
+
 def main() -> int:
-    if os.environ.get("KHAOS_DEV_MODE") == "1":
-        raise SystemExit("production composition probe refuses KHAOS_DEV_MODE=1")
+    args = _parse_args()
+    if os.environ.get("KHAOS_DEV_MODE") != "0":
+        raise SystemExit("production composition probe requires KHAOS_DEV_MODE=0")
+    if os.environ.get("KHAOS_AUTHORITY_PROFILE") != "native-production":
+        raise SystemExit("production composition probe requires native-production authority")
     policy_digest = os.environ.get("KHAOS_EFFECTIVE_POLICY_DIGEST")
     job_uid = os.environ.get("KHAOS_JOB_UID")
     if (
@@ -386,6 +599,27 @@ def main() -> int:
     workspace = Path(
         tempfile.mkdtemp(prefix="khaos-composition-", dir=workspace_parent)
     )
+    output = args.output.resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    authority_identity = _require_production_socket(
+        Path(os.environ["KHAOS_AUTHORITYD_SOCKET"]),
+        int(os.environ.get("KHAOS_AUTHORITYD_UID", "0")),
+    )
+    if os.getuid() != int(os.environ.get("KHAOS_AGENT_UID", str(os.getuid()))):
+        raise SystemExit("production composition probe is running as the wrong Agent UID")
+    runtime_manifest = asyncio.run(_build_runtime_manifest())
+    from khaos.coding.execution.platform import _linux_sandbox_launcher
+
+    sandbox_launcher = _linux_sandbox_launcher()
+    exec_launcher = Path(os.environ.get("KHAOS_EXEC_LAUNCHER", ""))
+    if sandbox_launcher is None or not exec_launcher.is_file() or exec_launcher.is_symlink():
+        raise SystemExit("production native launcher identity is unavailable")
+    launcher_digest = canonical_digest(
+        {
+            "sandbox_launcher": sha256_file(sandbox_launcher),
+            "exec_launcher": sha256_file(exec_launcher),
+        }
+    )
     command = (
         "/bin/sh",
         "-c",
@@ -407,9 +641,18 @@ def main() -> int:
             raise SystemExit(
                 "production composition probe did not observe the configured job UID"
             )
+        _write_composition_proof(
+            output=output,
+            policy_digest=policy_digest,
+            authority_identity=authority_identity,
+            runtime_manifest=runtime_manifest,
+            launcher_digest=launcher_digest,
+            result=result,
+            output_dir=output.parent,
+        )
         print(
             "production exact-effect composition: "
-            "ExecutionService -> ProcessSupervisor -> exec.host receipt -> "
+            "ProductionRuntime -> ExecutionService -> ProcessSupervisor -> "
             "native launcher -> bwrap -> child -> WORM success; "
             f"observed job UID {evidence.uid_map.splitlines()[-1]}"
         )

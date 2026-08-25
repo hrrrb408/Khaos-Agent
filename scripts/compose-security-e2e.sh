@@ -7,6 +7,8 @@ project_name="${COMPOSE_PROJECT_NAME:-khaos-compose-e2e}"
 active_compose_file=""
 worm_pid=""
 worm_store="$secret_dir/worm-audit.jsonl"
+producer_evidence_dir="$repo_root/producer-evidence"
+production_lifecycle_evidence_dir="$producer_evidence_dir/production-lifecycle-evidence"
 
 cleanup() {
     if [[ -n "$worm_pid" ]]; then
@@ -139,6 +141,21 @@ export KHAOS_AUDIT_WORM_ENDPOINT="https://host.docker.internal:${KHAOS_WORM_PORT
 export KHAOS_AUDIT_WORM_CA_FILE="$secret_dir/worm-cert.pem"
 
 cd "$repo_root"
+mkdir -p "$producer_evidence_dir"
+mkdir -p "$production_lifecycle_evidence_dir"
+rm -f \
+    "$producer_evidence_dir/production-composition-proof.json" \
+    "$producer_evidence_dir/production-composition-proof.junit.xml" \
+    "$producer_evidence_dir/production-composition-proof.stdout.log" \
+    "$producer_evidence_dir/production-composition-proof.stderr.log" \
+    "$producer_evidence_dir/production-process-tree-proof.json" \
+    "$producer_evidence_dir/production-resource-owner-proof.json" \
+    "$production_lifecycle_evidence_dir/production-process-tree-proof.json" \
+    "$production_lifecycle_evidence_dir/production-resource-owner-proof.json" \
+    "$production_lifecycle_evidence_dir/production-lifecycle-cases.json" \
+    "$production_lifecycle_evidence_dir/production-lifecycle.junit.xml" \
+    "$production_lifecycle_evidence_dir/production-lifecycle.stdout.log" \
+    "$production_lifecycle_evidence_dir/production-lifecycle.stderr.log"
 
 validate_execution_cgroup_source() {
     local source="${KHAOS_EXECUTION_CGROUP_SOURCE:-}"
@@ -321,8 +338,19 @@ run_profile() {
             --project-name "$project_name" \
             --project-directory "$repo_root" \
             --file "$repo_root/$compose_file" \
-            exec -T khaos-agent \
-            python -m khaos.security.production_composition_probe; then
+            exec -T \
+            -e GITHUB_REPOSITORY="${GITHUB_REPOSITORY:-}" \
+            -e GITHUB_WORKFLOW="${GITHUB_WORKFLOW:-}" \
+            -e GITHUB_EVENT_NAME="${GITHUB_EVENT_NAME:-}" \
+            -e GITHUB_REF="${GITHUB_REF:-}" \
+            -e GITHUB_SHA="${GITHUB_SHA:-}" \
+            -e GITHUB_RUN_ID="${GITHUB_RUN_ID:-}" \
+            -e GITHUB_RUN_ATTEMPT="${GITHUB_RUN_ATTEMPT:-}" \
+            -e RUNNER_OS="${RUNNER_OS:-}" \
+            -e GITHUB_JOB="${GITHUB_JOB:-compose-deployment}" \
+            khaos-agent \
+            python -m khaos.security.production_composition_probe \
+            --output /tmp/production-composition-proof.json; then
             docker compose \
                 --project-name "$project_name" \
                 --project-directory "$repo_root" \
@@ -330,6 +358,48 @@ run_profile() {
                 logs --no-color --tail=200 khaos-authorityd khaos-agent || true
             return 1
         fi
+        for evidence_file in \
+            production-composition-proof.json \
+            production-composition-proof.junit.xml \
+            production-composition-proof.stdout.log \
+            production-composition-proof.stderr.log; do
+            docker compose \
+                --project-name "$project_name" \
+                --project-directory "$repo_root" \
+                --file "$repo_root/$compose_file" \
+                cp "khaos-agent:/tmp/$evidence_file" \
+                "$producer_evidence_dir/$evidence_file"
+        done
+        if ! docker compose \
+            --project-name "$project_name" \
+            --project-directory "$repo_root" \
+            --file "$repo_root/$compose_file" \
+            exec -T \
+            -e GITHUB_REPOSITORY="${GITHUB_REPOSITORY:-}" \
+            -e GITHUB_WORKFLOW="${GITHUB_WORKFLOW:-}" \
+            -e GITHUB_EVENT_NAME="${GITHUB_EVENT_NAME:-}" \
+            -e GITHUB_REF="${GITHUB_REF:-}" \
+            -e GITHUB_SHA="${GITHUB_SHA:-}" \
+            -e GITHUB_RUN_ID="${GITHUB_RUN_ID:-}" \
+            -e GITHUB_RUN_ATTEMPT="${GITHUB_RUN_ATTEMPT:-}" \
+            -e RUNNER_OS="${RUNNER_OS:-}" \
+            -e GITHUB_JOB="${GITHUB_JOB:-compose-deployment}" \
+            khaos-agent \
+            python -m khaos.security.production_lifecycle_probe \
+            --output-dir /tmp/production-lifecycle-evidence; then
+            docker compose \
+                --project-name "$project_name" \
+                --project-directory "$repo_root" \
+                --file "$repo_root/$compose_file" \
+                logs --no-color --tail=200 khaos-authorityd khaos-agent || true
+            return 1
+        fi
+        docker compose \
+            --project-name "$project_name" \
+            --project-directory "$repo_root" \
+            --file "$repo_root/$compose_file" \
+            cp khaos-agent:/tmp/production-lifecycle-evidence/. \
+            "$production_lifecycle_evidence_dir/"
         python3 - "$worm_store" <<'PY'
 import json
 import sys

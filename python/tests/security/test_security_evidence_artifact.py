@@ -41,8 +41,9 @@ def _fragment() -> dict[str, object]:
     }
 
 
-def test_final_artifact_has_exact_required_evidence(tmp_path: Path):
+def test_final_artifact_has_exact_required_evidence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     module = _module()
+    monkeypatch.setenv("KHAOS_DEV_MODE", "0")
     fragment = tmp_path / "fragment.json"
     output = tmp_path / "evidence.json"
     fragments = tmp_path / "test-fragments"
@@ -55,9 +56,7 @@ def test_final_artifact_has_exact_required_evidence(tmp_path: Path):
                 run_id="run-1",
                 job=f"job-{name}",
                 test=name,
-                result="blocked",
                 runner_os="Linux",
-                production_mode="true",
                 output=str(fragments / f"{name}.json"),
             )
         )
@@ -119,9 +118,7 @@ def test_final_artifact_rejects_missing_or_forged_test_evidence(tmp_path: Path):
             run_id="run-1",
             job="schema-job",
             test="schema_injection",
-            result="blocked",
             runner_os="Linux",
-            production_mode="true",
             output=str(fragments / "schema.json"),
         )
     )

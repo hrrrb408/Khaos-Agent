@@ -46,6 +46,14 @@ def test_security_workflows_have_read_only_token_and_no_soft_failures():
                 "id-token": "write",
                 "attestations": "write",
             }, workflow.name
+        elif workflow.name == "community-local-closure.yml":
+            # The aggregator downloads exact-run artifacts from the Actions
+            # API.  Keep this as the only read-only Actions permission; it
+            # cannot publish, mutate workflows, or write repository contents.
+            assert parsed["permissions"] == {
+                "contents": "read",
+                "actions": "read",
+            }, workflow.name
         else:
             assert parsed["permissions"] == {"contents": "read"}, workflow.name
         assert "continue-on-error" not in text, workflow.name

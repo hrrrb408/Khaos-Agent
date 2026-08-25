@@ -129,11 +129,14 @@ _WORKFLOW_KEYS = frozenset(
 _PROOF_KEYS = frozenset(
     {
         "name",
+        "proof_type",
         "status",
         "profile",
         "commit",
         "policy_digest",
         "artifact_digest",
+        "producer_artifact_name",
+        "producer_evidence_digest",
         "provenance",
     }
 )
@@ -237,6 +240,29 @@ def _parse_proof(
     artifact_digest = _require_digest(
         mapping.get("artifact_digest"), f"proof {name}.artifact_digest"
     )
+    producer_artifact_name = mapping.get("producer_artifact_name")
+    if producer_artifact_name is not None:
+        _require_nonempty_string(
+            producer_artifact_name, f"proof {name}.producer_artifact_name"
+        )
+    producer_evidence_digest = mapping.get("producer_evidence_digest")
+    if producer_evidence_digest is not None:
+        _require_digest(
+            producer_evidence_digest, f"proof {name}.producer_evidence_digest"
+        )
+    if profile is LocalSecurityProfile.COMMUNITY_LOCAL and (
+        "proof_type" not in mapping
+        or not isinstance(producer_artifact_name, str)
+        or not producer_artifact_name
+        or not isinstance(producer_evidence_digest, str)
+        or not producer_evidence_digest
+    ):
+        raise LocalEvidenceError(
+            f"Community Local proof {name!r} lacks independent producer provenance"
+        )
+    proof_type = mapping.get("proof_type", name)
+    if proof_type != name:
+        raise LocalEvidenceError(f"proof {name!r} has a mismatched proof_type")
     provenance = _parse_workflow(
         mapping.get("provenance"), commit=commit, require_job=True
     )
@@ -248,6 +274,14 @@ def _parse_proof(
         policy_digest=policy_digest,
         artifact_digest=artifact_digest,
         provenance=provenance,
+        producer_artifact_name=(
+            producer_artifact_name if isinstance(producer_artifact_name, str) else ""
+        ),
+        producer_evidence_digest=(
+            producer_evidence_digest
+            if isinstance(producer_evidence_digest, str)
+            else ""
+        ),
     )
 
 
@@ -262,6 +296,8 @@ class LocalProof:
     policy_digest: str
     artifact_digest: str
     provenance: Mapping[str, object]
+    producer_artifact_name: str = ""
+    producer_evidence_digest: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -445,6 +481,20 @@ class ClosureEvidence:
         )
         if len({proof.name for proof in proofs}) != len(proofs):
             raise LocalEvidenceError("closure proof names must be unique")
+        if profile is LocalSecurityProfile.COMMUNITY_LOCAL:
+            proof_names = {proof.name for proof in proofs}
+            required_names = set(COMMUNITY_LOCAL_REQUIRED_PROOFS)
+            if proof_names != required_names:
+                unexpected = sorted(proof_names - required_names)
+                missing = sorted(required_names - proof_names)
+                details = []
+                if missing:
+                    details.append("missing=" + ",".join(missing))
+                if unexpected:
+                    details.append("unexpected=" + ",".join(unexpected))
+                raise LocalEvidenceError(
+                    "Community Local proof set is not exact: " + "; ".join(details)
+                )
         raw_status = payload.get("profile_status")
         if not isinstance(raw_status, Mapping):
             raise LocalEvidenceError("profile_status must be an object")
