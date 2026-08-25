@@ -1825,6 +1825,7 @@ class LinuxBubblewrapBackend:
 
     async def execute(self, request):
         from dataclasses import replace
+        production_composition = not _development_mode()
         if self.admission_closed:
             raise PermissionError(
                 f"Linux bubblewrap backend is {self._state.value}, not accepting executions"
@@ -2000,7 +2001,16 @@ class LinuxBubblewrapBackend:
                     directory_binding=directory_binding,
                     preserve_directory_fds=True,
                     env=outer_environment,
-                    termination_callback=terminate_backend_descendants,
+                    # The descendant callback owns production's native PID-1
+                    # composition. Development bwrap deliberately keeps its
+                    # own namespace reaper, so it must use the generic
+                    # supervisor signal path instead of waiting for bwrap to
+                    # reap itself as a child.
+                    termination_callback=(
+                        terminate_backend_descendants
+                        if production_composition
+                        else None
+                    ),
                 )
             except (OSError, PermissionError):
                 self._capability_cache = None

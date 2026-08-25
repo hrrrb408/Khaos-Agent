@@ -388,10 +388,14 @@ def test_linux_cgroup_tree_termination_orders_children_before_namespace_init():
 
 @pytest.mark.asyncio
 @pytest.mark.posix_host
+@pytest.mark.parametrize(
+    ("dev_mode", "expects_backend_callback"),
+    ((False, True), (True, False)),
+)
 async def test_linux_execute_joins_cgroup_before_bwrap_and_seccomp_after(
-    tmp_path: Path, monkeypatch,
+    tmp_path: Path, monkeypatch, dev_mode: bool, expects_backend_callback: bool,
 ):
-    """The host cgroup join precedes bwrap; seccomp is installed inside it."""
+    """The host cgroup join precedes bwrap in both compositions."""
     from khaos.coding.execution import platform as platform_module
 
     workspace = tmp_path / "workspace"
@@ -401,6 +405,16 @@ async def test_linux_execute_joins_cgroup_before_bwrap_and_seccomp_after(
     (cgroup / "cgroup.procs").write_text("", encoding="ascii")
     launcher = Path("/trusted/khaos-sandbox-launcher")
     captured: dict[str, object] = {}
+    if dev_mode:
+        monkeypatch.setenv("KHAOS_DEV_MODE", "1")
+    else:
+        monkeypatch.delenv("KHAOS_DEV_MODE", raising=False)
+        monkeypatch.setenv("KHAOS_AGENT_UID", str(os.geteuid()))
+        monkeypatch.setenv("KHAOS_AUTHORITYD_UID", "65533")
+        monkeypatch.setenv("KHAOS_JOB_UID", "65534")
+        monkeypatch.setattr(
+            platform_module, "_resolve_bwrap_path", lambda: "/usr/bin/bwrap"
+        )
 
     class RecordingSupervisor:
         async def run(self, request, **_kwargs):
@@ -436,11 +450,14 @@ async def test_linux_execute_joins_cgroup_before_bwrap_and_seccomp_after(
 
     argv = captured["argv"]
     assert isinstance(argv, tuple)
-    assert callable(captured["termination_callback"])
+    if expects_backend_callback:
+        assert callable(captured["termination_callback"])
+    else:
+        assert captured["termination_callback"] is None
     assert argv[:4] == (
         str(launcher), "--join-cgroup", str(cgroup / "cgroup.procs"), "--",
     )
-    assert argv[4] == "bwrap"
+    assert Path(argv[4]).name == "bwrap"
     assert (str(launcher), "--", "/bin/echo", "ok") == argv[-4:]
     assert "/run/khaos-cgroup.procs" not in argv
 
