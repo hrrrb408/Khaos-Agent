@@ -1258,6 +1258,12 @@ class ProcessSupervisor:
                     # caller receives the cleanup error and the backend keeps
                     # its lease quarantined instead of reporting CLOSED.
                     callback_error = exc
+            # A backend callback may have waited the shared subprocess task so
+            # its native parent could reap a namespace-init child.  Record
+            # that completed wait before deciding whether the fallback signal
+            # path is still needed; returncode synchronization can lag the
+            # asyncio wait result by one event-loop turn.
+            self._record_process_exit(active, process_wait_task)
             if not _has_terminal_process_proof(active):
                 # Cancelling the deadline race's wait and creating a second
                 # ``process.wait()`` can race the asyncio subprocess

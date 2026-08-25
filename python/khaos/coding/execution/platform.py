@@ -1942,6 +1942,36 @@ class LinuxBubblewrapBackend:
                         lease.path,
                         direct_pid=direct_pid,
                     )
+                    # Bubblewrap is the host-side parent of the PID-namespace
+                    # init.  Once the backend has terminated the payload and
+                    # namespace init, let that same parent reap its child and
+                    # complete the already-published supervisor wait task.
+                    # Sending the supervisor's process-group signal first can
+                    # kill both processes in the same scheduling window and
+                    # reparent the namespace-init zombie to container init.
+                    # That is an externally observable resource leak, not a
+                    # terminal process proof.  A bounded wait keeps cleanup
+                    # fail-closed: the supervisor still owns the fallback
+                    # signal path when bubblewrap cannot reach a terminal
+                    # state.
+                    wait_task = (
+                        active.process_wait_task
+                        if active is not None
+                        else None
+                    )
+                    if wait_task is None and active is not None:
+                        wait_task = asyncio.create_task(active.process.wait())
+                        active.process_wait_task = wait_task
+                    if wait_task is not None and not wait_task.done():
+                        try:
+                            await asyncio.wait_for(
+                                asyncio.shield(wait_task),
+                                timeout=supervisor.termination_grace_seconds,
+                            )
+                        except asyncio.TimeoutError as exc:
+                            raise TimeoutError(
+                                "production launcher did not reap its namespace init"
+                            ) from exc
 
                 return await supervisor.run(
                     sandboxed,
