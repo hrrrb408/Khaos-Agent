@@ -47,13 +47,13 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --tag "$RELEASE_TAG" \
             --token "$GH_TOKEN"
-          # A tag event proves only that a tag exists.  Require successful
-          # aggregate Security Closure, Product Integrity, and native
-          # authority E2E runs for this exact commit before producing any
-          # attestable subject.
+          # A tag event proves only that a tag exists. Require the
+          # Community Local profile's exact-main aggregate gates and local
+          # evidence artifact before producing any attestable subject.
           PYTHONPATH=python python3 scripts/verify_release_gate_runs.py \
             --repo "$GITHUB_REPOSITORY" \
             --commit "$release_commit" \
+            --profile community-local \
             --output dist/release-gate-evidence.json
           git archive --format=tar.gz --prefix="khaos-${RELEASE_TAG}/" \
             -o "dist/khaos-${RELEASE_TAG}-source.tar.gz" HEAD
@@ -66,6 +66,7 @@ jobs:
             --repo-root "$GITHUB_WORKSPACE" \
             --artifact-dir "$GITHUB_WORKSPACE/dist" \
             --commit "$release_commit" --tag "$RELEASE_TAG" \
+            --profile community-local \
             --gate-evidence "$GITHUB_WORKSPACE/dist/release-gate-evidence.json"
       - name: Generate signed SLSA provenance attestation
         id: provenance

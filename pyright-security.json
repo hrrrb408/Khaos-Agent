@@ -1,0 +1,10 @@
+{
+  "include": [
+    "python/khaos/security/local_closure.py",
+    "python/khaos/tools/admission.py",
+    "python/khaos/tools/execution_coordinator.py"
+  ],
+  "extraPaths": ["python"],
+  "pythonVersion": "3.11",
+  "typeCheckingMode": "strict"
+}

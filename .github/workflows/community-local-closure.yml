@@ -1,0 +1,54 @@
+name: Community Local Security Closure
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: community-local-closure-${{ github.event_name }}-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  community-local:
+    name: Community Local adversarial evidence
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      KHAOS_AUTHORITY_PROFILE: community
+      KHAOS_DEV_MODE: "0"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install test dependencies
+        run: |
+          python -m pip install --require-hashes -r python/bootstrap-requirements.txt
+          uv sync --frozen --extra test --extra lsp
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+      - name: Regenerate repository security inventories
+        run: |
+          python scripts/generate_security_inventory.py --check
+          python scripts/generate_production_reachability.py --check
+          python scripts/validate_m6_governance.py
+      - name: Collect exact-main Community Local evidence
+        run: |
+          PYTHONPATH=python python scripts/collect_local_security_evidence.py \
+            --repo-root "$GITHUB_WORKSPACE" \
+            --commit "$GITHUB_SHA" \
+            --output local-security-evidence.json
+      - name: Upload producer-owned local evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: local-security-evidence-${{ github.sha }}
+          path: local-security-evidence.json
+          if-no-files-found: error
+          retention-days: 14

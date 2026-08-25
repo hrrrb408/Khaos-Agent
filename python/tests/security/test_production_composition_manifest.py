@@ -180,6 +180,18 @@ def test_forbidden_host_backend_name_is_detected_by_name() -> None:
         check=False,
         capture_output=True,
         text=True,
+        env={
+            **os.environ,
+            "PYTHONPATH": os.pathsep.join(
+                filter(
+                    None,
+                    (
+                        str(Path(__file__).resolve().parents[3] / "python"),
+                        os.environ.get("PYTHONPATH", ""),
+                    ),
+                )
+            ),
+        },
     )
     assert probe.returncode == 0, probe.stderr
 
@@ -202,6 +214,40 @@ def test_forbidden_host_backend_name_is_detected_by_name() -> None:
     manifest = verify_runtime_composition(_Runtime())
     assert manifest.valid is False
     assert "khaos.coding.execution.host.HostExecutionBackend" in manifest.forbidden_detected
+
+
+@pytest.mark.parametrize(
+    ("module", "qualname"),
+    [
+        ("khaos.security.mock_authority", "MockAuthority"),
+        ("khaos.coding.execution.host", "HostBackend"),
+        ("khaos.coding.execution.testing_sandbox", "TestingSandbox"),
+        ("khaos.runtime.testing", "TestingRuntimeComposition"),
+    ],
+)
+def test_forbidden_testing_compositions_are_detected_without_importing_them(
+    module: str, qualname: str
+) -> None:
+    from khaos.security.production_composition_manifest import (
+        FORBIDDEN_TYPE_NAMES,
+        verify_runtime_composition,
+    )
+
+    expected = f"{module}.{qualname}"
+    assert expected in FORBIDDEN_TYPE_NAMES
+
+    class _FakeComponent:
+        pass
+
+    _FakeComponent.__module__ = module
+    _FakeComponent.__qualname__ = qualname
+
+    class _Runtime:
+        component = _FakeComponent()
+
+    manifest = verify_runtime_composition(_Runtime())
+    assert manifest.valid is False
+    assert expected in manifest.forbidden_detected
 
 
 def test_graph_walk_is_bounded() -> None:

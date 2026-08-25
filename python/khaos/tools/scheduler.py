@@ -51,7 +51,7 @@ from khaos.security.orchestration_phases import (
     digest_phase_payload,
 )
 from khaos.security.protocol_boundary import canonical_digest as _canonical_digest
-from khaos.tools.admission import RejectedToolCall, ToolAdmission
+from khaos.tools.admission import AdmittedToolCall, RejectedToolCall, ToolAdmission
 from khaos.tools.approval_callback import (
     ApprovalCallbackRunner,
     ConfirmCallback,
@@ -358,8 +358,9 @@ class ToolScheduler:
                     ),
                 )
                 continue
-            normalized = admission.call
+            normalized = admission.scheduler_state()
             tool = admission.tool
+            admission.assert_unchanged(normalized)
             # Production AgentLoop calls are already bound to a server key.
             # Generate one here as a defense-in-depth boundary for direct
             # scheduler callers that do not provide an explicit key.  The
@@ -581,6 +582,7 @@ class ToolScheduler:
                     call=normalized,
                     tool_context=tool_context,
                 )
+                admission.assert_unchanged(normalized)
             except (PermissionError, ValueError) as exc:
                 await self._close_network_broker(normalized)
                 yield SchedulerEvent(
@@ -701,6 +703,7 @@ class ToolScheduler:
                 )
                 yield SchedulerEvent(event="permission_request", permission_request=request)
                 confirmation = await self._confirm(request, confirm_callback)
+                admission.assert_unchanged(normalized)
                 confirmation = await broker.consume_for_dispatch(
                     normalized["id"],
                     bool(confirmation.get("approved", False)),
@@ -709,6 +712,7 @@ class ToolScheduler:
                     session_id=current_session,
                     binding_digest=binding_digest,
                 )
+                admission.assert_unchanged(normalized)
                 if not confirmation.get("approved", False):
                     await self._close_network_broker(normalized)
                     if destructive_context is not None:
@@ -903,6 +907,19 @@ class ToolScheduler:
         reservation: ToolBudgetReservation,
     ) -> ToolResult:
         start = time.monotonic()
+        admitted_call = call.get("_admitted_call")
+        if isinstance(admitted_call, AdmittedToolCall):
+            admitted_call.assert_unchanged(call)
+            # Every security decision below receives a detached copy of the
+            # immutable admission snapshot.  Scheduler metadata remains
+            # mutable, but model-controlled arguments cannot be substituted
+            # between approval, authority construction, and dispatch.
+            call = dict(call)
+            call["arguments"] = admitted_call.materialize_arguments()
+        elif tool_context.get("production_runtime"):
+            raise PermissionDeniedError(
+                "production execution requires an immutable admitted tool call"
+            )
         tool = self.registry.get(call["name"])
         resource: AuthorizationResource | None = call.get("_authorization_resource")
         target = self._resolve_target(tool.name, call.get("arguments", {}), resource)
@@ -1083,6 +1100,9 @@ class ToolScheduler:
                 timeout=float(tool.timeout),
                 default_effect_status=self._declared_effect_status(tool),
                 reconciliation_hint=reconciliation_hint,
+                admitted_call=admitted_call
+                if isinstance(admitted_call, AdmittedToolCall)
+                else None,
             )
             output = outcome.output
             handler_ok = outcome.ok
@@ -1459,6 +1479,14 @@ class ToolScheduler:
         usable; ``build_runtime`` still rejects an empty production principal
         before a scheduler can be exposed.
         """
+        admitted_call = call.get("_admitted_call")
+        if isinstance(admitted_call, AdmittedToolCall):
+            admitted_call.assert_unchanged(call)
+            call["arguments"] = admitted_call.materialize_arguments()
+        elif tool_context.get("production_runtime"):
+            raise PermissionDeniedError(
+                "production authority construction requires an immutable admitted tool call"
+            )
         principal_id = str(tool_context.get("principal_id") or "legacy-principal")
         principal_kind = str(tool_context.get("principal_kind") or "")
         parent_principal_id = str(tool_context.get("parent_principal_id") or "")
@@ -1714,6 +1742,14 @@ class ToolScheduler:
         tool_context: dict[str, Any],
     ) -> None:
         """Bind concrete sandbox evidence before the approval snapshot."""
+        admitted_call = call.get("_admitted_call")
+        if isinstance(admitted_call, AdmittedToolCall):
+            admitted_call.assert_unchanged(call)
+            call["arguments"] = admitted_call.materialize_arguments()
+        elif tool_context.get("production_runtime"):
+            raise PermissionDeniedError(
+                "production sandbox authority requires an immutable admitted tool call"
+            )
         if not _tool_has_capability(tool, "process.execute"):
             return
         argv = _execution_argv_for_authority(tool.name, call.get("arguments", {}))
@@ -1829,6 +1865,14 @@ class ToolScheduler:
         there is no direct-host process path hidden behind the legacy
         ``unrestricted-with-approval`` label.
         """
+        admitted_call = call.get("_admitted_call")
+        if isinstance(admitted_call, AdmittedToolCall):
+            admitted_call.assert_unchanged(call)
+            call["arguments"] = admitted_call.materialize_arguments()
+        elif tool_context.get("production_runtime"):
+            raise PermissionDeniedError(
+                "production network authority requires an immutable admitted tool call"
+            )
         if not _tool_has_capability(tool, "process.execute"):
             return
         if str(getattr(tool, "execution_kind", "host-sandbox")) in {

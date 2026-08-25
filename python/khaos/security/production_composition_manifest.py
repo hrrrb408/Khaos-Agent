@@ -46,9 +46,17 @@ FORBIDDEN_TYPE_NAMES = frozenset(
     {
         # The host execution backend is the forbidden production fallback.
         "khaos.coding.execution.host.HostExecutionBackend",
+        "khaos.coding.execution.host.HostBackend",
         # In-process / test / mock network and authority substitutions.
         "unittest.mock.Mock",
         "unittest.mock.MagicMock",
+        # Explicit composition names are kept here even when the forbidden
+        # modules are absent from the production graph.  A test/dev adapter
+        # injected through an object graph must fail closed without importing
+        # the adapter module into this verifier.
+        "khaos.security.mock_authority.MockAuthority",
+        "khaos.coding.execution.testing_sandbox.TestingSandbox",
+        "khaos.runtime.testing.TestingRuntimeComposition",
     }
 )
 

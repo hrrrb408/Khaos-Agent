@@ -185,3 +185,23 @@ async def test_dev_mode_allows_security_component_injection(tmp_path, monkeypatc
     )
     assert cfg.tool_scheduler is not None
     assert cfg.sandbox is not None
+
+
+@pytest.mark.asyncio
+async def test_production_structural_config_rejects_mock_borrowed_authority(
+    tmp_path, monkeypatch
+):
+    """A borrowed production slot cannot carry a mock authority."""
+    monkeypatch.delenv("KHAOS_DEV_MODE", raising=False)
+    from khaos.runtime import ProductionRuntimeConfig, build_production_runtime
+    from unittest.mock import MagicMock
+
+    cfg = ProductionRuntimeConfig(
+        project_root=tmp_path,
+        db=MagicMock(),
+        principal_id="local-uid:1000",
+        source_transport="cli",
+        approval_broker=MagicMock(),
+    )
+    with pytest.raises(PermissionError, match="forbidden testing/mock composition"):
+        await build_production_runtime(cfg)

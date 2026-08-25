@@ -25,6 +25,11 @@ _GENERATED_NAMES = {
     "release-gate-evidence.json",
     "sbom.spdx.json",
 }
+_COMMUNITY_LOCAL_GATES = {
+    "security_closure": "security-closure-gate.yml",
+    "product_integrity": "product-integrity-gate.yml",
+    "community_local": "community-local-closure.yml",
+}
 
 
 def _sha256(path: Path) -> str:
@@ -192,10 +197,16 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--commit", required=True)
     parser.add_argument("--tag", required=True)
     parser.add_argument("--gate-evidence", type=Path, required=True)
+    parser.add_argument("--profile", default="legacy-native")
     return parser.parse_args()
 
 
-def _load_gate_evidence(path: Path, commit: str) -> dict[str, Any]:
+def _load_gate_evidence(
+    path: Path,
+    commit: str,
+    *,
+    profile: str = "legacy-native",
+) -> dict[str, Any]:
     """Validate the exact successful gate evidence selected for this release."""
     try:
         evidence = json.loads(path.read_text(encoding="utf-8"))
@@ -209,6 +220,8 @@ def _load_gate_evidence(path: Path, commit: str) -> dict[str, Any]:
         raise SystemExit(
             f"release gate evidence commit mismatch: {evidence.get('commit')} != {commit}"
         )
+    if evidence.get("profile", "legacy-native") != profile:
+        raise SystemExit("release gate evidence profile mismatch")
     supplied_digest = evidence.get("evidence_digest")
     unsigned = dict(evidence)
     unsigned.pop("evidence_digest", None)
@@ -226,11 +239,15 @@ def _load_gate_evidence(path: Path, commit: str) -> dict[str, Any]:
     gates = evidence.get("gates")
     if not isinstance(gates, dict):
         raise SystemExit("release gate evidence has no gate records")
-    required = {
-        "security_closure": "security-closure-gate.yml",
-        "product_integrity": "product-integrity-gate.yml",
-        "native_authority": "native-authority-production-e2e.yml",
-    }
+    required = (
+        _COMMUNITY_LOCAL_GATES
+        if profile == "community-local"
+        else {
+            "security_closure": "security-closure-gate.yml",
+            "product_integrity": "product-integrity-gate.yml",
+            "native_authority": "native-authority-production-e2e.yml",
+        }
+    )
     required_native_artifacts = {"native-authority-windows-proof"}
     for name, workflow in required.items():
         record = gates.get(name)
@@ -307,6 +324,41 @@ def _load_gate_evidence(path: Path, commit: str) -> dict[str, Any]:
                     raise SystemExit(
                         "native authority macOS evidence artifact is not valid"
                     )
+        if name == "community_local":
+            expected_artifact = f"local-security-evidence-{commit}"
+            matches = [
+                artifact
+                for artifact in record.get("artifacts", [])
+                if isinstance(artifact, dict)
+                and artifact.get("name") == expected_artifact
+            ]
+            if len(matches) != 1:
+                raise SystemExit(
+                    f"community local evidence artifact is missing: {expected_artifact}"
+                )
+            artifact = matches[0]
+            if (
+                artifact.get("expired") is not False
+                or not isinstance(artifact.get("digest"), str)
+                or not artifact["digest"].strip()
+            ):
+                raise SystemExit(
+                    f"community local evidence artifact is not valid: {expected_artifact}"
+                )
+    provenance = evidence.get("github_provenance")
+    if profile == "community-local":
+        if not isinstance(provenance, dict) or any(
+            provenance.get(key) != value
+            for key, value in {
+                "status": "VERIFIED",
+                "repository": "hrrrb408/Khaos-Agent",
+                "commit": commit,
+                "event": "push",
+                "branch": "main",
+                "run_attempt": 1,
+            }.items()
+        ):
+            raise SystemExit("community local release evidence lacks exact GitHub provenance")
     return evidence
 
 
@@ -323,7 +375,11 @@ def main() -> int:
     artifact_dir = args.artifact_dir.resolve()
     artifact_dir.mkdir(parents=True, exist_ok=True)
     gate_evidence_path = args.gate_evidence.resolve()
-    gate_evidence = _load_gate_evidence(gate_evidence_path, args.commit)
+    gate_evidence = _load_gate_evidence(
+        gate_evidence_path,
+        args.commit,
+        profile=args.profile,
+    )
 
     actual_commit = subprocess.check_output(
         ["git", "-C", str(repo_root), "rev-parse", "HEAD"], text=True
@@ -364,6 +420,7 @@ def main() -> int:
         "schema": "khaos.release-evidence.v1",
         "tag": args.tag,
         "commit": args.commit,
+        "profile": args.profile,
         "toolchain": toolchain,
         "lockfiles": lock_digests,
         "artifacts": artifact_records,
@@ -379,6 +436,7 @@ def main() -> int:
             "evidence_file": gate_evidence_path.name,
             "evidence_sha256": _sha256(gate_evidence_path),
             "evidence_digest": gate_evidence["evidence_digest"],
+            "profile": gate_evidence.get("profile", args.profile),
             "gates": {
                 name: {
                     "workflow": record["workflow"],

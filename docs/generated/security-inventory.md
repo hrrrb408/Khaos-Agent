@@ -32,7 +32,7 @@
 
 ## GitHub Actions governance
 
-- Workflow action references inspected: `93`; immutable SHA-pinned/local references: `93`.
+- Workflow action references inspected: `96`; immutable SHA-pinned/local references: `96`.
 - Unpinned third-party actions (must remain empty): none.
 - Security-sensitive paths are covered by `.github/CODEOWNERS`; the repository reference ruleset preserves sole-maintainer liveness, while `scripts/github-m6-hardened-ruleset.json` prepares independent approval for a second maintainer. Independent approval is not verified locally.
 
@@ -114,7 +114,7 @@
 - `go/cmd/gateway/main.go`: `5c27479e8ef5ffa3c05008077e12e89e4f274d4255765606b3ee91d04df56481`
 - `go/internal/platform/python_client.go`: `1bb725121e13cece0ea49360de7fc52b7b0f38707189c5b58fbf8037f9324390`
 - `go/internal/platform/rpc_contract.go`: `85a24e13654bb8957dace5b8a04d9c99979ddd3092d4dcfae5fae67d58721d54`
-- `scripts/generate_production_reachability.py`: `57625551f3bc4c21fe06c0d04bf7fa9b7b4c20d676a35a64102a516d2ef9ee72`
+- `scripts/generate_production_reachability.py`: `5e3d5687dd55c5ad876ae4fb0aa1b4f365dbd2754e63c4e8c165598c180def53`
 - `packaging/macos/khaos-authorityd-xpc.m`: `6b9d18f13fd280a8819e88a4cccc96fcda5e34f52b40cf2940d5264667200855`
 - `packaging/macos/khaos-authorityd-xpc-client.c`: `3c751b9936b8665140f68466af9b77138efd538cb3b41f3687b3135b595a9f8d`
 - `rust/khaos-core/src/bin/khaos-authorityd-windows.rs`: `4a80c965d472c5d35a1350f24c725a4b313b6eb1debee0e5b5dc486dc287d63f`

@@ -722,7 +722,7 @@ class ToolRegistry:
                 serial_calls.append(call)
         return parallel_calls, serial_calls
 
-    def validate_call(self, name: str, params: dict) -> bool:
+    def validate_call(self, name: str, params: dict[str, Any]) -> bool:
         """Validate a small useful subset of JSON Schema."""
         if any(field in params for field in _INJECTED_CAPABILITY_FIELDS):
             return False

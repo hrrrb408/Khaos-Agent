@@ -5,6 +5,7 @@
 # as an external release prerequisite.
 
 /python/khaos/security/ @hrrrb408
+/python/khaos/runtime/ @hrrrb408
 /python/khaos/permissions/ @hrrrb408
 /python/khaos/audit/ @hrrrb408
 /python/khaos/verification/ @hrrrb408
@@ -14,6 +15,9 @@
 /python/khaos/coding/workspace/ @hrrrb408
 /python/khaos/agent/approval.py @hrrrb408
 /python/khaos/tools/scheduler.py @hrrrb408
+/python/khaos/tools/admission.py @hrrrb408
+/python/khaos/tools/execution_coordinator.py @hrrrb408
+/python/khaos/tools/result_finalizer.py @hrrrb408
 /python/khaos/tools/registry.py @hrrrb408
 /python/khaos/tools/terminal_tools.py @hrrrb408
 /khaos_policy.yaml @hrrrb408
@@ -32,5 +36,11 @@
 /scripts/generate_security_inventory.py @hrrrb408
 /scripts/generate_production_reachability.py @hrrrb408
 /scripts/verify_release_gate_runs.py @hrrrb408
+/scripts/build_local_security_closure_report.py @hrrrb408
+/scripts/collect_local_security_evidence.py @hrrrb408
+/docs/local-security-profile.md @hrrrb408
+/docs/security_facts.yaml @hrrrb408
+/docs/security/ @hrrrb408
+/pyright-security.json @hrrrb408
 /rust-toolchain.toml @hrrrb408
 /.go-version @hrrrb408

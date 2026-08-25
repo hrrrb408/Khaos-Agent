@@ -24,7 +24,7 @@ ADR.
 
 | Profile | Default / enablement | Required root | Evidence result |
 | --- | --- | --- | --- |
-| `community` — Community Local Profile | Default on macOS/POSIX personal installs | local user/runtime identity, owner-only `~/.khaos/authorityd/`, private AF_UNIX peer credentials, independent authorityd, Ed25519 receipt key, effective policy and typed catalog | `PASS` is valid without Apple membership; local JSONL audit is diagnostic, not WORM |
+| `community` — Community Local Profile | Default on macOS/POSIX personal installs | local user/runtime identity, owner-only `~/.khaos/authorityd/`, private AF_UNIX peer credentials, independent authorityd, Ed25519 receipt key, effective policy and typed catalog | `CLOSED` is valid without Apple membership only after exact-SHA evidence/provenance verification; local JSONL audit is diagnostic, not WORM |
 | `native-production` — macOS Signed Distribution Profile | Explicit opt-in for signed macOS distribution; existing Linux/Windows native deployments keep their contract | launchd/XPC or platform-native identity, Team ID/designated requirement, protected key, native service, independent audit, native proof | `OPTIONAL_PROFILE_NOT_ENABLED` / `NOT CERTIFIED` when not enabled; enabled-but-missing evidence is `FAIL` |
 
 The Community Local Trust Root is:
@@ -48,7 +48,7 @@ missing state, policy/catalog mismatch, unauthenticated peers, missing
 approval/verification/audit evidence, and all in-process/TCP/host fallbacks
 fail closed.
 
-The profile status vocabulary is deliberately finite:
+The transport status vocabulary is deliberately finite:
 
 ```text
 PASS | FAIL | BLOCKED_EXTERNAL | NOT_APPLICABLE | NOT_RUN |
@@ -88,8 +88,9 @@ PR #216's historical Memory V2 A-Y evidence remains authoritative and is not
 recomputed as a second Memory Core design. The new Z boundary is deployment
 profile-scoped:
 
-- Community Z: `PASS` when the local trust-root, security regression, runtime,
-  RPC, and required aggregate gates pass. Apple signing is not a prerequisite.
+- Community Z: `CLOSED` only when the local trust-root, security regression,
+  runtime, RPC, exact commit, and required aggregate gates are verified by the
+  local closure evaluator. Apple signing is not a prerequisite.
 - Signed macOS Z: `OPTIONAL_PROFILE_NOT_ENABLED` / `NOT CERTIFIED` until the
   profile is explicitly enabled; once enabled, all native signing, protected
   key, launchd/XPC, notarization, and artifact gates are required.

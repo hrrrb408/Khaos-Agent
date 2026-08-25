@@ -60,6 +60,7 @@ jobs:
         # construction are now part of the same hard gate; profile boundary
         # code must not drift into dynamically typed fail-open paths.
         run: |
+          uv run pyright --project pyright-security.json
           uv run pyright \
             python/khaos/runtime/authority.py \
             python/khaos/runtime/lifecycle.py \
@@ -80,7 +81,11 @@ jobs:
             python/khaos/security/authorityd_main.py \
             python/khaos/security/authorityd_protocol.py \
             python/khaos/security/identity_isolation.py \
+            python/khaos/security/production_composition_manifest.py \
+            python/khaos/security/local_closure.py \
             python/khaos/runtime/factory.py \
+            python/khaos/tools/admission.py \
+            python/khaos/tools/execution_coordinator.py \
             python/khaos/tools/registry.py \
             python/khaos/tools/scheduler.py \
             python/khaos/agent/approval.py

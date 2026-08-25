@@ -1,25 +1,31 @@
 # Memory V2 Production Closure Report
 
-Status: **PASS for Community Local Profile**
+Status: **NOT_CLOSED for current Community Local Profile**
 
 This is a profile-scoped Memory V2 closure report. It is not a second Memory
 Core redesign. PR #216 and main commit
 `ec02d5386f32cf3b06b3828149b6b587c4c9fa7a` remain the completed Memory V2
 baseline.
 
-## Closure result
+This is a historical PR #216/ADR-066 record, not an exact-SHA closure
+decision for the current worktree. The current machine decision is generated
+only by `scripts/build_local_security_closure_report.py`; until the exact
+main-push GitHub evidence is verified, the current profile remains
+`NOT_CLOSED`.
+
+## Historical closure result
 
 | Result | Status | Boundary |
 | --- | --- | --- |
 | Memory V2 A-Y | `PASS` | Historical PR #216/main evidence is preserved; the canonical ledger, Broker, provider, verification, maintenance, runtime integration, and Trust-Kernel audit contracts are unchanged. |
-| Community Local Profile | `PASS` | Production local authorityd, fixed owner-only trust root, 0600 peer-authenticated AF_UNIX, Ed25519 receipt verification, policy/catalog binding, approval, verification, and audit gates. No Apple membership is required. |
-| Memory V2 Production Closure (new Z) | `PASS` | Z is evaluated against the Community Local Profile. Optional Apple signing is not a prerequisite. |
+| Community Local Profile | `HISTORICAL` | Production local authorityd, fixed owner-only trust root, 0600 peer-authenticated AF_UNIX, Ed25519 receipt verification, policy/catalog binding, approval, verification, and audit gates. No Apple membership is required. |
+| Memory V2 Production Closure (new Z) | `HISTORICAL` | Z was evaluated against the Community Local Profile in the prior report; it is not current exact-SHA evidence. |
 | macOS Signed Distribution Profile | `OPTIONAL_PROFILE_NOT_ENABLED` / `NOT CERTIFIED` | No explicit `KHAOS_NATIVE_MACOS_E2E=true` enablement and no Team ID/certificate/notarization evidence are present in this local environment. |
 
-`PASS` here means the Community profile's required gates pass. It does not
-claim that the optional signed macOS profile was certified, and it does not
-upgrade the separate generic M6 report, whose stricter native/WORM evidence
-contract remains independent.
+The historical `PASS` wording is retained only as provenance for that prior
+report. It does not create the current `CLOSED` decision, does not claim that
+the optional signed macOS profile was certified, and does not upgrade the
+separate generic M6 report.
 
 ## Community Local Trust Root
 
@@ -46,7 +52,7 @@ Deployments requiring multi-user/code-signing identity or independently
 administered audit must select the signed/native profile or a separately
 provisioned equivalent.
 
-## Status vocabulary
+## Historical status vocabulary
 
 The machine-readable profile vocabulary is:
 

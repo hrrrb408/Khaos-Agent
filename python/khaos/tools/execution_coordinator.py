@@ -14,7 +14,9 @@ from typing import Any
 from khaos.agent.approval import StepExecutionAuthority
 from khaos.coding.execution.authority import ExecutionAuthority
 from khaos.coding.execution.models import ResolvedSpawnPlan
+from khaos.exceptions import PermissionDeniedError
 from khaos.security.middleware import SecurityMiddleware
+from khaos.tools.admission import AdmittedToolCall
 from khaos.tools.registry import ToolInvocationBroker
 from khaos.tools.result_codec import ToolResultCodec
 from khaos.tools.scheduler_models import ToolExecutionOutcome
@@ -52,8 +54,21 @@ class ToolExecutionCoordinator:
         timeout: float,
         default_effect_status: str,
         reconciliation_hint: str,
+        admitted_call: AdmittedToolCall | None = None,
     ) -> ToolExecutionOutcome:
         """Invoke a handler with an authority-bound, bounded context."""
+        if admitted_call is not None:
+            admitted_call.assert_unchanged(call)
+            invocation_arguments = admitted_call.materialize_arguments()
+        elif tool_context.get("production_runtime"):
+            raise PermissionDeniedError(
+                "production execution requires an immutable admitted tool call"
+            )
+        else:
+            # Direct library/test callers from before the admission extraction
+            # remain compatible.  Production AgentLoop paths must always use
+            # the immutable admitted snapshot above.
+            invocation_arguments = dict(call.get("arguments", {}))
         invocation_context = dict(tool_context)
         invocation_context["process_authority"] = self._process_authority
         sandbox = self._security_middleware.sandbox
@@ -90,7 +105,7 @@ class ToolExecutionCoordinator:
                 tool.name,
                 mode=mode,
                 context=invocation_context,
-                **call.get("arguments", {}),
+                **invocation_arguments,
             ),
             timeout=timeout,
         )

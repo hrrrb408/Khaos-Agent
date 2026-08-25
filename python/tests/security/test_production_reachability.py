@@ -50,3 +50,44 @@ def test_forbidden_module_is_rejected_even_when_seen_as_an_edge():
     )
     findings = module.forbidden_edges({"khaos.coding.execution.host"}, (edge,))
     assert findings
+
+
+def test_testing_composition_and_mock_authority_are_forbidden_edges():
+    module = _reachability_module()
+    edges = (
+        module.Edge(
+            source="khaos.runtime.factory",
+            target="khaos.runtime.testing",
+            symbol="TestingRuntimeComposition",
+            line=2,
+        ),
+        module.Edge(
+            source="khaos.runtime.factory",
+            target="khaos.security.mock_authority",
+            symbol="MockAuthority",
+            line=3,
+        ),
+        module.Edge(
+            source="khaos.runtime.factory",
+            target="khaos.coding.execution.testing_sandbox",
+            symbol="TestingSandbox",
+            line=4,
+        ),
+        module.Edge(
+            source="khaos.runtime.factory",
+            target="khaos.coding.execution.host",
+            symbol="HostBackend",
+            line=5,
+        ),
+    )
+
+    findings = module.forbidden_edges(
+        {
+            "khaos.runtime.testing",
+            "khaos.security.mock_authority",
+            "khaos.coding.execution.testing_sandbox",
+            "khaos.coding.execution.host",
+        },
+        edges,
+    )
+    assert len(findings) == 8
