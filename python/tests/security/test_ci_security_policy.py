@@ -186,6 +186,18 @@ def test_platform_matrix_and_real_sandbox_jobs_are_mandatory():
         assert required_contract in matrix
 
 
+def test_ordinary_community_producers_do_not_use_production_authority_mode():
+    """Ordinary proofs must not enter the production-only authority path."""
+    workflow = (WORKFLOWS / "security-closure-gate.yml").read_text(
+        encoding="utf-8"
+    )
+    producer_block = workflow.split("  community-local-producers:\n", 1)[1].split(
+        "  security-closure-gate:\n", 1
+    )[0]
+    assert 'KHAOS_DEV_MODE: "0"' not in producer_block
+    assert "run_security_producer_matrix.py" in producer_block
+
+
 def test_product_infra_marker_exclusions_have_dedicated_owners():
     """Every marker excluded from the product suite must have an owner job.
 

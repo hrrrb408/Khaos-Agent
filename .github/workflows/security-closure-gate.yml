@@ -212,8 +212,6 @@ jobs:
   community-local-producers:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
-    env:
-      KHAOS_DEV_MODE: "0"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
