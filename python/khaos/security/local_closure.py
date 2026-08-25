@@ -487,7 +487,7 @@ class ClosureEvidence:
             if proof_names != required_names:
                 unexpected = sorted(proof_names - required_names)
                 missing = sorted(required_names - proof_names)
-                details = []
+                details: list[str] = []
                 if missing:
                     details.append("missing=" + ",".join(missing))
                 if unexpected:

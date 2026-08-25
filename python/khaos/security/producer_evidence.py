@@ -1,3 +1,4 @@
+# KHAOS-PRIVILEGED-SPAWN owner=ProducerEvidenceGitIdentity threat-model=trusted-repository-provenance boundary=producer-evidence
 """Producer-owned evidence contracts for the Community Local profile.
 
 The producer is the component that owns the resource or execution

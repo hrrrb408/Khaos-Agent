@@ -39,6 +39,7 @@
 - `python/khaos/security/credential_provider_worker.py:238` `subprocess.Popen` in `<module>._run_bounded_helper` owner=`CredentialProviderWorker` threat-model=`provider-helper-execution` boundary=`one-shot-worker-spec`
 - `python/khaos/security/evidence_provenance.py:71` `subprocess.Popen` in `<module>._bounded_process` owner=`EvidenceProvenanceFetcher` threat-model=`untrusted-gh-cli-output` boundary=`evidence-provenance-lookup`
 - `python/khaos/security/native_authority.py:256` `subprocess.Popen` in `<module>._bounded_native_call` owner=`NativeAuthorityAdapter` threat-model=`native-authority` boundary=`platform-transport`
+- `python/khaos/security/producer_evidence.py:488` `subprocess.check_output` in `<module>.git_head` owner=`ProducerEvidenceGitIdentity` threat-model=`trusted-repository-provenance` boundary=`producer-evidence`
 - `python/khaos/tools/clipboard_tools.py:25` `subprocess.run` in `<module>._clipboard_read_sync` owner=`HostClipboard` threat-model=`foreground-user-host-integration` boundary=`host-integration`
 - `python/khaos/tools/clipboard_tools.py:51` `subprocess.run` in `<module>._clipboard_write_sync` owner=`HostClipboard` threat-model=`foreground-user-host-integration` boundary=`host-integration`
 - `rust/khaos-core/src/bin/khaos-authorityd-backend-windows.rs:221` `Command::new` in `rust::entrypoint` owner=`AuthorityBackendServiceHost` threat-model=`trusted-backend-child-lifecycle` boundary=`windows-authority-backend-service`
