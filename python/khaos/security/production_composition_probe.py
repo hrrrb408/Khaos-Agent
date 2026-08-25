@@ -446,6 +446,34 @@ def _production_probe_temp_root(workspace_parent: Path) -> Iterator[None]:
             os.environ["TMPDIR"] = previous_environment
 
 
+def _composition_probe_database_path(workspace_parent: Path) -> Path:
+    """Return the producer-owned database shared by both production probes.
+
+    Production audit anchors bind to the canonical database path.  The
+    composition and lifecycle producers run in separate processes but in the
+    same Compose container, so using a fresh temporary path for each process
+    would make the real anchor reject the second runtime as a different
+    database.  This path is deliberately below the verified production data
+    mount and is never treated as application state or closure evidence.
+    """
+    if workspace_parent.is_symlink() or not workspace_parent.is_dir():
+        raise SystemExit("production probe workspace parent is not a real directory")
+    probe_root = workspace_parent / ".khaos-production-probe"
+    if probe_root.is_symlink() or (probe_root.exists() and not probe_root.is_dir()):
+        raise SystemExit("production probe database directory is not a real directory")
+    probe_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        probe_root.chmod(0o700)
+    except OSError as exc:
+        raise SystemExit("production probe database directory mode is unverifiable") from exc
+    database_path = probe_root / "composition.db"
+    if database_path.is_symlink() or (
+        database_path.exists() and not database_path.is_file()
+    ):
+        raise SystemExit("production probe database is not a regular file")
+    return database_path
+
+
 async def _build_runtime_manifest(workspace_parent: Path) -> dict[str, object]:
     """Build and verify the same structural production Runtime factory uses."""
     if not Path("/app/khaos_policy.yaml").is_file():
@@ -457,39 +485,36 @@ async def _build_runtime_manifest(workspace_parent: Path) -> dict[str, object]:
     from khaos.security.production_composition_manifest import verify_runtime_composition
 
     with _production_probe_temp_root(workspace_parent):
-        with tempfile.TemporaryDirectory(
-            prefix="khaos-runtime-composition-", dir=workspace_parent
-        ) as temporary:
-            database = Database(Path(temporary) / "composition.db")
-            await database.connect()
-            await database.run_migrations()
-            runtime = None
-            try:
-                runtime = await build_production_runtime(
-                    ProductionRuntimeConfig(
-                        project_root=Path("/app"),
-                        config_path=Path("/app/config.yaml"),
-                        db=database,
-                        principal_id=_COMPOSE_PRINCIPAL_ID,
-                        principal_kind=_COMPOSE_PRINCIPAL_KIND,
-                        parent_principal_id=_COMPOSE_PARENT_PRINCIPAL_ID,
-                        source_transport="cron",
-                        project_id="compose",
-                        runtime_id=_COMPOSE_RUNTIME_ID,
-                    )
+        database = Database(_composition_probe_database_path(workspace_parent))
+        await database.connect()
+        await database.run_migrations()
+        runtime = None
+        try:
+            runtime = await build_production_runtime(
+                ProductionRuntimeConfig(
+                    project_root=Path("/app"),
+                    config_path=Path("/app/config.yaml"),
+                    db=database,
+                    principal_id=_COMPOSE_PRINCIPAL_ID,
+                    principal_kind=_COMPOSE_PRINCIPAL_KIND,
+                    parent_principal_id=_COMPOSE_PARENT_PRINCIPAL_ID,
+                    source_transport="cron",
+                    project_id="compose",
+                    runtime_id=_COMPOSE_RUNTIME_ID,
                 )
-                manifest = verify_runtime_composition(runtime)
-                payload = manifest.to_payload()
-                if not manifest.valid or manifest.forbidden_detected:
-                    raise SystemExit(
-                        "production runtime composition is invalid: "
-                        + "; ".join(manifest.errors)
-                    )
-                return payload
-            finally:
-                if runtime is not None:
-                    await runtime.aclose()
-                await database.close()
+            )
+            manifest = verify_runtime_composition(runtime)
+            payload = manifest.to_payload()
+            if not manifest.valid or manifest.forbidden_detected:
+                raise SystemExit(
+                    "production runtime composition is invalid: "
+                    + "; ".join(manifest.errors)
+                )
+            return payload
+        finally:
+            if runtime is not None:
+                await runtime.aclose()
+            await database.close()
 
 
 def _runtime_diagnostics(

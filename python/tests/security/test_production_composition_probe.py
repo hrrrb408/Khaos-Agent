@@ -51,6 +51,26 @@ def test_production_probe_uses_the_named_volume_for_io_limits() -> None:
     assert 'dir=workspace_parent' in source
 
 
+def test_production_probes_share_a_safe_anchor_database_path(tmp_path: Path) -> None:
+    database_path = production_composition_probe._composition_probe_database_path(tmp_path)
+
+    assert database_path == tmp_path / ".khaos-production-probe" / "composition.db"
+    assert database_path.parent.is_dir()
+    assert database_path.parent.stat().st_mode & 0o777 == 0o700
+
+
+def test_production_probe_rejects_a_symlinked_database_root(tmp_path: Path) -> None:
+    probe_root = tmp_path / ".khaos-production-probe"
+    probe_root.symlink_to(tmp_path / "elsewhere", target_is_directory=True)
+
+    try:
+        production_composition_probe._composition_probe_database_path(tmp_path)
+    except SystemExit as exc:
+        assert "not a real directory" in str(exc)
+    else:
+        raise AssertionError("symlinked production probe database root was accepted")
+
+
 def test_production_composition_diagnostics_use_artifact_filename_stem() -> None:
     source = Path(
         production_composition_probe.__file__
