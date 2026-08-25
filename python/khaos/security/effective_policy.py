@@ -138,6 +138,12 @@ class EffectiveSecurityPolicy:
     # Principals permitted to mutate registered communication channels.
     # This is a host-side grant, so only the trusted user layer contributes.
     channel_admins: frozenset[str] = field(default_factory=frozenset)
+    # The policy digest describes policy semantics, while the typed resource
+    # catalog binds those semantics to the concrete runtime workspace.  Keep
+    # the compiler's root here so relative filesystem capabilities can be
+    # canonicalized without putting a runner/container pathname into the
+    # cross-environment policy identity.
+    _workspace_root: Path = field(default=Path("."), compare=False, repr=False)
     digest: str = ""
     resource_order: TypedResourcePartialOrder | None = field(
         default=None,
@@ -175,6 +181,7 @@ def compile_effective_policy(
     B2: ``root_capabilities`` uses directory-containment intersection, not
     plain set ``&``.  An empty result means "deny all", not "no restriction".
     """
+    workspace_root = workspace_root.expanduser().resolve()
     user = user_policy  # None means "no user/global layer"
     platform = platform_capability or PlatformCapability()
 
@@ -332,6 +339,7 @@ def compile_effective_policy(
         secrets_scan_before_tool_result=secrets_scan_before_tool_result,
         secrets_block_env_dump=secrets_block_env_dump,
         channel_admins=channel_admins,
+        _workspace_root=workspace_root,
     )
     try:
         object.__setattr__(
@@ -676,6 +684,22 @@ def _intersect_path_capabilities(
 
 
 def _canonical_dict(policy: EffectiveSecurityPolicy) -> dict:
+    workspace_root = policy._workspace_root.expanduser().resolve()
+    canonical_root_capabilities: list[str] = []
+    for capability in policy.root_capabilities:
+        resolved = capability.expanduser().resolve()
+        try:
+            relative = resolved.relative_to(workspace_root)
+        except ValueError:
+            # Compiled policies reject capabilities outside the workspace.
+            # Preserve an explicit marker for defensive direct construction so
+            # an out-of-root value cannot collide with a workspace-relative
+            # capability in the binding digest.
+            canonical_root_capabilities.append(f"absolute:{resolved}")
+        else:
+            canonical_root_capabilities.append(
+                f"workspace:{relative.as_posix() or '.'}"
+            )
     return {
         "mode": policy.mode.value,
         "network_enabled": policy.network_enabled,
@@ -688,7 +712,11 @@ def _canonical_dict(policy: EffectiveSecurityPolicy) -> dict:
             else None
         ),
         "network_blocked_domains": sorted(policy.network_blocked_domains),
-        "root_capabilities": sorted(str(p) for p in policy.root_capabilities),
+        # The actual absolute roots remain in the immutable policy and in the
+        # typed resource catalog.  Only the policy identity is relocation
+        # stable so a producer in /app and a producer in a GitHub checkout can
+        # attest the same policy file without dropping the runtime root bind.
+        "root_capabilities": sorted(canonical_root_capabilities),
         "denied_paths": sorted(policy.denied_paths),
         "commands_allowed": sorted(policy.commands_allowed) if policy.commands_allowed is not None else None,
         "commands_require_approval": sorted(policy.commands_require_approval),
