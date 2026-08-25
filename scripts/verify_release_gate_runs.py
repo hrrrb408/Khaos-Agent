@@ -107,6 +107,15 @@ _NATIVE_ARTIFACT_CONTRACTS = {
 # provenance rules.
 _REQUIRED_NATIVE_ARTIFACTS = frozenset({"native-authority-windows-proof"})
 
+# GitHub prefixes a reusable-workflow job's API display name with the caller
+# job id.  The producer runs inside ``docker-security`` but GITHUB_JOB remains
+# the reusable job id (``compose-deployment``).  Keep this translation
+# explicit: accepting arbitrary suffix matches would let an unrelated job
+# satisfy the production producer contract.
+_PRODUCER_API_JOB_ALIASES = {
+    "compose-deployment": frozenset({"docker-security / compose-deployment"}),
+}
+
 
 def _canonical_digest(value: object) -> str:
     encoded = json.dumps(
@@ -522,12 +531,13 @@ def _producer_job(
     job_name: str,
 ) -> dict[str, Any]:
     """Bind a proof to exactly one successful GitHub producer job."""
+    allowed_names = {job_name} | set(_PRODUCER_API_JOB_ALIASES.get(job_name, ()))
     candidates = [
         job
         for job in jobs
         if job.get("status") == "completed"
         and job.get("conclusion") == "success"
-        and job.get("name") == job_name
+        and job.get("name") in allowed_names
     ]
     if len(candidates) != 1:
         raise RuntimeError(
@@ -675,9 +685,16 @@ def _verify_external_producers(
             raise RuntimeError(f"duplicate Security Closure artifact {name}")
         artifact_by_name[name] = artifact
 
-    local_payloads = local_record.get("proof_payloads")
+    local_binding = local_record.get("local_proof")
+    if not isinstance(local_binding, dict):
+        raise RuntimeError(
+            "Community Local artifact does not expose a live proof provenance binding"
+        )
+    local_payloads = local_binding.get("proof_payloads")
     if not isinstance(local_payloads, list):
-        raise RuntimeError("Community Local artifact does not expose proof provenance")
+        raise RuntimeError(
+            "Community Local artifact does not expose proof provenance"
+        )
     if len(local_payloads) != len(COMMUNITY_LOCAL_REQUIRED_PROOFS):
         raise RuntimeError("Community Local proof provenance count is not exact")
     local_by_type: dict[str, dict[str, object]] = {}

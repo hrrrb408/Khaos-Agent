@@ -251,7 +251,7 @@ def _fixture(
         },
         {
             "id": 102,
-            "name": "compose-deployment",
+            "name": "docker-security / compose-deployment",
             "status": "completed",
             "conclusion": "success",
             "workflow_name": "Security Closure Gate",
@@ -262,7 +262,7 @@ def _fixture(
         "workflow_name": "Security Closure Gate",
         "artifacts": artifacts,
     }
-    local_record = {"proof_payloads": local_payloads}
+    local_record = {"local_proof": {"proof_payloads": local_payloads}}
     return {
         "security_record": security_record,
         "local_record": local_record,
@@ -296,6 +296,42 @@ def test_all_external_producers_are_live_verified(monkeypatch: pytest.MonkeyPatc
     results = _run_fixture(monkeypatch, _fixture())
     assert len(results) == 10
     assert {result["proof_type"] for result in results} == set(COMMUNITY_LOCAL_REQUIRED_PROOFS)
+
+
+def test_external_provenance_cannot_be_injected_at_the_gate_record_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture()
+    records, _payloads = fixture
+    local_record = records["local_record"]
+    assert isinstance(local_record, dict)
+    local_binding = local_record.pop("local_proof")
+    assert isinstance(local_binding, dict)
+    local_record["proof_payloads"] = local_binding["proof_payloads"]
+
+    with pytest.raises(RuntimeError, match="live proof provenance binding"):
+        _run_fixture(monkeypatch, fixture)
+
+
+def test_duplicate_reusable_producer_jobs_are_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture()
+    records, _payloads = fixture
+    jobs = records["jobs"]
+    assert isinstance(jobs, list)
+    jobs.append(
+        {
+            "id": 103,
+            "name": "docker-security / compose-deployment",
+            "status": "completed",
+            "conclusion": "success",
+            "workflow_name": "Security Closure Gate",
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="compose-deployment.*not unique"):
+        _run_fixture(monkeypatch, fixture)
 
 
 @pytest.mark.parametrize(
