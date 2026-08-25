@@ -495,6 +495,7 @@ async def _build_runtime_manifest(workspace_parent: Path) -> dict[str, object]:
 def _runtime_diagnostics(
     *,
     proof_name: str,
+    diagnostic_stem: str,
     output_dir: Path,
     result: ExecutionResult,
     oracle_detail: str,
@@ -503,7 +504,7 @@ def _runtime_diagnostics(
     import xml.etree.ElementTree as element_tree
 
     passed = result.status == "passed" and not oracle_detail
-    junit = output_dir / f"{proof_name}.junit.xml"
+    junit = output_dir / f"{diagnostic_stem}.junit.xml"
     suite = element_tree.Element(
         "testsuite",
         {
@@ -523,8 +524,8 @@ def _runtime_diagnostics(
     element_tree.ElementTree(suite).write(
         junit, encoding="utf-8", xml_declaration=True
     )
-    stdout = output_dir / f"{proof_name}.stdout.log"
-    stderr = output_dir / f"{proof_name}.stderr.log"
+    stdout = output_dir / f"{diagnostic_stem}.stdout.log"
+    stderr = output_dir / f"{diagnostic_stem}.stderr.log"
     stdout.write_text(result.stdout[-16_000:], encoding="utf-8")
     stderr.write_text(
         (result.stderr or oracle_detail)[-16_000:], encoding="utf-8"
@@ -553,6 +554,7 @@ def _write_composition_proof(
     manifest_digest = canonical_digest(runtime_manifest)
     diagnostics = _runtime_diagnostics(
         proof_name=PRODUCTION_COMPOSITION_PROOF,
+        diagnostic_stem=output.stem,
         output_dir=output_dir,
         result=result,
         oracle_detail="",

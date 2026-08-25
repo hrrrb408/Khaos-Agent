@@ -51,6 +51,15 @@ def test_production_probe_uses_the_named_volume_for_io_limits() -> None:
     assert 'dir=workspace_parent' in source
 
 
+def test_production_composition_diagnostics_use_artifact_filename_stem() -> None:
+    source = Path(
+        production_composition_probe.__file__
+    ).read_text(encoding="utf-8")
+
+    assert "diagnostic_stem=output.stem" in source
+    assert 'output_dir / f"{diagnostic_stem}.junit.xml"' in source
+
+
 def test_production_producers_share_one_runtime_composition_digest_recipe() -> None:
     from khaos.security import production_lifecycle_probe
 
