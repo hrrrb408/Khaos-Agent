@@ -17,6 +17,8 @@ mod linux {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
     use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::sync::atomic::{AtomicI32, Ordering};
 
     #[cfg(target_arch = "x86_64")]
     const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
@@ -510,6 +512,134 @@ mod linux {
         pointers.push(std::ptr::null());
         unsafe { libc::execvp(program.as_ptr(), pointers.as_ptr()) };
         Err(io::Error::last_os_error())
+    }
+
+    // Bubblewrap's --as-pid-1 makes this launcher PID 1 in the private PID
+    // namespace.  A normal payload is not a PID-namespace init and will not
+    // reap grandchildren that become orphaned during teardown; those
+    // unreaped children can remain visible in the host /proc tree even after
+    // cgroup v2 reports populated=0.  Keep this small native launcher alive
+    // as namespace init, reap the complete payload tree, and only then
+    // return to bubblewrap.  The decision is derived from the kernel PID
+    // identity, never from caller-controlled metadata.
+    static FORWARDED_SIGNAL: AtomicI32 = AtomicI32::new(0);
+
+    extern "C" fn record_signal(signal: libc::c_int) {
+        if signal == libc::SIGTERM
+            || signal == libc::SIGINT
+            || signal == libc::SIGHUP
+            || signal == libc::SIGQUIT
+        {
+            FORWARDED_SIGNAL.store(signal, Ordering::Relaxed);
+        }
+    }
+
+    fn install_pid_namespace_signal_handlers() -> io::Result<()> {
+        for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT] {
+            let previous = unsafe { libc::signal(signal, record_signal as *const () as usize) };
+            if previous == libc::SIG_ERR {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+
+    fn child_exit_code(status: libc::c_int) -> i32 {
+        if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
+        } else if libc::WIFSIGNALED(status) {
+            128 + libc::WTERMSIG(status)
+        } else {
+            1
+        }
+    }
+
+    fn signal_child_group(child_pid: libc::pid_t, signal: libc::c_int) {
+        // The child is placed into its own process group before exec.  A
+        // group signal covers ordinary descendants while the waitpid(-1)
+        // loop below remains the authoritative reaping path for orphans.
+        let result = unsafe { libc::kill(-child_pid, signal) };
+        if result != 0 {
+            let _ = unsafe { libc::kill(child_pid, signal) };
+        }
+    }
+
+    fn supervise_pid_namespace_payload(args: &[std::ffi::OsString]) -> io::Result<()> {
+        if args.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "command required",
+            ));
+        }
+        install_pid_namespace_signal_handlers()?;
+        let mut command = Command::new(&args[0]);
+        command.args(&args[1..]);
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        let child = command.spawn()?;
+        let child_pid = child.id() as libc::pid_t;
+        // The Child handle owns only stdio bookkeeping here.  waitpid(-1)
+        // below is intentionally used instead of Child::wait so every
+        // adopted grandchild is reaped by this PID-namespace init.
+        std::mem::forget(child);
+        let mut child_status: Option<libc::c_int> = None;
+        let mut termination_requested = false;
+        loop {
+            let pending_signal = FORWARDED_SIGNAL.swap(0, Ordering::Relaxed);
+            if pending_signal != 0 && !termination_requested {
+                termination_requested = true;
+                signal_child_group(child_pid, pending_signal);
+            }
+            let mut status = 0;
+            let waited = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
+            if waited > 0 {
+                if waited == child_pid {
+                    child_status = Some(status);
+                    if !termination_requested {
+                        // A payload that exits while leaving a background
+                        // child must not keep the execution lease alive.
+                        termination_requested = true;
+                        signal_child_group(child_pid, libc::SIGTERM);
+                    }
+                }
+                continue;
+            }
+            if waited == 0 {
+                if child_status.is_some() {
+                    // There may be adopted descendants whose SIGCHLD has
+                    // not been delivered to this loop yet.  Keep draining
+                    // until waitpid reports ECHILD.
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                continue;
+            }
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ECHILD) {
+                break;
+            }
+            if error.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(error);
+        }
+        let status = child_status
+            .ok_or_else(|| io::Error::other("PID namespace init lost the payload wait status"))?;
+        let code = child_exit_code(status);
+        if code == 0 {
+            Ok(())
+        } else {
+            std::process::exit(code)
+        }
     }
 
     /// Batch 7.4 (round-7 §十一): close every inherited file descriptor
@@ -1842,14 +1972,18 @@ mod linux {
         })?;
         install_landlock_if_required()?;
         install_seccomp()?;
-        exec(&args)
+        if unsafe { libc::getpid() } == 1 {
+            supervise_pid_namespace_payload(&args)
+        } else {
+            exec(&args)
+        }
     }
 
     #[cfg(test)]
     mod tests {
         use super::{
-            ambient_capabilities_from_status, cap_sets_are_zero, is_trusted_cgroup_procs_path,
-            CapUserData,
+            ambient_capabilities_from_status, cap_sets_are_zero, child_exit_code,
+            is_trusted_cgroup_procs_path, CapUserData,
         };
         use std::path::Path;
 
@@ -1912,6 +2046,13 @@ mod linux {
             assert!(!is_trusted_cgroup_procs_path(Path::new(
                 "/run/khaos-execution-cgroup/exec-1/tasks",
             )));
+        }
+
+        #[test]
+        fn namespace_init_preserves_payload_exit_status() {
+            assert_eq!(child_exit_code(0), 0);
+            assert_eq!(child_exit_code(256), 1);
+            assert_eq!(child_exit_code(15), 143);
         }
     }
 }

@@ -3,22 +3,21 @@ name: Community Local Security Closure
 on:
   push:
     branches: [main]
-  workflow_dispatch:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
-  group: community-local-closure-${{ github.event_name }}-${{ github.sha }}
+  group: community-local-closure-${{ github.sha }}
   cancel-in-progress: false
 
 jobs:
   community-local:
-    name: Community Local adversarial evidence
+    name: Community Local evidence aggregator
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 35
     env:
-      KHAOS_AUTHORITY_PROFILE: community
       KHAOS_DEV_MODE: "0"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -28,24 +27,30 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
-      - name: Install test dependencies
+      - name: Install evidence verifier dependencies
         run: |
           python -m pip install --require-hashes -r python/bootstrap-requirements.txt
-          uv sync --frozen --extra test --extra lsp
+          uv sync --frozen
           echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
-      - name: Regenerate repository security inventories
+      - name: Fetch exact-SHA producer artifacts from Security Closure
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          python scripts/generate_security_inventory.py --check
-          python scripts/generate_production_reachability.py --check
-          python scripts/validate_m6_governance.py
-      - name: Collect exact-main Community Local evidence
+          mkdir -p producer-input
+          PYTHONPATH=python python scripts/fetch_security_producer_artifacts.py \
+            --repo "$GITHUB_REPOSITORY" \
+            --commit "$GITHUB_SHA" \
+            --output-dir producer-input \
+            --manifest producer-input/producer-artifact-manifest.json
+      - name: Aggregate producer-owned Community Local evidence
         run: |
           PYTHONPATH=python python scripts/collect_local_security_evidence.py \
             --repo-root "$GITHUB_WORKSPACE" \
+            --producer-dir producer-input \
+            --producer-manifest producer-input/producer-artifact-manifest.json \
             --commit "$GITHUB_SHA" \
             --output local-security-evidence.json
-      - name: Upload producer-owned local evidence
-        if: ${{ always() }}
+      - name: Upload exact-SHA local closure evidence
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: local-security-evidence-${{ github.sha }}

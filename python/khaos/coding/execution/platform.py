@@ -11,11 +11,13 @@ import math
 import os
 import re
 import secrets
+import signal
 import shutil
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -1795,17 +1797,35 @@ class LinuxBubblewrapBackend:
             if network_mode == "shared" or network_namespace
             else "--unshare-net"
         )
-        prefix.extend((
+        namespace_options = [
             network_option,
             *linux_job_namespace_args(),
-            "--unshare-pid", "--unshare-ipc", "--unshare-uts",
-            "--new-session", "--die-with-parent",
-            "--chdir", str(sandbox_cwd),
-        ))
+            "--unshare-pid",
+        ]
+        if not _development_mode():
+            # Production's native launcher is the reviewed owner of the
+            # payload process tree.  Make it PID 1 so it can reap adopted
+            # descendants; otherwise bubblewrap's own namespace init can
+            # become a host-visible zombie after a production cancellation.
+            # Development bwrap keeps its native reaper because the generic
+            # dev lifecycle contract and its test runner use that composition.
+            namespace_options.append("--as-pid-1")
+        namespace_options.extend(
+            (
+                "--unshare-ipc",
+                "--unshare-uts",
+                "--new-session",
+                "--die-with-parent",
+                "--chdir",
+                str(sandbox_cwd),
+            )
+        )
+        prefix.extend(namespace_options)
         return tuple(prefix)
 
     async def execute(self, request):
         from dataclasses import replace
+        production_composition = not _development_mode()
         if self.admission_closed:
             raise PermissionError(
                 f"Linux bubblewrap backend is {self._state.value}, not accepting executions"
@@ -1927,6 +1947,50 @@ class LinuxBubblewrapBackend:
                 )
                 supervisor = self.supervisor or ProcessSupervisor()
                 self.supervisor = supervisor
+
+                async def terminate_backend_descendants() -> None:
+                    active = getattr(supervisor, "_active", {}).get(execution_id)
+                    direct_pid = (
+                        active.process.pid
+                        if active is not None and active.process.pid is not None
+                        else None
+                    )
+                    await asyncio.to_thread(
+                        _terminate_linux_cgroup_descendants,
+                        lease.path,
+                        direct_pid=direct_pid,
+                    )
+                    # Bubblewrap is the host-side parent of the PID-namespace
+                    # init.  Once the backend has terminated the payload and
+                    # namespace init, let that same parent reap its child and
+                    # complete the already-published supervisor wait task.
+                    # Sending the supervisor's process-group signal first can
+                    # kill both processes in the same scheduling window and
+                    # reparent the namespace-init zombie to container init.
+                    # That is an externally observable resource leak, not a
+                    # terminal process proof.  A bounded wait keeps cleanup
+                    # fail-closed: the supervisor still owns the fallback
+                    # signal path when bubblewrap cannot reach a terminal
+                    # state.
+                    wait_task = (
+                        active.process_wait_task
+                        if active is not None
+                        else None
+                    )
+                    if wait_task is None and active is not None:
+                        wait_task = asyncio.create_task(active.process.wait())
+                        active.process_wait_task = wait_task
+                    if wait_task is not None and not wait_task.done():
+                        try:
+                            await asyncio.wait_for(
+                                asyncio.shield(wait_task),
+                                timeout=supervisor.termination_grace_seconds,
+                            )
+                        except asyncio.TimeoutError as exc:
+                            raise TimeoutError(
+                                "production launcher did not reap its namespace init"
+                            ) from exc
+
                 return await supervisor.run(
                     sandboxed,
                     cwd=request.cwd.expanduser().absolute(),
@@ -1937,10 +2001,15 @@ class LinuxBubblewrapBackend:
                     directory_binding=directory_binding,
                     preserve_directory_fds=True,
                     env=outer_environment,
+                    # The descendant callback owns production's native PID-1
+                    # composition. Development bwrap deliberately keeps its
+                    # own namespace reaper, so it must use the generic
+                    # supervisor signal path instead of waiting for bwrap to
+                    # reap itself as a child.
                     termination_callback=(
-                        lambda: asyncio.to_thread(
-                            _kill_linux_cgroup_processes, lease.path
-                        )
+                        terminate_backend_descendants
+                        if production_composition
+                        else None
                     ),
                 )
             except (OSError, PermissionError):
@@ -2224,32 +2293,244 @@ def _remove_linux_cgroup(group: Path) -> None:
 
 
 def _kill_linux_cgroup_processes(group: Path) -> None:
-    """Kill every process in a cgroup and prove that it became empty.
+    """Terminate a cgroup tree in reap-safe order and prove it became empty.
 
     This is deliberately separate from ``_remove_linux_cgroup`` because the
     process supervisor must perform kernel-level tree termination *before*
     it drains captured output.  Removing the cgroup belongs to the backend's
     final lease release and must happen only after the supervisor has reached
-    a terminal process result.
+    a terminal process result.  ``cgroup.kill`` alone is not sufficient for a
+    PID namespace: killing namespace init at the same instant as its children
+    can orphan zombie tasks into the container's outer init after the cgroup
+    already reports ``populated=0``.  Keep namespace init alive while its
+    descendants are terminated and reaped, then terminate init and apply the
+    kernel kill fence as a final bounded backstop.
     """
-    import time
-
     if not group.is_dir():
         return
     kill_file = group / "cgroup.kill"
     if not kill_file.is_file():
         raise OSError(f"cgroup.kill is unavailable: {group}")
+
+    process_ids = _terminate_linux_cgroup_descendants(group, direct_pid=None)
+
     kill_file.write_text("1", encoding="ascii")
     events_file = group / "cgroup.events"
     if not events_file.is_file():
         raise OSError(f"cgroup.events is unavailable: {group}")
     deadline = time.monotonic() + 5.0
+    cgroup_empty = False
     while time.monotonic() < deadline:
         content = events_file.read_text(encoding="ascii")
         if "populated 0" in content or "populated=0" in content:
-            return
+            cgroup_empty = True
+            break
         time.sleep(0.1)
-    raise TimeoutError(f"cgroup remained populated: {group}")
+    if not cgroup_empty:
+        raise TimeoutError(f"cgroup remained populated: {group}")
+    survivors = tuple(pid for pid in process_ids if Path(f"/proc/{pid}").exists())
+    if survivors:
+        raise TimeoutError(
+            "owned Linux process tree survived cgroup termination: "
+            + ",".join(str(pid) for pid in survivors)
+        )
+    return
+
+
+def _terminate_linux_cgroup_descendants(
+    group: Path,
+    *,
+    direct_pid: int | None,
+) -> tuple[int, ...]:
+    """Terminate descendants while optionally leaving the direct parent live.
+
+    The direct bubblewrap process is the host-side reaper for the bwrap PID
+    namespace.  During supervisor cancellation it must remain alive until
+    the namespace init and its children have exited; otherwise bwrap's
+    ``--die-with-parent`` path can reparent the namespace-init zombie to the
+    container init before the supervisor has a chance to reap it.
+    """
+    process_file = group / "cgroup.procs"
+    if not process_file.is_file():
+        return ()
+    process_ids = _read_linux_cgroup_process_ids(process_file)
+    if not process_ids:
+        return ()
+    namespace_init = {
+        pid for pid in process_ids if _linux_process_is_namespace_init(pid)
+    }
+    protected = set(namespace_init)
+    if direct_pid is not None:
+        protected.add(direct_pid)
+    parents = {
+        pid: parent
+        for pid in process_ids
+        if (parent := _linux_process_parent(pid)) is not None
+    }
+    ordered = _linux_processes_postorder(
+        process_ids,
+        parents,
+        protected=protected,
+    )
+    for pid in ordered:
+        _signal_linux_process(pid, signal.SIGTERM)
+        _wait_linux_process_gone((pid,), time.monotonic() + 0.25)
+    survivors = tuple(pid for pid in ordered if Path(f"/proc/{pid}").exists())
+    if survivors:
+        for pid in survivors:
+            _signal_linux_process(pid, signal.SIGKILL)
+        _wait_linux_process_gone(survivors, time.monotonic() + 2.0)
+
+    # Rescan after descendants had a chance to be reaped.  This closes the
+    # race where a payload creates a child during the first snapshot while
+    # the namespace init is still available to reap it.
+    late_processes = _read_linux_cgroup_process_ids(process_file)
+    observed = tuple(sorted(set(process_ids).union(late_processes)))
+    late_protected = set(namespace_init)
+    if direct_pid is not None:
+        late_protected.add(direct_pid)
+    late_descendants = tuple(
+        pid for pid in late_processes if pid not in late_protected
+    )
+    for pid in late_descendants:
+        _signal_linux_process(pid, signal.SIGKILL)
+    if late_descendants:
+        _wait_linux_process_gone(late_descendants, time.monotonic() + 2.0)
+
+    if direct_pid is None:
+        remaining_init = tuple(namespace_init)
+    else:
+        remaining_init = tuple(pid for pid in namespace_init if pid != direct_pid)
+    for pid in remaining_init:
+        if Path(f"/proc/{pid}").exists():
+            _signal_linux_process(pid, signal.SIGTERM)
+    _wait_linux_process_gone(remaining_init, time.monotonic() + 1.0)
+    stubborn_init = tuple(
+        pid for pid in remaining_init if Path(f"/proc/{pid}").exists()
+    )
+    for pid in stubborn_init:
+        _signal_linux_process(pid, signal.SIGKILL)
+    if stubborn_init:
+        _wait_linux_process_gone(stubborn_init, time.monotonic() + 2.0)
+
+    survivors = tuple(
+        pid
+        for pid in observed
+        if pid != direct_pid and Path(f"/proc/{pid}").exists()
+    )
+    # A namespace-init task can be a zombie until the still-live direct
+    # bubblewrap parent reaps it.  That is the exact reason this callback is
+    # ordered before the parent signal.  Defer only that parent-owned reap;
+    # any other survivor is an unproven descendant and must fail closed.
+    deferred_init = (
+        set(namespace_init) if direct_pid is not None else set()
+    )
+    unproven_survivors = tuple(pid for pid in survivors if pid not in deferred_init)
+    if unproven_survivors:
+        raise TimeoutError(
+            "owned Linux descendants survived ordered termination: "
+            + ",".join(str(pid) for pid in unproven_survivors)
+        )
+    return observed
+
+
+def _read_linux_cgroup_process_ids(process_file: Path) -> tuple[int, ...]:
+    try:
+        values = process_file.read_text(encoding="ascii").split()
+    except OSError as exc:
+        raise OSError(f"cannot read delegated cgroup process list: {process_file}") from exc
+    process_ids: list[int] = []
+    for value in values:
+        try:
+            pid = int(value, 10)
+        except ValueError as exc:
+            raise OSError(f"delegated cgroup process list is malformed: {process_file}") from exc
+        if pid <= 0:
+            raise OSError(f"delegated cgroup process list contains invalid PID: {pid}")
+        process_ids.append(pid)
+    return tuple(sorted(set(process_ids)))
+
+
+def _linux_process_parent(pid: int) -> int | None:
+    try:
+        stat_content = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+    except (OSError, UnicodeError):
+        return None
+    closing_name = stat_content.rfind(")")
+    if closing_name < 0:
+        return None
+    fields = stat_content[closing_name + 2 :].split()
+    if len(fields) < 2:
+        return None
+    try:
+        parent = int(fields[1], 10)
+    except ValueError:
+        return None
+    return parent if parent > 0 else None
+
+
+def _linux_process_is_namespace_init(pid: int) -> bool:
+    try:
+        status = Path(f"/proc/{pid}/status").read_text(encoding="ascii")
+    except (OSError, UnicodeError):
+        return False
+    for line in status.splitlines():
+        if not line.startswith("NSpid:"):
+            continue
+        values = line.removeprefix("NSpid:").split()
+        return bool(values) and values[-1] == "1"
+    return False
+
+
+def _linux_processes_postorder(
+    process_ids: tuple[int, ...],
+    parents: dict[int, int],
+    *,
+    protected: set[int],
+) -> tuple[int, ...]:
+    """Return cgroup members deepest-first, excluding namespace init."""
+    members = set(process_ids)
+    children: dict[int, list[int]] = {}
+    for pid, parent in parents.items():
+        if pid in members and parent in members:
+            children.setdefault(parent, []).append(pid)
+    ordered: list[int] = []
+    visited: set[int] = set()
+
+    def visit(pid: int) -> None:
+        if pid in visited:
+            return
+        visited.add(pid)
+        for child in sorted(children.get(pid, ())):
+            visit(child)
+        if pid not in protected:
+            ordered.append(pid)
+
+    roots = sorted(pid for pid in members if parents.get(pid) not in members)
+    for root in roots:
+        visit(root)
+    for pid in sorted(members):
+        visit(pid)
+    return tuple(ordered)
+
+
+def _signal_linux_process(pid: int, sig: signal.Signals) -> None:
+    try:
+        os.kill(pid, sig)
+    except ProcessLookupError:
+        return
+    except PermissionError as exc:
+        raise PermissionError(f"cannot terminate owned Linux process {pid}") from exc
+
+
+def _wait_linux_process_gone(pids: tuple[int, ...], deadline: float) -> bool:
+    import time
+
+    while time.monotonic() < deadline:
+        if all(not Path(f"/proc/{pid}").exists() for pid in pids):
+            return True
+        time.sleep(0.05)
+    return all(not Path(f"/proc/{pid}").exists() for pid in pids)
 
 
 def _validated_profile(request):

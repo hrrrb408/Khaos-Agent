@@ -203,6 +203,9 @@ def _local_evidence_payload(run_id: int = 1) -> dict[str, object]:
             "commit": COMMIT,
             "policy_digest": policy,
             "artifact_digest": canonical_digest({"proof": name}),
+            "proof_type": name,
+            "producer_artifact_name": f"producer-{name}",
+            "producer_evidence_digest": "f" * 64,
             "provenance": dict(workflow, job=name),
         }
         for name in COMMUNITY_LOCAL_REQUIRED_PROOFS
@@ -339,6 +342,8 @@ def test_release_evidence_requires_main_ancestry(monkeypatch: pytest.MonkeyPatch
                 "behind_by": 0,
                 "html_url": "https://github.com/compare",
             }
+        if endpoint == "git/ref/heads/main":
+            return {"object": {"sha": COMMIT}}
         if endpoint.startswith("actions/workflows/"):
             return {"workflow_runs": [_run(run_id=1, attempt=1)]}
         return {"artifacts": [_security_artifact(), *_native_artifacts()]}

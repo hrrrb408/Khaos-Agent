@@ -16,13 +16,13 @@
 - `python/khaos/coding/execution/native_launcher_runtime.py:149` `os.execvpe` in `<module>.main` owner=`NativeLauncherTCB` threat-model=`fd-bound-exec-and-codesign` boundary=`native-launcher`
 - `python/khaos/coding/execution/native_launcher_runtime.py:403` `subprocess.run` in `<module>._authority_path` owner=`NativeLauncherTCB` threat-model=`fd-bound-exec-and-codesign` boundary=`native-launcher`
 - `python/khaos/coding/execution/native_launcher_runtime.py:413` `subprocess.run` in `<module>._authority_path` owner=`NativeLauncherTCB` threat-model=`fd-bound-exec-and-codesign` boundary=`native-launcher`
-- `python/khaos/coding/execution/platform.py:201` `subprocess.run` in `<module>.probe_capability` owner=`ExecutionBackend` threat-model=`kernel-sandbox-and-resource-control` boundary=`execution-service`
-- `python/khaos/coding/execution/platform.py:471` `asyncio.create_subprocess_exec` in `<module>.execute` owner=`ExecutionBackend` threat-model=`kernel-sandbox-and-resource-control` boundary=`execution-service`
-- `python/khaos/coding/execution/platform.py:1197` `subprocess.run` in `<module>.probe_capability` owner=`ExecutionBackend` threat-model=`kernel-sandbox-and-resource-control` boundary=`execution-service`
-- `python/khaos/coding/execution/platform.py:1610` `subprocess.run` in `<module>.probe_capability` owner=`ExecutionBackend` threat-model=`kernel-sandbox-and-resource-control` boundary=`execution-service`
+- `python/khaos/coding/execution/platform.py:203` `subprocess.run` in `<module>.probe_capability` owner=`ExecutionBackend` threat-model=`kernel-sandbox-and-resource-control` boundary=`execution-service`
+- `python/khaos/coding/execution/platform.py:473` `asyncio.create_subprocess_exec` in `<module>.execute` owner=`ExecutionBackend` threat-model=`kernel-sandbox-and-resource-control` boundary=`execution-service`
+- `python/khaos/coding/execution/platform.py:1199` `subprocess.run` in `<module>.probe_capability` owner=`ExecutionBackend` threat-model=`kernel-sandbox-and-resource-control` boundary=`execution-service`
+- `python/khaos/coding/execution/platform.py:1612` `subprocess.run` in `<module>.probe_capability` owner=`ExecutionBackend` threat-model=`kernel-sandbox-and-resource-control` boundary=`execution-service`
 - `python/khaos/coding/execution/service.py:1001` `asyncio.create_subprocess_exec` in `<module>._start_managed_after_admission` owner=`ExecutionService` threat-model=`authority-bound-child-spawn` boundary=`execution-service`
-- `python/khaos/coding/execution/supervisor.py:465` `asyncio.create_subprocess_exec` in `<module>.run` owner=`ProcessSupervisor` threat-model=`child-tree-lifecycle` boundary=`execution-service`
-- `python/khaos/coding/execution/supervisor.py:1594` `subprocess.run` in `<module>._darwin_deleted_open_file_usage` owner=`ProcessSupervisor` threat-model=`child-tree-lifecycle` boundary=`execution-service`
+- `python/khaos/coding/execution/supervisor.py:466` `asyncio.create_subprocess_exec` in `<module>.run` owner=`ProcessSupervisor` threat-model=`child-tree-lifecycle` boundary=`execution-service`
+- `python/khaos/coding/execution/supervisor.py:1605` `subprocess.run` in `<module>._darwin_deleted_open_file_usage` owner=`ProcessSupervisor` threat-model=`child-tree-lifecycle` boundary=`execution-service`
 - `python/khaos/coding/planning/verification_sandbox.py:379` `asyncio.create_subprocess_exec` in `<module>._spawn_docker_process` owner=`VerificationSandbox` threat-model=`trusted-docker-verification` boundary=`verification-authority`
 - `python/khaos/coding/workspace/git_process.py:92` `asyncio.create_subprocess_exec` in `<module>.spawn` owner=`TrustedGitProcessOwner` threat-model=`untrusted-repository-config` boundary=`workspace-control-plane`
 - `python/khaos/coding/workspace/trusted_git.py:2126` `subprocess.Popen` in `<module>._run_sync_bounded` owner=`TrustedGitRunner` threat-model=`untrusted-repository-config` boundary=`workspace-control-plane`
@@ -39,6 +39,7 @@
 - `python/khaos/security/credential_provider_worker.py:238` `subprocess.Popen` in `<module>._run_bounded_helper` owner=`CredentialProviderWorker` threat-model=`provider-helper-execution` boundary=`one-shot-worker-spec`
 - `python/khaos/security/evidence_provenance.py:71` `subprocess.Popen` in `<module>._bounded_process` owner=`EvidenceProvenanceFetcher` threat-model=`untrusted-gh-cli-output` boundary=`evidence-provenance-lookup`
 - `python/khaos/security/native_authority.py:256` `subprocess.Popen` in `<module>._bounded_native_call` owner=`NativeAuthorityAdapter` threat-model=`native-authority` boundary=`platform-transport`
+- `python/khaos/security/producer_evidence.py:488` `subprocess.check_output` in `<module>.git_head` owner=`ProducerEvidenceGitIdentity` threat-model=`trusted-repository-provenance` boundary=`producer-evidence`
 - `python/khaos/tools/clipboard_tools.py:25` `subprocess.run` in `<module>._clipboard_read_sync` owner=`HostClipboard` threat-model=`foreground-user-host-integration` boundary=`host-integration`
 - `python/khaos/tools/clipboard_tools.py:51` `subprocess.run` in `<module>._clipboard_write_sync` owner=`HostClipboard` threat-model=`foreground-user-host-integration` boundary=`host-integration`
 - `rust/khaos-core/src/bin/khaos-authorityd-backend-windows.rs:221` `Command::new` in `rust::entrypoint` owner=`AuthorityBackendServiceHost` threat-model=`trusted-backend-child-lifecycle` boundary=`windows-authority-backend-service`
@@ -50,7 +51,8 @@
 - `rust/khaos-core/src/bin/khaos-exec-launcher.rs:476` `Command::new` in `rust::entrypoint` owner=`NativeExecLauncher` threat-model=`fd-bound-executable-authority` boundary=`native-launcher`
 - `rust/khaos-core/src/bin/khaos-exec-launcher.rs:481` `status` in `rust::entrypoint` owner=`NativeExecLauncher` threat-model=`fd-bound-executable-authority` boundary=`native-launcher`
 - `rust/khaos-core/src/bin/khaos-exec-launcher.rs:529` `execveat` in `rust::entrypoint` owner=`NativeExecLauncher` threat-model=`fd-bound-executable-authority` boundary=`native-launcher`
-- `rust/khaos-core/src/bin/khaos-sandbox-launcher.rs:511` `execvp` in `rust::entrypoint` owner=`LinuxSandboxLauncher` threat-model=`seccomp-landlock-bwrap-boundary` boundary=`linux-sandbox`
+- `rust/khaos-core/src/bin/khaos-sandbox-launcher.rs:513` `execvp` in `rust::entrypoint` owner=`LinuxSandboxLauncher` threat-model=`seccomp-landlock-bwrap-boundary` boundary=`linux-sandbox`
+- `rust/khaos-core/src/bin/khaos-sandbox-launcher.rs:575` `Command::new` in `rust::entrypoint` owner=`LinuxSandboxLauncher` threat-model=`seccomp-landlock-bwrap-boundary` boundary=`linux-sandbox`
 - `rust/khaos-core/src/bin/khaos-windows-sandbox.rs:1127` `Command::new` in `rust::entrypoint` owner=`WindowsSandboxTCB` threat-model=`restricted-token-job-acl-appcontainer-wfp` boundary=`windows-sandbox`
 - `rust/khaos-core/src/bin/khaos-windows-sandbox.rs:2241` `Command::new` in `rust::entrypoint` owner=`WindowsSandboxTCB` threat-model=`restricted-token-job-acl-appcontainer-wfp` boundary=`windows-sandbox`
 - `rust/khaos-core/src/bin/khaos-windows-sandbox.rs:2437` `Command::new` in `rust::entrypoint` owner=`WindowsSandboxTCB` threat-model=`restricted-token-job-acl-appcontainer-wfp` boundary=`windows-sandbox`

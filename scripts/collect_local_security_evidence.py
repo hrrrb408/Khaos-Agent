@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Run the Community Local adversarial matrix and emit producer evidence.
+"""Aggregate producer-owned Community Local evidence.
 
-The script derives proof status from real subprocess results.  It does not
-accept status/closed/boolean arguments and treats skipped tests as a failed
-proof so an unavailable boundary cannot be promoted to PASS.
+This command intentionally does not run pytest and cannot manufacture a proof.
+It consumes producer files downloaded from the exact Security Closure Gate run,
+checks each producer's own digest/result/diagnostics, and emits only the
+minimal local bundle consumed by the live release verifier.
 """
 
 from __future__ import annotations
@@ -11,11 +12,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
-import subprocess
-import sys
-import tempfile
-import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
@@ -26,61 +22,36 @@ from khaos.security.local_closure import (
     REPOSITORY,
     canonical_digest,
 )
+from khaos.security.producer_evidence import (
+    PROCESS_TREE_PROOF,
+    PRODUCTION_COMPOSITION_PROOF,
+    PRODUCER_EVIDENCE_SCHEMA,
+    RESOURCE_OWNER_PROOF,
+    validate_producer_proof,
+)
 
 
-PROOF_TESTS: dict[str, tuple[str, ...]] = {
-    "community_authority": (
-        "python/tests/security/test_local_trust.py",
-        "python/tests/security/test_authority_transport.py",
-        "python/tests/security/test_authorityd_protocol.py",
-        "python/tests/security/test_identity_isolation.py",
-    ),
-    "platform_kernel": (
-        "python/tests/security/test_identity_isolation.py",
-        "python/tests/security/test_kernel_helper_client_round11.py",
-    ),
-    "production_reachability": (
-        "python/tests/security/test_production_reachability.py",
-    ),
-    "production_composition": (
-        "python/tests/security/test_production_composition_manifest.py",
-        "python/tests/security/test_production_composition_probe.py",
-    ),
-    "workspace_escape": (
-        "python/tests/security/test_path_guard.py",
-        "python/tests/coding/test_safe_workspace_fs.py",
-        "python/tests/coding/test_workspace_boundary.py",
-        "python/tests/coding/test_workspace_artifact_boundary.py",
-    ),
-    "approval_replay": (
-        "python/tests/tools/test_authorization_contract.py",
-        "python/tests/tools/test_approval_callback_boundary.py",
-        "python/tests/agent/test_approval_broker.py",
-        "python/tests/agent/test_operation_approval_ledger.py",
-    ),
-    "approval_substitution": (
-        "python/tests/tools/test_authorization_contract.py",
-        "python/tests/tools/test_approval_callback_boundary.py",
-        "python/tests/tools/test_scheduler_boundaries.py",
-        "python/tests/tools/test_execution_coordinator_boundary.py",
-    ),
-    "process_tree_escape": (
-        "python/tests/coding/test_process_supervisor.py",
-        "python/tests/coding/test_managed_process_lifecycle.py",
-        "python/tests/coding/test_trusted_git_process_owner.py",
-    ),
-    "resource_owner_closure": (
-        "python/tests/coding/test_resource_owner_protocol.py",
-        "python/tests/coding/test_resource_owner_closure.py",
-        "python/tests/coding/test_linux_resource_owner.py",
-    ),
-    "network_isolation": (
-        "python/tests/security/test_network_guard.py",
-        "python/tests/security/test_network_broker.py",
-        "python/tests/tools/test_network_authority_integration.py",
-        "python/tests/security/test_host_network_authority.py",
-    ),
-}
+MANIFEST_SCHEMA = "khaos.local-security-producer-artifact-manifest.v1"
+EXPECTED_PRODUCER_ARTIFACTS = frozenset(
+    {
+        "community-local-test-producer-evidence-{commit}",
+        "production-composition-evidence-{commit}",
+        "production-lifecycle-evidence-{commit}",
+    }
+)
+_PRODUCTION_PROOFS = frozenset(
+    {PRODUCTION_COMPOSITION_PROOF, PROCESS_TREE_PROOF, RESOURCE_OWNER_PROOF}
+)
+
+
+def _args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--repo-root", type=Path, default=Path.cwd())
+    parser.add_argument("--producer-dir", type=Path, required=True)
+    parser.add_argument("--producer-manifest", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--commit", required=True)
+    return parser.parse_args()
 
 
 def _sha256(path: Path) -> str:
@@ -91,15 +62,9 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--repo-root", type=Path, default=Path.cwd())
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--commit", required=True)
-    return parser.parse_args()
+def _identity(commit: str) -> dict[str, object]:
+    import os
 
-
-def _ci_identity(commit: str) -> dict[str, object]:
     expected = {
         "repository": REPOSITORY,
         "event": "push",
@@ -114,124 +79,236 @@ def _ci_identity(commit: str) -> dict[str, object]:
     }
     if actual != expected:
         raise RuntimeError(
-            "Community Local evidence must be produced by the exact main push: "
+            "Community Local aggregator requires the exact main push: "
             + json.dumps(actual, sort_keys=True)
         )
+    if os.environ.get("GITHUB_RUN_ATTEMPT") != "1":
+        raise RuntimeError("Community Local aggregator requires attempt 1")
     run_id = os.environ.get("GITHUB_RUN_ID", "")
-    if not run_id or not run_id.isdigit():
-        raise RuntimeError("GITHUB_RUN_ID is required for producer evidence")
-    run_attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "1")
-    if run_attempt != "1":
-        raise RuntimeError("Community Local evidence requires the original run attempt")
+    if not run_id.isdigit() or int(run_id) <= 0:
+        raise RuntimeError("Community Local aggregator requires a numeric run id")
+    for key in ("GITHUB_WORKFLOW", "RUNNER_OS", "GITHUB_JOB"):
+        if not os.environ.get(key, "").strip():
+            raise RuntimeError(f"Community Local aggregator requires {key}")
     return {
         "repository": REPOSITORY,
-        "workflow": os.environ.get("GITHUB_WORKFLOW", "Community Local Security Closure"),
+        "workflow": os.environ["GITHUB_WORKFLOW"],
         "run_id": run_id,
         "run_attempt": 1,
         "event": "push",
         "ref": "refs/heads/main",
         "head_sha": commit,
-        "runner_os": os.environ.get("RUNNER_OS", "unknown"),
+        "runner_os": os.environ["RUNNER_OS"],
+        "job": os.environ["GITHUB_JOB"],
     }
 
 
-def _run_proof(repo_root: Path, name: str, tests: tuple[str, ...]) -> dict[str, object]:
-    with tempfile.TemporaryDirectory(prefix=f"khaos-{name}-") as temp_dir:
-        junit = Path(temp_dir) / "results.xml"
-        command = [
-            sys.executable,
-            "-m",
-            "pytest",
-            "-q",
-            "--junitxml",
-            str(junit),
-            *tests,
-        ]
-        environment = dict(os.environ)
-        environment["PYTHONPATH"] = str(repo_root / "python")
-        completed = subprocess.run(
-            command,
-            cwd=repo_root,
-            env=environment,
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            timeout=900,
+def _load_manifest(path: Path, commit: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"producer artifact manifest is unreadable: {path}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("producer artifact manifest is not an object")
+    supplied = payload.pop("manifest_digest", None)
+    if (
+        payload.get("schema") != MANIFEST_SCHEMA
+        or payload.get("commit") != commit
+        or not isinstance(payload.get("security_run"), dict)
+        or not isinstance(payload.get("artifacts"), list)
+        or not isinstance(supplied, str)
+        or supplied != canonical_digest(payload)
+    ):
+        raise RuntimeError("producer artifact manifest identity or digest is invalid")
+    payload["manifest_digest"] = supplied
+    security_run = payload["security_run"]
+    assert isinstance(security_run, dict)
+    if (
+        security_run.get("event") != "push"
+        or security_run.get("head_branch") != "main"
+        or security_run.get("head_sha") != commit
+        or security_run.get("run_attempt") != 1
+        or not str(security_run.get("run_id") or "").isdigit()
+    ):
+        raise RuntimeError("producer artifact manifest is not exact-main attempt 1")
+    names: set[str] = set()
+    for artifact in payload["artifacts"]:
+        if not isinstance(artifact, dict):
+            raise RuntimeError("producer artifact record is malformed")
+        name = artifact.get("name")
+        digest = artifact.get("artifact_sha256")
+        files = artifact.get("files")
+        if (
+            not isinstance(name, str)
+            or not name
+            or name in names
+            or not isinstance(digest, str)
+            or len(digest) != 64
+            or not isinstance(files, list)
+            or not files
+        ):
+            raise RuntimeError("producer artifact record is not exact")
+        names.add(name)
+        diagnostics_files = artifact.get("diagnostics_files")
+        if not isinstance(diagnostics_files, list) or not diagnostics_files:
+            raise RuntimeError(f"producer artifact {name} has no diagnostics provenance")
+        for file_record in files:
+            if not isinstance(file_record, dict):
+                raise RuntimeError("producer artifact file record is malformed")
+            if not isinstance(file_record.get("path"), str) or not file_record["path"]:
+                raise RuntimeError("producer artifact file path is missing")
+        for diagnostic_path in diagnostics_files:
+            if not isinstance(diagnostic_path, str) or not diagnostic_path:
+                raise RuntimeError("producer diagnostic file path is malformed")
+    expected_names = {
+        pattern.format(commit=commit) for pattern in EXPECTED_PRODUCER_ARTIFACTS
+    }
+    if names != expected_names:
+        raise RuntimeError(
+            "producer artifact set is not exact: "
+            f"missing={sorted(expected_names - names)} unexpected={sorted(names - expected_names)}"
         )
-        output = completed.stdout[-16000:]
-        skipped = 0
-        failed = 0
-        errors = 0
-        if junit.is_file():
-            root = ET.parse(junit).getroot()
-            suite = root if root.tag == "testsuite" else root.find("testsuite")
-            if suite is not None:
-                skipped = int(suite.attrib.get("skipped", "0"))
-                failed = int(suite.attrib.get("failures", "0"))
-                errors = int(suite.attrib.get("errors", "0"))
-        status = "PASS" if completed.returncode == 0 and skipped == 0 else "FAIL"
-        return {
-            "name": name,
-            "status": status,
-            "tests": list(tests),
-            "command": command,
-            "returncode": completed.returncode,
-            "skipped": skipped,
-            "failures": failed,
-            "errors": errors,
-            "output_digest": hashlib.sha256(output.encode("utf-8")).hexdigest(),
-            "artifact_digest": canonical_digest(
-                {
-                    "name": name,
-                    "status": status,
-                    "tests": list(tests),
-                    "returncode": completed.returncode,
-                    "skipped": skipped,
-                    "failures": failed,
-                    "errors": errors,
-                    "output_digest": hashlib.sha256(output.encode("utf-8")).hexdigest(),
-                }
-            ),
-        }
+    return payload
+
+
+def _producer_files(
+    producer_dir: Path,
+    manifest: dict[str, Any],
+    commit: str,
+) -> dict[str, tuple[dict[str, object], dict[str, object]]]:
+    artifact_by_path: dict[str, dict[str, object]] = {}
+    diagnostic_paths: set[str] = set()
+    for artifact in manifest["artifacts"]:
+        assert isinstance(artifact, dict)
+        for file_record in artifact["files"]:
+            assert isinstance(file_record, dict)
+            path = str(file_record["path"])
+            if path in artifact_by_path:
+                raise RuntimeError(f"duplicate producer file provenance: {path}")
+            artifact_by_path[path] = artifact
+        for diagnostic_path in artifact["diagnostics_files"]:
+            if (
+                not isinstance(diagnostic_path, str)
+                or diagnostic_path in artifact_by_path
+                or diagnostic_path in diagnostic_paths
+            ):
+                raise RuntimeError(f"duplicate producer diagnostic provenance: {diagnostic_path}")
+            diagnostic_paths.add(diagnostic_path)
+    for relative in diagnostic_paths:
+        path = (producer_dir / relative).resolve()
+        if producer_dir.resolve() not in path.parents or not path.is_file() or path.is_symlink():
+            raise RuntimeError(f"producer diagnostic is missing or escapes producer dir: {relative}")
+    found: dict[str, tuple[dict[str, object], dict[str, object]]] = {}
+    for relative, artifact in artifact_by_path.items():
+        path = (producer_dir / relative).resolve()
+        if producer_dir.resolve() not in path.parents or not path.is_file() or path.is_symlink():
+            raise RuntimeError(f"producer file is missing or escapes producer dir: {relative}")
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"producer proof is malformed: {relative}") from exc
+        if not isinstance(value, dict) or value.get("schema") != PRODUCER_EVIDENCE_SCHEMA:
+            raise RuntimeError(f"unexpected producer JSON in manifest: {relative}")
+        proof = validate_producer_proof(value, expected_commit=commit)
+        name = proof.get("proof_type")
+        if not isinstance(name, str) or name in found:
+            raise RuntimeError(f"duplicate producer proof: {name}")
+        artifact_name = artifact.get("name")
+        artifact_digest = artifact.get("artifact_sha256")
+        if not isinstance(artifact_name, str) or not isinstance(artifact_digest, str):
+            raise RuntimeError("producer artifact binding is malformed")
+        workflow = proof.get("workflow")
+        if not isinstance(workflow, dict):
+            raise RuntimeError("producer workflow provenance is malformed")
+        security_run = manifest["security_run"]
+        assert isinstance(security_run, dict)
+        if (
+            str(workflow.get("run_id")) != str(security_run.get("run_id"))
+            or workflow.get("event") != "push"
+            or workflow.get("ref") != "refs/heads/main"
+            or workflow.get("head_sha") != commit
+            or workflow.get("run_attempt") != 1
+        ):
+            raise RuntimeError(f"producer {name} provenance is not exact-main")
+        found[name] = (
+            proof,
+            {
+                "name": artifact_name,
+                "artifact_digest": artifact_digest,
+                "path": relative,
+            },
+        )
+    return found
+
+
+def _local_proof(
+    proof: dict[str, object], artifact: dict[str, object], policy_digest: str
+) -> dict[str, object]:
+    name = str(proof["proof_type"])
+    if proof.get("result") != "PASS":
+        diagnostics = proof.get("diagnostics")
+        raise RuntimeError(
+            f"proof {name} is {proof.get('result')}; diagnostics="
+            + json.dumps(diagnostics, sort_keys=True)
+        )
+    if proof.get("policy_digest") != policy_digest:
+        raise RuntimeError(f"proof {name} uses a different policy digest")
+    expected_production = name in _PRODUCTION_PROOFS
+    if proof.get("production_claim") is not expected_production:
+        raise RuntimeError(f"proof {name} has the wrong production ownership")
+    producer_digest = proof.get("evidence_digest")
+    if not isinstance(producer_digest, str) or len(producer_digest) != 64:
+        raise RuntimeError(f"proof {name} has no producer evidence digest")
+    workflow = proof["workflow"]
+    assert isinstance(workflow, dict)
+    return {
+        "name": name,
+        "proof_type": name,
+        "status": "PASS",
+        "profile": "community-local",
+        "commit": proof["commit"],
+        "policy_digest": policy_digest,
+        "artifact_digest": artifact["artifact_digest"],
+        "producer_artifact_name": artifact["name"],
+        "producer_evidence_digest": producer_digest,
+        "provenance": dict(workflow),
+    }
 
 
 def main() -> int:
-    args = _parse_args()
+    args = _args()
     repo_root = args.repo_root.resolve()
-    output = args.output.resolve()
-    identity = _ci_identity(args.commit)
-    policy = load_effective_policy(repo_root)
-    proofs: list[dict[str, object]] = []
-    failed = False
-    for name in COMMUNITY_LOCAL_REQUIRED_PROOFS:
-        result = _run_proof(repo_root, name, PROOF_TESTS[name])
-        failed = failed or result["status"] != "PASS"
-        provenance = dict(identity)
-        provenance["job"] = name
-        proofs.append(
-            {
-                "name": name,
-                "status": result["status"],
-                "profile": "community-local",
-                "commit": args.commit,
-                "policy_digest": policy.digest,
-                "artifact_digest": result["artifact_digest"],
-                "provenance": provenance,
-            }
+    commit = args.commit
+    identity = _identity(commit)
+    manifest = _load_manifest(args.producer_manifest.resolve(), commit)
+    producers = _producer_files(args.producer_dir.resolve(), manifest, commit)
+    required = set(COMMUNITY_LOCAL_REQUIRED_PROOFS)
+    if set(producers) != required:
+        missing = sorted(required - set(producers))
+        unexpected = sorted(set(producers) - required)
+        raise RuntimeError(
+            "producer proof set is not exact: "
+            f"missing={','.join(missing)} unexpected={','.join(unexpected)}"
         )
+    policy = load_effective_policy(repo_root)
+    proofs = [
+        _local_proof(producers[name][0], producers[name][1], policy.digest)
+        for name in COMMUNITY_LOCAL_REQUIRED_PROOFS
+    ]
+    composition = producers[PRODUCTION_COMPOSITION_PROOF][0]
+    composition_digest = composition.get("production_composition_manifest_digest")
+    if not isinstance(composition_digest, str) or len(composition_digest) != 64:
+        raise RuntimeError("production composition producer has no manifest digest")
     payload: dict[str, Any] = {
         "schema": LOCAL_EVIDENCE_SCHEMA,
         "profile": "community-local",
-        "commit": args.commit,
+        "commit": commit,
         "policy_digest": policy.digest,
         "security_facts_digest": _sha256(repo_root / "docs/security_facts.yaml"),
         "production_reachability_digest": _sha256(
             repo_root / "docs/generated/production-reachability.md"
         ),
-        "production_composition_digest": _sha256(
-            repo_root / "python/khaos/security/production_composition_manifest.py"
-        ),
+        "production_composition_digest": composition_digest,
         "workflow": identity,
         "proofs": proofs,
         "profile_status": {
@@ -250,9 +327,16 @@ def main() -> int:
         ],
     }
     payload["evidence_digest"] = canonical_digest(payload)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    return 0 if not failed else 1
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(
+        "aggregated exact producer proofs: "
+        + ", ".join(
+            f"{proof['name']} artifact={proof['producer_artifact_name']}"
+            for proof in proofs
+        )
+    )
+    return 0
 
 
 if __name__ == "__main__":

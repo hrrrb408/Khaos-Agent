@@ -22,6 +22,7 @@ from khaos.coding.execution.platform import (
     UnsupportedBackend,
     _create_linux_cgroup,
     _linux_sandbox_launcher,
+    _linux_processes_postorder,
     _mountinfo_has_cgroup_v2_path,
     _read_windows_output,
     _remove_windows_python_runtime,
@@ -228,7 +229,18 @@ def test_read_only_platform_profiles_do_not_mount_workspace_writable(tmp_path: P
     assert linux_argv[worktree_index - 1] == "--ro-bind"
 
 
-def test_linux_profile_isolates_proc_ipc_uts_and_parent_lifetime(tmp_path: Path):
+@pytest.mark.posix_host
+def test_linux_profile_isolates_proc_ipc_uts_and_parent_lifetime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.delenv("KHAOS_DEV_MODE", raising=False)
+    monkeypatch.setattr(
+        "khaos.coding.execution.platform._resolve_bwrap_path",
+        lambda: "/usr/bin/bwrap",
+    )
+    monkeypatch.setenv("KHAOS_AGENT_UID", str(os.geteuid()))
+    monkeypatch.setenv("KHAOS_AUTHORITYD_UID", "65533")
+    monkeypatch.setenv("KHAOS_JOB_UID", "65534")
     argv = LinuxBubblewrapBackend().argv_prefix(tmp_path)
 
     assert ("--proc", "/proc") == argv[
@@ -241,6 +253,7 @@ def test_linux_profile_isolates_proc_ipc_uts_and_parent_lifetime(tmp_path: Path)
     assert "--unshare-ipc" in argv
     assert "--unshare-uts" in argv
     assert "--unshare-net" in argv
+    assert argv.index("--as-pid-1") == argv.index("--unshare-pid") + 1
     assert "--new-session" in argv
     assert "--die-with-parent" in argv
     assert ("--ro-bind", "/", "/") not in tuple(
@@ -255,6 +268,16 @@ def test_linux_profile_isolates_proc_ipc_uts_and_parent_lifetime(tmp_path: Path)
         argv[index:index + 3] for index in range(len(argv) - 2)
     )
     assert "--clearenv" in argv
+
+
+def test_linux_dev_profile_keeps_bwrap_reaper(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Development bwrap must not claim the production PID-1 composition."""
+    monkeypatch.setenv("KHAOS_DEV_MODE", "1")
+
+    argv = LinuxBubblewrapBackend().argv_prefix(tmp_path)
+
+    assert "--unshare-pid" in argv
+    assert "--as-pid-1" not in argv
 
 
 def test_linux_profile_requires_landlock_allowlists_after_mount_setup(tmp_path: Path):
@@ -351,12 +374,29 @@ def test_linux_cgroup_process_kill_proves_empty_before_return(tmp_path: Path):
     assert (group / "cgroup.kill").read_text(encoding="ascii") == "1"
 
 
+def test_linux_cgroup_tree_termination_orders_children_before_namespace_init():
+    """A cgroup kill must leave namespace init alive long enough to reap."""
+    from khaos.coding.execution.platform import _linux_processes_postorder
+
+    ordered = _linux_processes_postorder(
+        (100, 101, 102, 103),
+        {100: 1, 101: 100, 102: 101, 103: 100},
+        protected={100},
+    )
+
+    assert ordered == (102, 101, 103)
+
+
 @pytest.mark.asyncio
 @pytest.mark.posix_host
+@pytest.mark.parametrize(
+    ("dev_mode", "expects_backend_callback"),
+    ((False, True), (True, False)),
+)
 async def test_linux_execute_joins_cgroup_before_bwrap_and_seccomp_after(
-    tmp_path: Path, monkeypatch,
+    tmp_path: Path, monkeypatch, dev_mode: bool, expects_backend_callback: bool,
 ):
-    """The host cgroup join precedes bwrap; seccomp is installed inside it."""
+    """The host cgroup join precedes bwrap in both compositions."""
     from khaos.coding.execution import platform as platform_module
 
     workspace = tmp_path / "workspace"
@@ -366,6 +406,16 @@ async def test_linux_execute_joins_cgroup_before_bwrap_and_seccomp_after(
     (cgroup / "cgroup.procs").write_text("", encoding="ascii")
     launcher = Path("/trusted/khaos-sandbox-launcher")
     captured: dict[str, object] = {}
+    if dev_mode:
+        monkeypatch.setenv("KHAOS_DEV_MODE", "1")
+    else:
+        monkeypatch.delenv("KHAOS_DEV_MODE", raising=False)
+        monkeypatch.setenv("KHAOS_AGENT_UID", str(os.geteuid()))
+        monkeypatch.setenv("KHAOS_AUTHORITYD_UID", "65533")
+        monkeypatch.setenv("KHAOS_JOB_UID", "65534")
+        monkeypatch.setattr(
+            platform_module, "_resolve_bwrap_path", lambda: "/usr/bin/bwrap"
+        )
 
     class RecordingSupervisor:
         async def run(self, request, **_kwargs):
@@ -401,11 +451,14 @@ async def test_linux_execute_joins_cgroup_before_bwrap_and_seccomp_after(
 
     argv = captured["argv"]
     assert isinstance(argv, tuple)
-    assert callable(captured["termination_callback"])
+    if expects_backend_callback:
+        assert callable(captured["termination_callback"])
+    else:
+        assert captured["termination_callback"] is None
     assert argv[:4] == (
         str(launcher), "--join-cgroup", str(cgroup / "cgroup.procs"), "--",
     )
-    assert argv[4] == "bwrap"
+    assert Path(argv[4]).name == "bwrap"
     assert (str(launcher), "--", "/bin/echo", "ok") == argv[-4:]
     assert "/run/khaos-cgroup.procs" not in argv
 

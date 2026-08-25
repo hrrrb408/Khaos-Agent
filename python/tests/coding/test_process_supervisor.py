@@ -147,6 +147,7 @@ async def test_supervisor_runs_backend_termination_callback_before_draining_outp
     """
     supervisor = ProcessSupervisor(termination_grace_seconds=0.1)
     callback_called = asyncio.Event()
+    callback_saw_live_process: list[bool] = []
     request = ExecutionRequest(
         (sys.executable, "-c", "import time; time.sleep(30)"),
         tmp_path,
@@ -155,6 +156,8 @@ async def test_supervisor_runs_backend_termination_callback_before_draining_outp
     )
 
     async def terminate_backend_tree() -> None:
+        active = supervisor._active["backend-termination-callback"]
+        callback_saw_live_process.append(active.process.returncode is None)
         callback_called.set()
 
     running = asyncio.create_task(
@@ -166,6 +169,43 @@ async def test_supervisor_runs_backend_termination_callback_before_draining_outp
 
     assert result.status == "timed-out"
     assert callback_called.is_set()
+    assert callback_saw_live_process == [True]
+    assert supervisor.active_execution_ids == ()
+
+
+@pytest.mark.asyncio
+@POSIX_ONLY
+async def test_backend_callback_can_reap_direct_launcher_before_group_signal(
+    tmp_path: Path, monkeypatch,
+):
+    """A backend-owned namespace parent may reap before supervisor fallback."""
+    supervisor = ProcessSupervisor(termination_grace_seconds=0.1)
+    signals: list[signal.Signals] = []
+    monkeypatch.setattr(
+        supervisor_module,
+        "_signal_process_group",
+        lambda _process, sig, **_kwargs: signals.append(sig),
+    )
+    request = ExecutionRequest(
+        (sys.executable, "-c", "import time; time.sleep(30)"),
+        tmp_path,
+        budget=ResourceBudget(timeout_seconds=0.05),
+        correlation_id="backend-reaped-launcher",
+    )
+
+    async def reap_direct_launcher() -> None:
+        active = supervisor._active["backend-reaped-launcher"]
+        active.process.terminate()
+        assert active.process_wait_task is not None
+        await asyncio.shield(active.process_wait_task)
+
+    result = await supervisor.run(
+        request,
+        termination_callback=reap_direct_launcher,
+    )
+
+    assert result.status == "timed-out"
+    assert signals == []
     assert supervisor.active_execution_ids == ()
 
 

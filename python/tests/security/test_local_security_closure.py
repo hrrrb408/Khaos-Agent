@@ -45,6 +45,9 @@ def _payload() -> dict[str, object]:
             "commit": COMMIT,
             "policy_digest": POLICY,
             "artifact_digest": canonical_digest({"proof": name}),
+            "proof_type": name,
+            "producer_artifact_name": f"producer-{name}",
+            "producer_evidence_digest": "f" * 64,
             "provenance": dict(_workflow(), job=name),
         }
         for name in COMMUNITY_LOCAL_REQUIRED_PROOFS
@@ -194,6 +197,17 @@ def test_tampered_proof_commit_is_rejected_even_with_a_rehashed_bundle() -> None
     payload["evidence_digest"] = canonical_digest(unsigned)
 
     with pytest.raises(LocalEvidenceError, match="different commit"):
+        ClosureEvidence.from_payload(payload)
+
+
+def test_community_proof_without_external_producer_binding_is_rejected() -> None:
+    payload = _payload()
+    payload["proofs"][0].pop("producer_artifact_name")
+    payload["proofs"][0].pop("producer_evidence_digest")
+    payload["evidence_digest"] = canonical_digest(
+        {key: value for key, value in payload.items() if key != "evidence_digest"}
+    )
+    with pytest.raises(LocalEvidenceError, match="independent producer provenance"):
         ClosureEvidence.from_payload(payload)
 
 

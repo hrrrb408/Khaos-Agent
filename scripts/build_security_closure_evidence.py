@@ -75,18 +75,20 @@ def _provenance_digest(payload: dict[str, object]) -> str:
 def test_fragment(args: argparse.Namespace) -> None:
     if args.test not in REQUIRED_TESTS:
         raise RuntimeError("unknown security evidence test")
-    if args.result != "blocked":
-        raise RuntimeError("security evidence result must be blocked")
+    # This fragment is a diagnostic contract for the security gate.  Its
+    # result is fixed by this producer and is never a caller-supplied PASS.
+    # ``production_mode`` is derived from the process environment so the old
+    # boolean CLI declaration cannot forge a production claim.
     environment = {
         "runner_os": args.runner_os,
-        "production_mode": args.production_mode == "true",
+        "production_mode": os.environ.get("KHAOS_DEV_MODE", "0") == "0",
     }
     payload: dict[str, object] = {
         "commit": args.commit,
         "run_id": args.run_id,
         "job": args.job,
         "test": args.test,
-        "result": args.result,
+        "result": "blocked",
         "environment": environment,
     }
     payload["digest"] = _provenance_digest(payload)
@@ -200,7 +202,7 @@ def final_artifact(args: argparse.Namespace) -> None:
     _write(Path(args.output), artifact)
 
 
-def main() -> None:
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
     fragment = subparsers.add_parser("browser-fragment")
@@ -223,12 +225,14 @@ def main() -> None:
     test.add_argument("--run-id", required=True)
     test.add_argument("--job", required=True)
     test.add_argument("--test", required=True)
-    test.add_argument("--result", default="blocked")
     test.add_argument("--runner-os", required=True)
-    test.add_argument("--production-mode", choices=("true", "false"), default="true")
     test.add_argument("--output", required=True)
     test.set_defaults(handler=test_fragment)
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> None:
+    args = _build_parser().parse_args()
     args.handler(args)
 
 
