@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import re
 import signal
 import subprocess
 import threading
@@ -22,6 +23,24 @@ from collections.abc import Callable
 
 class EvidenceProvenanceError(RuntimeError):
     """A GitHub API lookup for evidence provenance failed."""
+
+
+_REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+
+
+def _qualified_api_endpoint(repository: str, endpoint: str) -> str:
+    """Bind one GitHub API endpoint to the requested repository.
+
+    The bundled ``gh`` CLI accepts the endpoint as its first positional
+    argument and does not expose the newer ``--repo`` flag.  Qualifying the
+    endpoint itself keeps the repository binding explicit for both JSON and
+    artifact requests without relying on ambient repository state.
+    """
+    if not _REPOSITORY_RE.fullmatch(repository):
+        raise EvidenceProvenanceError("GitHub repository must be owner/name")
+    if not endpoint or endpoint.startswith("-"):
+        raise EvidenceProvenanceError("GitHub API endpoint is required")
+    return f"repos/{repository}/{endpoint.lstrip('/')}"
 
 
 def _kill_process_domain(process: subprocess.Popen[bytes]) -> None:
@@ -162,8 +181,11 @@ def gh_api_bytes(
     max_output_bytes: int = 8 * 1024 * 1024,
 ) -> bytes:
     """Fetch bounded raw bytes from GitHub through the ``gh`` CLI."""
+    if not args:
+        raise EvidenceProvenanceError("GitHub API endpoint is required")
+    endpoint = _qualified_api_endpoint(repository, args[0])
     stdout, _ = _bounded_process(
-        ["gh", "api", "--repo", repository, *args],
+        ["gh", "api", endpoint, *args[1:]],
         timeout_seconds=timeout_seconds,
         max_output_bytes=max_output_bytes,
     )
