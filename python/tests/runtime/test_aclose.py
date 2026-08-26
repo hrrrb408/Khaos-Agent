@@ -260,6 +260,7 @@ async def test_closed_field_is_not_bound_by_positional_construction():
         "memory_manager",
         "skill_manager",
         "new_verify_fix_loop",
+        "profile",
         "execution_service",
         "browser_manager",
         "cleanup_authority",

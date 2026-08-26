@@ -381,6 +381,7 @@ def cmd_start(args: argparse.Namespace) -> None:
     print(f"Database: {db_path}")
     print(f"Config: {args.config}")
     from khaos.grpc_server import serve_json_lines
+    from khaos.runtime_profile import RuntimeProfile
 
     try:
         asyncio.run(
@@ -393,6 +394,7 @@ def cmd_start(args: argparse.Namespace) -> None:
                 gateway_uid=args.gateway_uid,
                 gateway_gid=args.gateway_gid,
                 gateway_pid=gateway_pid,
+                runtime_profile=RuntimeProfile.PRODUCTION,
             )
         )
     finally:
@@ -642,6 +644,7 @@ async def _open_memory_cli(args: argparse.Namespace) -> dict[str, object]:
     )
     from khaos.memory import MemoryBudget, RuntimeMemoryContext
     from khaos.runtime import build_memory_host
+    from khaos.runtime_profile import RuntimeProfile
     from khaos.security.effective_policy import load_effective_policy
 
     root = Path(args.project_root or Path.cwd()).expanduser().resolve()
@@ -661,7 +664,7 @@ async def _open_memory_cli(args: argparse.Namespace) -> dict[str, object]:
                 log_path=resolve_safe_audit_log_path(effective_policy.audit_log_path),
                 anchor_path=(
                     resolve_safe_audit_anchor_path(project)
-                    if os.environ.get("KHAOS_DEV_MODE") != "1"
+                    if RuntimeProfile.PRODUCTION.is_production
                     else None
                 ),
                 principal_id=principal_id,

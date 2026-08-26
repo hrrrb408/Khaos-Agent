@@ -44,6 +44,7 @@ from khaos.security.authority_broker import (
     AuthorityBrokerError,
     EffectCapability,
 )
+from khaos.runtime_profile import RuntimeProfile, resolve_runtime_profile
 
 logger = logging.getLogger(__name__)
 
@@ -113,10 +114,12 @@ class ProcessSupervisor:
         *,
         termination_grace_seconds: float = 2.0,
         storage_authority: WorkspaceStorageAuthority | None = None,
+        runtime_profile: RuntimeProfile | str | None = None,
     ) -> None:
         if termination_grace_seconds <= 0:
             raise ValueError("termination grace period must be positive")
         self.termination_grace_seconds = termination_grace_seconds
+        self.runtime_profile = resolve_runtime_profile(runtime_profile)
         self.storage_authority = storage_authority or WorkspaceStorageAuthority()
         self._active: dict[str, _ActiveProcess] = {}
         self._pending_spawns: dict[str, _PendingSpawn] = {}
@@ -379,7 +382,7 @@ class ProcessSupervisor:
                     safe_environment,
                     expected_identity=request.executable_identity,
                 )
-                if _authority_receipt_required():
+                if _authority_receipt_required(self.runtime_profile):
                     authority_capability = _issue_execution_capability(
                         request,
                         resource_digest=execution_binding_digest(
@@ -395,6 +398,7 @@ class ProcessSupervisor:
                             environment=safe_environment,
                             executable_authority=authority,
                         ),
+                        runtime_profile=self.runtime_profile,
                     )
                     if not os.environ.get("KHAOS_AUTHORITYD_PUBLIC_KEY_PATH"):
                         raise PermissionError(
@@ -420,6 +424,7 @@ class ProcessSupervisor:
                         if authority_capability is not None
                         else None
                     ),
+                    runtime_profile=self.runtime_profile,
                 )
             except BaseException:
                 if authority_capability is not None:
@@ -1666,17 +1671,18 @@ def _darwin_deleted_open_file_usage(
     return total, True
 
 
-def _authority_receipt_required() -> bool:
+def _authority_receipt_required(
+    runtime_profile: RuntimeProfile | str | None = None,
+) -> bool:
     """Return whether host execution must cross the external authority gate."""
-    # Production has no safe in-process authority fallback.  The explicit
-    # development profile is the only place where the test broker may remain.
-    return os.environ.get("KHAOS_DEV_MODE") != "1"
+    return resolve_runtime_profile(runtime_profile).is_production
 
 
 def _issue_execution_capability(
     request: ExecutionRequest,
     *,
     resource_digest: str,
+    runtime_profile: RuntimeProfile | str | None = None,
 ) -> EffectCapability:
     """Issue one exact host-execution receipt for the native launch binding."""
     authority = request.execution_authority
@@ -1701,7 +1707,7 @@ def _issue_execution_capability(
         != authority.spawn_plan.authorization_resource_digest
     ):
         raise PermissionError("execution authority effect binding diverged")
-    broker = AuthorityBroker.default()
+    broker = AuthorityBroker.default(runtime_profile=runtime_profile)
     envelope = broker.envelope(
         principal_id=step.principal_id,
         project_id=step.project_id,

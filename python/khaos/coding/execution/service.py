@@ -44,6 +44,7 @@ from khaos.coding.workspace.storage import (
     WorkspaceStorageLimits,
     capture_workspace_snapshot,
 )
+from khaos.runtime_profile import RuntimeProfile, resolve_runtime_profile
 
 if TYPE_CHECKING:
     from khaos.coding.workspace.manager import WorkspaceManager
@@ -76,8 +77,12 @@ class ExecutionService:
         principal_id: str = "legacy",
         project_id: str = "",
         runtime_id: str = "",
+        runtime_profile: RuntimeProfile | str | None = None,
     ) -> None:
-        self.process_supervisor = process_supervisor or ProcessSupervisor()
+        self.runtime_profile = resolve_runtime_profile(runtime_profile)
+        self.process_supervisor = process_supervisor or ProcessSupervisor(
+            runtime_profile=self.runtime_profile
+        )
         self.backend = backend
         self.backend_selector = backend_selector
         self.workspace_manager = workspace_manager
@@ -129,6 +134,9 @@ class ExecutionService:
             self.docker_backend.supervisor = self.process_supervisor
         if self.backend_selector is not None:
             self.backend_selector.set_supervisor(self.process_supervisor)
+            set_profile = getattr(self.backend_selector, "set_runtime_profile", None)
+            if callable(set_profile):
+                set_profile(self.runtime_profile)
 
     @property
     def _closed(self) -> bool:
@@ -997,6 +1005,7 @@ class ExecutionService:
                             environment=safe_environment,
                             expected_identity=expected,
                             executable_authority=authority,
+                            runtime_profile=self.runtime_profile,
                         )
                         process = await asyncio.create_subprocess_exec(
                             *launch.argv,

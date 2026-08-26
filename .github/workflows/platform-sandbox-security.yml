@@ -456,6 +456,7 @@ jobs:
         with:
           name: browser-non-root-evidence
           path: diagnostics/
+          retention-days: 90
 
   macos-sandbox-security:
     runs-on: macos-latest

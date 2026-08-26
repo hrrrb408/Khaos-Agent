@@ -124,6 +124,177 @@ production_reachability:
   unresolved_internal_imports: fail_closed
   generated_artifact: docs/generated/production-reachability.md
   evidence_class: machine_checked_repository_graph_not_native_kernel_evidence
+runtime_profile:
+  type: python/khaos/runtime_profile.py:RuntimeProfile
+  values:
+    - production
+    - development
+    - testing
+  production_builder: build_production_runtime_fixes_production_profile
+  legacy_environment: KHAOS_DEV_MODE_is_only_a_compatibility_resolver_input
+  ambient_security_authority: forbidden_outside_legacy_profile_resolver
+  production_entrypoints:
+    - python/khaos/cli/main.py
+    - python/khaos/grpc_server.py
+    - python/khaos/rpc/agent_service.py
+    - scripts/verify_production_composition.py
+deployment_profiles:
+  community_local:
+    identifier: community-local
+    default: true
+    decision_owner: python/khaos/security/local_closure.py
+    machine_decision_status: CLOSED_or_NOT_CLOSED
+    exact_main_push_ci_required: true
+    apple_signing_prerequisite: not_required
+  macos_signed_distribution:
+    identifier: macos-signed-distribution
+    enabled_by: KHAOS_NATIVE_MACOS_E2E
+    disabled_status: OPTIONAL_PROFILE_NOT_ENABLED
+    missing_native_evidence: fail_closed
+  windows_native:
+    identifier: windows-native
+    status: native_or_fail_closed
+    missing_native_evidence: fail_closed
+closure_semantics:
+  live_authority: scripts/verify_release_gate_runs.py
+  saved_release_record_is_capability: false
+  exact_commit_required: true
+  original_run_attempt_required: 1
+  protected_main_ancestry_required: true
+  community_local_decision_is_profile_scoped: true
+required_gates:
+  merge_authority:
+    - Security Closure Gate
+    - Product Integrity Gate
+  security_closure_workflow: .github/workflows/security-closure-gate.yml
+  product_integrity_workflow: .github/workflows/product-integrity-gate.yml
+  community_local_provenance_workflow: .github/workflows/community-local-closure.yml
+  release_verifier: scripts/verify_release_gate_runs.py
+  exact_push_event: push
+  exact_main_ref: refs/heads/main
+required_proof_names:
+  community_local:
+    - community_authority
+    - platform_kernel
+    - production_reachability
+    - production_composition
+    - workspace_escape
+    - approval_replay
+    - approval_substitution
+    - process_tree_escape
+    - resource_owner_closure
+    - network_isolation
+accepted_residuals:
+  - id: hostile_same_uid_isolation
+    profile: community-local
+    status: NOT_CLAIMED
+    source: docs/local-security-profile.md
+  - id: second_maintainer_independent_review
+    profile: community-local
+    status: NOT_CLAIMED
+    source: docs/security-release-governance.md
+  - id: remote_worm_audit_sink
+    profile: community-local
+    status: RESIDUAL
+    source: docs/security-release-governance.md
+  - id: native_platform_authority_evidence
+    profile: community-local
+    status: BLOCKED_EXTERNAL
+    source: docs/security-release-governance.md
+supported_platform_claims:
+  community_local_macos_posix:
+    profile: community-local
+    claim: personal_local_owner_only_authority_and_peer_authenticated_socket
+    same_uid_isolation: NOT_CLAIMED
+  linux_kernel_sandbox:
+    claim: real_kernel_isolation_requires_ci_proof
+    local_status: BLOCKED_EXTERNAL
+    evidence_class: CI_ONLY
+  windows_native:
+    claim: native_or_fail_closed
+    evidence_class: native_ci_only
+  macos_signed_distribution:
+    claim: explicit_optional_signed_profile_only
+    disabled_status: OPTIONAL_PROFILE_NOT_ENABLED
+type_check:
+  source_of_truth: pyright-security.json
+  repository_default_mode: basic
+  strict_mode: strict
+  strict_files:
+    - python/khaos/security/local_closure.py
+    - python/khaos/tools/admission.py
+    - python/khaos/tools/execution_coordinator.py
+    - python/khaos/runtime_profile.py
+    - python/khaos/runtime/authority.py
+  workflow: .github/workflows/type-check.yml
+  hard_gate: true
+  additional_coverage_mode: basic
+  validator: scripts/validate_type_check_contract.py
+issue_169:
+  tracker: "#169"
+  overall_status: PARTIALLY_COMPLETED
+  do_not_close_from_local_evidence: true
+  classification_vocabulary:
+    - COMPLETED
+    - PARTIALLY_COMPLETED
+    - RESIDUAL
+    - DEFERRED
+    - OUT_OF_PROFILE
+  items:
+    typed_resource_narrowing:
+      status: COMPLETED
+      evidence:
+        - python/khaos/security/resource_scope.py
+        - python/tests/security/test_resource_scope.py
+    grant_descendants:
+      status: COMPLETED
+      evidence:
+        - python/khaos/security/authorityd.py
+        - python/tests/security/test_authorityd_protocol.py
+    immutable_scheduler_states:
+      status: PARTIALLY_COMPLETED
+      evidence:
+        - python/khaos/tools/admission.py
+        - python/khaos/security/orchestration_phases.py
+        - python/tests/security/test_tool_scheduler_state_contract.py
+      residual: mutable_compatibility_projection_and_incremental_physical_split
+    native_authority:
+      status: PARTIALLY_COMPLETED
+      evidence:
+        - python/khaos/security/native_authority.py
+        - .github/workflows/native-authority-production-e2e.yml
+        - python/tests/security/test_native_authority.py
+      residual: exact_sha_native_platform_ci_and_deployment_identity
+    delegation:
+      status: COMPLETED
+      evidence:
+        - python/khaos/security/delegation_issuer.py
+        - python/khaos/security/authorityd.py
+        - python/tests/security/test_delegation_authority_owned.py
+      residual: live_deployment_transport_remains_fail_closed_when_unavailable
+tool_scheduler_state_machine:
+  status: incremental_typed_boundary_already_present
+  canonical_immutable_states:
+    admitted_tool_call: python/khaos/tools/admission.py:AdmittedToolCall
+    phase_evidence: python/khaos/security/orchestration_phases.py:ToolPhaseSnapshot
+    approval_bound_call: python/khaos/agent/approval.py:ApprovalBinding
+    authorized_effect: python/khaos/agent/approval.py:StepExecutionAuthority
+    resolved_execution: python/khaos/coding/execution/models.py:ResolvedExecutionContext
+  phase_order:
+    - raw
+    - validated
+    - resource_resolved
+    - permission_decided
+    - approval_bound
+    - authorized_effect
+    - dispatching
+    - terminal
+  compatibility_projection: python/khaos/tools/scheduler.py:mutable_call_metadata_rechecked_against_canonical_states
+  mutation_fail_closed_tests:
+    - python/tests/tools/test_scheduler_boundaries.py
+    - python/tests/security/test_orchestration_phases.py
+    - python/tests/agent/test_approval_broker.py
+  unknown_effect: effect_status_unknown_and_retry_safe_false
 tcb_boundaries:
   pure_module: python/khaos/security/protocol_boundary.py
   owns:
@@ -201,6 +372,92 @@ local_security_closure:
   handwritten_status_or_boolean: rejected
   local_json_or_mock_artifact_can_close: false
   closure_capability: live_github_verifier_issues_non_serializable_typed_provenance
+  pre_closure:
+    status_vocabulary:
+      - PASS
+      - FAIL
+    gate_job: community-local-preclosure
+    commit_environment: GITHUB_SHA
+    required_proofs_source: python/khaos/security/local_closure.py
+    ordinary_producer_mapping: scripts/run_security_producer_matrix.py
+    producer_artifact_mapping: scripts/verify_release_gate_runs.py
+    producer_schema_validator: python/khaos/security/producer_evidence.py
+    local_evidence_schema: khaos.local-security-evidence.v1
+    producer_evidence_schema: khaos.local-security-producer-proof.v1
+    accepts_saved_release_record_as_live_provenance: false
+    final_certification_workflow: .github/workflows/community-local-closure.yml
+evidence_retention:
+  critical_minimum_days: 90
+  saved_evidence_is_audit_only: true
+  live_exact_sha_verifier_remains_authority: true
+  release_asset_contract:
+    workflow: .github/workflows/release-provenance.yml
+    upload_command: 'gh release upload "$RELEASE_TAG" dist/*'
+    replacement_flag_forbidden: --clobber
+    closure_bundle_generator: scripts/build_community_local_closure_bundle.py
+    closure_bundle_schema: khaos.community-local-closure-bundle.v1
+    closure_bundle_is_capability: false
+  artifacts:
+    - workflow: .github/workflows/batch5-required-jobs.yml
+      name: security-test-evidence-browser-kernel
+      class: closure-critical
+    - workflow: .github/workflows/browser-e2e.yml
+      name: security-test-evidence-browser-dns-rebinding
+      class: closure-critical
+    - workflow: .github/workflows/community-local-closure.yml
+      name: 'local-security-evidence-${{ github.sha }}'
+      class: release-critical
+    - workflow: .github/workflows/docker-security.yml
+      name: 'production-composition-evidence-${{ github.sha }}'
+      class: release-critical
+    - workflow: .github/workflows/docker-security.yml
+      name: 'production-lifecycle-evidence-${{ github.sha }}'
+      class: release-critical
+    - workflow: .github/workflows/native-authority-production-e2e.yml
+      name: native-authority-macos-proof
+      class: release-critical
+    - workflow: .github/workflows/native-authority-production-e2e.yml
+      name: native-authority-windows-proof
+      class: release-critical
+    - workflow: .github/workflows/native-authority-production-e2e.yml
+      name: deployment-profile-results
+      class: release-critical
+    - workflow: .github/workflows/platform-sandbox-security.yml
+      name: linux-bwrap-diagnostics
+      class: diagnostic
+    - workflow: .github/workflows/platform-sandbox-security.yml
+      name: browser-kernel-diagnostics
+      class: diagnostic
+    - workflow: .github/workflows/platform-sandbox-security.yml
+      name: browser-non-root-evidence
+      class: closure-critical
+    - workflow: .github/workflows/platform-sandbox-security.yml
+      name: macos-sandbox-diagnostics
+      class: diagnostic
+    - workflow: .github/workflows/platform-sandbox-security.yml
+      name: windows-fail-closed-diagnostics
+      class: diagnostic
+    - workflow: .github/workflows/ruleset-audit.yml
+      name: github-ruleset-audit
+      class: closure-critical
+    - workflow: .github/workflows/security-closure-gate.yml
+      name: closure-adversarial-evidence
+      class: closure-critical
+    - workflow: .github/workflows/security-closure-gate.yml
+      name: m6-security-closure-report
+      class: closure-critical
+    - workflow: .github/workflows/security-closure-gate.yml
+      name: 'community-local-test-producer-evidence-${{ github.sha }}'
+      class: release-critical
+    - workflow: .github/workflows/security-closure-gate.yml
+      name: 'security-evidence-${{ github.sha }}'
+      class: release-critical
+    - workflow: .github/workflows/supply-chain-audit.yml
+      name: 'supply-chain-provenance-${{ github.sha }}'
+      class: closure-critical
+    - workflow: .github/workflows/upstream-codex-security-watch.yml
+      name: upstream-codex-security-watch
+      class: diagnostic
 upstream_security_watch:
   generator: scripts/watch_upstream_codex_security.py
   fixed_sha: 711a5f8b3a6eb40134146ae9ec22fdcdda5e3170
@@ -211,13 +468,142 @@ governance:
   active_mode: single_maintainer_compatibility
   hardened_template: scripts/github-m6-hardened-ruleset.json
   independent_review_claimed: false
+  critical_path_change_requires_manual_diff_review: true
+  autonomous_merge_allowed: false
   validator: scripts/validate_m6_governance.py
+  security_critical_paths:
+    - .github/CODEOWNERS
+    - .github/workflows/
+    - .github/workflows/batch5-required-jobs.yml
+    - .github/workflows/browser-e2e.yml
+    - .github/workflows/community-local-closure.yml
+    - .github/workflows/docker-lifecycle-soak.yml
+    - .github/workflows/docker-security.yml
+    - .github/workflows/native-authority-production-e2e.yml
+    - .github/workflows/platform-sandbox-security.yml
+    - .github/workflows/product-integrity-gate.yml
+    - .github/workflows/release-provenance.yml
+    - .github/workflows/ruleset-audit.yml
+    - .github/workflows/security-closure-gate.yml
+    - .github/workflows/security-contract-matrix.yml
+    - .github/workflows/supply-chain-audit.yml
+    - .github/workflows/type-check.yml
+    - .github/workflows/upstream-codex-security-watch.yml
+    - docs/security_facts.yaml
+    - docs/security-release-governance.md
+    - docs/required-status-checks.md
+    - docs/local-security-profile.md
+    - docs/type-check-rollout.md
+    - docs/issue-169-status.md
+    - pyright-security.json
+    - python/tests/
+    - python/khaos/agent/approval.py
+    - python/khaos/coding/execution/models.py
+    - python/khaos/permissions/
+    - python/khaos/runtime/
+    - python/khaos/security/orchestration_phases.py
+    - python/khaos/security/network_guard.py
+    - python/khaos/tools/admission.py
+    - python/khaos/tools/execution_coordinator.py
+    - python/khaos/tools/scheduler.py
+    - python/khaos/runtime_profile.py
+    - rust/khaos-core/advisory-policy.toml
+    - rust/khaos-core/audit.toml
+    - scripts/audit-github-ruleset.sh
+    - scripts/build_community_local_closure_bundle.py
+    - scripts/build_local_security_closure_report.py
+    - scripts/build_m6_closure_report.py
+    - scripts/build_security_closure_evidence.py
+    - scripts/check_privileged_spawn_sites.py
+    - scripts/collect_local_security_evidence.py
+    - scripts/compose-security-e2e.sh
+    - scripts/fetch_security_producer_artifacts.py
+    - scripts/generate_browser_kernel_protocol.py
+    - scripts/generate_production_reachability.py
+    - scripts/generate_release_evidence.py
+    - scripts/generate_security_inventory.py
+    - scripts/github-main-ruleset.json
+    - scripts/github-m6-hardened-ruleset.json
+    - scripts/render_macos_authority_backend_plist.py
+    - scripts/run_native_authority_e2e.py
+    - scripts/run_native_authority_identity_probe.py
+    - scripts/run_security_producer_matrix.py
+    - scripts/run_windows_product_suite.py
+    - scripts/run_worm_audit_receiver.py
+    - scripts/validate_docker_outer_profiles.py
+    - scripts/validate_m6_governance.py
+    - scripts/validate_community_local_preclosure.py
+    - scripts/validate_type_check_contract.py
+    - scripts/validate_cargo_advisory_policy.py
+    - scripts/validate_evidence_retention.py
+    - scripts/validate_security_facts_consistency.py
+    - scripts/verify_production_composition.py
+    - scripts/verify_release_gate_runs.py
+    - scripts/verify_release_tag.py
+    - scripts/watch_upstream_codex_security.py
 orchestration_boundaries:
   extracted_components:
     - TurnAdmission
     - TurnFinalizer
     - ToolPhaseCoordinator
   decomposition_status: incremental_in_progress
+architecture_junctions:
+  status: incremental_owner_split_with_explicit_compatibility_boundaries
+  grpc:
+    status: ALREADY_SATISFIED
+    transport_owner: python/khaos/grpc_server.py:serve_json_lines
+    authenticator_owner: python/khaos/rpc/protocol.py:GatewayRPCAuthenticator
+    bootstrap_owner: python/khaos/grpc_server.py:serve_json_lines
+    composition_owner: python/khaos/rpc/composition.py
+    lifecycle_owner: python/khaos/grpc_server.py:serve_json_lines
+    service_owners:
+      agent: python/khaos/rpc/agent_service.py:AgentService
+      task: python/khaos/rpc/task_service.py:TaskService
+      models: python/khaos/rpc/models.py
+    security_invariants_preserved:
+      - instance_lock
+      - safe_run_dir
+      - O_NOFOLLOW
+      - inode_revalidation
+      - UDS_peer_verification
+      - capability_auth
+      - RPC_Initialize_negotiation
+      - bootstrap_policy_digest
+      - bounded_shutdown
+    regression_tests:
+      - python/tests/runtime/test_rpc_service_boundaries.py
+      - python/tests/security/test_rpc_protocol_boundary.py
+      - python/tests/security/test_rpc_negotiation.py
+  database:
+    status: COMPATIBILITY_MIGRATION_REMAINING
+    connection_owner: python/khaos/db/connection.py:DatabaseConnection
+    migration_owner: python/khaos/db/database.py:Database.run_migrations
+    repository_owner_root: python/khaos/db/repositories/
+    facade_rule: compatibility_methods_only_new_domain_sql_forbidden
+    regression_tests:
+      - python/tests/db/test_connection_boundary.py
+      - python/tests/db/test_scheduler_repository_boundary.py
+      - python/tests/db/test_static_gate_transaction_authority.py
+  tool_scheduler:
+    status: ALREADY_SATISFIED
+    orchestration_owner: python/khaos/tools/scheduler.py:ToolScheduler
+    admission_owner: python/khaos/tools/admission.py:ToolAdmission
+    authorization_owner: python/khaos/tools/authorization.py:ToolAuthorization
+    execution_owner: python/khaos/tools/execution_coordinator.py:ToolExecutionCoordinator
+    terminal_owner: python/khaos/tools/result_finalizer.py:ToolResultFinalizer
+    phase_owner: python/khaos/security/orchestration_phases.py:ToolPhaseSnapshot
+    regression_tests:
+      - python/tests/tools/test_scheduler_boundaries.py
+      - python/tests/security/test_orchestration_phases.py
+      - python/tests/security/test_tool_scheduler_state_contract.py
+  cron_scheduler:
+    status: ALREADY_SATISFIED
+    lifecycle_owner: python/khaos/scheduler/engine.py:CronEngine
+    execution_owner: python/khaos/scheduler/execution.py:SchedulerExecution
+    recovery_owner: python/khaos/scheduler/recovery.py:SchedulerRecovery
+    persistence_owner: python/khaos/scheduler/repository.py:ScheduledTaskRepository
+    regression_tests:
+      - python/tests/scheduler/test_scheduler_owner_boundaries.py
 evidence:
   local_platform_sandbox: diagnostic_only
   required_linux_proof: real_kernel_ci

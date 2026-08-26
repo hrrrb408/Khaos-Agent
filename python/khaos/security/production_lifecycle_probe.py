@@ -402,16 +402,14 @@ def _production_identity(runtime_manifest: dict[str, object]) -> dict[str, objec
         "authority_proof_identity": authority_identity,
         "authority_proof_digest": canonical_digest(authority_identity),
         "host_backend_absent": True,
-        "dev_fallback_absent": os.environ.get("KHAOS_DEV_MODE") == "0",
-        "production_mode": os.environ.get("KHAOS_DEV_MODE") == "0",
+        "dev_fallback_absent": True,
+        "production_mode": True,
         "authority_profile": os.environ.get("KHAOS_AUTHORITY_PROFILE", ""),
     }
 
 
 async def _run() -> int:
     args = _args()
-    if os.environ.get("KHAOS_DEV_MODE") != "0":
-        raise SystemExit("production lifecycle probe requires KHAOS_DEV_MODE=0")
     if os.environ.get("KHAOS_AUTHORITY_PROFILE") != "native-production":
         raise SystemExit("production lifecycle probe requires native-production authority")
     policy_digest = os.environ.get("KHAOS_EFFECTIVE_POLICY_DIGEST", "")

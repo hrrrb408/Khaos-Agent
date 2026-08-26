@@ -41,6 +41,7 @@ from khaos.coding.execution.environment import scrub_spawn_environment
 from khaos.coding.execution.identity import executable_identity
 from khaos.coding.execution.models import ExecutionResult, NetworkPolicy, ResourceBudget
 from khaos.coding.execution.supervisor import ProcessSupervisor
+from khaos.runtime_profile import RuntimeProfile, resolve_runtime_profile
 from khaos.security.identity_isolation import linux_job_namespace_args
 
 logger = logging.getLogger(__name__)
@@ -143,8 +144,14 @@ class WindowsSandboxBackend:
 
     name = "windows-native"
 
-    def __init__(self, supervisor=None) -> None:
+    def __init__(
+        self,
+        supervisor=None,
+        runtime_profile: RuntimeProfile | str | None = None,
+    ) -> None:
         self.supervisor = supervisor
+        self._runtime_profile_explicit = runtime_profile is not None
+        self.runtime_profile = resolve_runtime_profile(runtime_profile)
         self._capability_cache: _CapabilityCacheEntry | None = None
         self._active: dict[str, _WindowsOwnedProcess] = {}
         self._pending_spawns: dict[str, _WindowsPendingSpawn] = {}
@@ -1026,15 +1033,29 @@ def _remove_windows_python_runtime(staging_root: Path) -> None:
 class BackendSelector:
     """Select an OS-enforced backend; Agent execution never falls back to host."""
 
-    def __init__(self, supervisor=None) -> None:
+    def __init__(
+        self,
+        supervisor=None,
+        runtime_profile: RuntimeProfile | str | None = None,
+    ) -> None:
         self.supervisor = supervisor
+        self.runtime_profile = resolve_runtime_profile(runtime_profile)
 
     def set_supervisor(self, supervisor) -> None:
         self.supervisor = supervisor
 
+    def set_runtime_profile(
+        self, runtime_profile: RuntimeProfile | str | None
+    ) -> None:
+        """Set the profile before selecting an execution backend."""
+        self._runtime_profile_explicit = runtime_profile is not None
+        self.runtime_profile = resolve_runtime_profile(runtime_profile)
+
     def select(self, *, writable: bool):
         if sys.platform == "darwin":
-            backend = MacOSSandboxBackend(self.supervisor)
+            backend = MacOSSandboxBackend(
+                self.supervisor, runtime_profile=self.runtime_profile
+            )
             try:
                 availability = backend.probe_capability()
             except Exception:  # noqa: BLE001 - unavailable sandbox probes fail closed
@@ -1047,7 +1068,9 @@ class BackendSelector:
             if availability.available and availability.network_enforced:
                 return backend
         elif sys.platform.startswith("linux"):
-            backend = LinuxBubblewrapBackend(self.supervisor)
+            backend = LinuxBubblewrapBackend(
+                self.supervisor, runtime_profile=self.runtime_profile
+            )
             try:
                 availability = backend.probe_capability()
             except Exception as exc:  # noqa: BLE001 - unavailable sandbox probes fail closed
@@ -1066,7 +1089,9 @@ class BackendSelector:
             if writable:
                 return UnsupportedBackend()
         if sys.platform.startswith("win"):
-            backend = WindowsSandboxBackend(self.supervisor)
+            backend = WindowsSandboxBackend(
+                self.supervisor, runtime_profile=self.runtime_profile
+            )
             try:
                 availability = backend.probe_capability()
             except Exception as exc:  # noqa: BLE001 - Windows probes fail closed
@@ -1133,8 +1158,13 @@ class BackendSelector:
 class MacOSSandboxBackend:
     name = "macos-sandbox-exec"
 
-    def __init__(self, supervisor=None) -> None:
+    def __init__(
+        self,
+        supervisor=None,
+        runtime_profile: RuntimeProfile | str | None = None,
+    ) -> None:
         self.supervisor = supervisor
+        self.runtime_profile = resolve_runtime_profile(runtime_profile)
         self._capability_cache: _CapabilityCacheEntry | None = None
 
     @staticmethod
@@ -1430,8 +1460,14 @@ class MacOSSandboxBackend:
 class LinuxBubblewrapBackend:
     name = "linux-bwrap"
 
-    def __init__(self, supervisor=None) -> None:
+    def __init__(
+        self,
+        supervisor=None,
+        runtime_profile: RuntimeProfile | str | None = None,
+    ) -> None:
         self.supervisor = supervisor
+        self._runtime_profile_explicit = runtime_profile is not None
+        self.runtime_profile = resolve_runtime_profile(runtime_profile)
         self._capability_cache: _CapabilityCacheEntry | None = None
         self._cgroup_leases: dict[str, KernelResourceLease] = {}
         self._release_tasks: dict[str, asyncio.Task[None]] = {}
@@ -1439,6 +1475,12 @@ class LinuxBubblewrapBackend:
         self._state = LinuxBubblewrapBackendState.OPEN
         self._shutdown_task: asyncio.Task[None] | None = None
         self._shutdown_error: BaseException | None = None
+
+    def _profile_kwargs(self) -> dict[str, RuntimeProfile]:
+        """Preserve zero-argument helper compatibility for legacy callers."""
+        if not self._runtime_profile_explicit:
+            return {}
+        return {"runtime_profile": self.runtime_profile}
 
     @property
     def state(self) -> str:
@@ -1586,14 +1628,17 @@ class LinuxBubblewrapBackend:
         """
         if not sys.platform.startswith("linux") or shutil.which("bwrap") is None:
             return BackendAvailability(self.name, False, False, "bwrap unavailable on this platform")
-        launcher = _linux_sandbox_launcher()
+        launcher = _linux_sandbox_launcher(**self._profile_kwargs())
         if launcher is None:
             return BackendAvailability(
                 self.name, False, False,
                 "khaos-sandbox-launcher unavailable; no_new_privs/seccomp TCB is required",
             )
         evidence = _capability_evidence(
-            (Path(_resolve_bwrap_path()), launcher),
+            (
+                Path(_resolve_bwrap_path(**self._profile_kwargs())),
+                launcher,
+            ),
             cgroup_root=_linux_cgroup_root(),
         )
         cached = _cached_availability(self._capability_cache, evidence)
@@ -1690,7 +1735,8 @@ class LinuxBubblewrapBackend:
         home.mkdir(mode=0o700, parents=True, exist_ok=True)
         workspace_mount = workspace_source or str(canonical_worktree)
         prefix = [
-            _resolve_bwrap_path(),  # P1-1: validated absolute path, not bare PATH
+            _resolve_bwrap_path(**self._profile_kwargs()),
+            # P1-1: validated absolute path, not bare PATH
             "--tmpfs", "/",
             "--dir", "/home",
             "--dir", "/etc",
@@ -1741,7 +1787,7 @@ class LinuxBubblewrapBackend:
         for literal in _linux_literal_read_files():
             if literal.is_file():
                 prefix.extend(("--ro-bind", str(literal), str(literal)))
-        launcher = _linux_sandbox_launcher()
+        launcher = _linux_sandbox_launcher(**self._profile_kwargs())
         if launcher is not None:
             prefix.extend(("--ro-bind", str(launcher), str(launcher)))
         landlock_read_roots = {
@@ -1799,10 +1845,10 @@ class LinuxBubblewrapBackend:
         )
         namespace_options = [
             network_option,
-            *linux_job_namespace_args(),
+            *linux_job_namespace_args(**self._profile_kwargs()),
             "--unshare-pid",
         ]
-        if not _development_mode():
+        if not _development_mode(self.runtime_profile):
             # Production's native launcher is the reviewed owner of the
             # payload process tree.  Make it PID 1 so it can reap adopted
             # descendants; otherwise bubblewrap's own namespace init can
@@ -1825,7 +1871,7 @@ class LinuxBubblewrapBackend:
 
     async def execute(self, request):
         from dataclasses import replace
-        production_composition = not _development_mode()
+        production_composition = self.runtime_profile.is_production
         if self.admission_closed:
             raise PermissionError(
                 f"Linux bubblewrap backend is {self._state.value}, not accepting executions"
@@ -1907,7 +1953,7 @@ class LinuxBubblewrapBackend:
                     # to the already-validated directory inode.
                     workspace_source=workspace_source,
                 )
-                launcher = _linux_sandbox_launcher()
+                launcher = _linux_sandbox_launcher(**self._profile_kwargs())
                 if launcher is None:
                     raise PermissionError(
                         "execution refused: no_new_privs/seccomp launcher unavailable"
@@ -2076,7 +2122,9 @@ class LinuxBubblewrapBackend:
         self._cgroup_leases.pop(execution_id, None)
 
 
-def _resolve_bwrap_path() -> str:
+def _resolve_bwrap_path(
+    runtime_profile: RuntimeProfile | str | None = None,
+) -> str:
     """P1-1 (round-13): resolve bwrap to a validated absolute path.
 
     Reuses the browser path's ``_validate_tcb_binary`` to enforce the same
@@ -2084,7 +2132,7 @@ def _resolve_bwrap_path() -> str:
     permitted only under explicit ``KHAOS_DEV_MODE=1``.
     """
     from khaos.security.browser_sandbox import BrowserSandboxError, _validate_tcb_binary
-    require = not _development_mode()
+    require = not _development_mode(runtime_profile)
     located = shutil.which("bwrap")
     if located is None:
         if require:
@@ -2098,7 +2146,9 @@ def _resolve_bwrap_path() -> str:
     return located
 
 
-def _linux_sandbox_launcher() -> Path | None:
+def _linux_sandbox_launcher(
+    runtime_profile: RuntimeProfile | str | None = None,
+) -> Path | None:
     """Resolve the reviewed Rust execution inner TCB.
 
     P1-1 (round-13): secure production mode
@@ -2122,7 +2172,7 @@ def _linux_sandbox_launcher() -> Path | None:
         / "khaos-sandbox-launcher",
     ))
     # P1-1: target/debug is dev-only; skip it in production.
-    if _development_mode():
+    if _development_mode(runtime_profile):
         candidates.append(
             repository_root / "rust" / "khaos-core" / "target" / "debug"
             / "khaos-sandbox-launcher"
@@ -2130,7 +2180,7 @@ def _linux_sandbox_launcher() -> Path | None:
     located = shutil.which("khaos-execution-sandbox-launcher")
     if located:
         candidates.append(Path(located))
-    require = not _development_mode()
+    require = not _development_mode(runtime_profile)
     for candidate in candidates:
         canonical = candidate.resolve()
         if not (canonical.is_file() and os.access(canonical, os.X_OK)):
@@ -2149,9 +2199,11 @@ def _linux_sandbox_launcher() -> Path | None:
     return None
 
 
-def _development_mode() -> bool:
-    """Only the exact explicit opt-in enables development fallbacks."""
-    return os.environ.get("KHAOS_DEV_MODE") == "1"
+def _development_mode(
+    runtime_profile: RuntimeProfile | str | None = None,
+) -> bool:
+    """Return development semantics from an explicit profile or legacy env."""
+    return not resolve_runtime_profile(runtime_profile).is_production
 
 
 def _mountinfo_has_cgroup_v2_path(path: Path, mountinfo: str) -> bool:

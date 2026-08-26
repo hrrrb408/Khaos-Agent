@@ -1,0 +1,5 @@
+# Temporary RustSec exceptions are machine-readable and must be justified.
+# There are currently no active exceptions: Cargo.lock contains pyo3 0.29.0,
+# which is outside both historical pyo3 advisory ranges previously ignored.
+schema_version = 1
+advisory_exceptions = []

@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import logging
-import os
 import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from khaos.agent.core import AgentConfig, Message, SimpleTokenEngine
 from khaos.db.state_root import project_id as compute_project_id
+from khaos.runtime_profile import RuntimeProfile, resolve_runtime_profile
 from khaos.subagents.spawner import SubAgentTask
 
 if TYPE_CHECKING:
@@ -60,6 +60,7 @@ class SubAgentRunner:
         config_path: Path | None = None,      # B1: 继承 config 路径
         cleanup_authority: Any | None = None,
         memory_host: MemoryHost | None = None,
+        runtime_profile: RuntimeProfile | str | None = None,
     ):
         self.router = router
         self.db = db
@@ -108,6 +109,7 @@ class SubAgentRunner:
         self.config_path = config_path
         self.cleanup_authority = cleanup_authority
         self.memory_host = memory_host
+        self.runtime_profile = resolve_runtime_profile(runtime_profile)
 
     async def run(self, task: SubAgentTask) -> str:
         """执行子任务并返回结果字符串。
@@ -220,19 +222,27 @@ class SubAgentRunner:
             runtime_kwargs["memory_manager"] = (
                 self.memory_manager if self.inherit_memory else None
             )
-        if runtime_config_type is ProductionRuntimeConfig and os.environ.get(
-            "KHAOS_DEV_MODE"
-        ) != "1":
+            runtime_kwargs["profile"] = self.runtime_profile
+        elif not self.runtime_profile.is_production:
+            # A non-production server profile still needs to survive the
+            # structural-to-legacy adapter even when the runner has no
+            # injected test components.  Otherwise RuntimeConfig would
+            # resolve the ambient legacy environment again and an explicit
+            # TESTING/DEVELOPMENT profile could silently become production.
+            runtime_kwargs["profile"] = self.runtime_profile
+        if (
+            runtime_config_type is ProductionRuntimeConfig
+            and self.runtime_profile.is_production
+        ):
             runtime = await build_production_runtime(
                 ProductionRuntimeConfig(**runtime_kwargs)
             )
         else:
-            # Explicit development mode may use the ordinary factory for
-            # test adapters, but it still receives the structural production
-            # config when no injected scheduler/memory owner is present.  It
-            # never creates a host or same-UID authority fallback.
-            config_type = runtime_config_type
-            runtime = await build_runtime(config_type(**runtime_kwargs))
+            # Legacy/test adapters and explicitly non-production server
+            # profiles use the ordinary factory with the typed profile.  A
+            # production profile can never reach this branch with the
+            # structural production config.
+            runtime = await build_runtime(RuntimeConfig(**runtime_kwargs))
         try:
             logger.info(
                 "SubAgentRunner starting: task=%s session=%s goal=%r",

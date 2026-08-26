@@ -19,6 +19,34 @@ concurrency:
   cancel-in-progress: ${{ github.event_name != 'push' }}
 
 jobs:
+  # Structural PR contract for Community Local.  This validates the live
+  # proof/evidence mapping before merge but never certifies a main push.
+  community-local-preclosure:
+    name: Community Local pre-closure contract
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install contract dependencies
+        run: |
+          python -m pip install --require-hashes -r python/bootstrap-requirements.txt
+          uv sync --frozen --extra test
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+      - name: Validate COMMUNITY_LOCAL_PRE_CLOSURE
+        run: |
+          python scripts/validate_evidence_retention.py
+          python scripts/validate_security_facts_consistency.py
+          PYTHONPATH=python python scripts/validate_community_local_preclosure.py
+          PYTHONPATH=python python -m pytest \
+            python/tests/security/test_community_local_preclosure.py \
+            python/tests/security/test_security_facts_consistency.py -q -v
+
   # Python Security Suite, Go Race, Rust Clippy, Browser Kernel Attack E2E.
   core-security:
     uses: ./.github/workflows/batch5-required-jobs.yml
@@ -161,6 +189,7 @@ jobs:
           name: closure-adversarial-evidence
           path: evidence/*.json
           if-no-files-found: error
+          retention-days: 90
 
   m6-adversarial-matrix:
     name: M6 Adversarial Closure Matrix
@@ -204,6 +233,7 @@ jobs:
           name: m6-security-closure-report
           path: m6-evidence/m6-security-closure-report.md
           if-no-files-found: error
+          retention-days: 90
 
   # Community Local consumes these exact producer artifacts after the
   # Security Closure run completes.  This job owns the ordinary pytest
@@ -238,7 +268,7 @@ jobs:
           name: community-local-test-producer-evidence-${{ github.sha }}
           path: community-local-producer-evidence/
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 90
 
   security-closure-gate:
     name: Security Closure Gate
@@ -255,6 +285,7 @@ jobs:
       - closure-adversarial
       - m6-adversarial-matrix
       - community-local-producers
+      - community-local-preclosure
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -271,12 +302,13 @@ jobs:
           CLOSURE_ADVERSARIAL: ${{ needs.closure-adversarial.result }}
           M6_ADVERSARIAL_MATRIX: ${{ needs.m6-adversarial-matrix.result }}
           COMMUNITY_LOCAL_PRODUCERS: ${{ needs.community-local-producers.result }}
+          COMMUNITY_LOCAL_PRECLOSURE: ${{ needs.community-local-preclosure.result }}
         run: |
           for result in \
             "$CORE_SECURITY" "$STRICT_CONTRACTS" "$REAL_KERNEL" \
             "$PLAYWRIGHT_SECURITY" "$DOCKER_SECURITY" "$SUPPLY_CHAIN" \
             "$TYPE_CHECK" "$RULESET_AUDIT" "$CLOSURE_ADVERSARIAL" \
-            "$COMMUNITY_LOCAL_PRODUCERS"; do
+            "$COMMUNITY_LOCAL_PRODUCERS" "$COMMUNITY_LOCAL_PRECLOSURE"; do
             test "$result" = "success"
           done
           test "$M6_ADVERSARIAL_MATRIX" = "success"
@@ -317,3 +349,4 @@ jobs:
           name: security-evidence-${{ github.sha }}
           path: security-evidence/
           if-no-files-found: error
+          retention-days: 90

@@ -413,6 +413,7 @@ jobs:
         with:
           name: native-authority-macos-proof
           path: native-evidence/
+          retention-days: 90
 
   windows-service-named-pipe:
     name: Windows Service-SID Named Pipe authority
@@ -641,6 +642,7 @@ jobs:
         with:
           name: native-authority-windows-proof
           path: native-evidence/
+          retention-days: 90
 
   profile-results:
     name: Publish deployment profile results
@@ -738,3 +740,4 @@ jobs:
         with:
           name: deployment-profile-results
           path: profile-evidence/deployment-profile-results.json
+          retention-days: 90

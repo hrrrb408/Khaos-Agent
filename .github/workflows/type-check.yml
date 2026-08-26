@@ -59,10 +59,12 @@ jobs:
         # Round-24: Community Local Trust Root and explicit authority-profile
         # construction are now part of the same hard gate; profile boundary
         # code must not drift into dynamically typed fail-open paths.
+        # additional direct file coverage remains basic-mode until
+        # each file is promoted into pyright-security.json.
         run: |
+          python scripts/validate_type_check_contract.py
           uv run pyright --project pyright-security.json
           uv run pyright \
-            python/khaos/runtime/authority.py \
             python/khaos/runtime/lifecycle.py \
             python/khaos/coding/execution/capability.py \
             python/khaos/coding/execution/authority.py \

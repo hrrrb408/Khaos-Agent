@@ -1061,6 +1061,7 @@ async def test_subagent_runner_passes_none_mode_manager_in_production():
     """
     from khaos.subagents.runner import SubAgentRunner
     from khaos.subagents.spawner import SubAgentTask
+    from khaos.runtime_profile import RuntimeProfile
 
     captured: dict = {}
 
@@ -1087,7 +1088,9 @@ async def test_subagent_runner_passes_none_mode_manager_in_production():
     import khaos.runtime as runtime_mod
 
     original = runtime_mod.build_runtime
+    original_production = runtime_mod.build_production_runtime
     runtime_mod.build_runtime = _fake_build_runtime
+    runtime_mod.build_production_runtime = _fake_build_runtime
     try:
         db = MagicMock()
         db.create_session = AsyncMock()
@@ -1099,6 +1102,7 @@ async def test_subagent_runner_passes_none_mode_manager_in_production():
             mode_manager=None,
             memory_manager=None,
             principal_id="",
+            runtime_profile=RuntimeProfile.PRODUCTION,
         )
         task = SubAgentTask(
             id="t1", goal="g", context="c", tools=[],
@@ -1107,6 +1111,7 @@ async def test_subagent_runner_passes_none_mode_manager_in_production():
         await runner.run(task)
     finally:
         runtime_mod.build_runtime = original
+        runtime_mod.build_production_runtime = original_production
 
     # C-1-5b: the structural production config has no injectable
     # memory_manager field; build_runtime constructs the owner internally.

@@ -136,14 +136,14 @@ jobs:
             producer-evidence/production-composition-proof.stdout.log
             producer-evidence/production-composition-proof.stderr.log
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 90
       - name: Upload production lifecycle producer evidence
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: production-lifecycle-evidence-${{ github.sha }}
           path: producer-evidence/production-lifecycle-evidence/
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 90
       - name: Remove block-backed production workspace
         if: always()
         run: |

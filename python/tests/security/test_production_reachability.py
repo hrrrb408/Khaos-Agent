@@ -91,3 +91,11 @@ def test_testing_composition_and_mock_authority_are_forbidden_edges():
         edges,
     )
     assert len(findings) == 8
+
+
+def test_ambient_dev_mode_is_allowed_only_in_legacy_profile_resolver():
+    module = _reachability_module()
+    modules, edges, unresolved = module.build_graph()
+    assert not unresolved
+    findings = module.forbidden_edges(modules, edges)
+    assert not any("ambient KHAOS_DEV_MODE read" in finding for finding in findings)

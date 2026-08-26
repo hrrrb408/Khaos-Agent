@@ -484,6 +484,8 @@ def _verify_local_artifact(
         "artifact_sha256": digest,
         "local_evidence_digest": evidence.evidence_digest,
         "policy_digest": evidence.policy_digest,
+        "profile_status": dict(evidence.profile_status),
+        "residual_risks": list(evidence.residual_risks),
         "proof_names": [proof.name for proof in evidence.proofs],
         "proof_payloads": [
             dict(item)

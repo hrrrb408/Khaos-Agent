@@ -34,6 +34,14 @@ Rust remains governed by `Cargo.lock`; web installs use `npm ci` and
 `package-lock.json`; Go vulnerability analysis runs against the checked-in Go
 module graph.
 
+The locked Rust graph currently contains `pyo3 0.29.0`. The historical
+`RUSTSEC-2026-0177` (`pyo3 < 0.29`) and `RUSTSEC-2025-0020`
+(`pyo3 < 0.24.1`) suppressions were therefore stale and have been removed.
+Future exceptions must be complete records in
+`rust/khaos-core/advisory-policy.toml`; `scripts/validate_cargo_advisory_policy.py`
+fails when an ignored dependency has already reached its declared fixed
+version.
+
 ## Update procedure
 
 Change `pyproject.toml`, run `uv lock`, regenerate

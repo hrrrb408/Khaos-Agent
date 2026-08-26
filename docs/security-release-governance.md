@@ -1,8 +1,15 @@
 # Security Release Governance
 
-This repository has one declared maintainer, so repository ownership and
+This repository has one declared maintainer (the current
+`single-maintainer` compatibility mode), so repository ownership and
 independent review are separate controls.  A security-sensitive change is not
 release-ready merely because the maintainer can approve it.
+
+`docs/security_facts.yaml` is the machine-facing source for the deployment
+profiles, exact closure gates, proof names, accepted residuals, supported
+platform claims, and type-check TCB set described below. This governance
+document explains their meaning; prose here cannot replace live exact-SHA
+verification.
 
 ## Required controls
 
@@ -33,6 +40,11 @@ release-ready merely because the maintainer can approve it.
 7. Do not merge Docker, lockfile, workflow, permission, audit, RPC, or native
    helper changes while the corresponding real-kernel or supply-chain job is
    skipped, cancelled, or unavailable.
+8. Keep every closure-critical or release-critical Actions artifact for at
+   least 90 days. The complete upload classification is machine-checked by
+   `scripts/validate_evidence_retention.py` from `docs/security_facts.yaml`;
+   diagnostic artifacts remain explicitly separate from the re-verification
+   chain.
 
 ## Deployment profile evidence
 
@@ -67,6 +79,24 @@ closure vocabulary additionally uses `CLOSED`, `NOT_CLOSED`, `REJECTED`, and
 review are explicitly `NOT_CLAIMED`; neither blocks Community Local closure.
 Generic M6 closure has its own stricter evidence contract and must not be
 silently upgraded by a Community result.
+
+The Security Closure Gate also runs the structural
+`COMMUNITY_LOCAL_PRE_CLOSURE` contract on pull requests. It may report only
+`PASS` or `FAIL`; it checks proof and artifact wiring but does not certify a
+main push or create live provenance. Final Community Local certification still
+comes from `community-local-closure.yml` after an exact `main` push, original
+attempt, producer artifacts, and live GitHub verification.
+
+## Runtime profile authority
+
+Runtime security semantics are selected by the immutable typed
+khaos.runtime_profile.RuntimeProfile. build_production_runtime() and the
+production CLI/RPC entrypoints fix PRODUCTION explicitly; KHAOS_DEV_MODE
+is retained only as a legacy resolver for untyped direct/test adapters. It
+cannot disable injection checks, host-fallback rejection, native authority,
+local-trust validation, browser/sandbox enforcement, or RPC negotiation.
+scripts/generate_production_reachability.py fails if a production-reachable
+module reads KHAOS_DEV_MODE outside the compatibility resolver.
 
 ## Evidence boundary
 
@@ -103,11 +133,23 @@ Export/archive evidence before reducing any window.
   any CI-only skips are recorded together. Existing release assets are never
   overwritten.
 
+The release workflow already preserves the exact gate evidence, checksums,
+SBOM, and signed attestation bundles as release assets without `--clobber`
+(`ALREADY_SATISFIED`). These saved records are audit evidence only; they do
+not replace the live exact-SHA GitHub verifier or issue a closure capability.
+After that live verifier succeeds for the Community Local profile, the
+generator also publishes `community-local-closure-bundle-<SHA>.json`. It
+contains the closure report fields, exact gate identities, producer and proof
+digests, policy/schema digests, accepted residuals, and the machine decision;
+its machine contract explicitly records that it cannot issue provenance.
+
 ## M6 governance preparation
 
-`.github/CODEOWNERS` covers the security authority, permission, audit,
-verification, RPC, execution, native TCB, Docker, workflow, and release-gate
-paths. `scripts/validate_m6_governance.py` checks that coverage and the
-hardened ruleset template. A green local validation proves only that the
-preparation artifacts are internally consistent; it is not evidence of an
-independent human review.
+`docs/security_facts.yaml` is the canonical machine-readable inventory of
+security-critical paths. `scripts/validate_m6_governance.py` rejects duplicate
+or dead inventory entries and verifies that every declared path is covered by
+`.github/CODEOWNERS`. The hardened ruleset template remains a preparation
+artifact until a second maintainer is available. Changes to an inventory path
+or its owner require a manual maintainer diff review; autonomous merge is not
+allowed. A green local validation proves only that the preparation artifacts
+are internally consistent; it is not evidence of an independent human review.

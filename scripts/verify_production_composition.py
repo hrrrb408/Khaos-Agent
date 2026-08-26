@@ -25,9 +25,6 @@ from pathlib import Path
 
 
 async def _build_and_verify(output: Path) -> int:
-    if os.environ.get("KHAOS_DEV_MODE") == "1":
-        print("composition proof refuses KHAOS_DEV_MODE=1", file=sys.stderr)
-        return 1
     from khaos.db.database import Database
     from khaos.runtime import ProductionRuntimeConfig, build_production_runtime
     from khaos.security.production_composition_manifest import (

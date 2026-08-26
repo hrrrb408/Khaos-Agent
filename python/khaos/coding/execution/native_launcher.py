@@ -35,6 +35,7 @@ from khaos.security.authorityd_protocol import (
     SignedAuthorizationReceipt,
     open_authority_receipt_fds,
 )
+from khaos.runtime_profile import RuntimeProfile, resolve_runtime_profile
 
 _DARWIN_SIGNATURE_MODE: str | None = None
 
@@ -76,6 +77,7 @@ def build_process_launch(
     authority_receipt: SignedAuthorizationReceipt | None = None,
     authority_public_key_path: Path | None = None,
     authority_capability: EffectCapability | None = None,
+    runtime_profile: RuntimeProfile | str | None = None,
 ) -> ProcessLaunch:
     """Compile a safe launch into either the native or explicit dev boundary.
 
@@ -96,12 +98,13 @@ def build_process_launch(
         if authority_receipt is not None:
             raise ValueError("authority capability and receipt cannot both be supplied")
         authority_receipt = authority_capability.receipt
+    resolved_profile = resolve_runtime_profile(runtime_profile)
     require_receipt = (
-        os.environ.get("KHAOS_DEV_MODE") != "1"
+        resolved_profile.is_production
         if require_authority_receipt is None
         else require_authority_receipt
     )
-    if not require_receipt and os.environ.get("KHAOS_DEV_MODE") != "1":
+    if not require_receipt and resolved_profile.is_production:
         raise PermissionError(
             "production native execution cannot disable authority receipts"
         )
@@ -137,7 +140,7 @@ def build_process_launch(
             receipt_handles.close()
         raise
     launcher = _find_launcher()
-    development = os.environ.get("KHAOS_DEV_MODE") == "1"
+    development = not resolved_profile.is_production
     darwin_signature_mode: str | None = None
     # The explicit development wrapper performs the same fd/digest/rlimit
     # checks and selects a host-proven macOS staging-signature mode;

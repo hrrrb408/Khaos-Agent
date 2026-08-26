@@ -18,6 +18,7 @@ from khaos.security.authorityd import (
 )
 from khaos.security.authorityd_protocol import _O_BINARY
 from khaos.security.identity_isolation import read_contract_from_environment
+from khaos.runtime_profile import RuntimeProfile
 from khaos.security.local_trust import (
     LocalTrustRootError,
     local_authority_root,
@@ -28,9 +29,9 @@ from khaos.security.resource_scope import ResourceScopeError, TypedResourceParti
 
 
 def main() -> int:
-    if os.environ.get("KHAOS_DEV_MODE") == "1":
-        raise SystemExit("authorityd refuses to run in KHAOS_DEV_MODE")
-    deployment = AuthorityTransportConfig.from_environment()
+    deployment = AuthorityTransportConfig.from_environment(
+        runtime_profile=RuntimeProfile.PRODUCTION
+    )
     contract = read_contract_from_environment()
     deployment.validate_contract(contract)
     transport_path = _authority_transport_path(deployment)

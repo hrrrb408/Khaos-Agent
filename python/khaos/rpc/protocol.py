@@ -19,6 +19,7 @@ import time
 from typing import Any
 
 from khaos.security.protocol_boundary import canonical_json_bytes
+from khaos.runtime_profile import RuntimeProfile, resolve_runtime_profile
 
 RPC_MAX_REQUEST_BYTES = 1024 * 1024
 RPC_AUTH_WINDOW_SECONDS = 30
@@ -280,6 +281,7 @@ class GatewayRPCAuthenticator:
         expected_pid: int | None = None,
         require_protocol_v2: bool | None = None,
         require_protocol_metadata: bool = False,
+        runtime_profile: RuntimeProfile | str | None = None,
     ) -> None:
         if len(capability) < 32:
             raise ValueError("Gateway RPC capability must contain at least 32 characters")
@@ -290,12 +292,15 @@ class GatewayRPCAuthenticator:
             else expected_uid
         )
         self._expected_pid = expected_pid
+        self.runtime_profile = resolve_runtime_profile(runtime_profile)
         self._require_protocol_v2 = (
-            os.environ.get("KHAOS_DEV_MODE") != "1"
+            self.runtime_profile.is_production
             if require_protocol_v2 is None
             else require_protocol_v2
         )
-        self._require_protocol_metadata = require_protocol_metadata
+        self._require_protocol_metadata = (
+            require_protocol_metadata or self.runtime_profile.is_production
+        )
         self._bound_pid: int | None = None
         self._used_nonces: dict[str, float] = {}
 

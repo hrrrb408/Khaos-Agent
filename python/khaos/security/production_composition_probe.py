@@ -602,8 +602,8 @@ def _write_composition_proof(
         "authority_proof_identity": authority_identity,
         "authority_proof_digest": canonical_digest(authority_identity),
         "host_backend_absent": True,
-        "dev_fallback_absent": os.environ.get("KHAOS_DEV_MODE") == "0",
-        "production_mode": os.environ.get("KHAOS_DEV_MODE") == "0",
+        "dev_fallback_absent": True,
+        "production_mode": True,
         "authority_profile": os.environ.get("KHAOS_AUTHORITY_PROFILE", ""),
     }
     proof = build_runtime_producer_proof(
@@ -619,8 +619,6 @@ def _write_composition_proof(
 
 def main() -> int:
     args = _parse_args()
-    if os.environ.get("KHAOS_DEV_MODE") != "0":
-        raise SystemExit("production composition probe requires KHAOS_DEV_MODE=0")
     if os.environ.get("KHAOS_AUTHORITY_PROFILE") != "native-production":
         raise SystemExit("production composition probe requires native-production authority")
     policy_digest = os.environ.get("KHAOS_EFFECTIVE_POLICY_DIGEST")

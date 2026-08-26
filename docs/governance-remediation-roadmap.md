@@ -1,6 +1,6 @@
 # Governance Remediation Roadmap
 
-> Status reference: 2026-08-16 `main` branch and the current remediation branch.
+> Status reference: 2026-08-26 `main` branch and the current remediation branch.
 >
 > This roadmap tracks the review findings that **cannot be fixed by code
 > alone** — they require organizational, infrastructure, or third-party

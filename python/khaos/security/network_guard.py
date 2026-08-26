@@ -12,9 +12,10 @@ When enabled, ``allowed_domains`` and ``blocked_domains`` are STILL enforced:
   network is on and even when it appears in the allowlist);
 * when ``allowed_domains`` is non-empty, only allowlisted domains pass
   (deny-by-default);
-* when ``allowed_domains`` is empty and network is enabled, all domains
-  pass (no allowlist configured = unrestricted, but still subject to the
-  blocklist).
+* ``allowed_domains=None`` means no allowlist is configured (unrestricted
+  when network is enabled, but still subject to the blocklist);
+* ``allowed_domains=[]`` is an explicit deny-all allowlist, even when
+  network is enabled.
 
 When network is disabled, all network access is blocked regardless of the
 allowlist.
@@ -291,14 +292,14 @@ class NetworkGuard:
                     return result
             return NetworkCheckResult(allowed=True, reason="not a network command")
 
-        # H1: browser tools that can trigger network access (navigate,
-        # click, type, evaluate, upload) are gated by the ``network.access``
+        # Browser tools that can trigger network access (navigate, click,
+        # type, evaluate, upload) are gated by the ``network.access``
         # capability at the broker layer.  For browser_navigate and any
         # tool with a ``url`` argument, we also check the target domain
-        # here.  Browser click/type/evaluate/upload don't carry a URL, so
-        # domain enforcement for them happens at the Playwright route
-        # interception layer (future work) — the capability broker is the
-        # primary gate today.
+        # here.  Browser click/type/evaluate/upload do not carry a URL, so
+        # their redirects and subresources are checked by the mandatory
+        # Playwright ``context.route("**/*", ...)`` guard installed by
+        # BrowserManager; this method remains the tool-admission check.
         if tool_name == "browser_navigate":
             return self._check_url(arguments.get("url", ""))
 
@@ -479,7 +480,7 @@ class NetworkGuard:
 
     # Backward-compatible alias — older callers may use _is_domain_allowed.
     def _is_domain_allowed(self, domain: str) -> bool:
-        """检查域名是否在白名单中（支持子域名通配）。"""
+        """检查域名是否在白名单中（支持已授权的子域名匹配）。"""
         return self._check_domain(domain).allowed
 
     def _extract_domain(self, text: str) -> str:

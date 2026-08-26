@@ -62,3 +62,4 @@ jobs:
           name: security-test-evidence-browser-dns-rebinding
           path: evidence/browser_dns_rebinding.json
           if-no-files-found: error
+          retention-days: 90

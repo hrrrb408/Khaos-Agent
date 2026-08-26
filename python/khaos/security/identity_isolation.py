@@ -15,6 +15,8 @@ import struct
 from dataclasses import dataclass
 from pathlib import Path
 
+from khaos.runtime_profile import RuntimeProfile, resolve_runtime_profile
+
 
 class IdentityIsolationError(PermissionError):
     """The authority transport does not have an independent OS identity."""
@@ -271,7 +273,9 @@ def require_distinct_linux_identities(
         )
 
 
-def linux_job_namespace_args() -> tuple[str, ...]:
+def linux_job_namespace_args(
+    runtime_profile: RuntimeProfile | str | None = None,
+) -> tuple[str, ...]:
     """Return the fail-closed bwrap identity mapping for coding jobs.
 
     The configured job UID is the UID visible inside the private user
@@ -282,7 +286,7 @@ def linux_job_namespace_args() -> tuple[str, ...]:
     zero-capability postcondition (``--cap-drop ALL`` plus the launcher's
     final capget assertion) must not depend on UID inference.
     """
-    development = os.environ.get("KHAOS_DEV_MODE") == "1"
+    development = not resolve_runtime_profile(runtime_profile).is_production
     contract = read_contract_from_environment()
     if development:
         job_uid = contract.job_uid if contract.job_uid is not None else 65534

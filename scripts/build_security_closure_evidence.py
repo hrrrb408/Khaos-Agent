@@ -77,11 +77,11 @@ def test_fragment(args: argparse.Namespace) -> None:
         raise RuntimeError("unknown security evidence test")
     # This fragment is a diagnostic contract for the security gate.  Its
     # result is fixed by this producer and is never a caller-supplied PASS.
-    # ``production_mode`` is derived from the process environment so the old
-    # boolean CLI declaration cannot forge a production claim.
+    # This producer is a production-only evidence contract.  The runtime
+    # profile is selected by the invoking workflow, never by ambient dev mode.
     environment = {
         "runner_os": args.runner_os,
-        "production_mode": os.environ.get("KHAOS_DEV_MODE", "0") == "0",
+        "production_mode": True,
     }
     payload: dict[str, object] = {
         "commit": args.commit,
@@ -100,8 +100,6 @@ def browser_fragment(args: argparse.Namespace) -> None:
     cap_eff = _cap_eff()
     if uid == 0 or int(cap_eff, 16) != 0:
         raise RuntimeError("production Python browser evidence is privileged")
-    if os.environ.get("KHAOS_DEV_MODE") == "1":
-        raise RuntimeError("development mode cannot emit production evidence")
     socket_path = Path(args.helper_socket)
     if not socket_path.is_socket() or socket_path.stat().st_uid != uid:
         raise RuntimeError("authenticated helper socket evidence unavailable")

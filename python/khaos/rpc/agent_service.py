@@ -43,6 +43,7 @@ from khaos.memory import MemoryEventBridge, RuntimeMemoryContext
 from khaos.modes import ModeManager
 from khaos.rpc.models import ChatRequest, ConfirmRequest
 from khaos.runtime import RequestContext
+from khaos.runtime_profile import RuntimeProfile, resolve_runtime_profile
 from khaos.runtime.context import local_principal_id
 from khaos.scheduler import CronEngine
 from khaos.security.middleware import SecurityMiddleware
@@ -67,8 +68,18 @@ def _message_to_event(message) -> dict:
 class AgentService:
     """Agent RPC service backed by AgentLoop."""
 
-    def __init__(self, db: Database, project_root: Path | None = None, config_path: Path | None = None, router=None, *, boot_id: str = ""):
+    def __init__(
+        self,
+        db: Database,
+        project_root: Path | None = None,
+        config_path: Path | None = None,
+        router=None,
+        *,
+        boot_id: str = "",
+        runtime_profile: RuntimeProfile | str | None = None,
+    ):
         self.db = db
+        self.runtime_profile = resolve_runtime_profile(runtime_profile)
         self.project_root = project_root or Path.cwd()
         self.config_path = config_path or self.project_root / "config.yaml"
         self._router = router
@@ -142,7 +153,7 @@ class AgentService:
                 ),
                 anchor_path=(
                     resolve_safe_audit_anchor_path(_bound_project_id)
-                    if os.environ.get("KHAOS_DEV_MODE") != "1"
+                    if self.runtime_profile.is_production
                     else None
                 ),
                 # A2-6: bind the server-lifecycle AuditLogger to the
@@ -275,9 +286,7 @@ class AgentService:
         therefore proves the protected socket endpoint is present and labels
         the remaining live-RPC assertion explicitly for the per-sandbox path.
         """
-        required = sys.platform.startswith("linux") and os.environ.get(
-            "KHAOS_DEV_MODE"
-        ) != "1"
+        required = sys.platform.startswith("linux") and self.runtime_profile.is_production
         socket_name = os.environ.get(
             "KHAOS_BROWSER_KERNEL_HELPER_SOCKET",
             "/run/khaos/browser-kernel-helper.sock",
@@ -1076,7 +1085,12 @@ class AgentService:
             # call from a different project cannot re-stamp it.
             project_id=project_id,
         )
-        from khaos.runtime import ProductionRuntimeConfig, build_production_runtime
+        from khaos.runtime import (
+            ProductionRuntimeConfig,
+            RuntimeConfig,
+            build_production_runtime,
+            build_runtime,
+        )
 
         # The server owns the physical audit chain, but each runtime must
         # write under the authenticated request identity.  A bound sink is
@@ -1093,7 +1107,7 @@ class AgentService:
             else None
         )
 
-        return await build_production_runtime(ProductionRuntimeConfig(
+        runtime_config = ProductionRuntimeConfig(
             project_root=self.project_root, config_path=self.config_path,
             mode_override=mode or None, confirm_callback=self._wait_for_confirmation,
             db=self.db, audit_logger=request_audit_logger,
@@ -1135,7 +1149,12 @@ class AgentService:
             cron_engine=self.cron_engine,
             subagent_spawner=self.subagent_spawner,
             cleanup_authority=self.runtime_cleanup_authority,
-        ))
+        )
+        if self.runtime_profile.is_production:
+            return await build_production_runtime(runtime_config)
+        legacy_config: RuntimeConfig = runtime_config.as_runtime_config()
+        legacy_config.profile = self.runtime_profile
+        return await build_runtime(legacy_config)
 
     async def _wait_for_confirmation(self, request: dict) -> dict:
         return await self.approval_broker.wait(

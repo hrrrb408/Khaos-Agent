@@ -24,7 +24,13 @@ from khaos.rpc.models import ChatRequest, ConfirmRequest
 from khaos.rpc.task_service import TaskService
 from khaos.rpc.protocol import (
     GatewayRPCAuthenticator,
+    RPC_FEATURES,
+    RPC_METHOD_SCHEMA_VERSION,
+    RPC_PROTOCOL_MAX_VERSION,
+    RPC_PROTOCOL_MIN_VERSION,
+    RPC_SCHEMA_VERSION,
     rpc_binding_claim_error as _rpc_binding_claim_error,
+    rpc_feature_digest,
 )
 from khaos.channels import ChannelType, PlatformMessage, Sender
 from khaos.runtime import RequestContext
@@ -1077,10 +1083,24 @@ def _signed_rpc_request(
     ).encode("utf-8")
     digest = hashlib.sha256(canonical).hexdigest()
     principal = str(payload.get("principal_id") or "gateway")
+    protocol: dict[str, object] | None = None
     if protocol_version == 2:
+        protocol = {
+            "min_version": RPC_PROTOCOL_MIN_VERSION,
+            "max_version": RPC_PROTOCOL_MAX_VERSION,
+            "schema_version": RPC_SCHEMA_VERSION,
+            "method_schema_version": RPC_METHOD_SCHEMA_VERSION,
+            "features": list(RPC_FEATURES),
+            "feature_digest": rpc_feature_digest(RPC_FEATURES),
+            "unknown_field_policy": "reject",
+        }
         signed = (
             f"{protocol_version}\n{method}\n{nonce}\n{issued_at}\n"
             f"{principal}\n{digest}"
+            f"\n{protocol['min_version']}\n{protocol['max_version']}"
+            f"\n{protocol['schema_version']}"
+            f"\n{protocol['method_schema_version']}"
+            f"\n{protocol['feature_digest']}"
         ).encode()
     else:
         signed = f"{method}\n{nonce}\n{issued_at}\n{principal}\n{digest}".encode()
@@ -1089,7 +1109,7 @@ def _signed_rpc_request(
         f"khaos-rpc-method-v{protocol_version}\n{method}".encode(),
         hashlib.sha256,
     ).digest()
-    return {
+    request = {
         "protocol_version": protocol_version,
         "method": method, "payload": payload,
         "auth": {
@@ -1098,6 +1118,9 @@ def _signed_rpc_request(
             "mac": hmac.new(method_key, signed, hashlib.sha256).hexdigest(),
         },
     }
+    if protocol_version == 2:
+        request["protocol"] = protocol
+    return request
 
 
 def test_rpc_capability_is_method_payload_principal_and_nonce_bound():

@@ -91,3 +91,18 @@ The absence of exact-main CI evidence is reported as
 `CLOSURE_PENDING_EXACT_SHA_CI_EVIDENCE` and the profile remains
 `NOT_CLOSED`. The optional signed profile is reported separately and must not
 be conflated with the Community Local decision.
+
+## Exact proof and gate names
+
+The exact machine contract is maintained in `docs/security_facts.yaml`. The
+Community Local evaluator currently requires these ten producer-owned proofs:
+
+`community_authority`, `platform_kernel`, `production_reachability`,
+`production_composition`, `workspace_escape`, `approval_replay`,
+`approval_substitution`, `process_tree_escape`, `resource_owner_closure`, and
+`network_isolation`.
+
+Its required aggregate gates are `Security Closure Gate` and `Product Integrity
+Gate`. The separate `Community Local Security Closure` workflow verifies the
+exact protected-main push and producer artifacts; a saved report remains audit
+evidence only.

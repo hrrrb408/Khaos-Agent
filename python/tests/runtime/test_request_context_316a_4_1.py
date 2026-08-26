@@ -31,8 +31,9 @@ from khaos.rpc.composition import _handle_optional_subagent
 from khaos.rpc import AuditService, MemoryService
 from khaos.rpc.agent_service import AgentService
 from khaos.rpc.task_service import TaskService
-from khaos.runtime import RequestContext
+from khaos.runtime import ProductionRuntimeConfig, RequestContext, RuntimeConfig
 from khaos.runtime.context import local_principal_id
+from khaos.runtime_profile import RuntimeProfile
 
 
 def _test_ctx(*, principal_id: str = "", session_id: str = "") -> RequestContext:
@@ -263,7 +264,6 @@ async def test_build_runtime_propagates_session_id(tmp_path, monkeypatch):
     session_id lived on ``ctx`` but was never read."""
     from khaos.db import Database
     import khaos.runtime.factory as runtime_factory
-    from khaos.runtime import RuntimeConfig
 
     (tmp_path / "prompts").mkdir()
     (tmp_path / "prompts" / "office.md").write_text("office", encoding="utf-8")
@@ -271,16 +271,23 @@ async def test_build_runtime_propagates_session_id(tmp_path, monkeypatch):
     db = Database(tmp_path / "khaos.db")
     await db.connect()
     await db.run_migrations()
-    service = AgentService(db, project_root=tmp_path)
+    # Select the production profile explicitly so the test exercises the
+    # production composition seam even though conftest enables the legacy
+    # development environment for unrelated test fixtures.
+    service = AgentService(
+        db,
+        project_root=tmp_path,
+        runtime_profile=RuntimeProfile.PRODUCTION,
+    )
 
-    captured_configs: list[RuntimeConfig] = []
+    captured_configs: list[RuntimeConfig | ProductionRuntimeConfig] = []
 
     class _StubRuntime:
         """Bare stub — the test only inspects the RuntimeConfig."""
         async def aclose(self):
             pass
 
-    async def spy_build(config: RuntimeConfig):
+    async def spy_build(config: RuntimeConfig | ProductionRuntimeConfig):
         captured_configs.append(config)
         return _StubRuntime()
 

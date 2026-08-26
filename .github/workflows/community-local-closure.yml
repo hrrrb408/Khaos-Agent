@@ -56,4 +56,4 @@ jobs:
           name: local-security-evidence-${{ github.sha }}
           path: local-security-evidence.json
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 90
