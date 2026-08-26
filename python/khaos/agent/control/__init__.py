@@ -1,8 +1,9 @@
 """Typed contracts for the agent task control plane.
 
 M7.1.4 adds the immutable CompletionDecision record and its passive,
-append-only durable ledger.  Evaluation, completion gating, planning, and
-recovery remain later control-plane responsibilities.
+append-only durable ledger. M7.1.5 adds pure deterministic evaluation of
+structured facts; completion gating, planning, and recovery remain later
+control-plane responsibilities.
 """
 
 from khaos.agent.control.completion import (
@@ -18,6 +19,13 @@ from khaos.agent.control.completion import (
     CriterionAssessment,
     EvidenceRef,
     RequirementAssessment,
+)
+from khaos.agent.control.completion_evaluator import (
+    CompletionConstraint,
+    CompletionConstraintCode,
+    CompletionEvaluationInputError,
+    CompletionEvaluationSnapshot,
+    CompletionEvaluator,
 )
 from khaos.agent.control.completion_repository import (
     CompletionDecisionBindingError,
@@ -73,6 +81,8 @@ __all__ = [
     "CognitiveTransitionResult",
     "CognitiveTransitionStatus",
     "CognitiveTransitionValidation",
+    "CompletionConstraint",
+    "CompletionConstraintCode",
     "CompletionDecision",
     "CompletionDecisionBindingError",
     "CompletionDecisionConflictError",
@@ -80,6 +90,9 @@ __all__ = [
     "CompletionDecisionRepository",
     "CompletionDecisionRepositoryError",
     "CompletionDecisionValidationError",
+    "CompletionEvaluationInputError",
+    "CompletionEvaluationSnapshot",
+    "CompletionEvaluator",
     "CompletionEvidenceKind",
     "CompletionEvidenceRef",
     "CompletionIssue",
