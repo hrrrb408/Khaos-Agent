@@ -1,22 +1,23 @@
 """Verify-fix loop strategy layer for coding mode.
 
-When the agent runs ``test_run`` and the parsed result contains failing tests,
-this module formats the failure into a guidance message that is injected back
-into the conversation so the model diagnoses, fixes, and re-runs the tests —
-without any user intervention.
+The loop deliberately separates two timelines:
 
-It is a *strategy layer* that cooperates with :class:`AgentLoop.run`, not a
-separate agent. The loop keeps two pieces of state:
+* verification observations contain every parseable ``test_run`` result;
+* repair attempts contain only repair guidance that was actually issued.
 
-* ``_attempt_count`` — how many fix attempts have been issued so far.
-* ``_history`` — the outcome of every attempt (passed/failed test counts).
+This distinction is important at the repair budget boundary. A failing test
+result can still authorize the final repair attempt, and a later passing
+result must supersede historical failure/exhaustion state.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass, field
+from collections.abc import Mapping
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -24,20 +25,67 @@ logger = logging.getLogger(__name__)
 DEFAULT_MAX_FIX_ATTEMPTS: int = 3
 
 
-@dataclass
-class FixAttempt:
-    """Record of one verify-fix attempt."""
+class VerificationState(str, Enum):
+    """Terminal interpretation of the latest parseable verification result."""
 
-    attempt: int
+    UNKNOWN = "unknown"
+    FAILING = "failing"
+    PASSED = "passed"
+    EXHAUSTED_FAILURE = "exhausted_failure"
+
+
+@dataclass(frozen=True, slots=True)
+class VerificationObservation:
+    """One parseable test observation, independent of repair issuance."""
+
+    observation: int
     passed: int
     failed: int
     errors: int
-    failed_cases: list[dict] = field(default_factory=list)
+    failed_cases: tuple[dict[str, Any], ...] = ()
+    state: VerificationState = VerificationState.UNKNOWN
 
     @property
     def success(self) -> bool:
-        """True when the attempt had no failures and no errors."""
+        """True when this verification observation had no failures/errors."""
         return self.failed == 0 and self.errors == 0
+
+    @property
+    def failure_signature(self) -> tuple[Any, ...]:
+        """Return a bounded, deterministic signature for no-progress checks."""
+        cases = tuple(
+            (
+                str(case.get("name") or ""),
+                str(case.get("file") or ""),
+                case.get("line"),
+                str(case.get("error") or ""),
+            )
+            for case in self.failed_cases
+        )
+        return self.failed, self.errors, cases
+
+
+@dataclass(frozen=True, slots=True)
+class RepairAttempt:
+    """Record of one repair guidance issuance.
+
+    The linked observation identifies the failure that triggered this repair;
+    test counts themselves remain exclusively on ``VerificationObservation``.
+    """
+
+    attempt: int
+    observation: int
+    failure_signature: tuple[Any, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class NoProgressSignal:
+    """Typed observable signal for repeated identical verification failures."""
+
+    detected: bool
+    observation_indices: tuple[int, ...] = ()
+    failure_signature: tuple[Any, ...] = ()
+    reason: str = ""
 
 
 class VerifyFixLoop:
@@ -48,7 +96,7 @@ class VerifyFixLoop:
     failure context back into the message list so the model repairs the failure
     and re-runs the tests.
 
-    A ``ToolResult`` arriving from the scheduler is represented as a plain dict
+    A ``ToolResult`` arriving from the scheduler is represented as a mapping
     with the keys ``name``, ``success``, ``output``, and ``error``. The actual
     pass/fail counts live inside ``output`` (a JSON string produced by
     ``test_run``), because ``test_run`` never raises — it always returns a
@@ -68,65 +116,132 @@ class VerifyFixLoop:
         self.test_command = test_command
         self.test_cwd = test_cwd
         self._attempt_count = 0
-        self._history: list[FixAttempt] = []
+        self._verification_history: list[VerificationObservation] = []
+        self._repair_history: list[RepairAttempt] = []
+        self._report_emitted = False
 
-    def should_enter_loop(self, tool_result: dict) -> bool:
+    def observe_test_result(
+        self, tool_result: Mapping[str, Any]
+    ) -> VerificationObservation | None:
+        """Record one parseable ``test_run`` result.
+
+        Observation is intentionally independent from the repair budget. Every
+        parseable result is recorded, including results received after the
+        budget is exhausted. ``PASSED`` is always the latest authoritative
+        state when the current observation is green; a failure becomes
+        ``EXHAUSTED_FAILURE`` only when no repair remains *at the time the
+        failure is observed*.
+        """
+        if not isinstance(tool_result, Mapping):
+            return None
+        if tool_result.get("name") != "test_run":
+            return None
+        parsed = _parse_test_output(tool_result)
+        if parsed is None:
+            return None
+
+        observation_number = len(self._verification_history) + 1
+        if not parsed["failed"] and not parsed["errors"]:
+            state = VerificationState.PASSED
+        elif self._attempt_count >= self.max_fix_attempts:
+            state = VerificationState.EXHAUSTED_FAILURE
+        else:
+            state = VerificationState.FAILING
+        observation = VerificationObservation(
+            observation=observation_number,
+            passed=parsed["passed"],
+            failed=parsed["failed"],
+            errors=parsed["errors"],
+            failed_cases=tuple(parsed["failed_cases"]),
+            state=state,
+        )
+        self._verification_history.append(observation)
+        logger.info(
+            "verification observation %d: state=%s passed=%d failed=%d errors=%d",
+            observation.observation,
+            observation.state.value,
+            observation.passed,
+            observation.failed,
+            observation.errors,
+        )
+        return observation
+
+    def should_enter_loop(
+        self,
+        tool_result: Mapping[str, Any],
+        *,
+        observation: VerificationObservation | None = None,
+    ) -> bool:
         """Decide whether to enter the verify-fix loop for this result.
 
-        Conditions: ``name == "test_run"``, the parsed output reports a failure
-        (``failed > 0`` or ``errors > 0``), and the attempt budget is not yet
-        exhausted. Returns ``False`` for any other tool, a passing test, or
-        when ``max_fix_attempts == 0``.
+        This is a pure predicate: it never records an observation or mutates
+        repair state. Callers must invoke :meth:`observe_test_result` first.
+        Conditions are ``name == "test_run"``, a parseable failing result, and
+        at least one automatic repair still available.
         """
-        if self.max_fix_attempts == 0:
-            return False
-        if not isinstance(tool_result, dict):
+        if not isinstance(tool_result, Mapping):
             return False
         if tool_result.get("name") != "test_run":
             return False
         if self._attempt_count >= self.max_fix_attempts:
             return False
-        parsed = _parse_test_output(tool_result)
+        parsed = (
+            {
+                "failed": observation.failed,
+                "errors": observation.errors,
+            }
+            if observation is not None
+            else _parse_test_output(tool_result)
+        )
         if parsed is None:
             return False
-        # Record the attempt regardless of the decision so the final report is
-        # complete even when the budget runs out on this very call.
         return bool(parsed["failed"] or parsed["errors"])
 
-    def build_failure_context(self, tool_result: dict) -> str:
+    def build_failure_context(
+        self,
+        tool_result: Mapping[str, Any],
+        *,
+        observation: VerificationObservation | None = None,
+    ) -> str:
         """Format test-failure details into a guidance message for the model.
 
-        Increments the attempt counter and records the attempt. The message
-        includes the failing test names, files, line numbers, and the error
-        snippets, followed by an explicit ``read → fix → re-run`` instruction.
+        This method is the repair-issuance boundary. It increments
+        ``attempt_count`` only when a repair is actually admitted. For
+        backwards-compatible direct callers, a missing observation is recorded
+        here; AgentLoop passes the observation explicitly after observing it.
         """
-        parsed = _parse_test_output(tool_result)
-        if parsed is None:
-            logger.warning("build_failure_context called without parseable test output")
+        if observation is None:
+            observation = self.observe_test_result(tool_result)
+        if observation is None or (
+            not observation.failed and not observation.errors
+        ):
+            return ""
+        # A failure observed after the budget is spent cannot issue another
+        # automatic repair. In particular, the third failure does not reach
+        # this branch until repair #3 has already been admitted.
+        if self._attempt_count >= self.max_fix_attempts:
             return ""
 
         self._attempt_count += 1
-        attempt = FixAttempt(
+        repair = RepairAttempt(
             attempt=self._attempt_count,
-            passed=parsed["passed"],
-            failed=parsed["failed"],
-            errors=parsed["errors"],
-            failed_cases=parsed["failed_cases"],
+            observation=observation.observation,
+            failure_signature=observation.failure_signature,
         )
-        self._history.append(attempt)
+        self._repair_history.append(repair)
 
         lines: list[str] = [
             f"## 测试失败（第 {self._attempt_count}/{self.max_fix_attempts} 次修复尝试）",
             "",
             "以下测试失败：",
         ]
-        cases = parsed["failed_cases"]
+        cases = observation.failed_cases
         if cases:
             for case in cases:
                 lines.append(_format_failed_case(case))
         else:
             lines.append(
-                f"- {parsed['failed']} failed, {parsed['errors']} errors"
+                f"- {observation.failed} failed, {observation.errors} errors"
                 "（未能解析具体用例）"
             )
 
@@ -141,55 +256,123 @@ class VerifyFixLoop:
         )
         message = "\n".join(lines)
         logger.info(
-            "verify-fix attempt %d/%d: %d failed, %d errors",
+            "verify-fix repair attempt %d/%d issued for observation %d",
             self._attempt_count,
             self.max_fix_attempts,
-            parsed["failed"],
-            parsed["errors"],
+            observation.observation,
         )
         return message
 
+    @property
+    def verification_state(self) -> VerificationState:
+        """Return the latest parseable verification state."""
+        if not self._verification_history:
+            return VerificationState.UNKNOWN
+        return self._verification_history[-1].state
+
+    @property
+    def latest_verification(self) -> VerificationObservation | None:
+        """Return the latest parseable observation, if any."""
+        return self._verification_history[-1] if self._verification_history else None
+
+    @property
+    def verification_history(self) -> tuple[VerificationObservation, ...]:
+        """Return all parseable verification observations in order."""
+        return tuple(self._verification_history)
+
+    @property
+    def repair_history(self) -> tuple[RepairAttempt, ...]:
+        """Return all automatic repairs issued in order."""
+        return tuple(self._repair_history)
+
     def is_loop_exhausted(self) -> bool:
-        """True when the fix budget has been spent."""
-        return self._attempt_count >= self.max_fix_attempts
+        """Return whether the latest failure is terminally exhausted."""
+        return self.verification_state is VerificationState.EXHAUSTED_FAILURE
+
+    def no_progress_signal(self) -> NoProgressSignal:
+        """Return a typed signal for two identical latest failures.
+
+        M7.1.1 exposes the signal only. Recovery/Replan state transitions are
+        deliberately owned by the later Recovery Engine batch.
+        """
+        if len(self._verification_history) < 2:
+            return NoProgressSignal(False)
+        previous, current = self._verification_history[-2:]
+        if (
+            (not previous.failed and not previous.errors)
+            or (not current.failed and not current.errors)
+        ):
+            return NoProgressSignal(False)
+        if previous.failure_signature != current.failure_signature:
+            return NoProgressSignal(False)
+        return NoProgressSignal(
+            detected=True,
+            observation_indices=(previous.observation, current.observation),
+            failure_signature=current.failure_signature,
+            reason="identical_failure_signature",
+        )
 
     def should_stop_no_progress(self) -> bool:
-        """Stop after two identical failure signatures without a useful diff."""
-        if len(self._history) < 2:
-            return False
-        previous, current = self._history[-2:]
-        return (previous.failed, previous.errors, previous.failed_cases) == (current.failed, current.errors, current.failed_cases)
+        """Compatibility predicate backed by the typed no-progress signal."""
+        return self.no_progress_signal().detected
+
+    @property
+    def report_emitted(self) -> bool:
+        """Return whether the exhaustion report has already been emitted."""
+        return self._report_emitted
+
+    def mark_report_emitted(self) -> None:
+        """Mark the one-shot exhaustion report as emitted by AgentLoop."""
+        self._report_emitted = True
 
     def get_final_report(self) -> str:
-        """Summarise the loop: attempts made and which tests finally passed."""
-        if not self._history:
-            return "verify-fix loop: no attempts were made."
+        """Summarise repairs using the latest verification observation."""
+        latest = self.latest_verification
+        if latest is None:
+            return "verify-fix loop: no verification observations were recorded."
+
         lines: list[str] = [
-            f"## Verify-Fix 最终报告（共 {self._attempt_count} 次尝试）",
+            (
+                f"## Verify-Fix 最终报告（共 {self._attempt_count} 次修复尝试，"
+                f"{len(self._verification_history)} 次验证观察）"
+            ),
             "",
         ]
-        for attempt in self._history:
-            status = "通过" if attempt.success else "失败"
+        for observation in self._verification_history:
             lines.append(
-                f"- 第 {attempt.attempt} 次：{attempt.passed} passed, "
-                f"{attempt.failed} failed, {attempt.errors} errors — {status}"
+                f"- 验证观察 {observation.observation}："
+                f"{observation.passed} passed, {observation.failed} failed, "
+                f"{observation.errors} errors — {observation.state.value}"
             )
 
-        last = self._history[-1]
-        if last.success:
-            lines.append("")
-            lines.append(
-                f"所有测试在第 {self._attempt_count} 次尝试后通过。"
+        if latest.state is VerificationState.PASSED:
+            lines.extend(
+                [
+                    "",
+                    "最新验证观察已通过；历史失败或修复次数上限不覆盖 PASSED。",
+                ]
             )
-        else:
-            remaining = [c.get("name", "<unknown>") for c in last.failed_cases]
-            lines.append("")
-            lines.append(
-                f"达到最大修复次数（{self.max_fix_attempts}），以下测试仍然失败："
+        elif latest.state is VerificationState.EXHAUSTED_FAILURE:
+            remaining = [case.get("name", "<unknown>") for case in latest.failed_cases]
+            lines.extend(
+                [
+                    "",
+                    f"达到最大自动修复次数（{self.max_fix_attempts}），最新验证仍然失败：",
+                ]
             )
             for name in remaining:
                 lines.append(f"  - {name}")
             lines.append("请由用户决策后续操作。")
+        elif latest.state is VerificationState.FAILING:
+            lines.extend(
+                [
+                    "",
+                    "最新验证仍然失败；任务不能因普通 END_TURN 判定为完成。",
+                    f"已发出 {self._attempt_count}/{self.max_fix_attempts} 次自动修复。",
+                ]
+            )
+        else:
+            lines.extend(["", "最新验证状态未知。"])
         return "\n".join(lines)
 
     @property
@@ -198,7 +381,7 @@ class VerifyFixLoop:
         return self._attempt_count
 
 
-def _parse_test_output(tool_result: dict) -> dict | None:
+def _parse_test_output(tool_result: Mapping[str, Any]) -> dict[str, Any] | None:
     """Extract pass/fail counts from a ``test_run`` ToolResult dict.
 
     The ``output`` field is the JSON string produced by ``test_run``. When it
@@ -221,11 +404,27 @@ def _parse_test_output(tool_result: dict) -> dict | None:
     # Only treat it as a test result if it has the test_run shape.
     if not any(key in data for key in ("passed", "failed", "errors")):
         return None
+    try:
+        passed = int(data.get("passed", 0))
+        failed = int(data.get("failed", 0))
+        errors = int(data.get("errors", 0))
+    except (TypeError, ValueError):
+        return None
+    if min(passed, failed, errors) < 0:
+        return None
+    raw_failed_cases = data.get("failed_cases", [])
+    if raw_failed_cases is None:
+        raw_failed_cases = []
+    if not isinstance(raw_failed_cases, (list, tuple)):
+        return None
+    failed_cases = [
+        case for case in raw_failed_cases if isinstance(case, dict)
+    ]
     return {
-        "passed": int(data.get("passed", 0)),
-        "failed": int(data.get("failed", 0)),
-        "errors": int(data.get("errors", 0)),
-        "failed_cases": list(data.get("failed_cases", [])),
+        "passed": passed,
+        "failed": failed,
+        "errors": errors,
+        "failed_cases": failed_cases,
     }
 
 

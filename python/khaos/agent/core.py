@@ -926,10 +926,23 @@ class AgentLoop:
                                 "output": result.output,
                                 "error": result.error,
                             }
-                            if self.verify_fix_loop.should_enter_loop(result_dict):
+                            # Observation is deliberately first and is not
+                            # hidden inside should_enter_loop(). This records
+                            # every parseable test result, including results
+                            # received after the repair budget is exhausted.
+                            verification_observation = (
+                                self.verify_fix_loop.observe_test_result(
+                                    result_dict
+                                )
+                            )
+                            if self.verify_fix_loop.should_enter_loop(
+                                result_dict,
+                                observation=verification_observation,
+                            ):
                                 failure_context = (
                                     self.verify_fix_loop.build_failure_context(
-                                        result_dict
+                                        result_dict,
+                                        observation=verification_observation,
                                     )
                                 )
                                 if failure_context:
@@ -977,14 +990,22 @@ class AgentLoop:
                                             fix_attempts=self.verify_fix_loop.attempt_count,
                                         )
                                     yield fix_msg
-                                    if self.verify_fix_loop.is_loop_exhausted():
-                                        report = self.verify_fix_loop.get_final_report()
-                                        yield Message(
-                                            role="system",
-                                            content=report,
-                                            event="verify_fix_report",
-                                            created_at=time.time(),
-                                        )
+                            # Exhaustion is a terminal interpretation of the
+                            # latest observed failure, not of the repair count
+                            # alone. Emit the report once, after observation,
+                            # even when no further repair can be admitted.
+                            if (
+                                self.verify_fix_loop.is_loop_exhausted()
+                                and not self.verify_fix_loop.report_emitted
+                            ):
+                                report = self.verify_fix_loop.get_final_report()
+                                self.verify_fix_loop.mark_report_emitted()
+                                yield Message(
+                                    role="system",
+                                    content=report,
+                                    event="verify_fix_report",
+                                    created_at=time.time(),
+                                )
                         yield tool_msg
 
                 if budget_exhausted:
@@ -1298,6 +1319,7 @@ class AgentLoop:
     async def _finalize_task(self, task_id: str, stop_reason: str | None) -> None:
         """Apply terminal task semantics and run successful-task observation."""
         from khaos.coding.task_manager import TaskStatus
+        from khaos.coding.verify_fix import VerificationState
 
         if stop_reason == StopReason.MAX_TURNS.value:
             await self.task_manager.update_status(task_id, TaskStatus.FAILED, error="max_turns exhausted without completion")
@@ -1307,8 +1329,25 @@ class AgentLoop:
                 TaskStatus.FAILED,
                 error="token budget exhausted without completion",
             )
-        elif self.verify_fix_loop is not None and self.verify_fix_loop.is_loop_exhausted():
-            await self.task_manager.update_status(task_id, TaskStatus.FAILED, error="verify-fix loop exhausted, tests still failing")
+        elif self.verify_fix_loop is not None:
+            verification_state = self.verify_fix_loop.verification_state
+            if verification_state is VerificationState.EXHAUSTED_FAILURE:
+                await self.task_manager.update_status(
+                    task_id,
+                    TaskStatus.FAILED,
+                    error="verify-fix loop exhausted, tests still failing",
+                )
+            elif verification_state is VerificationState.FAILING:
+                # A model END_TURN cannot erase the latest known failing
+                # verification result. UNKNOWN remains legacy-compatible until
+                # the M7 Completion Gate owns this decision.
+                await self.task_manager.update_status(
+                    task_id,
+                    TaskStatus.FAILED,
+                    error="latest verification is failing; task did not complete",
+                )
+            else:
+                await self.task_manager.update_status(task_id, TaskStatus.COMPLETED)
         else:
             await self.task_manager.update_status(task_id, TaskStatus.COMPLETED)
         await self._analyze_task_skill(task_id)
