@@ -456,6 +456,14 @@ MIGRATIONS: tuple[MigrationSpec, ...] = (
         sql_files=("0015_memory_v2_closure.sql",),
         migrator_symbols=("_apply_v15_upgrades",),
     ),
+    MigrationSpec(
+        version=16,
+        name="m7_1_2_goal_spec_durable_contract",
+        # Release-time manifest over the v16 SQL and backfill migrator.
+        sha256="2901e287a0e73f78276169e37e8f842f80d4b02a44fa31f12faaf189cc8821fc",
+        sql_files=("0016_goal_specs.sql",),
+        migrator_symbols=("_apply_v16_upgrades", "_backfill_legacy_goal_specs"),
+    ),
 )
 
 

@@ -1420,10 +1420,16 @@ class AgentLoop:
             return []
         raw = task.to_dict(include_internal=True)
         metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
+        goal_spec = getattr(task, "goal_spec", None)
         facts = {
             "task_id": raw.get("id"),
             "goal": raw.get("goal"),
             "status": raw.get("status"),
+            # M7.1.2: these are bounded durable references/projections.  The
+            # canonical GoalSpec body remains in agent_goal_specs and is not
+            # copied into task metadata or injected wholesale.
+            "goal_spec_id": getattr(task, "goal_spec_id", None),
+            "goal_spec_digest": getattr(task, "goal_spec_digest", None),
             "workspace_id": metadata.get("workspace_id"),
             "base_sha": metadata.get("base_sha"),
             "pending_approval": metadata.get("pending_approval"),
@@ -1431,6 +1437,29 @@ class AgentLoop:
             "changeset_id": metadata.get("changeset_id"),
             "verification_run_id": metadata.get("verification_run_id"),
         }
+        if goal_spec is not None:
+            max_goal_fact_chars = 4096
+            facts["goal_spec_raw_goal"] = goal_spec.raw_goal[:max_goal_fact_chars]
+            facts["goal_spec_normalized_goal"] = goal_spec.normalized_goal[
+                :max_goal_fact_chars
+            ]
+            facts["goal_spec_raw_goal_truncated"] = len(
+                goal_spec.raw_goal
+            ) > max_goal_fact_chars
+            facts["goal_spec_requirements"] = [
+                {
+                    "requirement_id": requirement.requirement_id,
+                    "description": requirement.description[:max_goal_fact_chars],
+                    "required": requirement.required,
+                    "source": requirement.source.value,
+                    "description_truncated": len(requirement.description)
+                    > max_goal_fact_chars,
+                }
+                for requirement in goal_spec.requirements[:32]
+            ]
+            facts["goal_spec_requirements_truncated"] = len(
+                goal_spec.requirements
+            ) > 32
         content = "# Durable Task Facts\n" + json.dumps(
             facts, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         )

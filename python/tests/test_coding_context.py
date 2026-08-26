@@ -5,13 +5,10 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
-
-from khaos.agent import AgentConfig, AgentLoop, Message
+from khaos.agent import AgentConfig, AgentLoop
 from khaos.db import Database
 from khaos.modes import Mode, ModeManager
 from khaos.routing.router import create_default_router
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -168,6 +165,10 @@ async def test_durable_task_facts_reconstruct_internal_workspace_binding(tmp_pat
     assert '\"workspace_id\":\"workspace-1\"' in facts[0].content
     assert '\"binding_digest\":\"digest-1\"' in facts[0].content
     assert '\"plan_id\":\"plan-1\"' in facts[0].content
+    assert f'\"goal_spec_id\":\"{task.goal_spec_id}\"' in facts[0].content
+    assert f'\"goal_spec_digest\":\"{task.goal_spec_digest}\"' in facts[0].content
+    assert '\"goal_spec_normalized_goal\":\"keep approval scope\"' in facts[0].content
+    assert '\"source\":\"explicit_user\"' in facts[0].content
 
 
 # ---------------------------------------------------------------------------

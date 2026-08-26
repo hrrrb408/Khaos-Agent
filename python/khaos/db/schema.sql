@@ -562,6 +562,24 @@ CREATE INDEX IF NOT EXISTS idx_coding_tasks_status ON coding_tasks(status, updat
 CREATE INDEX IF NOT EXISTS idx_coding_tasks_principal ON coding_tasks(principal_id, status);
 -- M4 batch 3.1.16A-5-1: project-scoped index created by migration helper.
 
+-- M7.1.2: canonical immutable user-goal declaration.  The runtime migration
+-- source is migrations/0016_goal_specs.sql; this aggregate schema is retained
+-- for tooling and documentation only.
+CREATE TABLE IF NOT EXISTS agent_goal_specs (
+    goal_spec_id    TEXT PRIMARY KEY,
+    task_id         TEXT NOT NULL UNIQUE,
+    principal_id    TEXT NOT NULL,
+    project_id      TEXT NOT NULL,
+    schema_version  INTEGER NOT NULL,
+    semantic_digest TEXT NOT NULL,
+    canonical_json  TEXT NOT NULL,
+    created_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_goal_specs_owner_task
+    ON agent_goal_specs(principal_id, project_id, task_id);
+CREATE INDEX IF NOT EXISTS idx_agent_goal_specs_owner_digest
+    ON agent_goal_specs(principal_id, project_id, semantic_digest);
+
 -- Hermes batch 2: session history FTS5 search over messages.
 -- Separate FTS5 table (rowid mirrors messages.id) populated manually by
 -- insert_message_fts(). A standalone table avoids external-content trigger

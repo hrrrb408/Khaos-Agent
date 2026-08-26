@@ -20,12 +20,21 @@ from datetime import datetime
 from enum import Enum
 from typing import Any
 
+from khaos.agent.control.goal import GoalSpec
+from khaos.agent.control.goal_repository import (
+    GoalSpecIntegrityError,
+    GoalSpecRepository,
+)
 from khaos.time_utils import utc_now_naive
 
 logger = logging.getLogger(__name__)
 
 #: How many recent test results are retained per task (older ones dropped).
 TEST_RESULT_HISTORY = 5
+
+_GOAL_SPEC_PROTECTED_FIELDS = frozenset(
+    {"goal_spec_id", "goal_spec_digest", "goal_spec", "_persisted"}
+)
 
 
 class TaskStatus(Enum):
@@ -113,6 +122,48 @@ class CodingTask:
     # loaded from the DB via ``load()`` start with ``_persisted=True``.
     # Not included in ``to_dict()`` — it is a runtime-only flag.
     _persisted: bool = field(default=False, repr=False, compare=False)
+    # M7.1.2: the canonical declaration is stored in ``agent_goal_specs``.
+    # Only its identity/digest are projected into task state JSON; the
+    # in-memory value object is resolved from the owner-scoped repository.
+    goal_spec_id: str | None = field(default=None, compare=False)
+    goal_spec_digest: str | None = field(default=None, compare=False)
+    goal_spec: GoalSpec | None = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        """Enforce the task/display projection invariant for new tasks."""
+        if self.goal_spec is None:
+            if self.goal_spec_id is not None or self.goal_spec_digest is not None:
+                raise ValueError(
+                    "GoalSpec references require a resolved GoalSpec value"
+                )
+            return
+        if self.goal != self.goal_spec.raw_goal:
+            raise ValueError("CodingTask.goal must equal GoalSpec.raw_goal")
+        if self.goal_spec_id is None:
+            self.goal_spec_id = self.goal_spec.goal_spec_id
+        if self.goal_spec_digest is None:
+            self.goal_spec_digest = self.goal_spec.semantic_digest
+        if (
+            self.goal_spec_id != self.goal_spec.goal_spec_id
+            or self.goal_spec_digest != self.goal_spec.semantic_digest
+        ):
+            raise ValueError("CodingTask GoalSpec references do not match GoalSpec")
+
+    def _validate_goal_spec_projection(self) -> None:
+        """Reject a mutable task projection that diverged from GoalSpec."""
+        if self.goal_spec is None:
+            if self.goal_spec_id is not None or self.goal_spec_digest is not None:
+                raise ValueError(
+                    "GoalSpec references require a resolved GoalSpec value"
+                )
+            return
+        if self.goal != self.goal_spec.raw_goal:
+            raise ValueError("CodingTask.goal must equal GoalSpec.raw_goal")
+        if (
+            self.goal_spec_id != self.goal_spec.goal_spec_id
+            or self.goal_spec_digest != self.goal_spec.semantic_digest
+        ):
+            raise ValueError("CodingTask GoalSpec references do not match GoalSpec")
 
     def touch(self) -> None:
         """Stamp ``updated_at`` to now."""
@@ -142,6 +193,10 @@ class CodingTask:
             data["trace"] = self.trace
             data["event_sequence"] = self.event_sequence
             data["principal_id"] = self.principal_id
+            if self.goal_spec_id is not None:
+                data["goal_spec_id"] = self.goal_spec_id
+            if self.goal_spec_digest is not None:
+                data["goal_spec_digest"] = self.goal_spec_digest
         return data
 
 
@@ -189,6 +244,7 @@ class TaskManager:
         *,
         principal_id: str = "legacy",
         project_id: str = "",
+        goal_spec_repository: GoalSpecRepository | None = None,
     ) -> None:
         self._tasks: dict[str, CodingTask] = {}
         self._max_active = max_active
@@ -226,6 +282,24 @@ class TaskManager:
         # applied on this column yet) but distinguishable from rows
         # stamped by a project-bound runtime.
         self._project_id = project_id
+        if goal_spec_repository is not None:
+            if (
+                db is not None
+                and goal_spec_repository.database is not db
+            ):
+                raise ValueError(
+                    "GoalSpec repository must share the TaskManager database"
+                )
+            self._goal_spec_repository = goal_spec_repository
+        elif db is not None:
+            # Database composes one repository instance.  The fallback keeps
+            # explicit database test ports compatible without creating a
+            # module-global handle or a second physical connection.
+            self._goal_spec_repository = getattr(
+                db, "goal_spec_repository", None
+            ) or GoalSpecRepository(db)
+        else:
+            self._goal_spec_repository = None
 
     @property
     def principal_id(self) -> str:
@@ -239,6 +313,11 @@ class TaskManager:
         A-4-3 / A-4-4).
         """
         return self._principal_id
+
+    @property
+    def goal_spec_repository(self) -> GoalSpecRepository | None:
+        """Return the repository composed for this task manager."""
+        return self._goal_spec_repository
 
     def set_lease_invalidation_hook(self, hook: Any) -> None:
         """Register a callable invoked during cancel to release execution leases."""
@@ -261,12 +340,51 @@ class TaskManager:
         """
         if self._db is None:
             return
+        if self._goal_spec_repository is None:
+            raise GoalSpecIntegrityError(
+                "durable task loading requires a GoalSpec repository"
+            )
         for data in await self._db.list_coding_tasks(
             principal_id=self._principal_id,
             project_id=self._project_id,
         ):
+            task_id = data.get("id")
+            goal = data.get("goal", "")
+            if type(task_id) is not str or not task_id:
+                raise GoalSpecIntegrityError("coding task row has no valid task id")
+            if type(goal) is not str:
+                raise GoalSpecIntegrityError("coding task row has no valid goal")
+            goal_spec = await self._goal_spec_repository.get_for_task(
+                task_id,
+                principal_id=self._principal_id,
+                project_id=self._project_id,
+            )
+            if goal_spec is None:
+                raise GoalSpecIntegrityError(
+                    f"coding task {task_id!r} has no owner-scoped GoalSpec"
+                )
+            if goal != goal_spec.raw_goal:
+                raise GoalSpecIntegrityError(
+                    f"coding task {task_id!r} goal disagrees with canonical GoalSpec"
+                )
+            persisted_goal_spec_id = data.get("goal_spec_id")
+            persisted_goal_spec_digest = data.get("goal_spec_digest")
+            if (
+                persisted_goal_spec_id is not None
+                and persisted_goal_spec_id != goal_spec.goal_spec_id
+            ):
+                raise GoalSpecIntegrityError(
+                    f"coding task {task_id!r} GoalSpec id projection disagrees"
+                )
+            if (
+                persisted_goal_spec_digest is not None
+                and persisted_goal_spec_digest != goal_spec.semantic_digest
+            ):
+                raise GoalSpecIntegrityError(
+                    f"coding task {task_id!r} GoalSpec digest projection disagrees"
+                )
             task = CodingTask(
-                id=data["id"], goal=data.get("goal", ""),
+                id=task_id, goal=goal,
                 status=TaskStatus.parse(data.get("status", "pending")),
                 created_at=datetime.fromisoformat(data["created_at"]),
                 updated_at=datetime.fromisoformat(data["updated_at"]),
@@ -284,6 +402,9 @@ class TaskManager:
                 # somehow reached here without a principal, defaulting
                 # to 'legacy' keeps the invariant.
                 principal_id=data.get("principal_id", self._principal_id),
+                goal_spec_id=goal_spec.goal_spec_id,
+                goal_spec_digest=goal_spec.semantic_digest,
+                goal_spec=goal_spec,
             )
             # Round-4 review Batch 4: mark loaded tasks as already
             # persisted so ``_persist`` uses ``update_coding_task``
@@ -318,9 +439,41 @@ class TaskManager:
                     f"max active tasks reached ({self._max_active}); "
                     "complete or cancel an existing task first"
                 )
-            task = CodingTask(goal=goal, principal_id=self._principal_id)
+            goal_spec = GoalSpec.from_user_goal(goal)
+            task = CodingTask(
+                goal=goal,
+                principal_id=self._principal_id,
+                goal_spec=goal_spec,
+            )
             self._tasks[task.id] = task
-            await self._persist(task)
+            try:
+                if self._db is None:
+                    await self._persist(task)
+                else:
+                    if self._goal_spec_repository is None:
+                        raise GoalSpecIntegrityError(
+                            "durable task creation requires a GoalSpec repository"
+                        )
+                    # Database.transaction() owns BEGIN/COMMIT/ROLLBACK. The
+                    # task and canonical GoalSpec inserts are nested within
+                    # this one transaction; inner repository calls reuse the
+                    # same transaction owner and cannot commit independently.
+                    async with self._db.transaction():
+                        await self._persist(task, emit_event=False)
+                        await self._goal_spec_repository.insert(
+                            goal_spec,
+                            task_id=task.id,
+                            principal_id=task.principal_id,
+                            project_id=self._project_id,
+                        )
+            except BaseException:
+                # A failed atomic create must not leave a task visible in the
+                # manager cache or make the caller believe durable state exists.
+                self._tasks.pop(task.id, None)
+                task._persisted = False
+                raise
+            if self._db is not None:
+                self._publish_task_event(task)
             logger.info("created coding task %s: %s", task.id, goal[:80])
             return task
 
@@ -344,11 +497,7 @@ class TaskManager:
                 logger.warning("update_status: unknown task %s", task_id)
                 return TransitionResult.NOT_FOUND
             if task.status == resolved:
-                for key, value in kwargs.items():
-                    if hasattr(task, key):
-                        setattr(task, key, value)
-                    else:
-                        task.metadata[key] = value
+                self._apply_task_updates(task, kwargs)
                 if kwargs:
                     task.touch()
                     await self._persist(task)
@@ -356,12 +505,8 @@ class TaskManager:
             if task.status in TERMINAL_STATUSES:
                 logger.warning("refusing terminal task transition %s -> %s for %s", task.status.value, resolved.value, task_id)
                 return TransitionResult.INVALID_TRANSITION
+            self._apply_task_updates(task, kwargs)
             task.status = resolved
-            for key, value in kwargs.items():
-                if hasattr(task, key):
-                    setattr(task, key, value)
-                else:
-                    task.metadata[key] = value
             task.touch()
             await self._persist(task)
             return TransitionResult.UPDATED
@@ -374,12 +519,8 @@ class TaskManager:
                 return TransitionResult.NOT_FOUND
             if task.status not in expected:
                 return TransitionResult.INVALID_TRANSITION
+            self._apply_task_updates(task, updates)
             task.status = target
-            for key, value in updates.items():
-                if hasattr(task, key):
-                    setattr(task, key, value)
-                else:
-                    task.metadata[key] = value
             task.touch()
             await self._persist(task)
             return TransitionResult.UPDATED
@@ -532,7 +673,8 @@ class TaskManager:
             task.touch()
             await self._persist(task)
 
-    async def _persist(self, task: CodingTask) -> None:
+    async def _persist(self, task: CodingTask, *, emit_event: bool = True) -> None:
+        task._validate_goal_spec_projection()
         task.event_sequence += 1
         if self._db is not None:
             # A3-2: stamp the bound principal on every persisted row so
@@ -565,9 +707,34 @@ class TaskManager:
                     principal_id=task.principal_id,
                     project_id=self._project_id,
                 )
+        if emit_event:
+            self._publish_task_event(task)
+
+    def _publish_task_event(self, task: CodingTask) -> None:
+        """Publish a committed task snapshot to subscribers."""
         event = {"event_id": uuid.uuid4().hex, "task_id": task.id, "sequence": task.event_sequence, "type": f"task.{task.status.value}", "timestamp": task.updated_at.isoformat(), "payload": task.to_dict()}
         for queue in self._subscribers.get(task.id, []):
             queue.put_nowait(event)
+
+    @staticmethod
+    def _apply_task_updates(
+        task: CodingTask, updates: dict[str, Any]
+    ) -> None:
+        """Apply mutable task updates without permitting GoalSpec drift."""
+        for key, value in updates.items():
+            if key in _GOAL_SPEC_PROTECTED_FIELDS:
+                raise ValueError(f"CodingTask field {key!r} is immutable")
+            if (
+                key == "goal"
+                and task.goal_spec is not None
+                and value != task.goal_spec.raw_goal
+            ):
+                raise ValueError("CodingTask.goal must equal GoalSpec.raw_goal")
+        for key, value in updates.items():
+            if hasattr(task, key):
+                setattr(task, key, value)
+            else:
+                task.metadata[key] = value
 
     async def subscribe(self, task_id: str):
         """Yield an initial snapshot and subsequent state-change events.

@@ -16,6 +16,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from khaos.agent.control.goal_repository import GoalSpecRepository
 from khaos.agent.core import Message
 from khaos.db.connection import (
     READER_DRAIN_TIMEOUT,
@@ -242,6 +243,7 @@ class Database:
         self._audit_repository = AuditRepository(self)
         self._scheduler_repository = SchedulerRepository(self)
         self._tool_operation_repository = ToolOperationRepository(self)
+        self._goal_spec_repository = GoalSpecRepository(self)
         # F-01: Per-domain locks remain for logical serialization (e.g. two
         # concurrent permission grants must not race on epoch computation).
         self._operation_approval_lock = asyncio.Lock()
@@ -270,6 +272,11 @@ class Database:
         a second persistence boundary.
         """
         return self._tool_operation_repository
+
+    @property
+    def goal_spec_repository(self) -> GoalSpecRepository:
+        """Return the sole owner-scoped GoalSpec persistence boundary."""
+        return self._goal_spec_repository
 
     @_conn.setter
     def _conn(self, value: Any | None) -> None:
@@ -680,9 +687,12 @@ class Database:
             if SCHEMA_MIGRATION_VERSION in applied_versions:
                 # Latest version is already applied and verified against the
                 # registry.  (Batch 6.4: we still backfill any missing
-                # historical rows below for ledger completeness — but only if
-                # they are absent, so this path is a true no-op once full.)
+                # historical rows below for ledger completeness.)  M7.1.2
+                # also validates/backfills the GoalSpec projection on every
+                # startup so a task inserted through an older compatibility
+                # facade cannot become loadable without its canonical goal.
                 await self._backfill_historical_ledger_rows(conn, applied_versions)
+                await self._backfill_legacy_goal_specs(conn)
                 await conn.commit()
                 return
 
@@ -784,6 +794,14 @@ class Database:
             self._conn = _MigrationConnection(conn)
             try:
                 await self._apply_v15_upgrades()
+            finally:
+                self._conn = original_conn
+            # M7.1.2: create the immutable GoalSpec table and backfill every
+            # existing coding task before publishing the v16 ledger row.
+            original_conn = self._conn
+            self._conn = _MigrationConnection(conn)
+            try:
+                await self._apply_v16_upgrades()
             finally:
                 self._conn = original_conn
             # Batch 6.4 §10.4: backfill the historical ledger rows (v1–v5)
@@ -1403,6 +1421,200 @@ class Database:
             conn,
             migration_path.read_text(encoding="utf-8"),
         )
+
+    async def _apply_v16_upgrades(self) -> None:
+        """Create and backfill the M7.1.2 immutable GoalSpec contract."""
+
+        conn = await self._require_conn()
+        migration_path = _MIGRATIONS_DIR / "0016_goal_specs.sql"
+        await self._execute_schema_statements(
+            conn,
+            migration_path.read_text(encoding="utf-8"),
+        )
+        await self._backfill_legacy_goal_specs(conn)
+
+    async def _backfill_legacy_goal_specs(self, conn: Any) -> None:
+        """Backfill and validate one conservative GoalSpec per task.
+
+        This method runs inside the outer migration transaction.  It uses
+        direct SQL intentionally: invoking a repository transaction here
+        would create a second transaction owner during migration.  Existing
+        canonical rows are validated, never replaced; missing projection
+        references are added to ``coding_tasks.state_json`` only.
+        """
+        from khaos.agent.control.goal import GoalSpec
+
+        task_cursor = await conn.execute(
+            """
+            SELECT id, goal, state_json, principal_id, project_id
+            FROM coding_tasks
+            ORDER BY id
+            """
+        )
+        task_rows = await task_cursor.fetchall()
+        for task_row in task_rows:
+            task_id = task_row["id"]
+            raw_goal = task_row["goal"]
+            principal_id = task_row["principal_id"]
+            project_id = task_row["project_id"]
+            if (
+                type(task_id) is not str
+                or not task_id
+                or type(raw_goal) is not str
+                or not raw_goal
+                or type(principal_id) is not str
+                or not principal_id
+                or type(project_id) is not str
+            ):
+                raise RuntimeError(
+                    f"cannot backfill GoalSpec for malformed coding task {task_id!r}"
+                )
+            try:
+                state = json.loads(str(task_row["state_json"]))
+            except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"coding task {task_id!r} has malformed state_json; "
+                    "GoalSpec backfill refused"
+                ) from exc
+            if type(state) is not dict:
+                raise RuntimeError(
+                    f"coding task {task_id!r} state_json is not an object; "
+                    "GoalSpec backfill refused"
+                )
+            state_goal = state.get("goal")
+            if state_goal is not None and (
+                type(state_goal) is not str or state_goal != raw_goal
+            ):
+                raise RuntimeError(
+                    f"coding task {task_id!r} goal projection disagrees with row"
+                )
+
+            spec_cursor = await conn.execute(
+                """
+                SELECT goal_spec_id, task_id, principal_id, project_id,
+                       schema_version, semantic_digest, canonical_json
+                FROM agent_goal_specs
+                WHERE task_id = ?
+                """,
+                (task_id,),
+            )
+            spec_row = await spec_cursor.fetchone()
+            if spec_row is None:
+                # The task id is part of the identity only for persistence;
+                # it is deliberately excluded from semantic_digest.
+                spec = GoalSpec.from_user_goal(
+                    raw_goal,
+                    goal_spec_id=f"legacy-{task_id}",
+                )
+                try:
+                    await conn.execute(
+                        """
+                        INSERT INTO agent_goal_specs (
+                            goal_spec_id, task_id, principal_id, project_id,
+                            schema_version, semantic_digest, canonical_json, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            spec.goal_spec_id,
+                            task_id,
+                            principal_id,
+                            project_id,
+                            spec.schema_version,
+                            spec.semantic_digest,
+                            spec.canonical_json(),
+                            utc_now_naive().isoformat(),
+                        ),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise RuntimeError(
+                        f"GoalSpec backfill conflict for coding task {task_id!r}"
+                    ) from exc
+            else:
+                if (
+                    type(spec_row["goal_spec_id"]) is not str
+                    or not spec_row["goal_spec_id"]
+                    or type(spec_row["task_id"]) is not str
+                    or not spec_row["task_id"]
+                    or type(spec_row["principal_id"]) is not str
+                    or not spec_row["principal_id"]
+                    or type(spec_row["project_id"]) is not str
+                    or type(spec_row["semantic_digest"]) is not str
+                    or not spec_row["semantic_digest"]
+                    or type(spec_row["canonical_json"]) is not str
+                    or type(spec_row["schema_version"]) is not int
+                ):
+                    raise RuntimeError(
+                        f"GoalSpec row for coding task {task_id!r} has invalid owner, identity, or payload fields"
+                    )
+                if (
+                    spec_row["task_id"] != task_id
+                    or spec_row["principal_id"] != principal_id
+                    or spec_row["project_id"] != project_id
+                ):
+                    raise RuntimeError(
+                        f"GoalSpec owner/task mismatch for coding task {task_id!r}"
+                    )
+                try:
+                    spec = GoalSpec.from_canonical_json(
+                        spec_row["canonical_json"],
+                        expected_digest=spec_row["semantic_digest"],
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        f"GoalSpec row for coding task {task_id!r} failed integrity validation"
+                    ) from exc
+                if (
+                    spec.schema_version != spec_row["schema_version"]
+                    or spec.raw_goal != raw_goal
+                    or spec.goal_spec_id != spec_row["goal_spec_id"]
+                ):
+                    raise RuntimeError(
+                        f"GoalSpec row for coding task {task_id!r} disagrees with task"
+                    )
+
+            expected_id = spec.goal_spec_id
+            expected_digest = spec.semantic_digest
+            for field_name, expected_value in (
+                ("goal_spec_id", expected_id),
+                ("goal_spec_digest", expected_digest),
+            ):
+                projected_value = state.get(field_name)
+                if projected_value is not None and projected_value != expected_value:
+                    raise RuntimeError(
+                        f"coding task {task_id!r} has conflicting {field_name} projection"
+                    )
+            if (
+                state.get("goal_spec_id") != expected_id
+                or state.get("goal_spec_digest") != expected_digest
+            ):
+                state["goal_spec_id"] = expected_id
+                state["goal_spec_digest"] = expected_digest
+                await conn.execute(
+                    "UPDATE coding_tasks SET state_json = ? WHERE id = ?",
+                    (
+                        json.dumps(
+                            state,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        task_id,
+                    ),
+                )
+
+        orphan_cursor = await conn.execute(
+            """
+            SELECT specs.goal_spec_id
+            FROM agent_goal_specs AS specs
+            LEFT JOIN coding_tasks AS tasks ON tasks.id = specs.task_id
+            WHERE tasks.id IS NULL
+            """
+        )
+        orphan = await orphan_cursor.fetchone()
+        if orphan is not None:
+            raise RuntimeError(
+                f"orphan GoalSpec {str(orphan['goal_spec_id'])!r} detected"
+            )
 
     async def _ensure_memory_nodes_superseded_at(self) -> None:
         """Add the temporal supersession marker to existing v13 databases."""
@@ -3762,10 +3974,36 @@ class Database:
                 params.append(project_id)
             where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
             cursor = await conn.execute(
-                f"SELECT state_json FROM coding_tasks {where} ORDER BY created_at",
+                f"SELECT id, goal, status, state_json, created_at, updated_at, "
+                f"principal_id, project_id FROM coding_tasks {where} "
+                "ORDER BY created_at",
                 tuple(params),
             )
-            return [json.loads(str(row["state_json"])) for row in await cursor.fetchall()]
+            rows = await cursor.fetchall()
+            result: list[dict[str, Any]] = []
+            for row in rows:
+                state = json.loads(str(row["state_json"]))
+                if type(state) is not dict:
+                    raise ValueError(
+                        f"coding task {row['id']!r} state_json is not an object"
+                    )
+                for field_name, physical_value in (
+                    ("id", row["id"]),
+                    ("goal", row["goal"]),
+                    ("status", row["status"]),
+                    ("created_at", row["created_at"]),
+                    ("updated_at", row["updated_at"]),
+                ):
+                    if field_name in state and state[field_name] != physical_value:
+                        raise ValueError(
+                            f"coding task {row['id']!r} {field_name} projection disagrees"
+                        )
+                    state[field_name] = physical_value
+                # Owner columns are authoritative even if an old state JSON
+                # payload contains a stale or forged projection.
+                state["principal_id"] = row["principal_id"]
+                result.append(state)
+            return result
 
     async def search_sessions(
         self,

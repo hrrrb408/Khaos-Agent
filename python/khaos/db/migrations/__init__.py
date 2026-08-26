@@ -22,6 +22,7 @@ Current chain (see ``_registry.MIGRATIONS``):
   v6 = Batch 6.4 immutable migration chain + historical ledger backfill
        — FIRST version with a real manifest checksum (covers the actual
          executed SQL + migrator source bytes; review §10.1/§10.2)
+  v16 = M7.1.2 immutable GoalSpec declarations and conservative backfill
 
 Immutability contract
 ---------------------

@@ -1,0 +1,71 @@
+"""AgentLoop reachability tests for the durable GoalSpec creation path."""
+
+from __future__ import annotations
+
+from khaos.agent import AgentConfig, AgentLoop
+from khaos.coding.task_manager import TaskManager, TaskStatus
+from khaos.db import Database
+from khaos.modes import Mode, ModeManager
+from khaos.routing.router import create_default_router
+
+
+async def test_coding_agent_loop_auto_created_task_has_goal_spec(tmp_path) -> None:
+    prompts = tmp_path / "prompts"
+    prompts.mkdir()
+    (prompts / "office.md").write_text("office", encoding="utf-8")
+    (prompts / "coding.md").write_text("coding", encoding="utf-8")
+
+    db = Database(tmp_path / "agent.db")
+    await db.connect()
+    await db.run_migrations()
+    await db.create_session(
+        "s1",
+        mode="coding",
+        principal_id="alice",
+        project_id="project-a",
+    )
+    mode_manager = ModeManager(
+        db,
+        project_root=tmp_path,
+        principal_id="alice",
+        session_id="s1",
+        project_id="project-a",
+    )
+    await mode_manager.switch(Mode.CODING)
+    task_manager = TaskManager(
+        db=db,
+        principal_id="alice",
+        project_id="project-a",
+    )
+    loop = AgentLoop(
+        AgentConfig(),
+        mode_manager,
+        create_default_router(),
+        db,
+        project_root=tmp_path,
+        task_manager=task_manager,
+        principal_id="alice",
+        project_id="project-a",
+    )
+
+    try:
+        events = [message async for message in loop.run("修复中文目标", "s1")]
+        tasks = await db.list_coding_tasks(
+            principal_id="alice", project_id="project-a"
+        )
+        assert len(tasks) == 1
+        task_id = tasks[0]["id"]
+        spec = await db.goal_spec_repository.get_for_task(
+            task_id, principal_id="alice", project_id="project-a"
+        )
+        assert spec is not None
+        assert spec.raw_goal == "修复中文目标"
+        assert tasks[0]["goal"] == spec.raw_goal
+        assert tasks[0]["goal_spec_id"] == spec.goal_spec_id
+        assert tasks[0]["goal_spec_digest"] == spec.semantic_digest
+        assert any(message.event == "done" for message in events)
+        # The normal END_TURN/finalization path is intentionally unrelated to
+        # GoalSpec declaration persistence; it must not mutate the contract.
+        assert tasks[0]["status"] == TaskStatus.COMPLETED.value
+    finally:
+        await db.close()

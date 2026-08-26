@@ -17,8 +17,8 @@
 
 ## Import reachability result
 
-- Reachable repository modules: `247`.
-- Resolved import edges: `1724`.
+- Reachable repository modules: `249`.
+- Resolved import edges: `1733`.
 - Forbidden production edges: `0`.
 - Unresolved internal edges: `0`.
 
@@ -36,6 +36,8 @@
 - `khaos.agent.approval`
 - `khaos.agent.compressor`
 - `khaos.agent.context_facts`
+- `khaos.agent.control.goal`
+- `khaos.agent.control.goal_repository`
 - `khaos.agent.core`
 - `khaos.agent.error_handler`
 - `khaos.agent.events`
