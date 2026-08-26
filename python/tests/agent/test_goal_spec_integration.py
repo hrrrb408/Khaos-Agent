@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
+
 from khaos.agent import AgentConfig, AgentLoop
+from khaos.agent.control.state import AgentCognitiveState
 from khaos.coding.task_manager import TaskManager, TaskStatus
 from khaos.db import Database
 from khaos.modes import Mode, ModeManager
@@ -63,6 +66,12 @@ async def test_coding_agent_loop_auto_created_task_has_goal_spec(tmp_path) -> No
         assert tasks[0]["goal"] == spec.raw_goal
         assert tasks[0]["goal_spec_id"] == spec.goal_spec_id
         assert tasks[0]["goal_spec_digest"] == spec.semantic_digest
+        assert tasks[0]["cognitive_state"] == AgentCognitiveState.UNDERSTANDING.value
+        assert tasks[0]["control_state_version"] == 1
+        facts = await loop._build_durable_task_facts(task_id)
+        fact_payload = json.loads(facts[0].content.removeprefix("# Durable Task Facts\n"))
+        assert fact_payload["cognitive_state"] == AgentCognitiveState.UNDERSTANDING.value
+        assert fact_payload["control_state_version"] == 1
         assert any(message.event == "done" for message in events)
         # The normal END_TURN/finalization path is intentionally unrelated to
         # GoalSpec declaration persistence; it must not mutate the contract.

@@ -25,6 +25,17 @@ from khaos.agent.control.goal_repository import (
     GoalSpecIntegrityError,
     GoalSpecRepository,
 )
+from khaos.agent.control.state import (
+    AgentCognitiveState,
+    AgentCognitiveStateMachine,
+    CognitiveTransitionValidation,
+)
+from khaos.agent.control.state_repository import (
+    AgentControlStateRepository,
+    CognitiveStateIntegrityError,
+    CognitiveTransitionResult,
+    CognitiveTransitionStatus,
+)
 from khaos.time_utils import utc_now_naive
 
 logger = logging.getLogger(__name__)
@@ -34,6 +45,9 @@ TEST_RESULT_HISTORY = 5
 
 _GOAL_SPEC_PROTECTED_FIELDS = frozenset(
     {"goal_spec_id", "goal_spec_digest", "goal_spec", "_persisted"}
+)
+_COGNITIVE_STATE_PROTECTED_FIELDS = frozenset(
+    {"cognitive_state", "control_state_version"}
 )
 
 
@@ -128,9 +142,26 @@ class CodingTask:
     goal_spec_id: str | None = field(default=None, compare=False)
     goal_spec_digest: str | None = field(default=None, compare=False)
     goal_spec: GoalSpec | None = field(default=None, repr=False, compare=False)
+    # M7.1.3: this is a read projection of the independent SQL control-state
+    # domain.  The database columns, not state_json or this mutable object,
+    # are the canonical authority.  Appended after the pre-M7 fields to keep
+    # existing positional CodingTask construction source-compatible.
+    cognitive_state: AgentCognitiveState = field(
+        default=AgentCognitiveState.UNINITIALIZED, compare=False
+    )
+    control_state_version: int = field(default=0, compare=False)
 
     def __post_init__(self) -> None:
         """Enforce the task/display projection invariant for new tasks."""
+        if type(self.cognitive_state) is not AgentCognitiveState:
+            raise ValueError("cognitive_state must be an AgentCognitiveState")
+        if (
+            type(self.control_state_version) is not int
+            or self.control_state_version < 0
+        ):
+            raise ValueError(
+                "control_state_version must be a non-negative integer"
+            )
         if self.goal_spec is None:
             if self.goal_spec_id is not None or self.goal_spec_digest is not None:
                 raise ValueError(
@@ -187,6 +218,8 @@ class CodingTask:
             "test_results": self.test_results[-TEST_RESULT_HISTORY:],
             "fix_attempts": self.fix_attempts,
             "error": self.error,
+            "cognitive_state": self.cognitive_state.value,
+            "control_state_version": self.control_state_version,
         }
         if include_internal:
             data["metadata"] = self.metadata
@@ -291,6 +324,12 @@ class TaskManager:
                     "GoalSpec repository must share the TaskManager database"
                 )
             self._goal_spec_repository = goal_spec_repository
+            if db is not None:
+                self._agent_control_state_repository = getattr(
+                    db, "agent_control_state_repository", None
+                ) or AgentControlStateRepository(db)
+            else:
+                self._agent_control_state_repository = None
         elif db is not None:
             # Database composes one repository instance.  The fallback keeps
             # explicit database test ports compatible without creating a
@@ -298,8 +337,12 @@ class TaskManager:
             self._goal_spec_repository = getattr(
                 db, "goal_spec_repository", None
             ) or GoalSpecRepository(db)
+            self._agent_control_state_repository = getattr(
+                db, "agent_control_state_repository", None
+            ) or AgentControlStateRepository(db)
         else:
             self._goal_spec_repository = None
+            self._agent_control_state_repository = None
 
     @property
     def principal_id(self) -> str:
@@ -318,6 +361,11 @@ class TaskManager:
     def goal_spec_repository(self) -> GoalSpecRepository | None:
         """Return the repository composed for this task manager."""
         return self._goal_spec_repository
+
+    @property
+    def agent_control_state_repository(self) -> AgentControlStateRepository | None:
+        """Return the owner-scoped cognitive-state CAS repository."""
+        return self._agent_control_state_repository
 
     def set_lease_invalidation_hook(self, hook: Any) -> None:
         """Register a callable invoked during cancel to release execution leases."""
@@ -383,6 +431,25 @@ class TaskManager:
                 raise GoalSpecIntegrityError(
                     f"coding task {task_id!r} GoalSpec digest projection disagrees"
                 )
+            try:
+                cognitive_state = AgentCognitiveState.parse(
+                    data.get(
+                        "cognitive_state",
+                        AgentCognitiveState.UNINITIALIZED.value,
+                    )
+                )
+            except ValueError as exc:
+                raise CognitiveStateIntegrityError(
+                    f"coding task {task_id!r} has an invalid cognitive state"
+                ) from exc
+            control_state_version = data.get("control_state_version", 0)
+            if (
+                type(control_state_version) is not int
+                or control_state_version < 0
+            ):
+                raise CognitiveStateIntegrityError(
+                    f"coding task {task_id!r} has an invalid control-state version"
+                )
             task = CodingTask(
                 id=task_id, goal=goal,
                 status=TaskStatus.parse(data.get("status", "pending")),
@@ -405,6 +472,8 @@ class TaskManager:
                 goal_spec_id=goal_spec.goal_spec_id,
                 goal_spec_digest=goal_spec.semantic_digest,
                 goal_spec=goal_spec,
+                cognitive_state=cognitive_state,
+                control_state_version=control_state_version,
             )
             # Round-4 review Batch 4: mark loaded tasks as already
             # persisted so ``_persist`` uses ``update_coding_task``
@@ -524,6 +593,138 @@ class TaskManager:
             task.touch()
             await self._persist(task)
             return TransitionResult.UPDATED
+
+    async def initialize_cognitive_state(
+        self, task_id: str
+    ) -> CognitiveTransitionResult:
+        """Explicitly initialize a newly started task for the AgentLoop."""
+        return await self.transition_cognitive_state(
+            task_id,
+            target=AgentCognitiveState.UNDERSTANDING,
+            expected_state=AgentCognitiveState.UNINITIALIZED,
+            expected_version=0,
+        )
+
+    async def transition_cognitive_state(
+        self,
+        task_id: str,
+        *,
+        target: AgentCognitiveState,
+        expected_state: AgentCognitiveState | None = None,
+        expected_version: int | None = None,
+    ) -> CognitiveTransitionResult:
+        """Validate and CAS a task's durable cognitive state.
+
+        The pure state machine is consulted before the SQL repository.  A
+        successful database CAS updates only this manager's in-memory
+        projection; ordinary task persistence never writes the cognitive
+        columns.  A stale result leaves the projection untouched so callers
+        must explicitly refresh before making a new decision.
+        """
+        if type(target) is not AgentCognitiveState:
+            raise TypeError("target must be an AgentCognitiveState")
+        async with self._lock:
+            task = self._tasks.get(task_id)
+            resolved_expected_state = (
+                expected_state
+                if expected_state is not None
+                else (
+                    task.cognitive_state
+                    if task is not None
+                    else AgentCognitiveState.UNINITIALIZED
+                )
+            )
+            resolved_expected_version = (
+                expected_version
+                if expected_version is not None
+                else (task.control_state_version if task is not None else 0)
+            )
+            if type(resolved_expected_state) is not AgentCognitiveState:
+                raise TypeError(
+                    "expected_state must be an AgentCognitiveState"
+                )
+            if (
+                type(resolved_expected_version) is not int
+                or resolved_expected_version < 0
+            ):
+                raise ValueError(
+                    "expected_version must be a non-negative integer"
+                )
+            if task is None:
+                return CognitiveTransitionResult(
+                    status=CognitiveTransitionStatus.NOT_FOUND,
+                    task_id=task_id,
+                    expected_state=resolved_expected_state,
+                    expected_version=resolved_expected_version,
+                    target_state=target,
+                )
+
+            validation = AgentCognitiveStateMachine.validate_transition(
+                resolved_expected_state, target
+            )
+            if validation is CognitiveTransitionValidation.ILLEGAL:
+                return CognitiveTransitionResult.illegal_transition(
+                    task_id=task_id,
+                    current_state=resolved_expected_state,
+                    current_version=resolved_expected_version,
+                    target_state=target,
+                )
+
+            if self._agent_control_state_repository is None:
+                # A database-less TaskManager is retained for isolated unit
+                # callers.  It has no durable authority, but still follows
+                # the same closed graph and version semantics locally.
+                if task.status in TERMINAL_STATUSES:
+                    return CognitiveTransitionResult(
+                        status=CognitiveTransitionStatus.TERMINAL_TASK,
+                        task_id=task_id,
+                        expected_state=resolved_expected_state,
+                        expected_version=resolved_expected_version,
+                        target_state=target,
+                        current_state=task.cognitive_state,
+                        control_state_version=task.control_state_version,
+                        task_status=task.status.value,
+                    )
+                if task.control_state_version != resolved_expected_version:
+                    result_status = CognitiveTransitionStatus.STALE_VERSION
+                elif task.cognitive_state is not resolved_expected_state:
+                    result_status = CognitiveTransitionStatus.STALE_STATE
+                elif validation is CognitiveTransitionValidation.UNCHANGED:
+                    result_status = CognitiveTransitionStatus.UNCHANGED
+                else:
+                    task.cognitive_state = target
+                    task.control_state_version += 1
+                    result_status = CognitiveTransitionStatus.UPDATED
+                return CognitiveTransitionResult(
+                    status=result_status,
+                    task_id=task_id,
+                    expected_state=resolved_expected_state,
+                    expected_version=resolved_expected_version,
+                    target_state=target,
+                    current_state=task.cognitive_state,
+                    control_state_version=task.control_state_version,
+                    task_status=task.status.value,
+                )
+
+            result = await self._agent_control_state_repository.compare_and_transition(
+                task_id,
+                principal_id=self._principal_id,
+                project_id=self._project_id,
+                expected_state=resolved_expected_state,
+                expected_version=resolved_expected_version,
+                target_state=target,
+            )
+            if result.status in {
+                CognitiveTransitionStatus.UPDATED,
+                CognitiveTransitionStatus.UNCHANGED,
+            }:
+                if result.current_state is None or result.control_state_version is None:
+                    raise CognitiveStateIntegrityError(
+                        "successful cognitive transition has no resulting projection"
+                    )
+                task.cognitive_state = result.current_state
+                task.control_state_version = result.control_state_version
+            return result
 
     async def find_by_pending_tool(self, tool_call_id: str) -> CodingTask | None:
         async with self._lock:
@@ -720,10 +921,14 @@ class TaskManager:
     def _apply_task_updates(
         task: CodingTask, updates: dict[str, Any]
     ) -> None:
-        """Apply mutable task updates without permitting GoalSpec drift."""
+        """Apply mutable task updates without bypassing control owners."""
         for key, value in updates.items():
             if key in _GOAL_SPEC_PROTECTED_FIELDS:
                 raise ValueError(f"CodingTask field {key!r} is immutable")
+            if key in _COGNITIVE_STATE_PROTECTED_FIELDS:
+                raise ValueError(
+                    f"CodingTask field {key!r} requires the cognitive-state CAS owner"
+                )
             if (
                 key == "goal"
                 and task.goal_spec is not None

@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 from khaos.agent.control.goal_repository import GoalSpecIntegrityError
+from khaos.agent.control.state import AgentCognitiveState
+from khaos.agent.control.state_repository import CognitiveTransitionStatus
 from khaos.coding.task_manager import TaskManager, TaskStatus
 from khaos.db import Database
 from khaos.db.database import SCHEMA_MIGRATION_VERSION
@@ -71,6 +73,26 @@ async def test_task_manager_rejects_repository_from_another_database(
     finally:
         await db.close()
         await other.close()
+
+
+@pytest.mark.asyncio
+async def test_task_manager_composes_control_repo_with_explicit_goal_repo(
+    tmp_path: Path,
+) -> None:
+    db = await _make_db(tmp_path / "shared-repository.db")
+    try:
+        manager = TaskManager(
+            db=db,
+            principal_id="alice",
+            project_id="project-a",
+            goal_spec_repository=db.goal_spec_repository,
+        )
+        task = await manager.create("explicit repository wiring")
+        result = await manager.initialize_cognitive_state(task.id)
+        assert result.status is CognitiveTransitionStatus.UPDATED
+        assert task.cognitive_state is AgentCognitiveState.UNDERSTANDING
+    finally:
+        await db.close()
 
 
 @pytest.mark.asyncio

@@ -329,6 +329,14 @@ class AgentLoop:
                 active_task_id = task.id
                 self._active_task_id = active_task_id
                 await self.task_manager.update_status(active_task_id, "running")
+                cognitive_result = await self.task_manager.initialize_cognitive_state(
+                    active_task_id
+                )
+                if not cognitive_result.updated:
+                    raise RuntimeError(
+                        "new coding task could not initialize cognitive state: "
+                        f"{cognitive_result.status.value}"
+                    )
                 await self._record_memory_runtime_event(
                     "TASK_CREATED",
                     session_id=session_id,
@@ -1425,6 +1433,14 @@ class AgentLoop:
             "task_id": raw.get("id"),
             "goal": raw.get("goal"),
             "status": raw.get("status"),
+            "cognitive_state": getattr(
+                getattr(task, "cognitive_state", None),
+                "value",
+                None,
+            ),
+            "control_state_version": getattr(
+                task, "control_state_version", None
+            ),
             # M7.1.2: these are bounded durable references/projections.  The
             # canonical GoalSpec body remains in agent_goal_specs and is not
             # copied into task metadata or injected wholesale.

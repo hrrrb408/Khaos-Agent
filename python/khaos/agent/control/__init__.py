@@ -21,12 +21,34 @@ from khaos.agent.control.goal_repository import (
     GoalSpecIntegrityError,
     GoalSpecRepository,
 )
+from khaos.agent.control.state import (
+    LEGAL_COGNITIVE_TRANSITIONS,
+    AgentCognitiveState,
+    AgentCognitiveStateMachine,
+    CognitiveTransitionValidation,
+)
+from khaos.agent.control.state_repository import (
+    AgentControlStateRepository,
+    CognitiveStateIntegrityError,
+    CognitiveStateSnapshot,
+    CognitiveTransitionResult,
+    CognitiveTransitionStatus,
+)
 
 __all__ = [
     "ACCEPTANCE_CRITERION_SCHEMA_KEYS",
     "GOAL_REQUIREMENT_SCHEMA_KEYS",
     "GOAL_SPEC_SCHEMA_VERSION",
+    "LEGAL_COGNITIVE_TRANSITIONS",
     "AcceptanceCriterion",
+    "AgentCognitiveState",
+    "AgentCognitiveStateMachine",
+    "AgentControlStateRepository",
+    "CognitiveStateIntegrityError",
+    "CognitiveStateSnapshot",
+    "CognitiveTransitionResult",
+    "CognitiveTransitionStatus",
+    "CognitiveTransitionValidation",
     "GoalRequirement",
     "GoalSource",
     "GoalSpec",

@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 
 import pytest
-
 from khaos.coding.task_manager import (
     ACTIVE_STATUSES,
     CodingTask,
@@ -13,7 +12,6 @@ from khaos.coding.task_manager import (
     TaskStatus,
     TransitionResult,
 )
-
 
 # ---------------------------------------------------------------------------
 # CodingTask serialization
@@ -34,6 +32,8 @@ def test_coding_task_to_dict_has_expected_keys() -> None:
         "test_results",
         "fix_attempts",
         "error",
+        "cognitive_state",
+        "control_state_version",
     }
     assert data["goal"] == "fix bug"
     assert data["status"] == "pending"

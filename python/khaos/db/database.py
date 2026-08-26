@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from khaos.agent.control.goal_repository import GoalSpecRepository
+from khaos.agent.control.state_repository import AgentControlStateRepository
 from khaos.agent.core import Message
 from khaos.db.connection import (
     READER_DRAIN_TIMEOUT,
@@ -244,6 +245,7 @@ class Database:
         self._scheduler_repository = SchedulerRepository(self)
         self._tool_operation_repository = ToolOperationRepository(self)
         self._goal_spec_repository = GoalSpecRepository(self)
+        self._agent_control_state_repository = AgentControlStateRepository(self)
         # F-01: Per-domain locks remain for logical serialization (e.g. two
         # concurrent permission grants must not race on epoch computation).
         self._operation_approval_lock = asyncio.Lock()
@@ -277,6 +279,11 @@ class Database:
     def goal_spec_repository(self) -> GoalSpecRepository:
         """Return the sole owner-scoped GoalSpec persistence boundary."""
         return self._goal_spec_repository
+
+    @property
+    def agent_control_state_repository(self) -> AgentControlStateRepository:
+        """Return the sole SQL owner for cognitive-state CAS transitions."""
+        return self._agent_control_state_repository
 
     @_conn.setter
     def _conn(self, value: Any | None) -> None:
@@ -802,6 +809,16 @@ class Database:
             self._conn = _MigrationConnection(conn)
             try:
                 await self._apply_v16_upgrades()
+            finally:
+                self._conn = original_conn
+            # M7.1.3: add the independent cognitive-state/version columns.
+            # The delta is applied after v16 GoalSpec backfill so every
+            # existing coding task receives the conservative UNINITIALIZED/0
+            # defaults in the same outer migration transaction.
+            original_conn = self._conn
+            self._conn = _MigrationConnection(conn)
+            try:
+                await self._apply_v17_upgrades()
             finally:
                 self._conn = original_conn
             # Batch 6.4 §10.4: backfill the historical ledger rows (v1–v5)
@@ -1432,6 +1449,53 @@ class Database:
             migration_path.read_text(encoding="utf-8"),
         )
         await self._backfill_legacy_goal_specs(conn)
+
+    async def _apply_v17_upgrades(self) -> None:
+        """Add the M7.1.3 independent cognitive-state CAS columns."""
+
+        conn = await self._require_conn()
+        await self._ensure_coding_tasks_cognitive_state_columns(conn)
+
+    async def _ensure_coding_tasks_cognitive_state_columns(
+        self, conn: Any
+    ) -> None:
+        """Idempotently add the v17 control-state columns.
+
+        The normal path executes the checked-in v17 SQL artifact verbatim.
+        The per-column fallback handles a process that was interrupted after
+        one additive ALTER in a non-versioned/hand-repaired database.  Only
+        the two exact v17 columns are accepted; no task history is used to
+        infer a cognitive phase.
+        """
+        cursor = await conn.execute("PRAGMA table_info(coding_tasks)")
+        columns = {str(row["name"]) for row in await cursor.fetchall()}
+        required = {"cognitive_state", "control_state_version"}
+        missing = required - columns
+        if not missing:
+            return
+
+        migration_path = _MIGRATIONS_DIR / "0017_agent_cognitive_state.sql"
+        migration_sql = migration_path.read_text(encoding="utf-8")
+        if missing == required:
+            await self._execute_schema_statements(conn, migration_sql)
+            return
+
+        # SQLite has no portable ``ADD COLUMN IF NOT EXISTS``.  When a
+        # partial additive operation is observed, execute only the missing
+        # statement while retaining the same schema contract as the artifact.
+        if "cognitive_state" in missing:
+            await conn.execute(
+                "ALTER TABLE coding_tasks ADD COLUMN cognitive_state TEXT "
+                "NOT NULL DEFAULT 'uninitialized' CHECK (cognitive_state IN "
+                "('uninitialized', 'understanding', 'exploring', 'planning', "
+                "'implementing', 'verifying', 'diagnosing', 'recovering', "
+                "'replanning', 'reviewing', 'completion_check'))"
+            )
+        if "control_state_version" in missing:
+            await conn.execute(
+                "ALTER TABLE coding_tasks ADD COLUMN control_state_version "
+                "INTEGER NOT NULL DEFAULT 0 CHECK (control_state_version >= 0)"
+            )
 
     async def _backfill_legacy_goal_specs(self, conn: Any) -> None:
         """Backfill and validate one conservative GoalSpec per task.
@@ -3975,7 +4039,8 @@ class Database:
             where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
             cursor = await conn.execute(
                 f"SELECT id, goal, status, state_json, created_at, updated_at, "
-                f"principal_id, project_id FROM coding_tasks {where} "
+                f"principal_id, project_id, cognitive_state, "
+                f"control_state_version FROM coding_tasks {where} "
                 "ORDER BY created_at",
                 tuple(params),
             )
@@ -4002,6 +4067,11 @@ class Database:
                 # Owner columns are authoritative even if an old state JSON
                 # payload contains a stale or forged projection.
                 state["principal_id"] = row["principal_id"]
+                # M7.1.3: cognitive state/version are a separate SQL CAS
+                # domain.  The state_json values are only a compatibility
+                # projection and are overwritten by the canonical columns.
+                state["cognitive_state"] = row["cognitive_state"]
+                state["control_state_version"] = row["control_state_version"]
                 result.append(state)
             return result
 

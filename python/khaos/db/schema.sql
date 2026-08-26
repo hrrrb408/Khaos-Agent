@@ -555,7 +555,17 @@ CREATE TABLE IF NOT EXISTS coding_tasks (
     -- authenticated principal's TaskManager.
     principal_id   TEXT NOT NULL DEFAULT 'legacy',
     -- M4 batch 3.1.16A-5-1: project identity closure (see ``sessions``).
-    project_id     TEXT NOT NULL DEFAULT ''
+    project_id     TEXT NOT NULL DEFAULT '',
+    -- M7.1.3: canonical durable cognitive phase and its independent CAS
+    -- version.  Runtime migration source: migrations/0017_*.sql.
+    cognitive_state TEXT NOT NULL DEFAULT 'uninitialized'
+        CHECK (cognitive_state IN (
+            'uninitialized', 'understanding', 'exploring', 'planning',
+            'implementing', 'verifying', 'diagnosing', 'recovering',
+            'replanning', 'reviewing', 'completion_check'
+        )),
+    control_state_version INTEGER NOT NULL DEFAULT 0
+        CHECK (control_state_version >= 0)
 );
 
 CREATE INDEX IF NOT EXISTS idx_coding_tasks_status ON coding_tasks(status, updated_at);

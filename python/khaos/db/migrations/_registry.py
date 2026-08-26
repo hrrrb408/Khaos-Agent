@@ -464,6 +464,18 @@ MIGRATIONS: tuple[MigrationSpec, ...] = (
         sql_files=("0016_goal_specs.sql",),
         migrator_symbols=("_apply_v16_upgrades", "_backfill_legacy_goal_specs"),
     ),
+    MigrationSpec(
+        version=17,
+        name="m7_1_3_agent_cognitive_state_cas",
+        # Release-time manifest over the additive v17 SQL and its idempotent
+        # column migrator.  Future edits must add a new migration version.
+        sha256="6405eca2774dcf12592d0ff9069021f4d6fc27984084858d0c36c980be55484e",
+        sql_files=("0017_agent_cognitive_state.sql",),
+        migrator_symbols=(
+            "_apply_v17_upgrades",
+            "_ensure_coding_tasks_cognitive_state_columns",
+        ),
+    ),
 )
 
 

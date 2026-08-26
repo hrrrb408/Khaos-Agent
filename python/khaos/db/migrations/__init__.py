@@ -23,6 +23,7 @@ Current chain (see ``_registry.MIGRATIONS``):
        — FIRST version with a real manifest checksum (covers the actual
          executed SQL + migrator source bytes; review §10.1/§10.2)
   v16 = M7.1.2 immutable GoalSpec declarations and conservative backfill
+  v17 = M7.1.3 Agent Cognitive State CAS columns with conservative defaults
 
 Immutability contract
 ---------------------
