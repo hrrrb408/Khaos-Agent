@@ -15,10 +15,10 @@ not become a lifecycle authority, a model judge, or a verification/security auth
 ### 1. Evaluator, Decision, and Gate are separate
 
 `CompletionEvaluator` consumes typed structured facts and returns one
-`CompletionDecision`.  `CompletionDecision` records the result and owns its canonical digest;
-it does not prove completion or change `TaskStatus`.  The later Completion Gate owns stale
-checks, authority checks, and any lifecycle projection.  `PROPOSE_COMPLETION` and END_TURN
-interception remain outside this batch.
+`CompletionDecision`. `CompletionDecision` records the result and owns its canonical digest;
+it does not prove completion or change `TaskStatus`. The later Completion Gate owns stale
+checks, authority checks, and any lifecycle projection. The M7.1.6 controller supplies the
+separate `PROPOSE_COMPLETION`/END_TURN orchestration described by ADR-072.
 
 ### 2. GoalSpec owns required semantics
 
@@ -69,9 +69,10 @@ digest owner.  `decision_id` is intentionally excluded from that semantic digest
 
 ### 7. Pure/no persistence
 
-The evaluator has no database or repository dependency.  It does not append a decision, write a
-task, publish an event, change cognitive state, or project `TaskStatus`.  M7.1.6 will own the
-future control flow from a completion proposal through evaluation and durable append.
+The evaluator has no database or repository dependency. It does not append a decision, write a
+task, publish an event, change cognitive state, or project `TaskStatus`. M7.1.6 owns the control
+flow from a completion proposal through evaluation and durable append, while keeping those
+lifecycle boundaries unchanged.
 
 ### 8. Security non-authority
 
@@ -89,8 +90,7 @@ negative constraints without introducing caller-controlled completion authority.
 
 ## Deferred
 
-- Completion Gate and `PROPOSE_COMPLETION` flow
-- END_TURN interception and `TaskStatus` projection
+- Completion Gate and `TaskStatus` projection
 - GoalAssessment persistence and evaluator/repository integration
 - Trusted Verification composition
 - Planning and Recovery/Replan execution

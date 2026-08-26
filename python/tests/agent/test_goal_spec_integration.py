@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 from khaos.agent import AgentConfig, AgentLoop
+from khaos.agent.control.completion import CompletionOutcome
 from khaos.agent.control.state import AgentCognitiveState
 from khaos.coding.task_manager import TaskManager, TaskStatus
 from khaos.db import Database
@@ -73,8 +74,15 @@ async def test_coding_agent_loop_auto_created_task_has_goal_spec(tmp_path) -> No
         assert fact_payload["cognitive_state"] == AgentCognitiveState.UNDERSTANDING.value
         assert fact_payload["control_state_version"] == 1
         assert any(message.event == "done" for message in events)
-        # The normal END_TURN/finalization path is intentionally unrelated to
-        # GoalSpec declaration persistence; it must not mutate the contract.
-        assert tasks[0]["status"] == TaskStatus.COMPLETED.value
+        decisions = await db.completion_decision_repository.list_for_task(
+            task_id,
+            principal_id="alice",
+            project_id="project-a",
+        )
+        assert len(decisions) == 1
+        assert decisions[0].outcome is CompletionOutcome.REPLAN
+        # END_TURN is a completion proposal only.  The M7.1.7 gate owns any
+        # future TaskStatus projection, so this task remains non-terminal.
+        assert tasks[0]["status"] == TaskStatus.RUNNING.value
     finally:
         await db.close()

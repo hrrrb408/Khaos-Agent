@@ -13,6 +13,7 @@ from khaos.agent.control.completion import (
     CompletionDecisionValidationError,
     CompletionOutcome,
 )
+from khaos.agent.control.completion_evaluator import CompletionEvaluationSnapshot
 from khaos.agent.control.goal import GoalSpec, GoalSpecValidationError
 from khaos.agent.control.state import AgentCognitiveState
 from khaos.time_utils import utc_now_naive
@@ -257,6 +258,63 @@ class CompletionDecisionRepository:
             principal_id=principal_id,
             project_id=project_id,
             created_at=timestamp,
+        )
+
+    async def read_current_task_snapshot(
+        self,
+        task_id: str,
+        *,
+        principal_id: str,
+        project_id: str,
+        goal_spec: GoalSpec,
+    ) -> CompletionEvaluationSnapshot | None:
+        """Read one owner-scoped current task snapshot for evaluation.
+
+        Cognitive state, its CAS version, and ``TaskStatus`` are read from
+        their physical SQL columns.  The workspace value is decoded from the
+        existing durable task projection by the same strict decoder used by
+        ``append``.  ``goal_spec`` must already have been loaded through the
+        owner-scoped GoalSpec repository; this method only binds its identity
+        into the returned evaluation snapshot.
+
+        The read is deliberately non-mutating and does not use
+        ``TaskManager.load()``.  The append path performs the authoritative
+        recheck after evaluation, so a concurrent task change is reported as
+        a stale append rather than being silently retried.
+        """
+        _validate_scope(
+            task_id=task_id,
+            principal_id=principal_id,
+            project_id=project_id,
+        )
+        if type(goal_spec) is not GoalSpec:
+            raise TypeError("goal_spec must be a GoalSpec")
+        async with self._database.read_connection() as conn:
+            task_row = await _select_task(
+                conn,
+                task_id=task_id,
+                principal_id=principal_id,
+                project_id=project_id,
+            )
+        if task_row is None:
+            return None
+        task_snapshot = _decode_task_snapshot(task_row)
+        if (
+            task_snapshot.task_id != task_id
+            or task_snapshot.principal_id != principal_id
+            or task_snapshot.project_id != project_id
+        ):
+            raise CompletionDecisionIntegrityError(
+                "current task snapshot owner or identity disagrees"
+            )
+        return CompletionEvaluationSnapshot(
+            task_id=task_snapshot.task_id,
+            goal_spec_id=goal_spec.goal_spec_id,
+            goal_spec_digest=goal_spec.semantic_digest,
+            cognitive_state=task_snapshot.cognitive_state,
+            control_state_version=task_snapshot.control_state_version,
+            task_status=task_snapshot.task_status,
+            workspace_id=task_snapshot.workspace_id,
         )
 
     async def get_by_id(

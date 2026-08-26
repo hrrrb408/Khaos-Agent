@@ -56,8 +56,8 @@ from khaos.modes import ModeManager
 from khaos.permissions import PermissionEngine
 from khaos.routing.router import create_default_router
 from khaos.runtime.authority import RuntimeAuthoritySeal
-from khaos.runtime_profile import RuntimeProfile, resolve_runtime_profile
 from khaos.runtime.lifecycle import CloseState
+from khaos.runtime_profile import RuntimeProfile, resolve_runtime_profile
 from khaos.rust_bridge import get_token_engine
 from khaos.security.credential_broker import CredentialBroker
 from khaos.security.effective_policy import EffectiveSecurityPolicy
@@ -234,6 +234,12 @@ class RuntimeConfig:
     # Default ``''`` (CLI / tests) falls back to
     # ``compute_project_id(root)`` for backward compat.
     project_id: str = ""
+    # M7.1.6: a typed fact provider may be injected by test/development
+    # composition.  It is appended after the legacy fields so positional
+    # RuntimeConfig construction remains source-compatible.  The
+    # ProductionRuntimeConfig deliberately does not expose this hook; its
+    # default is the conservative empty provider.
+    completion_fact_provider: Any = None
 
 
 @dataclass(frozen=True)
@@ -1655,6 +1661,29 @@ async def build_runtime(
     verify_factory = VerifyFixLoop
     skill_generator = SkillGenerator()
     cleanup_authority = cfg.cleanup_authority or RuntimeCleanupAuthority()
+    from khaos.agent.control.completion_flow import (
+        CompletionProposalController,
+        EmptyCompletionFactProvider,
+    )
+
+    goal_spec_repository = getattr(task_manager, "goal_spec_repository", None)
+    if goal_spec_repository is None:
+        goal_spec_repository = getattr(cfg.db, "goal_spec_repository", None)
+    decision_repository = getattr(cfg.db, "completion_decision_repository", None)
+    if goal_spec_repository is None or decision_repository is None:
+        raise RuntimeError(
+            "completion control repositories are unavailable in runtime composition"
+        )
+    fact_provider = cfg.completion_fact_provider
+    if fact_provider is None:
+        fact_provider = EmptyCompletionFactProvider()
+    completion_controller = CompletionProposalController(
+        goal_spec_repository=goal_spec_repository,
+        decision_repository=decision_repository,
+        principal_id=cfg.principal_id,
+        project_id=project_id,
+        fact_provider=fact_provider,
+    )
     loop = AgentLoop(
         cfg.agent_config or AgentConfig(), mode_manager, router, cfg.db,
         tool_scheduler=scheduler, confirm_callback=cfg.confirm_callback,
@@ -1699,6 +1728,7 @@ async def build_runtime(
         browser_manager=browser_manager,
         subagent_spawner=cfg.subagent_spawner,
         credential_broker=credential_broker,
+        completion_controller=completion_controller,
         # M4 batch 3.1.16A-5-1b (CRITICAL): carry the RPC-verified
         # project identity into the AgentLoop so every message / turn
         # write is stamped with it.  ``self._bound_project_id`` (set

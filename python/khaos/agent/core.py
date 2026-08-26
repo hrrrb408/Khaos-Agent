@@ -15,6 +15,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
+    from khaos.agent.control.completion_flow import (
+        CompletionFactProvider,
+        CompletionProposalController,
+        CompletionProposalResult,
+    )
     from khaos.coding.cost_tracker import CostTracker
     from khaos.coding.fingerprint import FileFingerprintCache
     from khaos.coding.task_manager import TaskManager
@@ -155,6 +160,8 @@ class AgentLoop:
         # for drift detection (fail-closed rejection).
         project_id: str = "",
         runtime_profile: RuntimeProfile | str | None = None,
+        completion_controller: CompletionProposalController | None = None,
+        completion_fact_provider: CompletionFactProvider | None = None,
     ):
         self.config = config
         self.mode_manager = mode_manager
@@ -192,6 +199,11 @@ class AgentLoop:
         # Long-task tracking: record files viewed/modified and test outcomes.
         self.task_manager = task_manager
         self.task_id = task_id
+        # M7.1.6: a coding END_TURN is a completion proposal, not a task
+        # lifecycle transition.  The controller is a narrow orchestration
+        # port; it owns no tool, approval, workspace, or sandbox authority.
+        self.completion_controller = completion_controller
+        self.completion_fact_provider = completion_fact_provider
         self.skill_generator = skill_generator
         self.workspace_manager = workspace_manager
         self.active_workspace = None
@@ -1022,8 +1034,30 @@ class AgentLoop:
             else:
                 stop_reason = StopReason.MAX_TURNS.value
 
+            coding_completion_proposed = (
+                is_coding
+                and active_task_id is not None
+                and stop_reason == StopReason.END_TURN.value
+            )
+            if coding_completion_proposed:
+                assert active_task_id is not None
+                completion_result = await self._propose_completion(
+                    turn=turn,
+                    task_id=active_task_id,
+                )
+                yield self._completion_result_message(
+                    result=completion_result,
+                    turn_id=turn.turn_id,
+                    attempt_id=turn.attempt_id,
+                    task_id=active_task_id,
+                )
+
             if self.task_manager is not None and active_task_id:
-                await self._finalize_task(active_task_id, stop_reason)
+                await self._finalize_task(
+                    active_task_id,
+                    stop_reason,
+                    preserve_successful_completion=coding_completion_proposed,
+                )
 
             # Non-terminal accounting events must precede the durable terminal.
             if self.cost_tracker is not None:
@@ -1288,6 +1322,148 @@ class AgentLoop:
             )
         return exceeded
 
+    def _ensure_completion_controller(self) -> CompletionProposalController | None:
+        """Build the default proposal controller for a DB-backed coding task.
+
+        The runtime factory normally injects this controller explicitly.  The
+        lazy fallback keeps direct, authenticated AgentLoop construction
+        compatible while still requiring the existing composed repositories;
+        it never creates a new database or authority owner.
+        """
+        controller = self.completion_controller
+        if controller is not None:
+            return controller
+        if self.db is None or self.task_manager is None:
+            return None
+
+        from khaos.agent.control.completion_flow import (
+            CompletionProposalController,
+            EmptyCompletionFactProvider,
+        )
+
+        goal_spec_repository = getattr(
+            self.task_manager,
+            "goal_spec_repository",
+            None,
+        )
+        if goal_spec_repository is None:
+            goal_spec_repository = getattr(self.db, "goal_spec_repository", None)
+        decision_repository = getattr(
+            self.db,
+            "completion_decision_repository",
+            None,
+        )
+        if goal_spec_repository is None or decision_repository is None:
+            return None
+
+        fact_provider = self.completion_fact_provider
+        if fact_provider is None:
+            fact_provider = EmptyCompletionFactProvider()
+        controller = CompletionProposalController(
+            goal_spec_repository=goal_spec_repository,
+            decision_repository=decision_repository,
+            principal_id=self.principal_id,
+            project_id=self.project_id,
+            fact_provider=fact_provider,
+        )
+        self.completion_controller = controller
+        return controller
+
+    async def _propose_completion(
+        self,
+        *,
+        turn: Any,
+        task_id: str,
+    ) -> CompletionProposalResult:
+        """Evaluate a structured END_TURN proposal without task projection."""
+        from khaos.agent.control.completion_flow import (
+            CompletionProposal,
+            CompletionProposalResult,
+            CompletionProposalStatus,
+            CompletionProposalTrigger,
+        )
+
+        proposal = CompletionProposal(
+            task_id=task_id,
+            turn_id=turn.turn_id,
+            attempt_id=turn.attempt_id,
+            trigger=CompletionProposalTrigger.MODEL_END_TURN,
+        )
+        await turn.emit(
+            "completion.proposed",
+            {
+                "task_id": proposal.task_id,
+                "turn_id": proposal.turn_id,
+                "attempt_id": proposal.attempt_id,
+                "trigger": proposal.trigger.value,
+            },
+        )
+
+        controller = self._ensure_completion_controller()
+        if controller is None:
+            result = CompletionProposalResult(
+                status=CompletionProposalStatus.REJECTED,
+                decision=None,
+                decision_sequence=None,
+                reason="completion controller is unavailable.",
+            )
+        else:
+            result = await controller.propose(proposal)
+
+        payload: dict[str, Any] = {
+            "task_id": proposal.task_id,
+            "turn_id": proposal.turn_id,
+            "attempt_id": proposal.attempt_id,
+            "status": result.status.value,
+        }
+        if result.decision is not None:
+            payload.update(
+                {
+                    "decision_id": result.decision.decision_id,
+                    "decision_digest": result.decision.decision_digest,
+                    "decision_sequence": result.decision_sequence,
+                    "outcome": result.decision.outcome.value,
+                }
+            )
+        if result.reason:
+            payload["reason"] = result.reason
+        await turn.emit("completion.evaluated", payload)
+        return result
+
+    @staticmethod
+    def _completion_result_message(
+        *,
+        result: CompletionProposalResult,
+        turn_id: str,
+        attempt_id: str,
+        task_id: str,
+    ) -> Message:
+        """Expose a bounded passive proposal result to turn consumers."""
+        metadata: dict[str, Any] = {
+            "task_id": task_id,
+            "turn_id": turn_id,
+            "attempt_id": attempt_id,
+            "status": result.status.value,
+        }
+        if result.decision is not None:
+            metadata.update(
+                {
+                    "decision_id": result.decision.decision_id,
+                    "decision_digest": result.decision.decision_digest,
+                    "decision_sequence": result.decision_sequence,
+                    "outcome": result.decision.outcome.value,
+                }
+            )
+        if result.reason:
+            metadata["reason"] = result.reason
+        return Message(
+            role="system",
+            content="completion proposal evaluated",
+            event="completion_evaluated",
+            metadata=metadata,
+            created_at=time.time(),
+        )
+
     async def _analyze_task_skill(self, task_id: str) -> None:
         if self.skill_generator is None or self.task_manager is None:
             return
@@ -1324,8 +1500,14 @@ class AgentLoop:
                 source_type="TASK",
             )
 
-    async def _finalize_task(self, task_id: str, stop_reason: str | None) -> None:
-        """Apply terminal task semantics and run successful-task observation."""
+    async def _finalize_task(
+        self,
+        task_id: str,
+        stop_reason: str | None,
+        *,
+        preserve_successful_completion: bool = False,
+    ) -> None:
+        """Apply task semantics while keeping proposals passive when requested."""
         from khaos.coding.task_manager import TaskStatus
         from khaos.coding.verify_fix import VerificationState
 
@@ -1354,9 +1536,9 @@ class AgentLoop:
                     TaskStatus.FAILED,
                     error="latest verification is failing; task did not complete",
                 )
-            else:
+            elif not preserve_successful_completion:
                 await self.task_manager.update_status(task_id, TaskStatus.COMPLETED)
-        else:
+        elif not preserve_successful_completion:
             await self.task_manager.update_status(task_id, TaskStatus.COMPLETED)
         await self._analyze_task_skill(task_id)
         task = await self.task_manager.get(task_id)
@@ -1373,7 +1555,11 @@ class AgentLoop:
                     "value",
                     getattr(task, "status", ""),
                 ),
-                "rationale": stop_reason or "task completed",
+                "rationale": (
+                    "completion proposed"
+                    if preserve_successful_completion
+                    else stop_reason or "task completed"
+                ),
             },
             source_type="TASK",
         )
