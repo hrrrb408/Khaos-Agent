@@ -368,6 +368,7 @@ governance:
     - python/khaos/tools/execution_coordinator.py
     - python/khaos/tools/scheduler.py
     - python/khaos/runtime_profile.py
+    - rust/khaos-core/advisory-policy.toml
     - rust/khaos-core/audit.toml
     - scripts/audit-github-ruleset.sh
     - scripts/build_community_local_closure_bundle.py
@@ -394,6 +395,8 @@ governance:
     - scripts/validate_m6_governance.py
     - scripts/validate_community_local_preclosure.py
     - scripts/validate_type_check_contract.py
+    - scripts/validate_cargo_advisory_policy.py
+    - scripts/validate_evidence_retention.py
     - scripts/verify_production_composition.py
     - scripts/verify_release_gate_runs.py
     - scripts/verify_release_tag.py

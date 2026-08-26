@@ -55,6 +55,7 @@
 /scripts/validate_community_local_preclosure.py @hrrrb408
 /scripts/validate_type_check_contract.py @hrrrb408
 /scripts/validate_evidence_retention.py @hrrrb408
+/scripts/validate_cargo_advisory_policy.py @hrrrb408
 /scripts/validate_m6_governance.py @hrrrb408
 /scripts/verify_production_composition.py @hrrrb408
 /scripts/verify_release_gate_runs.py @hrrrb408
@@ -69,5 +70,6 @@
 /docs/security/ @hrrrb408
 /pyright-security.json @hrrrb408
 /rust/khaos-core/audit.toml @hrrrb408
+/rust/khaos-core/advisory-policy.toml @hrrrb408
 /rust-toolchain.toml @hrrrb408
 /.go-version @hrrrb408
