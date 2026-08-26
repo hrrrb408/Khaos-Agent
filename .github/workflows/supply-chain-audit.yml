@@ -67,6 +67,7 @@ jobs:
           name: supply-chain-provenance-${{ github.sha }}
           path: provenance/
           if-no-files-found: error
+          retention-days: 90
 
   # ─── 1. Python: pip-audit ──────────────────────────────────────────
   pip-audit:

@@ -54,12 +54,14 @@
 /scripts/validate_docker_outer_profiles.py @hrrrb408
 /scripts/validate_community_local_preclosure.py @hrrrb408
 /scripts/validate_type_check_contract.py @hrrrb408
+/scripts/validate_evidence_retention.py @hrrrb408
 /scripts/validate_m6_governance.py @hrrrb408
 /scripts/verify_production_composition.py @hrrrb408
 /scripts/verify_release_gate_runs.py @hrrrb408
 /scripts/verify_release_tag.py @hrrrb408
 /scripts/watch_upstream_codex_security.py @hrrrb408
 /scripts/build_local_security_closure_report.py @hrrrb408
+/scripts/build_community_local_closure_bundle.py @hrrrb408
 /scripts/collect_local_security_evidence.py @hrrrb408
 /docs/local-security-profile.md @hrrrb408
 /docs/security_facts.yaml @hrrrb408

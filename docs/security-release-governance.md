@@ -34,6 +34,11 @@ release-ready merely because the maintainer can approve it.
 7. Do not merge Docker, lockfile, workflow, permission, audit, RPC, or native
    helper changes while the corresponding real-kernel or supply-chain job is
    skipped, cancelled, or unavailable.
+8. Keep every closure-critical or release-critical Actions artifact for at
+   least 90 days. The complete upload classification is machine-checked by
+   `scripts/validate_evidence_retention.py` from `docs/security_facts.yaml`;
+   diagnostic artifacts remain explicitly separate from the re-verification
+   chain.
 
 ## Deployment profile evidence
 
@@ -121,6 +126,16 @@ Export/archive evidence before reducing any window.
   non-retargetable tag, and
   any CI-only skips are recorded together. Existing release assets are never
   overwritten.
+
+The release workflow already preserves the exact gate evidence, checksums,
+SBOM, and signed attestation bundles as release assets without `--clobber`
+(`ALREADY_SATISFIED`). These saved records are audit evidence only; they do
+not replace the live exact-SHA GitHub verifier or issue a closure capability.
+After that live verifier succeeds for the Community Local profile, the
+generator also publishes `community-local-closure-bundle-<SHA>.json`. It
+contains the closure report fields, exact gate identities, producer and proof
+digests, policy/schema digests, accepted residuals, and the machine decision;
+its machine contract explicitly records that it cannot issue provenance.
 
 ## M6 governance preparation
 

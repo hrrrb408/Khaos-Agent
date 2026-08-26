@@ -252,6 +252,78 @@ local_security_closure:
     producer_evidence_schema: khaos.local-security-producer-proof.v1
     accepts_saved_release_record_as_live_provenance: false
     final_certification_workflow: .github/workflows/community-local-closure.yml
+evidence_retention:
+  critical_minimum_days: 90
+  saved_evidence_is_audit_only: true
+  live_exact_sha_verifier_remains_authority: true
+  release_asset_contract:
+    workflow: .github/workflows/release-provenance.yml
+    upload_command: 'gh release upload "$RELEASE_TAG" dist/*'
+    replacement_flag_forbidden: --clobber
+    closure_bundle_generator: scripts/build_community_local_closure_bundle.py
+    closure_bundle_schema: khaos.community-local-closure-bundle.v1
+    closure_bundle_is_capability: false
+  artifacts:
+    - workflow: .github/workflows/batch5-required-jobs.yml
+      name: security-test-evidence-browser-kernel
+      class: closure-critical
+    - workflow: .github/workflows/browser-e2e.yml
+      name: security-test-evidence-browser-dns-rebinding
+      class: closure-critical
+    - workflow: .github/workflows/community-local-closure.yml
+      name: 'local-security-evidence-${{ github.sha }}'
+      class: release-critical
+    - workflow: .github/workflows/docker-security.yml
+      name: 'production-composition-evidence-${{ github.sha }}'
+      class: release-critical
+    - workflow: .github/workflows/docker-security.yml
+      name: 'production-lifecycle-evidence-${{ github.sha }}'
+      class: release-critical
+    - workflow: .github/workflows/native-authority-production-e2e.yml
+      name: native-authority-macos-proof
+      class: release-critical
+    - workflow: .github/workflows/native-authority-production-e2e.yml
+      name: native-authority-windows-proof
+      class: release-critical
+    - workflow: .github/workflows/native-authority-production-e2e.yml
+      name: deployment-profile-results
+      class: release-critical
+    - workflow: .github/workflows/platform-sandbox-security.yml
+      name: linux-bwrap-diagnostics
+      class: diagnostic
+    - workflow: .github/workflows/platform-sandbox-security.yml
+      name: browser-kernel-diagnostics
+      class: diagnostic
+    - workflow: .github/workflows/platform-sandbox-security.yml
+      name: browser-non-root-evidence
+      class: closure-critical
+    - workflow: .github/workflows/platform-sandbox-security.yml
+      name: macos-sandbox-diagnostics
+      class: diagnostic
+    - workflow: .github/workflows/platform-sandbox-security.yml
+      name: windows-fail-closed-diagnostics
+      class: diagnostic
+    - workflow: .github/workflows/ruleset-audit.yml
+      name: github-ruleset-audit
+      class: closure-critical
+    - workflow: .github/workflows/security-closure-gate.yml
+      name: closure-adversarial-evidence
+      class: closure-critical
+    - workflow: .github/workflows/security-closure-gate.yml
+      name: m6-security-closure-report
+      class: closure-critical
+    - workflow: .github/workflows/security-closure-gate.yml
+      name: 'community-local-test-producer-evidence-${{ github.sha }}'
+      class: release-critical
+    - workflow: .github/workflows/security-closure-gate.yml
+      name: 'security-evidence-${{ github.sha }}'
+      class: release-critical
+    - workflow: .github/workflows/supply-chain-audit.yml
+      name: 'supply-chain-provenance-${{ github.sha }}'
+      class: closure-critical
+    - workflow: .github/workflows/upstream-codex-security-watch.yml
+      name: upstream-codex-security-watch
+      class: diagnostic
 upstream_security_watch:
   generator: scripts/watch_upstream_codex_security.py
   fixed_sha: 711a5f8b3a6eb40134146ae9ec22fdcdda5e3170
@@ -298,6 +370,7 @@ governance:
     - python/khaos/runtime_profile.py
     - rust/khaos-core/audit.toml
     - scripts/audit-github-ruleset.sh
+    - scripts/build_community_local_closure_bundle.py
     - scripts/build_local_security_closure_report.py
     - scripts/build_m6_closure_report.py
     - scripts/build_security_closure_evidence.py

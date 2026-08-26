@@ -32,3 +32,4 @@ jobs:
         with:
           name: github-ruleset-audit
           path: ruleset-audit/
+          retention-days: 90

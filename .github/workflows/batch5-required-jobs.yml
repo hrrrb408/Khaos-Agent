@@ -133,6 +133,7 @@ jobs:
           name: security-test-evidence-browser-kernel
           path: evidence/*.json
           if-no-files-found: error
+          retention-days: 90
 
   # ─── 4. Go race test ─────────────────────────────────────────────────
   go-race:

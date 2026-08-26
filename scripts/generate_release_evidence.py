@@ -19,6 +19,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from build_community_local_closure_bundle import build_bundle
+
 _GENERATED_NAMES = {
     "release-checksums.txt",
     "release-manifest.json",
@@ -401,6 +403,12 @@ def main() -> int:
     toolchain = _toolchain_identity(repo_root)
     sbom_path = artifact_dir / "sbom.spdx.json"
     sbom_path.write_text(json.dumps(sbom, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    if args.profile == "community-local":
+        bundle = build_bundle(gate_evidence)
+        (artifact_dir / f"community-local-closure-bundle-{args.commit}.json").write_text(
+            json.dumps(bundle, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
 
     artifacts = sorted(
         path for path in artifact_dir.iterdir() if path.is_file() and path.name not in _GENERATED_NAMES
