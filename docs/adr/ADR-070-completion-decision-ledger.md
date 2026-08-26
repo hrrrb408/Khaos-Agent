@@ -45,8 +45,13 @@ only and cannot grant authority.
 Every decision binds `task_id`, `goal_spec_id`, `goal_spec_digest`, cognitive state,
 `control_state_version`, `task_status_at_evaluation`, and optional `workspace_id`. This is a
 snapshot fence for future stale-decision handling. M7.1.4 does not invent workspace generation
-or base-SHA concepts. The repository verifies this binding against the owner-scoped current
-task row and canonical GoalSpec before append; a future gate must stale-check again after append.
+or base-SHA concepts. The task-level workspace snapshot is read from the owner-scoped
+`coding_tasks.state_json.metadata.workspace_id` projection, which is currently the only stable
+task/workspace binding persisted by the task path. The repository strictly decodes that
+projection and rejects a decision whose `workspace_id` does not match it before append; missing
+on both sides is the valid unbound case. This projection is used only for decision-input
+identity consistency, not as a Workspace authority. A future gate must stale-check the current
+task projection again after append.
 
 ### 5. Deterministic digest
 
@@ -93,7 +98,12 @@ into completion evidence.
 
 The decision contract grants no tool capability, approval, workspace access, sandbox authority,
 delegation authority, Memory visibility, or Trusted Verification status. Goal and decision
-records are evidence/context only. The invariant remains: the Agent may describe desired work,
+
+Workspace binding validation is likewise non-authoritative: it neither grants workspace access
+nor changes Sandbox, Approval, Tool, execution-lease, or Trusted Verification authority. It only
+prevents a completion snapshot from claiming a different durable task workspace. Completion
+Gate remains responsible for repeating this binding check when it later considers projecting a
+decision into task lifecycle state. The invariant remains: the Agent may describe desired work,
 but the Security Runtime decides what work is allowed.
 
 ### 9. M7.1.3 debt carried forward

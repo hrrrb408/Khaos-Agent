@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
@@ -101,11 +102,32 @@ class StoredCompletionDecision:
         return self.decision.continuation_possible
 
 
+@dataclass(frozen=True, slots=True)
+class _CompletionTaskSnapshot:
+    """Owner-scoped task facts used to bind a decision at append time.
+
+    Cognitive state, control-state version, and task status come from their
+    canonical SQL columns.  M7.1.4 has no task-level workspace column, so
+    ``workspace_id`` is decoded from the task's durable
+    ``state_json.metadata`` projection after strict shape validation.  This
+    is an identity-consistency fact only; it does not grant workspace access
+    or any execution authority.
+    """
+
+    task_id: str
+    principal_id: str
+    project_id: str
+    cognitive_state: AgentCognitiveState
+    control_state_version: int
+    task_status: str
+    workspace_id: str | None
+
+
 class CompletionDecisionRepository:
     """Append and read immutable decisions inside an authenticated owner scope.
 
     The repository is the sole sequence allocator.  ``append`` verifies the
-    current task, GoalSpec, and cognitive-state snapshot in the same
+    current task, GoalSpec, cognitive-state, and workspace snapshot in the same
     ``Database.transaction()`` that allocates and inserts the next sequence.
     There are intentionally no update, delete, or unscoped read methods.
     """
@@ -157,7 +179,7 @@ class CompletionDecisionRepository:
                     raise CompletionDecisionBindingError(
                         "task is unavailable in the supplied owner scope"
                     )
-                task_state = _decode_task_snapshot(task_row)
+                task_snapshot = _decode_task_snapshot(task_row)
 
                 goal_row = await _select_goal_spec(
                     conn,
@@ -176,7 +198,7 @@ class CompletionDecisionRepository:
 
                 _validate_binding(
                     decision,
-                    task_state=task_state,
+                    task_snapshot=task_snapshot,
                     goal_spec=goal_spec,
                     principal_id=principal_id,
                     project_id=project_id,
@@ -376,7 +398,7 @@ async def _select_task(
     cursor = await conn.execute(
         """
         SELECT id, principal_id, project_id, cognitive_state,
-               control_state_version, status
+               control_state_version, status, state_json
         FROM coding_tasks
         WHERE id = ? AND principal_id = ? AND project_id = ?
         """,
@@ -400,7 +422,7 @@ async def _select_goal_spec(conn: Any, *, task_id: str) -> Any:
 
 def _decode_task_snapshot(
     row: Any,
-) -> tuple[str, str, str, AgentCognitiveState, int, str]:
+) -> _CompletionTaskSnapshot:
     try:
         row_task_id = row["id"]
         row_principal_id = row["principal_id"]
@@ -408,6 +430,7 @@ def _decode_task_snapshot(
         row_state = AgentCognitiveState.parse(row["cognitive_state"])
         row_version = row["control_state_version"]
         row_status = row["status"]
+        state_json = row["state_json"]
     except (KeyError, TypeError, ValueError) as exc:
         raise CompletionDecisionIntegrityError(
             "coding task control-state snapshot is malformed"
@@ -426,14 +449,56 @@ def _decode_task_snapshot(
         raise CompletionDecisionIntegrityError(
             "coding task owner, version, or status is malformed"
         )
-    return (
-        row_task_id,
-        row_principal_id,
-        row_project_id,
-        row_state,
-        row_version,
-        row_status,
+    workspace_id = _decode_workspace_projection(state_json)
+    return _CompletionTaskSnapshot(
+        task_id=row_task_id,
+        principal_id=row_principal_id,
+        project_id=row_project_id,
+        cognitive_state=row_state,
+        control_state_version=row_version,
+        task_status=row_status,
+        workspace_id=workspace_id,
     )
+
+
+def _decode_workspace_projection(state_json: Any) -> str | None:
+    """Decode the task's durable workspace projection, failing closed.
+
+    Only ``metadata.workspace_id`` is read from ``state_json``.  The physical
+    SQL columns remain authoritative for every other task snapshot field.  A
+    missing metadata object means that the task has no workspace binding; an
+    explicitly malformed metadata value is never silently treated as
+    unbound.
+    """
+    if type(state_json) is not str:
+        raise CompletionDecisionIntegrityError(
+            "coding task state_json is not a JSON string"
+        )
+    try:
+        decoded = json.loads(state_json)
+    except (json.JSONDecodeError, TypeError, UnicodeDecodeError) as exc:
+        raise CompletionDecisionIntegrityError(
+            "coding task state_json is malformed"
+        ) from exc
+    if type(decoded) is not dict:
+        raise CompletionDecisionIntegrityError(
+            "coding task state_json is not an object"
+        )
+    if "metadata" not in decoded:
+        return None
+    metadata = decoded["metadata"]
+    if type(metadata) is not dict:
+        raise CompletionDecisionIntegrityError(
+            "coding task metadata projection is not an object"
+        )
+    if "workspace_id" not in metadata or metadata["workspace_id"] is None:
+        return None
+    workspace_id = metadata["workspace_id"]
+    if type(workspace_id) is not str or not workspace_id:
+        raise CompletionDecisionIntegrityError(
+            "coding task workspace_id projection is malformed"
+        )
+    return workspace_id
 
 
 def _decode_goal_spec_row(row: Any) -> GoalSpec:
@@ -482,39 +547,38 @@ def _decode_goal_spec_row(row: Any) -> GoalSpec:
 def _validate_binding(
     decision: CompletionDecision,
     *,
-    task_state: tuple[str, str, str, AgentCognitiveState, int, str],
+    task_snapshot: _CompletionTaskSnapshot,
     goal_spec: GoalSpec,
     principal_id: str,
     project_id: str,
 ) -> None:
-    (
-        task_id,
-        task_principal,
-        task_project,
-        task_state_value,
-        task_version,
-        task_status,
-    ) = task_state
     # Keep each comparison explicit: these fields are the input snapshot
     # fence for a future stale-decision gate, not a free-form caller claim.
-    if task_id != decision.task_id:
+    if task_snapshot.task_id != decision.task_id:
         raise CompletionDecisionBindingError("decision task binding mismatch")
-    if task_principal != principal_id or task_project != project_id:
+    if (
+        task_snapshot.principal_id != principal_id
+        or task_snapshot.project_id != project_id
+    ):
         raise CompletionDecisionBindingError("task owner binding mismatch")
     if decision.goal_spec_id != goal_spec.goal_spec_id:
         raise CompletionDecisionBindingError("decision GoalSpec identity mismatch")
     if decision.goal_spec_digest != goal_spec.semantic_digest:
         raise CompletionDecisionBindingError("decision GoalSpec digest mismatch")
-    if decision.cognitive_state is not task_state_value:
+    if decision.cognitive_state is not task_snapshot.cognitive_state:
         raise CompletionDecisionBindingError(
             "decision cognitive-state snapshot is stale"
         )
-    if decision.control_state_version != task_version:
+    if decision.control_state_version != task_snapshot.control_state_version:
         raise CompletionDecisionBindingError(
             "decision cognitive-state version is stale"
         )
-    if decision.task_status_at_evaluation != task_status:
+    if decision.task_status_at_evaluation != task_snapshot.task_status:
         raise CompletionDecisionBindingError("decision task-status snapshot is stale")
+    if decision.workspace_id != task_snapshot.workspace_id:
+        raise CompletionDecisionBindingError(
+            "decision workspace snapshot is stale or mismatched"
+        )
 
 
 def _decode_row(

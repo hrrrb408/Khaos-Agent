@@ -113,6 +113,12 @@ async def _create_task(
     return manager, task, task.goal_spec
 
 
+async def _bind_workspace(manager: TaskManager, task: Any, workspace_id: str) -> None:
+    """Persist the same task-level workspace projection used by AgentLoop."""
+    await manager.update_status(task.id, task.status, workspace_id=workspace_id)
+    assert task.metadata["workspace_id"] == workspace_id
+
+
 def _task_decision(
     task: Any,
     spec: GoalSpec,
@@ -123,6 +129,7 @@ def _task_decision(
     task_status: str | None = None,
     goal_spec_id: str | None = None,
     goal_spec_digest: str | None = None,
+    workspace_id: str | None = None,
     outcome: CompletionOutcome = CompletionOutcome.REPLAN,
 ) -> CompletionDecision:
     return CompletionDecision.from_parts(
@@ -143,7 +150,7 @@ def _task_decision(
         task_status_at_evaluation=(
             task.status.value if task_status is None else task_status
         ),
-        workspace_id=None,
+        workspace_id=workspace_id,
         outcome=outcome,
     )
 
@@ -305,6 +312,100 @@ async def test_append_and_owner_scoped_readback(tmp_path: Path) -> None:
             )
             == []
         )
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("task_workspace_id", "decision_workspace_id", "expected_sequence"),
+    [
+        ("workspace-1", "workspace-1", 1),
+        ("workspace-1", "workspace-2", None),
+        ("workspace-1", None, None),
+        (None, "workspace-1", None),
+        (None, None, 1),
+    ],
+    ids=[
+        "matching-workspace",
+        "different-workspace",
+        "missing-decision-workspace",
+        "unexpected-decision-workspace",
+        "both-unbound",
+    ],
+)
+async def test_append_validates_workspace_snapshot_binding(
+    tmp_path: Path,
+    task_workspace_id: str | None,
+    decision_workspace_id: str | None,
+    expected_sequence: int | None,
+) -> None:
+    db = await _make_db(tmp_path / "workspace-binding.db")
+    try:
+        manager, task, spec = await _create_task(db)
+        if task_workspace_id is not None:
+            await _bind_workspace(manager, task, task_workspace_id)
+        decision = _task_decision(
+            task,
+            spec,
+            decision_id=f"workspace-{task_workspace_id}-{decision_workspace_id}",
+            workspace_id=decision_workspace_id,
+        )
+        if expected_sequence is None:
+            with pytest.raises(CompletionDecisionBindingError, match="workspace"):
+                await db.completion_decision_repository.append(
+                    decision,
+                    principal_id="alice",
+                    project_id="project-a",
+                )
+        else:
+            stored = await db.completion_decision_repository.append(
+                decision,
+                principal_id="alice",
+                project_id="project-a",
+            )
+            assert stored.decision.workspace_id == task_workspace_id
+            assert stored.decision_sequence == expected_sequence
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "malformed_state_json",
+    [
+        "{not-json",
+        "[]",
+        json.dumps({"metadata": []}),
+        json.dumps({"metadata": {"workspace_id": ""}}),
+        json.dumps({"metadata": {"workspace_id": 42}}),
+    ],
+    ids=[
+        "invalid-json",
+        "non-object-root",
+        "non-object-metadata",
+        "empty-workspace-id",
+        "non-string-workspace-id",
+    ],
+)
+async def test_malformed_durable_workspace_projection_fails_closed(
+    tmp_path: Path,
+    malformed_state_json: str,
+) -> None:
+    db = await _make_db(tmp_path / "malformed-workspace.db")
+    try:
+        _, task, spec = await _create_task(db)
+        async with db.transaction() as conn:
+            await conn.execute(
+                "UPDATE coding_tasks SET state_json = ? WHERE id = ?",
+                (malformed_state_json, task.id),
+            )
+        with pytest.raises(CompletionDecisionIntegrityError, match="workspace|state_json|metadata"):
+            await db.completion_decision_repository.append(
+                _task_decision(task, spec, decision_id="malformed-workspace"),
+                principal_id="alice",
+                project_id="project-a",
+            )
     finally:
         await db.close()
 
@@ -657,8 +758,12 @@ async def test_restart_preserves_decision_and_existing_blocked_semantics(
     task = await manager.get(task.id)
     assert task is not None
     await manager.initialize_cognitive_state(task.id)
-    await manager.update_status(task.id, TaskStatus.RUNNING)
-    decision = _task_decision(task, spec)
+    await manager.update_status(
+        task.id,
+        TaskStatus.RUNNING,
+        workspace_id="workspace-restart",
+    )
+    decision = _task_decision(task, spec, workspace_id="workspace-restart")
     await db.completion_decision_repository.append(
         decision,
         principal_id="alice",
@@ -679,6 +784,7 @@ async def test_restart_preserves_decision_and_existing_blocked_semantics(
         assert restored.status is TaskStatus.BLOCKED
         assert restored.cognitive_state is AgentCognitiveState.UNDERSTANDING
         assert restored.control_state_version == 1
+        assert restored.metadata["workspace_id"] == "workspace-restart"
         stored = await reopened.completion_decision_repository.get_latest_for_task(
             task.id,
             principal_id="alice",
