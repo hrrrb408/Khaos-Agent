@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 
 from khaos.agent.turn_repository import DatabaseTurnRepository, TurnRepository
 from khaos.exceptions import CompressionCircuitOpenError
+from khaos.runtime_profile import RuntimeProfile, resolve_runtime_profile
 from khaos.security.orchestration_components import TurnAdmission, TurnFinalizer
 from khaos.security.orchestration_phases import (
     OrchestrationPhaseError,
@@ -153,11 +154,13 @@ class AgentLoop:
         # the value the RPC dispatcher compares against ``ctx.project_id``
         # for drift detection (fail-closed rejection).
         project_id: str = "",
+        runtime_profile: RuntimeProfile | str | None = None,
     ):
         self.config = config
         self.mode_manager = mode_manager
         self.router = router
         self.db = db
+        self.runtime_profile = resolve_runtime_profile(runtime_profile)
         # The agent loop still uses ``db`` for message/session persistence,
         # while durable turn events travel through one explicit port.  The
         # default keeps legacy construction sites source-compatible; runtime
@@ -253,7 +256,9 @@ class AgentLoop:
             # still construct a loop without an execution service, but any
             # accidental coding/tool execution is denied instead of escaping
             # to an unrestricted host subprocess.
-            self.execution_service = ExecutionService(UnsupportedBackend())
+            self.execution_service = ExecutionService(
+                UnsupportedBackend(), runtime_profile=self.runtime_profile
+            )
 
     @staticmethod
     def _turn_context_digest(messages: list[Message]) -> str:
@@ -673,7 +678,7 @@ class AgentLoop:
                         "sandbox_backend": execution_backend_identity,
                         "workspace_manager": self.workspace_manager,
                         "coding_workspace_enforced": self.active_workspace is not None,
-                        "production_runtime": os.environ.get("KHAOS_DEV_MODE") != "1",
+                        "production_runtime": self.runtime_profile.is_production,
                         "approval_broker": self.approval_broker,
                         "credential_broker": self.credential_broker,
                         "requester": session_id,

@@ -47,6 +47,7 @@ from urllib.parse import urlparse
 
 from khaos.security.browser_egress_proxy import BrowserEgressProxy
 from khaos.security.browser_sandbox import BrowserNetworkSandbox, BrowserSandboxError
+from khaos.runtime_profile import RuntimeProfile, resolve_runtime_profile
 
 logger = logging.getLogger(__name__)
 
@@ -126,7 +127,8 @@ class BrowserManager:
     # resources by creating unbounded (session, runtime) tuples.
     MAX_CONTEXTS_PER_GENERATION = 32
 
-    def __init__(self):
+    def __init__(self, runtime_profile: RuntimeProfile | str | None = None):
+        self.runtime_profile = resolve_runtime_profile(runtime_profile)
         self._playwright = None
         self._browser: Browser | None = None
         self._headless: bool = True
@@ -380,7 +382,7 @@ class BrowserManager:
             # C-04 (round-5): production defaults to fail-closed.
             # Only the explicit process-wide KHAOS_DEV_MODE=1 allows
             # proxy-only fallback.
-            _dev_mode = os.environ.get("KHAOS_DEV_MODE", "") == "1"
+            _dev_mode = not self.runtime_profile.is_production
             # F-05: set up the OS-level netns sandbox before launching
             # Chromium.  On Linux with CAP_NET_ADMIN, this creates a
             # dedicated network namespace with no default route so even
@@ -409,6 +411,7 @@ class BrowserManager:
                     runtime_id=runtime_id,
                     principal_id=principal_id,
                     task_id=task_id or f"runtime:{runtime_id}",
+                    runtime_profile=self.runtime_profile,
                 )
                 # Round-5 Batch 5.4: setup() invokes subprocess.run
                 # (ip netns add, ip link add, nft -f -, cgroup mkdir)
@@ -1582,12 +1585,13 @@ class BrowserManager:
 
 def _require_browser_manager(
     browser_manager: BrowserManager | None,
+    runtime_profile: RuntimeProfile | str | None = None,
 ) -> BrowserManager | None:
     """Return the injected runtime authority; production never invents one."""
     if browser_manager is not None:
         return browser_manager
-    if os.environ.get("KHAOS_DEV_MODE") == "1":
-        return BrowserManager()
+    if not resolve_runtime_profile(runtime_profile).is_production:
+        return BrowserManager(runtime_profile=runtime_profile)
     return None
 
 

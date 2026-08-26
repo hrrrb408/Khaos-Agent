@@ -171,6 +171,7 @@ def render() -> str:
         ("python/khaos/tools/result_codec.py", sha256(ROOT / "python" / "khaos" / "tools" / "result_codec.py")),
         ("python/khaos/tools/result_finalizer.py", sha256(ROOT / "python" / "khaos" / "tools" / "result_finalizer.py")),
         ("python/khaos/rpc/protocol.py", sha256(ROOT / "python" / "khaos" / "rpc" / "protocol.py")),
+        ("python/khaos/runtime_profile.py", sha256(ROOT / "python" / "khaos" / "runtime_profile.py")),
         ("python/khaos/rpc/models.py", sha256(ROOT / "python" / "khaos" / "rpc" / "models.py")),
         ("python/khaos/rpc/agent_service.py", sha256(ROOT / "python" / "khaos" / "rpc" / "agent_service.py")),
         ("python/khaos/rpc/task_service.py", sha256(ROOT / "python" / "khaos" / "rpc" / "task_service.py")),

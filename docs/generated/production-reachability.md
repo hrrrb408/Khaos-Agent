@@ -17,8 +17,8 @@
 
 ## Import reachability result
 
-- Reachable repository modules: `246`.
-- Resolved import edges: `1681`.
+- Reachable repository modules: `247`.
+- Resolved import edges: `1723`.
 - Forbidden production edges: `0`.
 - Unresolved internal edges: `0`.
 
@@ -203,6 +203,7 @@
 - `khaos.runtime.context`
 - `khaos.runtime.factory`
 - `khaos.runtime.lifecycle`
+- `khaos.runtime_profile`
 - `khaos.rust_bridge`
 - `khaos.scheduler`
 - `khaos.scheduler.calculator`

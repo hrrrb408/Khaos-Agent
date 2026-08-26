@@ -48,6 +48,7 @@ from khaos.rpc.models import ChatRequest as _ChatRequest
 from khaos.rpc.models import ConfirmRequest as _ConfirmRequest
 from khaos.rpc.task_service import TaskService as _TaskService
 from khaos.runtime import RequestContext
+from khaos.runtime_profile import RuntimeProfile, resolve_runtime_profile
 from khaos.subagents import SubAgentService
 from khaos.tools import create_runtime_registry
 
@@ -637,6 +638,7 @@ async def serve_json_lines(
     gateway_uid: int | None = None,
     gateway_pid: int | None = None,
     gateway_gid: int | None = None,
+    runtime_profile: RuntimeProfile | str | None = None,
 ) -> None:
     """Serve the privileged JSON-line control plane over a protected UDS.
 
@@ -667,6 +669,7 @@ async def serve_json_lines(
     state root path before calling this function.
     """
     uds_path = Path(socket_path).expanduser().resolve()
+    resolved_runtime_profile = resolve_runtime_profile(runtime_profile)
     capability = gateway_capability or _load_rpc_capability()
     if gateway_gid is not None and gateway_gid < 0:
         raise ValueError("gateway GID must be non-negative")
@@ -678,7 +681,8 @@ async def serve_json_lines(
         capability,
         expected_uid=gateway_uid,
         expected_pid=gateway_pid,
-        require_protocol_metadata=os.environ.get("KHAOS_DEV_MODE") != "1",
+        runtime_profile=resolved_runtime_profile,
+        require_protocol_metadata=resolved_runtime_profile.is_production,
     )
     uds_path.parent.mkdir(mode=parent_mode, parents=True, exist_ok=True)
     parent_stat = uds_path.parent.stat()
@@ -757,6 +761,7 @@ async def serve_json_lines(
         agent = _AgentService(
             db, project_root=project_root, config_path=config_path, router=router,
             boot_id=boot_id,
+            runtime_profile=resolved_runtime_profile,
         )
         await agent.start()
         # Round-4 review Batch 4 (§11.2 + §13.1): start the periodic
@@ -821,6 +826,7 @@ async def serve_json_lines(
                 audit_logger=agent._audit_logger,
                 cleanup_authority=agent.runtime_cleanup_authority,
                 memory_host=agent.memory_host,
+                runtime_profile=resolved_runtime_profile,
             )
             agent.subagent_spawner = subagent_service.spawner
 
@@ -871,7 +877,7 @@ async def serve_json_lines(
                     return
                 method = request.get("method")
                 payload = request.get("payload", {})
-                require_initialize = os.environ.get("KHAOS_DEV_MODE") != "1"
+                require_initialize = resolved_runtime_profile.is_production
                 if (
                     require_initialize
                     and method != _rpc_protocol.RPC_INITIALIZE_METHOD
@@ -976,7 +982,7 @@ async def serve_json_lines(
                         payload,
                         bound_project_id=agent._bound_project_id,
                         bound_policy_digest=agent._effective_policy.digest,
-                        require_claims=os.environ.get("KHAOS_DEV_MODE") != "1",
+                        require_claims=resolved_runtime_profile.is_production,
                     )
                     if claim_error is not None:
                         error_code, error_message = claim_error
@@ -1000,7 +1006,7 @@ async def serve_json_lines(
                     payload,
                     bound_project_id=agent._bound_project_id,
                     bound_policy_digest=agent._effective_policy.digest,
-                    require_claims=os.environ.get("KHAOS_DEV_MODE") != "1",
+                    require_claims=resolved_runtime_profile.is_production,
                 )
                 if claim_error is not None:
                     error_code, error_message = claim_error
@@ -1436,6 +1442,7 @@ def _parse_json_line(line: bytes) -> dict:
 
 def main() -> None:
     from khaos.db.state_root import open_state_db_safely, resolve_state_db_path
+    from khaos.runtime_profile import RuntimeProfile
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--socket", default="/tmp/khaos-agent.sock")
@@ -1457,6 +1464,7 @@ def main() -> None:
             project_root=Path.cwd(),
             config_path=Path(args.config),
             enable_subagents=args.subagents,
+            runtime_profile=RuntimeProfile.PRODUCTION,
         )
     )
 

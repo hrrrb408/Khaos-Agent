@@ -124,6 +124,20 @@ production_reachability:
   unresolved_internal_imports: fail_closed
   generated_artifact: docs/generated/production-reachability.md
   evidence_class: machine_checked_repository_graph_not_native_kernel_evidence
+runtime_profile:
+  type: python/khaos/runtime_profile.py:RuntimeProfile
+  values:
+    - production
+    - development
+    - testing
+  production_builder: build_production_runtime_fixes_production_profile
+  legacy_environment: KHAOS_DEV_MODE_is_only_a_compatibility_resolver_input
+  ambient_security_authority: forbidden_outside_legacy_profile_resolver
+  production_entrypoints:
+    - python/khaos/cli/main.py
+    - python/khaos/grpc_server.py
+    - python/khaos/rpc/agent_service.py
+    - scripts/verify_production_composition.py
 tcb_boundaries:
   pure_module: python/khaos/security/protocol_boundary.py
   owns:
@@ -250,6 +264,7 @@ governance:
     - docs/security-release-governance.md
     - pyright-security.json
     - python/tests/
+    - python/khaos/runtime_profile.py
     - rust/khaos-core/audit.toml
     - scripts/audit-github-ruleset.sh
     - scripts/build_local_security_closure_report.py

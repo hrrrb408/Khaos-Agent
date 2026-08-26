@@ -430,10 +430,7 @@ def _verify_live_production_authority_identity(
     production_identity: dict[str, object],
 ) -> None:
     """Bind production proof creation to the live Compose authority endpoint."""
-    if (
-        os.environ.get("KHAOS_DEV_MODE") != "0"
-        or os.environ.get("KHAOS_AUTHORITY_PROFILE") != "native-production"
-    ):
+    if os.environ.get("KHAOS_AUTHORITY_PROFILE") != "native-production":
         raise LocalEvidenceError(
             "production proof creation requires the native-production environment"
         )

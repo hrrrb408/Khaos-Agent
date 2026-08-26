@@ -32,6 +32,12 @@ import hmac
 import os
 from dataclasses import dataclass
 
+from khaos.runtime_profile import (
+    RuntimeProfile,
+    resolve_legacy_runtime_profile,
+    resolve_runtime_profile,
+)
+
 
 @dataclass(frozen=True)
 class RuntimeAuthoritySeal:
@@ -121,12 +127,11 @@ def _compute_mac(
     return hmac.new(_MAC_KEY, payload, hashlib.sha256).hexdigest()
 
 
-def is_production_mode() -> bool:
-    """Return True when the runtime must enforce the sealed-injection gate.
+def is_production_mode(profile: RuntimeProfile | str | None = None) -> bool:
+    """Return whether a runtime must enforce the sealed-injection gate.
 
-    Production packaging (systemd unit, Compose) explicitly sets
-    ``KHAOS_DEV_MODE=0``; the test suite and ad-hoc dev runs set it to ``1``.
-    Only in production mode does ``build_runtime`` refuse injected
-    security-critical components — the dev/test path injects mocks freely.
+    ``profile`` is the authoritative input for new callers.  With no profile,
+    preserve the legacy ``KHAOS_DEV_MODE`` compatibility behavior for direct
+    tests and older adapters.
     """
-    return os.environ.get("KHAOS_DEV_MODE") != "1"
+    return resolve_runtime_profile(profile).is_production

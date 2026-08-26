@@ -76,6 +76,17 @@ main push or create live provenance. Final Community Local certification still
 comes from `community-local-closure.yml` after an exact `main` push, original
 attempt, producer artifacts, and live GitHub verification.
 
+## Runtime profile authority
+
+Runtime security semantics are selected by the immutable typed
+khaos.runtime_profile.RuntimeProfile. build_production_runtime() and the
+production CLI/RPC entrypoints fix PRODUCTION explicitly; KHAOS_DEV_MODE
+is retained only as a legacy resolver for untyped direct/test adapters. It
+cannot disable injection checks, host-fallback rejection, native authority,
+local-trust validation, browser/sandbox enforcement, or RPC negotiation.
+scripts/generate_production_reachability.py fails if a production-reachable
+module reads KHAOS_DEV_MODE outside the compatibility resolver.
+
 ## Evidence boundary
 
 Local Python/Go/Rust tests prove source-level contracts only. Linux namespace,

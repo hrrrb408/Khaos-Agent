@@ -9,6 +9,7 @@ from khaos.runtime.factory import (
     build_runtime,
     close_runtime_or_register,
 )
+from khaos.runtime_profile import RuntimeProfile
 
 __all__ = [
     "ProductionRuntimeConfig",
@@ -16,6 +17,7 @@ __all__ = [
     "RuntimeCleanupAuthority",
     "RuntimeConfig",
     "RuntimeResult",
+    "RuntimeProfile",
     "build_memory_host",
     "build_production_runtime",
     "build_runtime",

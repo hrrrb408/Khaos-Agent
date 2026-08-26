@@ -75,6 +75,7 @@ from khaos.security.authority_broker import (
     AuthorityBrokerError,
     EffectCapability,
 )
+from khaos.runtime_profile import RuntimeProfile, resolve_runtime_profile
 from khaos.security.resource_scope import (
     GIT_SCOPE_OPERATIONS,
     GitRefScope,
@@ -257,6 +258,7 @@ class WorkspaceManager:
         policy_digest: str = "legacy-unbound",
         authorization_epoch: int = 1,
         resource_order: TypedResourcePartialOrder | None = None,
+        runtime_profile: RuntimeProfile | str | None = None,
     ) -> None:
         if root is None:
             try:
@@ -278,7 +280,10 @@ class WorkspaceManager:
         self.root, self._root_identity = _open_private_authority_root(
             configured_root
         )
-        self._authority_broker = AuthorityBroker.default()
+        self.runtime_profile = resolve_runtime_profile(runtime_profile)
+        self._authority_broker = AuthorityBroker.default(
+            runtime_profile=self.runtime_profile
+        )
         try:
             self._git_runner = TrustedGitRunner.for_authority_root(
                 self.root,

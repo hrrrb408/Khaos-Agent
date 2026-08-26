@@ -91,6 +91,7 @@ from pathlib import Path
 from typing import Self
 
 from khaos.coding.execution.environment import scrub_spawn_environment
+from khaos.runtime_profile import RuntimeProfile, resolve_runtime_profile
 from khaos.security.kernel_helper_client import (
     KernelAuthorityClient,
     KernelIsolationEvidence,
@@ -649,6 +650,7 @@ class BrowserNetworkSandbox:
         task_id: str = "",
         sandbox_token: str | None = None,
         kernel_authority: KernelAuthorityClient | None = None,
+        runtime_profile: RuntimeProfile | str | None = None,
     ) -> None:
         self._config = config or BrowserSandboxConfig()
         self._require_os_sandbox = require_os_sandbox
@@ -659,8 +661,9 @@ class BrowserNetworkSandbox:
         self._principal_id = principal_id
         self._task_id = task_id
         self._kernel_authority = kernel_authority
+        self.runtime_profile = resolve_runtime_profile(runtime_profile)
         self._production_authority = (
-            require_os_sandbox and os.environ.get("KHAOS_DEV_MODE") != "1"
+            require_os_sandbox and self.runtime_profile.is_production
         )
         if self._production_authority and self._kernel_authority is None:
             if not project_id or not runtime_id or not principal_id or not task_id:

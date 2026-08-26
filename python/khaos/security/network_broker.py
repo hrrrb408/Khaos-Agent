@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, TypedDict
 from urllib.parse import quote, urlsplit, urlunsplit
 
+from khaos.runtime_profile import RuntimeProfile, resolve_runtime_profile
 from khaos.security.authority import AuthorityEnvelope
 from khaos.security.authority_broker import (
     AuthorityBroker,
@@ -365,6 +366,7 @@ class NetworkBroker:
         audit: Callable[[dict[str, object]], None] | None = None,
         linux_namespace: bool = False,
         resource_digest: str | None = None,
+        runtime_profile: RuntimeProfile | str | None = None,
     ) -> None:
         if not isinstance(capability, EffectCapability):
             raise NetworkBrokerError("network broker requires a broker-issued capability")
@@ -388,7 +390,10 @@ class NetworkBroker:
         )
         normalized_blocked = frozenset(_normalize_domain(domain) for domain in blocked_domains)
         self._capability = capability
-        self._authority_broker = authority_broker or AuthorityBroker.default()
+        self.runtime_profile = resolve_runtime_profile(runtime_profile)
+        self._authority_broker = authority_broker or AuthorityBroker.default(
+            runtime_profile=self.runtime_profile
+        )
         self._allowed_domains = normalized_allowed
         self._blocked_domains = normalized_blocked
         self._allowed_ports = frozenset(allowed_ports)
@@ -1077,8 +1082,12 @@ class NetworkBrokerFactory:
         linux_namespace: bool | None = None,
         audit: Callable[[dict[str, object]], None] | None = None,
         resource_order: TypedResourcePartialOrder | None = None,
+        runtime_profile: RuntimeProfile | str | None = None,
     ) -> None:
-        self.authority_broker = authority_broker or AuthorityBroker.default()
+        self.runtime_profile = resolve_runtime_profile(runtime_profile)
+        self.authority_broker = authority_broker or AuthorityBroker.default(
+            runtime_profile=self.runtime_profile
+        )
         self.resource_order = resource_order
         self.linux_namespace = (
             sys.platform.startswith("linux")
@@ -1136,6 +1145,7 @@ class NetworkBrokerFactory:
             audit=self.audit,
             linux_namespace=self.linux_namespace,
             resource_digest=policy_resource,
+            runtime_profile=self.runtime_profile,
         )
         try:
             lease = await broker.start()

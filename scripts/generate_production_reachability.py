@@ -43,6 +43,7 @@ FORBIDDEN_SYMBOLS = {
     ("khaos.security.mock_authority", "MockAuthority"),
     ("khaos.coding.execution.testing_sandbox", "TestingSandbox"),
 }
+LEGACY_RUNTIME_PROFILE_MODULE = "khaos.runtime_profile"
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,6 +218,37 @@ def forbidden_edges(modules: set[str], edges: tuple[Edge, ...]) -> tuple[str, ..
             findings.add(
                 f"{edge.source}:{edge.line} -> {edge.target}.{edge.symbol}"
             )
+    # The environment switch is retained only in the isolated compatibility
+    # resolver.  Any production-reachable security module that reads it is a
+    # real ambient-authority edge, even if the import graph otherwise looks
+    # safe.
+    for module in sorted(modules):
+        if module == LEGACY_RUNTIME_PROFILE_MODULE:
+            continue
+        info = load_module(module)
+        if info is None:
+            continue
+        for node in ast.walk(info.tree):
+            if not isinstance(node, ast.Call) or not node.args:
+                continue
+            function = node.func
+            if not (
+                isinstance(function, ast.Attribute)
+                and function.attr == "get"
+                and isinstance(function.value, ast.Attribute)
+                and function.value.attr == "environ"
+                and isinstance(function.value.value, ast.Name)
+                and function.value.value.id == "os"
+            ):
+                continue
+            first_argument = node.args[0]
+            if (
+                isinstance(first_argument, ast.Constant)
+                and first_argument.value == "KHAOS_DEV_MODE"
+            ):
+                findings.add(
+                    f"{module}:{node.lineno}: ambient KHAOS_DEV_MODE read"
+                )
     return tuple(sorted(findings))
 
 

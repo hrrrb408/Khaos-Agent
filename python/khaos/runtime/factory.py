@@ -55,7 +55,8 @@ from khaos.memory.transfer import MemoryTransferService
 from khaos.modes import ModeManager
 from khaos.permissions import PermissionEngine
 from khaos.routing.router import create_default_router
-from khaos.runtime.authority import RuntimeAuthoritySeal, is_production_mode
+from khaos.runtime.authority import RuntimeAuthoritySeal
+from khaos.runtime_profile import RuntimeProfile, resolve_runtime_profile
 from khaos.runtime.lifecycle import CloseState
 from khaos.rust_bridge import get_token_engine
 from khaos.security.credential_broker import CredentialBroker
@@ -142,6 +143,9 @@ class RuntimeCleanupAuthority:
 @dataclass
 class RuntimeConfig:
     project_root: Path = field(default_factory=Path.cwd)
+    # ``None`` preserves the legacy adapter boundary; production entrypoints
+    # use ``ProductionRuntimeConfig`` whose profile is fixed and immutable.
+    profile: RuntimeProfile | None = None
     config_path: Path | None = None
     mode_override: str | None = None
     confirm_callback: Any = None
@@ -247,6 +251,11 @@ class ProductionRuntimeConfig:
     """
 
     project_root: Path = field(default_factory=Path.cwd)
+    profile: RuntimeProfile = field(
+        default=RuntimeProfile.PRODUCTION,
+        init=False,
+        repr=False,
+    )
     config_path: Path | None = None
     mode_override: str | None = None
     confirm_callback: Any = None
@@ -290,6 +299,7 @@ class ProductionRuntimeConfig:
         """Materialize the internal config after the structural boundary."""
         return RuntimeConfig(
             project_root=self.project_root,
+            profile=self.profile,
             config_path=self.config_path,
             mode_override=self.mode_override,
             confirm_callback=self.confirm_callback,
@@ -341,6 +351,7 @@ class RuntimeResult:
     memory_manager: MemoryManager
     skill_manager: SkillManager
     new_verify_fix_loop: Callable[[], VerifyFixLoop] | None
+    profile: RuntimeProfile = RuntimeProfile.TESTING
     execution_service: ExecutionService | None = None
     browser_manager: Any = None
     cleanup_authority: RuntimeCleanupAuthority = field(
@@ -1002,9 +1013,10 @@ def _enforce_borrowed_authority_match(
 
 def _load_production_resource_order(
     effective_policy: EffectiveSecurityPolicy,
+    runtime_profile: RuntimeProfile,
 ) -> TypedResourcePartialOrder | None:
     """Load the host-reviewed typed catalog used by production authorities."""
-    if not is_production_mode():
+    if not runtime_profile.is_production:
         return None
     catalog_path = os.environ.get("KHAOS_TYPED_RESOURCE_CATALOG_PATH")
     if not catalog_path:
@@ -1018,7 +1030,9 @@ def _load_production_resource_order(
         validate_trusted_local_path,
     )
 
-    deployment = AuthorityTransportConfig.from_environment()
+    deployment = AuthorityTransportConfig.from_environment(
+        runtime_profile=runtime_profile
+    )
     if deployment.is_community:
         try:
             validate_trusted_local_path(
@@ -1162,6 +1176,11 @@ async def build_runtime(
 ) -> RuntimeResult:
     """Build and initialize a complete runtime; this is the sole loop factory."""
     structural_production_config = isinstance(cfg, ProductionRuntimeConfig)
+    runtime_profile = (
+        RuntimeProfile.PRODUCTION
+        if structural_production_config
+        else resolve_runtime_profile(cfg.profile)
+    )
     if isinstance(cfg, ProductionRuntimeConfig):
         cfg = cfg.as_runtime_config()
     if cfg.db is None:
@@ -1189,7 +1208,7 @@ async def build_runtime(
             principal_from_kind(cfg.principal_id, cfg.principal_kind)
         elif cfg.source_transport != "unknown":
             principal_for_transport(cfg.principal_id, cfg.source_transport)
-        elif is_production_mode() and structural_production_config:
+        elif runtime_profile.is_production and structural_production_config:
             raise PrincipalDelegationError(
                 "production runtime requires a typed principal transport"
             )
@@ -1202,7 +1221,7 @@ async def build_runtime(
     # initializing a runtime (e.g. loading the mode manager) only to reject
     # it.  The borrowed AuditLogger digest match runs later, after the
     # effective policy is loaded.
-    if is_production_mode():
+    if runtime_profile.is_production:
         _enforce_no_testing_composition(cfg)
         _enforce_no_security_injection(cfg)
     root = cfg.project_root.expanduser().resolve()
@@ -1225,7 +1244,7 @@ async def build_runtime(
             # Production-safe behaviour is the default.  Mock routing is a
             # test/development fixture only, never an implicit result of a
             # missing KHAOS_ENV deployment variable.
-            if os.environ.get("KHAOS_DEV_MODE") != "1":
+            if runtime_profile.is_production:
                 logger.error("runtime config router unavailable; refusing mock fallback")
                 raise
             logger.warning("development runtime config router unavailable; using mock", exc_info=True)
@@ -1237,7 +1256,9 @@ async def build_runtime(
     from khaos.security.effective_policy import load_effective_policy
     effective_policy = load_effective_policy(root)
     logger.info("effective security policy digest: %s", effective_policy.digest)
-    typed_resource_order = _load_production_resource_order(effective_policy)
+    typed_resource_order = _load_production_resource_order(
+        effective_policy, runtime_profile
+    )
     # A2-3: bind the PermissionEngine to (principal_id, project_id,
     # policy_digest, runtime_id).  Rules loaded, granted, or revoked
     # through this engine are scoped to that triple — a different
@@ -1257,7 +1278,7 @@ async def build_runtime(
     # In production mode the factory refuses to install an injected
     # security-critical component below, closing the "second authority"
     # backdoor.  Dev/test mode (KHAOS_DEV_MODE=1) still injects mocks freely.
-    production_mode = is_production_mode()
+    production_mode = runtime_profile.is_production
     authority_seal = RuntimeAuthoritySeal.mint(
         principal_id=cfg.principal_id,
         project_id=project_id,
@@ -1306,7 +1327,7 @@ async def build_runtime(
             log_path=resolve_safe_audit_log_path(effective_policy.audit_log_path),
             anchor_path=(
                 resolve_safe_audit_anchor_path(project_id)
-                if os.environ.get("KHAOS_DEV_MODE") != "1"
+                if runtime_profile.is_production
                 else None
             ),
             principal_id=cfg.principal_id,
@@ -1476,6 +1497,7 @@ async def build_runtime(
         policy_digest=effective_policy.digest,
         authorization_epoch=await permission_engine.authorization_snapshot(),
         resource_order=typed_resource_order,
+        runtime_profile=runtime_profile,
     )
     injected_workspace_policy = getattr(workspace_manager, "policy_digest", None)
     if (
@@ -1490,10 +1512,11 @@ async def build_runtime(
         )
     execution_service = cfg.execution_service or ExecutionService(
         workspace_manager=workspace_manager,
-        backend_selector=BackendSelector(),
+        backend_selector=BackendSelector(runtime_profile=runtime_profile),
         principal_id=cfg.principal_id,
         project_id=project_id,
         runtime_id=cfg.runtime_id,
+        runtime_profile=runtime_profile,
     )
     execution_service.bind_runtime_authority(
         principal_id=cfg.principal_id,
@@ -1586,6 +1609,7 @@ async def build_runtime(
             runtime_id=cfg.runtime_id,
             network_broker_factory=NetworkBrokerFactory(
                 resource_order=typed_resource_order,
+                runtime_profile=runtime_profile,
             ),
             credential_broker=credential_broker,
         )
@@ -1609,7 +1633,7 @@ async def build_runtime(
     if cfg.browser_manager is None:
         from khaos.tools.browser_tools import BrowserManager
 
-        browser_manager = BrowserManager()
+        browser_manager = BrowserManager(runtime_profile=runtime_profile)
     else:
         browser_manager = cfg.browser_manager
     # B1: register the authority on the scheduler only (instance attribute).
@@ -1682,6 +1706,7 @@ async def build_runtime(
         # against ``ctx.project_id`` for drift detection (fail-closed
         # rejection).
         project_id=project_id,
+        runtime_profile=runtime_profile,
     )
     from khaos.security.production_composition_manifest import (
         build_construction_manifest,
@@ -1714,6 +1739,7 @@ async def build_runtime(
         memory_manager=memory_manager,
         skill_manager=skill_manager,
         new_verify_fix_loop=verify_factory,
+        profile=runtime_profile,
         execution_service=execution_service,
         office_authority=office_authority,
         owns_office_authority=owns_office_authority,

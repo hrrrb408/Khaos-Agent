@@ -18,6 +18,7 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from khaos.runtime_profile import RuntimeProfile, resolve_runtime_profile
 from khaos.security.local_trust import (
     LocalTrustRootError,
     local_authority_root,
@@ -72,6 +73,7 @@ class AuthorityTransportConfig:
     transport: AuthorityTransport
     platform_name: str
     os_name: str
+    runtime_profile: RuntimeProfile = RuntimeProfile.PRODUCTION
 
     @classmethod
     def from_environment(
@@ -79,6 +81,7 @@ class AuthorityTransportConfig:
         *,
         platform_name: str | None = None,
         os_name: str | None = None,
+        runtime_profile: RuntimeProfile | str | None = None,
     ) -> AuthorityTransportConfig:
         """Resolve the explicit profile without probing or inventing secrets.
 
@@ -90,6 +93,7 @@ class AuthorityTransportConfig:
         """
 
         current_platform = sys.platform if platform_name is None else platform_name
+        resolved_runtime_profile = resolve_runtime_profile(runtime_profile)
         current_os = (
             ("nt" if _is_windows_platform(current_platform) else "posix")
             if os_name is None
@@ -143,6 +147,7 @@ class AuthorityTransportConfig:
             transport=transport,
             platform_name=current_platform,
             os_name=current_os,
+            runtime_profile=resolved_runtime_profile,
         )
 
     @property
@@ -181,7 +186,7 @@ class AuthorityTransportConfig:
             raise AuthorityTransportError(
                 "KHAOS_AUTHORITYD_SOCKET must be an absolute path"
             )
-        if self.is_community and os.environ.get("KHAOS_DEV_MODE") != "1":
+        if self.is_community and self.runtime_profile.is_production:
             try:
                 path = validate_trusted_local_path(
                     path,
@@ -206,7 +211,7 @@ class AuthorityTransportConfig:
             raise AuthorityTransportError(
                 "KHAOS_AUTHORITYD_PUBLIC_KEY_PATH must be an absolute path"
             )
-        if self.is_community and os.environ.get("KHAOS_DEV_MODE") != "1":
+        if self.is_community and self.runtime_profile.is_production:
             try:
                 path = validate_trusted_local_path(
                     path,
@@ -253,6 +258,7 @@ class AuthorityTransportConfig:
                 expected_authority_uid=self.expected_authority_uid(contract),
                 native_adapter=adapter,
                 transport=self.transport.value,
+                runtime_profile=self.runtime_profile,
             )
 
         socket_path = self.socket_path()
@@ -262,10 +268,11 @@ class AuthorityTransportConfig:
             public_key_path=self.public_key_path(),
             trusted_local_root=(
                 local_authority_root()
-                if self.is_community and os.environ.get("KHAOS_DEV_MODE") != "1"
+                if self.is_community and self.runtime_profile.is_production
                 else None
             ),
             transport=self.transport.value,
+            runtime_profile=self.runtime_profile,
         )
 
 

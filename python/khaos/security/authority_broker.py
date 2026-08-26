@@ -40,6 +40,7 @@ from khaos.security.identity_isolation import (
     read_contract_from_environment,
     require_distinct_linux_identities,
 )
+from khaos.runtime_profile import RuntimeProfile, resolve_runtime_profile
 
 _BROKER_PROTOCOL = 1
 _DEFAULT_TTL_SECONDS = 300.0
@@ -595,6 +596,7 @@ class AuthorityBroker:
     """Synchronous client for the dedicated effect-capability broker."""
 
     _default: AuthorityBroker | None = None
+    _default_profile: RuntimeProfile | None = None
     _default_lock = threading.Lock()
 
     def __init__(self) -> None:
@@ -609,7 +611,9 @@ class AuthorityBroker:
         self._closed = False
 
     @classmethod
-    def default(cls) -> AuthorityBroker:
+    def default(
+        cls, *, runtime_profile: RuntimeProfile | str | None = None
+    ) -> AuthorityBroker:
         """Return the process-wide control-plane broker.
 
         Production is fail-closed: the default broker is always a client of
@@ -619,13 +623,23 @@ class AuthorityBroker:
         (``KHAOS_DEV_MODE=1``) or when a caller constructs ``AuthorityBroker()``
         directly for unit tests.
         """
+        profile = resolve_runtime_profile(runtime_profile)
         with cls._default_lock:
+            if (
+                cls._default is not None
+                and cls._default_profile is not None
+                and cls._default_profile is not profile
+            ):
+                cls._default.close()
+                cls._default = None
             if cls._default is None or cls._default.closed:
-                if os.environ.get("KHAOS_DEV_MODE") == "1":
+                if not profile.is_production:
                     cls._default = cls()
                 else:
                     try:
-                        deployment = AuthorityTransportConfig.from_environment()
+                        deployment = AuthorityTransportConfig.from_environment(
+                            runtime_profile=profile
+                        )
                         contract = read_contract_from_environment()
                         deployment.validate_contract(contract)
                         if (
@@ -653,6 +667,7 @@ class AuthorityBroker:
                     cls._default = AuthorityDaemonBroker(
                         client
                     )
+                cls._default_profile = profile
                 atexit.register(cls._close_default)
             return cls._default
 
@@ -661,6 +676,8 @@ class AuthorityBroker:
         broker = cls._default
         if broker is not None:
             broker.close()
+        cls._default = None
+        cls._default_profile = None
 
     @property
     def closed(self) -> bool:

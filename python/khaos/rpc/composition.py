@@ -17,6 +17,7 @@ from khaos.memory.runtime import MemoryHost
 from khaos.routing import ModelRouter
 from khaos.routing.router import create_default_router
 from khaos.runtime import RequestContext
+from khaos.runtime_profile import RuntimeProfile, resolve_runtime_profile
 from khaos.rust_bridge import get_token_engine
 from khaos.skills import SkillManager
 from khaos.subagents import (
@@ -40,6 +41,7 @@ async def _build_subagent_service(
     audit_logger: Any = None,
     cleanup_authority: Any = None,
     memory_host: MemoryHost | None = None,
+    runtime_profile: RuntimeProfile | str | None = None,
 ) -> SubAgentService:
     """Build the SubAgent service bound to the server's shared security stack.
 
@@ -68,6 +70,7 @@ async def _build_subagent_service(
     subagent's mode switches / memory scope are bound to the CALLING
     principal, not the server's local UID.
     """
+    resolved_runtime_profile = resolve_runtime_profile(runtime_profile)
     root = project_root or Path.cwd()
     resolved_config = config_path or root / "config.yaml"
     router = load_router_from_config(resolved_config, project_root=root)
@@ -108,6 +111,7 @@ async def _build_subagent_service(
         # authority rooted at the process cwd.
         project_root=root,
         config_path=resolved_config,
+        runtime_profile=resolved_runtime_profile,
     )
     spawner = SubAgentSpawner(
         SubAgentConfig(max_concurrent=3, max_spawn_depth=1, allow_nesting=False),
@@ -131,7 +135,7 @@ async def _build_subagent_service(
             "KHAOS_WINDOWS_AUTHORITY_PIPE_CLIENT",
         )
     )
-    if authority_configured and os.environ.get("KHAOS_DEV_MODE") != "1":
+    if authority_configured and resolved_runtime_profile.is_production:
         try:
             from khaos.security.authority_transport import (
                 AuthorityTransportConfig,
@@ -142,7 +146,9 @@ async def _build_subagent_service(
             )
 
             contract = read_contract_from_environment()
-            deployment = AuthorityTransportConfig.from_environment()
+            deployment = AuthorityTransportConfig.from_environment(
+                runtime_profile=resolved_runtime_profile
+            )
             deployment.validate_contract(contract)
             delegation_issuer = AuthorityDelegationIssuer(
                 deployment.client(contract)

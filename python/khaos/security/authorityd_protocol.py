@@ -28,6 +28,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PublicKey,
 )
 
+from khaos.runtime_profile import RuntimeProfile, resolve_runtime_profile
 from khaos.security.identity_isolation import (
     IdentityIsolationError,
     validate_private_unix_socket,
@@ -601,6 +602,7 @@ class AuthorityDaemonClient:
         transport: str | None = None,
         public_key_path: Path | None = None,
         trusted_local_root: Path | None = None,
+        runtime_profile: RuntimeProfile | str | None = None,
     ) -> None:
         # The caller (normally AuthorityTransportConfig) selects the
         # transport.  For direct protocol tests, preserve the intuitive
@@ -631,7 +633,7 @@ class AuthorityDaemonClient:
             raise ValueError("authorityd trusted root must be absolute")
         if (
             trusted_local_root is not None
-            and os.environ.get("KHAOS_DEV_MODE") != "1"
+            and resolve_runtime_profile(runtime_profile).is_production
             and trusted_local_root != local_authority_root()
         ):
             raise ValueError(
@@ -644,6 +646,7 @@ class AuthorityDaemonClient:
         self.transport = selected_transport
         self.public_key_path = public_key_path
         self.trusted_local_root = trusted_local_root
+        self.runtime_profile = resolve_runtime_profile(runtime_profile)
 
     def _verify_receipt(self, value: object) -> SignedAuthorizationReceipt:
         """Parse and verify a receipt against the configured local trust anchor."""

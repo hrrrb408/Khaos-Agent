@@ -6,6 +6,7 @@
 
 /python/khaos/security/ @hrrrb408
 /python/khaos/runtime/ @hrrrb408
+/python/khaos/runtime_profile.py @hrrrb408
 /python/khaos/permissions/ @hrrrb408
 /python/khaos/audit/ @hrrrb408
 /python/khaos/verification/ @hrrrb408
