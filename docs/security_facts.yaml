@@ -201,6 +201,20 @@ local_security_closure:
   handwritten_status_or_boolean: rejected
   local_json_or_mock_artifact_can_close: false
   closure_capability: live_github_verifier_issues_non_serializable_typed_provenance
+  pre_closure:
+    status_vocabulary:
+      - PASS
+      - FAIL
+    gate_job: community-local-preclosure
+    commit_environment: GITHUB_SHA
+    required_proofs_source: python/khaos/security/local_closure.py
+    ordinary_producer_mapping: scripts/run_security_producer_matrix.py
+    producer_artifact_mapping: scripts/verify_release_gate_runs.py
+    producer_schema_validator: python/khaos/security/producer_evidence.py
+    local_evidence_schema: khaos.local-security-evidence.v1
+    producer_evidence_schema: khaos.local-security-producer-proof.v1
+    accepts_saved_release_record_as_live_provenance: false
+    final_certification_workflow: .github/workflows/community-local-closure.yml
 upstream_security_watch:
   generator: scripts/watch_upstream_codex_security.py
   fixed_sha: 711a5f8b3a6eb40134146ae9ec22fdcdda5e3170
@@ -259,6 +273,7 @@ governance:
     - scripts/run_worm_audit_receiver.py
     - scripts/validate_docker_outer_profiles.py
     - scripts/validate_m6_governance.py
+    - scripts/validate_community_local_preclosure.py
     - scripts/verify_production_composition.py
     - scripts/verify_release_gate_runs.py
     - scripts/verify_release_tag.py

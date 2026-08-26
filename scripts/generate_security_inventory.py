@@ -187,6 +187,7 @@ def render() -> str:
         ("packaging/macos/khaos-authorityd-xpc-client.c", sha256(ROOT / "packaging" / "macos" / "khaos-authorityd-xpc-client.c")),
         ("rust/khaos-core/src/bin/khaos-authorityd-windows.rs", sha256(ROOT / "rust" / "khaos-core" / "src" / "bin" / "khaos-authorityd-windows.rs")),
         ("scripts/build_m6_closure_report.py", sha256(ROOT / "scripts" / "build_m6_closure_report.py")),
+        ("scripts/validate_community_local_preclosure.py", sha256(ROOT / "scripts" / "validate_community_local_preclosure.py")),
         ("scripts/validate_m6_governance.py", sha256(ROOT / "scripts" / "validate_m6_governance.py")),
         ("scripts/watch_upstream_codex_security.py", sha256(ROOT / "scripts" / "watch_upstream_codex_security.py")),
         ("scripts/github-m6-hardened-ruleset.json", sha256(ROOT / "scripts" / "github-m6-hardened-ruleset.json")),

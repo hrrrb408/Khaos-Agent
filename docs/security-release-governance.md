@@ -69,6 +69,13 @@ review are explicitly `NOT_CLAIMED`; neither blocks Community Local closure.
 Generic M6 closure has its own stricter evidence contract and must not be
 silently upgraded by a Community result.
 
+The Security Closure Gate also runs the structural
+`COMMUNITY_LOCAL_PRE_CLOSURE` contract on pull requests. It may report only
+`PASS` or `FAIL`; it checks proof and artifact wiring but does not certify a
+main push or create live provenance. Final Community Local certification still
+comes from `community-local-closure.yml` after an exact `main` push, original
+attempt, producer artifacts, and live GitHub verification.
+
 ## Evidence boundary
 
 Local Python/Go/Rust tests prove source-level contracts only. Linux namespace,
