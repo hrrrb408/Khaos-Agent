@@ -1,10 +1,32 @@
 """Typed contracts for the agent task control plane.
 
-M7.1.2 exposes only the immutable GoalSpec declaration and its durable
-repository.  Mutable assessment, completion, planning, and recovery
-contracts belong to later batches and are deliberately not imported here.
+M7.1.4 adds the immutable CompletionDecision record and its passive,
+append-only durable ledger.  Evaluation, completion gating, planning, and
+recovery remain later control-plane responsibilities.
 """
 
+from khaos.agent.control.completion import (
+    COMPLETION_DECISION_SCHEMA_VERSION,
+    AssessmentStatus,
+    CompletionDecision,
+    CompletionDecisionValidationError,
+    CompletionEvidenceKind,
+    CompletionEvidenceRef,
+    CompletionIssue,
+    CompletionIssueCode,
+    CompletionOutcome,
+    CriterionAssessment,
+    EvidenceRef,
+    RequirementAssessment,
+)
+from khaos.agent.control.completion_repository import (
+    CompletionDecisionBindingError,
+    CompletionDecisionConflictError,
+    CompletionDecisionIntegrityError,
+    CompletionDecisionRepository,
+    CompletionDecisionRepositoryError,
+    StoredCompletionDecision,
+)
 from khaos.agent.control.goal import (
     ACCEPTANCE_CRITERION_SCHEMA_KEYS,
     GOAL_REQUIREMENT_SCHEMA_KEYS,
@@ -37,6 +59,7 @@ from khaos.agent.control.state_repository import (
 
 __all__ = [
     "ACCEPTANCE_CRITERION_SCHEMA_KEYS",
+    "COMPLETION_DECISION_SCHEMA_VERSION",
     "GOAL_REQUIREMENT_SCHEMA_KEYS",
     "GOAL_SPEC_SCHEMA_VERSION",
     "LEGAL_COGNITIVE_TRANSITIONS",
@@ -44,11 +67,26 @@ __all__ = [
     "AgentCognitiveState",
     "AgentCognitiveStateMachine",
     "AgentControlStateRepository",
+    "AssessmentStatus",
     "CognitiveStateIntegrityError",
     "CognitiveStateSnapshot",
     "CognitiveTransitionResult",
     "CognitiveTransitionStatus",
     "CognitiveTransitionValidation",
+    "CompletionDecision",
+    "CompletionDecisionBindingError",
+    "CompletionDecisionConflictError",
+    "CompletionDecisionIntegrityError",
+    "CompletionDecisionRepository",
+    "CompletionDecisionRepositoryError",
+    "CompletionDecisionValidationError",
+    "CompletionEvidenceKind",
+    "CompletionEvidenceRef",
+    "CompletionIssue",
+    "CompletionIssueCode",
+    "CompletionOutcome",
+    "CriterionAssessment",
+    "EvidenceRef",
     "GoalRequirement",
     "GoalSource",
     "GoalSpec",
@@ -56,5 +94,7 @@ __all__ = [
     "GoalSpecIntegrityError",
     "GoalSpecRepository",
     "GoalSpecValidationError",
+    "RequirementAssessment",
+    "StoredCompletionDecision",
     "normalize_goal",
 ]

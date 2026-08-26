@@ -16,6 +16,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from khaos.agent.control.completion_repository import CompletionDecisionRepository
 from khaos.agent.control.goal_repository import GoalSpecRepository
 from khaos.agent.control.state_repository import AgentControlStateRepository
 from khaos.agent.core import Message
@@ -246,6 +247,7 @@ class Database:
         self._tool_operation_repository = ToolOperationRepository(self)
         self._goal_spec_repository = GoalSpecRepository(self)
         self._agent_control_state_repository = AgentControlStateRepository(self)
+        self._completion_decision_repository = CompletionDecisionRepository(self)
         # F-01: Per-domain locks remain for logical serialization (e.g. two
         # concurrent permission grants must not race on epoch computation).
         self._operation_approval_lock = asyncio.Lock()
@@ -284,6 +286,11 @@ class Database:
     def agent_control_state_repository(self) -> AgentControlStateRepository:
         """Return the sole SQL owner for cognitive-state CAS transitions."""
         return self._agent_control_state_repository
+
+    @property
+    def completion_decision_repository(self) -> CompletionDecisionRepository:
+        """Return the sole owner-scoped completion-decision ledger."""
+        return self._completion_decision_repository
 
     @_conn.setter
     def _conn(self, value: Any | None) -> None:
@@ -819,6 +826,15 @@ class Database:
             self._conn = _MigrationConnection(conn)
             try:
                 await self._apply_v17_upgrades()
+            finally:
+                self._conn = original_conn
+            # M7.1.4: add the passive, append-only completion-decision
+            # ledger.  No historical decisions are synthesized from legacy
+            # TaskStatus, test results, or assistant text.
+            original_conn = self._conn
+            self._conn = _MigrationConnection(conn)
+            try:
+                await self._apply_v18_upgrades()
             finally:
                 self._conn = original_conn
             # Batch 6.4 §10.4: backfill the historical ledger rows (v1–v5)
@@ -1455,6 +1471,16 @@ class Database:
 
         conn = await self._require_conn()
         await self._ensure_coding_tasks_cognitive_state_columns(conn)
+
+    async def _apply_v18_upgrades(self) -> None:
+        """Add the M7.1.4 immutable completion-decision ledger."""
+
+        conn = await self._require_conn()
+        migration_path = _MIGRATIONS_DIR / "0018_completion_decisions.sql"
+        await self._execute_schema_statements(
+            conn,
+            migration_path.read_text(encoding="utf-8"),
+        )
 
     async def _ensure_coding_tasks_cognitive_state_columns(
         self, conn: Any

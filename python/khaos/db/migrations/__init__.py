@@ -24,6 +24,7 @@ Current chain (see ``_registry.MIGRATIONS``):
          executed SQL + migrator source bytes; review §10.1/§10.2)
   v16 = M7.1.2 immutable GoalSpec declarations and conservative backfill
   v17 = M7.1.3 Agent Cognitive State CAS columns with conservative defaults
+  v18 = M7.1.4 immutable completion-decision ledger without historical backfill
 
 Immutability contract
 ---------------------

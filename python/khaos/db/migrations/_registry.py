@@ -476,6 +476,16 @@ MIGRATIONS: tuple[MigrationSpec, ...] = (
             "_ensure_coding_tasks_cognitive_state_columns",
         ),
     ),
+    MigrationSpec(
+        version=18,
+        name="m7_1_4_completion_decision_ledger",
+        # Release-time manifest over the additive v18 SQL and migrator.  The
+        # literal is intentionally pinned so later changes require a new
+        # migration version.
+        sha256="ceeff204ab946b1efc1a2177cedf49042f4b9d019d1eb39658dc0c591dc95f17",
+        sql_files=("0018_completion_decisions.sql",),
+        migrator_symbols=("_apply_v18_upgrades",),
+    ),
 )
 
 
