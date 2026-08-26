@@ -1,6 +1,7 @@
 # Security Release Governance
 
-This repository has one declared maintainer, so repository ownership and
+This repository has one declared maintainer (the current
+`single-maintainer` compatibility mode), so repository ownership and
 independent review are separate controls.  A security-sensitive change is not
 release-ready merely because the maintainer can approve it.
 
@@ -105,9 +106,11 @@ Export/archive evidence before reducing any window.
 
 ## M6 governance preparation
 
-`.github/CODEOWNERS` covers the security authority, permission, audit,
-verification, RPC, execution, native TCB, Docker, workflow, and release-gate
-paths. `scripts/validate_m6_governance.py` checks that coverage and the
-hardened ruleset template. A green local validation proves only that the
-preparation artifacts are internally consistent; it is not evidence of an
-independent human review.
+`docs/security_facts.yaml` is the canonical machine-readable inventory of
+security-critical paths. `scripts/validate_m6_governance.py` rejects duplicate
+or dead inventory entries and verifies that every declared path is covered by
+`.github/CODEOWNERS`. The hardened ruleset template remains a preparation
+artifact until a second maintainer is available. Changes to an inventory path
+or its owner require a manual maintainer diff review; autonomous merge is not
+allowed. A green local validation proves only that the preparation artifacts
+are internally consistent; it is not evidence of an independent human review.

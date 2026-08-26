@@ -211,7 +211,58 @@ governance:
   active_mode: single_maintainer_compatibility
   hardened_template: scripts/github-m6-hardened-ruleset.json
   independent_review_claimed: false
+  critical_path_change_requires_manual_diff_review: true
+  autonomous_merge_allowed: false
   validator: scripts/validate_m6_governance.py
+  security_critical_paths:
+    - .github/CODEOWNERS
+    - .github/workflows/
+    - .github/workflows/batch5-required-jobs.yml
+    - .github/workflows/browser-e2e.yml
+    - .github/workflows/community-local-closure.yml
+    - .github/workflows/docker-lifecycle-soak.yml
+    - .github/workflows/docker-security.yml
+    - .github/workflows/native-authority-production-e2e.yml
+    - .github/workflows/platform-sandbox-security.yml
+    - .github/workflows/product-integrity-gate.yml
+    - .github/workflows/release-provenance.yml
+    - .github/workflows/ruleset-audit.yml
+    - .github/workflows/security-closure-gate.yml
+    - .github/workflows/security-contract-matrix.yml
+    - .github/workflows/supply-chain-audit.yml
+    - .github/workflows/type-check.yml
+    - .github/workflows/upstream-codex-security-watch.yml
+    - docs/security_facts.yaml
+    - docs/security-release-governance.md
+    - pyright-security.json
+    - python/tests/
+    - rust/khaos-core/audit.toml
+    - scripts/audit-github-ruleset.sh
+    - scripts/build_local_security_closure_report.py
+    - scripts/build_m6_closure_report.py
+    - scripts/build_security_closure_evidence.py
+    - scripts/check_privileged_spawn_sites.py
+    - scripts/collect_local_security_evidence.py
+    - scripts/compose-security-e2e.sh
+    - scripts/fetch_security_producer_artifacts.py
+    - scripts/generate_browser_kernel_protocol.py
+    - scripts/generate_production_reachability.py
+    - scripts/generate_release_evidence.py
+    - scripts/generate_security_inventory.py
+    - scripts/github-main-ruleset.json
+    - scripts/github-m6-hardened-ruleset.json
+    - scripts/render_macos_authority_backend_plist.py
+    - scripts/run_native_authority_e2e.py
+    - scripts/run_native_authority_identity_probe.py
+    - scripts/run_security_producer_matrix.py
+    - scripts/run_windows_product_suite.py
+    - scripts/run_worm_audit_receiver.py
+    - scripts/validate_docker_outer_profiles.py
+    - scripts/validate_m6_governance.py
+    - scripts/verify_production_composition.py
+    - scripts/verify_release_gate_runs.py
+    - scripts/verify_release_tag.py
+    - scripts/watch_upstream_codex_security.py
 orchestration_boundaries:
   extracted_components:
     - TurnAdmission
