@@ -53,6 +53,7 @@
 /scripts/run_worm_audit_receiver.py @hrrrb408
 /scripts/validate_docker_outer_profiles.py @hrrrb408
 /scripts/validate_community_local_preclosure.py @hrrrb408
+/scripts/validate_type_check_contract.py @hrrrb408
 /scripts/validate_m6_governance.py @hrrrb408
 /scripts/verify_production_composition.py @hrrrb408
 /scripts/verify_release_gate_runs.py @hrrrb408

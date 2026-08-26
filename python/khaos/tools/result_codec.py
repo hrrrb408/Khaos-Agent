@@ -131,6 +131,11 @@ class ToolResultCodec:
             status = EFFECT_NOT_APPLIED
         if status not in _VALID_EFFECT_STATUSES:
             raise ValueError(f"invalid ToolExecutionOutcome effect status: {status!r}")
+        if status == EFFECT_UNKNOWN:
+            # An unproven effect is never a safe retry, even when a legacy or
+            # typed handler incorrectly marks its outcome retryable.  The
+            # codec is the single value-level owner of this postcondition.
+            retry_safe = False
         if len(effect_id) > 256 or any(char in effect_id for char in "\x00\r\n"):
             raise ValueError("invalid ToolExecutionOutcome effect_id")
         if len(reconciliation_hint) > 4096 or any(

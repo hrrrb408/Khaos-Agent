@@ -100,7 +100,7 @@
 - `python/khaos/scheduler/execution.py`: `f0fa37a613f2db2cd22d121ccfb78791b2e93764a679e38901f5d93ebdc299a8`
 - `python/khaos/scheduler/recovery.py`: `aa18112a5978133b3a39db16fe1d540a9d247cd9ba1a3e8409f9ba01e657a6f2`
 - `python/khaos/coding/planning/limits.py`: `f39749886151ed96b73a9e252bd6a568b0f85d295aed77282e5c8ebc64d87193`
-- `python/khaos/tools/result_codec.py`: `cf9852cb62f4daeb07a3bdfc4144492dfbcd95661a26f08e97d2d9ef99f716fb`
+- `python/khaos/tools/result_codec.py`: `4c6efc599507baa6bca4a29ada48883f7f5ad6801d57671eb1d54f7a0f23094f`
 - `python/khaos/tools/result_finalizer.py`: `f8d5fa676602a17f0c93cf7bb9cb92730157aa7488e68ecf759fc468eafc15a2`
 - `python/khaos/rpc/protocol.py`: `ba1412c0d55e9347621bba541d7bec722bac628e6743d384511a86c8a56c75b1`
 - `python/khaos/runtime_profile.py`: `1015564e2a18975a2767d949bb9471b6976968bf9e437d279aa6dd57ae8ce79a`
