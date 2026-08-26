@@ -138,6 +138,140 @@ runtime_profile:
     - python/khaos/grpc_server.py
     - python/khaos/rpc/agent_service.py
     - scripts/verify_production_composition.py
+deployment_profiles:
+  community_local:
+    identifier: community-local
+    default: true
+    decision_owner: python/khaos/security/local_closure.py
+    machine_decision_status: CLOSED_or_NOT_CLOSED
+    exact_main_push_ci_required: true
+    apple_signing_prerequisite: not_required
+  macos_signed_distribution:
+    identifier: macos-signed-distribution
+    enabled_by: KHAOS_NATIVE_MACOS_E2E
+    disabled_status: OPTIONAL_PROFILE_NOT_ENABLED
+    missing_native_evidence: fail_closed
+  windows_native:
+    identifier: windows-native
+    status: native_or_fail_closed
+    missing_native_evidence: fail_closed
+closure_semantics:
+  live_authority: scripts/verify_release_gate_runs.py
+  saved_release_record_is_capability: false
+  exact_commit_required: true
+  original_run_attempt_required: 1
+  protected_main_ancestry_required: true
+  community_local_decision_is_profile_scoped: true
+required_gates:
+  merge_authority:
+    - Security Closure Gate
+    - Product Integrity Gate
+  security_closure_workflow: .github/workflows/security-closure-gate.yml
+  product_integrity_workflow: .github/workflows/product-integrity-gate.yml
+  community_local_provenance_workflow: .github/workflows/community-local-closure.yml
+  release_verifier: scripts/verify_release_gate_runs.py
+  exact_push_event: push
+  exact_main_ref: refs/heads/main
+required_proof_names:
+  community_local:
+    - community_authority
+    - platform_kernel
+    - production_reachability
+    - production_composition
+    - workspace_escape
+    - approval_replay
+    - approval_substitution
+    - process_tree_escape
+    - resource_owner_closure
+    - network_isolation
+accepted_residuals:
+  - id: hostile_same_uid_isolation
+    profile: community-local
+    status: NOT_CLAIMED
+    source: docs/local-security-profile.md
+  - id: second_maintainer_independent_review
+    profile: community-local
+    status: NOT_CLAIMED
+    source: docs/security-release-governance.md
+  - id: remote_worm_audit_sink
+    profile: community-local
+    status: RESIDUAL
+    source: docs/security-release-governance.md
+  - id: native_platform_authority_evidence
+    profile: community-local
+    status: BLOCKED_EXTERNAL
+    source: docs/security-release-governance.md
+supported_platform_claims:
+  community_local_macos_posix:
+    profile: community-local
+    claim: personal_local_owner_only_authority_and_peer_authenticated_socket
+    same_uid_isolation: NOT_CLAIMED
+  linux_kernel_sandbox:
+    claim: real_kernel_isolation_requires_ci_proof
+    local_status: BLOCKED_EXTERNAL
+    evidence_class: CI_ONLY
+  windows_native:
+    claim: native_or_fail_closed
+    evidence_class: native_ci_only
+  macos_signed_distribution:
+    claim: explicit_optional_signed_profile_only
+    disabled_status: OPTIONAL_PROFILE_NOT_ENABLED
+type_check:
+  source_of_truth: pyright-security.json
+  repository_default_mode: basic
+  strict_mode: strict
+  strict_files:
+    - python/khaos/security/local_closure.py
+    - python/khaos/tools/admission.py
+    - python/khaos/tools/execution_coordinator.py
+    - python/khaos/runtime_profile.py
+    - python/khaos/runtime/authority.py
+  workflow: .github/workflows/type-check.yml
+  hard_gate: true
+  additional_coverage_mode: basic
+  validator: scripts/validate_type_check_contract.py
+issue_169:
+  tracker: "#169"
+  overall_status: PARTIALLY_COMPLETED
+  do_not_close_from_local_evidence: true
+  classification_vocabulary:
+    - COMPLETED
+    - PARTIALLY_COMPLETED
+    - RESIDUAL
+    - DEFERRED
+    - OUT_OF_PROFILE
+  items:
+    typed_resource_narrowing:
+      status: COMPLETED
+      evidence:
+        - python/khaos/security/resource_scope.py
+        - python/tests/security/test_resource_scope.py
+    grant_descendants:
+      status: COMPLETED
+      evidence:
+        - python/khaos/security/authorityd.py
+        - python/tests/security/test_authorityd_protocol.py
+    immutable_scheduler_states:
+      status: PARTIALLY_COMPLETED
+      evidence:
+        - python/khaos/tools/admission.py
+        - python/khaos/security/orchestration_phases.py
+        - python/tests/security/test_tool_scheduler_state_contract.py
+      residual: mutable_compatibility_projection_and_incremental_physical_split
+    native_authority:
+      status: PARTIALLY_COMPLETED
+      evidence:
+        - python/khaos/security/native_authority.py
+        - .github/workflows/native-authority-production-e2e.yml
+        - python/tests/security/test_native_authority.py
+      residual: exact_sha_native_platform_ci_and_deployment_identity
+    delegation:
+      status: COMPLETED
+      evidence:
+        - python/khaos/security/delegation_issuer.py
+        - python/khaos/security/authorityd.py
+        - python/tests/security/test_delegation_authority_owned.py
+      residual: live_deployment_transport_remains_fail_closed_when_unavailable
 tool_scheduler_state_machine:
   status: incremental_typed_boundary_already_present
   canonical_immutable_states:
@@ -357,6 +491,10 @@ governance:
     - .github/workflows/upstream-codex-security-watch.yml
     - docs/security_facts.yaml
     - docs/security-release-governance.md
+    - docs/required-status-checks.md
+    - docs/local-security-profile.md
+    - docs/type-check-rollout.md
+    - docs/issue-169-status.md
     - pyright-security.json
     - python/tests/
     - python/khaos/agent/approval.py
@@ -364,6 +502,7 @@ governance:
     - python/khaos/permissions/
     - python/khaos/runtime/
     - python/khaos/security/orchestration_phases.py
+    - python/khaos/security/network_guard.py
     - python/khaos/tools/admission.py
     - python/khaos/tools/execution_coordinator.py
     - python/khaos/tools/scheduler.py
@@ -397,6 +536,7 @@ governance:
     - scripts/validate_type_check_contract.py
     - scripts/validate_cargo_advisory_policy.py
     - scripts/validate_evidence_retention.py
+    - scripts/validate_security_facts_consistency.py
     - scripts/verify_production_composition.py
     - scripts/verify_release_gate_runs.py
     - scripts/verify_release_tag.py

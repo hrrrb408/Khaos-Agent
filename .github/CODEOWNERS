@@ -15,6 +15,7 @@
 /python/khaos/coding/execution/ @hrrrb408
 /python/khaos/coding/workspace/ @hrrrb408
 /python/khaos/agent/approval.py @hrrrb408
+/python/khaos/security/network_guard.py @hrrrb408
 /python/khaos/tools/scheduler.py @hrrrb408
 /python/khaos/tools/admission.py @hrrrb408
 /python/khaos/tools/execution_coordinator.py @hrrrb408
@@ -57,6 +58,7 @@
 /scripts/validate_evidence_retention.py @hrrrb408
 /scripts/validate_cargo_advisory_policy.py @hrrrb408
 /scripts/validate_m6_governance.py @hrrrb408
+/scripts/validate_security_facts_consistency.py @hrrrb408
 /scripts/verify_production_composition.py @hrrrb408
 /scripts/verify_release_gate_runs.py @hrrrb408
 /scripts/verify_release_tag.py @hrrrb408
@@ -65,8 +67,11 @@
 /scripts/build_community_local_closure_bundle.py @hrrrb408
 /scripts/collect_local_security_evidence.py @hrrrb408
 /docs/local-security-profile.md @hrrrb408
+/docs/required-status-checks.md @hrrrb408
 /docs/security_facts.yaml @hrrrb408
 /docs/security-release-governance.md @hrrrb408
+/docs/type-check-rollout.md @hrrrb408
+/docs/issue-169-status.md @hrrrb408
 /docs/security/ @hrrrb408
 /pyright-security.json @hrrrb408
 /rust/khaos-core/audit.toml @hrrrb408

@@ -41,9 +41,11 @@ jobs:
       - name: Validate COMMUNITY_LOCAL_PRE_CLOSURE
         run: |
           python scripts/validate_evidence_retention.py
+          python scripts/validate_security_facts_consistency.py
           PYTHONPATH=python python scripts/validate_community_local_preclosure.py
           PYTHONPATH=python python -m pytest \
-            python/tests/security/test_community_local_preclosure.py -q -v
+            python/tests/security/test_community_local_preclosure.py \
+            python/tests/security/test_security_facts_consistency.py -q -v
 
   # Python Security Suite, Go Race, Rust Clippy, Browser Kernel Attack E2E.
   core-security:

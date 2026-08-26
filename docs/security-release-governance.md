@@ -5,6 +5,12 @@ This repository has one declared maintainer (the current
 independent review are separate controls.  A security-sensitive change is not
 release-ready merely because the maintainer can approve it.
 
+`docs/security_facts.yaml` is the machine-facing source for the deployment
+profiles, exact closure gates, proof names, accepted residuals, supported
+platform claims, and type-check TCB set described below. This governance
+document explains their meaning; prose here cannot replace live exact-SHA
+verification.
+
 ## Required controls
 
 1. Protect `main` against force-push and deletion.

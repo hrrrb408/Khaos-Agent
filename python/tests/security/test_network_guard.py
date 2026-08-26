@@ -86,12 +86,21 @@ def test_domain_wildcard() -> None:
     assert result.domain == "api.github.com"
 
 
-def test_network_enabled_allows_all() -> None:
-    """network_enabled=True bypasses all checks."""
+def test_network_enabled_without_allowlist_allows_all() -> None:
+    """An enabled network with no allowlist is unrestricted by domain."""
     guard = NetworkGuard(network_enabled=True)
     result = guard.check_tool("terminal", {"command": "curl https://anything.com"})
 
     assert result.allowed is True
+
+
+def test_explicit_empty_allowlist_denies_all_domains() -> None:
+    """An explicit empty allowlist is deny-all, not the unset state."""
+    guard = NetworkGuard(network_enabled=True, allowed_domains=[])
+    result = guard.check_tool("terminal", {"command": "curl https://anything.com"})
+
+    assert result.allowed is False
+    assert "empty allowlist" in result.reason
 
 
 def test_blocked_domain_overrides_allowlist() -> None:

@@ -7,6 +7,11 @@
 > repository rulesets because the default Actions token cannot always inspect
 > organization-managed rules.
 
+The machine-facing profile, gate, proof, residual, platform, and type-check
+facts live in `docs/security_facts.yaml`. This document is the operator-facing
+projection of those facts; it does not create a release pass or closure
+capability by itself.
+
 ## How to apply
 
 1. Open the repo → **Settings** → **Branches**.

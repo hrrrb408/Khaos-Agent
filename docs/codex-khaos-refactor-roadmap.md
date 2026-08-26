@@ -281,6 +281,10 @@ M5 closure ledger（本轮 review 对应状态）：
 
 M5.5/M5.6 的第二 maintainer、CODEOWNERS 和 independent assurance 是组织治理前置条件，
 由 issue #169 跟踪；没有第二个有权限维护者时不把 ruleset 强行改成无人可合并。
+Issue #169 的代码边界分类见 `docs/issue-169-status.md` 和
+`docs/security_facts.yaml:issue_169`；已完成的 typed narrowing、grant
+descendant 和 authority-owned delegation 不再写成待实现，native CI 与
+兼容投影仍保留为明确的 `PARTIALLY_COMPLETED` / residual 边界。
 
 ## 12. 交付和基线升级规则
 

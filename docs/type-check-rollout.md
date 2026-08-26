@@ -1,6 +1,6 @@
 # Pyright Type-Check Rollout Plan
 
-> Status reference: 2026-08-25.
+> Status reference: 2026-08-26.
 
 Review P2-6 found that Khaos had no static type-check gate at all. The current
 repository now has a hard reusable `Type Check` workflow wired into the
@@ -31,6 +31,11 @@ This document tracks the rollout of a Pyright gate to fix that.
   explicitly listed set of security modules in repository-wide basic mode.
   The latter list is coverage, not a strict-mode claim, until files are
   promoted into `pyright-security.json`.
+
+The module table below is a migration backlog, not a claim about the current
+strict gate. The only current strict-mode claim is the five-file list above;
+`scripts/validate_type_check_contract.py` checks that list against
+`pyright-security.json`, the workflow, and this document.
 
 ## Gate semantics
 
