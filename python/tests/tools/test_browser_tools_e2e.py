@@ -119,7 +119,13 @@ async def fresh_manager(monkeypatch):
     the test already closed it.
     """
     mgr = BrowserManager()
-    monkeypatch.setattr(browser_tools, "BrowserManager", lambda: mgr)
+    # Keep the fixture aligned with the production factory contract: the
+    # public tools pass the resolved RuntimeProfile when creating a manager.
+    monkeypatch.setattr(
+        browser_tools,
+        "BrowserManager",
+        lambda runtime_profile=None: mgr,
+    )
     try:
         yield mgr
     finally:
