@@ -581,6 +581,27 @@ async def test_projection_repository_cannot_be_used_as_free_authority(
 
 
 @pytest.mark.asyncio
+async def test_task_cache_reflection_requires_gate_token(tmp_path: Path) -> None:
+    db = await _make_db(tmp_path / "cache-reflection-owner.db")
+    try:
+        manager, task = await _create_running_task(db)
+
+        with pytest.raises(TypeError):
+            await manager.reflect_gate_completion(task.id)  # type: ignore[call-arg]
+        with pytest.raises(PermissionError):
+            await manager.reflect_gate_completion(task.id, gate_token=object())
+
+        assert (
+            await db.list_coding_tasks(
+                principal_id="alice",
+                project_id="project-a",
+            )
+        )[0]["status"] == TaskStatus.RUNNING.value
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_malformed_decision_row_fails_closed(tmp_path: Path) -> None:
     db = await _make_db(tmp_path / "malformed-decision.db")
     try:
@@ -793,6 +814,7 @@ async def test_agent_loop_end_turn_uses_gate_and_preserves_event_order(
         )
         gate = _gate(
             db,
+            manager=task_manager,
             authority=_AllowCompletionAuthority(),
         )
         loop = AgentLoop(

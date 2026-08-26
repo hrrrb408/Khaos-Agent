@@ -1693,6 +1693,7 @@ async def build_runtime(
         goal_spec_repository=goal_spec_repository,
         principal_id=cfg.principal_id,
         project_id=project_id,
+        task_projection=task_manager,
     )
     loop = AgentLoop(
         cfg.agent_config or AgentConfig(), mode_manager, router, cfg.db,

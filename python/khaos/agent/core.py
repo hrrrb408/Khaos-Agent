@@ -1509,15 +1509,6 @@ class AgentLoop:
             )
         else:
             result = await gate.evaluate(decision_id)
-        if (
-            result.status is CompletionGateStatus.COMPLETED
-            and self.task_manager is not None
-        ):
-            # The Gate owns the durable SQL projection.  Keep this loop's
-            # cache aligned before the post-turn skill/trace projection can
-            # persist anything, even when a caller supplied a Gate without
-            # its optional cache sink.
-            await self.task_manager.reflect_gate_completion(task_id)
         await turn.emit(
             "completion.gated",
             {

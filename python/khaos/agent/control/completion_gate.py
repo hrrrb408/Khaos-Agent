@@ -128,7 +128,9 @@ class CompletionGateAuthorityPolicy(Protocol):
 class CompletionTaskProjection(Protocol):
     """Optional in-memory projection sink after the DB projection commits."""
 
-    async def reflect_gate_completion(self, task_id: str) -> None:
+    async def reflect_gate_completion(
+        self, task_id: str, *, gate_token: object
+    ) -> None:
         """Reflect a database-confirmed completion without writing the DB."""
         raise NotImplementedError
 
@@ -388,7 +390,14 @@ class CompletionGate:
             and self._task_projection is not None
         ):
             try:
-                await self._task_projection.reflect_gate_completion(decision.task_id)
+                from khaos.agent.control.completion_gate_repository import (
+                    _COMPLETION_GATE_TOKEN,
+                )
+
+                await self._task_projection.reflect_gate_completion(
+                    decision.task_id,
+                    gate_token=_COMPLETION_GATE_TOKEN,
+                )
             except Exception:
                 logger.exception(
                     "in-memory task projection failed after durable completion"
