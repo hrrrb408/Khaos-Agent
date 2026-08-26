@@ -2,7 +2,9 @@
   "include": [
     "python/khaos/security/local_closure.py",
     "python/khaos/tools/admission.py",
-    "python/khaos/tools/execution_coordinator.py"
+    "python/khaos/tools/execution_coordinator.py",
+    "python/khaos/runtime_profile.py",
+    "python/khaos/runtime/authority.py"
   ],
   "extraPaths": ["python"],
   "pythonVersion": "3.11",
