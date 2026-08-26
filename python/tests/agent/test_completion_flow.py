@@ -1,4 +1,4 @@
-"""M7.1.6 coding ``PROPOSE_COMPLETION`` flow tests."""
+"""M7.1.6/7 coding proposal and Completion Gate flow tests."""
 
 from __future__ import annotations
 
@@ -24,6 +24,7 @@ from khaos.agent.control.completion_flow import (
     CompletionProposalStatus,
     CompletionProposalTrigger,
 )
+from khaos.agent.control.completion_gate import CompletionGateStatus
 from khaos.agent.control.state import AgentCognitiveState
 from khaos.coding.task_manager import CodingTask, TaskManager, TaskStatus
 from khaos.db import Database
@@ -332,12 +333,16 @@ async def test_end_turn_interception_records_events_and_keeps_task_running(
             "turn.started",
             "completion.proposed",
             "completion.evaluated",
+            "completion.gated",
             "turn.completed",
         ]
         proposed_payload = json.loads(turn_events[1]["payload_json"])
         evaluated_payload = json.loads(turn_events[2]["payload_json"])
+        gated_payload = json.loads(turn_events[3]["payload_json"])
         assert proposed_payload["trigger"] == "model_end_turn"
         assert evaluated_payload["outcome"] == CompletionOutcome.REPLAN.value
+        assert gated_payload["gate_status"] == "not_complete"
+        assert gated_payload["resulting_task_status"] == TaskStatus.RUNNING.value
         task_rows = await db.list_coding_tasks(
             principal_id="alice",
             project_id="project-a",
@@ -397,6 +402,12 @@ async def test_explicit_satisfied_provider_complete_is_still_passive(
             message for message in output if message.event == "completion_evaluated"
         )
         assert completion.metadata["outcome"] == CompletionOutcome.COMPLETE.value
+        gated = next(
+            message for message in output if message.event == "completion_gated"
+        )
+        assert gated.metadata["status"] == (
+            CompletionGateStatus.AUTHORITY_INSUFFICIENT.value
+        )
         task_rows = await db.list_coding_tasks(
             principal_id="alice",
             project_id="project-a",

@@ -580,6 +580,22 @@ class TaskManager:
             await self._persist(task)
             return TransitionResult.UPDATED
 
+    async def reflect_gate_completion(self, task_id: str) -> None:
+        """Reflect a database-confirmed Gate projection in this cache.
+
+        ``CompletionGateRepository`` is the lifecycle authority and has
+        already committed the owner-scoped SQL CAS before this method is
+        called.  This method deliberately does not persist or decide a
+        transition; it only keeps the current manager projection aligned with
+        the committed database result.
+        """
+        async with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                return
+            task.status = TaskStatus.COMPLETED
+            task.touch()
+
     async def transition(self, task_id: str, *, expected: set[TaskStatus], target: TaskStatus, **updates: Any) -> TransitionResult:
         """Atomically transition only when current state is expected."""
         async with self._lock:

@@ -20,6 +20,10 @@ if TYPE_CHECKING:
         CompletionProposalController,
         CompletionProposalResult,
     )
+    from khaos.agent.control.completion_gate import (
+        CompletionGate,
+        CompletionGateResult,
+    )
     from khaos.coding.cost_tracker import CostTracker
     from khaos.coding.fingerprint import FileFingerprintCache
     from khaos.coding.task_manager import TaskManager
@@ -162,6 +166,7 @@ class AgentLoop:
         runtime_profile: RuntimeProfile | str | None = None,
         completion_controller: CompletionProposalController | None = None,
         completion_fact_provider: CompletionFactProvider | None = None,
+        completion_gate: CompletionGate | None = None,
     ):
         self.config = config
         self.mode_manager = mode_manager
@@ -204,6 +209,7 @@ class AgentLoop:
         # port; it owns no tool, approval, workspace, or sandbox authority.
         self.completion_controller = completion_controller
         self.completion_fact_provider = completion_fact_provider
+        self.completion_gate = completion_gate
         self.skill_generator = skill_generator
         self.workspace_manager = workspace_manager
         self.active_workspace = None
@@ -1051,12 +1057,28 @@ class AgentLoop:
                     attempt_id=turn.attempt_id,
                     task_id=active_task_id,
                 )
+                from khaos.agent.control.completion_flow import (
+                    CompletionProposalStatus,
+                )
+
+                if completion_result.status is CompletionProposalStatus.RECORDED:
+                    assert completion_result.decision is not None
+                    gate_result = await self._evaluate_completion_gate(
+                        turn=turn,
+                        task_id=active_task_id,
+                        decision_id=completion_result.decision.decision_id,
+                    )
+                    yield self._completion_gate_message(
+                        result=gate_result,
+                        turn_id=turn.turn_id,
+                        attempt_id=turn.attempt_id,
+                        task_id=active_task_id,
+                    )
 
             if self.task_manager is not None and active_task_id:
                 await self._finalize_task(
                     active_task_id,
                     stop_reason,
-                    preserve_successful_completion=coding_completion_proposed,
                 )
 
             # Non-terminal accounting events must precede the durable terminal.
@@ -1369,6 +1391,39 @@ class AgentLoop:
         self.completion_controller = controller
         return controller
 
+    def _ensure_completion_gate(self) -> CompletionGate | None:
+        """Build the fail-closed Gate from the existing DB repositories."""
+        gate = self.completion_gate
+        if gate is not None:
+            return gate
+        if self.db is None or self.task_manager is None:
+            return None
+
+        from khaos.agent.control.completion_gate import CompletionGate
+
+        goal_spec_repository = getattr(
+            self.task_manager,
+            "goal_spec_repository",
+            None,
+        )
+        if goal_spec_repository is None:
+            goal_spec_repository = getattr(self.db, "goal_spec_repository", None)
+        decision_repository = getattr(
+            self.db,
+            "completion_decision_repository",
+            None,
+        )
+        if goal_spec_repository is None or decision_repository is None:
+            return None
+        gate = CompletionGate(
+            decision_repository=decision_repository,
+            goal_spec_repository=goal_spec_repository,
+            principal_id=self.principal_id,
+            project_id=self.project_id,
+        )
+        self.completion_gate = gate
+        return gate
+
     async def _propose_completion(
         self,
         *,
@@ -1430,6 +1485,52 @@ class AgentLoop:
         await turn.emit("completion.evaluated", payload)
         return result
 
+    async def _evaluate_completion_gate(
+        self,
+        *,
+        turn: Any,
+        task_id: str,
+        decision_id: str,
+    ) -> CompletionGateResult:
+        """Run the Gate after a recorded proposal and emit its bounded event."""
+        from khaos.agent.control.completion_gate import (
+            CompletionGateResult,
+            CompletionGateStatus,
+        )
+
+        gate = self._ensure_completion_gate()
+        if gate is None:
+            result = CompletionGateResult(
+                status=CompletionGateStatus.ERROR,
+                decision_id=decision_id,
+                decision_digest=None,
+                task_status=None,
+                reason="completion gate is unavailable",
+            )
+        else:
+            result = await gate.evaluate(decision_id)
+        if (
+            result.status is CompletionGateStatus.COMPLETED
+            and self.task_manager is not None
+        ):
+            # The Gate owns the durable SQL projection.  Keep this loop's
+            # cache aligned before the post-turn skill/trace projection can
+            # persist anything, even when a caller supplied a Gate without
+            # its optional cache sink.
+            await self.task_manager.reflect_gate_completion(task_id)
+        await turn.emit(
+            "completion.gated",
+            {
+                "task_id": task_id,
+                "decision_id": result.decision_id,
+                "decision_digest": result.decision_digest,
+                "gate_status": result.status.value,
+                "resulting_task_status": result.task_status,
+                **({"reason": result.reason} if result.reason else {}),
+            },
+        )
+        return result
+
     @staticmethod
     def _completion_result_message(
         *,
@@ -1460,6 +1561,34 @@ class AgentLoop:
             role="system",
             content="completion proposal evaluated",
             event="completion_evaluated",
+            metadata=metadata,
+            created_at=time.time(),
+        )
+
+    @staticmethod
+    def _completion_gate_message(
+        *,
+        result: CompletionGateResult,
+        turn_id: str,
+        attempt_id: str,
+        task_id: str,
+    ) -> Message:
+        """Expose a bounded passive Gate result to turn consumers."""
+        metadata: dict[str, Any] = {
+            "task_id": task_id,
+            "turn_id": turn_id,
+            "attempt_id": attempt_id,
+            "status": result.status.value,
+            "decision_id": result.decision_id,
+            "decision_digest": result.decision_digest,
+            "task_status": result.task_status,
+        }
+        if result.reason:
+            metadata["reason"] = result.reason
+        return Message(
+            role="system",
+            content="completion gate evaluated",
+            event="completion_gated",
             metadata=metadata,
             created_at=time.time(),
         )
@@ -1504,10 +1633,13 @@ class AgentLoop:
         self,
         task_id: str,
         stop_reason: str | None,
-        *,
-        preserve_successful_completion: bool = False,
     ) -> None:
-        """Apply task semantics while keeping proposals passive when requested."""
+        """Apply non-success terminal semantics after a turn.
+
+        Successful coding-task projection is intentionally absent here.  The
+        Completion Gate is the sole control-plane owner of COMPLETE ->
+        ``TaskStatus.COMPLETED``.
+        """
         from khaos.coding.task_manager import TaskStatus
         from khaos.coding.verify_fix import VerificationState
 
@@ -1536,10 +1668,8 @@ class AgentLoop:
                     TaskStatus.FAILED,
                     error="latest verification is failing; task did not complete",
                 )
-            elif not preserve_successful_completion:
-                await self.task_manager.update_status(task_id, TaskStatus.COMPLETED)
-        elif not preserve_successful_completion:
-            await self.task_manager.update_status(task_id, TaskStatus.COMPLETED)
+            # A passing/unknown verification result does not authorize task
+            # completion. The Gate owns the successful lifecycle projection.
         await self._analyze_task_skill(task_id)
         task = await self.task_manager.get(task_id)
         await self._record_memory_runtime_event(
@@ -1556,9 +1686,9 @@ class AgentLoop:
                     getattr(task, "status", ""),
                 ),
                 "rationale": (
-                    "completion proposed"
-                    if preserve_successful_completion
-                    else stop_reason or "task completed"
+                    "turn finalized; completion projection is Gate-owned"
+                    if stop_reason == StopReason.END_TURN.value
+                    else stop_reason or "turn finalized"
                 ),
             },
             source_type="TASK",

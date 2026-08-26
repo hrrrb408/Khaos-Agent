@@ -1665,6 +1665,7 @@ async def build_runtime(
         CompletionProposalController,
         EmptyCompletionFactProvider,
     )
+    from khaos.agent.control.completion_gate import CompletionGate
 
     goal_spec_repository = getattr(task_manager, "goal_spec_repository", None)
     if goal_spec_repository is None:
@@ -1683,6 +1684,15 @@ async def build_runtime(
         principal_id=cfg.principal_id,
         project_id=project_id,
         fact_provider=fact_provider,
+    )
+    # The production authority policy is intentionally the Gate's fail-closed
+    # default. RuntimeConfig exposes no arbitrary authority-policy injection;
+    # trusted evidence composition belongs to its designated later batch.
+    completion_gate = CompletionGate(
+        decision_repository=decision_repository,
+        goal_spec_repository=goal_spec_repository,
+        principal_id=cfg.principal_id,
+        project_id=project_id,
     )
     loop = AgentLoop(
         cfg.agent_config or AgentConfig(), mode_manager, router, cfg.db,
@@ -1729,6 +1739,7 @@ async def build_runtime(
         subagent_spawner=cfg.subagent_spawner,
         credential_broker=credential_broker,
         completion_controller=completion_controller,
+        completion_gate=completion_gate,
         # M4 batch 3.1.16A-5-1b (CRITICAL): carry the RPC-verified
         # project identity into the AgentLoop so every message / turn
         # write is stamped with it.  ``self._bound_project_id`` (set

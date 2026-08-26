@@ -44,7 +44,7 @@ async def test_latest_failing_verification_cannot_complete_on_end_turn():
     assert (await manager.get(task.id)).status == TaskStatus.FAILED
 
 
-async def test_latest_pass_after_repair_budget_keeps_task_completed():
+async def test_latest_pass_after_repair_budget_stays_gate_owned():
     manager = TaskManager()
     task = await manager.create("work")
     verify_fix = VerifyFixLoop(max_fix_attempts=3)
@@ -68,7 +68,10 @@ async def test_latest_pass_after_repair_budget_keeps_task_completed():
     loop.skill_generator = None
     await loop._finalize_task(task.id, StopReason.END_TURN.value)
 
-    assert (await manager.get(task.id)).status == TaskStatus.COMPLETED
+    # M7.1.7 removes the legacy successful finalizer write.  A passing latest
+    # observation is preserved by VerifyFixLoop, but only CompletionGate may
+    # project a COMPLETE decision onto TaskStatus.COMPLETED.
+    assert (await manager.get(task.id)).status is not TaskStatus.COMPLETED
 
 
 def test_verify_fix_instances_do_not_share_state():
