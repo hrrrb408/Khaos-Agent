@@ -407,6 +407,63 @@ orchestration_boundaries:
     - TurnFinalizer
     - ToolPhaseCoordinator
   decomposition_status: incremental_in_progress
+architecture_junctions:
+  status: incremental_owner_split_with_explicit_compatibility_boundaries
+  grpc:
+    status: ALREADY_SATISFIED
+    transport_owner: python/khaos/grpc_server.py:serve_json_lines
+    authenticator_owner: python/khaos/rpc/protocol.py:GatewayRPCAuthenticator
+    bootstrap_owner: python/khaos/grpc_server.py:serve_json_lines
+    composition_owner: python/khaos/rpc/composition.py
+    lifecycle_owner: python/khaos/grpc_server.py:serve_json_lines
+    service_owners:
+      agent: python/khaos/rpc/agent_service.py:AgentService
+      task: python/khaos/rpc/task_service.py:TaskService
+      models: python/khaos/rpc/models.py
+    security_invariants_preserved:
+      - instance_lock
+      - safe_run_dir
+      - O_NOFOLLOW
+      - inode_revalidation
+      - UDS_peer_verification
+      - capability_auth
+      - RPC_Initialize_negotiation
+      - bootstrap_policy_digest
+      - bounded_shutdown
+    regression_tests:
+      - python/tests/runtime/test_rpc_service_boundaries.py
+      - python/tests/security/test_rpc_protocol_boundary.py
+      - python/tests/security/test_rpc_negotiation.py
+  database:
+    status: COMPATIBILITY_MIGRATION_REMAINING
+    connection_owner: python/khaos/db/connection.py:DatabaseConnection
+    migration_owner: python/khaos/db/database.py:Database.run_migrations
+    repository_owner_root: python/khaos/db/repositories/
+    facade_rule: compatibility_methods_only_new_domain_sql_forbidden
+    regression_tests:
+      - python/tests/db/test_connection_boundary.py
+      - python/tests/db/test_scheduler_repository_boundary.py
+      - python/tests/db/test_static_gate_transaction_authority.py
+  tool_scheduler:
+    status: ALREADY_SATISFIED
+    orchestration_owner: python/khaos/tools/scheduler.py:ToolScheduler
+    admission_owner: python/khaos/tools/admission.py:ToolAdmission
+    authorization_owner: python/khaos/tools/authorization.py:ToolAuthorization
+    execution_owner: python/khaos/tools/execution_coordinator.py:ToolExecutionCoordinator
+    terminal_owner: python/khaos/tools/result_finalizer.py:ToolResultFinalizer
+    phase_owner: python/khaos/security/orchestration_phases.py:ToolPhaseSnapshot
+    regression_tests:
+      - python/tests/tools/test_scheduler_boundaries.py
+      - python/tests/security/test_orchestration_phases.py
+      - python/tests/security/test_tool_scheduler_state_contract.py
+  cron_scheduler:
+    status: ALREADY_SATISFIED
+    lifecycle_owner: python/khaos/scheduler/engine.py:CronEngine
+    execution_owner: python/khaos/scheduler/execution.py:SchedulerExecution
+    recovery_owner: python/khaos/scheduler/recovery.py:SchedulerRecovery
+    persistence_owner: python/khaos/scheduler/repository.py:ScheduledTaskRepository
+    regression_tests:
+      - python/tests/scheduler/test_scheduler_owner_boundaries.py
 evidence:
   local_platform_sandbox: diagnostic_only
   required_linux_proof: real_kernel_ci
