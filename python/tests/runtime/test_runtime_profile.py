@@ -93,6 +93,7 @@ def test_production_rpc_still_requires_protocol_metadata_when_dev_env_is_set(
         )
 
 
+@pytest.mark.posix_host
 def test_community_local_production_still_validates_trusted_root_when_dev_env_is_set(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
