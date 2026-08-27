@@ -5000,9 +5000,10 @@ class Database:
 
         M7.1.8 reuses the existing durable turn-event ledger rather than
         introducing a second gate-history table.  The task/owner predicates
-        are applied to ``agent_turns`` before the bounded event payload is
-        handed to the recovery decoder; the decoder, not this generic DB
-        facade, owns the event payload schema.
+        are applied to ``agent_turns`` before a bounded newest tail is handed
+        to the recovery decoder; oversized bodies are replaced by an empty
+        transport value plus their byte count.  The decoder, not this
+        generic DB facade, owns the event payload schema.
         """
         if type(task_id) is not str or not task_id:
             raise ValueError("task_id must be a non-empty string")
@@ -5011,6 +5012,7 @@ class Database:
         if type(project_id) is not str:
             raise ValueError("project_id must be a string")
         from khaos.agent.control.completion_recovery import (
+            MAX_COMPLETION_GATE_HISTORY_RECORDS,
             MAX_COMPLETION_GATE_PAYLOAD_BYTES,
             CompletionGateHistoryRecord,
         )
@@ -5020,25 +5022,38 @@ class Database:
             cursor = await conn.execute(
                 """
                 SELECT t.turn_id, t.attempt_id, t.task_id, t.started_at,
-                       e.sequence, e.event_type, e.payload_json, e.created_at
+                       e.sequence, e.event_type,
+                       CASE
+                           WHEN length(CAST(e.payload_json AS BLOB)) <= ?
+                           THEN e.payload_json
+                           ELSE ''
+                       END AS payload_json,
+                       COALESCE(length(CAST(e.payload_json AS BLOB)), -1)
+                           AS payload_bytes,
+                       e.created_at
                 FROM agent_turns AS t
                 JOIN agent_turn_events AS e ON e.turn_id = t.turn_id
                 WHERE t.task_id = ?
                   AND t.principal_id = ?
                   AND t.project_id = ?
                   AND e.event_type = 'completion.gated'
-                  AND length(CAST(e.payload_json AS BLOB)) <= ?
-                ORDER BY e.created_at ASC, t.started_at ASC,
-                         t.turn_id ASC, e.sequence ASC
+                ORDER BY e.created_at DESC, t.started_at DESC,
+                         t.turn_id DESC, e.sequence DESC
+                LIMIT ?
                 """,
                 (
+                    MAX_COMPLETION_GATE_PAYLOAD_BYTES,
                     task_id,
                     principal_id,
                     project_id,
-                    MAX_COMPLETION_GATE_PAYLOAD_BYTES,
+                    MAX_COMPLETION_GATE_HISTORY_RECORDS,
                 ),
             )
             rows = await cursor.fetchall()
+        # The query reads the newest bounded tail so a current gate result is
+        # retained while memory use remains fixed.  Restore chronological
+        # order for callers that inspect the history deterministically.
+        rows.reverse()
         return tuple(
             CompletionGateHistoryRecord(
                 turn_id=row["turn_id"],
@@ -5047,6 +5062,7 @@ class Database:
                 event_sequence=row["sequence"],
                 event_type=row["event_type"],
                 payload_json=row["payload_json"],
+                payload_bytes=row["payload_bytes"],
                 created_at=row["created_at"],
                 turn_started_at=row["started_at"],
             )

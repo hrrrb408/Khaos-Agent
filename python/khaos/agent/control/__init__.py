@@ -60,6 +60,7 @@ from khaos.agent.control.completion_gate_repository import (
     CompletionProjectionStatus,
 )
 from khaos.agent.control.completion_recovery import (
+    MAX_COMPLETION_GATE_HISTORY_RECORDS,
     MAX_COMPLETION_GATE_PAYLOAD_BYTES,
     CompletionContinuationState,
     CompletionGateHistoryEntry,
@@ -116,6 +117,7 @@ __all__ = [
     "GOAL_REQUIREMENT_SCHEMA_KEYS",
     "GOAL_SPEC_SCHEMA_VERSION",
     "LEGAL_COGNITIVE_TRANSITIONS",
+    "MAX_COMPLETION_GATE_HISTORY_RECORDS",
     "MAX_COMPLETION_GATE_PAYLOAD_BYTES",
     "AcceptanceCriterion",
     "AgentCognitiveState",

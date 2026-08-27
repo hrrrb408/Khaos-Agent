@@ -31,6 +31,11 @@ from khaos.agent.control.state import AgentCognitiveState
 _MAX_ID_LENGTH = 512
 _MAX_REASON_LENGTH = 512
 MAX_COMPLETION_GATE_PAYLOAD_BYTES = 4096
+# Recovery reads only a bounded tail of the existing turn ledger.  A current
+# decision's gate event is expected to be in this tail; if it is not, the
+# absence of a usable matching event is conservative and requires a fresh
+# evaluation rather than replaying old history.
+MAX_COMPLETION_GATE_HISTORY_RECORDS = 256
 
 _TASK_STATUSES = frozenset(
     {
@@ -91,9 +96,12 @@ class CompletionContinuationState(str, Enum):
 class CompletionGateHistoryRecord:
     """Owner-scoped raw record returned by the existing turn-event ledger.
 
-    The database adapter returns the bounded event payload as text.  The
-    recovery layer performs strict shape and binding validation before the
-    record can influence continuation interpretation.
+    The database adapter returns the payload only when it is within the
+    bounded byte budget and always reports its original byte count.  An
+    over-limit row is represented without its body so recovery can reject it
+    without materializing an unbounded event.  The recovery layer performs
+    strict shape and binding validation before the record can influence
+    continuation interpretation.
     """
 
     turn_id: str
@@ -104,6 +112,7 @@ class CompletionGateHistoryRecord:
     payload_json: str
     created_at: float
     turn_started_at: float
+    payload_bytes: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,6 +147,15 @@ class CompletionGateHistoryEntry:
         if record.event_type != "completion.gated":
             return None
         if type(record.payload_json) is not str:
+            return None
+        payload_bytes = (
+            len(record.payload_json.encode("utf-8"))
+            if record.payload_bytes is None
+            else record.payload_bytes
+        )
+        if type(payload_bytes) is not int or payload_bytes < 0:
+            return None
+        if payload_bytes > MAX_COMPLETION_GATE_PAYLOAD_BYTES:
             return None
         if len(record.payload_json.encode("utf-8")) > MAX_COMPLETION_GATE_PAYLOAD_BYTES:
             return None
@@ -602,13 +620,23 @@ class CompletionRecoveryService:
         if type(records) is not tuple:
             return _integrity_state(task_id, "completion gate history has invalid type")
 
-        decoded_entries = tuple(
-            entry
-            for record in records
-            for entry in (CompletionGateHistoryEntry.from_record(record),)
-            if entry is not None
+        decoded_entries: list[CompletionGateHistoryEntry] = []
+        malformed_history = False
+        for record in records:
+            entry = CompletionGateHistoryEntry.from_record(record)
+            if entry is None:
+                # Never discard a malformed newer event and fall back to an
+                # older usable gate result.  The event ledger is history, not
+                # a bearer capability; ambiguous history requires a fresh
+                # evaluation.
+                malformed_history = True
+                continue
+            decoded_entries.append(entry)
+        latest_gate = (
+            None
+            if malformed_history
+            else _latest_gate_for_decision(tuple(decoded_entries), latest)
         )
-        latest_gate = _latest_gate_for_decision(decoded_entries, latest)
         return CompletionRecoveryResolver.resolve(
             current_task_snapshot=snapshot,
             latest_completion_decision=latest,
@@ -760,6 +788,7 @@ def _finite_number(value: object) -> bool:
 
 
 __all__ = [
+    "MAX_COMPLETION_GATE_HISTORY_RECORDS",
     "MAX_COMPLETION_GATE_PAYLOAD_BYTES",
     "CompletionContinuationState",
     "CompletionGateHistoryEntry",

@@ -1,4 +1,4 @@
-"""M7.1.8 durable completion continuation and restart-recovery tests."""
+"""M7.1.8/M7.1.9 durable completion recovery and closure tests."""
 
 from __future__ import annotations
 
@@ -26,6 +26,7 @@ from khaos.agent.control.completion_gate import (
     CompletionGateStatus,
 )
 from khaos.agent.control.completion_recovery import (
+    MAX_COMPLETION_GATE_HISTORY_RECORDS,
     MAX_COMPLETION_GATE_PAYLOAD_BYTES,
     CompletionContinuationState,
     CompletionRecoveryService,
@@ -149,11 +150,12 @@ async def _record_gate_event(
     project_id: str = "project-a",
     resulting_task_status: str | None = None,
     payload_override: dict[str, object] | None = None,
+    now: float | None = None,
 ) -> None:
     """Append a bounded gate event through the existing turn ledger."""
     turn_id = f"turn-{uuid.uuid4().hex}"
     session_id = f"session-{uuid.uuid4().hex}"
-    now = 1000.0 + len(turn_id)
+    event_now = 1000.0 + len(turn_id) if now is None else now
     await db.create_session(
         session_id,
         mode="coding",
@@ -166,7 +168,7 @@ async def _record_gate_event(
         session_id=session_id,
         task_id=task.id,
         payload={"task_id": task.id},
-        now=now,
+        now=event_now,
         principal_id=principal_id,
         project_id=project_id,
     )
@@ -182,14 +184,14 @@ async def _record_gate_event(
         expected_sequence=1,
         event_type="completion.gated",
         payload=payload,
-        now=now + 1,
+        now=event_now + 1,
     )
     await db.append_agent_turn_event(
         turn_id=turn_id,
         expected_sequence=2,
         event_type="turn.completed",
         payload={},
-        now=now + 2,
+        now=event_now + 2,
         terminal_status="completed",
     )
 
@@ -495,6 +497,48 @@ async def test_malformed_gate_history_is_ignored_as_authority(
 
 
 @pytest.mark.asyncio
+async def test_newer_malformed_gate_history_cannot_fall_back_to_older_valid_result(
+    tmp_path: Path,
+) -> None:
+    db = await _make_db(tmp_path / "malformed-newer-gate-history.db")
+    try:
+        _manager, task = await _create_running_task(db)
+        decision = await _record_decision(db, task)
+        await _record_gate_event(
+            db,
+            task,
+            decision_id=decision.decision_id,
+            decision_digest=decision.decision_digest,
+            gate_status=CompletionGateStatus.AUTHORITY_INSUFFICIENT,
+            now=1000.0,
+        )
+        await _record_gate_event(
+            db,
+            task,
+            decision_id=decision.decision_id,
+            decision_digest=decision.decision_digest,
+            gate_status=CompletionGateStatus.AUTHORITY_INSUFFICIENT,
+            payload_override={
+                "task_id": task.id,
+                "decision_id": decision.decision_id,
+                "decision_digest": decision.decision_digest,
+                "gate_status": "malformed-status",
+                "resulting_task_status": None,
+            },
+            now=2000.0,
+        )
+
+        recovered = await _recovery_service(db).recover(task.id)
+
+        assert recovered is not None
+        assert recovered.continuation_state is CompletionContinuationState.REEVALUATION_REQUIRED
+        assert recovered.gate_status is None
+        assert "no current gate result" in recovered.reason
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_oversized_gate_history_is_ignored_as_authority(
     tmp_path: Path,
 ) -> None:
@@ -524,6 +568,68 @@ async def test_oversized_gate_history_is_ignored_as_authority(
         assert recovered is not None
         assert recovered.continuation_state is CompletionContinuationState.REEVALUATION_REQUIRED
         assert recovered.gate_status is None
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_gate_history_reads_only_a_bounded_newest_tail(tmp_path: Path) -> None:
+    db = await _make_db(tmp_path / "bounded-gate-history.db")
+    try:
+        _manager, task = await _create_running_task(db)
+        session_id = "bounded-history-session"
+        await db.create_session(
+            session_id,
+            mode="coding",
+            principal_id="alice",
+            project_id="project-a",
+        )
+        total = MAX_COMPLETION_GATE_HISTORY_RECORDS + 17
+        payload = json.dumps(
+            {
+                "task_id": task.id,
+                "decision_id": "history-decision",
+                "decision_digest": "d" * 64,
+                "gate_status": CompletionGateStatus.NOT_COMPLETE.value,
+                "resulting_task_status": TaskStatus.RUNNING.value,
+            },
+            sort_keys=True,
+        )
+        async with db.transaction() as conn:
+            for index in range(total):
+                turn_id = f"bounded-history-turn-{index}"
+                await conn.execute(
+                    """
+                    INSERT INTO agent_turns(
+                        turn_id, attempt_id, session_id, task_id, status,
+                        last_sequence, started_at, principal_id, project_id
+                    ) VALUES (?, ?, ?, ?, 'completed', 2, ?, ?, ?)
+                    """,
+                    (
+                        turn_id,
+                        f"bounded-history-attempt-{index}",
+                        session_id,
+                        task.id,
+                        float(index),
+                        "alice",
+                        "project-a",
+                    ),
+                )
+                await conn.execute(
+                    "INSERT INTO agent_turn_events VALUES (?, 2, 'completion.gated', ?, ?)",
+                    (turn_id, payload, float(index)),
+                )
+
+        records = await db.list_completion_gate_history(
+            task.id,
+            principal_id="alice",
+            project_id="project-a",
+        )
+
+        assert len(records) == MAX_COMPLETION_GATE_HISTORY_RECORDS
+        assert records[0].created_at == float(total - MAX_COMPLETION_GATE_HISTORY_RECORDS)
+        assert records[-1].created_at == float(total - 1)
+        assert all(record.payload_bytes == len(payload.encode("utf-8")) for record in records)
     finally:
         await db.close()
 
