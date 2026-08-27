@@ -153,6 +153,22 @@ TaskManager restart semantics remain unchanged.  Subsequent workspace or
 task mutations make a previously bound plan stale for future consumers; M7.3
 does not silently relabel old evidence as fresh.
 
+Live manager construction has separate semantics from restart loading.
+`TaskService` bootstraps a secondary `TaskManager` through the explicit
+`hydrate_projection()` read path, which uses the strict persisted-task decoder
+but preserves the physical `TaskStatus` and performs no write.  The regular
+`load()` path remains reserved for process-restart recovery and may apply the
+existing interrupted-active-task `ACTIVE -> BLOCKED` mutation.  This fence is
+important because constructing another live manager must not interrupt a task
+owned by an already-running runtime.
+
+When a task is physically `IMPLEMENTING`, the published plan identity is the
+only current implementation-plan projection.  If that identity is absent,
+AgentLoop exposes a bounded legacy/unpublished integrity fact and does not
+project the latest planning-history head as the current plan.  The latest
+revision remains available only as history; it is never silently promoted to
+execution context.
+
 ## Compatibility and deferred work
 
 The legacy `ImplementationPlan`/path-based planner API remains available for

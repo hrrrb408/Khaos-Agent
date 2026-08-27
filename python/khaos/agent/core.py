@@ -14,6 +14,8 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
+from khaos.agent.control.state import AgentCognitiveState
+
 if TYPE_CHECKING:
     from khaos.agent.control.completion_flow import (
         CompletionFactProvider,
@@ -2098,11 +2100,28 @@ class AgentLoop:
                     latest_plan.plan_revision_id if latest_plan is not None else None
                 )
                 facts["published_plan_revision_id"] = published_plan_revision_id
-                selected_plan = (
-                    published_plan
-                    if published_plan_revision_id is not None
-                    else latest_plan
+                is_implementing = (
+                    current_plan_snapshot is not None
+                    and current_plan_snapshot.cognitive_state
+                    is AgentCognitiveState.IMPLEMENTING
                 )
+                if is_implementing and published_plan_revision_id is None:
+                    # An IMPLEMENTING task must have a durable publication
+                    # identity.  The latest history head is not an
+                    # implementation-plan authority and must not be
+                    # projected into the current-plan fact when the
+                    # publication projection is absent.
+                    facts["planning_integrity"] = (
+                        "legacy_unpublished_implementation_plan"
+                    )
+                    facts["plan_revision_source"] = "none"
+                    selected_plan = None
+                else:
+                    selected_plan = (
+                        published_plan
+                        if published_plan_revision_id is not None
+                        else latest_plan
+                    )
                 if published_plan_revision_id is not None and published_plan is None:
                     facts["planning_integrity"] = "unavailable"
                 elif selected_plan is not None:

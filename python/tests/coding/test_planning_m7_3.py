@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import sqlite3
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from khaos.agent import AgentConfig, AgentLoop
 from khaos.agent.control.goal import GoalSpec
 from khaos.agent.control.state import AgentCognitiveState
 from khaos.coding.intelligence.context import (
@@ -663,6 +665,74 @@ async def test_planning_coordinator_publishes_ready_without_task_lifecycle_autho
             project_id=PROJECT,
         )
         assert current[0]["status"] == TaskStatus.RUNNING.value
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_does_not_project_latest_as_current_without_publication(
+    tmp_path: Path,
+) -> None:
+    """IMPLEMENTING without a published identity is an explicit integrity fact."""
+    database, manager, task = await _make_task_database(
+        tmp_path / "unpublished-implementation.db"
+    )
+    try:
+        planning = await _enter_planning_for_publication_test(database, task.id)
+        goal_spec = await manager.goal_spec_repository.get_for_task(
+            task.id,
+            principal_id=OWNER,
+            project_id=PROJECT,
+        )
+        assert goal_spec is not None
+        revision = _build_revision(
+            goal_spec=goal_spec,
+            task_id=task.id,
+            documents=(_document("foo.py", "def target():\n    return 1\n"),),
+            target_files=("foo.py",),
+            cognitive_state=planning.cognitive_state,
+            control_state_version=planning.control_state_version,
+            task_status=planning.task_status,
+        )
+        stored = await database.plan_revision_repository.append(
+            revision,
+            principal_id=OWNER,
+            project_id=PROJECT,
+        )
+
+        # Deliberately perform only the legal cognitive CAS, not the planning
+        # publication operation.  This models a legacy/unpublished row with a
+        # real latest history entry and must not make that entry current.
+        transition = await database.agent_control_state_repository.compare_and_transition(
+            task.id,
+            principal_id=OWNER,
+            project_id=PROJECT,
+            expected_state=planning.cognitive_state,
+            expected_version=planning.control_state_version,
+            target_state=AgentCognitiveState.IMPLEMENTING,
+            expected_task_status=planning.task_status,
+        )
+        assert transition.updated
+        await manager.refresh_projection(task.id)
+
+        loop = AgentLoop(
+            AgentConfig(),
+            mode_manager=object(),
+            router=object(),
+            db=database,
+            task_manager=manager,
+            principal_id=OWNER,
+            project_id=PROJECT,
+        )
+        facts = await loop._build_durable_task_facts(task.id)
+        payload = json.loads(facts[0].content.removeprefix("# Durable Task Facts\n"))
+        assert payload["latest_plan_revision_id"] == stored.plan_revision_id
+        assert payload["published_plan_revision_id"] is None
+        assert payload["planning_integrity"] == (
+            "legacy_unpublished_implementation_plan"
+        )
+        assert payload["plan_revision_source"] == "none"
+        assert "plan_revision" not in payload
     finally:
         await database.close()
 

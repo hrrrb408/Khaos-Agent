@@ -106,7 +106,12 @@ class TaskService:
                     db=self.db, principal_id=ctx.principal_id,
                     project_id=ctx.project_id,
                 )
-                await manager.load()
+                # This is construction of a live secondary manager, not
+                # process-restart recovery.  ``load()`` would persist
+                # ACTIVE -> BLOCKED and could interrupt another runtime's
+                # task.  Hydration only decodes the physical owner-scoped
+                # projection and preserves its lifecycle status exactly.
+                await manager.hydrate_projection()
                 self._managers[key] = manager
             else:
                 # Move to end (most-recently-used).

@@ -106,7 +106,7 @@
 - `python/khaos/runtime_profile.py`: `1015564e2a18975a2767d949bb9471b6976968bf9e437d279aa6dd57ae8ce79a`
 - `python/khaos/rpc/models.py`: `3173ba3356d970604df7540af92c1d96e8777813292bb1dab26e142bc572228e`
 - `python/khaos/rpc/agent_service.py`: `42f254c703a02dda2db570a09add233d81ccad98559ebe0b3afe9f99c2b1a38a`
-- `python/khaos/rpc/task_service.py`: `03615243a21e7ea2ec3c0edb4ade35168825ff32362fbc19c2f9249056f34f97`
+- `python/khaos/rpc/task_service.py`: `0d1ac12ca29f6f5b16186d1be2f2b2877e87d7b1fe2573f1e584914ec835e98c`
 - `python/khaos/rpc/composition.py`: `bb174346c85c4df4b3b352c99bdf3cf4558fe237da3dacadfb8a1543c6f8dd3b`
 - `rust/khaos-core/src/bin/khaos-exec-launcher.rs`: `c5eb7343002ecb7f74e1ca10df5d5edaf4de39f90ecc68064cb355b56b2fda71`
 - `rust/khaos-core/src/bin/khaos-sandbox-launcher.rs`: `ff2cd158b0c909c20880c3c56a07615d11af7db24d6df84505a9259820bd6190`
@@ -115,7 +115,7 @@
 - `go/cmd/gateway/main.go`: `5c27479e8ef5ffa3c05008077e12e89e4f274d4255765606b3ee91d04df56481`
 - `go/internal/platform/python_client.go`: `1bb725121e13cece0ea49360de7fc52b7b0f38707189c5b58fbf8037f9324390`
 - `go/internal/platform/rpc_contract.go`: `85a24e13654bb8957dace5b8a04d9c99979ddd3092d4dcfae5fae67d58721d54`
-- `scripts/generate_production_reachability.py`: `c624cee49c1649abd3117460474b6486eafb3142bf0ec7879f46a91bdc0072b9`
+- `scripts/generate_production_reachability.py`: `20235c8b2a4ea90768492c39bd8358d3b7d9e1c31dfd20db1439a6c549f665ff`
 - `packaging/macos/khaos-authorityd-xpc.m`: `6b9d18f13fd280a8819e88a4cccc96fcda5e34f52b40cf2940d5264667200855`
 - `packaging/macos/khaos-authorityd-xpc-client.c`: `3c751b9936b8665140f68466af9b77138efd538cb3b41f3687b3135b595a9f8d`
 - `rust/khaos-core/src/bin/khaos-authorityd-windows.rs`: `4a80c965d472c5d35a1350f24c725a4b313b6eb1debee0e5b5dc486dc287d63f`

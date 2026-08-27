@@ -549,6 +549,32 @@ class TaskManager:
             self._tasks[task.id] = task
             await self._persist(task, expected_status=loaded_status)
 
+    async def hydrate_projection(self) -> None:
+        """Populate this manager from the current durable task projection.
+
+        This is the live-manager bootstrap path and is deliberately distinct
+        from :meth:`load`.  It uses the same strict row decoder, but it never
+        applies process-restart semantics and never persists a row.  A
+        secondary RPC manager can therefore observe active tasks without
+        turning its construction into a restart event for another runtime.
+        """
+        if self._db is None:
+            return
+        if self._goal_spec_repository is None:
+            raise GoalSpecIntegrityError(
+                "durable task hydration requires a GoalSpec repository"
+            )
+        async with self._lock:
+            hydrated: dict[str, CodingTask] = {}
+            for data in await self._db.list_coding_tasks(
+                principal_id=self._principal_id,
+                project_id=self._project_id,
+            ):
+                task, _loaded_status = await self._decode_persisted_task(data)
+                hydrated[task.id] = task
+            self._tasks.clear()
+            self._tasks.update(hydrated)
+
     async def refresh_projection(self, task_id: str) -> CodingTask | None:
         """Refresh one cached task from durable state without lifecycle writes.
 

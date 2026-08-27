@@ -262,6 +262,111 @@ async def test_task_service_only_approves_or_rejects_blocked_tasks(tmp_path):
     await db.close()
 
 
+async def test_task_service_live_manager_hydration_preserves_active_task(
+    tmp_path, monkeypatch
+):
+    """A secondary service manager must not apply restart semantics."""
+    from khaos.coding.task_manager import TaskManager, TaskStatus, TransitionResult
+
+    db = Database(tmp_path / "task-live-hydration-test.db")
+    await db.connect()
+    await db.run_migrations()
+    ctx = RequestContext(
+        principal_id="principal",
+        project_id="project-a",
+        source_transport="test",
+    )
+    manager_a = TaskManager(
+        db=db,
+        principal_id="principal",
+        project_id="project-a",
+    )
+    task = await manager_a.create("keep active during live manager bootstrap")
+    service = TaskService(db)
+    persistence_calls: list[dict[str, object]] = []
+    original_update = db.update_coding_task
+
+    async def record_update(
+        task_data: dict[str, object], *, principal_id: str, project_id: str,
+        expected_status: str,
+    ) -> None:
+        persistence_calls.append(
+            {
+                "task_id": task_data["id"],
+                "principal_id": principal_id,
+                "project_id": project_id,
+                "expected_status": expected_status,
+            }
+        )
+        await original_update(
+            task_data,
+            principal_id=principal_id,
+            project_id=project_id,
+            expected_status=expected_status,
+        )
+
+    monkeypatch.setattr(db, "update_coding_task", record_update)
+
+    # Exercise all read/approval entry points that can construct manager B.
+    listed = await service.list(ctx)
+    fetched = await service.get(ctx, task.id)
+    approval = await service.approve(ctx, task.id)
+
+    assert listed[0]["status"] == TaskStatus.PENDING.value
+    assert fetched["status"] == TaskStatus.PENDING.value
+    assert approval["ok"] is False
+    assert persistence_calls == []
+    physical = await db.list_coding_tasks(
+        principal_id="principal", project_id="project-a"
+    )
+    assert physical[0]["status"] == TaskStatus.PENDING.value
+
+    # Manager A still owns the unchanged lifecycle snapshot and can perform
+    # its next legal CAS; B's construction did not create a stale write.
+    assert (
+        await manager_a.update_status(task.id, TaskStatus.RUNNING)
+    ) is TransitionResult.UPDATED
+    assert len(persistence_calls) == 1
+    physical = await db.list_coding_tasks(
+        principal_id="principal", project_id="project-a"
+    )
+    assert physical[0]["status"] == TaskStatus.RUNNING.value
+    await db.close()
+
+
+async def test_task_manager_load_retains_process_restart_blocking_semantics(tmp_path):
+    """The explicit restart path still blocks an interrupted active task."""
+    from khaos.coding.task_manager import TaskManager, TaskStatus
+
+    db = Database(tmp_path / "task-restart-load-test.db")
+    await db.connect()
+    await db.run_migrations()
+    manager = TaskManager(
+        db=db,
+        principal_id="principal",
+        project_id="project-a",
+    )
+    task = await manager.create("restart safety")
+    assert (
+        await manager.update_status(task.id, TaskStatus.RUNNING)
+    ).value == "updated"
+
+    restarted = TaskManager(
+        db=db,
+        principal_id="principal",
+        project_id="project-a",
+    )
+    await restarted.load()
+    loaded = await restarted.get(task.id)
+    assert loaded is not None
+    assert loaded.status is TaskStatus.BLOCKED
+    physical = await db.list_coding_tasks(
+        principal_id="principal", project_id="project-a"
+    )
+    assert physical[0]["status"] == TaskStatus.BLOCKED.value
+    await db.close()
+
+
 async def test_task_approval_is_consumed_before_running_is_observable(tmp_path):
     from khaos.coding.task_manager import TaskManager, TaskStatus
 
