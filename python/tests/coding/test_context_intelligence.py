@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from dataclasses import fields
+from dataclasses import fields, replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -192,6 +192,39 @@ def test_goal_and_repository_binding_mismatch_fails_closed(tmp_path: Path) -> No
                 runtime_id=request.runtime_id,
             ),
             goal,
+        )
+
+
+def test_base_revision_binding_is_exact_and_not_wildcard(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    workspace = _workspace(root)
+    service = ContextIntelligenceService(_WorkspaceManager(workspace))
+    goal = _goal()
+    request = _request(service, workspace, goal)
+
+    service._validate_workspace_binding(request, workspace)
+
+    with pytest.raises(ContextInputError):
+        service._validate_workspace_binding(
+            replace(request, base_revision="other", request_digest=""),
+            workspace,
+        )
+    with pytest.raises(ContextInputError):
+        service._validate_workspace_binding(
+            replace(request, base_revision=None, request_digest=""),
+            workspace,
+        )
+
+    unbound_workspace = _workspace(root, workspace_id="ws-without-base")
+    unbound_workspace.base_sha = None
+    unbound_request = _request(service, unbound_workspace, goal)
+    service._validate_workspace_binding(unbound_request, unbound_workspace)
+
+    with pytest.raises(ContextInputError):
+        service._validate_workspace_binding(
+            replace(unbound_request, base_revision="base-1", request_digest=""),
+            unbound_workspace,
         )
     with pytest.raises(ContextInputError):
         _retrieve(

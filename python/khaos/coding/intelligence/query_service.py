@@ -1119,10 +1119,10 @@ class ContextIntelligenceService:
         if expected_repository != request.repository_id:
             raise ContextInputError("ContextRequest repository identity is stale")
         workspace_base = getattr(workspace, "base_sha", None)
-        if request.base_revision is not None and request.base_revision != workspace_base:
-            raise ContextInputError("ContextRequest base revision is stale")
         if workspace_base is not None and not isinstance(workspace_base, str):
             raise ContextUnavailableError("TaskWorkspace base revision is malformed")
+        if request.base_revision != workspace_base:
+            raise ContextInputError("ContextRequest base revision is stale")
 
     def _retrieve_sync(
         self,

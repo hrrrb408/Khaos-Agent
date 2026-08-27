@@ -33,6 +33,11 @@ files; a file whose identity changes during capture causes a bounded retry or
 an explicit stale result.  Cache hits are additionally checked against the
 current safe file digest.  TTL is not used as a correctness fence.
 
+When a `TaskWorkspace` exposes a base revision, `ContextRequest.base_revision`
+must bind to that revision exactly.  Omitting the request revision is stale or
+invalid; it is not wildcard semantics.  A workspace with no base revision may
+only be queried by a request that also has no base revision.
+
 Mutating tool results invalidate the workspace cache as an optimization, but
 correctness does not depend on that hook: the next request recaptures the
 manifest and rejects a generation or content-digest mismatch.  Delete and
