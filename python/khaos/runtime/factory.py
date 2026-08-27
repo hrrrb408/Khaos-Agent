@@ -21,6 +21,7 @@ from khaos.audit import (
     resolve_safe_audit_log_path,
 )
 from khaos.coding.execution import BackendSelector, ExecutionService
+from khaos.coding.intelligence.query_service import ContextIntelligenceService
 from khaos.coding.task_manager import TaskManager
 from khaos.coding.verify_fix import VerifyFixLoop
 from khaos.coding.workspace.manager import WorkspaceManager
@@ -270,7 +271,6 @@ class ProductionRuntimeConfig:
     mode_manager: ModeManager | None = None
     audit_logger: AuditLogger | None = None
     task_manager: TaskManager | None = None
-    coding_context_builder: Any = None
     agent_config: AgentConfig | None = None
     memory_host: MemoryHost | None = None
     skill_manager: SkillManager | None = None
@@ -314,7 +314,6 @@ class ProductionRuntimeConfig:
             mode_manager=self.mode_manager,
             audit_logger=self.audit_logger,
             task_manager=self.task_manager,
-            coding_context_builder=self.coding_context_builder,
             agent_config=self.agent_config,
             memory_host=self.memory_host,
             skill_manager=self.skill_manager,
@@ -1529,6 +1528,15 @@ async def build_runtime(
         project_id=project_id,
         runtime_id=cfg.runtime_id,
     )
+    # M7.2: production context is composed from the runtime-owned workspace
+    # authority.  ProductionRuntimeConfig intentionally has no reader/index
+    # injection seam, so model-controlled or host-path readers cannot replace
+    # SafeWorkspaceFS here.
+    context_intelligence = (
+        ContextIntelligenceService(workspace_manager)
+        if production_mode
+        else None
+    )
     # B1: the OfficeMutationAuthority is a server/project-lifecycle object.
     # When ``cfg.office_authority`` is injected (AgentService / SubAgentService
     # share one across every turn), reuse it so the aggregate storage baseline
@@ -1723,7 +1731,10 @@ async def build_runtime(
         verify_fix_factory=verify_factory,
         task_manager=task_manager,
         skill_generator=skill_generator, project_root=root,
-        coding_context_builder=cfg.coding_context_builder,
+        coding_context_builder=(
+            cfg.coding_context_builder if not production_mode else None
+        ),
+        context_intelligence=context_intelligence,
         workspace_manager=workspace_manager,
         execution_service=execution_service,
         approval_broker=cfg.approval_broker,

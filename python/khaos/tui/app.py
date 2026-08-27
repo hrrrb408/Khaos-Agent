@@ -215,7 +215,6 @@ class KhaosApp(App):
         runtime = await build_production_runtime(ProductionRuntimeConfig(
             db=self.db, project_root=self.project_root, mode_manager=self.mode_manager,
             confirm_callback=self._confirm_callback,
-            coding_context_builder=self._build_coding_context_builder(),
             skill_manager=self.skill_manager,
             principal_id=local_principal_id(),
             # M4 batch 3.1.16A-5-1b: pass the cached project identity so
@@ -236,15 +235,6 @@ class KhaosApp(App):
             await close_runtime_or_register(self._runtime)
         if self.db is not None:
             await self.db.close()
-
-    def _build_coding_context_builder(self):
-        """Construct a CodingContextBuilder, or None if coding pkg is absent."""
-        try:
-            from khaos.coding import CodingContextBuilder
-        except ImportError:
-            logger.debug("coding module unavailable; skipping context builder")
-            return None
-        return CodingContextBuilder()
 
     # --- input handling ----------------------------------------------------
 

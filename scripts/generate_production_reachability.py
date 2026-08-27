@@ -44,6 +44,15 @@ FORBIDDEN_SYMBOLS = {
     ("khaos.coding.execution.testing_sandbox", "TestingSandbox"),
 }
 LEGACY_RUNTIME_PROFILE_MODULE = "khaos.runtime_profile"
+# The parser adapter imports a locked third-party grammar named by a frozen
+# ``GrammarSpec`` field.  This is an explicit, audited external dependency
+# boundary; it is not an unresolved internal Khaos import and must not be
+# confused with arbitrary model-controlled dynamic imports.
+TRUSTED_EXTERNAL_DYNAMIC_IMPORT_MODULES = frozenset(
+    {
+        "khaos.coding.intelligence.adapters",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,6 +159,13 @@ def import_edges(info: ModuleInfo) -> tuple[tuple[Edge, ...], tuple[str, ...]]:
                 if value is not None:
                     if value.startswith("khaos"):
                         edges.append(Edge(info.name, value, "dynamic-import", node.lineno))
+                elif info.name in TRUSTED_EXTERNAL_DYNAMIC_IMPORT_MODULES:
+                    # ``TreeSitterAdapter`` resolves only its locked
+                    # GrammarSpec.module values; those are external grammar
+                    # packages, not repository modules.  The explicit
+                    # allowlist keeps the graph fail-closed for every other
+                    # dynamic import.
+                    continue
                 elif info.lazy_exports:
                     # The package's __getattr__ implementation is covered by
                     # its explicit literal lazy-export map.

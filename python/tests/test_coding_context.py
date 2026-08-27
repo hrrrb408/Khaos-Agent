@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from khaos.agent import AgentConfig, AgentLoop
+from khaos.coding.intelligence.query_service import ContextIntelligenceService
 from khaos.db import Database
 from khaos.modes import Mode, ModeManager
 from khaos.routing.router import create_default_router
@@ -231,6 +232,56 @@ async def test_coding_mode_without_builder_skips_injection(tmp_path):
 
     assert "# Project Structure" not in messages[0].content
     assert not any("# Relevant Files" in m.content for m in messages)
+
+
+async def test_workspace_bound_context_service_is_the_typed_agent_projection(tmp_path):
+    (tmp_path / "approval.py").write_text(
+        "def consume_approval():\n    return True\n", encoding="utf-8"
+    )
+    loop, db = await _make_loop(tmp_path, mode=Mode.CODING, builder=None)
+    from khaos.coding.task_manager import TaskManager
+
+    manager = TaskManager(
+        db=db, principal_id="context-test", project_id="context-project"
+    )
+    task = await manager.create("inspect approval.py")
+    workspace = SimpleNamespace(
+        id="workspace-context",
+        task_id=task.id,
+        principal_id="context-test",
+        project_id="context-project",
+        worktree_path=tmp_path,
+        base_sha="base-context",
+        git_identity=None,
+        creator_runtime_id="runtime-context",
+    )
+
+    class _BoundWorkspaceManager:
+        def get(self, workspace_id):
+            return workspace if workspace_id == workspace.id else None
+
+        def require(self, workspace_id, **_kwargs):
+            return self.get(workspace_id)
+
+    loop.task_manager = manager
+    loop.principal_id = "context-test"
+    loop.project_id = "context-project"
+    loop._active_task_id = task.id
+    loop.active_workspace = workspace
+    loop.context_intelligence = ContextIntelligenceService(_BoundWorkspaceManager())
+
+    messages = await loop._build_context("s1", "inspect approval.py")
+    await db.close()
+
+    context_messages = [
+        message
+        for message in messages
+        if message.metadata.get("context_layer") == "workspace-bound-observation"
+    ]
+    assert len(context_messages) == 1
+    assert "approval.py" in context_messages[0].content
+    assert context_messages[0].metadata["workspace_id"] == workspace.id
+    assert context_messages[0].metadata["freshness"] == "fresh"
 
 
 # ---------------------------------------------------------------------------

@@ -195,7 +195,6 @@ class SubAgentRunner:
             "tool_allowlist": (task.tools if self.tool_scheduler is None else None),
             "skill_manager": self.skill_manager,
             "agent_config": config,
-            "coding_context_builder": self.coding_context_builder,
             "office_authority": self.office_authority,
             # B1: inherit the server-level approval broker / audit logger.
             "approval_broker": self.approval_broker,
@@ -218,6 +217,7 @@ class SubAgentRunner:
         if runtime_config_type is RuntimeConfig:
             # Explicit legacy/test adapters may inject these components; the
             # production structural type has no fields for them.
+            runtime_kwargs["coding_context_builder"] = self.coding_context_builder
             runtime_kwargs["tool_scheduler"] = self.tool_scheduler
             runtime_kwargs["memory_manager"] = (
                 self.memory_manager if self.inherit_memory else None

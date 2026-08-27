@@ -17,8 +17,8 @@
 
 ## Import reachability result
 
-- Reachable repository modules: `258`.
-- Resolved import edges: `1843`.
+- Reachable repository modules: `263`.
+- Resolved import edges: `1883`.
 - Forbidden production edges: `0`.
 - Unresolved internal edges: `0`.
 
@@ -79,6 +79,11 @@
 - `khaos.coding.execution.supervisor`
 - `khaos.coding.fingerprint`
 - `khaos.coding.indexer`
+- `khaos.coding.intelligence.adapters`
+- `khaos.coding.intelligence.context`
+- `khaos.coding.intelligence.models`
+- `khaos.coding.intelligence.query_service`
+- `khaos.coding.intelligence.registry`
 - `khaos.coding.parser`
 - `khaos.coding.planning.approval.execution_contract`
 - `khaos.coding.planning.approval.execution_journal_writer`

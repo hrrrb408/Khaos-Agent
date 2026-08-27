@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from khaos.agent.control.completion_recovery import CompletionRecoveryService
     from khaos.coding.cost_tracker import CostTracker
     from khaos.coding.fingerprint import FileFingerprintCache
+    from khaos.coding.intelligence.query_service import ContextIntelligenceService
     from khaos.coding.task_manager import TaskManager
     from khaos.coding.verify_fix import VerifyFixLoop
     from khaos.project_context import ProjectContextLoader
@@ -75,6 +76,13 @@ class AgentConfig:
     compression_threshold: int = 128000
     # Token budget for the injected project-structure tree (coding mode only).
     project_structure_token_budget: int = 2000
+    # M7.2 bounded workspace context limits.  These are disclosure/compute
+    # bounds, never filesystem or execution authority.
+    context_token_budget: int = 12_000
+    context_max_files: int = 16
+    context_max_symbols: int = 128
+    context_max_bytes: int = 256 * 1024
+    context_max_file_bytes: int = 64 * 1024
 
 
 @dataclass
@@ -119,6 +127,7 @@ class AgentLoop:
         skill_manager=None,
         project_root=None,
         coding_context_builder=None,
+        context_intelligence: ContextIntelligenceService | None = None,
         project_context_loader: ProjectContextLoader | None = None,
         file_fingerprint_cache: FileFingerprintCache | None = None,
         cost_tracker: CostTracker | None = None,
@@ -191,6 +200,10 @@ class AgentLoop:
         # left as-is (not resolved) so callers can pass relative paths.
         self.project_root = project_root
         self.coding_context_builder = coding_context_builder
+        # M7.2: production coding context is built through the
+        # owner-scoped, SafeWorkspaceFS-backed service.  The legacy builder
+        # remains available for explicitly injected development/test loops.
+        self.context_intelligence = context_intelligence
         # Phase 6: 项目约定文件加载器（KHAOS.md / AGENTS.md）。注入优先级
         # 高于 memory / skill，因为它们是项目级硬规则。
         self.project_context_loader = project_context_loader
@@ -938,6 +951,17 @@ class AgentLoop:
                             stop_reason = StopReason.MAX_BUDGET.value
                         # Long-task observability: record what this turn touched.
                         await self._record_task_activity(result, active_task_id)
+                        if (
+                            result.success
+                            and self.context_intelligence is not None
+                            and active_task_id
+                            and self.active_workspace is not None
+                        ):
+                            self.context_intelligence.invalidate_from_tool_result(
+                                workspace_id=self.active_workspace.id,
+                                tool_name=result.name,
+                                arguments=result.arguments or {},
+                            )
                         if result.name == "test_run" and self.task_manager is not None and active_task_id:
                             await self.task_manager.update_status(active_task_id, "waiting_test")
                         if self.task_manager is not None and active_task_id:
@@ -1764,11 +1788,177 @@ class AgentLoop:
         )
         messages.extend(self._active_context_facts)
 
-        relevant = self._build_relevant_files_message(user_input)
+        if self.context_intelligence is not None and self._is_coding_mode():
+            relevant = await self._build_context_intelligence_message(user_input)
+        else:
+            relevant = self._build_relevant_files_message(user_input)
         if relevant is not None:
             messages.append(relevant)
 
         return messages
+
+    async def _build_context_intelligence_message(
+        self, user_input: str
+    ) -> Message | None:
+        """Build a bounded projection from the canonical GoalSpec/workspace.
+
+        A missing or invalid TaskWorkspace is intentionally unavailable: this
+        path never falls back to ``project_root`` or to the legacy builder.
+        """
+
+        task_id = self._active_task_id
+        workspace = self.active_workspace
+        if task_id is None or workspace is None or self.task_manager is None:
+            logger.warning(
+                "workspace-bound context unavailable: task=%s workspace=%s",
+                task_id,
+                getattr(workspace, "id", None),
+            )
+            return None
+        goal_repository = getattr(self.task_manager, "goal_spec_repository", None)
+        if goal_repository is None:
+            logger.warning("workspace-bound context unavailable: GoalSpec repository missing")
+            return None
+        try:
+            goal_spec = await goal_repository.get_for_task(
+                task_id,
+                principal_id=self.principal_id,
+                project_id=self.project_id,
+            )
+            if goal_spec is None:
+                logger.warning("workspace-bound context unavailable: GoalSpec missing for %s", task_id)
+                return None
+            service = self.context_intelligence
+            if service is None:
+                return None
+            repository_id = service.repository_id_for_workspace(workspace)
+            from khaos.coding.intelligence.context import (
+                ContextFreshness,
+                ContextRequest,
+            )
+
+            request = ContextRequest(
+                task_id=task_id,
+                principal_id=self.principal_id,
+                project_id=self.project_id,
+                goal_spec_id=goal_spec.goal_spec_id,
+                goal_spec_digest=goal_spec.semantic_digest,
+                workspace_id=workspace.id,
+                repository_id=repository_id,
+                base_revision=getattr(workspace, "base_sha", None),
+                query=user_input or goal_spec.normalized_goal,
+                runtime_id=self.runtime_id,
+                token_budget=max(
+                    1,
+                    int(getattr(self.config, "context_token_budget", 12_000)),
+                ),
+                max_bytes=max(
+                    1,
+                    int(getattr(self.config, "context_max_bytes", 256 * 1024)),
+                ),
+                max_file_bytes=max(
+                    1,
+                    int(getattr(self.config, "context_max_file_bytes", 64 * 1024)),
+                ),
+                max_files=max(
+                    1,
+                    int(getattr(self.config, "context_max_files", 16)),
+                ),
+                max_symbols=max(
+                    1,
+                    int(getattr(self.config, "context_max_symbols", 128)),
+                ),
+            )
+            bundle = await service.retrieve(request, goal_spec)
+        except Exception as exc:  # noqa: BLE001 - context is non-fatal and fail-closed
+            logger.warning("workspace-bound context build failed: %s", exc)
+            return None
+        if bundle.freshness is not ContextFreshness.FRESH:
+            logger.warning(
+                "workspace-bound context is not fresh: task=%s freshness=%s",
+                task_id,
+                bundle.freshness.value,
+            )
+            return None
+        blocks = [
+            "# Context Bundle",
+            "",
+            "<untrusted_workspace_context>",
+            (
+                f"bundle_digest={bundle.bundle_digest} "
+                f"workspace_id={bundle.workspace_id} "
+                f"repository_id={bundle.repository_id} "
+                f"base_revision={bundle.base_revision or ''} "
+                f"repository_generation={bundle.repository_generation} "
+                f"index_generation={bundle.index_generation} "
+                f"truncated={str(bundle.truncated).lower()}"
+            ),
+        ]
+        if bundle.structure_paths:
+            blocks.extend(["", "## Workspace Structure", "", *bundle.structure_paths])
+        if bundle.documents:
+            blocks.extend(["", "## Relevant Files", ""])
+            for document in bundle.documents:
+                language = document.language if document.language != "text" else ""
+                blocks.extend(
+                    [
+                        f"### {document.relative_path}",
+                        f"```{language}",
+                        document.content,
+                        "```",
+                    ]
+                )
+        if bundle.symbols:
+            blocks.extend(["", "## Relevant Symbols", ""])
+            blocks.extend(
+                f"- {symbol.relative_path}:{symbol.start_line + 1} "
+                f"{symbol.qualified_name} ({symbol.kind})"
+                for symbol in bundle.symbols
+            )
+        blocks.append("</untrusted_workspace_context>")
+        content = "\n".join(blocks)
+        render_truncated = False
+        render_budget = max(
+            1, int(getattr(self.config, "context_token_budget", 12_000))
+        )
+        if self.token_engine.count_tokens(content) > render_budget:
+            render_truncated = True
+            # Keep the projection bounded even when the token engine is more
+            # precise than the byte-based service bound.  The service bundle
+            # remains immutable; this is only a smaller prompt projection.
+            closing = "</untrusted_workspace_context>"
+            marker = "... (context projection truncated)"
+            prefix_budget = max(
+                1,
+                render_budget
+                - self.token_engine.count_tokens(f"{marker}\n{closing}"),
+            )
+            prefix = self._trim_to_budget("\n".join(blocks[:-1]), prefix_budget).rstrip()
+            content = f"{prefix}\n{marker}\n{closing}"
+            while self.token_engine.count_tokens(content) > render_budget:
+                prefix_lines = prefix.splitlines()
+                if len(prefix_lines) <= 1:
+                    break
+                prefix = "\n".join(prefix_lines[:-1]).rstrip()
+                content = f"{prefix}\n{marker}\n{closing}"
+        return Message(
+            role="system",
+            content=content,
+            token_count=self.token_engine.count_tokens(content),
+            metadata={
+                "context_layer": "workspace-bound-observation",
+                "trusted": False,
+                "context_bundle_id": bundle.bundle_id,
+                "context_bundle_digest": bundle.bundle_digest,
+                "workspace_id": bundle.workspace_id,
+                "repository_id": bundle.repository_id,
+                "base_revision": bundle.base_revision,
+                "repository_generation": bundle.repository_generation,
+                "index_generation": bundle.index_generation,
+                "truncated": bundle.truncated or render_truncated,
+                "freshness": bundle.freshness.value,
+            },
+        )
 
     async def _build_durable_task_facts(
         self, task_id: str | None
@@ -1942,6 +2132,8 @@ class AgentLoop:
         """
         if not self._is_coding_mode():
             return ""
+        if self.context_intelligence is not None:
+            return ""
         builder = self.coding_context_builder
         if builder is None:
             return ""
@@ -1975,6 +2167,8 @@ class AgentLoop:
         status: ``(changed)`` or ``(cached)``.
         """
         if not self._is_coding_mode():
+            return None
+        if self.context_intelligence is not None:
             return None
         builder = self.coding_context_builder
         if builder is None:
