@@ -37,6 +37,7 @@ from khaos.coding.intelligence.context import (
 )
 from khaos.coding.intelligence.models import ParseResult, Symbol
 from khaos.coding.intelligence.registry import LanguageRegistry
+from khaos.coding.planning.safe_workspace_path import SafePathError
 from khaos.coding.workspace.boundary import SafeWorkspaceFS, WorkspaceBoundaryError
 from khaos.coding.workspace.models import TaskWorkspace
 from khaos.security.protocol_boundary import canonical_digest
@@ -1180,7 +1181,7 @@ class ContextIntelligenceService:
                 return _stale_bundle(request, generation=generation)
         except ContextQueryError:
             raise
-        except (OSError, WorkspaceBoundaryError) as exc:
+        except (OSError, SafePathError, WorkspaceBoundaryError) as exc:
             raise ContextUnavailableError("safe workspace context is unavailable") from exc
 
     async def retrieve(self, request: ContextRequest, goal_spec: GoalSpec) -> ContextBundle:

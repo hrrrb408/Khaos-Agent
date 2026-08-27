@@ -69,6 +69,16 @@ identity mismatches fail closed or produce an explicit unavailable/stale
 result.  Context facts never affect Approval, ToolScheduler capability,
 Sandbox, execution leases, Memory visibility, or Trusted Verification.
 
+The current safe source reader is the POSIX dirfd/`O_NOFOLLOW` capability.  A
+platform without that capability, including the current Windows runtime,
+cannot receive a weaker pathname-based replacement: `SafeWorkspaceFS` fails
+closed and `ContextIntelligenceService` exposes the condition as typed
+`ContextUnavailableError`.  Successful capture tests that require this
+POSIX-only capability are explicitly marked `posix_host`; Windows coverage
+asserts the unavailable/no-Host-fallback contract instead.  A future native
+Windows reader would require a separately audited no-follow implementation and
+must not be introduced as an implicit fallback.
+
 ## Existing intelligence inventory
 
 * `LanguageRegistry` and its adapters are reusable after safe byte capture.

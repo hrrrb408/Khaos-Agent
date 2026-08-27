@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 import threading
 from dataclasses import fields, replace
 from pathlib import Path
@@ -145,6 +146,7 @@ def test_context_request_digest_is_unicode_safe_and_order_independent(tmp_path: 
     assert first.changed_files == ()
 
 
+@pytest.mark.posix_host
 def test_fresh_bundle_is_deterministic_and_rebuilds_after_mutation(tmp_path: Path) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
@@ -245,6 +247,7 @@ def test_base_revision_binding_is_exact_and_not_wildcard(tmp_path: Path) -> None
         )
 
 
+@pytest.mark.posix_host
 def test_deleted_and_renamed_files_are_not_served_from_cache(tmp_path: Path) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
@@ -268,6 +271,7 @@ def test_deleted_and_renamed_files_are_not_served_from_cache(tmp_path: Path) -> 
     assert all(item.relative_path != "bar.py" for item in removed_view.documents)
 
 
+@pytest.mark.posix_host
 def test_same_named_symbols_keep_distinct_generation_bound_identity(tmp_path: Path) -> None:
     root = tmp_path / "workspace"
     (root / "one").mkdir(parents=True)
@@ -294,6 +298,7 @@ def test_same_named_symbols_keep_distinct_generation_bound_identity(tmp_path: Pa
     assert len({symbol.symbol_id for symbol in runs}) == 2
 
 
+@pytest.mark.posix_host
 def test_parser_relationship_evidence_is_not_duplicated_for_simple_names(
     tmp_path: Path,
 ) -> None:
@@ -325,6 +330,7 @@ def test_parser_relationship_evidence_is_not_duplicated_for_simple_names(
     assert ContextEvidenceKind.CALLER in evidence_kinds
 
 
+@pytest.mark.posix_host
 def test_context_is_bounded_and_records_truncation(tmp_path: Path) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
@@ -371,6 +377,22 @@ def test_symlink_and_missing_workspace_never_fall_back_to_host(tmp_path: Path) -
         _retrieve(unavailable, request, goal)
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows fail-closed contract")
+def test_windows_context_retrieval_is_unavailable_without_host_fallback(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "foo.py").write_text("VALUE = 'workspace'\n", encoding="utf-8")
+    workspace = _workspace(root)
+    service = ContextIntelligenceService(_WorkspaceManager(workspace))
+    goal = _goal()
+    request = _request(service, workspace, goal, target_files=("foo.py",))
+
+    with pytest.raises(ContextUnavailableError, match="safe workspace context"):
+        _retrieve(service, request, goal)
+
+
 class _BlockingRegistry(LanguageRegistry):
     def __init__(self) -> None:
         super().__init__()
@@ -390,6 +412,7 @@ class _BlockingRegistry(LanguageRegistry):
         )
 
 
+@pytest.mark.posix_host
 def test_query_mutation_race_retries_without_stale_as_fresh(tmp_path: Path) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
@@ -413,6 +436,7 @@ def test_query_mutation_race_retries_without_stale_as_fresh(tmp_path: Path) -> N
     assert "'new'" in bundle.documents[0].content
 
 
+@pytest.mark.posix_host
 def test_cache_is_workspace_scoped_and_restart_rebuild_is_deterministic(tmp_path: Path) -> None:
     root_a = tmp_path / "workspace-a"
     root_b = tmp_path / "workspace-b"
