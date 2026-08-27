@@ -24,6 +24,13 @@ from khaos.coding.execution import BackendSelector, ExecutionService
 from khaos.coding.intelligence.query_service import ContextIntelligenceService
 from khaos.coding.planning.coordinator import PlanningControlCoordinator
 from khaos.coding.planning.service import DeterministicPlanningService
+from khaos.coding.planning.trusted_verification_authority import (
+    TrustedVerificationAuthority,
+)
+from khaos.coding.planning.trusted_verification_service import (
+    TrustedVerificationFactProvider,
+    TrustedVerificationService,
+)
 from khaos.coding.task_manager import TaskManager
 from khaos.coding.verify_fix import VerifyFixLoop
 from khaos.coding.workspace.manager import WorkspaceManager
@@ -459,6 +466,15 @@ class RuntimeResult:
     # orchestration owner only; plan revisions remain passive and TaskStatus
     # lifecycle writes remain owned by their existing control boundaries.
     planning_coordinator: PlanningControlCoordinator | None = field(
+        default=None, repr=False
+    )
+    # M7.4: the trusted-verification authority and passive assessment service
+    # are explicit runtime-owned composition facts.  Neither component owns
+    # TaskStatus projection; CompletionGate remains the sole lifecycle owner.
+    trusted_verification_authority: TrustedVerificationAuthority | None = field(
+        default=None, repr=False
+    )
+    trusted_verification_service: TrustedVerificationService | None = field(
         default=None, repr=False
     )
 
@@ -1679,14 +1695,12 @@ async def build_runtime(
     cleanup_authority = cfg.cleanup_authority or RuntimeCleanupAuthority()
     from khaos.agent.control.completion_flow import (
         CompletionProposalController,
-        EmptyCompletionFactProvider,
     )
     from khaos.agent.control.completion_gate import CompletionGate
     from khaos.agent.control.completion_recovery import (
         CompletionRecoveryService,
         DatabaseCompletionGateHistoryReader,
     )
-
     goal_spec_repository = getattr(task_manager, "goal_spec_repository", None)
     if goal_spec_repository is None:
         goal_spec_repository = getattr(cfg.db, "goal_spec_repository", None)
@@ -1695,9 +1709,25 @@ async def build_runtime(
         raise RuntimeError(
             "completion control repositories are unavailable in runtime composition"
         )
+    verification_assessment_repository = getattr(
+        cfg.db, "verification_assessment_repository", None
+    )
+    if verification_assessment_repository is None:
+        raise RuntimeError(
+            "trusted verification assessment repository is unavailable in runtime composition"
+        )
+    trusted_verification_authority = TrustedVerificationAuthority()
+    trusted_verification_service = TrustedVerificationService(
+        authority=trusted_verification_authority,
+        repository=verification_assessment_repository,
+    )
     fact_provider = cfg.completion_fact_provider
     if fact_provider is None:
-        fact_provider = EmptyCompletionFactProvider()
+        fact_provider = TrustedVerificationFactProvider(
+            repository=verification_assessment_repository,
+            principal_id=cfg.principal_id,
+            project_id=project_id,
+        )
     completion_controller = CompletionProposalController(
         goal_spec_repository=goal_spec_repository,
         decision_repository=decision_repository,
@@ -1800,6 +1830,8 @@ async def build_runtime(
         completion_gate=completion_gate,
         completion_recovery=completion_recovery,
         planning_coordinator=planning_coordinator,
+        trusted_verification_authority=trusted_verification_authority,
+        trusted_verification_service=trusted_verification_service,
         # M4 batch 3.1.16A-5-1b (CRITICAL): carry the RPC-verified
         # project identity into the AgentLoop so every message / turn
         # write is stamped with it.  ``self._bound_project_id`` (set
@@ -1847,6 +1879,8 @@ async def build_runtime(
         credential_broker=credential_broker,
         owns_credential_broker=owns_credential_broker,
         planning_coordinator=planning_coordinator,
+        trusted_verification_authority=trusted_verification_authority,
+        trusted_verification_service=trusted_verification_service,
         principal_id=cfg.principal_id,
         principal_kind=cfg.principal_kind,
         parent_principal_id=cfg.parent_principal_id,

@@ -24,6 +24,9 @@ from khaos.agent.control.goal_repository import GoalSpecRepository
 from khaos.agent.control.state_repository import AgentControlStateRepository
 from khaos.agent.core import Message
 from khaos.coding.planning.repository import PlanRevisionRepository
+from khaos.coding.planning.verification_assessment_repository import (
+    VerificationAssessmentRepository,
+)
 from khaos.db.connection import (
     READER_DRAIN_TIMEOUT,
     DatabaseClosingError,  # noqa: F401 - compatibility export
@@ -263,6 +266,7 @@ class Database:
         self._agent_control_state_repository = AgentControlStateRepository(self)
         self._completion_decision_repository = CompletionDecisionRepository(self)
         self._plan_revision_repository = PlanRevisionRepository(self)
+        self._verification_assessment_repository = VerificationAssessmentRepository(self)
         # F-01: Per-domain locks remain for logical serialization (e.g. two
         # concurrent permission grants must not race on epoch computation).
         self._operation_approval_lock = asyncio.Lock()
@@ -311,6 +315,11 @@ class Database:
     def plan_revision_repository(self) -> PlanRevisionRepository:
         """Return the sole owner-scoped immutable planning-revision ledger."""
         return self._plan_revision_repository
+
+    @property
+    def verification_assessment_repository(self) -> VerificationAssessmentRepository:
+        """Return the owner-scoped trusted-verification assessment ledger."""
+        return self._verification_assessment_repository
 
     @_conn.setter
     def _conn(self, value: Any | None) -> None:
@@ -872,6 +881,15 @@ class Database:
             self._conn = _MigrationConnection(conn)
             try:
                 await self._apply_v20_upgrades()
+            finally:
+                self._conn = original_conn
+            # M7.4: add the immutable, owner/task-scoped trusted-verification
+            # assessment ledger.  No historical verification result is
+            # synthesized from legacy task/test/model state.
+            original_conn = self._conn
+            self._conn = _MigrationConnection(conn)
+            try:
+                await self._apply_v21_upgrades()
             finally:
                 self._conn = original_conn
             # Batch 6.4 §10.4: backfill the historical ledger rows (v1–v5)
@@ -1535,6 +1553,16 @@ class Database:
         conn = await self._require_conn()
         await self._ensure_coding_tasks_published_plan_revision_column(conn)
         migration_path = _MIGRATIONS_DIR / "0020_plan_publication_fence.sql"
+        await self._execute_schema_statements(
+            conn,
+            migration_path.read_text(encoding="utf-8"),
+        )
+
+    async def _apply_v21_upgrades(self) -> None:
+        """Add the M7.4 immutable trusted-verification assessment ledger."""
+
+        conn = await self._require_conn()
+        migration_path = _MIGRATIONS_DIR / "0021_trusted_verification_assessments.sql"
         await self._execute_schema_statements(
             conn,
             migration_path.read_text(encoding="utf-8"),

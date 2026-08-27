@@ -59,6 +59,39 @@ class CompletionProposalStatus(str, Enum):
     ERROR = "error"
 
 
+class VerificationFactStatus(str, Enum):
+    """Projection status for one trusted-verification assessment.
+
+    This is a data projection only.  It is not a verification authority
+    result, a completion capability, or a TaskStatus transition.
+    """
+
+    SATISFIED = "satisfied"
+    UNSATISFIED = "unsatisfied"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True, slots=True)
+class VerificationCompletionFact:
+    """Bounded completion input projected from current verification history."""
+
+    assessment_id: str
+    assessment_digest: str
+    status: VerificationFactStatus
+    evidence: tuple[CompletionEvidenceRef, ...] = ()
+
+    def __post_init__(self) -> None:
+        _require_id(self.assessment_id, label="assessment_id")
+        _require_id(self.assessment_digest, label="assessment_digest")
+        if type(self.status) is not VerificationFactStatus:
+            raise ValueError("status must be a VerificationFactStatus")
+        _require_typed_tuple(
+            self.evidence,
+            label="evidence",
+            item_type=CompletionEvidenceRef,
+        )
+
+
 def _require_text(value: object, *, label: str, allow_empty: bool = False) -> str:
     if type(value) is not str or (not allow_empty and not value):
         suffix = "" if allow_empty else " and must not be empty"
@@ -117,6 +150,7 @@ class CompletionFactBundle:
     criterion_assessments: tuple[CriterionAssessment, ...] = ()
     evidence: tuple[CompletionEvidenceRef, ...] = ()
     constraints: tuple[CompletionConstraint, ...] = ()
+    verification_facts: tuple[VerificationCompletionFact, ...] = ()
 
     def __post_init__(self) -> None:
         _require_typed_tuple(
@@ -138,6 +172,11 @@ class CompletionFactBundle:
             self.constraints,
             label="constraints",
             item_type=CompletionConstraint,
+        )
+        _require_typed_tuple(
+            self.verification_facts,
+            label="verification_facts",
+            item_type=VerificationCompletionFact,
         )
 
 
@@ -474,4 +513,6 @@ __all__ = [
     "CompletionTaskSnapshotReader",
     "EmptyCompletionFactProvider",
     "GoalSpecLoader",
+    "VerificationCompletionFact",
+    "VerificationFactStatus",
 ]

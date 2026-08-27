@@ -507,6 +507,15 @@ MIGRATIONS: tuple[MigrationSpec, ...] = (
             "_ensure_coding_tasks_published_plan_revision_column",
         ),
     ),
+    MigrationSpec(
+        version=21,
+        name="m7_4_trusted_verification_assessments",
+        # Release-time manifest over the additive M7.4 assessment ledger and
+        # its migration owner.  Future edits require a new migration version.
+        sha256="8db1179cfb689f23aba89511c89d73583a9442ebc0b26fb3ad9a62547c3239c0",
+        sql_files=("0021_trusted_verification_assessments.sql",),
+        migrator_symbols=("_apply_v21_upgrades",),
+    ),
 )
 
 

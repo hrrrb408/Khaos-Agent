@@ -181,6 +181,8 @@ class AgentLoop:
         completion_gate: CompletionGate | None = None,
         completion_recovery: CompletionRecoveryService | None = None,
         planning_coordinator: Any = None,
+        trusted_verification_authority: Any = None,
+        trusted_verification_service: Any = None,
     ):
         self.config = config
         self.mode_manager = mode_manager
@@ -233,6 +235,11 @@ class AgentLoop:
         # only invokes the composed owner; it does not infer plans from tool
         # names or implement planner/risk/DAG logic itself.
         self.planning_coordinator = planning_coordinator
+        # M7.4: trusted verification is a passive evidence/assessment
+        # composition. These references do not grant execution authority and
+        # are not lifecycle writers.
+        self.trusted_verification_authority = trusted_verification_authority
+        self.trusted_verification_service = trusted_verification_service
         self._active_planning_result: Any = None
         self.skill_generator = skill_generator
         self.workspace_manager = workspace_manager

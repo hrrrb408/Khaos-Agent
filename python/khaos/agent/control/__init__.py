@@ -40,6 +40,8 @@ from khaos.agent.control.completion_flow import (
     CompletionTaskSnapshotReader,
     EmptyCompletionFactProvider,
     GoalSpecLoader,
+    VerificationCompletionFact,
+    VerificationFactStatus,
 )
 from khaos.agent.control.completion_gate import (
     CompletionAuthorityResult,
@@ -192,5 +194,7 @@ __all__ = [
     "GoalSpecValidationError",
     "RequirementAssessment",
     "StoredCompletionDecision",
+    "VerificationCompletionFact",
+    "VerificationFactStatus",
     "normalize_goal",
 ]

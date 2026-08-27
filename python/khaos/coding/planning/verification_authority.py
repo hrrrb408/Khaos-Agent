@@ -636,6 +636,67 @@ class VerificationReadHandle:
             )
         return status
 
+    def success_binding(
+        self,
+        verification_run_id: str,
+        *,
+        execution_run_id: str | None = None,
+    ) -> tuple[str, str]:
+        """Return the authority identity/digest for one canonical success.
+
+        The returned pair is a bounded identity reference, not a bearer
+        capability.  The lookup re-runs the same canonical-success proof used
+        by :meth:`verification_status` before exposing it to an adapter, so a
+        caller cannot turn a forged ``authority_id``/digest field into an M7.4
+        trusted assessment.
+        """
+        self.__authority.verify_storage()
+        row = self.__connection.execute(
+            "SELECT authority_instance_id,payload_digest "
+            "FROM verification_success_evidence "
+            "WHERE verification_run_id=?",
+            (verification_run_id,),
+        ).fetchone()
+        if row is None:
+            raise PermissionError("verification success evidence is unavailable")
+        require_canonical_success(
+            self.__connection,
+            self.__authority,
+            verification_run_id=verification_run_id,
+            execution_run_id=execution_run_id,
+        )
+        authority_id = row[0]
+        authority_digest = row[1]
+        if (
+            type(authority_id) is not str
+            or not authority_id
+            or type(authority_digest) is not str
+            or not authority_digest
+        ):
+            raise PermissionError("verification success binding is malformed")
+        return authority_id, authority_digest
+
+    def verification_for_execution(self, execution_run_id: str) -> str:
+        """Return the canonical verification identity bound to an execution."""
+        self.__authority.verify_storage()
+        row = self.__connection.execute(
+            "SELECT verification_run_id,status FROM plan_verification_runs "
+            "WHERE execution_run_id=?",
+            (execution_run_id,),
+        ).fetchone()
+        if row is None or str(row[1]) != "passed":
+            raise PermissionError("execution has no persisted passed verification")
+        verification_run_id = row[0]
+        if type(verification_run_id) is not str or not verification_run_id:
+            raise PermissionError("execution verification identity is malformed")
+        require_canonical_success(
+            self.__connection,
+            self.__authority,
+            verification_run_id=verification_run_id,
+            execution_run_id=execution_run_id,
+        )
+        return verification_run_id
+
     def close(self) -> None:
         if self.__owns_connection:
             self.__connection.close()
