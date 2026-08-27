@@ -2058,11 +2058,34 @@ class AgentLoop:
         plan_repository = getattr(self.db, "plan_revision_repository", None)
         if plan_repository is not None:
             try:
+                current_plan_snapshot = (
+                    await plan_repository.get_current_task_snapshot(
+                        task_id,
+                        principal_id=self.principal_id,
+                        project_id=self.project_id,
+                    )
+                )
                 latest_plan = await plan_repository.get_latest_for_task(
                     task_id,
                     principal_id=self.principal_id,
                     project_id=self.project_id,
                 )
+                published_plan = None
+                published_plan_revision_id = (
+                    current_plan_snapshot.published_plan_revision_id
+                    if current_plan_snapshot is not None
+                    else None
+                )
+                if published_plan_revision_id is not None:
+                    # This strict reader resolves the physical publication
+                    # identity to its exact owner/task-scoped ledger row.  A
+                    # missing or malformed published row is an integrity
+                    # failure; latest history is never a fallback.
+                    published_plan = await plan_repository.get_published_for_task(
+                        task_id,
+                        principal_id=self.principal_id,
+                        project_id=self.project_id,
+                    )
             except Exception as exc:  # noqa: BLE001 - facts fail closed
                 logger.warning(
                     "durable planning facts unavailable: task=%s error=%s",
@@ -2071,11 +2094,27 @@ class AgentLoop:
                 )
                 facts["planning_integrity"] = "unavailable"
             else:
-                if latest_plan is not None:
-                    revision = latest_plan.revision
+                facts["latest_plan_revision_id"] = (
+                    latest_plan.plan_revision_id if latest_plan is not None else None
+                )
+                facts["published_plan_revision_id"] = published_plan_revision_id
+                selected_plan = (
+                    published_plan
+                    if published_plan_revision_id is not None
+                    else latest_plan
+                )
+                if published_plan_revision_id is not None and published_plan is None:
+                    facts["planning_integrity"] = "unavailable"
+                elif selected_plan is not None:
+                    revision = selected_plan.revision
+                    facts["plan_revision_source"] = (
+                        "published"
+                        if published_plan_revision_id is not None
+                        else "latest"
+                    )
                     facts["plan_revision"] = {
                         "plan_revision_id": revision.plan_revision_id,
-                        "revision_sequence": latest_plan.revision_sequence,
+                        "revision_sequence": selected_plan.revision_sequence,
                         "plan_semantic_digest": revision.plan_semantic_digest,
                         "status": revision.disposition.value,
                         "disposition": revision.disposition.value,

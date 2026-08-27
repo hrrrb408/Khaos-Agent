@@ -865,6 +865,15 @@ class Database:
                 await self._apply_v19_upgrades()
             finally:
                 self._conn = original_conn
+            # M7.3 closure amendment: add the physical, descriptive
+            # publication identity used to atomically bind IMPLEMENTING to
+            # one READY plan-revision ledger head.
+            original_conn = self._conn
+            self._conn = _MigrationConnection(conn)
+            try:
+                await self._apply_v20_upgrades()
+            finally:
+                self._conn = original_conn
             # Batch 6.4 §10.4: backfill the historical ledger rows (v1–v5)
             # so the chain is complete from this point on.  Idempotent —
             # uses INSERT OR IGNORE keyed on the version PK.
@@ -1518,6 +1527,36 @@ class Database:
         await self._execute_schema_statements(
             conn,
             migration_path.read_text(encoding="utf-8"),
+        )
+
+    async def _apply_v20_upgrades(self) -> None:
+        """Add the M7.3 atomic plan-publication projection."""
+
+        conn = await self._require_conn()
+        await self._ensure_coding_tasks_published_plan_revision_column(conn)
+        migration_path = _MIGRATIONS_DIR / "0020_plan_publication_fence.sql"
+        await self._execute_schema_statements(
+            conn,
+            migration_path.read_text(encoding="utf-8"),
+        )
+
+    async def _ensure_coding_tasks_published_plan_revision_column(
+        self, conn: Any
+    ) -> None:
+        """Idempotently add the v20 published-plan identity column.
+
+        SQLite has no portable ``ADD COLUMN IF NOT EXISTS``.  The helper is
+        deliberately limited to this one additive column and performs no
+        inference from task status, plan history, or model output.  A legacy
+        task therefore starts with ``NULL``: it has no published plan until a
+        planning publication transaction records one.
+        """
+        cursor = await conn.execute("PRAGMA table_info(coding_tasks)")
+        columns = {str(row["name"]) for row in await cursor.fetchall()}
+        if "published_plan_revision_id" in columns:
+            return
+        await conn.execute(
+            "ALTER TABLE coding_tasks ADD COLUMN published_plan_revision_id TEXT"
         )
 
     async def _ensure_coding_tasks_cognitive_state_columns(

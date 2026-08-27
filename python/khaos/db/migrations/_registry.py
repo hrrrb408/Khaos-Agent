@@ -494,6 +494,19 @@ MIGRATIONS: tuple[MigrationSpec, ...] = (
         sql_files=("0019_plan_revisions.sql",),
         migrator_symbols=("_apply_v19_upgrades",),
     ),
+    MigrationSpec(
+        version=20,
+        name="m7_3_atomic_plan_publication_fence",
+        # Release-time manifest over the additive v20 index artifact and its
+        # idempotent physical-column migrator.  Future changes must add a new
+        # migration version instead of editing this contract.
+        sha256="696b84f04e5a2d9a08f244ccbdf6c917c3aa3605ecea1f4ea63dd4b2e5026bc8",
+        sql_files=("0020_plan_publication_fence.sql",),
+        migrator_symbols=(
+            "_apply_v20_upgrades",
+            "_ensure_coding_tasks_published_plan_revision_column",
+        ),
+    ),
 )
 
 

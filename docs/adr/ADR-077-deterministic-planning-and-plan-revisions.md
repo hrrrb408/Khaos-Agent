@@ -36,7 +36,8 @@ PlanRevisionRepository.append() (owner-scoped, append-only sequence)
         ↓
 READY / BLOCKED / STALE / INVALID disposition
         ↓
-only READY + current CAS snapshot may move PLANNING → IMPLEMENTING
+only the exact READY ledger head, under one publication transaction, may
+move PLANNING → IMPLEMENTING
 ```
 
 `PlanningInput`, `PlanningStep`, `PlanningRisk`, verification intents,
@@ -90,10 +91,29 @@ cognitive result after another lifecycle owner has changed the task.  The
 fence protects the planning publication boundary; it does not make the
 cognitive CAS a general `coding_tasks` row version.
 
+The latest plan revision and the published implementation plan are separate
+concepts.  The latest revision is the newest owner/task history head; the
+published revision is the exact READY revision that legally caused the current
+`IMPLEMENTING` phase.  M7.3's closure fence is a single `BEGIN IMMEDIATE`
+transaction that strictly decodes the head, requires the requested revision to
+still be that head, revalidates GoalSpec/workspace/repository/base/cognitive
+state/version/task-status bindings, performs the cognitive CAS, and writes
+`coding_tasks.published_plan_revision_id`.  Therefore a newer READY revision
+cannot appear as the head between validation and publication, and the durable
+task row proves which revision caused `IMPLEMENTING`.
+
+`published_plan_revision_id` is a descriptive control-plane projection, not a
+Tool, Approval, Workspace, Sandbox, Verification, or execution capability.
+Readers that need the current implementation plan use the exact published
+identity and fail closed on a missing or malformed referenced revision; they do
+not silently fall back to the latest history head.
+
 ## Durable plan revisions
 
 Migration v19 adds the owner/project/task-scoped
-`agent_plan_revisions` append-only ledger.  The repository allocates the
+`agent_plan_revisions` append-only ledger.  Migration v20 adds the nullable
+physical `published_plan_revision_id` projection and its owner/task lookup
+index; legacy tasks remain unpublished (`NULL`).  The repository allocates the
 monotonic per-task `revision_sequence` inside the shared `BEGIN IMMEDIATE`
 transaction and binds `parent_revision_id` to the current history head.  A
 caller cannot overwrite a revision or select its sequence.  Database triggers
@@ -119,9 +139,11 @@ authority may need to inspect; they do not approve anything and do not widen
 ToolScheduler, Approval, Workspace, Sandbox, Memory, or execution authority.
 
 No plan outcome projects `TaskStatus.BLOCKED`, `FAILED`, or `COMPLETED`.
-Only a fresh `READY` revision plus the coordinator's cognitive CAS can enter
+Only a fresh `READY` revision plus the atomic publication fence can enter
 `IMPLEMENTING`; task lifecycle and completion remain owned by their existing
-control-plane gates.
+control-plane gates.  A later history append cannot replace the published
+identity, and a stale planning revision cannot publish after the task has
+entered `IMPLEMENTING`.
 
 ## Restart and mutation semantics
 

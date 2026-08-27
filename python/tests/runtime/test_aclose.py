@@ -276,6 +276,7 @@ async def test_closed_field_is_not_bound_by_positional_construction():
         "runtime_id",
         "audit_logger",
         "owns_audit_logger",
+        "planning_coordinator",
     ]
 
 

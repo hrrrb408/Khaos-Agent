@@ -28,6 +28,8 @@ from khaos.coding.intelligence.context import (
 )
 from khaos.coding.planning.repository import (
     PlanningTaskSnapshot,
+    PlanPublicationResult,
+    PlanPublicationStatus,
     PlanRevisionBindingError,
     PlanRevisionConflictError,
     PlanRevisionIntegrityError,
@@ -71,6 +73,7 @@ class PlanningControlResult:
     revision: PlanRevision | None = None
     revision_sequence: int | None = None
     cognitive_transition: CognitiveTransitionResult | None = None
+    publication: PlanPublicationResult | None = None
     reason: str = ""
 
     @property
@@ -399,34 +402,79 @@ class PlanningControlCoordinator:
                 reason=stored.revision.summary,
             )
 
-        publish = await self._control_state_repository.compare_and_transition(
-            task_id,
-            principal_id=self._principal_id,
-            project_id=self._project_id,
-            expected_state=snapshot.cognitive_state,
-            expected_version=snapshot.control_state_version,
-            target_state=AgentCognitiveState.IMPLEMENTING,
-            expected_task_status=snapshot.task_status,
-            expected_workspace_binding=_workspace_binding(snapshot),
-        )
-        if publish.status not in {
-            CognitiveTransitionStatus.UPDATED,
-            CognitiveTransitionStatus.UNCHANGED,
-        }:
+        try:
+            publication = await self._plan_revision_repository.publish_ready_revision(
+                stored.plan_revision_id,
+                principal_id=self._principal_id,
+                project_id=self._project_id,
+            )
+        except PlanRevisionIntegrityError as exc:
+            return PlanningControlResult(
+                PlanningControlStatus.INVALID,
+                task_id,
+                revision=stored.revision,
+                revision_sequence=stored.revision_sequence,
+                cognitive_transition=transition,
+                reason=type(exc).__name__,
+            )
+        except (PlanRevisionBindingError, PlanRevisionStaleError) as exc:
             return PlanningControlResult(
                 PlanningControlStatus.STALE,
                 task_id,
                 revision=stored.revision,
                 revision_sequence=stored.revision_sequence,
-                cognitive_transition=publish,
-                reason="READY plan was not published because the task snapshot changed",
+                cognitive_transition=transition,
+                reason=type(exc).__name__,
             )
+        except PlanRevisionConflictError as exc:
+            return PlanningControlResult(
+                PlanningControlStatus.CONFLICT,
+                task_id,
+                revision=stored.revision,
+                revision_sequence=stored.revision_sequence,
+                cognitive_transition=transition,
+                reason=type(exc).__name__,
+            )
+
+        publication_status = _publication_result_status(publication.status)
+        if publication_status is not PlanningControlStatus.IMPLEMENTING:
+            return PlanningControlResult(
+                publication_status,
+                task_id,
+                revision=stored.revision,
+                revision_sequence=stored.revision_sequence,
+                cognitive_transition=transition,
+                publication=publication,
+                reason=publication.reason,
+            )
+        published_transition = CognitiveTransitionResult(
+            status=CognitiveTransitionStatus.UPDATED,
+            task_id=task_id,
+            expected_state=AgentCognitiveState.PLANNING,
+            expected_version=stored.revision.control_state_version,
+            target_state=AgentCognitiveState.IMPLEMENTING,
+            current_state=publication.cognitive_state,
+            control_state_version=publication.control_state_version,
+            task_status=publication.task_status,
+        )
+        await _emit(
+            event_sink,
+            "planning.revision.published",
+            {
+                "task_id": task_id,
+                "plan_revision_id": stored.plan_revision_id,
+                "revision_sequence": stored.revision_sequence,
+                "plan_semantic_digest": stored.revision.plan_semantic_digest,
+                "cognitive_state": AgentCognitiveState.IMPLEMENTING.value,
+            },
+        )
         return PlanningControlResult(
             PlanningControlStatus.IMPLEMENTING,
             task_id,
             revision=stored.revision,
             revision_sequence=stored.revision_sequence,
-            cognitive_transition=publish,
+            cognitive_transition=published_transition,
+            publication=publication,
             reason="READY plan published as the next cognitive phase",
         )
 
@@ -526,6 +574,19 @@ def _transition_result_status(status: CognitiveTransitionStatus) -> PlanningCont
     if status is CognitiveTransitionStatus.ILLEGAL_TRANSITION:
         return PlanningControlStatus.NOT_READY
     return PlanningControlStatus.ERROR
+
+
+def _publication_result_status(status: PlanPublicationStatus) -> PlanningControlStatus:
+    """Map the atomic publication result into the coordinator vocabulary."""
+    return {
+        PlanPublicationStatus.PUBLISHED: PlanningControlStatus.IMPLEMENTING,
+        PlanPublicationStatus.ALREADY_PUBLISHED: PlanningControlStatus.IMPLEMENTING,
+        PlanPublicationStatus.STALE: PlanningControlStatus.STALE,
+        PlanPublicationStatus.CONFLICT: PlanningControlStatus.CONFLICT,
+        PlanPublicationStatus.NOT_FOUND: PlanningControlStatus.NOT_FOUND,
+        PlanPublicationStatus.TERMINAL: PlanningControlStatus.TERMINAL,
+        PlanPublicationStatus.INVALID: PlanningControlStatus.INVALID,
+    }[status]
 
 
 def _disposition_status(disposition: PlanDisposition) -> PlanningControlStatus:

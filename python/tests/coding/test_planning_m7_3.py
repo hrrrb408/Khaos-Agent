@@ -24,8 +24,11 @@ from khaos.coding.planning.coordinator import (
     PlanningControlStatus,
 )
 from khaos.coding.planning.repository import (
+    PlanningTaskSnapshot,
+    PlanPublicationStatus,
     PlanRevisionConflictError,
     PlanRevisionIntegrityError,
+    PlanRevisionStaleError,
 )
 from khaos.coding.planning.revision import (
     PLANNER_ALGORITHM_VERSION,
@@ -572,6 +575,9 @@ class _StatusChangingPlanRepository:
         await self._manager.update_status(self._task_id, TaskStatus.BLOCKED)
         return stored
 
+    async def publish_ready_revision(self, *args: object, **kwargs: object):
+        return await self._delegate.publish_ready_revision(*args, **kwargs)
+
 
 class _WorkspaceChangingPlanRepository:
     """Test-only wrapper that races the workspace binding after append."""
@@ -597,6 +603,9 @@ class _WorkspaceChangingPlanRepository:
             repository_id=REPOSITORY,
         )
         return stored
+
+    async def publish_ready_revision(self, *args: object, **kwargs: object):
+        return await self._delegate.publish_ready_revision(*args, **kwargs)
 
 
 @pytest.mark.asyncio
@@ -627,7 +636,10 @@ async def test_planning_coordinator_publishes_ready_without_task_lifecycle_autho
         assert [event[0] for event in sink.events] == [
             "planning.started",
             "planning.revision.created",
+            "planning.revision.published",
         ]
+        assert result.publication is not None
+        assert result.publication.status is PlanPublicationStatus.PUBLISHED
         physical = await database.agent_control_state_repository.get_snapshot(
             task.id,
             principal_id=OWNER,
@@ -637,11 +649,274 @@ async def test_planning_coordinator_publishes_ready_without_task_lifecycle_autho
         assert physical.cognitive_state is AgentCognitiveState.IMPLEMENTING
         assert physical.control_state_version == 3
         assert physical.task_status == TaskStatus.RUNNING.value
+        planning_snapshot = (
+            await database.plan_revision_repository.get_current_task_snapshot(
+                task.id,
+                principal_id=OWNER,
+                project_id=PROJECT,
+            )
+        )
+        assert planning_snapshot is not None
+        assert planning_snapshot.published_plan_revision_id == result.revision.plan_revision_id
         current = await database.list_coding_tasks(
             principal_id=OWNER,
             project_id=PROJECT,
         )
         assert current[0]["status"] == TaskStatus.RUNNING.value
+    finally:
+        await database.close()
+
+
+async def _enter_planning_for_publication_test(
+    database: Database,
+    task_id: str,
+) -> PlanningTaskSnapshot:
+    snapshot = await database.plan_revision_repository.get_current_task_snapshot(
+        task_id,
+        principal_id=OWNER,
+        project_id=PROJECT,
+    )
+    assert snapshot is not None
+    transition = await database.agent_control_state_repository.compare_and_transition(
+        task_id,
+        principal_id=OWNER,
+        project_id=PROJECT,
+        expected_state=snapshot.cognitive_state,
+        expected_version=snapshot.control_state_version,
+        target_state=AgentCognitiveState.PLANNING,
+        expected_task_status=snapshot.task_status,
+    )
+    assert transition.status.value == "updated"
+    planning = await database.plan_revision_repository.get_current_task_snapshot(
+        task_id,
+        principal_id=OWNER,
+        project_id=PROJECT,
+    )
+    assert planning is not None
+    assert planning.cognitive_state is AgentCognitiveState.PLANNING
+    return planning
+
+
+@pytest.mark.asyncio
+async def test_atomic_publication_rejects_stale_ready_head_and_publishes_new_head(
+    tmp_path: Path,
+) -> None:
+    database, manager, task = await _make_task_database(tmp_path / "publication-race.db")
+    try:
+        planning = await _enter_planning_for_publication_test(database, task.id)
+        goal_spec = await manager.goal_spec_repository.get_for_task(
+            task.id,
+            principal_id=OWNER,
+            project_id=PROJECT,
+        )
+        assert goal_spec is not None
+        revision_one = _build_revision(
+            goal_spec=goal_spec,
+            task_id=task.id,
+            documents=(_document("foo.py", "def target():\n    return 1\n"),),
+            target_files=("foo.py",),
+            cognitive_state=planning.cognitive_state,
+            control_state_version=planning.control_state_version,
+            task_status=planning.task_status,
+        )
+        stored_one = await database.plan_revision_repository.append(
+            revision_one,
+            principal_id=OWNER,
+            project_id=PROJECT,
+        )
+        revision_two = replace(
+            revision_one,
+            parent_revision_id=stored_one.plan_revision_id,
+        )
+        stored_two = await database.plan_revision_repository.append(
+            revision_two,
+            principal_id=OWNER,
+            project_id=PROJECT,
+        )
+
+        stale_publication = await database.plan_revision_repository.publish_ready_revision(
+            stored_one.plan_revision_id,
+            principal_id=OWNER,
+            project_id=PROJECT,
+        )
+        assert stale_publication.status is PlanPublicationStatus.STALE
+
+        publication = await database.plan_revision_repository.publish_ready_revision(
+            stored_two.plan_revision_id,
+            principal_id=OWNER,
+            project_id=PROJECT,
+        )
+        assert publication.status is PlanPublicationStatus.PUBLISHED
+        assert publication.published_plan_revision_id == stored_two.plan_revision_id
+        current = await database.plan_revision_repository.get_current_task_snapshot(
+            task.id,
+            principal_id=OWNER,
+            project_id=PROJECT,
+        )
+        assert current is not None
+        assert current.cognitive_state is AgentCognitiveState.IMPLEMENTING
+        assert current.control_state_version == planning.control_state_version + 1
+        assert current.published_plan_revision_id == stored_two.plan_revision_id
+        latest = await database.plan_revision_repository.get_latest_for_task(
+            task.id,
+            principal_id=OWNER,
+            project_id=PROJECT,
+        )
+        assert latest is not None
+        assert latest.plan_revision_id == stored_two.plan_revision_id
+        published = await database.plan_revision_repository.get_published_for_task(
+            task.id,
+            principal_id=OWNER,
+            project_id=PROJECT,
+        )
+        assert published is not None
+        assert published.plan_revision_id == stored_two.plan_revision_id
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_published_plan_identity_is_not_replaced_by_later_history(
+    tmp_path: Path,
+) -> None:
+    database, manager, task = await _make_task_database(tmp_path / "published-head.db")
+    try:
+        planning = await _enter_planning_for_publication_test(database, task.id)
+        goal_spec = await manager.goal_spec_repository.get_for_task(
+            task.id,
+            principal_id=OWNER,
+            project_id=PROJECT,
+        )
+        assert goal_spec is not None
+        revision_one = _build_revision(
+            goal_spec=goal_spec,
+            task_id=task.id,
+            documents=(_document("foo.py", "def target():\n    return 1\n"),),
+            target_files=("foo.py",),
+            cognitive_state=AgentCognitiveState.PLANNING,
+            control_state_version=planning.control_state_version,
+            task_status=planning.task_status,
+        )
+        stored_one = await database.plan_revision_repository.append(
+            revision_one,
+            principal_id=OWNER,
+            project_id=PROJECT,
+        )
+        first_publication = await database.plan_revision_repository.publish_ready_revision(
+            stored_one.plan_revision_id,
+            principal_id=OWNER,
+            project_id=PROJECT,
+        )
+        assert first_publication.status is PlanPublicationStatus.PUBLISHED
+
+        current = await database.plan_revision_repository.get_current_task_snapshot(
+            task.id,
+            principal_id=OWNER,
+            project_id=PROJECT,
+        )
+        assert current is not None
+        later_revision = _build_revision(
+            goal_spec=goal_spec,
+            task_id=task.id,
+            documents=(_document("foo.py", "def target():\n    return 1\n"),),
+            target_files=("foo.py",),
+            cognitive_state=current.cognitive_state,
+            control_state_version=current.control_state_version,
+            task_status=current.task_status,
+        )
+        later_revision = replace(
+            later_revision,
+            parent_revision_id=stored_one.plan_revision_id,
+        )
+        later_stored = await database.plan_revision_repository.append(
+            later_revision,
+            principal_id=OWNER,
+            project_id=PROJECT,
+        )
+        assert later_stored.revision_sequence == stored_one.revision_sequence + 1
+
+        replacement = await database.plan_revision_repository.publish_ready_revision(
+            later_stored.plan_revision_id,
+            principal_id=OWNER,
+            project_id=PROJECT,
+        )
+        assert replacement.status is PlanPublicationStatus.CONFLICT
+        published = await database.plan_revision_repository.get_published_for_task(
+            task.id,
+            principal_id=OWNER,
+            project_id=PROJECT,
+        )
+        assert published is not None
+        assert published.plan_revision_id == stored_one.plan_revision_id
+        latest = await database.plan_revision_repository.get_latest_for_task(
+            task.id,
+            principal_id=OWNER,
+            project_id=PROJECT,
+        )
+        assert latest is not None
+        assert latest.plan_revision_id == later_stored.plan_revision_id
+        assert latest.plan_revision_id != published.plan_revision_id
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_stale_planning_revision_cannot_append_after_publication(
+    tmp_path: Path,
+) -> None:
+    database, manager, task = await _make_task_database(tmp_path / "stale-planning.db")
+    try:
+        planning = await _enter_planning_for_publication_test(database, task.id)
+        goal_spec = await manager.goal_spec_repository.get_for_task(
+            task.id,
+            principal_id=OWNER,
+            project_id=PROJECT,
+        )
+        assert goal_spec is not None
+        revision = _build_revision(
+            goal_spec=goal_spec,
+            task_id=task.id,
+            documents=(_document("foo.py", "def target():\n    return 1\n"),),
+            target_files=("foo.py",),
+            cognitive_state=AgentCognitiveState.PLANNING,
+            control_state_version=planning.control_state_version,
+            task_status=planning.task_status,
+        )
+        stored = await database.plan_revision_repository.append(
+            revision,
+            principal_id=OWNER,
+            project_id=PROJECT,
+        )
+        published = await database.plan_revision_repository.publish_ready_revision(
+            stored.plan_revision_id,
+            principal_id=OWNER,
+            project_id=PROJECT,
+        )
+        assert published.status is PlanPublicationStatus.PUBLISHED
+
+        stale_revision = _build_revision(
+            goal_spec=goal_spec,
+            task_id=task.id,
+            documents=(_document("foo.py", "def target():\n    return 1\n"),),
+            target_files=("foo.py",),
+            cognitive_state=AgentCognitiveState.PLANNING,
+            control_state_version=planning.control_state_version,
+            task_status=planning.task_status,
+        )
+        with pytest.raises(PlanRevisionStaleError):
+            await database.plan_revision_repository.append(
+                stale_revision,
+                principal_id=OWNER,
+                project_id=PROJECT,
+            )
+        current = await database.plan_revision_repository.get_current_task_snapshot(
+            task.id,
+            principal_id=OWNER,
+            project_id=PROJECT,
+        )
+        assert current is not None
+        assert current.cognitive_state is AgentCognitiveState.IMPLEMENTING
+        assert current.published_plan_revision_id == stored.plan_revision_id
     finally:
         await database.close()
 

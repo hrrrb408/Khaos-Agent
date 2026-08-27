@@ -565,7 +565,12 @@ CREATE TABLE IF NOT EXISTS coding_tasks (
             'replanning', 'reviewing', 'completion_check'
         )),
     control_state_version INTEGER NOT NULL DEFAULT 0
-        CHECK (control_state_version >= 0)
+        CHECK (control_state_version >= 0),
+    -- M7.3 closure amendment: exact READY revision that caused the current
+    -- IMPLEMENTING cognitive phase.  This is descriptive control state, not
+    -- execution/approval/workspace authority; runtime migration source is
+    -- migrations/0020_plan_publication_fence.sql.
+    published_plan_revision_id TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_coding_tasks_status ON coding_tasks(status, updated_at);

@@ -15,6 +15,8 @@ from khaos.coding.planning.execution_models import (
 )
 from khaos.coding.planning.repository import (
     PlanningTaskSnapshot,
+    PlanPublicationResult,
+    PlanPublicationStatus,
     PlanRevisionBindingError,
     PlanRevisionConflictError,
     PlanRevisionIntegrityError,
@@ -59,6 +61,8 @@ __all__ = [
     "ExecutionRunStatus",
     "PlanDisposition",
     "PlanExecutionRun",
+    "PlanPublicationResult",
+    "PlanPublicationStatus",
     "PlanRevision",
     "PlanRevisionBindingError",
     "PlanRevisionConflictError",
