@@ -2,8 +2,9 @@
 
 M7.1.4 adds the immutable CompletionDecision record and its passive,
 append-only durable ledger. M7.1.5 adds pure deterministic evaluation of
-structured facts; completion gating, planning, and recovery remain later
-control-plane responsibilities.
+structured facts. M7.1.8 adds read-only durable continuation recovery;
+planning and Recovery/Replan execution remain later control-plane
+responsibilities.
 """
 
 from khaos.agent.control.completion import (
@@ -58,6 +59,19 @@ from khaos.agent.control.completion_gate_repository import (
     CompletionProjectionResult,
     CompletionProjectionStatus,
 )
+from khaos.agent.control.completion_recovery import (
+    MAX_COMPLETION_GATE_PAYLOAD_BYTES,
+    CompletionContinuationState,
+    CompletionGateHistoryEntry,
+    CompletionGateHistoryReader,
+    CompletionGateHistoryRecord,
+    CompletionRecoveryDecisionReader,
+    CompletionRecoveryGoalSpecReader,
+    CompletionRecoveryResolver,
+    CompletionRecoveryService,
+    CompletionRecoveryState,
+    DatabaseCompletionGateHistoryReader,
+)
 from khaos.agent.control.completion_repository import (
     CompletionDecisionBindingError,
     CompletionDecisionConflictError,
@@ -102,6 +116,7 @@ __all__ = [
     "GOAL_REQUIREMENT_SCHEMA_KEYS",
     "GOAL_SPEC_SCHEMA_VERSION",
     "LEGAL_COGNITIVE_TRANSITIONS",
+    "MAX_COMPLETION_GATE_PAYLOAD_BYTES",
     "AcceptanceCriterion",
     "AgentCognitiveState",
     "AgentCognitiveStateMachine",
@@ -116,6 +131,7 @@ __all__ = [
     "CompletionAuthorityStatus",
     "CompletionConstraint",
     "CompletionConstraintCode",
+    "CompletionContinuationState",
     "CompletionDecision",
     "CompletionDecisionBindingError",
     "CompletionDecisionConflictError",
@@ -135,6 +151,9 @@ __all__ = [
     "CompletionGate",
     "CompletionGateAuthorityPolicy",
     "CompletionGateDatabase",
+    "CompletionGateHistoryEntry",
+    "CompletionGateHistoryReader",
+    "CompletionGateHistoryRecord",
     "CompletionGateRepository",
     "CompletionGateResult",
     "CompletionGateStatus",
@@ -149,9 +168,15 @@ __all__ = [
     "CompletionProposalResult",
     "CompletionProposalStatus",
     "CompletionProposalTrigger",
+    "CompletionRecoveryDecisionReader",
+    "CompletionRecoveryGoalSpecReader",
+    "CompletionRecoveryResolver",
+    "CompletionRecoveryService",
+    "CompletionRecoveryState",
     "CompletionTaskProjection",
     "CompletionTaskSnapshotReader",
     "CriterionAssessment",
+    "DatabaseCompletionGateHistoryReader",
     "EmptyCompletionFactProvider",
     "EvidenceRef",
     "FailClosedCompletionAuthorityPolicy",

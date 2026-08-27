@@ -379,6 +379,151 @@ class TaskManager:
         """Install the persisted ACTIVE-lease task/workspace resolver."""
         self._execution_scope_resolver = resolver
 
+    async def _decode_persisted_task(
+        self, data: dict[str, Any]
+    ) -> tuple[CodingTask, TaskStatus]:
+        """Decode one owner-scoped row without applying restart semantics.
+
+        ``load`` and ``refresh_projection`` intentionally share this strict
+        decoder but have different lifecycle semantics.  The former marks an
+        interrupted active task ``BLOCKED``; the latter is read-only cache
+        reconciliation and must preserve the physical SQL status exactly.
+        """
+        task_id = data.get("id")
+        goal = data.get("goal", "")
+        if type(task_id) is not str or not task_id:
+            raise GoalSpecIntegrityError("coding task row has no valid task id")
+        if type(goal) is not str:
+            raise GoalSpecIntegrityError("coding task row has no valid goal")
+        if self._goal_spec_repository is None:
+            raise GoalSpecIntegrityError(
+                "durable task loading requires a GoalSpec repository"
+            )
+        goal_spec = await self._goal_spec_repository.get_for_task(
+            task_id,
+            principal_id=self._principal_id,
+            project_id=self._project_id,
+        )
+        if goal_spec is None:
+            raise GoalSpecIntegrityError(
+                f"coding task {task_id!r} has no owner-scoped GoalSpec"
+            )
+        if goal != goal_spec.raw_goal:
+            raise GoalSpecIntegrityError(
+                f"coding task {task_id!r} goal disagrees with canonical GoalSpec"
+            )
+        persisted_goal_spec_id = data.get("goal_spec_id")
+        persisted_goal_spec_digest = data.get("goal_spec_digest")
+        if (
+            persisted_goal_spec_id is not None
+            and persisted_goal_spec_id != goal_spec.goal_spec_id
+        ):
+            raise GoalSpecIntegrityError(
+                f"coding task {task_id!r} GoalSpec id projection disagrees"
+            )
+        if (
+            persisted_goal_spec_digest is not None
+            and persisted_goal_spec_digest != goal_spec.semantic_digest
+        ):
+            raise GoalSpecIntegrityError(
+                f"coding task {task_id!r} GoalSpec digest projection disagrees"
+            )
+        try:
+            cognitive_state = AgentCognitiveState.parse(
+                data.get(
+                    "cognitive_state",
+                    AgentCognitiveState.UNINITIALIZED.value,
+                )
+            )
+        except ValueError as exc:
+            raise CognitiveStateIntegrityError(
+                f"coding task {task_id!r} has an invalid cognitive state"
+            ) from exc
+        control_state_version = data.get("control_state_version", 0)
+        if (
+            type(control_state_version) is not int
+            or control_state_version < 0
+        ):
+            raise CognitiveStateIntegrityError(
+                f"coding task {task_id!r} has an invalid control-state version"
+            )
+        loaded_status = TaskStatus.parse(data.get("status", "pending"))
+
+        list_fields = (
+            "files_modified",
+            "files_viewed",
+            "test_results",
+            "trace",
+        )
+        for field_name in list_fields:
+            if type(data.get(field_name, [])) is not list:
+                raise GoalSpecIntegrityError(
+                    f"coding task {task_id!r} field {field_name!r} is not a list"
+                )
+        metadata = data.get("metadata", {})
+        if type(metadata) is not dict:
+            raise GoalSpecIntegrityError(
+                f"coding task {task_id!r} metadata is not an object"
+            )
+        workspace_id = metadata.get("workspace_id")
+        if workspace_id is not None and (
+            type(workspace_id) is not str or not workspace_id
+        ):
+            raise GoalSpecIntegrityError(
+                f"coding task {task_id!r} workspace projection is malformed"
+            )
+        fix_attempts = data.get("fix_attempts", 0)
+        event_sequence = data.get("event_sequence", 0)
+        if (
+            type(fix_attempts) is not int
+            or fix_attempts < 0
+            or type(event_sequence) is not int
+            or event_sequence < 0
+        ):
+            raise GoalSpecIntegrityError(
+                f"coding task {task_id!r} has invalid counters"
+            )
+        try:
+            created_at = datetime.fromisoformat(data["created_at"])
+            updated_at = datetime.fromisoformat(data["updated_at"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise GoalSpecIntegrityError(
+                f"coding task {task_id!r} has invalid timestamps"
+            ) from exc
+        error = data.get("error")
+        if error is not None and type(error) is not str:
+            raise GoalSpecIntegrityError(
+                f"coding task {task_id!r} error projection is invalid"
+            )
+        principal_id = data.get("principal_id", self._principal_id)
+        if type(principal_id) is not str or not principal_id:
+            raise GoalSpecIntegrityError(
+                f"coding task {task_id!r} principal projection is invalid"
+            )
+        task = CodingTask(
+            id=task_id,
+            goal=goal,
+            status=loaded_status,
+            created_at=created_at,
+            updated_at=updated_at,
+            files_modified=list(data.get("files_modified", [])),
+            files_viewed=list(data.get("files_viewed", [])),
+            test_results=list(data.get("test_results", [])),
+            fix_attempts=fix_attempts,
+            error=error,
+            metadata=dict(metadata),
+            trace=list(data.get("trace", [])),
+            event_sequence=event_sequence,
+            principal_id=principal_id,
+            goal_spec_id=goal_spec.goal_spec_id,
+            goal_spec_digest=goal_spec.semantic_digest,
+            goal_spec=goal_spec,
+            cognitive_state=cognitive_state,
+            control_state_version=control_state_version,
+        )
+        task._persisted = True
+        return task, loaded_status
+
     async def load(self) -> None:
         """Restore tasks and mark interrupted in-flight work as blocked.
 
@@ -396,96 +541,42 @@ class TaskManager:
             principal_id=self._principal_id,
             project_id=self._project_id,
         ):
-            task_id = data.get("id")
-            goal = data.get("goal", "")
-            if type(task_id) is not str or not task_id:
-                raise GoalSpecIntegrityError("coding task row has no valid task id")
-            if type(goal) is not str:
-                raise GoalSpecIntegrityError("coding task row has no valid goal")
-            goal_spec = await self._goal_spec_repository.get_for_task(
-                task_id,
-                principal_id=self._principal_id,
-                project_id=self._project_id,
-            )
-            if goal_spec is None:
-                raise GoalSpecIntegrityError(
-                    f"coding task {task_id!r} has no owner-scoped GoalSpec"
-                )
-            if goal != goal_spec.raw_goal:
-                raise GoalSpecIntegrityError(
-                    f"coding task {task_id!r} goal disagrees with canonical GoalSpec"
-                )
-            persisted_goal_spec_id = data.get("goal_spec_id")
-            persisted_goal_spec_digest = data.get("goal_spec_digest")
-            if (
-                persisted_goal_spec_id is not None
-                and persisted_goal_spec_id != goal_spec.goal_spec_id
-            ):
-                raise GoalSpecIntegrityError(
-                    f"coding task {task_id!r} GoalSpec id projection disagrees"
-                )
-            if (
-                persisted_goal_spec_digest is not None
-                and persisted_goal_spec_digest != goal_spec.semantic_digest
-            ):
-                raise GoalSpecIntegrityError(
-                    f"coding task {task_id!r} GoalSpec digest projection disagrees"
-                )
-            try:
-                cognitive_state = AgentCognitiveState.parse(
-                    data.get(
-                        "cognitive_state",
-                        AgentCognitiveState.UNINITIALIZED.value,
-                    )
-                )
-            except ValueError as exc:
-                raise CognitiveStateIntegrityError(
-                    f"coding task {task_id!r} has an invalid cognitive state"
-                ) from exc
-            control_state_version = data.get("control_state_version", 0)
-            if (
-                type(control_state_version) is not int
-                or control_state_version < 0
-            ):
-                raise CognitiveStateIntegrityError(
-                    f"coding task {task_id!r} has an invalid control-state version"
-                )
-            loaded_status = TaskStatus.parse(data.get("status", "pending"))
-            task = CodingTask(
-                id=task_id, goal=goal,
-                status=loaded_status,
-                created_at=datetime.fromisoformat(data["created_at"]),
-                updated_at=datetime.fromisoformat(data["updated_at"]),
-                files_modified=list(data.get("files_modified", [])),
-                files_viewed=list(data.get("files_viewed", [])),
-                test_results=list(data.get("test_results", [])),
-                fix_attempts=int(data.get("fix_attempts", 0)),
-                error=data.get("error"), metadata=dict(data.get("metadata", {})),
-                trace=list(data.get("trace", [])),
-                event_sequence=int(data.get("event_sequence", 0)),
-                # A3-3: preserve the persisted principal.  Pre-A3 rows
-                # lack this field and default to 'legacy' (matching the
-                # migration helper's quarantine), so they'd be filtered
-                # out by ``list_coding_tasks`` anyway — but if a row
-                # somehow reached here without a principal, defaulting
-                # to 'legacy' keeps the invariant.
-                principal_id=data.get("principal_id", self._principal_id),
-                goal_spec_id=goal_spec.goal_spec_id,
-                goal_spec_digest=goal_spec.semantic_digest,
-                goal_spec=goal_spec,
-                cognitive_state=cognitive_state,
-                control_state_version=control_state_version,
-            )
-            # Round-4 review Batch 4: mark loaded tasks as already
-            # persisted so ``_persist`` uses ``update_coding_task``
-            # (Owner-bound UPDATE) instead of ``insert_coding_task``.
-            task._persisted = True
+            task, loaded_status = await self._decode_persisted_task(data)
             if task.status in ACTIVE_STATUSES:
                 task.status = TaskStatus.BLOCKED
                 task.error = "interrupted by process restart"
                 task.touch()
             self._tasks[task.id] = task
             await self._persist(task, expected_status=loaded_status)
+
+    async def refresh_projection(self, task_id: str) -> CodingTask | None:
+        """Refresh one cached task from durable state without lifecycle writes.
+
+        This is intentionally separate from ``load``.  It does not apply the
+        process-restart ``ACTIVE -> BLOCKED`` rule, does not persist anything,
+        and never treats the in-memory cache as authoritative.  A missing row
+        is indistinguishable from an owner-scoped unavailable task.
+        """
+        if type(task_id) is not str or not task_id:
+            raise ValueError("task_id must be a non-empty string")
+        if self._db is None:
+            return await self.get(task_id)
+        if self._goal_spec_repository is None:
+            raise GoalSpecIntegrityError(
+                "durable task refresh requires a GoalSpec repository"
+            )
+        async with self._lock:
+            rows = await self._db.list_coding_tasks(
+                principal_id=self._principal_id,
+                project_id=self._project_id,
+            )
+            data = next((row for row in rows if row.get("id") == task_id), None)
+            if data is None:
+                self._tasks.pop(task_id, None)
+                return None
+            task, _loaded_status = await self._decode_persisted_task(data)
+            self._tasks[task.id] = task
+        return task
 
     async def create(self, goal: str) -> CodingTask:
         """Create a new task. Raises if the active-task limit is reached.

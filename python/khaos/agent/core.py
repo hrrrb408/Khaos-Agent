@@ -24,6 +24,7 @@ if TYPE_CHECKING:
         CompletionGate,
         CompletionGateResult,
     )
+    from khaos.agent.control.completion_recovery import CompletionRecoveryService
     from khaos.coding.cost_tracker import CostTracker
     from khaos.coding.fingerprint import FileFingerprintCache
     from khaos.coding.task_manager import TaskManager
@@ -167,6 +168,7 @@ class AgentLoop:
         completion_controller: CompletionProposalController | None = None,
         completion_fact_provider: CompletionFactProvider | None = None,
         completion_gate: CompletionGate | None = None,
+        completion_recovery: CompletionRecoveryService | None = None,
     ):
         self.config = config
         self.mode_manager = mode_manager
@@ -210,6 +212,7 @@ class AgentLoop:
         self.completion_controller = completion_controller
         self.completion_fact_provider = completion_fact_provider
         self.completion_gate = completion_gate
+        self.completion_recovery = completion_recovery
         self.skill_generator = skill_generator
         self.workspace_manager = workspace_manager
         self.active_workspace = None
@@ -1424,6 +1427,49 @@ class AgentLoop:
         self.completion_gate = gate
         return gate
 
+    def _ensure_completion_recovery(self) -> CompletionRecoveryService | None:
+        """Build the read-only durable continuation service when needed.
+
+        Recovery is deliberately lazy for direct AgentLoop construction, but
+        the runtime factory composes the same service explicitly.  This
+        fallback only wires owner-scoped readers; it cannot invoke a model,
+        planner, evaluator, gate, or task lifecycle writer.
+        """
+        recovery = self.completion_recovery
+        if recovery is not None:
+            return recovery
+        if self.db is None:
+            return None
+
+        from khaos.agent.control.completion_recovery import (
+            CompletionRecoveryService,
+            DatabaseCompletionGateHistoryReader,
+        )
+
+        goal_spec_repository = getattr(
+            self.task_manager,
+            "goal_spec_repository",
+            None,
+        )
+        if goal_spec_repository is None:
+            goal_spec_repository = getattr(self.db, "goal_spec_repository", None)
+        decision_repository = getattr(
+            self.db,
+            "completion_decision_repository",
+            None,
+        )
+        if goal_spec_repository is None or decision_repository is None:
+            return None
+        recovery = CompletionRecoveryService(
+            decision_repository=decision_repository,
+            goal_spec_repository=goal_spec_repository,
+            gate_history_reader=DatabaseCompletionGateHistoryReader(self.db),
+            principal_id=self.principal_id,
+            project_id=self.project_id,
+        )
+        self.completion_recovery = recovery
+        return recovery
+
     async def _propose_completion(
         self,
         *,
@@ -1728,31 +1774,47 @@ class AgentLoop:
         self, task_id: str | None
     ) -> list[Message]:
         """Reconstruct authoritative Task/approval facts outside summaries."""
-        if task_id is None or self.task_manager is None:
+        if task_id is None:
             return []
-        task = await self.task_manager.get(task_id)
-        if task is None:
+        recovery = self._ensure_completion_recovery()
+        recovery_state = (
+            await recovery.recover(task_id) if recovery is not None else None
+        )
+        task = (
+            await self.task_manager.get(task_id)
+            if self.task_manager is not None
+            else None
+        )
+        if task is None and recovery_state is None:
             return []
-        raw = task.to_dict(include_internal=True)
+        raw = task.to_dict(include_internal=True) if task is not None else {}
         metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
-        goal_spec = getattr(task, "goal_spec", None)
+        goal_spec = getattr(task, "goal_spec", None) if task is not None else None
         facts = {
-            "task_id": raw.get("id"),
+            "task_id": raw.get("id", task_id),
             "goal": raw.get("goal"),
             "status": raw.get("status"),
             "cognitive_state": getattr(
-                getattr(task, "cognitive_state", None),
+                getattr(task, "cognitive_state", None)
+                if task is not None
+                else None,
                 "value",
                 None,
             ),
-            "control_state_version": getattr(
-                task, "control_state_version", None
+            "control_state_version": (
+                getattr(task, "control_state_version", None)
+                if task is not None
+                else None
             ),
             # M7.1.2: these are bounded durable references/projections.  The
             # canonical GoalSpec body remains in agent_goal_specs and is not
             # copied into task metadata or injected wholesale.
-            "goal_spec_id": getattr(task, "goal_spec_id", None),
-            "goal_spec_digest": getattr(task, "goal_spec_digest", None),
+            "goal_spec_id": (
+                getattr(task, "goal_spec_id", None) if task is not None else None
+            ),
+            "goal_spec_digest": (
+                getattr(task, "goal_spec_digest", None) if task is not None else None
+            ),
             "workspace_id": metadata.get("workspace_id"),
             "base_sha": metadata.get("base_sha"),
             "pending_approval": metadata.get("pending_approval"),
@@ -1760,6 +1822,23 @@ class AgentLoop:
             "changeset_id": metadata.get("changeset_id"),
             "verification_run_id": metadata.get("verification_run_id"),
         }
+        # M7.1.8: expose only a bounded read-only continuation projection.
+        # Recovery never invokes a planner/model/gate and never projects a
+        # lifecycle status.
+        if recovery_state is not None:
+            facts["completion_recovery"] = recovery_state.to_bounded_fact()
+            # The recovery service reads the physical SQL task snapshot.  If
+            # the in-memory projection is stale, keep these bounded top-level
+            # facts aligned with the durable source without mutating it.
+            if recovery_state.task_status is not None:
+                facts["status"] = recovery_state.task_status
+            if recovery_state.cognitive_state is not None:
+                facts["cognitive_state"] = recovery_state.cognitive_state.value
+            if recovery_state.control_state_version is not None:
+                facts["control_state_version"] = (
+                    recovery_state.control_state_version
+                )
+            facts["workspace_id"] = recovery_state.workspace_id
         if goal_spec is not None:
             max_goal_fact_chars = 4096
             facts["goal_spec_raw_goal"] = goal_spec.raw_goal[:max_goal_fact_chars]

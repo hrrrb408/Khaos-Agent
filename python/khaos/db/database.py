@@ -14,7 +14,10 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from khaos.agent.control.completion_recovery import CompletionGateHistoryRecord
 
 from khaos.agent.control.completion_repository import CompletionDecisionRepository
 from khaos.agent.control.goal_repository import GoalSpecRepository
@@ -4985,6 +4988,70 @@ class Database:
                 (turn_id,),
             )
             return [dict(row) for row in await cursor.fetchall()]
+
+    async def list_completion_gate_history(
+        self,
+        task_id: str,
+        *,
+        principal_id: str,
+        project_id: str,
+    ) -> tuple[CompletionGateHistoryRecord, ...]:
+        """Read owner-scoped ``completion.gated`` events for one task.
+
+        M7.1.8 reuses the existing durable turn-event ledger rather than
+        introducing a second gate-history table.  The task/owner predicates
+        are applied to ``agent_turns`` before the bounded event payload is
+        handed to the recovery decoder; the decoder, not this generic DB
+        facade, owns the event payload schema.
+        """
+        if type(task_id) is not str or not task_id:
+            raise ValueError("task_id must be a non-empty string")
+        if type(principal_id) is not str or not principal_id:
+            raise ValueError("principal_id must be a non-empty string")
+        if type(project_id) is not str:
+            raise ValueError("project_id must be a string")
+        from khaos.agent.control.completion_recovery import (
+            MAX_COMPLETION_GATE_PAYLOAD_BYTES,
+            CompletionGateHistoryRecord,
+        )
+
+        async with self._read_lease():
+            conn = await self._require_conn()
+            cursor = await conn.execute(
+                """
+                SELECT t.turn_id, t.attempt_id, t.task_id, t.started_at,
+                       e.sequence, e.event_type, e.payload_json, e.created_at
+                FROM agent_turns AS t
+                JOIN agent_turn_events AS e ON e.turn_id = t.turn_id
+                WHERE t.task_id = ?
+                  AND t.principal_id = ?
+                  AND t.project_id = ?
+                  AND e.event_type = 'completion.gated'
+                  AND length(CAST(e.payload_json AS BLOB)) <= ?
+                ORDER BY e.created_at ASC, t.started_at ASC,
+                         t.turn_id ASC, e.sequence ASC
+                """,
+                (
+                    task_id,
+                    principal_id,
+                    project_id,
+                    MAX_COMPLETION_GATE_PAYLOAD_BYTES,
+                ),
+            )
+            rows = await cursor.fetchall()
+        return tuple(
+            CompletionGateHistoryRecord(
+                turn_id=row["turn_id"],
+                attempt_id=row["attempt_id"],
+                task_id=row["task_id"],
+                event_sequence=row["sequence"],
+                event_type=row["event_type"],
+                payload_json=row["payload_json"],
+                created_at=row["created_at"],
+                turn_started_at=row["started_at"],
+            )
+            for row in rows
+        )
 
     async def prune_terminal_agent_turns(
         self, *, older_than_seconds: float, now: float, limit: int = 256

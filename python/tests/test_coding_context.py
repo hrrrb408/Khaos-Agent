@@ -145,7 +145,11 @@ async def test_durable_task_facts_reconstruct_internal_workspace_binding(tmp_pat
     from khaos.coding.task_manager import TaskManager
 
     loop, db = await _make_loop(tmp_path, mode=Mode.CODING, builder=None)
-    manager = TaskManager(db=db)
+    # The database quarantine for unauthenticated ``legacy`` writes is an
+    # intentional security invariant.  Bind this persistence fixture to an
+    # explicit owner so the test exercises durable task facts rather than the
+    # legacy quarantine path.
+    manager = TaskManager(db=db, principal_id="context-test")
     task = await manager.create("keep approval scope")
     await manager.update_status(
         task.id,

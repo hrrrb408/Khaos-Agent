@@ -1666,6 +1666,10 @@ async def build_runtime(
         EmptyCompletionFactProvider,
     )
     from khaos.agent.control.completion_gate import CompletionGate
+    from khaos.agent.control.completion_recovery import (
+        CompletionRecoveryService,
+        DatabaseCompletionGateHistoryReader,
+    )
 
     goal_spec_repository = getattr(task_manager, "goal_spec_repository", None)
     if goal_spec_repository is None:
@@ -1694,6 +1698,13 @@ async def build_runtime(
         principal_id=cfg.principal_id,
         project_id=project_id,
         task_projection=task_manager,
+    )
+    completion_recovery = CompletionRecoveryService(
+        decision_repository=decision_repository,
+        goal_spec_repository=goal_spec_repository,
+        gate_history_reader=DatabaseCompletionGateHistoryReader(cfg.db),
+        principal_id=cfg.principal_id,
+        project_id=project_id,
     )
     loop = AgentLoop(
         cfg.agent_config or AgentConfig(), mode_manager, router, cfg.db,
@@ -1741,6 +1752,7 @@ async def build_runtime(
         credential_broker=credential_broker,
         completion_controller=completion_controller,
         completion_gate=completion_gate,
+        completion_recovery=completion_recovery,
         # M4 batch 3.1.16A-5-1b (CRITICAL): carry the RPC-verified
         # project identity into the AgentLoop so every message / turn
         # write is stamped with it.  ``self._bound_project_id`` (set
