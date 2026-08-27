@@ -1,10 +1,5 @@
 """Read-only implementation planning contracts and deterministic service."""
 from khaos.coding.planning.contracts import *
-from khaos.coding.planning.coordinator import (
-    PlanningControlCoordinator,
-    PlanningControlResult,
-    PlanningControlStatus,
-)
 from khaos.coding.planning.execution_models import (
     ExecutionRunStatus,
     PlanExecutionRun,
@@ -53,6 +48,38 @@ from khaos.coding.planning.verification_execution_models import (
     VerificationStepRun,
     VerificationStepStatus,
 )
+
+
+def __getattr__(name: str) -> object:
+    """Lazily expose orchestration types without importing workspace code.
+
+    ``khaos.security.resource_scope`` imports planning security identities.
+    Eagerly importing the coordinator while that package is initialized would
+    recurse through ``coding.workspace`` back into ``resource_scope``.  The
+    coordinator remains available through the historical package-level API,
+    but is loaded only when a caller explicitly requests an orchestration
+    symbol.
+    """
+    if name in {
+        "PlanningControlCoordinator",
+        "PlanningControlResult",
+        "PlanningControlStatus",
+    }:
+        from khaos.coding.planning.coordinator import (
+            PlanningControlCoordinator,
+            PlanningControlResult,
+            PlanningControlStatus,
+        )
+
+        globals().update(
+            {
+                "PlanningControlCoordinator": PlanningControlCoordinator,
+                "PlanningControlResult": PlanningControlResult,
+                "PlanningControlStatus": PlanningControlStatus,
+            }
+        )
+        return globals()[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
     "PLANNER_ALGORITHM_VERSION",

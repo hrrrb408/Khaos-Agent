@@ -161,6 +161,13 @@ M7.3 context-bound composition.  `control_state_version` is already owned by
 the M7.1.3 cognitive CAS domain and is used as a snapshot fence; it does not
 claim to protect unrelated `coding_tasks` fields.
 
+The planning package does not eagerly import the workspace-bound orchestration
+coordinator during package initialization.  Its package-level coordinator
+exports are lazy, while the production runtime factory imports the coordinator
+explicitly.  This keeps security resource-scope identity imports from
+recursing through workspace initialization; it is an import-boundary
+invariant, not a new runtime authority or capability path.
+
 The following are explicitly deferred: M7.4 Trusted Verification, M7.5
 Recovery/Replan execution, M7.6 Tool Router, M7.7 Memory policy, M7.8
 Sub-Agent control, and M7.9 metrics.
