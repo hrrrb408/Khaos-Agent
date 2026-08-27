@@ -686,7 +686,10 @@ async def test_acceptance_16_coding_tasks_update_rejects_foreign_project(tmp_pat
         task_dict["updated_at"] = "2026-07-21T01:00:00Z"
         with pytest.raises(OwnerMismatchError):
             await db.update_coding_task(
-                task_dict, principal_id="u1", project_id=PROJECT_ID_B,
+                task_dict,
+                principal_id="u1",
+                project_id=PROJECT_ID_B,
+                expected_status="in_progress",
             )
         # The original row is untouched.
         stamped_still_a = await _fetch_project_id(db, "coding_tasks", "id='task-rebind-1'")
@@ -717,16 +720,19 @@ async def test_acceptance_17_coding_tasks_update_same_owner_succeeds(tmp_path):
         )
         # Same owner UPDATE — succeeds.
         task_dict["goal"] = "updated goal"
-        task_dict["status"] = "completed"
+        task_dict["status"] = "failed"
         task_dict["updated_at"] = "2026-07-21T01:00:00Z"
         await db.update_coding_task(
-            task_dict, principal_id="u1", project_id=PROJECT_ID_A,
+            task_dict,
+            principal_id="u1",
+            project_id=PROJECT_ID_A,
+            expected_status="in_progress",
         )
         # Verify the update took effect.
         rows = await db.list_coding_tasks(principal_id="u1", project_id=PROJECT_ID_A)
         assert len(rows) == 1
         assert rows[0]["goal"] == "updated goal"
-        assert rows[0]["status"] == "completed"
+        assert rows[0]["status"] == "failed"
     finally:
         await db.close()
 
@@ -754,7 +760,7 @@ async def test_acceptance_17b_coding_task_manager_rejects_foreign_rebind(tmp_pat
         # manager_b tries to re-persist the SAME task → OwnerMismatchError.
         manager_b = TaskManager(db=db, principal_id="u1", project_id=PROJECT_ID_B)
         with pytest.raises(OwnerMismatchError):
-            await manager_b._persist(task)
+            await manager_b._persist(task, expected_status=task.status)
         # The original row's project_id is still A.
         stamped_still_a = await _fetch_project_id(db, "coding_tasks", f"id='{task.id}'")
         assert stamped_still_a == PROJECT_ID_A

@@ -90,6 +90,26 @@ state, task status, GoalSpec, or workspace before the projection returns
 `STALE`; a second call after a successful projection returns
 `ALREADY_TERMINAL` and cannot perform a second transition.
 
+### 3.1 Durable terminal monotonicity and the generic write fence
+
+The Gate's atomic SQL projection is not sufficient by itself: an older
+TaskManager cache could otherwise write a stale `RUNNING` snapshot after the
+Gate committed `COMPLETED`. Every existing-row write through generic
+`TaskManager` persistence therefore carries the lifecycle status observed
+before the in-memory operation. `Database.update_coding_task()` requires that
+value in its owner-scoped `WHERE status = expected_status` CAS predicate and
+raises the typed `TaskLifecycleConflictError` when the durable lifecycle has
+changed.
+
+The generic path also enforces terminal monotonicity. `COMPLETED`, `FAILED`,
+and `CANCELLED` may receive same-status metadata projections, but cannot be
+changed to another status by a stale or direct generic writer. In particular,
+an active task cannot be changed to `COMPLETED` through this API. Only the
+owner-scoped `CompletionGateRepository` projection can transition an eligible
+active coding task to `COMPLETED`; there is no caller-set bypass flag. This
+CAS fence is a lifecycle guard, not a claim that `control_state_version`
+protects every mutable `coding_tasks` field.
+
 ### 4. Turn lifecycle remains separate
 
 After a recorded proposal the AgentLoop evaluates the Gate and appends a
@@ -133,3 +153,5 @@ fact, not as an access grant.
   memory routing remain later work.
 - Future Gate revisions must preserve the final stale check even after trusted
   verification is integrated.
+- Durable terminal states are monotonic across all TaskManager persistence
+  paths; a stale cache fails closed instead of restoring a non-terminal state.

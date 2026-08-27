@@ -822,12 +822,24 @@ async def test_fresh_v18_and_v17_to_v18_upgrade_do_not_backfill_decisions(
     manager = TaskManager(db=db, principal_id="alice", project_id="project-a")
     completed = await manager.create("历史完成任务")
     failed = await manager.create("历史失败任务")
-    await manager.update_status(completed.id, TaskStatus.COMPLETED)
     await manager.update_status(failed.id, TaskStatus.FAILED)
     await db.close()
 
     raw = sqlite3.connect(path)
     try:
+        # Seed the historical completed row directly.  It is deliberately
+        # not created through the generic TaskManager API, which no longer
+        # owns active-to-completed lifecycle projection.
+        state_row = raw.execute(
+            "SELECT state_json FROM coding_tasks WHERE id = ?",
+            (completed.id,),
+        ).fetchone()
+        state = json.loads(state_row[0])
+        state["status"] = TaskStatus.COMPLETED.value
+        raw.execute(
+            "UPDATE coding_tasks SET status = ?, state_json = ? WHERE id = ?",
+            (TaskStatus.COMPLETED.value, json.dumps(state), completed.id),
+        )
         raw.execute("DROP TRIGGER trg_agent_completion_decisions_immutable_update")
         raw.execute("DROP TRIGGER trg_agent_completion_decisions_immutable_delete")
         raw.execute("DROP INDEX idx_agent_completion_decisions_owner_task_sequence")

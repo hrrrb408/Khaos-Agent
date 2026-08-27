@@ -167,10 +167,10 @@ async def test_list_active_excludes_terminal() -> None:
     await manager.update_status(running.id, TaskStatus.RUNNING)
 
     done = await manager.create("done")
-    await manager.update_status(done.id, TaskStatus.COMPLETED)
+    await manager.update_status(done.id, TaskStatus.FAILED)
 
     failed = await manager.create("fail")
-    await manager.update_status(failed.id, TaskStatus.FAILED)
+    await manager.update_status(failed.id, TaskStatus.CANCELLED)
 
     active = await manager.list_active()
     active_ids = {item["id"] for item in active}
@@ -184,7 +184,7 @@ async def test_list_all_returns_every_task() -> None:
     manager = TaskManager()
     a = await manager.create("a")
     b = await manager.create("b")
-    await manager.update_status(b.id, TaskStatus.COMPLETED)
+    await manager.update_status(b.id, TaskStatus.FAILED)
 
     all_ids = {item["id"] for item in await manager.list_all()}
     assert all_ids == {a.id, b.id}
@@ -200,11 +200,11 @@ async def test_max_active_limit() -> None:
 
 
 @pytest.mark.asyncio
-async def test_max_active_frees_up_after_completion() -> None:
+async def test_max_active_frees_up_after_terminal_cancel() -> None:
     manager = TaskManager(max_active=1)
     first = await manager.create("first")
-    await manager.update_status(first.id, TaskStatus.COMPLETED)
-    # Slot freed → second creation succeeds.
+    await manager.cancel(first.id)
+    # Slot freed by a terminal cancellation → second creation succeeds.
     second = await manager.create("second")
     assert second.status == TaskStatus.PENDING
 

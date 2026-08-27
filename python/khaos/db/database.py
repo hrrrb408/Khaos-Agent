@@ -142,6 +142,16 @@ class OwnerMismatchError(RuntimeError):
     """
 
 
+class TaskLifecycleConflictError(RuntimeError):
+    """A coding-task lifecycle CAS did not match the durable row.
+
+    This is deliberately separate from :class:`OwnerMismatchError`.  The
+    latter means the owner-scoped row is unavailable to the caller; this
+    error means the caller was correctly scoped but its cached lifecycle
+    status is stale, or it attempted a forbidden generic lifecycle write.
+    """
+
+
 class ChatStreamTerminalError(RuntimeError):
     """Round-5 Batch 5.2 (C-05): attempt to append to an already-terminal stream.
 
@@ -3992,24 +4002,81 @@ class Database:
 
     async def update_coding_task(
         self, task: dict[str, Any], *, principal_id: str,
-        project_id: str,
+        project_id: str, expected_status: str,
     ) -> None:
-        """UPDATE an existing coding task row with Owner-Match predicate.
+        """Update a coding task with owner and lifecycle CAS predicates.
 
-        Round-4 review Batch 4 (§八): updates use a standalone
-        ``UPDATE ... WHERE id=? AND principal_id=? AND project_id=?``
-        so a foreign caller cannot mutate another owner's task.
-        If the predicate matches zero rows, ``OwnerMismatchError`` is
-        raised — the caller fails loudly instead of silently touching
-        another owner's row.
+        Existing task persistence is a lifecycle compare-and-swap.  The
+        caller must state the durable status it read *before* applying its
+        in-memory mutation; the SQL update then requires that status to
+        remain current.  This prevents a stale TaskManager cache from
+        overwriting a Gate-committed terminal status.
+
+        Owner mismatch and lifecycle conflict are intentionally distinct:
+        an owner-scoped row that cannot be selected raises
+        ``OwnerMismatchError``; a selected row whose status no longer
+        matches ``expected_status`` raises ``TaskLifecycleConflictError``.
+        The owner-scoped probe does not disclose whether an unowned id
+        exists.
 
         Unlike ``insert_coding_task``, this method does NOT re-stamp
         ``principal_id`` or ``project_id`` — ownership is immutable
         after creation.  Only ``goal``, ``status``, ``state_json``,
         and ``updated_at`` are updated.
+
+        The generic path is never a successful completion authority:
+        active-to-``completed`` and terminal-to-different-status writes are
+        rejected even when the supplied expected status happens to match.
+        CompletionGateRepository owns the dedicated successful projection
+        SQL.
         """
         persisted_task = dict(task)
+        task_id = persisted_task["id"]
+        new_status = persisted_task["status"]
+        if type(expected_status) is not str or not expected_status:
+            raise ValueError("expected_status must be a non-empty status string")
+        if type(new_status) is not str or not new_status:
+            raise ValueError("task status must be a non-empty status string")
+
         async with self.transaction() as conn:
+            owner_cursor = await conn.execute(
+                """
+                SELECT status FROM coding_tasks
+                WHERE id = ? AND principal_id = ? AND project_id = ?
+                """,
+                (task_id, principal_id, project_id),
+            )
+            owner_row = await owner_cursor.fetchone()
+            if owner_row is None:
+                raise OwnerMismatchError(
+                    f"coding task {task_id!r} does not exist "
+                    "or is owned by a different (principal_id, project_id)"
+                )
+
+            current_status = owner_row["status"]
+            if current_status != expected_status:
+                raise TaskLifecycleConflictError(
+                    f"coding task {task_id!r} lifecycle is stale: "
+                    f"expected {expected_status!r}, current {current_status!r}"
+                )
+
+            # Terminal states are monotonic in the generic persistence
+            # domain.  Same-status metadata projections are allowed, but no
+            # stale or direct caller can move a terminal row elsewhere.
+            if (
+                current_status in {"completed", "failed", "cancelled"}
+                and new_status != current_status
+            ):
+                raise TaskLifecycleConflictError(
+                    f"coding task {task_id!r} terminal status "
+                    f"{current_status!r} cannot change to {new_status!r}"
+                )
+            if new_status == "completed" and current_status != "completed":
+                raise TaskLifecycleConflictError(
+                    "generic coding-task persistence cannot transition an "
+                    "active task to completed; CompletionGate owns that write"
+                )
+
             cursor = await conn.execute(
                 """
                 UPDATE coding_tasks SET
@@ -4018,6 +4085,7 @@ class Database:
                     state_json = ?,
                     updated_at = ?
                 WHERE id = ? AND principal_id = ? AND project_id = ?
+                  AND status = ?
                 """,
                 (
                     persisted_task["goal"],
@@ -4027,12 +4095,12 @@ class Database:
                     persisted_task["id"],
                     principal_id,
                     project_id,
+                    expected_status,
                 ),
             )
-            if cursor.rowcount == 0:
-                raise OwnerMismatchError(
-                    f"coding task {persisted_task['id']!r} does not exist "
-                    f"or is owned by a different (principal_id, project_id)"
+            if cursor.rowcount != 1:
+                raise TaskLifecycleConflictError(
+                    f"coding task {task_id!r} lifecycle changed during update"
                 )
 
     async def list_coding_tasks(

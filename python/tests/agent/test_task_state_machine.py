@@ -6,9 +6,9 @@ from khaos.coding.verify_fix import VerifyFixLoop
 async def test_terminal_state_cannot_return_to_active():
     manager = TaskManager()
     task = await manager.create("work")
-    await manager.update_status(task.id, TaskStatus.COMPLETED)
+    await manager.update_status(task.id, TaskStatus.FAILED)
     await manager.update_status(task.id, TaskStatus.RUNNING)
-    assert (await manager.get(task.id)).status == TaskStatus.COMPLETED
+    assert (await manager.get(task.id)).status == TaskStatus.FAILED
 
 
 async def test_finalize_marks_max_turns_failed():

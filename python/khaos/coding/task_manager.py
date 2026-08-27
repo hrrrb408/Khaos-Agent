@@ -450,9 +450,10 @@ class TaskManager:
                 raise CognitiveStateIntegrityError(
                     f"coding task {task_id!r} has an invalid control-state version"
                 )
+            loaded_status = TaskStatus.parse(data.get("status", "pending"))
             task = CodingTask(
                 id=task_id, goal=goal,
-                status=TaskStatus.parse(data.get("status", "pending")),
+                status=loaded_status,
                 created_at=datetime.fromisoformat(data["created_at"]),
                 updated_at=datetime.fromisoformat(data["updated_at"]),
                 files_modified=list(data.get("files_modified", [])),
@@ -484,7 +485,7 @@ class TaskManager:
                 task.error = "interrupted by process restart"
                 task.touch()
             self._tasks[task.id] = task
-            await self._persist(task)
+            await self._persist(task, expected_status=loaded_status)
 
     async def create(self, goal: str) -> CodingTask:
         """Create a new task. Raises if the active-task limit is reached.
@@ -565,19 +566,27 @@ class TaskManager:
             if task is None:
                 logger.warning("update_status: unknown task %s", task_id)
                 return TransitionResult.NOT_FOUND
+            old_status = task.status
             if task.status == resolved:
                 self._apply_task_updates(task, kwargs)
                 if kwargs:
                     task.touch()
-                    await self._persist(task)
+                    await self._persist(task, expected_status=old_status)
                 return TransitionResult.UNCHANGED
-            if task.status in TERMINAL_STATUSES:
-                logger.warning("refusing terminal task transition %s -> %s for %s", task.status.value, resolved.value, task_id)
+            if resolved is TaskStatus.COMPLETED:
+                logger.warning(
+                    "refusing generic task completion %s -> completed for %s",
+                    old_status.value,
+                    task_id,
+                )
+                return TransitionResult.INVALID_TRANSITION
+            if old_status in TERMINAL_STATUSES:
+                logger.warning("refusing terminal task transition %s -> %s for %s", old_status.value, resolved.value, task_id)
                 return TransitionResult.INVALID_TRANSITION
             self._apply_task_updates(task, kwargs)
             task.status = resolved
             task.touch()
-            await self._persist(task)
+            await self._persist(task, expected_status=old_status)
             return TransitionResult.UPDATED
 
     async def reflect_gate_completion(
@@ -617,10 +626,26 @@ class TaskManager:
                 return TransitionResult.NOT_FOUND
             if task.status not in expected:
                 return TransitionResult.INVALID_TRANSITION
+            old_status = task.status
+            if old_status in TERMINAL_STATUSES and target is not old_status:
+                logger.warning(
+                    "refusing terminal task transition %s -> %s for %s",
+                    old_status.value,
+                    target.value,
+                    task_id,
+                )
+                return TransitionResult.INVALID_TRANSITION
+            if target is TaskStatus.COMPLETED and old_status is not TaskStatus.COMPLETED:
+                logger.warning(
+                    "refusing generic task completion %s -> completed for %s",
+                    old_status.value,
+                    task_id,
+                )
+                return TransitionResult.INVALID_TRANSITION
             self._apply_task_updates(task, updates)
             task.status = target
             task.touch()
-            await self._persist(task)
+            await self._persist(task, expected_status=old_status)
             return TransitionResult.UPDATED
 
     async def initialize_cognitive_state(
@@ -770,12 +795,13 @@ class TaskManager:
             if task is None:
                 logger.warning("add_test_result: unknown task %s", task_id)
                 return
+            expected_status = task.status
             task.test_results.append(result)
             # Keep only the most recent history to bound memory.
             if len(task.test_results) > TEST_RESULT_HISTORY:
                 task.test_results = task.test_results[-TEST_RESULT_HISTORY:]
             task.touch()
-            await self._persist(task)
+            await self._persist(task, expected_status=expected_status)
 
     async def track_file_modified(self, task_id: str, path: str) -> None:
         """Record a file this task modified (deduplicated)."""
@@ -783,10 +809,11 @@ class TaskManager:
             task = self._tasks.get(task_id)
             if task is None:
                 return
+            expected_status = task.status
             if path not in task.files_modified:
                 task.files_modified.append(path)
             task.touch()
-            await self._persist(task)
+            await self._persist(task, expected_status=expected_status)
 
     async def track_file_viewed(self, task_id: str, path: str) -> None:
         """Record a file this task read (deduplicated)."""
@@ -794,10 +821,11 @@ class TaskManager:
             task = self._tasks.get(task_id)
             if task is None:
                 return
+            expected_status = task.status
             if path not in task.files_viewed:
                 task.files_viewed.append(path)
             task.touch()
-            await self._persist(task)
+            await self._persist(task, expected_status=expected_status)
 
     async def list_active(
         self, *, principal_id: str | None = None,
@@ -889,9 +917,10 @@ class TaskManager:
                         task_id, exc,
                     )
                     return TransitionResult.LEASE_INVALIDATION_FAILED
+            old_status = task.status
             task.status = TaskStatus.CANCELLED
             task.touch()
-            await self._persist(task)
+            await self._persist(task, expected_status=old_status)
             return TransitionResult.UPDATED
 
     async def record_trace(self, task_id: str, entry: dict[str, Any]) -> None:
@@ -899,44 +928,77 @@ class TaskManager:
             task = self._tasks.get(task_id)
             if task is None:
                 return
+            expected_status = task.status
             task.trace.append(entry)
             task.touch()
-            await self._persist(task)
+            await self._persist(task, expected_status=expected_status)
 
-    async def _persist(self, task: CodingTask, *, emit_event: bool = True) -> None:
+    async def _persist(
+        self,
+        task: CodingTask,
+        *,
+        expected_status: TaskStatus | str | None = None,
+        emit_event: bool = True,
+    ) -> None:
         task._validate_goal_spec_projection()
+        if task._persisted and expected_status is None:
+            raise ValueError(
+                "expected_status is required when persisting an existing task"
+            )
+        previous_event_sequence = task.event_sequence
         task.event_sequence += 1
-        if self._db is not None:
-            # A3-2: stamp the bound principal on every persisted row so
-            # ``list_coding_tasks(principal_id=...)`` can filter by it.
-            # The task's own ``principal_id`` is the source of truth
-            # (set at create time from ``self._principal_id``); we pass
-            # it explicitly here so a row can never silently inherit
-            # the DB default ('legacy') if a future code path constructs
-            # a task with a different principal.
-            #
-            # Round-4 review Batch 4 (§八): split into Plain INSERT (first
-            # write) and Owner-bound UPDATE (subsequent writes).  The
-            # ``_persisted`` flag tracks which path to take.  This closes
-            # the silent-overwrite bypass: a 128-bit UUID collision on
-            # INSERT raises ``IntegrityError``, and a foreign caller's
-            # UPDATE raises ``OwnerMismatchError`` (predicate matches 0
-            # rows).  Ownership (principal_id + project_id) is immutable
-            # after creation.
-            task_dict = task.to_dict(include_internal=True)
-            if not task._persisted:
-                await self._db.insert_coding_task(
-                    task_dict,
-                    principal_id=task.principal_id,
-                    project_id=self._project_id,
-                )
-                task._persisted = True
-            else:
-                await self._db.update_coding_task(
-                    task_dict,
-                    principal_id=task.principal_id,
-                    project_id=self._project_id,
-                )
+        try:
+            if self._db is not None:
+                # A3-2: stamp the bound principal on every persisted row so
+                # ``list_coding_tasks(principal_id=...)`` can filter by it.
+                # The task's own ``principal_id`` is the source of truth
+                # (set at create time from ``self._principal_id``); we pass
+                # it explicitly here so a row can never silently inherit
+                # the DB default ('legacy') if a future code path constructs
+                # a task with a different principal.
+                #
+                # Round-4 review Batch 4 (§八): split into Plain INSERT
+                # (first write) and lifecycle-CAS UPDATE (subsequent writes).
+                # Ownership (principal_id + project_id) is immutable after
+                # creation, and the expected status is captured before the
+                # caller mutates this in-memory projection.
+                task_dict = task.to_dict(include_internal=True)
+                if not task._persisted:
+                    await self._db.insert_coding_task(
+                        task_dict,
+                        principal_id=task.principal_id,
+                        project_id=self._project_id,
+                    )
+                    task._persisted = True
+                else:
+                    if isinstance(expected_status, TaskStatus):
+                        expected_status_value = expected_status.value
+                    else:
+                        expected_status_value = expected_status
+                    await self._db.update_coding_task(
+                        task_dict,
+                        principal_id=task.principal_id,
+                        project_id=self._project_id,
+                        expected_status=expected_status_value,
+                    )
+        except BaseException:
+            # A failed CAS did not commit this event.  Keep the local event
+            # sequence and lifecycle projection aligned with the last
+            # committed values; the caller still receives the original
+            # typed failure and must explicitly refresh before making
+            # another lifecycle decision.  Metadata mutations remain local
+            # observations until a later successful persistence operation.
+            if isinstance(expected_status, TaskStatus):
+                task.status = expected_status
+            elif isinstance(expected_status, str):
+                try:
+                    task.status = TaskStatus.parse(expected_status)
+                except ValueError:
+                    # The database layer owns validation of raw status
+                    # strings; do not mask its original exception here.
+                    pass
+            task.event_sequence = previous_event_sequence
+            raise
         if emit_event:
             self._publish_task_event(task)
 

@@ -212,7 +212,7 @@ async def test_owner_project_and_terminal_boundaries_fail_closed(tmp_path: Path)
         )
         assert foreign_project is None
 
-        await manager.update_status(task.id, TaskStatus.COMPLETED)
+        await manager.update_status(task.id, TaskStatus.FAILED)
         terminal = await manager.transition_cognitive_state(
             task.id,
             target=AgentCognitiveState.EXPLORING,
@@ -386,11 +386,23 @@ async def test_v16_to_v17_migration_is_conservative_and_idempotent(
     db = await _make_db(path)
     manager = TaskManager(db=db, principal_id="alice", project_id="project-a")
     task = await manager.create("legacy cognitive migration")
-    await manager.update_status(task.id, TaskStatus.COMPLETED)
     await db.close()
 
     raw = sqlite3.connect(path)
     try:
+        # Historical terminal rows are fixture data for the migration test.
+        # Generic TaskManager persistence is intentionally not a completion
+        # authority after M7.1.7.
+        state_row = raw.execute(
+            "SELECT state_json FROM coding_tasks WHERE id = ?",
+            (task.id,),
+        ).fetchone()
+        state = json.loads(state_row[0])
+        state["status"] = TaskStatus.COMPLETED.value
+        raw.execute(
+            "UPDATE coding_tasks SET status = ?, state_json = ? WHERE id = ?",
+            (TaskStatus.COMPLETED.value, json.dumps(state), task.id),
+        )
         raw.execute(
             "DELETE FROM schema_migrations WHERE version = ?",
             (SCHEMA_MIGRATION_VERSION,),
