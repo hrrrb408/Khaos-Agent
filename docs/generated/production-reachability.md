@@ -17,8 +17,8 @@
 
 ## Import reachability result
 
-- Reachable repository modules: `263`.
-- Resolved import edges: `1883`.
+- Reachable repository modules: `272`.
+- Resolved import edges: `1978`.
 - Forbidden production edges: `0`.
 - Unresolved internal edges: `0`.
 
@@ -101,15 +101,24 @@
 - `khaos.coding.planning.approval.service`
 - `khaos.coding.planning.approval.store`
 - `khaos.coding.planning.approval.validator`
+- `khaos.coding.planning.context_planner`
 - `khaos.coding.planning.contracts`
+- `khaos.coding.planning.coordinator`
+- `khaos.coding.planning.dag`
 - `khaos.coding.planning.execution_models`
 - `khaos.coding.planning.git_state`
+- `khaos.coding.planning.limits`
 - `khaos.coding.planning.recovery_directory`
+- `khaos.coding.planning.repository`
+- `khaos.coding.planning.revision`
+- `khaos.coding.planning.risk`
 - `khaos.coding.planning.safe_identifiers`
 - `khaos.coding.planning.safe_workspace_path`
 - `khaos.coding.planning.security_identities`
+- `khaos.coding.planning.service`
 - `khaos.coding.planning.trusted_verification`
 - `khaos.coding.planning.trusted_verification_runner`
+- `khaos.coding.planning.verification`
 - `khaos.coding.planning.verification_authority`
 - `khaos.coding.planning.verification_catalog`
 - `khaos.coding.planning.verification_execution_models`

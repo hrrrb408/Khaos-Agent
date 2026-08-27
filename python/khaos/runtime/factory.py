@@ -22,6 +22,8 @@ from khaos.audit import (
 )
 from khaos.coding.execution import BackendSelector, ExecutionService
 from khaos.coding.intelligence.query_service import ContextIntelligenceService
+from khaos.coding.planning.coordinator import PlanningControlCoordinator
+from khaos.coding.planning.service import DeterministicPlanningService
 from khaos.coding.task_manager import TaskManager
 from khaos.coding.verify_fix import VerifyFixLoop
 from khaos.coding.workspace.manager import WorkspaceManager
@@ -452,6 +454,12 @@ class RuntimeResult:
     # production composition verifier checks it against fixed live paths.
     composition_manifest: dict[str, object] | None = field(
         init=False, default=None
+    )
+    # M7.3: production-composed planning control coordinator.  It is an
+    # orchestration owner only; plan revisions remain passive and TaskStatus
+    # lifecycle writes remain owned by their existing control boundaries.
+    planning_coordinator: PlanningControlCoordinator | None = field(
+        default=None, repr=False
     )
 
     @property
@@ -1714,6 +1722,33 @@ async def build_runtime(
         principal_id=cfg.principal_id,
         project_id=project_id,
     )
+    # M7.3: production planning is composed around the M7.2 context owner.
+    # The deterministic service is deliberately constructed without its
+    # legacy path/index query port; the production entry is
+    # ``plan_from_context`` and receives only a fresh ContextBundle.
+    planning_coordinator = None
+    if context_intelligence is not None:
+        plan_repository = getattr(cfg.db, "plan_revision_repository", None)
+        control_state_repository = getattr(
+            cfg.db, "agent_control_state_repository", None
+        )
+        if plan_repository is None or control_state_repository is None:
+            raise RuntimeError(
+                "planning control repositories are unavailable in runtime composition"
+            )
+        planning_service = DeterministicPlanningService(
+            None,
+            repositories={},
+        )
+        planning_coordinator = PlanningControlCoordinator(
+            planning_service=planning_service,
+            context_intelligence=context_intelligence,
+            goal_spec_repository=goal_spec_repository,
+            plan_revision_repository=plan_repository,
+            control_state_repository=control_state_repository,
+            principal_id=cfg.principal_id,
+            project_id=project_id,
+        )
     loop = AgentLoop(
         cfg.agent_config or AgentConfig(), mode_manager, router, cfg.db,
         tool_scheduler=scheduler, confirm_callback=cfg.confirm_callback,
@@ -1764,6 +1799,7 @@ async def build_runtime(
         completion_controller=completion_controller,
         completion_gate=completion_gate,
         completion_recovery=completion_recovery,
+        planning_coordinator=planning_coordinator,
         # M4 batch 3.1.16A-5-1b (CRITICAL): carry the RPC-verified
         # project identity into the AgentLoop so every message / turn
         # write is stamped with it.  ``self._bound_project_id`` (set
@@ -1810,6 +1846,7 @@ async def build_runtime(
         owns_office_authority=owns_office_authority,
         credential_broker=credential_broker,
         owns_credential_broker=owns_credential_broker,
+        planning_coordinator=planning_coordinator,
         principal_id=cfg.principal_id,
         principal_kind=cfg.principal_kind,
         parent_principal_id=cfg.parent_principal_id,

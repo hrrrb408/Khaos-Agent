@@ -486,6 +486,14 @@ MIGRATIONS: tuple[MigrationSpec, ...] = (
         sql_files=("0018_completion_decisions.sql",),
         migrator_symbols=("_apply_v18_upgrades",),
     ),
+    MigrationSpec(
+        version=19,
+        name="m7_3_deterministic_plan_revisions",
+        # Release-time manifest over the additive v19 SQL and migrator.
+        sha256="c0568e0d408215aeed18a6b4a84ff2777b1ed7b9c4534dc2acfaa4ecb23f5f7a",
+        sql_files=("0019_plan_revisions.sql",),
+        migrator_symbols=("_apply_v19_upgrades",),
+    ),
 )
 
 

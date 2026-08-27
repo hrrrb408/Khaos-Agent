@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from enum import Enum
@@ -35,6 +36,8 @@ class CognitiveTransitionStatus(str, Enum):
     OWNER_MISMATCH = "owner_mismatch"
     STALE_VERSION = "stale_version"
     STALE_STATE = "stale_state"
+    STALE_TASK_STATUS = "stale_task_status"
+    STALE_WORKSPACE_BINDING = "stale_workspace_binding"
     ILLEGAL_TRANSITION = "illegal_transition"
     TERMINAL_TASK = "terminal_task"
 
@@ -62,6 +65,25 @@ class CognitiveStateSnapshot:
     def version(self) -> int:
         """Compatibility alias for the control-state CAS version."""
         return self.control_state_version
+
+
+@dataclass(frozen=True, slots=True)
+class CognitiveWorkspaceBinding:
+    """Optional durable workspace facts used as an additional CAS fence.
+
+    These values identify the workspace snapshot observed by a caller.  They
+    do not grant access to that workspace or change any execution authority.
+    """
+
+    workspace_id: str | None
+    base_revision: str | None
+    repository_id: str | None
+
+    def __post_init__(self) -> None:
+        for field_name in ("workspace_id", "base_revision", "repository_id"):
+            value = getattr(self, field_name)
+            if value is not None and (type(value) is not str or not value):
+                raise ValueError(f"{field_name} must be None or a non-empty string")
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,13 +205,17 @@ class AgentControlStateRepository:
         expected_state: AgentCognitiveState,
         expected_version: int,
         target_state: AgentCognitiveState,
+        expected_task_status: str | None = None,
+        expected_workspace_binding: CognitiveWorkspaceBinding | None = None,
     ) -> CognitiveTransitionResult:
         """Atomically CAS one non-terminal task's cognitive state.
 
         The SQL predicate binds task identity, both ownership dimensions,
         expected state/version, and non-terminal task status.  A self
         transition performs only an owner-scoped observation and returns
-        ``UNCHANGED`` without incrementing the version.
+        ``UNCHANGED`` without incrementing the version.  When supplied,
+        ``expected_task_status`` is an additional lifecycle fence; it does
+        not make this repository a TaskStatus writer.
         """
         _validate_owner_inputs(
             task_id=task_id,
@@ -200,6 +226,16 @@ class AgentControlStateRepository:
         _validate_state(target_state, label="target_state")
         if type(expected_version) is not int or expected_version < 0:
             raise ValueError("expected_version must be a non-negative integer")
+        if expected_task_status is not None and (
+            type(expected_task_status) is not str or not expected_task_status
+        ):
+            raise ValueError("expected_task_status must be a non-empty string")
+        if expected_workspace_binding is not None and type(
+            expected_workspace_binding
+        ) is not CognitiveWorkspaceBinding:
+            raise TypeError(
+                "expected_workspace_binding must be a CognitiveWorkspaceBinding"
+            )
         if (
             AgentCognitiveStateMachine.validate_transition(
                 expected_state, target_state
@@ -234,9 +270,18 @@ class AgentControlStateRepository:
                     expected_state=expected_state,
                     expected_version=expected_version,
                     target_state=target_state,
+                    expected_task_status=expected_task_status,
                 )
                 if mismatch is not None:
                     return mismatch
+                if _workspace_binding_mismatch(row, expected_workspace_binding):
+                    return _result_from_snapshot(
+                        CognitiveTransitionStatus.STALE_WORKSPACE_BINDING,
+                        snapshot,
+                        expected_state=expected_state,
+                        expected_version=expected_version,
+                        target_state=target_state,
+                    )
                 return _result_from_snapshot(
                     CognitiveTransitionStatus.UNCHANGED,
                     snapshot,
@@ -244,6 +289,39 @@ class AgentControlStateRepository:
                     expected_version=expected_version,
                     target_state=target_state,
                 )
+
+            if expected_workspace_binding is not None:
+                row = await self._select_owned(
+                    conn,
+                    task_id=task_id,
+                    principal_id=principal_id,
+                    project_id=project_id,
+                )
+                snapshot = _decode_snapshot(row)
+                if snapshot is None:
+                    return _not_found_result(
+                        task_id=task_id,
+                        expected_state=expected_state,
+                        expected_version=expected_version,
+                        target_state=target_state,
+                    )
+                mismatch = _classify_cas_mismatch(
+                    snapshot,
+                    expected_state=expected_state,
+                    expected_version=expected_version,
+                    target_state=target_state,
+                    expected_task_status=expected_task_status,
+                )
+                if mismatch is not None:
+                    return mismatch
+                if _workspace_binding_mismatch(row, expected_workspace_binding):
+                    return _result_from_snapshot(
+                        CognitiveTransitionStatus.STALE_WORKSPACE_BINDING,
+                        snapshot,
+                        expected_state=expected_state,
+                        expected_version=expected_version,
+                        target_state=target_state,
+                    )
 
             cursor = await conn.execute(
                 """
@@ -255,6 +333,7 @@ class AgentControlStateRepository:
                   AND project_id = ?
                   AND cognitive_state = ?
                   AND control_state_version = ?
+                  AND (? IS NULL OR status = ?)
                   AND status NOT IN ('completed', 'failed', 'cancelled')
                 """,
                 (
@@ -264,6 +343,8 @@ class AgentControlStateRepository:
                     project_id,
                     expected_state.value,
                     expected_version,
+                    expected_task_status,
+                    expected_task_status,
                 ),
             )
             if int(cursor.rowcount or 0) == 1:
@@ -307,6 +388,7 @@ class AgentControlStateRepository:
                 expected_state=expected_state,
                 expected_version=expected_version,
                 target_state=target_state,
+                expected_task_status=expected_task_status,
             )
             if mismatch is None:
                 raise CognitiveStateIntegrityError(
@@ -325,13 +407,54 @@ class AgentControlStateRepository:
         cursor = await conn.execute(
             """
             SELECT id, principal_id, project_id, cognitive_state,
-                   control_state_version, status
+                   control_state_version, status, state_json
             FROM coding_tasks
             WHERE id = ? AND principal_id = ? AND project_id = ?
             """,
             (task_id, principal_id, project_id),
         )
         return await cursor.fetchone()
+
+
+def _workspace_binding_mismatch(
+    row: Any, expected: CognitiveWorkspaceBinding | None
+) -> bool:
+    if expected is None:
+        return False
+    if row is None:
+        return True
+    try:
+        raw_state = row["state_json"]
+        if type(raw_state) is not str:
+            raise CognitiveStateIntegrityError("coding task state_json is malformed")
+        state = json.loads(raw_state)
+        if type(state) is not dict:
+            raise CognitiveStateIntegrityError("coding task state_json root is malformed")
+        metadata = state.get("metadata", {})
+        if type(metadata) is not dict:
+            raise CognitiveStateIntegrityError(
+                "coding task metadata projection is malformed"
+            )
+        actual = {
+            "workspace_id": metadata.get("workspace_id"),
+            "base_revision": metadata.get("base_sha"),
+            "repository_id": metadata.get("repository_id"),
+        }
+        for field_name, value in actual.items():
+            if value is not None and (type(value) is not str or not value):
+                raise CognitiveStateIntegrityError(
+                    f"coding task {field_name} projection is malformed"
+                )
+    except CognitiveStateIntegrityError:
+        raise
+    except (KeyError, TypeError, ValueError) as exc:
+        raise CognitiveStateIntegrityError(
+            "coding task workspace projection is malformed"
+        ) from exc
+    return any(
+        actual[field_name] != getattr(expected, field_name)
+        for field_name in ("workspace_id", "base_revision", "repository_id")
+    )
 
 
 def _validate_owner_inputs(
@@ -430,6 +553,7 @@ def _classify_cas_mismatch(
     expected_state: AgentCognitiveState,
     expected_version: int,
     target_state: AgentCognitiveState,
+    expected_task_status: str | None = None,
 ) -> CognitiveTransitionResult | None:
     if snapshot.task_status in TERMINAL_TASK_STATUSES:
         return _result_from_snapshot(
@@ -455,6 +579,14 @@ def _classify_cas_mismatch(
             expected_version=expected_version,
             target_state=target_state,
         )
+    if expected_task_status is not None and snapshot.task_status != expected_task_status:
+        return _result_from_snapshot(
+            CognitiveTransitionStatus.STALE_TASK_STATUS,
+            snapshot,
+            expected_state=expected_state,
+            expected_version=expected_version,
+            target_state=target_state,
+        )
     return None
 
 
@@ -465,5 +597,6 @@ __all__ = [
     "CognitiveStateSnapshot",
     "CognitiveTransitionResult",
     "CognitiveTransitionStatus",
+    "CognitiveWorkspaceBinding",
     "ControlStateDatabase",
 ]

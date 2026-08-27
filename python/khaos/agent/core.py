@@ -178,6 +178,7 @@ class AgentLoop:
         completion_fact_provider: CompletionFactProvider | None = None,
         completion_gate: CompletionGate | None = None,
         completion_recovery: CompletionRecoveryService | None = None,
+        planning_coordinator: Any = None,
     ):
         self.config = config
         self.mode_manager = mode_manager
@@ -226,6 +227,11 @@ class AgentLoop:
         self.completion_fact_provider = completion_fact_provider
         self.completion_gate = completion_gate
         self.completion_recovery = completion_recovery
+        # M7.3: planning is an explicit control-plane coordinator.  The loop
+        # only invokes the composed owner; it does not infer plans from tool
+        # names or implement planner/risk/DAG logic itself.
+        self.planning_coordinator = planning_coordinator
+        self._active_planning_result: Any = None
         self.skill_generator = skill_generator
         self.workspace_manager = workspace_manager
         self.active_workspace = None
@@ -393,6 +399,13 @@ class AgentLoop:
                             workspace_id=self.active_workspace.id,
                             worktree_path=str(self.active_workspace.worktree_path),
                             base_sha=self.active_workspace.base_sha,
+                            repository_id=(
+                                self.context_intelligence.repository_id_for_workspace(
+                                    self.active_workspace
+                                )
+                                if self.context_intelligence is not None
+                                else None
+                            ),
                         )
                         await self._record_memory_runtime_event(
                             "WORKSPACE_CREATED",
@@ -423,6 +436,30 @@ class AgentLoop:
             # agent_turns row.
             project_id=self.project_id,
         )
+        if (
+            is_coding
+            and active_task_id is not None
+            and self.planning_coordinator is not None
+            and self.active_workspace is not None
+            and (
+                self._active_planning_result is None
+                or getattr(self._active_planning_result, "task_id", None)
+                != active_task_id
+            )
+        ):
+            self._active_planning_result = await self.planning_coordinator.plan(
+                active_task_id,
+                workspace=self.active_workspace,
+                query=user_input,
+                runtime_id=self.runtime_id,
+                event_sink=turn,
+            )
+            # The coordinator owns the physical cognitive CAS.  Refresh only
+            # the in-memory projection so the task facts below do not expose a
+            # stale pre-CAS state; this is not restart ``load()`` semantics.
+            refresh = getattr(self.task_manager, "refresh_projection", None)
+            if refresh is not None:
+                await refresh(active_task_id)
         self._active_context_facts = await self._build_durable_task_facts(
             active_task_id
         )
@@ -2015,6 +2052,73 @@ class AgentLoop:
             "changeset_id": metadata.get("changeset_id"),
             "verification_run_id": metadata.get("verification_run_id"),
         }
+        # M7.3: expose only a bounded read projection of the durable plan
+        # history.  The canonical revision remains in the owner-scoped
+        # ledger; no raw plan JSON or repository text is injected here.
+        plan_repository = getattr(self.db, "plan_revision_repository", None)
+        if plan_repository is not None:
+            try:
+                latest_plan = await plan_repository.get_latest_for_task(
+                    task_id,
+                    principal_id=self.principal_id,
+                    project_id=self.project_id,
+                )
+            except Exception as exc:  # noqa: BLE001 - facts fail closed
+                logger.warning(
+                    "durable planning facts unavailable: task=%s error=%s",
+                    task_id,
+                    type(exc).__name__,
+                )
+                facts["planning_integrity"] = "unavailable"
+            else:
+                if latest_plan is not None:
+                    revision = latest_plan.revision
+                    facts["plan_revision"] = {
+                        "plan_revision_id": revision.plan_revision_id,
+                        "revision_sequence": latest_plan.revision_sequence,
+                        "plan_semantic_digest": revision.plan_semantic_digest,
+                        "status": revision.disposition.value,
+                        "disposition": revision.disposition.value,
+                        "planning_input_digest": revision.planning_input_digest,
+                        "goal_spec_digest": revision.goal_spec_digest,
+                        "workspace_id": revision.workspace_id,
+                        "repository_id": revision.repository_id,
+                        "base_revision": revision.base_revision,
+                        "context_bundle_id": revision.context_bundle_id,
+                        "context_bundle_digest": revision.context_bundle_digest,
+                        "repository_generation": revision.repository_generation,
+                        "index_generation": revision.index_generation,
+                        "target_files": tuple(
+                            item.path for item in revision.affected_files[:32]
+                        ),
+                        "target_symbols": tuple(
+                            item.symbol_id for item in revision.affected_symbols[:64]
+                        ),
+                        "step_ids": tuple(
+                            item.step_id for item in revision.steps[:32]
+                        ),
+                        "step_operations": tuple(
+                            item.operation.value for item in revision.steps[:32]
+                        ),
+                        "step_titles": tuple(
+                            item.title[:512] for item in revision.steps[:32]
+                        ),
+                        "step_targets": tuple(
+                            {
+                                "step_id": item.step_id,
+                                "target_files": tuple(item.target_files[:32]),
+                                "target_symbols": tuple(item.target_symbols[:64]),
+                            }
+                            for item in revision.steps[:32]
+                        ),
+                        "diagnostic_codes": tuple(
+                            item.code for item in revision.diagnostics[:32]
+                        ),
+                        "context_truncated": any(
+                            item.code == "context-truncated"
+                            for item in revision.diagnostics
+                        ),
+                    }
         # M7.1.8: expose only a bounded read-only continuation projection.
         # Recovery never invokes a planner/model/gate and never projects a
         # lifecycle status.

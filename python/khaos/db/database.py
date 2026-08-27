@@ -23,6 +23,7 @@ from khaos.agent.control.completion_repository import CompletionDecisionReposito
 from khaos.agent.control.goal_repository import GoalSpecRepository
 from khaos.agent.control.state_repository import AgentControlStateRepository
 from khaos.agent.core import Message
+from khaos.coding.planning.repository import PlanRevisionRepository
 from khaos.db.connection import (
     READER_DRAIN_TIMEOUT,
     DatabaseClosingError,  # noqa: F401 - compatibility export
@@ -261,6 +262,7 @@ class Database:
         self._goal_spec_repository = GoalSpecRepository(self)
         self._agent_control_state_repository = AgentControlStateRepository(self)
         self._completion_decision_repository = CompletionDecisionRepository(self)
+        self._plan_revision_repository = PlanRevisionRepository(self)
         # F-01: Per-domain locks remain for logical serialization (e.g. two
         # concurrent permission grants must not race on epoch computation).
         self._operation_approval_lock = asyncio.Lock()
@@ -304,6 +306,11 @@ class Database:
     def completion_decision_repository(self) -> CompletionDecisionRepository:
         """Return the sole owner-scoped completion-decision ledger."""
         return self._completion_decision_repository
+
+    @property
+    def plan_revision_repository(self) -> PlanRevisionRepository:
+        """Return the sole owner-scoped immutable planning-revision ledger."""
+        return self._plan_revision_repository
 
     @_conn.setter
     def _conn(self, value: Any | None) -> None:
@@ -848,6 +855,14 @@ class Database:
             self._conn = _MigrationConnection(conn)
             try:
                 await self._apply_v18_upgrades()
+            finally:
+                self._conn = original_conn
+            # M7.3: add the passive, append-only deterministic planning
+            # revision ledger.  No plan is inferred from legacy task history.
+            original_conn = self._conn
+            self._conn = _MigrationConnection(conn)
+            try:
+                await self._apply_v19_upgrades()
             finally:
                 self._conn = original_conn
             # Batch 6.4 §10.4: backfill the historical ledger rows (v1–v5)
@@ -1490,6 +1505,16 @@ class Database:
 
         conn = await self._require_conn()
         migration_path = _MIGRATIONS_DIR / "0018_completion_decisions.sql"
+        await self._execute_schema_statements(
+            conn,
+            migration_path.read_text(encoding="utf-8"),
+        )
+
+    async def _apply_v19_upgrades(self) -> None:
+        """Add the M7.3 immutable deterministic planning ledger."""
+
+        conn = await self._require_conn()
+        migration_path = _MIGRATIONS_DIR / "0019_plan_revisions.sql"
         await self._execute_schema_statements(
             conn,
             migration_path.read_text(encoding="utf-8"),

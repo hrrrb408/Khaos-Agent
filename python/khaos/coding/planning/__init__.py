@@ -1,5 +1,10 @@
 """Read-only implementation planning contracts and deterministic service."""
 from khaos.coding.planning.contracts import *
+from khaos.coding.planning.coordinator import (
+    PlanningControlCoordinator,
+    PlanningControlResult,
+    PlanningControlStatus,
+)
 from khaos.coding.planning.execution_models import (
     ExecutionRunStatus,
     PlanExecutionRun,
@@ -7,6 +12,34 @@ from khaos.coding.planning.execution_models import (
     PlannedEditOperation,
     PlannedFileEdit,
     WorkspaceMutationResult,
+)
+from khaos.coding.planning.repository import (
+    PlanningTaskSnapshot,
+    PlanRevisionBindingError,
+    PlanRevisionConflictError,
+    PlanRevisionIntegrityError,
+    PlanRevisionRepository,
+    PlanRevisionStaleError,
+    StoredPlanRevision,
+)
+from khaos.coding.planning.revision import (
+    PLANNER_ALGORITHM_VERSION,
+    PLANNING_SCHEMA_VERSION,
+    PlanDisposition,
+    PlanningAffectedFile,
+    PlanningAffectedSymbol,
+    PlanningContractError,
+    PlanningDependencyImpact,
+    PlanningDiagnostic,
+    PlanningEvidenceKind,
+    PlanningEvidenceRef,
+    PlanningInput,
+    PlanningRisk,
+    PlanningRiskLevel,
+    PlanningStep,
+    PlanningVerificationIntent,
+    PlanRevision,
+    plan_revision_from_canonical_json,
 )
 from khaos.coding.planning.service import DeterministicPlanningService
 from khaos.coding.planning.verification_execution_models import (
@@ -20,12 +53,38 @@ from khaos.coding.planning.verification_execution_models import (
 )
 
 __all__ = [
+    "PLANNER_ALGORITHM_VERSION",
+    "PLANNING_SCHEMA_VERSION",
     "DeterministicPlanningService",
     "ExecutionRunStatus",
+    "PlanDisposition",
     "PlanExecutionRun",
+    "PlanRevision",
+    "PlanRevisionBindingError",
+    "PlanRevisionConflictError",
+    "PlanRevisionIntegrityError",
+    "PlanRevisionRepository",
+    "PlanRevisionStaleError",
     "PlannedEditBundle",
     "PlannedEditOperation",
     "PlannedFileEdit",
+    "PlanningAffectedFile",
+    "PlanningAffectedSymbol",
+    "PlanningContractError",
+    "PlanningControlCoordinator",
+    "PlanningControlResult",
+    "PlanningControlStatus",
+    "PlanningDependencyImpact",
+    "PlanningDiagnostic",
+    "PlanningEvidenceKind",
+    "PlanningEvidenceRef",
+    "PlanningInput",
+    "PlanningRisk",
+    "PlanningRiskLevel",
+    "PlanningStep",
+    "PlanningTaskSnapshot",
+    "PlanningVerificationIntent",
+    "StoredPlanRevision",
     "TrustedVerificationCommand",
     "VerificationExecutionRun",
     "VerificationPhaseContext",
@@ -34,4 +93,5 @@ __all__ = [
     "VerificationStepRun",
     "VerificationStepStatus",
     "WorkspaceMutationResult",
+    "plan_revision_from_canonical_json",
 ]

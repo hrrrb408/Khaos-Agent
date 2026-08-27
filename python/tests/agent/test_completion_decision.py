@@ -813,7 +813,10 @@ async def test_fresh_v18_and_v17_to_v18_upgrade_do_not_backfill_decisions(
                 )
             ).fetchone()
             assert table["name"] == "agent_completion_decisions"
-        assert SCHEMA_MIGRATION_VERSION == 18
+        # M7.3 adds v19 after the immutable completion-decision ledger; the
+        # v18 no-backfill assertion remains valid while the current schema
+        # version advances monotonically.
+        assert SCHEMA_MIGRATION_VERSION == 19
     finally:
         await fresh.close()
 
@@ -844,7 +847,9 @@ async def test_fresh_v18_and_v17_to_v18_upgrade_do_not_backfill_decisions(
         raw.execute("DROP TRIGGER trg_agent_completion_decisions_immutable_delete")
         raw.execute("DROP INDEX idx_agent_completion_decisions_owner_task_sequence")
         raw.execute("DROP TABLE agent_completion_decisions")
-        raw.execute("DELETE FROM schema_migrations WHERE version = 18")
+        # v19 is now the current schema.  Remove both post-v17 manifest rows
+        # so the upgrade path replays v18 and then the idempotent v19 delta.
+        raw.execute("DELETE FROM schema_migrations WHERE version >= 18")
         raw.commit()
     finally:
         raw.close()
