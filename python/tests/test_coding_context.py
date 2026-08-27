@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from khaos.agent import AgentConfig, AgentLoop, Message
 from khaos.coding.intelligence.query_service import ContextIntelligenceService
 from khaos.db import Database
@@ -235,6 +236,7 @@ async def test_coding_mode_without_builder_skips_injection(tmp_path):
     assert not any("# Relevant Files" in m.content for m in messages)
 
 
+@pytest.mark.posix_host
 async def test_workspace_bound_context_service_is_the_typed_agent_projection(tmp_path):
     (tmp_path / "approval.py").write_text(
         "def consume_approval():\n"
