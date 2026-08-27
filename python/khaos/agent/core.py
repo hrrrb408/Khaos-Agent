@@ -1761,9 +1761,9 @@ class AgentLoop:
 
         1. The project structure tree into the *system* prompt (see
            :meth:`_build_system_prompt`) — kept small (≤ token budget).
-        2. The contents of files relevant to ``user_input`` as an extra
-           ``# Relevant Files`` system message appended *after* the persisted
-           history, so the model sees them just before the current turn.
+        2. The contents of files relevant to ``user_input`` as a lower-trust
+           user observation appended *after* the persisted history, so the
+           authenticated current user request remains the final turn input.
 
         Neither injection happens in office mode or when ``project_root`` is
         unset, so non-coding behaviour is unchanged.
@@ -1941,8 +1941,11 @@ class AgentLoop:
                     break
                 prefix = "\n".join(prefix_lines[:-1]).rstrip()
                 content = f"{prefix}\n{marker}\n{closing}"
+        # Repository/workspace bytes are data.  The OpenAI-compatible client
+        # forwards Message.role and does not forward Khaos metadata, so this
+        # must remain a user-level observation rather than a system message.
         return Message(
-            role="system",
+            role="user",
             content=content,
             token_count=self.token_engine.count_tokens(content),
             metadata={
@@ -2155,7 +2158,7 @@ class AgentLoop:
         return f"# Project Structure\n\n{trimmed}"
 
     def _build_relevant_files_message(self, user_input: str):
-        """Return a ``# Relevant Files`` system Message, or None.
+        """Return a ``# Relevant Files`` user observation, or None.
 
         Aggregates the file contents collected by the coding context builder
         into one fenced block per file. Returns None outside coding mode or

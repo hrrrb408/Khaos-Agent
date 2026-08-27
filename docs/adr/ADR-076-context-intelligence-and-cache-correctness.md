@@ -93,6 +93,23 @@ verification authority from context.  Compression/rebuild correctness is
 preserved by rebuilding the typed bundle rather than relying on a historical
 fingerprint-only “already shown” decision.
 
+## Prompt privilege fence amendment
+
+Repository/workspace context is emitted as a `Message(role="user")`
+ephemeral observation.  The authenticated current user request is appended
+after that observation by `AgentLoop`; the context message is never promoted
+to `system` or `developer` role.  `metadata["trusted"] = False` remains
+descriptive telemetry only: the OpenAI-compatible boundary is allowed to drop
+Khaos metadata, so no security property relies on provider metadata support.
+
+The trusted coding system prompt explicitly treats repository bytes as data
+and rejects embedded instructions, policy/role/approval/permission claims, or
+completion claims.  XML/Markdown delimiters are defense in depth and are not
+considered a prompt-isolation or authority boundary.  Only trusted system
+policy and the authenticated user request define the goal; Tool, Approval,
+Sandbox, Workspace, Verification, and Completion authority remain enforced by
+the runtime outside the model.
+
 ## Non-goals
 
 M7.2 does not implement deterministic planning, PlanRevision persistence,
