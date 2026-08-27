@@ -1,7 +1,10 @@
+import asyncio
 import json
 
+import pytest
 from khaos.agent import AgentConfig, AgentLoop, Message
 from khaos.agent.compressor import CompressionLevel, CompressionResult
+from khaos.coding.task_manager import TaskManager, TaskStatus
 from khaos.db import Database
 from khaos.modes import Mode, ModeManager
 from khaos.permissions import PermissionEngine
@@ -240,6 +243,110 @@ async def test_agent_loop_reports_error_after_repeated_empty_model_response(tmp_
     assert chunks[-1].metadata["orchestration_phase"] == "finalized"
     assert chunks[-1].metadata["orchestration_phase_digest"]
     assert [message.role for message in persisted] == ["user"]
+    await db.close()
+
+
+async def test_coding_agent_abort_preserves_cancelled_task_semantics(tmp_path):
+    class CancelRouter:
+        async def call(self, function, messages):
+            del function, messages
+            raise asyncio.CancelledError
+            yield  # pragma: no cover - keeps this method an async generator
+
+    (tmp_path / "prompts").mkdir()
+    (tmp_path / "prompts" / "office.md").write_text("office prompt", encoding="utf-8")
+    (tmp_path / "prompts" / "coding.md").write_text("coding prompt", encoding="utf-8")
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    await db.create_session(
+        "s1",
+        mode="coding",
+        principal_id="alice",
+        project_id="project-a",
+    )
+    mode_manager = ModeManager(
+        db,
+        project_root=tmp_path,
+        principal_id="alice",
+        session_id="s1",
+        project_id="project-a",
+    )
+    await mode_manager.switch(Mode.CODING)
+    task_manager = TaskManager(
+        db=db,
+        principal_id="alice",
+        project_id="project-a",
+    )
+    loop = AgentLoop(
+        AgentConfig(),
+        mode_manager,
+        CancelRouter(),
+        db,
+        project_root=tmp_path,
+        task_manager=task_manager,
+        principal_id="alice",
+        project_id="project-a",
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        _ = [message async for message in loop.run("abort", "s1")]
+
+    tasks = await task_manager.list_all()
+    assert len(tasks) == 1
+    assert tasks[0]["status"] == TaskStatus.CANCELLED.value
+    await db.close()
+
+
+async def test_coding_agent_fatal_error_preserves_failed_task_semantics(tmp_path):
+    class FatalRouter:
+        async def call(self, function, messages):
+            del function, messages
+            raise RuntimeError("synthetic router failure")
+            yield  # pragma: no cover - keeps this method an async generator
+
+    (tmp_path / "prompts").mkdir()
+    (tmp_path / "prompts" / "office.md").write_text("office prompt", encoding="utf-8")
+    (tmp_path / "prompts" / "coding.md").write_text("coding prompt", encoding="utf-8")
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    await db.create_session(
+        "s1",
+        mode="coding",
+        principal_id="alice",
+        project_id="project-a",
+    )
+    mode_manager = ModeManager(
+        db,
+        project_root=tmp_path,
+        principal_id="alice",
+        session_id="s1",
+        project_id="project-a",
+    )
+    await mode_manager.switch(Mode.CODING)
+    task_manager = TaskManager(
+        db=db,
+        principal_id="alice",
+        project_id="project-a",
+    )
+    loop = AgentLoop(
+        AgentConfig(),
+        mode_manager,
+        FatalRouter(),
+        db,
+        project_root=tmp_path,
+        task_manager=task_manager,
+        principal_id="alice",
+        project_id="project-a",
+    )
+
+    events = [message async for message in loop.run("fatal", "s1")]
+
+    assert events[-1].event == "error"
+    tasks = await task_manager.list_all()
+    assert len(tasks) == 1
+    assert tasks[0]["status"] == TaskStatus.FAILED.value
     await db.close()
 
 
