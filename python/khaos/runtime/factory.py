@@ -471,8 +471,12 @@ class RuntimeResult:
     # M7.5: durable recovery-control coordinator.  Recovery decisions are
     # passive history and this coordinator only owns the explicitly composed
     # cognitive recovery boundary; it is not a TaskStatus or capability
-    # authority.
-    recovery_control: Any = field(default=None, repr=False)
+    # authority.  Keep this factory-attached, like ``memory_host``: adding a
+    # composed control-plane service must not change the long-standing
+    # positional RuntimeResult constructor contract.
+    recovery_control: Any = field(
+        default=None, init=False, repr=False
+    )
     @property
     def memory_host(self) -> MemoryHost | None:
         """Return the canonical host attached by the runtime factory."""
@@ -1908,7 +1912,6 @@ async def build_runtime(
         credential_broker=credential_broker,
         owns_credential_broker=owns_credential_broker,
         planning_coordinator=planning_coordinator,
-        recovery_control=recovery_control,
         principal_id=cfg.principal_id,
         principal_kind=cfg.principal_kind,
         parent_principal_id=cfg.parent_principal_id,
@@ -1929,6 +1932,7 @@ async def build_runtime(
     )._with_seal(authority_seal)
     runtime.memory_host = memory_host
     runtime.owns_memory_host = owns_memory_host
+    runtime.recovery_control = recovery_control
     runtime.composition_manifest = composition_manifest
     return runtime
 
