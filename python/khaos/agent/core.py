@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 import logging
@@ -27,6 +28,8 @@ if TYPE_CHECKING:
         CompletionGateResult,
     )
     from khaos.agent.control.completion_recovery import CompletionRecoveryService
+    from khaos.agent.control.recovery import NormalizedFailureSignature
+    from khaos.agent.control.recovery_control import RecoveryControlCoordinator
     from khaos.coding.cost_tracker import CostTracker
     from khaos.coding.fingerprint import FileFingerprintCache
     from khaos.coding.intelligence.query_service import ContextIntelligenceService
@@ -183,6 +186,7 @@ class AgentLoop:
         planning_coordinator: Any = None,
         trusted_verification_authority: Any = None,
         trusted_verification_service: Any = None,
+        recovery_control: RecoveryControlCoordinator | None = None,
     ):
         self.config = config
         self.mode_manager = mode_manager
@@ -240,12 +244,17 @@ class AgentLoop:
         # are not lifecycle writers.
         self.trusted_verification_authority = trusted_verification_authority
         self.trusted_verification_service = trusted_verification_service
+        # M7.5: recovery is an explicit control-plane seam.  It only consumes
+        # durable facts and can project cognitive recovery state; it never
+        # grants tools/approval/workspace authority or changes TaskStatus.
+        self.recovery_control = recovery_control
         self._active_planning_result: Any = None
         self.skill_generator = skill_generator
         self.workspace_manager = workspace_manager
         self.active_workspace = None
         self._active_session_id = ""
         self._active_task_id: str | None = None
+        self._recovery_cycles_this_turn = 0
         self.execution_service = execution_service
         if approval_broker is None:
             from khaos.agent.approval import ApprovalBroker
@@ -367,6 +376,7 @@ class AgentLoop:
         active_task_id = task_id or self.task_id
         self._active_task_id = active_task_id
         self._active_session_id = session_id
+        self._recovery_cycles_this_turn = 0
         is_coding = self.mode_manager.current_mode.value == "coding"
         if is_coding and self._verify_fix_factory is not None:
             self.verify_fix_loop = self._verify_fix_factory()
@@ -481,6 +491,7 @@ class AgentLoop:
         total_tokens = 0
         budget_exhausted = False
         stop_reason: str | None = None
+        recovery_result: Any = None
         try:
             messages = await self._build_context(session_id, user_input)
             user_msg = Message(
@@ -1034,9 +1045,69 @@ class AgentLoop:
                                     result_dict
                                 )
                             )
-                            if self.verify_fix_loop.should_enter_loop(
-                                result_dict,
-                                observation=verification_observation,
+                            recovery_for_observation = None
+                            no_progress = self.verify_fix_loop.no_progress_signal()
+                            if (
+                                no_progress.detected
+                                and verification_observation is not None
+                                and active_task_id is not None
+                            ):
+                                normalized_failure = (
+                                    self._normalize_verify_fix_failure(
+                                        verification_observation
+                                    )
+                                )
+                                await turn.emit(
+                                    "recovery.no_progress",
+                                    {
+                                        "task_id": active_task_id,
+                                        "observation_indices": list(
+                                            no_progress.observation_indices
+                                        ),
+                                        "failure_signature_digest": (
+                                            normalized_failure.failure_signature_digest
+                                        ),
+                                        "reason": "identical_failure_signature",
+                                    },
+                                )
+                                recovery_for_observation = (
+                                    await self._recover_after_no_progress(
+                                        turn=turn,
+                                        task_id=active_task_id,
+                                        failure_signature=normalized_failure,
+                                        query=user_input,
+                                    )
+                                )
+                                if recovery_for_observation is not None:
+                                    recovery_result = recovery_for_observation
+                            recovery_status = getattr(
+                                getattr(
+                                    recovery_for_observation,
+                                    "status",
+                                    None,
+                                ),
+                                "value",
+                                None,
+                            )
+                            recovery_action = getattr(
+                                getattr(
+                                    recovery_for_observation,
+                                    "action",
+                                    None,
+                                ),
+                                "value",
+                                None,
+                            )
+                            suppress_legacy_repair = (
+                                recovery_status in {"applied", "blocked"}
+                                and recovery_action in {"replan", "block"}
+                            )
+                            if (
+                                not suppress_legacy_repair
+                                and self.verify_fix_loop.should_enter_loop(
+                                    result_dict,
+                                    observation=verification_observation,
+                                )
                             ):
                                 failure_context = (
                                     self.verify_fix_loop.build_failure_context(
@@ -1147,11 +1218,25 @@ class AgentLoop:
                         attempt_id=turn.attempt_id,
                         task_id=active_task_id,
                     )
+                    recovery_result = await self._recover_after_completion(
+                        turn=turn,
+                        task_id=active_task_id,
+                        decision_outcome=completion_result.decision.outcome.value,
+                        query=user_input,
+                    )
+                    if recovery_result is not None:
+                        yield self._recovery_result_message(
+                            result=recovery_result,
+                            turn_id=turn.turn_id,
+                            attempt_id=turn.attempt_id,
+                            task_id=active_task_id,
+                        )
 
             if self.task_manager is not None and active_task_id:
                 await self._finalize_task(
                     active_task_id,
                     stop_reason,
+                    recovery_result=recovery_result,
                 )
 
             # Non-terminal accounting events must precede the durable terminal.
@@ -1540,6 +1625,61 @@ class AgentLoop:
         self.completion_recovery = recovery
         return recovery
 
+    def _ensure_recovery_control(self) -> RecoveryControlCoordinator | None:
+        """Build the owner-scoped M7.5 control seam for direct loop callers.
+
+        The runtime factory composes this coordinator explicitly.  This small
+        fallback keeps older/test AgentLoop construction sites functional while
+        still requiring the database-owned repositories; it never invents an
+        authority policy or turns recovery history into a TaskStatus write.
+        """
+        control = self.recovery_control
+        if control is not None:
+            return control
+        if self.db is None or not self.principal_id:
+            return None
+
+        from khaos.agent.control.recovery import RecoveryPolicy
+        from khaos.agent.control.recovery_control import RecoveryControlCoordinator
+        from khaos.agent.control.recovery_gate import RecoveryGate
+
+        recovery_repository = getattr(self.db, "recovery_decision_repository", None)
+        gate_repository = getattr(self.db, "recovery_gate_repository", None)
+        if recovery_repository is None or gate_repository is None:
+            return None
+        goal_spec_repository = getattr(
+            self.task_manager, "goal_spec_repository", None
+        )
+        if goal_spec_repository is None:
+            goal_spec_repository = getattr(self.db, "goal_spec_repository", None)
+        if goal_spec_repository is None:
+            return None
+        control = RecoveryControlCoordinator(
+            recovery_repository=recovery_repository,
+            recovery_gate=RecoveryGate(
+                gate_repository=gate_repository,
+                principal_id=self.principal_id,
+                project_id=self.project_id,
+            ),
+            principal_id=self.principal_id,
+            project_id=self.project_id,
+            policy=RecoveryPolicy.production_default(),
+            goal_spec_repository=goal_spec_repository,
+            plan_revision_repository=getattr(
+                self.db, "plan_revision_repository", None
+            ),
+            verification_assessment_repository=getattr(
+                self.db, "verification_assessment_repository", None
+            ),
+            completion_recovery=self._ensure_completion_recovery(),
+            planning_coordinator=self.planning_coordinator,
+            control_state_repository=getattr(
+                self.db, "agent_control_state_repository", None
+            ),
+        )
+        self.recovery_control = control
+        return control
+
     async def _propose_completion(
         self,
         *,
@@ -1637,6 +1777,244 @@ class AgentLoop:
             },
         )
         return result
+
+    async def _recover_after_completion(
+        self,
+        *,
+        turn: Any,
+        task_id: str,
+        decision_outcome: str,
+        query: str,
+    ) -> Any:
+        """Handle only negative completion outcomes at an explicit boundary.
+
+        ``COMPLETE`` remains the Completion Gate's concern.  A recorded
+        ``REPLAN``, ``BLOCKED``, or ``FAILED`` decision is a deterministic
+        recovery signal; the recovery coordinator may persist/apply its
+        cognitive control decision and, when safely composed, invoke the
+        existing planning coordinator.  No model prose is inspected and no
+        recovery path writes TaskStatus.
+        """
+        if decision_outcome == "complete":
+            return None
+        control = self._ensure_recovery_control()
+        if control is None:
+            return None
+        if not self._admit_recovery_cycle(control):
+            result = self._recovery_cycle_limit_result(task_id)
+            await self._emit_recovery_blocked(turn, task_id, result)
+            return result
+        result = await control.evaluate_current(
+            task_id,
+            workspace=self.active_workspace,
+            query=query,
+            runtime_id=self.runtime_id,
+            event_sink=turn,
+        )
+        if (
+            getattr(getattr(result, "action", None), "value", None) == "block"
+            or getattr(getattr(result, "status", None), "value", None) == "blocked"
+        ):
+            await self._emit_recovery_blocked(turn, task_id, result)
+        refresh = getattr(self.task_manager, "refresh_projection", None)
+        if refresh is not None and result.cognitive_state is not None:
+            await refresh(task_id)
+        return result
+
+    async def _recover_after_no_progress(
+        self,
+        *,
+        turn: Any,
+        task_id: str,
+        failure_signature: NormalizedFailureSignature,
+        query: str,
+    ) -> Any:
+        """Apply one bounded recovery decision for a repeated failure.
+
+        VerifyFixLoop remains the low-level observation/repair strategy.  This
+        boundary only forwards its typed negative signal to M7.5; it never
+        treats test output as successful verification or completion authority.
+        """
+        control = self._ensure_recovery_control()
+        if control is None:
+            return None
+        if not self._admit_recovery_cycle(control):
+            result = self._recovery_cycle_limit_result(task_id)
+            await self._emit_recovery_blocked(turn, task_id, result)
+            return result
+        result = await control.evaluate_current(
+            task_id,
+            failure_signature=failure_signature,
+            no_progress_detected=True,
+            workspace=self.active_workspace,
+            query=query,
+            runtime_id=self.runtime_id,
+            event_sink=turn,
+        )
+        if getattr(result, "gate_status", None) is not None:
+            refresh = getattr(self.task_manager, "refresh_projection", None)
+            if refresh is not None and result.cognitive_state is not None:
+                await refresh(task_id)
+        if (
+            getattr(getattr(result, "action", None), "value", None) == "block"
+            or getattr(getattr(result, "status", None), "value", None) == "blocked"
+        ):
+            await self._emit_recovery_blocked(turn, task_id, result)
+        return result
+
+    def _admit_recovery_cycle(self, control: Any) -> bool:
+        """Consume one bounded recovery cycle for the current user turn."""
+        limit = getattr(
+            getattr(control, "policy", None),
+            "max_recovery_cycles_per_turn",
+            0,
+        )
+        if type(limit) is not int or limit < 0:
+            return False
+        if self._recovery_cycles_this_turn >= limit:
+            return False
+        self._recovery_cycles_this_turn += 1
+        return True
+
+    @staticmethod
+    def _recovery_cycle_limit_result(task_id: str) -> Any:
+        """Return a bounded non-authoritative result when the turn budget ends."""
+        from khaos.agent.control.recovery import RecoveryAction, RecoveryReasonCode
+        from khaos.agent.control.recovery_control import (
+            RecoveryControlResult,
+            RecoveryControlStatus,
+        )
+
+        return RecoveryControlResult(
+            status=RecoveryControlStatus.BLOCKED,
+            task_id=task_id,
+            action=RecoveryAction.BLOCK,
+            reason_code=RecoveryReasonCode.RECOVERY_ATTEMPT_BUDGET_EXHAUSTED,
+            reason="per-turn recovery cycle budget is exhausted",
+        )
+
+    @staticmethod
+    async def _emit_recovery_blocked(
+        turn: Any,
+        task_id: str,
+        result: Any,
+    ) -> None:
+        """Emit a bounded observability event for an explicit recovery stop."""
+        await turn.emit(
+            "recovery.blocked",
+            {
+                "task_id": task_id,
+                "recovery_decision_id": getattr(
+                    result, "recovery_decision_id", None
+                ),
+                "recovery_sequence": getattr(result, "recovery_sequence", None),
+                "action": getattr(
+                    getattr(result, "action", None), "value", None
+                ),
+                "reason_code": getattr(
+                    getattr(result, "reason_code", None), "value", None
+                ),
+                "status": getattr(
+                    getattr(result, "status", None), "value", None
+                ),
+            },
+        )
+
+    @staticmethod
+    def _normalize_verify_fix_failure(
+        observation: Any,
+    ) -> NormalizedFailureSignature:
+        """Convert VerifyFix observations to bounded M7.5 failure identity."""
+        from khaos.agent.control.recovery import (
+            NormalizedFailureCase,
+            NormalizedFailureSignature,
+            RecoveryFailureSource,
+        )
+
+        cases: list[NormalizedFailureCase] = []
+        for index, raw_case in enumerate(getattr(observation, "failed_cases", ())):
+            if not isinstance(raw_case, dict):
+                continue
+            name = raw_case.get("name")
+            subject_id = str(name)[:512] if name else f"test-case:{index + 1}"
+            file_value = raw_case.get("file")
+            file_identity = (
+                str(file_value)[:512] if isinstance(file_value, str) and file_value else None
+            )
+            line_value = raw_case.get("line")
+            line = line_value if type(line_value) is int and line_value > 0 else None
+            error_value = raw_case.get("error")
+            error_digest = None
+            if isinstance(error_value, str) and error_value:
+                error_digest = hashlib.sha256(
+                    error_value[:4096].encode("utf-8", errors="replace")
+                ).hexdigest()
+            cases.append(
+                NormalizedFailureCase(
+                    subject_id=subject_id,
+                    check_id=subject_id,
+                    file_identity=file_identity,
+                    line=line,
+                    error_digest=error_digest,
+                    result_status="failed",
+                )
+            )
+        if not cases:
+            cases.append(
+                NormalizedFailureCase(
+                    subject_id="test-run:unresolved-failure",
+                    result_status="failed",
+                )
+            )
+        check_ids = tuple(
+            case.check_id for case in cases if case.check_id is not None
+        )
+        return NormalizedFailureSignature.from_cases(
+            source=RecoveryFailureSource.VERIFY_FIX,
+            failed_count=int(getattr(observation, "failed", 0)),
+            error_count=int(getattr(observation, "errors", 0)),
+            failed_cases=tuple(cases),
+            verification_check_ids=check_ids,
+            result_statuses=("failed",),
+        )
+
+    @staticmethod
+    def _recovery_result_message(
+        *,
+        result: Any,
+        turn_id: str,
+        attempt_id: str,
+        task_id: str,
+    ) -> Message:
+        """Expose a bounded recovery result without injecting raw history."""
+        metadata: dict[str, Any] = {
+            "task_id": task_id,
+            "turn_id": turn_id,
+            "attempt_id": attempt_id,
+            "status": getattr(getattr(result, "status", None), "value", None),
+            "recovery_decision_id": getattr(result, "recovery_decision_id", None),
+            "recovery_sequence": getattr(result, "recovery_sequence", None),
+            "action": getattr(
+                getattr(result, "action", None), "value", None
+            ),
+            "reason_code": getattr(
+                getattr(result, "reason_code", None), "value", None
+            ),
+            "gate_status": getattr(
+                getattr(result, "gate_status", None), "value", None
+            ),
+            "planning_status": getattr(result, "planning_status", None),
+            "planning_revision_id": getattr(result, "planning_revision_id", None),
+        }
+        if getattr(result, "reason", ""):
+            metadata["reason"] = result.reason
+        return Message(
+            role="system",
+            content="recovery control evaluated",
+            event="recovery_control",
+            metadata=metadata,
+            created_at=time.time(),
+        )
 
     @staticmethod
     def _completion_result_message(
@@ -1740,6 +2118,7 @@ class AgentLoop:
         self,
         task_id: str,
         stop_reason: str | None,
+        recovery_result: Any = None,
     ) -> None:
         """Apply non-success terminal semantics after a turn.
 
@@ -1760,13 +2139,27 @@ class AgentLoop:
             )
         elif self.verify_fix_loop is not None:
             verification_state = self.verify_fix_loop.verification_state
-            if verification_state is VerificationState.EXHAUSTED_FAILURE:
+            recovery_replanned = (
+                getattr(getattr(recovery_result, "action", None), "value", None)
+                == "replan"
+                and getattr(
+                    getattr(recovery_result, "status", None), "value", None
+                )
+                == "applied"
+            )
+            if (
+                verification_state is VerificationState.EXHAUSTED_FAILURE
+                and not recovery_replanned
+            ):
                 await self.task_manager.update_status(
                     task_id,
                     TaskStatus.FAILED,
                     error="verify-fix loop exhausted, tests still failing",
                 )
-            elif verification_state is VerificationState.FAILING:
+            elif (
+                verification_state is VerificationState.FAILING
+                and not recovery_replanned
+            ):
                 # A model END_TURN cannot erase the latest known failing
                 # verification result. UNKNOWN remains legacy-compatible until
                 # the M7 Completion Gate owns this decision.
@@ -2019,6 +2412,12 @@ class AgentLoop:
         recovery_state = (
             await recovery.recover(task_id) if recovery is not None else None
         )
+        recovery_control = self._ensure_recovery_control()
+        recovery_control_fact = (
+            await recovery_control.recover(task_id)
+            if recovery_control is not None
+            else None
+        )
         task = (
             await self.task_manager.get(task_id)
             if self.task_manager is not None
@@ -2201,6 +2600,16 @@ class AgentLoop:
                     recovery_state.control_state_version
                 )
             facts["workspace_id"] = recovery_state.workspace_id
+        if recovery_control_fact is not None:
+            facts["recovery_control"] = recovery_control_fact.to_bounded_fact()
+            # RecoveryControlCoordinator reads the same physical task row and
+            # is therefore another safe source for correcting a stale cache
+            # projection.  It is read-only and never applies recovery here.
+            facts["status"] = recovery_control_fact.task_status
+            facts["cognitive_state"] = recovery_control_fact.cognitive_state
+            facts["control_state_version"] = (
+                recovery_control_fact.control_state_version
+            )
         if goal_spec is not None:
             max_goal_fact_chars = 4096
             facts["goal_spec_raw_goal"] = goal_spec.raw_goal[:max_goal_fact_chars]

@@ -468,6 +468,11 @@ class RuntimeResult:
     planning_coordinator: PlanningControlCoordinator | None = field(
         default=None, repr=False
     )
+    # M7.5: durable recovery-control coordinator.  Recovery decisions are
+    # passive history and this coordinator only owns the explicitly composed
+    # cognitive recovery boundary; it is not a TaskStatus or capability
+    # authority.
+    recovery_control: Any = field(default=None, repr=False)
     @property
     def memory_host(self) -> MemoryHost | None:
         """Return the canonical host attached by the runtime factory."""
@@ -1691,6 +1696,9 @@ async def build_runtime(
         CompletionRecoveryService,
         DatabaseCompletionGateHistoryReader,
     )
+    from khaos.agent.control.recovery import RecoveryPolicy
+    from khaos.agent.control.recovery_control import RecoveryControlCoordinator
+    from khaos.agent.control.recovery_gate import RecoveryGate
     goal_spec_repository = getattr(task_manager, "goal_spec_repository", None)
     if goal_spec_repository is None:
         goal_spec_repository = getattr(cfg.db, "goal_spec_repository", None)
@@ -1746,12 +1754,16 @@ async def build_runtime(
     # The deterministic service is deliberately constructed without its
     # legacy path/index query port; the production entry is
     # ``plan_from_context`` and receives only a fresh ContextBundle.
+    # The plan ledger remains an owner-scoped durable read boundary even when
+    # the optional context/planning composition is unavailable.  Recovery
+    # must never lose strict published/latest-plan validation merely because
+    # its planner is not composed in a particular runtime profile.
+    plan_repository = getattr(cfg.db, "plan_revision_repository", None)
+    control_state_repository = getattr(
+        cfg.db, "agent_control_state_repository", None
+    )
     planning_coordinator = None
     if context_intelligence is not None:
-        plan_repository = getattr(cfg.db, "plan_revision_repository", None)
-        control_state_repository = getattr(
-            cfg.db, "agent_control_state_repository", None
-        )
         if plan_repository is None or control_state_repository is None:
             raise RuntimeError(
                 "planning control repositories are unavailable in runtime composition"
@@ -1769,6 +1781,32 @@ async def build_runtime(
             principal_id=cfg.principal_id,
             project_id=project_id,
         )
+    recovery_decision_repository = getattr(
+        cfg.db, "recovery_decision_repository", None
+    )
+    recovery_gate_repository = getattr(cfg.db, "recovery_gate_repository", None)
+    if recovery_decision_repository is None or recovery_gate_repository is None:
+        raise RuntimeError(
+            "recovery control repositories are unavailable in runtime composition"
+        )
+    recovery_gate = RecoveryGate(
+        gate_repository=recovery_gate_repository,
+        principal_id=cfg.principal_id,
+        project_id=project_id,
+    )
+    recovery_control = RecoveryControlCoordinator(
+        recovery_repository=recovery_decision_repository,
+        recovery_gate=recovery_gate,
+        principal_id=cfg.principal_id,
+        project_id=project_id,
+        policy=RecoveryPolicy.production_default(),
+        goal_spec_repository=goal_spec_repository,
+        plan_revision_repository=plan_repository,
+        verification_assessment_repository=verification_assessment_repository,
+        completion_recovery=completion_recovery,
+        planning_coordinator=planning_coordinator,
+        control_state_repository=control_state_repository,
+    )
     loop = AgentLoop(
         cfg.agent_config or AgentConfig(), mode_manager, router, cfg.db,
         tool_scheduler=scheduler, confirm_callback=cfg.confirm_callback,
@@ -1820,6 +1858,7 @@ async def build_runtime(
         completion_gate=completion_gate,
         completion_recovery=completion_recovery,
         planning_coordinator=planning_coordinator,
+        recovery_control=recovery_control,
         trusted_verification_authority=trusted_verification_authority,
         trusted_verification_service=trusted_verification_service,
         # M4 batch 3.1.16A-5-1b (CRITICAL): carry the RPC-verified
@@ -1869,6 +1908,7 @@ async def build_runtime(
         credential_broker=credential_broker,
         owns_credential_broker=owns_credential_broker,
         planning_coordinator=planning_coordinator,
+        recovery_control=recovery_control,
         principal_id=cfg.principal_id,
         principal_kind=cfg.principal_kind,
         parent_principal_id=cfg.parent_principal_id,

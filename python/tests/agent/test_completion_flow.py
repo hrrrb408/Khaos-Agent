@@ -328,6 +328,21 @@ async def test_end_turn_interception_records_events_and_keeps_task_running(
         assert completion.metadata["outcome"] == CompletionOutcome.REPLAN.value
         done = next(message for message in output if message.event == "done")
         assert done.metadata["turn_id"] == completion.metadata["turn_id"]
+        recovery = next(
+            message for message in output if message.event == "recovery_control"
+        )
+        assert recovery.metadata["status"] == "invalid"
+        assert recovery.metadata["action"] == "replan"
+        assert await db.recovery_decision_repository.list_for_task(
+            task_id=next(
+                row["id"]
+                for row in await db.list_coding_tasks(
+                    principal_id="alice", project_id="project-a"
+                )
+            ),
+            principal_id="alice",
+            project_id="project-a",
+        ) == []
         turn_events = await db.list_agent_turn_events(done.metadata["turn_id"])
         assert [event["event_type"] for event in turn_events] == [
             "turn.started",

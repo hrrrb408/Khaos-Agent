@@ -2,9 +2,9 @@
 
 M7.1.4 adds the immutable CompletionDecision record and its passive,
 append-only durable ledger. M7.1.5 adds pure deterministic evaluation of
-structured facts. M7.1.8 adds read-only durable continuation recovery;
-planning and Recovery/Replan execution remain later control-plane
-responsibilities.
+structured facts. M7.1.8 adds read-only durable continuation recovery, and
+M7.5 adds bounded durable recovery/replan/no-progress control. Tool routing,
+state-aware memory, sub-agent control, and metrics remain later milestones.
 """
 
 from khaos.agent.control.completion import (
@@ -99,6 +99,55 @@ from khaos.agent.control.goal_repository import (
     GoalSpecIntegrityError,
     GoalSpecRepository,
 )
+from khaos.agent.control.recovery import (
+    MAX_FAILURE_CASES,
+    MAX_FAILURE_SIGNATURE_BYTES,
+    MAX_RECOVERY_HISTORY_RECORDS,
+    RECOVERY_DECISION_SCHEMA_VERSION,
+    RECOVERY_POLICY_SCHEMA_VERSION,
+    NormalizedFailureCase,
+    NormalizedFailureSignature,
+    PlanningRecoveryStatus,
+    RecoveryAction,
+    RecoveryContractError,
+    RecoveryDecision,
+    RecoveryEvaluation,
+    RecoveryEvaluator,
+    RecoveryFailureSource,
+    RecoveryInput,
+    RecoveryPolicy,
+    RecoveryReasonCode,
+)
+from khaos.agent.control.recovery_control import (
+    RecoveryControlContinuation,
+    RecoveryControlCoordinator,
+    RecoveryControlFact,
+    RecoveryControlResult,
+    RecoveryControlStatus,
+    RecoveryEventSink,
+)
+from khaos.agent.control.recovery_gate import (
+    RecoveryGate,
+    RecoveryGateResult,
+    RecoveryGateStatus,
+)
+from khaos.agent.control.recovery_gate_repository import (
+    RecoveryGateDatabase,
+    RecoveryGateRepository,
+    RecoveryProjectionResult,
+    RecoveryProjectionStatus,
+)
+from khaos.agent.control.recovery_repository import (
+    RecoveryDecisionBindingError,
+    RecoveryDecisionConflictError,
+    RecoveryDecisionIntegrityError,
+    RecoveryDecisionRepository,
+    RecoveryDecisionRepositoryError,
+    RecoveryDecisionStaleError,
+    RecoveryHistorySummary,
+    RecoveryTaskSnapshot,
+    StoredRecoveryDecision,
+)
 from khaos.agent.control.state import (
     LEGAL_COGNITIVE_TRANSITIONS,
     AgentCognitiveState,
@@ -121,6 +170,11 @@ __all__ = [
     "LEGAL_COGNITIVE_TRANSITIONS",
     "MAX_COMPLETION_GATE_HISTORY_RECORDS",
     "MAX_COMPLETION_GATE_PAYLOAD_BYTES",
+    "MAX_FAILURE_CASES",
+    "MAX_FAILURE_SIGNATURE_BYTES",
+    "MAX_RECOVERY_HISTORY_RECORDS",
+    "RECOVERY_DECISION_SCHEMA_VERSION",
+    "RECOVERY_POLICY_SCHEMA_VERSION",
     "AcceptanceCriterion",
     "AgentCognitiveState",
     "AgentCognitiveStateMachine",
@@ -192,8 +246,42 @@ __all__ = [
     "GoalSpecLoader",
     "GoalSpecRepository",
     "GoalSpecValidationError",
+    "NormalizedFailureCase",
+    "NormalizedFailureSignature",
+    "PlanningRecoveryStatus",
+    "RecoveryAction",
+    "RecoveryContractError",
+    "RecoveryControlContinuation",
+    "RecoveryControlCoordinator",
+    "RecoveryControlFact",
+    "RecoveryControlResult",
+    "RecoveryControlStatus",
+    "RecoveryDecision",
+    "RecoveryDecisionBindingError",
+    "RecoveryDecisionConflictError",
+    "RecoveryDecisionIntegrityError",
+    "RecoveryDecisionRepository",
+    "RecoveryDecisionRepositoryError",
+    "RecoveryDecisionStaleError",
+    "RecoveryEvaluation",
+    "RecoveryEvaluator",
+    "RecoveryEventSink",
+    "RecoveryFailureSource",
+    "RecoveryGate",
+    "RecoveryGateDatabase",
+    "RecoveryGateRepository",
+    "RecoveryGateResult",
+    "RecoveryGateStatus",
+    "RecoveryHistorySummary",
+    "RecoveryInput",
+    "RecoveryPolicy",
+    "RecoveryProjectionResult",
+    "RecoveryProjectionStatus",
+    "RecoveryReasonCode",
+    "RecoveryTaskSnapshot",
     "RequirementAssessment",
     "StoredCompletionDecision",
+    "StoredRecoveryDecision",
     "VerificationCompletionFact",
     "VerificationFactStatus",
     "normalize_goal",

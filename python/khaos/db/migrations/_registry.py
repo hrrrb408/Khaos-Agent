@@ -516,6 +516,19 @@ MIGRATIONS: tuple[MigrationSpec, ...] = (
         sql_files=("0021_trusted_verification_assessments.sql",),
         migrator_symbols=("_apply_v21_upgrades",),
     ),
+    MigrationSpec(
+        version=22,
+        name="m7_5_recovery_control_plane",
+        # Release-time manifest over the immutable recovery ledger and its
+        # additive causal projection.  This literal is filled from the
+        # checked-in source after the migration owner is complete.
+        sha256="e61679ec6faa5b88a4312bbe702bc2ac3322f670a56e7ce6fb64b92a8b3314db",
+        sql_files=("0022_recovery_control_plane.sql",),
+        migrator_symbols=(
+            "_apply_v22_upgrades",
+            "_ensure_coding_tasks_last_applied_recovery_decision_column",
+        ),
+    ),
 )
 
 

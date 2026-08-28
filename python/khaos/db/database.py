@@ -21,6 +21,8 @@ if TYPE_CHECKING:
 
 from khaos.agent.control.completion_repository import CompletionDecisionRepository
 from khaos.agent.control.goal_repository import GoalSpecRepository
+from khaos.agent.control.recovery_gate_repository import RecoveryGateRepository
+from khaos.agent.control.recovery_repository import RecoveryDecisionRepository
 from khaos.agent.control.state_repository import AgentControlStateRepository
 from khaos.agent.core import Message
 from khaos.coding.planning.repository import PlanRevisionRepository
@@ -265,6 +267,8 @@ class Database:
         self._goal_spec_repository = GoalSpecRepository(self)
         self._agent_control_state_repository = AgentControlStateRepository(self)
         self._completion_decision_repository = CompletionDecisionRepository(self)
+        self._recovery_decision_repository = RecoveryDecisionRepository(self)
+        self._recovery_gate_repository = RecoveryGateRepository(self)
         self._plan_revision_repository = PlanRevisionRepository(self)
         self._verification_assessment_repository = VerificationAssessmentRepository(self)
         # F-01: Per-domain locks remain for logical serialization (e.g. two
@@ -310,6 +314,16 @@ class Database:
     def completion_decision_repository(self) -> CompletionDecisionRepository:
         """Return the sole owner-scoped completion-decision ledger."""
         return self._completion_decision_repository
+
+    @property
+    def recovery_decision_repository(self) -> RecoveryDecisionRepository:
+        """Return the sole owner-scoped recovery-decision ledger."""
+        return self._recovery_decision_repository
+
+    @property
+    def recovery_gate_repository(self) -> RecoveryGateRepository:
+        """Return the atomic owner for recovery cognitive projections."""
+        return self._recovery_gate_repository
 
     @property
     def plan_revision_repository(self) -> PlanRevisionRepository:
@@ -890,6 +904,15 @@ class Database:
             self._conn = _MigrationConnection(conn)
             try:
                 await self._apply_v21_upgrades()
+            finally:
+                self._conn = original_conn
+            # M7.5: add the immutable recovery-decision ledger and the
+            # descriptive causal projection for recovery-gate applications.
+            # No historical recovery decision is synthesized.
+            original_conn = self._conn
+            self._conn = _MigrationConnection(conn)
+            try:
+                await self._apply_v22_upgrades()
             finally:
                 self._conn = original_conn
             # Batch 6.4 §10.4: backfill the historical ledger rows (v1–v5)
@@ -1566,6 +1589,34 @@ class Database:
         await self._execute_schema_statements(
             conn,
             migration_path.read_text(encoding="utf-8"),
+        )
+
+    async def _apply_v22_upgrades(self) -> None:
+        """Add the M7.5 immutable recovery ledger and causal projection."""
+
+        conn = await self._require_conn()
+        await self._ensure_coding_tasks_last_applied_recovery_decision_column(conn)
+        migration_path = _MIGRATIONS_DIR / "0022_recovery_control_plane.sql"
+        await self._execute_schema_statements(
+            conn,
+            migration_path.read_text(encoding="utf-8"),
+        )
+
+    async def _ensure_coding_tasks_last_applied_recovery_decision_column(
+        self, conn: Any
+    ) -> None:
+        """Add the descriptive recovery-gate causal projection once.
+
+        The column records which durable RecoveryDecision caused the last
+        recovery control transition.  It is not a capability, approval, or
+        lifecycle authority, and legacy rows remain NULL.
+        """
+        cursor = await conn.execute("PRAGMA table_info(coding_tasks)")
+        columns = {str(row["name"]) for row in await cursor.fetchall()}
+        if "last_applied_recovery_decision_id" in columns:
+            return
+        await conn.execute(
+            "ALTER TABLE coding_tasks ADD COLUMN last_applied_recovery_decision_id TEXT"
         )
 
     async def _ensure_coding_tasks_published_plan_revision_column(
