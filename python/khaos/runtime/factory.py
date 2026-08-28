@@ -468,16 +468,6 @@ class RuntimeResult:
     planning_coordinator: PlanningControlCoordinator | None = field(
         default=None, repr=False
     )
-    # M7.4: the trusted-verification authority and passive assessment service
-    # are explicit runtime-owned composition facts.  Neither component owns
-    # TaskStatus projection; CompletionGate remains the sole lifecycle owner.
-    trusted_verification_authority: TrustedVerificationAuthority | None = field(
-        default=None, repr=False
-    )
-    trusted_verification_service: TrustedVerificationService | None = field(
-        default=None, repr=False
-    )
-
     @property
     def memory_host(self) -> MemoryHost | None:
         """Return the canonical host attached by the runtime factory."""
@@ -1879,8 +1869,6 @@ async def build_runtime(
         credential_broker=credential_broker,
         owns_credential_broker=owns_credential_broker,
         planning_coordinator=planning_coordinator,
-        trusted_verification_authority=trusted_verification_authority,
-        trusted_verification_service=trusted_verification_service,
         principal_id=cfg.principal_id,
         principal_kind=cfg.principal_kind,
         parent_principal_id=cfg.parent_principal_id,
