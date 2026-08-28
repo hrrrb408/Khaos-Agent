@@ -452,7 +452,11 @@ class ToolScheduler:
                 resource_digest=resource.digest() if resource is not None else "",
             )
 
-            if mode == "coding" and tool_context.get("coding_workspace_enforced"):
+            if (
+                mode == "coding"
+                and tool_context.get("production_runtime")
+                and tool_context.get("coding_workspace_enforced")
+            ):
                 route_error = "router returned no decision"
                 if (
                     tool_context.get("production_runtime")
