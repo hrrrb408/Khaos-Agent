@@ -26,6 +26,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from khaos.coding.planning.verification_execution_models import (
+    VerificationRunBinding,
+    VerificationRunStatus,
+)
+
 PROTECTED_SCHEMA_OBJECTS: dict[str, str] = {
     "plan_execution_runs": "table",
     "plan_verification_runs": "table",
@@ -635,6 +640,54 @@ class VerificationReadHandle:
                 execution_run_id=execution_run_id,
             )
         return status
+
+    def verification_run_binding(
+        self, verification_run_id: str,
+    ) -> VerificationRunBinding | None:
+        """Return the narrow trusted-read projection for one verification run.
+
+        The run facts remain owned by ``plan_verification_runs`` and are not
+        merged into the plan execution read model.  A PASSED projection is
+        returned only after the same canonical-success proof used by the
+        other read methods has been rechecked.
+        """
+        self.__authority.verify_storage()
+        row = self.__connection.execute(
+            "SELECT verification_run_id,execution_run_id,plan_id,"
+            "plan_content_hash,task_id,workspace_id,repository_id,"
+            "final_mutation_attestation_digest,verification_plan_digest,"
+            "trusted_catalog_fingerprint,status "
+            "FROM plan_verification_runs WHERE verification_run_id=?",
+            (verification_run_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            binding = VerificationRunBinding(
+                verification_run_id=row["verification_run_id"],
+                execution_run_id=row["execution_run_id"],
+                plan_id=row["plan_id"],
+                plan_content_hash=row["plan_content_hash"],
+                task_id=row["task_id"],
+                workspace_id=row["workspace_id"],
+                repository_id=row["repository_id"],
+                final_mutation_attestation_digest=row[
+                    "final_mutation_attestation_digest"
+                ],
+                verification_plan_digest=row["verification_plan_digest"],
+                trusted_catalog_fingerprint=row["trusted_catalog_fingerprint"],
+                status=VerificationRunStatus(row["status"]),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise PermissionError("verification run binding is malformed") from exc
+        if binding.status is VerificationRunStatus.PASSED:
+            require_canonical_success(
+                self.__connection,
+                self.__authority,
+                verification_run_id=binding.verification_run_id,
+                execution_run_id=binding.execution_run_id,
+            )
+        return binding
 
     def success_binding(
         self,

@@ -6,12 +6,17 @@ import hashlib
 import sqlite3
 from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 from khaos.agent.control.completion_evaluator import CompletionEvaluationSnapshot
 from khaos.agent.control.goal import GoalSpec
 from khaos.agent.control.state import AgentCognitiveState
+from khaos.coding.planning.approval import PlanApprovalStore
+from khaos.coding.planning.execution_models import (
+    ExecutionRunStatus,
+    FinalMutationAttestation,
+    PlanExecutionRun,
+)
 from khaos.coding.planning.trusted_verification_authority import (
     M4VerificationEvidenceValidator,
     StructuralVerificationEvidenceValidator,
@@ -40,6 +45,20 @@ from khaos.coding.planning.verification_assessment_repository import (
     VerificationAssessmentRepository,
     VerificationCurrentSnapshot,
 )
+from khaos.coding.planning.verification_authority import (
+    VerificationAuthorityRegistry,
+    VerificationWriteAuthority,
+)
+from khaos.coding.planning.verification_execution_models import (
+    VerificationCleanupProof,
+    VerificationExecutionRun,
+    VerificationRunBinding,
+    VerificationRunStatus,
+    VerificationStepRun,
+    VerificationStepStatus,
+    compute_cleanup_digest,
+)
+from khaos.coding.planning.verification_store import VerificationExecutionStore
 from khaos.coding.task_manager import TaskManager, TaskStatus
 from khaos.db import Database
 from khaos.security.protocol_boundary import canonical_digest
@@ -49,7 +68,7 @@ PROJECT = "m7-4-project"
 WORKSPACE = "m7-4-workspace"
 REPOSITORY = "m7-4-repository"
 BASE_REVISION = "m7-4-base"
-GENERATION = "m7-4-generation"
+GENERATION = "1"
 CHANGE_IDENTITY = "m7-4-change"
 
 
@@ -119,6 +138,9 @@ def _evidence(
     termination: VerificationTermination = VerificationTermination.COMPLETED,
     output_truncated: bool = False,
     requirement_id: str = "check-1",
+    authority_id: str = "authority-1",
+    authority_digest: str | None = None,
+    attestation_digest: str | None = None,
 ) -> VerificationExecutionEvidence:
     requirement = next(
         item
@@ -137,8 +159,8 @@ def _evidence(
         repository_generation=verification_input.repository_generation or GENERATION,
         change_identity=verification_input.change_identity or CHANGE_IDENTITY,
         command_digest=requirement.command_digest or _digest("command"),
-        authority_id="authority-1",
-        authority_digest=_digest("authority-1"),
+        authority_id=authority_id,
+        authority_digest=authority_digest or _digest(authority_id),
         status=status,
         exit_code=exit_code,
         termination=termination,
@@ -150,7 +172,7 @@ def _evidence(
             VerificationEvidenceRef(
                 kind=VerificationEvidenceKind.FINAL_MUTATION_ATTESTATION,
                 ref_id="attestation-1",
-                digest=_digest("attestation-1"),
+                digest=attestation_digest or _digest("attestation-1"),
             ),
         ),
     )
@@ -346,6 +368,24 @@ class _FakeVerificationReadHandle:
         assert execution_run_id == "execution-1"
         return "verified"
 
+    def verification_run_binding(
+        self, verification_run_id: str,
+    ) -> VerificationRunBinding:
+        assert verification_run_id == "verification-1"
+        return VerificationRunBinding(
+            verification_run_id="verification-1",
+            execution_run_id="execution-1",
+            plan_id="plan-1",
+            plan_content_hash=_digest("plan-1"),
+            task_id="task-m7-4",
+            workspace_id=WORKSPACE,
+            repository_id=REPOSITORY,
+            final_mutation_attestation_digest=_digest("attestation-1"),
+            verification_plan_digest=_digest("verification-plan"),
+            trusted_catalog_fingerprint=_digest("catalog"),
+            status=VerificationRunStatus.PASSED,
+        )
+
 
 class _FakeExecutionReadModel:
     def __init__(self, *, step_command_digest: str | None = None) -> None:
@@ -356,39 +396,63 @@ class _FakeExecutionReadModel:
         execution_run_id: str,
         *,
         authoritative_verification_reads_required: bool = False,
-    ) -> object:
+    ) -> PlanExecutionRun:
         assert execution_run_id == "execution-1"
         assert authoritative_verification_reads_required is True
-        return SimpleNamespace(
+        return PlanExecutionRun(
             execution_run_id="execution-1",
-            task_id="task-m7-4",
             plan_id="plan-1",
             plan_content_hash=_digest("plan-1"),
+            approval_request_id="approval-1",
+            authorization_id="authorization-1",
+            execution_context_id="context-1",
+            lease_id="lease-1",
+            task_id="task-m7-4",
             workspace_id=WORKSPACE,
             repository_id=REPOSITORY,
             base_sha=BASE_REVISION,
-            repository_generation=GENERATION,
-            final_mutation_attestation_digest=_digest("attestation-1"),
-            trusted_catalog_fingerprint=_digest("catalog"),
+            repository_generation=1,
+            binding_digest=_digest("binding"),
+            edit_bundle_digest=_digest("bundle"),
+            status=ExecutionRunStatus.VERIFIED,
+            started_at=1.0,
+            updated_at=1.0,
+            completed_at=1.0,
         )
 
-    def get_final_mutation_attestation(self, execution_run_id: str) -> object:
+    def get_final_mutation_attestation(
+        self, execution_run_id: str,
+    ) -> FinalMutationAttestation:
         assert execution_run_id == "execution-1"
-        return SimpleNamespace(
-            generation=GENERATION,
+        return FinalMutationAttestation(
+            execution_run_id="execution-1",
+            bundle_digest=_digest("bundle"),
+            ordered_states=(),
+            path_state_digest=_digest("paths"),
+            head="head-1",
+            generation=1,
+            index_digest=_digest("index"),
+            worktree_admin_digest=_digest("worktree"),
+            workspace_state_digest=_digest("workspace-state"),
+            execution_context_id="context-1",
+            lease_id="lease-1",
+            binding_digest=_digest("binding"),
+            attested_at=1.0,
             attestation_digest=_digest("attestation-1"),
         )
 
-    def get_verification_step(self, step_run_id: str) -> object:
+    def get_verification_step(self, step_run_id: str) -> VerificationStepRun:
         assert step_run_id == "step-run-1"
-        return SimpleNamespace(
+        return VerificationStepRun(
             step_run_id="step-run-1",
             verification_run_id="verification-1",
             requirement_id="check-1",
             command_digest=(
                 self.step_command_digest or _digest("pytest tests/test_target.py")
             ),
-            status="passed",
+            command_id="command-1",
+            ordinal=0,
+            status=VerificationStepStatus.PASSED,
             exit_code=0,
             stdout_digest=_digest("stdout"),
             stderr_digest=_digest("stderr"),
@@ -426,6 +490,397 @@ def test_m4_adapter_requires_the_existing_authority_identity_and_snapshot() -> N
         ),
     ).validate(verification_input=verification_input, evidence=evidence)
     assert rejected_step.status is VerificationEvidenceValidationStatus.REJECTED
+
+
+def _build_real_m4_success(
+    tmp_path: Path,
+    *,
+    finalize: bool = True,
+) -> tuple[PlanApprovalStore, VerificationWriteAuthority, FinalMutationAttestation]:
+    """Build one successful M4 run through its real durable authorities."""
+    database_path = tmp_path / "m4-real.sqlite"
+    connection = sqlite3.connect(database_path)
+    approval = PlanApprovalStore(connection)
+    authority: VerificationWriteAuthority | None = None
+    try:
+        execution_run = PlanExecutionRun(
+            execution_run_id="execution-1",
+            plan_id="plan-1",
+            plan_content_hash=_digest("plan-1"),
+            approval_request_id="approval-1",
+            authorization_id="authorization-1",
+            execution_context_id="context-1",
+            lease_id="lease-1",
+            task_id="task-m7-4",
+            workspace_id=WORKSPACE,
+            repository_id=REPOSITORY,
+            base_sha=BASE_REVISION,
+            repository_generation=1,
+            binding_digest=_digest("binding"),
+            edit_bundle_digest=_digest("bundle"),
+            status=ExecutionRunStatus.CREATED,
+            started_at=1.0,
+            updated_at=1.0,
+        )
+        writer = approval.execution_writer
+        writer.create_execution_run(execution_run)
+        for expected, target in (
+            ("created", "validating"),
+            ("validating", "mutating"),
+            ("mutating", "sealing"),
+            ("sealing", "mutated"),
+        ):
+            writer.transition_execution_run(
+                execution_run.execution_run_id,
+                expected=(expected,),
+                target=target,
+            )
+
+        attestation = FinalMutationAttestation(
+            execution_run_id="execution-1",
+            bundle_digest=_digest("bundle"),
+            ordered_states=(),
+            path_state_digest="",
+            head="head-1",
+            generation=1,
+            index_digest=_digest("index"),
+            worktree_admin_digest=_digest("worktree"),
+            workspace_state_digest=_digest("workspace-state"),
+            execution_context_id="context-1",
+            lease_id="lease-1",
+            binding_digest=_digest("binding"),
+            attested_at=1.0,
+        ).normalized()
+        writer.save_final_mutation_attestation(attestation)
+
+        verification_store = VerificationExecutionStore(approval)
+        verification_run = VerificationExecutionRun(
+            verification_run_id="verification-1",
+            execution_run_id="execution-1",
+            plan_id="plan-1",
+            plan_content_hash=_digest("plan-1"),
+            approval_request_id="approval-1",
+            execution_context_id="context-1",
+            task_id="task-m7-4",
+            workspace_id=WORKSPACE,
+            repository_id=REPOSITORY,
+            bundle_digest=_digest("bundle"),
+            final_mutation_attestation_digest=attestation.attestation_digest,
+            verification_plan_digest=_digest("verification-plan"),
+            trusted_catalog_fingerprint=_digest("catalog"),
+            sandbox_profile_digest=_digest("profile"),
+            status=VerificationRunStatus.CREATED,
+            started_at=1.0,
+            updated_at=1.0,
+        )
+        verification_store.create_run(verification_run)
+        for expected, target in (
+            (VerificationRunStatus.CREATED, VerificationRunStatus.VALIDATING),
+            (
+                VerificationRunStatus.VALIDATING,
+                VerificationRunStatus.PREPARING_SANDBOX,
+            ),
+            (
+                VerificationRunStatus.PREPARING_SANDBOX,
+                VerificationRunStatus.RUNNING,
+            ),
+            (VerificationRunStatus.RUNNING, VerificationRunStatus.FINALIZING),
+        ):
+            verification_store.transition_run(
+                "verification-1", expected=(expected,), target=target
+            )
+        step = VerificationStepRun(
+            step_run_id="step-run-1",
+            verification_run_id="verification-1",
+            requirement_id="check-1",
+            command_id="command-1",
+            command_digest=_digest("pytest tests/test_target.py"),
+            ordinal=0,
+            status=VerificationStepStatus.RUNNING,
+            exit_code=0,
+            started_at=1.0,
+            completed_at=2.0,
+            timeout_ms=1000,
+            stdout_digest=_digest("stdout"),
+            stderr_digest=_digest("stderr"),
+        )
+        verification_store.create_steps((step,))
+        verification_store.stage_step_for_finalization(step)
+
+        verification_store.install_cleanup_validator(lambda proof: None)
+        authority = VerificationAuthorityRegistry().issue(
+            connection,
+            runtime_id="m7-4-runtime",
+            boot_id="m7-4-boot",
+        )
+        verification_store.bind_write_authority(authority)
+        proof_values = {
+            "verification_run_id": "verification-1",
+            "disposable_workspace_id": "dvw-m7-4",
+            "disposable_workspace_identity": "m7-4-disposable-instance",
+            "disposable_cleaned_at": 2.0,
+            "sandbox_instance_ids": (),
+            "sandbox_absence_digests": (),
+            "artifact_ids": (),
+            "artifact_seal_digests": (),
+            "canonical_workspace_final_digest": "",
+            "created_at": 2.0,
+        }
+        proof_values["cleanup_digest"] = compute_cleanup_digest(
+            **{
+                key: proof_values[key]
+                for key in (
+                    "verification_run_id",
+                    "disposable_workspace_id",
+                    "disposable_workspace_identity",
+                    "disposable_cleaned_at",
+                    "sandbox_instance_ids",
+                    "sandbox_absence_digests",
+                    "artifact_ids",
+                    "artifact_seal_digests",
+                    "canonical_workspace_final_digest",
+                )
+            }
+        )
+        proof = VerificationCleanupProof(**proof_values)
+        verification_store.persist_cleanup_proof(proof)
+        if finalize:
+            verification_store.finalize_success(
+                step=None,
+                verification_run_id="verification-1",
+                execution_run_id="execution-1",
+                workspace_id=proof.disposable_workspace_id,
+                cleanup_proof=proof,
+            )
+        return approval, authority, attestation
+    except Exception:
+        if authority is not None:
+            authority.close()
+        else:
+            connection.close()
+        raise
+
+
+@pytest.mark.posix_host
+def test_m4_adapter_consumes_real_m4_typed_read_projections(
+    tmp_path: Path,
+) -> None:
+    approval, authority, attestation = _build_real_m4_success(tmp_path)
+    try:
+        read_handle = authority.open_readonly()
+        verification_run = read_handle.verification_run_binding("verification-1")
+        execution_run = approval.execution_read_model.get_execution_run(
+            "execution-1", authoritative_verification_reads_required=True
+        )
+        assert isinstance(verification_run, VerificationRunBinding)
+        assert isinstance(execution_run, PlanExecutionRun)
+        assert not hasattr(execution_run, "trusted_catalog_fingerprint")
+        assert not hasattr(execution_run, "final_mutation_attestation_digest")
+
+        verification_input = _verification_input()
+        authority_id, authority_digest = read_handle.success_binding(
+            "verification-1", execution_run_id="execution-1"
+        )
+        evidence = _evidence(
+            verification_input,
+            authority_id=authority_id,
+            authority_digest=authority_digest,
+            attestation_digest=attestation.attestation_digest,
+        )
+        result = M4VerificationEvidenceValidator(
+            verification_read_handle=read_handle,
+            execution_read_model=approval.execution_read_model,
+        ).validate(verification_input=verification_input, evidence=evidence)
+        assert result.status is VerificationEvidenceValidationStatus.ACCEPTED
+    finally:
+        authority.close()
+
+
+@pytest.mark.posix_host
+def test_m4_adapter_rejects_real_m4_binding_drift(tmp_path: Path) -> None:
+    approval, authority, attestation = _build_real_m4_success(tmp_path)
+    try:
+        read_handle = authority.open_readonly()
+        validator = M4VerificationEvidenceValidator(
+            verification_read_handle=read_handle,
+            execution_read_model=approval.execution_read_model,
+        )
+        base_input = _verification_input()
+        authority_id, authority_digest = read_handle.success_binding(
+            "verification-1", execution_run_id="execution-1"
+        )
+        base_evidence = _evidence(
+            base_input,
+            authority_id=authority_id,
+            authority_digest=authority_digest,
+            attestation_digest=attestation.attestation_digest,
+        )
+
+        cases = (
+            ("execution", replace(base_evidence, execution_run_id="other"), base_input),
+            (
+                "verification",
+                replace(base_evidence, verification_run_id="other"),
+                base_input,
+            ),
+            (
+                "plan",
+                base_evidence,
+                replace(
+                    base_input,
+                    published_plan_revision_id="other",
+                    published_plan_revision_digest=_digest("other"),
+                    input_digest="",
+                ),
+            ),
+            (
+                "plan-digest",
+                base_evidence,
+                replace(
+                    base_input,
+                    published_plan_revision_digest=_digest("other"),
+                    input_digest="",
+                ),
+            ),
+            (
+                "workspace",
+                replace(base_evidence, workspace_id="other-workspace"),
+                replace(base_input, workspace_id="other-workspace", input_digest=""),
+            ),
+            (
+                "repository",
+                replace(base_evidence, repository_id="other-repository"),
+                replace(base_input, repository_id="other-repository", input_digest=""),
+            ),
+            (
+                "base",
+                replace(base_evidence, base_revision="other-base"),
+                replace(base_input, base_revision="other-base", input_digest=""),
+            ),
+            (
+                "generation",
+                replace(base_evidence, repository_generation="2"),
+                replace(base_input, repository_generation="2", input_digest=""),
+            ),
+            (
+                "attestation",
+                replace(
+                    base_evidence,
+                    references=(
+                        VerificationEvidenceRef(
+                            kind=VerificationEvidenceKind.FINAL_MUTATION_ATTESTATION,
+                            ref_id="attestation-1",
+                            digest=_digest("other-attestation"),
+                        ),
+                    ),
+                ),
+                base_input,
+            ),
+            (
+                "catalog",
+                base_evidence,
+                replace(base_input, catalog_fingerprint=_digest("other"), input_digest=""),
+            ),
+            (
+                "requirement",
+                replace(base_evidence, requirement_id="other-check"),
+                base_input,
+            ),
+            (
+                "command",
+                replace(base_evidence, command_digest=_digest("other-command")),
+                base_input,
+            ),
+            (
+                "exit",
+                replace(base_evidence, exit_code=1),
+                base_input,
+            ),
+            (
+                "truncated",
+                replace(base_evidence, output_truncated=True),
+                base_input,
+            ),
+        )
+        for name, evidence, verification_input in cases:
+            result = validator.validate(
+                verification_input=verification_input,
+                evidence=evidence,
+            )
+            assert result.status is not VerificationEvidenceValidationStatus.ACCEPTED, name
+    finally:
+        authority.close()
+
+
+@pytest.mark.posix_host
+def test_m4_adapter_rejects_missing_real_m4_success_authority(
+    tmp_path: Path,
+) -> None:
+    approval, authority, _ = _build_real_m4_success(tmp_path, finalize=False)
+    try:
+        read_handle = authority.open_readonly()
+        verification_input = _verification_input()
+        evidence = _evidence(verification_input)
+        result = M4VerificationEvidenceValidator(
+            verification_read_handle=read_handle,
+            execution_read_model=approval.execution_read_model,
+        ).validate(verification_input=verification_input, evidence=evidence)
+        assert result.status is VerificationEvidenceValidationStatus.UNAVAILABLE
+    finally:
+        authority.close()
+
+
+@pytest.mark.posix_host
+def test_m4_adapter_rejects_corrupt_real_m4_success_payload(
+    tmp_path: Path,
+) -> None:
+    approval, authority, _ = _build_real_m4_success(tmp_path)
+    database_path = Path(
+        approval._conn.execute("PRAGMA database_list").fetchone()[2]
+    )
+    authority.close()
+
+    connection = sqlite3.connect(database_path)
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("DROP TRIGGER trg_vse_immutable_update")
+        connection.execute(
+            "UPDATE verification_success_evidence "
+            "SET payload_digest=? WHERE verification_run_id=?",
+            (_digest("corrupt-success"), "verification-1"),
+        )
+        connection.execute(
+            """CREATE TRIGGER IF NOT EXISTS trg_vse_immutable_update
+            BEFORE UPDATE ON verification_success_evidence
+            BEGIN SELECT RAISE(ABORT, 'verification success evidence is immutable'); END"""
+        )
+        connection.commit()
+        reopened_approval = PlanApprovalStore(connection)
+        reopened_authority = VerificationAuthorityRegistry().issue(
+            connection,
+            runtime_id="m7-4-corrupt-runtime",
+            boot_id="m7-4-corrupt-boot",
+        )
+        try:
+            read_handle = reopened_authority.open_readonly()
+            verification_input = _verification_input()
+            evidence = _evidence(verification_input)
+            result = M4VerificationEvidenceValidator(
+                verification_read_handle=read_handle,
+                execution_read_model=reopened_approval.execution_read_model,
+            ).validate(
+                verification_input=verification_input,
+                evidence=evidence,
+            )
+            assert result.status is VerificationEvidenceValidationStatus.UNAVAILABLE
+        finally:
+            reopened_authority.close()
+    finally:
+        if connection is not None:
+            try:
+                connection.close()
+            except sqlite3.Error:
+                pass
 
 
 @pytest.mark.asyncio

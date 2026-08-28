@@ -57,6 +57,14 @@ M7.4 introduces `TrustedVerificationAuthority` and the immutable
    and exit status.  It does not read host paths or instantiate the legacy
    pipeline.  Until an audited M4 runtime supplies this adapter, the production
    factory uses `FailClosedVerificationEvidenceValidator`.
+   The adapter keeps the M4 evidence owners separate: `PlanExecutionRun` and
+   `PlanExecutionReadModel` own execution facts; `VerificationExecutionRun`
+   is exposed to M7.4 only through the narrow, authority-bound
+   `VerificationReadHandle.verification_run_binding()` projection;
+   `VerificationStepRun` owns per-check facts; and `FinalMutationAttestation`
+   owns the sealed post-change mutation identity.  M7.4 joins these typed
+   projections and never requires a synthetic object that merges verification
+   fields into `PlanExecutionRun`.
 8. **Completion remains a separate authority.**  `TrustedVerificationFactProvider`
    projects only a current durable assessment into bounded completion facts.
    `CompletionEvaluator` remains pure; `CompletionDecision` remains passive;

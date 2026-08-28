@@ -15,6 +15,10 @@ from enum import Enum
 from typing import Protocol, cast
 from uuid import uuid4
 
+from khaos.coding.planning.execution_models import (
+    FinalMutationAttestation,
+    PlanExecutionRun,
+)
 from khaos.coding.planning.verification_assessment import (
     TRUSTED_VERIFICATION_INPUT_SCHEMA_VERSION,
     TrustedVerificationInput,
@@ -27,6 +31,10 @@ from khaos.coding.planning.verification_assessment import (
     VerificationExecutionStatus,
     VerificationRequirement,
     VerificationTermination,
+)
+from khaos.coding.planning.verification_execution_models import (
+    VerificationRunBinding,
+    VerificationStepRun,
 )
 from khaos.security.protocol_boundary import canonical_digest
 
@@ -104,6 +112,11 @@ class _M4VerificationReadHandle(Protocol):
     def execution_status(self, execution_run_id: str) -> str | None:
         ...
 
+    def verification_run_binding(
+        self, verification_run_id: str,
+    ) -> VerificationRunBinding | None:
+        ...
+
 
 class _M4ExecutionReadModel(Protocol):
     """Typed read-only surface required from the existing M4 read model."""
@@ -113,13 +126,15 @@ class _M4ExecutionReadModel(Protocol):
         execution_run_id: str,
         *,
         authoritative_verification_reads_required: bool = False,
-    ) -> object | None:
+    ) -> PlanExecutionRun | None:
         ...
 
-    def get_final_mutation_attestation(self, execution_run_id: str) -> object | None:
+    def get_final_mutation_attestation(
+        self, execution_run_id: str,
+    ) -> FinalMutationAttestation | None:
         ...
 
-    def get_verification_step(self, step_run_id: str) -> object | None:
+    def get_verification_step(self, step_run_id: str) -> VerificationStepRun | None:
         ...
 
 
@@ -204,6 +219,12 @@ class M4VerificationEvidenceValidator:
             raise TypeError(
                 "verification_read_handle must expose verification_for_execution"
             )
+        if not callable(
+            getattr(verification_read_handle, "verification_run_binding", None)
+        ):
+            raise TypeError(
+                "verification_read_handle must expose verification_run_binding"
+            )
         if not callable(getattr(execution_read_model, "get_execution_run", None)):
             raise TypeError("execution_read_model must expose get_execution_run")
         if not callable(getattr(execution_read_model, "get_final_mutation_attestation", None)):
@@ -238,6 +259,9 @@ class M4VerificationEvidenceValidator:
                 self._verification_read_handle.verification_for_execution(
                     evidence.execution_run_id
                 )
+            )
+            verification_run = self._verification_read_handle.verification_run_binding(
+                evidence.verification_run_id
             )
             authority_id, authority_digest = self._verification_read_handle.success_binding(
                 evidence.verification_run_id,
@@ -284,11 +308,29 @@ class M4VerificationEvidenceValidator:
                 status=VerificationEvidenceValidationStatus.REJECTED,
                 reason="M4 verification/execution status is not an authorized success",
             )
-        if execution_run is None or attestation is None or verification_step is None:
+        if (
+            verification_run is None
+            or execution_run is None
+            or attestation is None
+            or verification_step is None
+        ):
             return VerificationEvidenceValidation(
                 evidence_id=evidence.evidence_id,
                 status=VerificationEvidenceValidationStatus.UNAVAILABLE,
                 reason="M4 success lacks execution, step, or mutation attestation",
+            )
+        if not all(
+            (
+                isinstance(verification_run, VerificationRunBinding),
+                isinstance(execution_run, PlanExecutionRun),
+                isinstance(attestation, FinalMutationAttestation),
+                isinstance(verification_step, VerificationStepRun),
+            )
+        ):
+            return VerificationEvidenceValidation(
+                evidence_id=evidence.evidence_id,
+                status=VerificationEvidenceValidationStatus.UNAVAILABLE,
+                reason="M4 read projection has an invalid typed contract",
             )
         if not _passed_evidence_shape(evidence):
             return VerificationEvidenceValidation(
@@ -298,6 +340,7 @@ class M4VerificationEvidenceValidator:
             )
         if not _m4_run_matches_input(
             execution_run,
+            verification_run,
             attestation,
             verification_step,
             verification_input,
@@ -621,52 +664,62 @@ def _evidence_matches_requirement(
 
 
 def _m4_run_matches_input(
-    execution_run: object,
-    attestation: object,
-    verification_step: object,
+    execution_run: PlanExecutionRun,
+    verification_run: VerificationRunBinding,
+    attestation: FinalMutationAttestation,
+    verification_step: VerificationStepRun,
     verification_input: TrustedVerificationInput,
     evidence: VerificationExecutionEvidence,
 ) -> bool:
     return (
-        getattr(execution_run, "execution_run_id", None) == evidence.execution_run_id
-        and getattr(execution_run, "task_id", None) == verification_input.task_id
-        and getattr(execution_run, "plan_id", None)
+        execution_run.execution_run_id
+        == verification_run.execution_run_id
+        == evidence.execution_run_id
+        and verification_run.verification_run_id == evidence.verification_run_id
+        and execution_run.task_id
+        == verification_run.task_id
+        == verification_input.task_id
+        and execution_run.plan_id
+        == verification_run.plan_id
         == verification_input.published_plan_revision_id
-        and getattr(execution_run, "plan_content_hash", None)
+        and execution_run.plan_content_hash
+        == verification_run.plan_content_hash
         == verification_input.published_plan_revision_digest
-        and getattr(execution_run, "workspace_id", None) == verification_input.workspace_id
-        and getattr(execution_run, "repository_id", None) == verification_input.repository_id
-        and getattr(execution_run, "base_sha", None) == verification_input.base_revision
-        and str(getattr(execution_run, "repository_generation", ""))
+        and execution_run.workspace_id
+        == verification_run.workspace_id
+        == verification_input.workspace_id
+        and execution_run.repository_id
+        == verification_run.repository_id
+        == verification_input.repository_id
+        and execution_run.base_sha == verification_input.base_revision
+        and str(execution_run.repository_generation)
         == verification_input.repository_generation
-        and str(getattr(attestation, "generation", ""))
+        and str(attestation.generation)
         == verification_input.repository_generation
-        and getattr(execution_run, "trusted_catalog_fingerprint", None)
+        and attestation.execution_run_id == execution_run.execution_run_id
+        and _enum_value(verification_run.status) == "passed"
+        and verification_run.trusted_catalog_fingerprint
         == verification_input.catalog_fingerprint
-        and getattr(execution_run, "final_mutation_attestation_digest", None)
-        == getattr(attestation, "attestation_digest", None)
+        and verification_run.final_mutation_attestation_digest
+        == attestation.attestation_digest
         and any(
             ref.kind is VerificationEvidenceKind.FINAL_MUTATION_ATTESTATION
-            and ref.digest == getattr(attestation, "attestation_digest", None)
+            and ref.digest == attestation.attestation_digest
             for ref in evidence.references
         )
-        and getattr(verification_step, "step_run_id", None)
-        == evidence.verification_step_id
-        and getattr(verification_step, "verification_run_id", None)
-        == evidence.verification_run_id
-        and getattr(verification_step, "requirement_id", None)
-        == evidence.requirement_id
-        and getattr(verification_step, "command_digest", None)
-        == evidence.command_digest
-        and _enum_value(getattr(verification_step, "status", None)) == "passed"
-        and getattr(verification_step, "exit_code", None) == 0
-        and (getattr(verification_step, "stdout_digest", "") or "")
+        and verification_step.step_run_id == evidence.verification_step_id
+        and verification_step.verification_run_id == evidence.verification_run_id
+        and verification_step.requirement_id == evidence.requirement_id
+        and verification_step.command_digest == evidence.command_digest
+        and _enum_value(verification_step.status) == "passed"
+        and verification_step.exit_code == 0
+        and (verification_step.stdout_digest or "")
         == (evidence.stdout_digest or "")
-        and (getattr(verification_step, "stderr_digest", "") or "")
+        and (verification_step.stderr_digest or "")
         == (evidence.stderr_digest or "")
-        and bool(getattr(verification_step, "output_truncated", True))
+        and bool(verification_step.output_truncated)
         == evidence.output_truncated
-        and getattr(verification_step, "completed_at", None) is not None
+        and verification_step.completed_at is not None
     )
 
 
