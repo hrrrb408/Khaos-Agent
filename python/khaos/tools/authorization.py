@@ -181,6 +181,7 @@ def build_approval_binding(
     authorization_epoch: int,
     policy_digest: str,
     step_authority_digest: str,
+    plan_binding: Any | None = None,
 ) -> ApprovalBinding:
     """Build the one immutable digest contract consumed by approval broker."""
     project_id = str(tool_context.get("project_id") or "")
@@ -214,6 +215,13 @@ def build_approval_binding(
         tool_schema_digest=tool.schema_digest,
         tool_security_digest=tool.security_digest,
         step_authority_digest=step_authority_digest,
+        plan_revision_id=str(getattr(plan_binding, "plan_revision_id", "") or ""),
+        plan_revision_digest=str(getattr(plan_binding, "plan_revision_digest", "") or ""),
+        plan_step_id=str(getattr(plan_binding, "plan_step_id", "") or ""),
+        plan_step_digest=str(getattr(plan_binding, "plan_step_digest", "") or ""),
+        plan_execution_epoch_digest=str(getattr(plan_binding, "execution_epoch_digest", "") or ""),
+        plan_route_id=str(getattr(plan_binding, "route_id", "") or ""),
+        plan_route_digest=str(getattr(plan_binding, "route_digest", "") or ""),
     )
 
 
@@ -253,6 +261,13 @@ def build_permission_request(
         tool_schema_digest=binding.tool_schema_digest,
         tool_security_digest=binding.tool_security_digest,
         step_execution_digest=step_execution_digest,
+        plan_revision_id=binding.plan_revision_id,
+        plan_revision_digest=binding.plan_revision_digest,
+        plan_step_id=binding.plan_step_id,
+        plan_step_digest=binding.plan_step_digest,
+        plan_execution_epoch_digest=binding.plan_execution_epoch_digest,
+        plan_route_id=binding.plan_route_id,
+        plan_route_digest=binding.plan_route_digest,
     )
 
 

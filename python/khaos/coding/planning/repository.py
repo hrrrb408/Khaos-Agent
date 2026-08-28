@@ -95,6 +95,7 @@ class PlanningTaskSnapshot:
     base_revision: str | None
     repository_id: str | None
     published_plan_revision_id: str | None = None
+    last_applied_recovery_decision_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -842,7 +843,8 @@ async def _select_task(
     cursor = await conn.execute(
         """
         SELECT id, principal_id, project_id, status, cognitive_state,
-               control_state_version, published_plan_revision_id, state_json
+               control_state_version, published_plan_revision_id,
+               last_applied_recovery_decision_id, state_json
         FROM coding_tasks
         WHERE id = ? AND principal_id = ? AND project_id = ?
         """,
@@ -939,6 +941,10 @@ def _decode_task_snapshot(row: Any) -> PlanningTaskSnapshot | None:
             ("base_sha", base_revision),
             ("repository_id", repository_id),
             ("published_plan_revision_id", published_plan_revision_id),
+            (
+                "last_applied_recovery_decision_id",
+                row["last_applied_recovery_decision_id"],
+            ),
         ):
             if value is not None and (type(value) is not str or not value):
                 raise PlanRevisionIntegrityError(
@@ -955,6 +961,7 @@ def _decode_task_snapshot(row: Any) -> PlanningTaskSnapshot | None:
             base_revision=base_revision,
             repository_id=repository_id,
             published_plan_revision_id=published_plan_revision_id,
+            last_applied_recovery_decision_id=row["last_applied_recovery_decision_id"],
         )
     except PlanRevisionIntegrityError:
         raise

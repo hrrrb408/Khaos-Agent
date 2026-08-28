@@ -154,6 +154,13 @@ class PermissionRequest:
     # Final digest of the immutable authority consumed by execution.  The
     # binding itself carries the pre-receipt scope digest.
     step_execution_digest: str = ""
+    plan_revision_id: str = ""
+    plan_revision_digest: str = ""
+    plan_step_id: str = ""
+    plan_step_digest: str = ""
+    plan_execution_epoch_digest: str = ""
+    plan_route_id: str = ""
+    plan_route_digest: str = ""
 
 
 @dataclass

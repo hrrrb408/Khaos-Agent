@@ -24,6 +24,7 @@ from khaos.coding.execution import BackendSelector, ExecutionService
 from khaos.coding.intelligence.query_service import ContextIntelligenceService
 from khaos.coding.planning.coordinator import PlanningControlCoordinator
 from khaos.coding.planning.service import DeterministicPlanningService
+from khaos.coding.planning.tool_router import PlanToolRouter
 from khaos.coding.planning.trusted_verification_authority import (
     TrustedVerificationAuthority,
 )
@@ -1617,6 +1618,17 @@ async def build_runtime(
     # the variable was only assigned inside the ``if scheduler is None``
     # block, so RuntimeResult couldn't reference it — the fd leaked.
     scheduler = cfg.tool_scheduler
+    plan_repository_for_router = getattr(cfg.db, "plan_revision_repository", None)
+    route_repository_for_router = getattr(cfg.db, "plan_tool_route_repository", None)
+    plan_router = None
+    if plan_repository_for_router is not None and route_repository_for_router is not None:
+        plan_router = PlanToolRouter(
+            plan_repository_for_router, route_repository_for_router
+        )
+    elif production_mode:
+        raise RuntimeError(
+            "production coding runtime requires published-plan routing repositories"
+        )
     if scheduler is None:
         # B1: when a tool allowlist is configured (SubAgent path), prune the
         # full runtime registry down to exactly the declared tool subset so
@@ -1649,7 +1661,13 @@ async def build_runtime(
                 runtime_profile=runtime_profile,
             ),
             credential_broker=credential_broker,
+            plan_router=plan_router,
         )
+    elif production_mode:
+        if not isinstance(getattr(scheduler, "plan_router", None), PlanToolRouter):
+            raise RuntimeError(
+                "injected production ToolScheduler must use PublishedPlanToolRouter"
+            )
     if production_mode:
         scheduler_resource_order = getattr(
             getattr(scheduler, "network_broker_factory", None),

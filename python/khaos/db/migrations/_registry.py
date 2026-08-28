@@ -529,6 +529,13 @@ MIGRATIONS: tuple[MigrationSpec, ...] = (
             "_ensure_coding_tasks_last_applied_recovery_decision_column",
         ),
     ),
+    MigrationSpec(
+        version=23,
+        name="m7_6_published_plan_tool_routing",
+        sha256="6191a01e7394f93b4b2effb04a35f8d977ca211f911485b0a64130e676029529",
+        sql_files=("0023_plan_tool_routing.sql",),
+        migrator_symbols=("_apply_v23_upgrades",),
+    ),
 )
 
 

@@ -581,6 +581,75 @@ CREATE INDEX IF NOT EXISTS idx_coding_tasks_status ON coding_tasks(status, updat
 CREATE INDEX IF NOT EXISTS idx_coding_tasks_principal ON coding_tasks(principal_id, status);
 -- M4 batch 3.1.16A-5-1: project-scoped index created by migration helper.
 
+-- M7.6: canonical plan-tool route history and execution projections. Runtime
+-- source of truth is migrations/0023_plan_tool_routing.sql.
+CREATE TABLE IF NOT EXISTS agent_plan_tool_routes (
+    route_id TEXT PRIMARY KEY,
+    route_sequence INTEGER NOT NULL CHECK (route_sequence >= 1),
+    principal_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    execution_epoch_digest TEXT,
+    plan_revision_id TEXT,
+    plan_revision_digest TEXT,
+    plan_step_id TEXT,
+    plan_step_digest TEXT,
+    tool_name TEXT NOT NULL,
+    tool_security_digest TEXT NOT NULL,
+    arguments_digest TEXT NOT NULL,
+    authorization_resource_digest TEXT NOT NULL,
+    route_disposition TEXT NOT NULL,
+    reason_code TEXT NOT NULL,
+    route_input_digest TEXT NOT NULL,
+    route_digest TEXT NOT NULL,
+    canonical_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (principal_id, project_id, task_id, route_sequence)
+);
+CREATE TABLE IF NOT EXISTS agent_plan_step_states (
+    principal_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    execution_epoch_digest TEXT NOT NULL,
+    plan_revision_id TEXT NOT NULL,
+    plan_revision_digest TEXT NOT NULL,
+    plan_step_id TEXT NOT NULL,
+    plan_step_digest TEXT NOT NULL,
+    state TEXT NOT NULL,
+    attempt_generation INTEGER NOT NULL,
+    covered_targets TEXT NOT NULL,
+    covered_targets_digest TEXT NOT NULL,
+    active_route_id TEXT,
+    active_route_digest TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (principal_id, project_id, task_id, execution_epoch_digest, plan_step_id)
+);
+CREATE TABLE IF NOT EXISTS agent_plan_dispatch_fences (
+    fence_id TEXT PRIMARY KEY,
+    route_id TEXT NOT NULL,
+    route_digest TEXT NOT NULL,
+    principal_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    execution_epoch_digest TEXT NOT NULL,
+    plan_revision_id TEXT NOT NULL,
+    plan_step_id TEXT,
+    workspace_id TEXT NOT NULL,
+    workspace_generation INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    finished_at TEXT,
+    effect_status TEXT,
+    effect_id TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_plan_dispatch_fences_route
+    ON agent_plan_dispatch_fences(route_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_plan_dispatch_fences_active_step
+    ON agent_plan_dispatch_fences(
+        principal_id, project_id, task_id, execution_epoch_digest, plan_step_id
+    )
+    WHERE status = 'ACTIVE' AND plan_step_id IS NOT NULL;
+
 -- M7.1.2: canonical immutable user-goal declaration.  The runtime migration
 -- source is migrations/0016_goal_specs.sql; this aggregate schema is retained
 -- for tooling and documentation only.

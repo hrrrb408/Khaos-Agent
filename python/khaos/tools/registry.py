@@ -21,13 +21,14 @@ from khaos.permissions.resource import (
     resolve_single_workspace_path,
     resolve_terminal_argv,
     resolve_terminal_shell,
+    resolve_test_command,
     resolve_workspace_root,
 )
 from khaos.tools import schema as tool_schema
 
 _WORKSPACE_FILE_TOOLS = frozenset({
     "read_file", "search_files", "list_directory", "file_info", "tree_view",
-    "file_search_content", "write_file", "patch", "multi_edit", "copy_file",
+    "file_search_content", "write_file", "delete_file", "patch", "multi_edit", "copy_file",
     "move_file", "code_search", "code_symbols",
 })
 _OFFICE_WORKSPACE_FILE_TOOLS = frozenset({
@@ -91,7 +92,7 @@ _BUILTIN_EFFECT_STATUS: dict[str, str] = {
         name: _EFFECT_APPLIED
         for name in (
             "channel_enable", "channel_disable", "github_create_pr",
-            "github_comment_issue", "github_request_review", "write_file",
+            "github_comment_issue", "github_request_review", "write_file", "delete_file",
             "multi_edit", "patch", "copy_file", "move_file", "quick_note",
             "delete_note", "clipboard_write", "sandbox_build", "git_commit",
             "git_branch", "git_status_write", "git_smart_commit", "git_undo",
@@ -138,6 +139,17 @@ class CapabilityName(str, Enum):
     HISTORY_READ = "history.read"
     CHANNEL_READ = "channel.read"
     CHANNEL_MANAGE = "channel.manage"
+
+
+class PlanToolRole(str, Enum):
+    """Reviewed compatibility declaration for published-plan routing."""
+
+    SUPPORTING_READ = "supporting_read"
+    FILE_MUTATION = "file_mutation"
+    FILE_CREATE = "file_create"
+    FILE_RENAME = "file_rename"
+    FILE_DELETE = "file_delete"
+    VERIFICATION_COMMAND = "verification_command"
 
 
 @dataclass(frozen=True)
@@ -207,6 +219,26 @@ _BUILTIN_CAPABILITY_MANIFEST: dict[str, tuple[ToolCapability, ...]] = {
     "todo_write": _capability("task.state.write", {"coding"}, {"runtime"}),
     "todo_read": _capability("task.state.read", {"coding"}, {"runtime"}),
     "todo_update": _capability("task.state.write", {"coding"}, {"runtime"}),
+    "delete_file": _capability("filesystem.write", {"coding"}, {"task-workspace"}),
+}
+
+# Closed reviewed compatibility table.  Names absent from this table remain
+# ineligible for production plan execution; permission_level and descriptions
+# are never used to infer a plan role.
+_BUILTIN_PLAN_TOOL_ROLES: dict[str, PlanToolRole] = {
+    **{name: PlanToolRole.SUPPORTING_READ for name in (
+        "read_file", "search_files", "list_directory", "file_info", "tree_view",
+        "file_search_content", "code_search", "code_symbols", "git_diff",
+        "git_log", "git_status", "git_pr_body",
+    )},
+    "write_file": PlanToolRole.FILE_MUTATION,
+    "patch": PlanToolRole.FILE_MUTATION,
+    "multi_edit": PlanToolRole.FILE_MUTATION,
+    "copy_file": PlanToolRole.FILE_CREATE,
+    "delete_file": PlanToolRole.FILE_DELETE,
+    "move_file": PlanToolRole.FILE_RENAME,
+    "terminal_argv": PlanToolRole.VERIFICATION_COMMAND,
+    "test_run": PlanToolRole.VERIFICATION_COMMAND,
 }
 
 # The resolver is part of each ToolDefinition's security contract.  This
@@ -221,11 +253,12 @@ _BUILTIN_RESOURCE_RESOLVERS: dict[str, ResourceResolver] = {
     )},
     "copy_file": resolve_copy_or_move,
     "move_file": resolve_copy_or_move,
+    "delete_file": resolve_single_workspace_path,
     "terminal_argv": resolve_terminal_argv,
     "terminal_shell": resolve_terminal_shell,
     "terminal": resolve_terminal_shell,
     "process": resolve_process_control,
-    "test_run": resolve_terminal_shell,
+    "test_run": resolve_test_command,
     **{name: resolve_workspace_root for name in (
         "git_diff", "git_log", "git_status", "git_pr_body", "git_commit",
         "git_branch", "git_smart_commit", "git_undo", "git_create_branch",
@@ -259,6 +292,7 @@ _SECURITY_FIELDS: frozenset[str] = frozenset({
     "name", "parameters", "modes", "permission_level",
     "parallel", "timeout", "capabilities", "resource_resolver",
     "effect_status", "reconciliation_hint", "execution_kind",
+    "plan_tool_role",
 })
 
 
@@ -408,6 +442,9 @@ class ToolDefinition:
     # security field: a tool approved for a host sandbox must never silently
     # dispatch through Docker (or vice versa).
     execution_kind: str = "host-sandbox"
+    # M7.6: reviewed compatibility with PlanningStep operations. This is
+    # separate from capabilities and never grants authority.
+    plan_tool_role: PlanToolRole | None = None
     # Round-17 review §十: implementation identity.  Set via
     # :meth:`bind_handler` when the runtime handler is wired.  This field
     # is NOT a frozen security field (it must be settable after
@@ -573,6 +610,9 @@ class ToolDefinition:
             "effect_status": self.effect_status,
             "reconciliation_hint": self.reconciliation_hint,
             "execution_kind": self.execution_kind,
+            "plan_tool_role": (
+                self.plan_tool_role.value if self.plan_tool_role is not None else None
+            ),
             # Round-17 review §十: bind the implementation identity into
             # the security contract so swapping the handler invalidates
             # old approval bindings.
@@ -607,6 +647,10 @@ class ToolRegistry:
             definition.effect_status = _BUILTIN_EFFECT_STATUS.get(
                 definition.name, _EFFECT_UNKNOWN
             )
+        if definition.plan_tool_role is not None:
+            definition.plan_tool_role = PlanToolRole(definition.plan_tool_role)
+        elif definition.name in _BUILTIN_PLAN_TOOL_ROLES:
+            definition.plan_tool_role = _BUILTIN_PLAN_TOOL_ROLES[definition.name]
         if definition.effect_status not in {
             _EFFECT_NOT_APPLIED,
             _EFFECT_APPLIED,
@@ -1211,6 +1255,20 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
                     "content": {"type": "string"},
                 },
                 "required": ["path", "content"],
+            },
+            modes=["coding"],
+            permission_level="write",
+            parallel=False,
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="delete_file",
+            description="Delete one file from the active coding workspace.",
+            parameters={
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
             },
             modes=["coding"],
             permission_level="write",
@@ -2630,6 +2688,7 @@ def create_runtime_registry() -> ToolRegistry:
     _bind("github_request_review", github_tools.github_request_review, "khaos.tools.github_tools")
     _bind("read_file", file_tools.read_file, "khaos.tools.file_tools")
     _bind("write_file", file_tools.write_file, "khaos.tools.file_tools")
+    _bind("delete_file", file_tools.delete_file, "khaos.tools.file_tools")
     _bind("patch", file_tools.patch, "khaos.tools.file_tools")
     _bind("multi_edit", file_tools.multi_edit, "khaos.tools.file_tools")
     _bind("search_files", file_tools.search_files, "khaos.tools.file_tools")

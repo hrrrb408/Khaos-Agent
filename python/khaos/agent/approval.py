@@ -77,6 +77,16 @@ class StepExecutionAuthority:
     # recomputes the transport-root commitment from it, so the grant
     # caller must present the same transport the context was built from.
     source_transport: str = ""
+    # M7.6: explicit binding to the server-selected published-plan route.
+    # Empty values remain a legacy/test adapter only; production coding
+    # callers must provide the complete tuple.
+    plan_revision_id: str = ""
+    plan_revision_digest: str = ""
+    plan_step_id: str = ""
+    plan_step_digest: str = ""
+    plan_execution_epoch_digest: str = ""
+    plan_route_id: str = ""
+    plan_route_digest: str = ""
 
     def __post_init__(self) -> None:
         required = (
@@ -126,6 +136,13 @@ class StepExecutionAuthority:
             or any(c not in "0123456789abcdef" for c in self.delegation_digest)
         ):
             raise ValueError("step execution delegation digest is invalid")
+        plan_fields = (
+            self.plan_revision_id, self.plan_revision_digest, self.plan_step_id,
+            self.plan_step_digest, self.plan_execution_epoch_digest,
+            self.plan_route_id, self.plan_route_digest,
+        )
+        if any(plan_fields) and not all(plan_fields):
+            raise ValueError("plan execution binding is incomplete")
 
     def _payload(self, *, include_receipt: bool) -> dict[str, object]:
         authority_context = self.authority_context()
@@ -162,6 +179,13 @@ class StepExecutionAuthority:
             "delegation_digest": self.delegation_digest,
             "runtime_id": self.runtime_id,
             "source_transport": self.source_transport,
+            "plan_revision_id": self.plan_revision_id,
+            "plan_revision_digest": self.plan_revision_digest,
+            "plan_step_id": self.plan_step_id,
+            "plan_step_digest": self.plan_step_digest,
+            "plan_execution_epoch_digest": self.plan_execution_epoch_digest,
+            "plan_route_id": self.plan_route_id,
+            "plan_route_digest": self.plan_route_digest,
             "authority_context": authority_context.payload(),
             "authority_context_digest": authority_context.digest(),
         }
@@ -233,6 +257,14 @@ class ApprovalBinding:
     # approval.  The final authority adds the broker binding digest as its
     # approval receipt.
     step_authority_digest: str = ""
+    # M7.6 route identity is part of the ordinary approval binding.
+    plan_revision_id: str = ""
+    plan_revision_digest: str = ""
+    plan_step_id: str = ""
+    plan_step_digest: str = ""
+    plan_execution_epoch_digest: str = ""
+    plan_route_id: str = ""
+    plan_route_digest: str = ""
 
     def __post_init__(self) -> None:
         required = (
@@ -251,6 +283,13 @@ class ApprovalBinding:
             raise ValueError("approval binding fields must not be empty")
         if self.expires_at <= 0:
             raise ValueError("approval binding expiry must be positive")
+        plan_fields = (
+            self.plan_revision_id, self.plan_revision_digest, self.plan_step_id,
+            self.plan_step_digest, self.plan_execution_epoch_digest,
+            self.plan_route_id, self.plan_route_digest,
+        )
+        if any(plan_fields) and not all(plan_fields):
+            raise ValueError("approval plan binding is incomplete")
 
     def digest(self) -> str:
         payload = {
@@ -273,6 +312,13 @@ class ApprovalBinding:
             "tool_schema_digest": self.tool_schema_digest,
             "tool_security_digest": self.tool_security_digest,
             "step_authority_digest": self.step_authority_digest,
+            "plan_revision_id": self.plan_revision_id,
+            "plan_revision_digest": self.plan_revision_digest,
+            "plan_step_id": self.plan_step_id,
+            "plan_step_digest": self.plan_step_digest,
+            "plan_execution_epoch_digest": self.plan_execution_epoch_digest,
+            "plan_route_id": self.plan_route_id,
+            "plan_route_digest": self.plan_route_digest,
         }
         canonical = json.dumps(
             payload, sort_keys=True, separators=(",", ":")

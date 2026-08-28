@@ -39,6 +39,23 @@ from khaos.coding.planning.revision import (
     plan_revision_from_canonical_json,
 )
 from khaos.coding.planning.service import DeterministicPlanningService
+from khaos.coding.planning.step_execution_repository import (
+    PlanDispatchFence,
+    PlanStepExecutionRepository,
+    PlanStepExecutionState,
+)
+from khaos.coding.planning.tool_route_repository import (
+    PlanToolRouteRepository,
+    StoredPlanToolRoute,
+)
+from khaos.coding.planning.tool_router import PlanToolRouter, PlanToolRouterError
+from khaos.coding.planning.tool_routing import (
+    PlanExecutionEpochBinding,
+    PlanRouteDisposition,
+    PlanToolRouteBinding,
+    PlanToolRouteDecision,
+    PlanToolRouteInput,
+)
 from khaos.coding.planning.trusted_verification_authority import (
     FailClosedVerificationEvidenceValidator,
     M4VerificationEvidenceValidator,
@@ -145,7 +162,9 @@ __all__ = [
     "ExecutionRunStatus",
     "FailClosedVerificationEvidenceValidator",
     "M4VerificationEvidenceValidator",
+    "PlanDispatchFence",
     "PlanDisposition",
+    "PlanExecutionEpochBinding",
     "PlanExecutionRun",
     "PlanPublicationResult",
     "PlanPublicationStatus",
@@ -155,6 +174,15 @@ __all__ = [
     "PlanRevisionIntegrityError",
     "PlanRevisionRepository",
     "PlanRevisionStaleError",
+    "PlanRouteDisposition",
+    "PlanStepExecutionRepository",
+    "PlanStepExecutionState",
+    "PlanToolRouteBinding",
+    "PlanToolRouteDecision",
+    "PlanToolRouteInput",
+    "PlanToolRouteRepository",
+    "PlanToolRouter",
+    "PlanToolRouterError",
     "PlannedEditBundle",
     "PlannedEditOperation",
     "PlannedFileEdit",
@@ -175,6 +203,7 @@ __all__ = [
     "PlanningTaskSnapshot",
     "PlanningVerificationIntent",
     "StoredPlanRevision",
+    "StoredPlanToolRoute",
     "StoredVerificationAssessment",
     "StructuralVerificationEvidenceValidator",
     "TrustedVerificationAuthority",

@@ -268,6 +268,19 @@ class CompletionGateRepository:
                         ),
                     )
 
+                active_fence = await conn.execute(
+                    "SELECT 1 FROM agent_plan_dispatch_fences WHERE principal_id = ? AND project_id = ? AND task_id = ? AND status = 'ACTIVE' LIMIT 1",
+                    (principal_id, project_id, decision.task_id),
+                )
+                if await active_fence.fetchone() is not None:
+                    return _result(
+                        CompletionProjectionStatus.STALE,
+                        decision_id,
+                        decision_digest=decision.decision_digest,
+                        task_status=task_snapshot.task_status,
+                        reason="active plan dispatch fence prevents completion",
+                    )
+
                 try:
                     state = _decode_state_projection(task_row["state_json"])
                 except CompletionDecisionIntegrityError as exc:

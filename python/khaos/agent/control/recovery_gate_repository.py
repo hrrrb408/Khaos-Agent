@@ -432,6 +432,26 @@ class RecoveryGateRepository:
                         reason="published implementation plan is not READY",
                     )
 
+                if decision.action is RecoveryAction.REPLAN:
+                    active_fence = await conn.execute(
+                        "SELECT 1 FROM agent_plan_dispatch_fences WHERE principal_id = ? AND project_id = ? AND task_id = ? AND plan_revision_id = ? AND status = 'ACTIVE' LIMIT 1",
+                        (
+                            principal_id,
+                            project_id,
+                            decision.task_id,
+                            task_snapshot.published_plan_revision_id,
+                        ),
+                    )
+                    if await active_fence.fetchone() is not None:
+                        return _task_result(
+                            RecoveryProjectionStatus.BLOCKED,
+                            recovery_decision_id,
+                            stored.recovery_sequence,
+                            decision,
+                            task_snapshot,
+                            reason="active plan dispatch fence prevents plan retirement",
+                        )
+
                 target_state, target_plan_id = _target_projection(
                     decision.action,
                     task_snapshot=task_snapshot,

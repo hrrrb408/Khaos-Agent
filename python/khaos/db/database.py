@@ -26,6 +26,8 @@ from khaos.agent.control.recovery_repository import RecoveryDecisionRepository
 from khaos.agent.control.state_repository import AgentControlStateRepository
 from khaos.agent.core import Message
 from khaos.coding.planning.repository import PlanRevisionRepository
+from khaos.coding.planning.step_execution_repository import PlanStepExecutionRepository
+from khaos.coding.planning.tool_route_repository import PlanToolRouteRepository
 from khaos.coding.planning.verification_assessment_repository import (
     VerificationAssessmentRepository,
 )
@@ -270,6 +272,8 @@ class Database:
         self._recovery_decision_repository = RecoveryDecisionRepository(self)
         self._recovery_gate_repository = RecoveryGateRepository(self)
         self._plan_revision_repository = PlanRevisionRepository(self)
+        self._plan_tool_route_repository = PlanToolRouteRepository(self)
+        self._plan_step_execution_repository = PlanStepExecutionRepository(self)
         self._verification_assessment_repository = VerificationAssessmentRepository(self)
         # F-01: Per-domain locks remain for logical serialization (e.g. two
         # concurrent permission grants must not race on epoch computation).
@@ -329,6 +333,16 @@ class Database:
     def plan_revision_repository(self) -> PlanRevisionRepository:
         """Return the sole owner-scoped immutable planning-revision ledger."""
         return self._plan_revision_repository
+
+    @property
+    def plan_tool_route_repository(self) -> PlanToolRouteRepository:
+        """Return the append-only M7.6 route ledger owner."""
+        return self._plan_tool_route_repository
+
+    @property
+    def plan_step_execution_repository(self) -> PlanStepExecutionRepository:
+        """Return the M7.6 step/fence projection owner."""
+        return self._plan_step_execution_repository
 
     @property
     def verification_assessment_repository(self) -> VerificationAssessmentRepository:
@@ -913,6 +927,14 @@ class Database:
             self._conn = _MigrationConnection(conn)
             try:
                 await self._apply_v22_upgrades()
+            finally:
+                self._conn = original_conn
+            # M7.6: connect published-plan routing to durable step state and
+            # dispatch fencing before any production tool can use the seam.
+            original_conn = self._conn
+            self._conn = _MigrationConnection(conn)
+            try:
+                await self._apply_v23_upgrades()
             finally:
                 self._conn = original_conn
             # Batch 6.4 §10.4: backfill the historical ledger rows (v1–v5)
@@ -1597,6 +1619,15 @@ class Database:
         conn = await self._require_conn()
         await self._ensure_coding_tasks_last_applied_recovery_decision_column(conn)
         migration_path = _MIGRATIONS_DIR / "0022_recovery_control_plane.sql"
+        await self._execute_schema_statements(
+            conn,
+            migration_path.read_text(encoding="utf-8"),
+        )
+
+    async def _apply_v23_upgrades(self) -> None:
+        """Add the M7.6 route, step-state, and dispatch-fence ledgers."""
+        conn = await self._require_conn()
+        migration_path = _MIGRATIONS_DIR / "0023_plan_tool_routing.sql"
         await self._execute_schema_statements(
             conn,
             migration_path.read_text(encoding="utf-8"),
