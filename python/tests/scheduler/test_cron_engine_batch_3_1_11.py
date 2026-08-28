@@ -18,17 +18,15 @@ Acceptance tests for the 10 criteria specified in the batch review:
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
 
+import khaos.scheduler.execution as _engine_mod
 import pytest
-
 from khaos.db import Database
 from khaos.exceptions import ServiceShutdownError
-from khaos.scheduler import CronEngine, ScheduleConfig, TaskStatus
+from khaos.scheduler import CronEngine, ScheduleConfig
 from khaos.time_utils import utc_now_naive
-import khaos.scheduler.execution as _engine_mod
-
 
 # ---------------------------------------------------------------------------
 # Test helpers
@@ -156,7 +154,7 @@ async def test_acceptance_2_claim_commit_then_raise_read_back(tmp_path) -> None:
             call_count["n"] += 1
             if call_count["n"] == 1:
                 # Commit the UPDATE, then raise.
-                result = await original_claim(*args, **kwargs)
+                await original_claim(*args, **kwargs)
                 raise RuntimeError("ambiguous commit — network error")
             return await original_claim(*args, **kwargs)
 
@@ -244,7 +242,10 @@ async def test_acceptance_3_terminal_write_failure_retains_lease(tmp_path) -> No
 
         # Patch finalize to raise (simulating DB failure during
         # terminal write).
+        finalize_called = asyncio.Event()
+
         async def failing_finalize(*args, **kwargs):
+            finalize_called.set()
             raise RuntimeError("DB wedged during finalize")
 
         db.finalize_scheduled_task = failing_finalize
@@ -256,8 +257,12 @@ async def test_acceptance_3_terminal_write_failure_retains_lease(tmp_path) -> No
             principal_id="alice",
         )
 
-        # Let the executor complete (but finalize fails).
-        await asyncio.sleep(0.3)
+        # Wait for the executor to reach the terminal write instead of
+        # assuming a fixed scheduler delay.  The Windows product runner is
+        # materially slower under the full suite; a short sleep can observe
+        # the task's initial PENDING row before the claim/finalize sequence
+        # has run, which makes this test report a false failure.
+        await asyncio.wait_for(finalize_called.wait(), timeout=5.0)
 
         # The DB row MUST still have execution_id and lease_until set.
         row = await db.get_scheduled_task(task.id)
@@ -754,7 +759,6 @@ async def test_acceptance_8_control_op_commit_then_raise_no_version_drift(
             "version-drift", "p", ScheduleConfig(interval_seconds=60),
             principal_id="alice",
         )
-        version_before = task.lifecycle_version
         db_version_before = int(
             (await db.get_scheduled_task(task.id))["lifecycle_version"]
         )
@@ -768,7 +772,7 @@ async def test_acceptance_8_control_op_commit_then_raise_no_version_drift(
             call_count["n"] += 1
             if call_count["n"] == 1:
                 # First call: commit, then raise.
-                result = await original_control(*args, **kwargs)
+                await original_control(*args, **kwargs)
                 raise RuntimeError("ambiguous commit — network error")
             # Subsequent calls: return the real result.
             return await original_control(*args, **kwargs)
