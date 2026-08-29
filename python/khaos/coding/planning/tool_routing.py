@@ -122,6 +122,18 @@ class PlanToolRouteBinding:
     authorization_resource_digest: str
     disposition: PlanRouteDisposition
     reason_code: str
+    # M7.8 additive actor/owner binding.  Empty values from v23 routes are
+    # normalized to the ordinary parent identity for compatibility.
+    task_owner_principal_id: str = ""
+    execution_principal_id: str = ""
+    subagent_assignment_id: str | None = None
+    subagent_assignment_digest: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.task_owner_principal_id:
+            object.__setattr__(self, "task_owner_principal_id", self.principal_id)
+        if not self.execution_principal_id:
+            object.__setattr__(self, "execution_principal_id", self.principal_id)
 
     def payload(self) -> dict[str, Any]:
         return {
@@ -142,6 +154,10 @@ class PlanToolRouteBinding:
             "authorization_resource_digest": self.authorization_resource_digest,
             "disposition": self.disposition.value,
             "reason_code": self.reason_code,
+            "task_owner_principal_id": self.task_owner_principal_id,
+            "execution_principal_id": self.execution_principal_id,
+            "subagent_assignment_id": self.subagent_assignment_id,
+            "subagent_assignment_digest": self.subagent_assignment_digest,
         }
 
     def recompute_digest(self) -> str:

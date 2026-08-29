@@ -57,9 +57,10 @@ class PlanToolRouterError(RuntimeError):
 class PlanToolRouter:
     """Resolve one admitted tool call against the physical published plan."""
 
-    def __init__(self, plan_repository: PlanRevisionRepository, route_repository: Any) -> None:
+    def __init__(self, plan_repository: PlanRevisionRepository, route_repository: Any, assignment_repository: Any = None) -> None:
         self._plan_repository = plan_repository
         self._route_repository = route_repository
+        self._assignment_repository = assignment_repository
 
     async def route(
         self,
@@ -88,6 +89,8 @@ class PlanToolRouter:
             )
         try:
             principal_id = _required_context(tool_context, "principal_id")
+            task_owner_principal_id = str(tool_context.get("task_owner_principal_id") or principal_id)
+            execution_principal_id = principal_id
             project_id = _required_context(tool_context, "project_id")
             task_id = _required_context(tool_context, "task_id")
             workspace_id = _required_context(tool_context, "workspace_id")
@@ -109,7 +112,7 @@ class PlanToolRouter:
                     reason="authorization resource is outside the current task scope",
                 ))
             snapshot = await self._plan_repository.get_current_task_snapshot(
-                task_id, principal_id=principal_id, project_id=project_id
+                task_id, principal_id=task_owner_principal_id, project_id=project_id
             )
             if snapshot is None:
                 return await self._record(self._decision(
@@ -117,7 +120,7 @@ class PlanToolRouter:
                     context=tool_context, disposition=PlanRouteDisposition.UNAVAILABLE,
                     reason_code="task_unavailable", reason="task snapshot is unavailable",
                 ))
-            if snapshot.principal_id != principal_id or snapshot.project_id != project_id:
+            if snapshot.principal_id != task_owner_principal_id or snapshot.project_id != project_id:
                 return await self._record(self._decision(
                     tool=tool, arguments=arguments, resource=resource,
                     context=tool_context, disposition=PlanRouteDisposition.INVALID,
@@ -180,7 +183,7 @@ class PlanToolRouter:
                 ))
 
             published = await self._plan_repository.get_published_for_task(
-                task_id, principal_id=principal_id, project_id=project_id
+                task_id, principal_id=task_owner_principal_id, project_id=project_id
             )
             if published is None:
                 return await self._record(self._decision(
@@ -211,7 +214,9 @@ class PlanToolRouter:
                     published=published,
                 ))
             epoch = PlanExecutionEpochBinding(
-                principal_id=principal_id,
+                # The epoch is parent-task global.  Child actor identity is
+                # carried by the route/assignment binding instead.
+                principal_id=task_owner_principal_id,
                 project_id=project_id,
                 task_id=task_id,
                 goal_spec_id=published.revision.goal_spec_id,
@@ -242,8 +247,34 @@ class PlanToolRouter:
                     published=published, epoch=epoch,
                 ))
             step = candidates[0]
+            if execution_principal_id != task_owner_principal_id:
+                assignment_id = tool_context.get("subagent_assignment_id")
+                assignment_digest = tool_context.get("subagent_assignment_digest")
+                if self._assignment_repository is None or not assignment_id or not assignment_digest:
+                    return await self._record(self._decision(
+                        tool=tool, arguments=arguments, resource=resource,
+                        context=tool_context, disposition=PlanRouteDisposition.INVALID,
+                        reason_code="delegated_assignment_required",
+                        reason="execution actor differs from task owner without an assignment",
+                        published=published, epoch=epoch, step=step,
+                    ))
+                if not await self._assignment_repository.validate_active_for_route(
+                    assignment_id=str(assignment_id), assignment_digest=str(assignment_digest),
+                    child_execution_principal_id=execution_principal_id,
+                    task_owner_principal_id=task_owner_principal_id,
+                    project_id=project_id, parent_task_id=task_id,
+                    workspace_id=workspace_id, published_plan_revision_id=published.plan_revision_id,
+                    plan_step_id=step.step_id, execution_epoch_digest=epoch.digest(),
+                ):
+                    return await self._record(self._decision(
+                        tool=tool, arguments=arguments, resource=resource,
+                        context=tool_context, disposition=PlanRouteDisposition.STALE,
+                        reason_code="assignment_invalid_or_stale",
+                        reason="delegated assignment is not active or exact",
+                        published=published, epoch=epoch, step=step,
+                    ))
             state = await self._route_repository.get_step_state(
-                principal_id=principal_id,
+                principal_id=task_owner_principal_id,
                 project_id=project_id,
                 task_id=task_id,
                 execution_epoch_digest=epoch.digest(),
@@ -262,7 +293,7 @@ class PlanToolRouter:
                     published=published, epoch=epoch, step=step,
                 ))
             if not await self._dependencies_executed(
-                published.revision.steps, step, epoch.digest(), principal_id, project_id, task_id
+                published.revision.steps, step, epoch.digest(), task_owner_principal_id, project_id, task_id
             ):
                 return await self._record(self._decision(
                     tool=tool, arguments=arguments, resource=resource,
@@ -331,6 +362,10 @@ class PlanToolRouter:
             authorization_resource_digest=(resource.digest() if resource is not None else ""),
             disposition=disposition,
             reason_code=reason_code,
+            task_owner_principal_id=str(context.get("task_owner_principal_id") or context.get("principal_id") or ""),
+            execution_principal_id=str(context.get("execution_principal_id") or context.get("principal_id") or ""),
+            subagent_assignment_id=context.get("subagent_assignment_id"),
+            subagent_assignment_digest=context.get("subagent_assignment_digest"),
         )
         object.__setattr__(binding, "route_digest", binding.recompute_digest())
         return PlanToolRouteDecision(disposition, reason_code, reason, binding, requires_approval)

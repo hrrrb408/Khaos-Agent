@@ -623,6 +623,24 @@ class PlanRevisionRepository:
                     reason="task snapshot changed during plan publication",
                 )
 
+            # Replanning creates a new published plan identity.  Any child
+            # bound to an older revision is stale by construction and must
+            # stop contributing to completion/dispatch admission before the
+            # new publication becomes observable outside this transaction.
+            await conn.execute(
+                """UPDATE agent_subagent_runs
+                   SET state = 'STALE', state_version = state_version + 1,
+                       finished_at = datetime('now'), error = 'plan revision superseded'
+                   WHERE state IN ('PENDING', 'ACTIVE')
+                     AND assignment_id IN (
+                         SELECT assignment_id FROM agent_subagent_assignments
+                         WHERE task_owner_principal_id = ? AND project_id = ?
+                           AND parent_task_id = ?
+                           AND published_plan_revision_id <> ?
+                     )""",
+                (principal_id, project_id, head.task_id, head.plan_revision_id),
+            )
+
             published_row = await _select_task(
                 conn,
                 task_id=head.task_id,

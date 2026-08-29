@@ -46,7 +46,7 @@ _INJECTED_CAPABILITY_FIELDS = frozenset({
     "principal_id", "project_id", "runtime_id", "network_guard",
     "network_lease",
     "credential_context", "credential_lease", "credential_broker", "process_supervisor", "process_authority",
-    "browser_manager", "cron_engine",
+    "browser_manager", "cron_engine", "subagent_control_coordinator",
 })
 
 
@@ -98,7 +98,7 @@ _BUILTIN_EFFECT_STATUS: dict[str, str] = {
             "git_branch", "git_status_write", "git_smart_commit", "git_undo",
             "git_create_branch", "git_push", "todo_write", "todo_update",
             "cron_create", "cron_remove", "cron_pause", "cron_resume",
-            "spawn_subagent", "execute_plan", "grant_permission",
+            "spawn_subagent", "delegate_plan_step", "execute_plan", "grant_permission",
             "revoke_permission",
             "browser_launch", "browser_close",
         )
@@ -133,6 +133,7 @@ class CapabilityName(str, Enum):
     TASK_STATE_READ = "task.state.read"
     TASK_STATE_WRITE = "task.state.write"
     SUBAGENT_SPAWN = "subagent.spawn"
+    SUBAGENT_DELEGATE = "subagent.delegate"
     PERMISSION_READ = "permission.read"
     PERMISSION_MANAGE = "permission.manage"
     CRON_MANAGE = "cron.manage"
@@ -964,6 +965,13 @@ class ToolInvocationBroker:
             handler_params["principal_id"] = context.get("principal_id", "")
             handler_params["project_id"] = context.get("project_id", "")
             handler_params["subagent_spawner"] = context.get("subagent_spawner")
+        if any(capability.name == "subagent.delegate" for capability in capabilities):
+            handler_params["principal_id"] = context.get("principal_id", "")
+            handler_params["project_id"] = context.get("project_id", "")
+            handler_params["task_id"] = context.get("task_id", "")
+            handler_params["subagent_control_coordinator"] = context.get(
+                "subagent_control_coordinator"
+            )
         # M4 batch 3.1.10 (CRITICAL): the five cron tools declare the
         # ``cron.manage`` capability so the broker injects the caller's
         # ``principal_id``.  The engine / DB layer filter every read and
@@ -2360,6 +2368,30 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
     )
     registry.register(
         ToolDefinition(
+            name="delegate_plan_step",
+            description=(
+                "Delegate exactly one step from the current published coding plan. "
+                "The server derives the child scope and tools."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "plan_step_id": {"type": "string"},
+                },
+                "required": ["plan_step_id"],
+            },
+            modes=["coding"],
+            permission_level="write",
+            parallel=False,
+            capabilities=(ToolCapability(
+                "subagent.delegate",
+                frozenset({"coding"}),
+                frozenset({"task-workspace"}),
+            ),),
+        )
+    )
+    registry.register(
+        ToolDefinition(
             name="collect_results",
             description="Wait for all running subagents to complete and collect their results.",
             parameters={"type": "object", "properties": {}},
@@ -2749,6 +2781,7 @@ def create_runtime_registry() -> ToolRegistry:
     from khaos.tools import orchestrator_tools
 
     _bind("spawn_subagent", orchestrator_tools.spawn_subagent, "khaos.tools.orchestrator_tools")
+    _bind("delegate_plan_step", orchestrator_tools.delegate_plan_step, "khaos.tools.orchestrator_tools")
     _bind("collect_results", orchestrator_tools.collect_results, "khaos.tools.orchestrator_tools")
     _bind("execute_plan", orchestrator_tools.execute_plan, "khaos.tools.orchestrator_tools")
     _bind("subagent_status", orchestrator_tools.subagent_status, "khaos.tools.orchestrator_tools")

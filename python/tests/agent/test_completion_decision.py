@@ -816,11 +816,12 @@ async def test_fresh_v18_and_v17_to_v18_upgrade_do_not_backfill_decisions(
         # M7.3 adds the v19 planning ledger and the v20 publication fence;
         # M7.4 adds the v21 trusted-verification assessment ledger and M7.5
         # adds the v22 recovery ledger and M7.6 adds the v23 published-plan
-        # routing ledgers; M7.7 adds v24 provenance-bound retrieval metadata
+            # routing ledgers; M7.7 adds v24 provenance-bound retrieval metadata
+            # and M7.8 adds v25 plan-bound sub-agent assignment/run ledgers
         # after the immutable completion-decision ledger. The
         # v18 no-backfill assertion remains valid while the schema advances
         # monotonically.
-        assert SCHEMA_MIGRATION_VERSION == 24
+            assert SCHEMA_MIGRATION_VERSION == 25
     finally:
         await fresh.close()
 

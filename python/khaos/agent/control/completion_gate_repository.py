@@ -56,6 +56,7 @@ class CompletionProjectionStatus(str, Enum):
     AUTHORITY_INSUFFICIENT = "authority_insufficient"
     REJECTED = "rejected"
     ALREADY_TERMINAL = "already_terminal"
+    DELEGATED_CHILD_ACTIVE = "delegated_child_active"
     NOT_FOUND = "not_found"
     INTEGRITY_ERROR = "integrity_error"
     ERROR = "error"
@@ -266,6 +267,23 @@ class CompletionGateRepository:
                             "task status is not eligible for successful "
                             "completion projection"
                         ),
+                    )
+
+                delegated_child = await conn.execute(
+                    """SELECT 1 FROM agent_subagent_assignments a
+                       JOIN agent_subagent_runs r ON r.assignment_id = a.assignment_id
+                       WHERE a.task_owner_principal_id = ? AND a.project_id = ?
+                         AND a.parent_task_id = ?
+                         AND r.state IN ('PENDING', 'ACTIVE') LIMIT 1""",
+                    (principal_id, project_id, decision.task_id),
+                )
+                if await delegated_child.fetchone() is not None:
+                    return _result(
+                        CompletionProjectionStatus.DELEGATED_CHILD_ACTIVE,
+                        decision_id,
+                        decision_digest=decision.decision_digest,
+                        task_status=task_snapshot.task_status,
+                        reason="active delegated child blocks parent completion",
                     )
 
                 active_fence = await conn.execute(

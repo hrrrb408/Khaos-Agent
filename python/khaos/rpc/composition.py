@@ -112,12 +112,14 @@ async def _build_subagent_service(
         project_root=root,
         config_path=resolved_config,
         runtime_profile=resolved_runtime_profile,
+        assignment_repository=getattr(db, "subagent_assignment_repository", None),
     )
     spawner = SubAgentSpawner(
         SubAgentConfig(max_concurrent=3, max_spawn_depth=1, allow_nesting=False),
         db,
         runner=runner.run,
         registry=create_runtime_registry(),
+        assignment_repository=getattr(db, "subagent_assignment_repository", None),
     )
     # M6.9 BATCH 4: production spawns receive authority-owned narrow child
     # delegations when an authority daemon is deployed.  Without one the

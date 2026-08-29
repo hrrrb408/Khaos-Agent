@@ -175,6 +175,8 @@ class RuntimeConfig:
     skill_manager: SkillManager | None = None
     tool_scheduler: ToolScheduler | None = None
     workspace_manager: WorkspaceManager | None = None
+    delegated_workspace_manager: WorkspaceManager | None = None
+    delegated_execution_context: Any = None
     execution_service: ExecutionService | None = None
     browser_manager: Any = None
     cleanup_authority: RuntimeCleanupAuthority | None = None
@@ -289,6 +291,8 @@ class ProductionRuntimeConfig:
     approval_broker: Any = None
     office_authority: OfficeMutationAuthority | None = None
     credential_broker: CredentialBroker | None = None
+    delegated_workspace_manager: WorkspaceManager | None = None
+    delegated_execution_context: Any = None
     principal_id: str = ""
     principal_kind: str = ""
     parent_principal_id: str = ""
@@ -332,6 +336,8 @@ class ProductionRuntimeConfig:
             approval_broker=self.approval_broker,
             office_authority=self.office_authority,
             credential_broker=self.credential_broker,
+            delegated_workspace_manager=self.delegated_workspace_manager,
+            delegated_execution_context=self.delegated_execution_context,
             principal_id=self.principal_id,
             principal_kind=self.principal_kind,
             parent_principal_id=self.parent_principal_id,
@@ -1526,7 +1532,18 @@ async def build_runtime(
             project_id=project_id,
         )
         await task_manager.load()
-    workspace_manager = cfg.workspace_manager or WorkspaceManager(
+    if (
+        cfg.delegated_execution_context is not None
+        and cfg.delegated_workspace_manager is None
+    ):
+        raise RuntimeError(
+            "delegated runtime requires the exact parent workspace manager"
+        )
+    workspace_manager = (
+        cfg.delegated_workspace_manager
+        if cfg.delegated_execution_context is not None
+        else cfg.workspace_manager
+    ) or WorkspaceManager(
         policy_digest=effective_policy.digest,
         authorization_epoch=await permission_engine.authorization_snapshot(),
         resource_order=typed_resource_order,
@@ -1624,10 +1641,12 @@ async def build_runtime(
     scheduler = cfg.tool_scheduler
     plan_repository_for_router = getattr(cfg.db, "plan_revision_repository", None)
     route_repository_for_router = getattr(cfg.db, "plan_tool_route_repository", None)
+    assignment_repository_for_router = getattr(cfg.db, "subagent_assignment_repository", None)
     plan_router = None
     if plan_repository_for_router is not None and route_repository_for_router is not None:
         plan_router = PlanToolRouter(
-            plan_repository_for_router, route_repository_for_router
+            plan_repository_for_router, route_repository_for_router,
+            assignment_repository_for_router,
         )
     elif production_mode:
         raise RuntimeError(
@@ -1768,6 +1787,7 @@ async def build_runtime(
         principal_id=cfg.principal_id,
         project_id=project_id,
         task_projection=task_manager,
+        active_subagent_reader=getattr(cfg.db, "subagent_assignment_repository", None),
     )
     completion_recovery = CompletionRecoveryService(
         decision_repository=decision_repository,
@@ -1806,6 +1826,30 @@ async def build_runtime(
             control_state_repository=control_state_repository,
             principal_id=cfg.principal_id,
             project_id=project_id,
+        )
+    # M7.8: compose the plan-bound delegation authority only for a parent
+    # runtime.  A delegated child deliberately receives no coordinator, so a
+    # child cannot create a second control tree or recursively delegate.
+    subagent_control_coordinator = None
+    assignment_repository = getattr(cfg.db, "subagent_assignment_repository", None)
+    if (
+        cfg.subagent_spawner is not None
+        and cfg.delegated_execution_context is None
+        and plan_repository is not None
+        and assignment_repository is not None
+        and goal_spec_repository is not None
+        and workspace_manager is not None
+        and getattr(scheduler, "registry", None) is not None
+    ):
+        from khaos.subagents.assignment import SubAgentControlCoordinator
+
+        subagent_control_coordinator = SubAgentControlCoordinator(
+            plan_repository=plan_repository,
+            assignment_repository=assignment_repository,
+            goal_spec_repository=goal_spec_repository,
+            workspace_manager=workspace_manager,
+            registry=scheduler.registry,
+            spawner=cfg.subagent_spawner,
         )
     recovery_decision_repository = getattr(
         cfg.db, "recovery_decision_repository", None
@@ -1848,7 +1892,9 @@ async def build_runtime(
         token_engine=get_token_engine(),
         skill_manager=skill_manager if len(skill_manager.registry) else None,
         verify_fix_factory=verify_factory,
-        task_manager=task_manager,
+        task_manager=(
+            None if cfg.delegated_execution_context is not None else task_manager
+        ),
         skill_generator=skill_generator, project_root=root,
         coding_context_builder=(
             cfg.coding_context_builder if not production_mode else None
@@ -1879,12 +1925,26 @@ async def build_runtime(
         cron_engine=cfg.cron_engine,
         browser_manager=browser_manager,
         subagent_spawner=cfg.subagent_spawner,
+        subagent_control_coordinator=subagent_control_coordinator,
         credential_broker=credential_broker,
         completion_controller=completion_controller,
-        completion_gate=completion_gate,
-        completion_recovery=completion_recovery,
-        planning_coordinator=planning_coordinator,
-        recovery_control=recovery_control,
+        completion_gate=(
+            None if cfg.delegated_execution_context is not None else completion_gate
+        ),
+        completion_recovery=(
+            None
+            if cfg.delegated_execution_context is not None
+            else completion_recovery
+        ),
+        planning_coordinator=(
+            None
+            if cfg.delegated_execution_context is not None
+            else planning_coordinator
+        ),
+        recovery_control=(
+            None if cfg.delegated_execution_context is not None else recovery_control
+        ),
+        delegated_execution_context=cfg.delegated_execution_context,
         trusted_verification_authority=trusted_verification_authority,
         trusted_verification_service=trusted_verification_service,
         # M4 batch 3.1.16A-5-1b (CRITICAL): carry the RPC-verified

@@ -602,6 +602,10 @@ CREATE TABLE IF NOT EXISTS agent_plan_tool_routes (
     reason_code TEXT NOT NULL,
     route_input_digest TEXT NOT NULL,
     route_digest TEXT NOT NULL,
+    task_owner_principal_id TEXT NOT NULL DEFAULT '',
+    execution_principal_id TEXT NOT NULL DEFAULT '',
+    subagent_assignment_id TEXT,
+    subagent_assignment_digest TEXT,
     canonical_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
     UNIQUE (principal_id, project_id, task_id, route_sequence)
@@ -649,6 +653,49 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_plan_dispatch_fences_active_step
         principal_id, project_id, task_id, execution_epoch_digest, plan_step_id
     )
     WHERE status = 'ACTIVE' AND plan_step_id IS NOT NULL;
+
+-- M7.8: immutable plan-bound sub-agent assignments and mutable run state.
+CREATE TABLE IF NOT EXISTS agent_subagent_assignments (
+    assignment_id TEXT PRIMARY KEY,
+    assignment_sequence INTEGER NOT NULL CHECK (assignment_sequence >= 1),
+    task_owner_principal_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    parent_task_id TEXT NOT NULL,
+    goal_spec_id TEXT NOT NULL,
+    goal_spec_digest TEXT NOT NULL,
+    parent_task_status TEXT NOT NULL,
+    parent_cognitive_state TEXT NOT NULL,
+    parent_control_state_version INTEGER NOT NULL CHECK (parent_control_state_version >= 0),
+    workspace_id TEXT NOT NULL,
+    repository_id TEXT NOT NULL,
+    base_revision TEXT,
+    workspace_generation INTEGER NOT NULL CHECK (workspace_generation > 0),
+    published_plan_revision_id TEXT NOT NULL,
+    published_plan_revision_digest TEXT NOT NULL,
+    execution_epoch_digest TEXT NOT NULL,
+    plan_step_id TEXT NOT NULL,
+    plan_step_digest TEXT NOT NULL,
+    plan_operation TEXT NOT NULL,
+    allowed_tools TEXT NOT NULL,
+    child_execution_principal_id TEXT NOT NULL,
+    child_session_id TEXT NOT NULL,
+    child_runtime_id TEXT NOT NULL,
+    depth INTEGER NOT NULL CHECK (depth = 1),
+    policy_digest TEXT NOT NULL,
+    assignment_json TEXT NOT NULL,
+    assignment_digest TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT,
+    UNIQUE (task_owner_principal_id, project_id, parent_task_id, execution_epoch_digest, plan_step_id)
+);
+CREATE TABLE IF NOT EXISTS agent_subagent_runs (
+    assignment_id TEXT PRIMARY KEY REFERENCES agent_subagent_assignments(assignment_id),
+    state TEXT NOT NULL CHECK (state IN ('PENDING', 'ACTIVE', 'COMPLETED', 'FAILED', 'CANCELLED', 'STALE', 'ORPHANED')),
+    state_version INTEGER NOT NULL CHECK (state_version >= 0),
+    started_at TEXT,
+    finished_at TEXT,
+    error TEXT
+);
 
 -- M7.1.2: canonical immutable user-goal declaration.  The runtime migration
 -- source is migrations/0016_goal_specs.sql; this aggregate schema is retained

@@ -66,8 +66,10 @@ class PlanToolRouteRepository:
                         plan_step_id, plan_step_digest, tool_name, tool_security_digest,
                         arguments_digest, authorization_resource_digest,
                         route_disposition, reason_code, route_input_digest,
+                        task_owner_principal_id, execution_principal_id,
+                        subagent_assignment_id, subagent_assignment_digest,
                         route_digest, canonical_json, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         binding.route_id, sequence, binding.principal_id,
@@ -78,7 +80,10 @@ class PlanToolRouteRepository:
                         binding.tool_security_digest, binding.arguments_digest,
                         binding.authorization_resource_digest,
                         binding.disposition.value, binding.reason_code,
-                        input_digest, binding.route_digest,
+                        input_digest,
+                        binding.task_owner_principal_id, binding.execution_principal_id,
+                        binding.subagent_assignment_id, binding.subagent_assignment_digest,
+                        binding.route_digest,
                         canonical, created_at,
                     ),
                 )
@@ -193,6 +198,10 @@ def _decode_route(row: Any) -> StoredPlanToolRoute:
             authorization_resource_digest=str(row["authorization_resource_digest"]),
             disposition=PlanRouteDisposition(str(row["route_disposition"])),
             reason_code=str(row["reason_code"]),
+            task_owner_principal_id=str(row["task_owner_principal_id"] or ""),
+            execution_principal_id=str(row["execution_principal_id"] or ""),
+            subagent_assignment_id=row["subagent_assignment_id"],
+            subagent_assignment_digest=row["subagent_assignment_digest"],
         )
         _validate_binding(binding)
         expected_payload = binding.payload()

@@ -22,6 +22,7 @@ class SubTaskPlan:
     tasks: list[SubAgentTask] = field(default_factory=list)
     dependencies: dict[str, list[str]] = field(default_factory=dict)  # task_id -> [dep_task_ids]
     has_dependencies: bool = False
+    invalid_reasons: tuple[str, ...] = ()
 
 
 class TaskPlanner:
@@ -52,7 +53,8 @@ class TaskPlanner:
             }
 
         如果没有 dependencies 字段或为空，所有任务可并行。
-        task_id 自动生成（task_1, task_2, ...）。返回 None 表示 JSON 无效。
+        task_id 自动生成（task_1, task_2, ...）。依赖图错误会被保留为
+        ``invalid_reasons``，由执行器 fail-closed；返回 None 表示 JSON 无效。
         """
         try:
             data = json.loads(plan_json)
@@ -108,6 +110,9 @@ class TaskPlanner:
                     timeout=int(spec.get("timeout", 300)),
                     parent_session_id=str(spec.get("parent_session_id", parent_session_id)),
                     depth=int(spec.get("depth", 1)),
+                    # Legacy planner compatibility is quarantined; M7.8
+                    # coding authority never consumes this path.
+                    principal_id="legacy",
                 )
             )
 
@@ -131,6 +136,7 @@ class TaskPlanner:
             tasks=tasks,
             dependencies=dependencies,
             has_dependencies=bool(dependencies),
+            invalid_reasons=TaskPlanner._dependency_errors(tasks, dependencies),
         )
 
     @staticmethod
@@ -172,6 +178,7 @@ class TaskPlanner:
                 tools=list(tool_set),
                 timeout=timeout,
                 parent_session_id=parent_session_id,
+                principal_id="legacy",
             )
             for goal in goals
         ]
@@ -188,10 +195,14 @@ class TaskPlanner:
         """将依赖图划分为可并行执行的层级。
 
         返回 ``[["task_1", "task_3"], ["task_2"]]`` 形式，每个内层列表内的
-        任务互不依赖，可同时 spawn。依赖中出现但 plan.tasks 不存在的 id
-        视为已满足（外部已完成），仅忽略不存在的叶子任务。
+        任务互不依赖，可同时 spawn。未知依赖、重复节点、自依赖和循环图
+        都是无效计划，直接返回空层，禁止把不完整图当成可执行计划。
         """
         task_ids = {task.id for task in plan.tasks}
+        errors = TaskPlanner._dependency_errors(plan.tasks, plan.dependencies)
+        if errors:
+            logger.warning("invalid task dependencies in plan %s: %s", plan.id, errors)
+            return []
         deps: dict[str, set[str]] = {
             tid: {d for d in plan.dependencies.get(tid, []) if d in task_ids}
             for tid in task_ids
@@ -214,15 +225,9 @@ class TaskPlanner:
                 remaining.difference_update(current_layer)
                 progress = True
             if not progress:
-                # 存在循环依赖或不可解析的依赖；把剩余任务全部塞进最后一层，
-                # 以便调度器仍然尝试执行（避免永久卡死）。
-                logger.warning(
-                    "unresolvable task dependencies in plan %s: %s",
-                    plan.id,
-                    sorted(remaining),
-                )
-                layers.append(sorted(remaining))
-                break
+                # Invalid DAGs are fail-closed.  Never turn an unresolved
+                # cycle into an executable final layer.
+                return []
             if len(layers) >= max_iterations:
                 break
         return layers
@@ -245,11 +250,10 @@ class TaskPlanner:
            d. 进入下一层
         4. 返回所有完成（或被跳过/失败）的任务
 
-        M2: the planner is an in-process caller (not the RPC service),
-        so it stamps every task with the sentinel principal_id
-        ``"orchestrator"`` and passes that to ``wait_all``.  This keeps
-        the planner working now that the spawner's empty-principal path
-        returns NOTHING (M2 defense in depth) instead of all tasks.
+        Legacy plans remain quarantined from the M7.8 coding authority. They
+        require an already-stamped principal and invalid dependency graphs
+        produce no spawn calls; the planner never mints an orchestrator
+        principal or turns model JSON into coding authority.
 
         Returns:
             所有见过的 SubAgentTask 列表（status 为 completed / failed / skipped）。
@@ -257,14 +261,14 @@ class TaskPlanner:
         if not plan.tasks:
             return []
 
-        # M2: stamp every task with the sentinel "orchestrator" principal
-        # so ``wait_all(principal_id="orchestrator")`` actually waits for
-        # them.  Without this, the spawner's empty-principal path returns
-        # [] immediately (M2) and the planner would race the tasks.
-        _PLANNER_PRINCIPAL = "orchestrator"
-        for task in plan.tasks:
-            if not task.principal_id:
-                task.principal_id = _PLANNER_PRINCIPAL
+        # An absent principal is a fail-closed compatibility error.  The
+        # legacy parser uses the quarantined ``legacy`` owner solely for old
+        # office callers; production coding delegation never calls here.
+        if any(not task.principal_id for task in plan.tasks):
+            for task in plan.tasks:
+                task.status = "failed"
+                task.error = "authenticated principal is required"
+            return []
 
         tasks_by_id: dict[str, SubAgentTask] = {task.id: task for task in plan.tasks}
         seen: list[SubAgentTask] = []
@@ -272,6 +276,11 @@ class TaskPlanner:
         completed_ids: set[str] = set()
 
         layers = TaskPlanner._topological_layers(plan)
+        if plan.tasks and not layers:
+            for task in plan.tasks:
+                task.status = "failed"
+                task.error = "invalid dependency graph"
+            return []
         for layer in layers:
             # 先判定 skip：任一未满足的依赖即标记 skipped，不 spawn。
             to_spawn: list[SubAgentTask] = []
@@ -305,9 +314,9 @@ class TaskPlanner:
                     logger.warning("spawn failed for task %s: %s", task.id, exc)
 
             if spawned:
-                # M2: pass the sentinel principal so wait_all actually
-                # waits for the spawned tasks.
-                await spawner.wait_all(principal_id=_PLANNER_PRINCIPAL)
+                # Use the caller-stamped principal so wait_all remains
+                # owner-scoped; no synthetic orchestrator identity is minted.
+                await spawner.wait_all(principal_id=plan.tasks[0].principal_id)
 
             # 记录成功的 task_id
             for task in to_spawn:
@@ -315,3 +324,33 @@ class TaskPlanner:
                     completed_ids.add(task.id)
 
         return seen
+
+    @staticmethod
+    def _dependency_errors(
+        tasks: list[SubAgentTask], dependencies: dict[str, list[str]]
+    ) -> tuple[str, ...]:
+        task_ids = [task.id for task in tasks]
+        errors: list[str] = []
+        if len(task_ids) != len(set(task_ids)):
+            errors.append("duplicate task id")
+        task_set = set(task_ids)
+        for task_id, deps in dependencies.items():
+            if task_id not in task_set:
+                errors.append(f"dependency owner is unknown: {task_id}")
+            if not isinstance(deps, list):
+                errors.append(f"dependencies for {task_id} are malformed")
+                continue
+            for dep in deps:
+                if dep not in task_set:
+                    errors.append(f"unknown dependency: {dep}")
+                if dep == task_id:
+                    errors.append(f"self dependency: {task_id}")
+        graph = {task_id: set(dependencies.get(task_id, [])) for task_id in task_ids}
+        remaining = set(task_ids)
+        while remaining:
+            ready = {task_id for task_id in remaining if not graph[task_id] & remaining}
+            if not ready:
+                errors.append("cyclic dependency")
+                break
+            remaining -= ready
+        return tuple(sorted(set(errors)))

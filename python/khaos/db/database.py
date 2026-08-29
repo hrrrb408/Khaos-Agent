@@ -39,6 +39,7 @@ from khaos.db.connection import (
     _AsyncSqliteFallback,  # noqa: F401 - compatibility export
     aiosqlite,  # noqa: F401 - tests patch the shared driver module
 )
+from khaos.subagents.assignment import SubAgentAssignmentRepository
 
 # Compatibility name for released tests and integrations.  The lifecycle
 # owner is ``db.connection.READER_DRAIN_TIMEOUT``; this alias must not become
@@ -274,6 +275,7 @@ class Database:
         self._plan_revision_repository = PlanRevisionRepository(self)
         self._plan_tool_route_repository = PlanToolRouteRepository(self)
         self._plan_step_execution_repository = PlanStepExecutionRepository(self)
+        self._subagent_assignment_repository = SubAgentAssignmentRepository(self)
         self._verification_assessment_repository = VerificationAssessmentRepository(self)
         # F-01: Per-domain locks remain for logical serialization (e.g. two
         # concurrent permission grants must not race on epoch computation).
@@ -343,6 +345,11 @@ class Database:
     def plan_step_execution_repository(self) -> PlanStepExecutionRepository:
         """Return the M7.6 step/fence projection owner."""
         return self._plan_step_execution_repository
+
+    @property
+    def subagent_assignment_repository(self) -> SubAgentAssignmentRepository:
+        """Return the M7.8 assignment/run persistence owner."""
+        return self._subagent_assignment_repository
 
     @property
     def verification_assessment_repository(self) -> VerificationAssessmentRepository:
@@ -944,6 +951,16 @@ class Database:
             self._conn = _MigrationConnection(conn)
             try:
                 await self._apply_v24_upgrades()
+            finally:
+                self._conn = original_conn
+            # M7.8: immutable plan-bound sub-agent assignments and run CAS
+            # projections.  Legacy subagent_tasks are intentionally not
+            # backfilled: their provenance is unbound and cannot become
+            # coding authority.
+            original_conn = self._conn
+            self._conn = _MigrationConnection(conn)
+            try:
+                await self._apply_v25_upgrades()
             finally:
                 self._conn = original_conn
             # Batch 6.4 §10.4: backfill the historical ledger rows (v1–v5)
@@ -1672,6 +1689,32 @@ class Database:
             "ON memory_nodes(project_id, principal_id, namespace, session_id, "
             "source_kind, status, updated_at, memory_id)"
         )
+
+    async def _apply_v25_upgrades(self) -> None:
+        """Add M7.8 assignment/run ledgers and route actor identity."""
+        conn = await self._require_conn()
+        migration_path = _MIGRATIONS_DIR / "0025_plan_bound_subagents.sql"
+        text = migration_path.read_text(encoding="utf-8")
+        # Execute the CREATE statements through the normal statement parser;
+        # trigger bodies contain semicolons and must not be split manually.
+        create_text = "\n".join(
+            line for line in text.splitlines()
+            if not line.lstrip().upper().startswith("ALTER TABLE AGENT_PLAN_TOOL_ROUTES")
+        )
+        await self._execute_schema_statements(conn, create_text)
+        cursor = await conn.execute("PRAGMA table_info(agent_plan_tool_routes)")
+        columns = {str(row["name"]) for row in await cursor.fetchall()}
+        additions = (
+            ("task_owner_principal_id", "TEXT NOT NULL DEFAULT ''"),
+            ("execution_principal_id", "TEXT NOT NULL DEFAULT ''"),
+            ("subagent_assignment_id", "TEXT"),
+            ("subagent_assignment_digest", "TEXT"),
+        )
+        for name, declaration in additions:
+            if name not in columns:
+                await conn.execute(
+                    f"ALTER TABLE agent_plan_tool_routes ADD COLUMN {name} {declaration}"
+                )
 
     async def _ensure_coding_tasks_last_applied_recovery_decision_column(
         self, conn: Any

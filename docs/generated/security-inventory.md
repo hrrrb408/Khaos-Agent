@@ -107,7 +107,7 @@
 - `python/khaos/rpc/models.py`: `3173ba3356d970604df7540af92c1d96e8777813292bb1dab26e142bc572228e`
 - `python/khaos/rpc/agent_service.py`: `42f254c703a02dda2db570a09add233d81ccad98559ebe0b3afe9f99c2b1a38a`
 - `python/khaos/rpc/task_service.py`: `0d1ac12ca29f6f5b16186d1be2f2b2877e87d7b1fe2573f1e584914ec835e98c`
-- `python/khaos/rpc/composition.py`: `bb174346c85c4df4b3b352c99bdf3cf4558fe237da3dacadfb8a1543c6f8dd3b`
+- `python/khaos/rpc/composition.py`: `2d7e53626a5ee9e539d63e39c85852f9fab2cdc074a49f3beb7d7c9ba1a0c83d`
 - `rust/khaos-core/src/bin/khaos-exec-launcher.rs`: `c5eb7343002ecb7f74e1ca10df5d5edaf4de39f90ecc68064cb355b56b2fda71`
 - `rust/khaos-core/src/bin/khaos-sandbox-launcher.rs`: `ff2cd158b0c909c20880c3c56a07615d11af7db24d6df84505a9259820bd6190`
 - `python/khaos/grpc_server.py`: `db7e729aa478bb03520bb911e71b26ae5f6f72e7ea8068b5b592d988e230394b`

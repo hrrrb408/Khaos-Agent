@@ -168,6 +168,7 @@ class AgentLoop:
         cron_engine=None,
         browser_manager=None,
         subagent_spawner=None,
+        subagent_control_coordinator=None,
         credential_broker=None,
         # M4 batch 3.1.16A-5-1b (CRITICAL): project identity stamp.
         # Bound at construction from ``RuntimeConfig.project_id`` (set by
@@ -187,6 +188,7 @@ class AgentLoop:
         trusted_verification_authority: Any = None,
         trusted_verification_service: Any = None,
         recovery_control: RecoveryControlCoordinator | None = None,
+        delegated_execution_context: Any = None,
     ):
         self.config = config
         self.mode_manager = mode_manager
@@ -248,6 +250,9 @@ class AgentLoop:
         # durable facts and can project cognitive recovery state; it never
         # grants tools/approval/workspace authority or changes TaskStatus.
         self.recovery_control = recovery_control
+        # M7.8: a delegated loop is a worker attached to a parent control
+        # plane.  This structural marker is never inferred from prompt text.
+        self.delegated_execution_context = delegated_execution_context
         self._active_planning_result: Any = None
         self.skill_generator = skill_generator
         self.workspace_manager = workspace_manager
@@ -289,6 +294,7 @@ class AgentLoop:
         self.cron_engine = cron_engine
         self.browser_manager = browser_manager
         self.subagent_spawner = subagent_spawner
+        self.subagent_control_coordinator = subagent_control_coordinator
         self.credential_broker = credential_broker
         self.channel_admins = (
             channel_admins if channel_admins is not None else frozenset()
@@ -376,13 +382,21 @@ class AgentLoop:
         active_task_id = task_id or self.task_id
         self._active_task_id = active_task_id
         self._active_session_id = session_id
+        if self.delegated_execution_context is not None:
+            if self.workspace_manager is None:
+                raise PermissionError("delegated execution requires the parent workspace authority")
+            self.active_workspace = self.workspace_manager.get(
+                self.delegated_execution_context.workspace_id
+            )
+            if self.active_workspace is None:
+                raise PermissionError("delegated execution cannot attach the parent workspace")
         self._recovery_cycles_this_turn = 0
         is_coding = self.mode_manager.current_mode.value == "coding"
         if is_coding and self._verify_fix_factory is not None:
             self.verify_fix_loop = self._verify_fix_factory()
         elif not is_coding:
             self.verify_fix_loop = None
-        if self.task_manager is not None and is_coding:
+        if self.task_manager is not None and is_coding and self.delegated_execution_context is None:
             if active_task_id is None:
                 task = await self.task_manager.create(user_input)
                 active_task_id = task.id
@@ -460,6 +474,7 @@ class AgentLoop:
             and active_task_id is not None
             and self.planning_coordinator is not None
             and self.active_workspace is not None
+            and self.delegated_execution_context is None
             and (
                 self._active_planning_result is None
                 or getattr(self._active_planning_result, "task_id", None)
@@ -782,6 +797,22 @@ class AgentLoop:
                         "credential_broker": self.credential_broker,
                         "requester": session_id,
                         "principal_id": self.principal_id,
+                        "execution_principal_id": self.principal_id,
+                        "task_owner_principal_id": (
+                            self.delegated_execution_context.task_owner_principal_id
+                            if self.delegated_execution_context is not None
+                            else self.principal_id
+                        ),
+                        "subagent_assignment_id": (
+                            self.delegated_execution_context.assignment_id
+                            if self.delegated_execution_context is not None
+                            else None
+                        ),
+                        "subagent_assignment_digest": (
+                            self.delegated_execution_context.assignment_digest
+                            if self.delegated_execution_context is not None
+                            else None
+                        ),
                         "principal_kind": self.principal_kind,
                         "parent_principal_id": self.parent_principal_id,
                         "delegation_digest": self.delegation_digest,
@@ -857,6 +888,9 @@ class AgentLoop:
                         "browser_manager": getattr(self, "browser_manager", None),
                         "subagent_spawner": getattr(
                             self, "subagent_spawner", None
+                        ),
+                        "subagent_control_coordinator": getattr(
+                            self, "subagent_control_coordinator", None
                         ),
                     },
                 }
@@ -1188,6 +1222,7 @@ class AgentLoop:
                 is_coding
                 and active_task_id is not None
                 and stop_reason == StopReason.END_TURN.value
+                and self.delegated_execution_context is None
             )
             if coding_completion_proposed:
                 assert active_task_id is not None

@@ -17,8 +17,8 @@
 
 ## Import reachability result
 
-- Reachable repository modules: `286`.
-- Resolved import edges: `2218`.
+- Reachable repository modules: `287`.
+- Resolved import edges: `2239`.
 - Forbidden production edges: `0`.
 - Unresolved internal edges: `0`.
 
@@ -294,6 +294,7 @@
 - `khaos.skills.registry`
 - `khaos.skills.skill`
 - `khaos.subagents`
+- `khaos.subagents.assignment`
 - `khaos.subagents.planner`
 - `khaos.subagents.runner`
 - `khaos.subagents.service`

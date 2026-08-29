@@ -44,6 +44,7 @@ class CompletionGateStatus(str, Enum):
     STALE = "stale"
     AUTHORITY_INSUFFICIENT = "authority_insufficient"
     ALREADY_TERMINAL = "already_terminal"
+    DELEGATED_CHILD_ACTIVE = "delegated_child_active"
     REJECTED = "rejected"
     ERROR = "error"
 
@@ -200,6 +201,7 @@ class CompletionGate:
         authority_policy: CompletionGateAuthorityPolicy | None = None,
         gate_repository: CompletionGateRepository | None = None,
         task_projection: CompletionTaskProjection | None = None,
+        active_subagent_reader: object | None = None,
     ) -> None:
         _require_text(principal_id, label="principal_id")
         if type(project_id) is not str:
@@ -214,6 +216,7 @@ class CompletionGate:
             else authority_policy
         )
         self._task_projection = task_projection
+        self._active_subagent_reader = active_subagent_reader
         if gate_repository is None:
             database = getattr(decision_repository, "database", None)
             if database is None:
@@ -283,6 +286,35 @@ class CompletionGate:
                 task_status=decision.task_status_at_evaluation,
                 reason="only a COMPLETE decision is eligible for projection",
             )
+
+        # A parent may not complete while a delegated child still owns an
+        # active assignment.  Re-read this immediately before authority
+        # evaluation; the projection repository remains the final lifecycle
+        # CAS owner, while this check provides the explicit control-plane
+        # boundary and a stable diagnostic.
+        if self._active_subagent_reader is not None:
+            try:
+                active_count = await self._active_subagent_reader.active_count(
+                    task_owner_principal_id=self._principal_id,
+                    project_id=self._project_id,
+                    parent_task_id=decision.task_id,
+                )
+            except Exception as exc:
+                logger.exception("active delegated-child lookup failed")
+                return _gate_error(
+                    decision_id,
+                    decision_digest=decision_digest,
+                    task_status=decision.task_status_at_evaluation,
+                    reason=type(exc).__name__,
+                )
+            if active_count > 0:
+                return CompletionGateResult(
+                    status=CompletionGateStatus.DELEGATED_CHILD_ACTIVE,
+                    decision_id=decision_id,
+                    decision_digest=decision_digest,
+                    task_status=decision.task_status_at_evaluation,
+                    reason="active delegated child blocks parent completion",
+                )
 
         try:
             goal_spec = await self._goal_spec_repository.get_for_task(
@@ -435,6 +467,7 @@ def _map_projection_result(
         CompletionProjectionStatus.AUTHORITY_INSUFFICIENT: CompletionGateStatus.AUTHORITY_INSUFFICIENT,
         CompletionProjectionStatus.REJECTED: CompletionGateStatus.REJECTED,
         CompletionProjectionStatus.ALREADY_TERMINAL: CompletionGateStatus.ALREADY_TERMINAL,
+        CompletionProjectionStatus.DELEGATED_CHILD_ACTIVE: CompletionGateStatus.DELEGATED_CHILD_ACTIVE,
         CompletionProjectionStatus.NOT_FOUND: CompletionGateStatus.REJECTED,
         CompletionProjectionStatus.INTEGRITY_ERROR: CompletionGateStatus.ERROR,
         CompletionProjectionStatus.ERROR: CompletionGateStatus.ERROR,

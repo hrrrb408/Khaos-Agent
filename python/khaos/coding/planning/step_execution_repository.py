@@ -89,6 +89,7 @@ class PlanStepExecutionRepository:
             raise ValueError("unknown plan dispatch effect status")
         if binding.plan_step_id is None or binding.execution_epoch_digest is None:
             return None
+        owner_principal_id = binding.task_owner_principal_id or binding.principal_id
         normalized = tuple(sorted(set(affected_targets)))
         targets_match = True
         if effect_status == "applied":
@@ -97,7 +98,7 @@ class PlanStepExecutionRepository:
                     "SELECT canonical_json FROM agent_plan_revisions WHERE plan_revision_id = ? AND principal_id = ? AND project_id = ? AND task_id = ?",
                     (
                         binding.plan_revision_id,
-                        binding.principal_id,
+                        owner_principal_id,
                         binding.project_id,
                         binding.task_id,
                     ),
@@ -141,7 +142,7 @@ class PlanStepExecutionRepository:
                     updated_at = excluded.updated_at
                 """,
                 (
-                    binding.principal_id, binding.project_id, binding.task_id,
+                    owner_principal_id, binding.project_id, binding.task_id,
                     binding.execution_epoch_digest, binding.plan_revision_id,
                     binding.plan_revision_digest, binding.plan_step_id,
                     binding.plan_step_digest, state,
@@ -151,7 +152,7 @@ class PlanStepExecutionRepository:
             )
             cursor = await conn.execute(
                 "SELECT * FROM agent_plan_step_states WHERE principal_id = ? AND project_id = ? AND task_id = ? AND execution_epoch_digest = ? AND plan_step_id = ?",
-                (binding.principal_id, binding.project_id, binding.task_id, binding.execution_epoch_digest, binding.plan_step_id),
+                (owner_principal_id, binding.project_id, binding.task_id, binding.execution_epoch_digest, binding.plan_step_id),
             )
             row = await cursor.fetchone()
         return _decode_state(row)
@@ -161,17 +162,47 @@ class PlanStepExecutionRepository:
             raise PermissionError("dispatch fence requires a plan-bound route")
         now = utc_now_naive().isoformat()
         fence_id = f"fence-{uuid.uuid4().hex}"
+        owner_principal_id = binding.task_owner_principal_id or binding.principal_id
         async with self._database.transaction() as conn:
             task_cursor = await conn.execute(
                 "SELECT published_plan_revision_id, project_id, principal_id, last_applied_recovery_decision_id, state_json FROM coding_tasks WHERE id = ? AND principal_id = ? AND project_id = ? AND status NOT IN ('completed', 'failed', 'cancelled')",
-                (binding.task_id, binding.principal_id, binding.project_id),
+                (binding.task_id, owner_principal_id, binding.project_id),
             )
             task = await task_cursor.fetchone()
             if task is None or task["published_plan_revision_id"] != binding.plan_revision_id:
                 raise PermissionError("published plan changed before dispatch")
+            if binding.execution_principal_id != owner_principal_id:
+                if not binding.subagent_assignment_id or not binding.subagent_assignment_digest:
+                    raise PermissionError("delegated dispatch requires an assignment")
+                assignment_cursor = await conn.execute(
+                    """SELECT a.assignment_digest, a.child_execution_principal_id,
+                              a.task_owner_principal_id, a.project_id, a.parent_task_id,
+                              a.workspace_id, a.published_plan_revision_id, a.plan_step_id,
+                              a.execution_epoch_digest, r.state
+                       FROM agent_subagent_assignments a
+                       JOIN agent_subagent_runs r ON r.assignment_id = a.assignment_id
+                       WHERE a.assignment_id = ?""",
+                    (binding.subagent_assignment_id,),
+                )
+                assignment = await assignment_cursor.fetchone()
+                if assignment is None or any(
+                    (
+                        assignment["assignment_digest"] != binding.subagent_assignment_digest,
+                        assignment["child_execution_principal_id"] != binding.execution_principal_id,
+                        assignment["task_owner_principal_id"] != owner_principal_id,
+                        assignment["project_id"] != binding.project_id,
+                        assignment["parent_task_id"] != binding.task_id,
+                        assignment["workspace_id"] != binding.workspace_id,
+                        assignment["published_plan_revision_id"] != binding.plan_revision_id,
+                        assignment["plan_step_id"] != binding.plan_step_id,
+                        assignment["execution_epoch_digest"] != binding.execution_epoch_digest,
+                        assignment["state"] != "ACTIVE",
+                    )
+                ):
+                    raise PermissionError("delegated assignment changed before dispatch")
             plan_cursor = await conn.execute(
                 "SELECT canonical_json, plan_semantic_digest FROM agent_plan_revisions WHERE plan_revision_id = ? AND principal_id = ? AND project_id = ? AND task_id = ?",
-                (binding.plan_revision_id, binding.principal_id, binding.project_id, binding.task_id),
+                (binding.plan_revision_id, owner_principal_id, binding.project_id, binding.task_id),
             )
             plan_row = await plan_cursor.fetchone()
             if plan_row is None or plan_row["plan_semantic_digest"] != binding.plan_revision_digest:
@@ -192,7 +223,7 @@ class PlanStepExecutionRepository:
                 ):
                     raise ValueError("task physical scope changed")
                 current_epoch = PlanExecutionEpochBinding(
-                    principal_id=binding.principal_id,
+                    principal_id=owner_principal_id,
                     project_id=binding.project_id,
                     task_id=binding.task_id,
                     goal_spec_id=plan.goal_spec_id,
@@ -219,7 +250,7 @@ class PlanStepExecutionRepository:
             for dependency in selected_step.dependencies:
                 dependency_cursor = await conn.execute(
                     "SELECT state FROM agent_plan_step_states WHERE principal_id = ? AND project_id = ? AND task_id = ? AND execution_epoch_digest = ? AND plan_step_id = ?",
-                    (binding.principal_id, binding.project_id, binding.task_id, binding.execution_epoch_digest, dependency),
+                    (owner_principal_id, binding.project_id, binding.task_id, binding.execution_epoch_digest, dependency),
                 )
                 dependency_row = await dependency_cursor.fetchone()
                 if dependency_row is None or dependency_row["state"] != "EXECUTED":
@@ -230,7 +261,7 @@ class PlanStepExecutionRepository:
                 "INSERT INTO agent_plan_dispatch_fences (fence_id, route_id, route_digest, principal_id, project_id, task_id, execution_epoch_digest, plan_revision_id, plan_step_id, workspace_id, workspace_generation, status, created_at, finished_at, effect_status, effect_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, NULL, NULL, NULL)",
                 (
                     fence_id, binding.route_id, binding.route_digest,
-                    binding.principal_id, binding.project_id, binding.task_id,
+                    owner_principal_id, binding.project_id, binding.task_id,
                     binding.execution_epoch_digest, binding.plan_revision_id,
                     binding.plan_step_id, binding.workspace_id,
                     binding.workspace_generation, now,
@@ -252,7 +283,7 @@ class PlanStepExecutionRepository:
                         updated_at = excluded.updated_at
                     """,
                     (
-                        binding.principal_id, binding.project_id, binding.task_id,
+                        owner_principal_id, binding.project_id, binding.task_id,
                         binding.execution_epoch_digest, binding.plan_revision_id,
                         binding.plan_revision_digest, binding.plan_step_id,
                         binding.plan_step_digest, canonical_digest([]),
@@ -261,7 +292,7 @@ class PlanStepExecutionRepository:
                 )
         return PlanDispatchFence(
             fence_id, binding.route_id, binding.route_digest,
-            binding.principal_id, binding.project_id, binding.task_id,
+            owner_principal_id, binding.project_id, binding.task_id,
             binding.execution_epoch_digest, binding.plan_revision_id,
             binding.plan_step_id, binding.workspace_id, binding.workspace_generation,
             "ACTIVE", now, binding,

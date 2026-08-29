@@ -543,6 +543,13 @@ MIGRATIONS: tuple[MigrationSpec, ...] = (
         sql_files=("0024_memory_retrieval_provenance.sql",),
         migrator_symbols=("_apply_v24_upgrades",),
     ),
+    MigrationSpec(
+        version=25,
+        name="m7_8_plan_bound_subagents",
+        sha256="1240f556cd02352c76b460e6c028002a0d426da6069c23ff9fc5a5875377391c",
+        sql_files=("0025_plan_bound_subagents.sql",),
+        migrator_symbols=("_apply_v25_upgrades",),
+    ),
 )
 
 
