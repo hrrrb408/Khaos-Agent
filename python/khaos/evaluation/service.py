@@ -159,6 +159,10 @@ class CapabilityEvidenceService:
                          FROM agent_plan_revisions
                          WHERE principal_id = ? AND project_id = ? AND task_id = ?
                          ORDER BY revision_sequence ASC LIMIT ?""",
+                head_query="""SELECT plan_revision_id, revision_sequence, plan_semantic_digest, disposition
+                              FROM agent_plan_revisions
+                              WHERE principal_id = ? AND project_id = ? AND task_id = ?
+                              ORDER BY revision_sequence DESC LIMIT 1""",
                 params=(request.principal_id, request.project_id, request.task_id),
                 limit=limit,
                 id_key="plan_revision_id",
@@ -176,6 +180,13 @@ class CapabilityEvidenceService:
                          FROM agent_verification_assessments
                          WHERE principal_id = ? AND project_id = ? AND task_id = ?
                          ORDER BY assessment_sequence ASC LIMIT ?""",
+                head_query="""SELECT assessment_id, assessment_sequence, assessment_digest,
+                                     disposition, goal_spec_id, goal_spec_digest,
+                                     control_state_version, task_status, workspace_id,
+                                     published_plan_revision_id
+                              FROM agent_verification_assessments
+                              WHERE principal_id = ? AND project_id = ? AND task_id = ?
+                              ORDER BY assessment_sequence DESC LIMIT 1""",
                 params=(request.principal_id, request.project_id, request.task_id),
                 limit=limit,
                 id_key="assessment_id",
@@ -191,6 +202,11 @@ class CapabilityEvidenceService:
                          FROM agent_recovery_decisions
                          WHERE principal_id = ? AND project_id = ? AND task_id = ?
                          ORDER BY recovery_sequence ASC LIMIT ?""",
+                head_query="""SELECT recovery_decision_id, recovery_sequence, decision_digest,
+                                     action, reason_code, identical_failure_streak
+                              FROM agent_recovery_decisions
+                              WHERE principal_id = ? AND project_id = ? AND task_id = ?
+                              ORDER BY recovery_sequence DESC LIMIT 1""",
                 params=(request.principal_id, request.project_id, request.task_id),
                 limit=limit,
                 id_key="recovery_decision_id",
@@ -205,6 +221,10 @@ class CapabilityEvidenceService:
                          FROM agent_plan_tool_routes
                          WHERE principal_id = ? AND project_id = ? AND task_id = ?
                          ORDER BY route_sequence ASC LIMIT ?""",
+                head_query="""SELECT route_id, route_sequence, route_digest, route_disposition, reason_code
+                              FROM agent_plan_tool_routes
+                              WHERE principal_id = ? AND project_id = ? AND task_id = ?
+                              ORDER BY route_sequence DESC LIMIT 1""",
                 params=(request.principal_id, request.project_id, request.task_id),
                 limit=limit,
                 id_key="route_id",
@@ -220,12 +240,29 @@ class CapabilityEvidenceService:
                          FROM agent_plan_step_states
                          WHERE principal_id = ? AND project_id = ? AND task_id = ?
                          ORDER BY updated_at ASC, plan_step_id ASC LIMIT ?""",
+                head_query="""SELECT plan_step_id, plan_step_digest, state, attempt_generation,
+                                     execution_epoch_digest, updated_at
+                              FROM agent_plan_step_states
+                              WHERE principal_id = ? AND project_id = ? AND task_id = ?
+                              ORDER BY updated_at DESC, plan_step_id DESC LIMIT 1""",
                 params=(request.principal_id, request.project_id, request.task_id),
                 limit=limit,
                 id_key="plan_step_id",
                 sequence_key=None,
                 digest_key="plan_step_digest",
                 field_keys=("state", "attempt_generation", "execution_epoch_digest", "updated_at"),
+                state_query="""SELECT json_group_array(json_object(
+                                      'plan_step_id', plan_step_id,
+                                      'plan_step_digest', plan_step_digest,
+                                      'state', state,
+                                      'attempt_generation', attempt_generation,
+                                      'execution_epoch_digest', execution_epoch_digest,
+                                      'updated_at', updated_at)) AS state_json
+                              FROM (SELECT plan_step_id, plan_step_digest, state,
+                                           attempt_generation, execution_epoch_digest, updated_at
+                                    FROM agent_plan_step_states
+                                    WHERE principal_id = ? AND project_id = ? AND task_id = ?
+                                    ORDER BY plan_step_id ASC)""",
             )
             marks["step_states"] = _with_state_digest(marks["step_states"], steps)
             fences, availability["dispatch_fences"], marks["dispatch_fences"] = await self._records(
@@ -236,12 +273,29 @@ class CapabilityEvidenceService:
                          FROM agent_plan_dispatch_fences
                          WHERE principal_id = ? AND project_id = ? AND task_id = ?
                          ORDER BY created_at ASC, fence_id ASC LIMIT ?""",
+                head_query="""SELECT fence_id, route_digest, status, effect_status, effect_id,
+                                     created_at
+                              FROM agent_plan_dispatch_fences
+                              WHERE principal_id = ? AND project_id = ? AND task_id = ?
+                              ORDER BY created_at DESC, fence_id DESC LIMIT 1""",
                 params=(request.principal_id, request.project_id, request.task_id),
                 limit=limit,
                 id_key="fence_id",
                 sequence_key=None,
                 digest_key="route_digest",
                 field_keys=("status", "effect_status", "effect_id", "created_at"),
+                state_query="""SELECT json_group_array(json_object(
+                                      'fence_id', fence_id,
+                                      'route_digest', route_digest,
+                                      'status', status,
+                                      'effect_status', effect_status,
+                                      'effect_id', effect_id,
+                                      'created_at', created_at)) AS state_json
+                              FROM (SELECT fence_id, route_digest, status, effect_status,
+                                           effect_id, created_at
+                                    FROM agent_plan_dispatch_fences
+                                    WHERE principal_id = ? AND project_id = ? AND task_id = ?
+                                    ORDER BY fence_id ASC)""",
             )
             marks["dispatch_fences"] = _with_state_digest(marks["dispatch_fences"], fences)
             assignments, availability["subagent_assignments"], marks["subagent_assignments"] = await self._records(
@@ -262,12 +316,48 @@ class CapabilityEvidenceService:
                          WHERE a.task_owner_principal_id = ? AND a.project_id = ?
                            AND a.parent_task_id = ?
                          ORDER BY a.assignment_sequence ASC LIMIT ?""",
+                head_query="""SELECT a.assignment_id, a.assignment_sequence, a.assignment_digest,
+                                     a.plan_step_id, r.state AS run_state,
+                                     r.state_version AS run_state_version,
+                                     s.state AS parent_step_state
+                              FROM agent_subagent_assignments a
+                              LEFT JOIN agent_subagent_runs r ON r.assignment_id = a.assignment_id
+                              LEFT JOIN agent_plan_step_states s
+                                ON s.principal_id = a.task_owner_principal_id
+                               AND s.project_id = a.project_id
+                               AND s.task_id = a.parent_task_id
+                               AND s.execution_epoch_digest = a.execution_epoch_digest
+                               AND s.plan_step_id = a.plan_step_id
+                              WHERE a.task_owner_principal_id = ? AND a.project_id = ?
+                                AND a.parent_task_id = ?
+                              ORDER BY a.assignment_sequence DESC LIMIT 1""",
                 params=(request.principal_id, request.project_id, request.task_id),
                 limit=limit,
                 id_key="assignment_id",
                 sequence_key="assignment_sequence",
                 digest_key="assignment_digest",
                 field_keys=("plan_step_id", "run_state", "run_state_version", "parent_step_state"),
+                state_query="""SELECT json_group_array(json_object(
+                                      'assignment_id', assignment_id,
+                                      'assignment_digest', assignment_digest,
+                                      'plan_step_id', plan_step_id,
+                                      'run_state', run_state,
+                                      'run_state_version', run_state_version,
+                                      'parent_step_state', parent_step_state)) AS state_json
+                              FROM (SELECT a.assignment_id, a.assignment_digest, a.plan_step_id,
+                                           r.state AS run_state, r.state_version AS run_state_version,
+                                           s.state AS parent_step_state
+                                    FROM agent_subagent_assignments a
+                                    LEFT JOIN agent_subagent_runs r ON r.assignment_id = a.assignment_id
+                                    LEFT JOIN agent_plan_step_states s
+                                      ON s.principal_id = a.task_owner_principal_id
+                                     AND s.project_id = a.project_id
+                                     AND s.task_id = a.parent_task_id
+                                     AND s.execution_epoch_digest = a.execution_epoch_digest
+                                     AND s.plan_step_id = a.plan_step_id
+                                    WHERE a.task_owner_principal_id = ? AND a.project_id = ?
+                                      AND a.parent_task_id = ?
+                                    ORDER BY a.assignment_id ASC)""",
             )
             assignment_availability = availability["subagent_assignments"]
             availability["subagent_runs"] = SourceAvailability(
@@ -276,7 +366,14 @@ class CapabilityEvidenceService:
                 assignment_availability.truncated,
                 assignment_availability.reason,
             )
-            marks["subagent_runs"] = _subagent_run_mark(assignments)
+            assignment_mark = marks["subagent_assignments"]
+            marks["subagent_runs"] = SourceHighWaterMark(
+                "subagent_runs",
+                assignment_mark.latest_sequence,
+                assignment_mark.latest_record_id,
+                assignment_mark.latest_record_digest,
+                assignment_mark.state_digest,
+            )
             turns, availability["turns"], marks["turns"] = await self._turns(conn, request, limit)
             audits, availability["audit_log"], marks["audit_log"] = await self._records(
                 conn,
@@ -285,6 +382,10 @@ class CapabilityEvidenceService:
                          FROM audit_log
                          WHERE principal_id = ? AND project_id = ? AND task_id = ?
                          ORDER BY id ASC LIMIT ?""",
+                head_query="""SELECT id, action, result, operation_id
+                              FROM audit_log
+                              WHERE principal_id = ? AND project_id = ? AND task_id = ?
+                              ORDER BY id DESC LIMIT 1""",
                 params=(request.principal_id, request.project_id, request.task_id),
                 limit=limit,
                 id_key="id",
@@ -391,17 +492,27 @@ class CapabilityEvidenceService:
         except (json.JSONDecodeError, TypeError, ValueError, EvaluationContractError) as exc:
             availability = SourceAvailability("completion_decisions", False, truncated, type(exc).__name__)
             return (), availability, SourceHighWaterMark("completion_decisions", None, None, None)
-        mark = _mark("completion_decisions", rows, "decision_id", "decision_sequence", "decision_digest")
+        head_cursor = await conn.execute(
+            """SELECT decision_id, decision_sequence, decision_digest
+               FROM agent_completion_decisions
+               WHERE principal_id = ? AND project_id = ? AND task_id = ?
+               ORDER BY decision_sequence DESC LIMIT 1""",
+            (request.principal_id, request.project_id, request.task_id),
+        )
+        head_rows = await head_cursor.fetchall()
+        try:
+            mark = _mark("completion_decisions", head_rows, "decision_id", "decision_sequence", "decision_digest", strict_digest=True)
+        except (KeyError, TypeError, ValueError, EvaluationContractError) as exc:
+            return (), SourceAvailability("completion_decisions", False, truncated, type(exc).__name__), SourceHighWaterMark("completion_decisions", None, None, None)
         return tuple(records), SourceAvailability("completion_decisions", True, truncated, "bounded history" if truncated else ""), mark
 
-    async def _records(self, conn: Any, *, source: str, query: str, params: tuple[Any, ...], limit: int, id_key: str, sequence_key: str | None, digest_key: str | None, field_keys: tuple[str, ...]) -> tuple[tuple[EvidenceRecord, ...], SourceAvailability, SourceHighWaterMark]:
+    async def _records(self, conn: Any, *, source: str, query: str, head_query: str, params: tuple[Any, ...], limit: int, id_key: str, sequence_key: str | None, digest_key: str | None, field_keys: tuple[str, ...], state_query: str | None = None) -> tuple[tuple[EvidenceRecord, ...], SourceAvailability, SourceHighWaterMark]:
         try:
             cursor = await conn.execute(query, (*params, limit + 1))
             rows = await cursor.fetchall()
         except sqlite3.Error as exc:
             return (), SourceAvailability(source, False, False, type(exc).__name__), SourceHighWaterMark(source, None, None, None)
         truncated = len(rows) > limit
-        mark_row = rows[-1] if rows else None
         rows = rows[:limit]
         records: list[EvidenceRecord] = []
         try:
@@ -414,7 +525,23 @@ class CapabilityEvidenceService:
                 records.append(EvidenceRecord(source, record_id, digest, sequence, fields))
         except (KeyError, TypeError, ValueError, EvaluationContractError) as exc:
             return (), SourceAvailability(source, False, truncated, type(exc).__name__), SourceHighWaterMark(source, None, None, None)
-        mark = _mark(source, [mark_row] if mark_row is not None else [], id_key, sequence_key, digest_key, field_keys=field_keys)
+        try:
+            head_cursor = await conn.execute(head_query, params)
+            head_rows = await head_cursor.fetchall()
+            mark = _mark(source, head_rows, id_key, sequence_key, digest_key, field_keys=field_keys, strict_digest=True)
+            if state_query is not None:
+                state_cursor = await conn.execute(state_query, params)
+                state_row = await state_cursor.fetchone()
+                state_value = _row_value(state_row, "state_json") if state_row is not None else None
+                mark = SourceHighWaterMark(
+                    mark.source,
+                    mark.latest_sequence,
+                    mark.latest_record_id,
+                    mark.latest_record_digest,
+                    canonical_digest({"source": source, "state": state_value or "[]"}),
+                )
+        except (sqlite3.Error, KeyError, TypeError, ValueError, EvaluationContractError) as exc:
+            return (), SourceAvailability(source, False, truncated, type(exc).__name__), SourceHighWaterMark(source, None, None, None)
         return tuple(records), SourceAvailability(source, True, truncated, "bounded history" if truncated else ""), mark
 
     async def _turns(self, conn: Any, request: CapabilityEvaluationRequest, limit: int) -> tuple[tuple[EvidenceRecord, ...], SourceAvailability, SourceHighWaterMark]:
@@ -428,7 +555,6 @@ class CapabilityEvidenceService:
             )
             rows = await cursor.fetchall()
             truncated = len(rows) > limit
-            mark_row = rows[-1] if rows else None
             rows = rows[:limit]
             records: list[EvidenceRecord] = []
             for row in rows:
@@ -446,7 +572,27 @@ class CapabilityEvidenceService:
                 }
                 digest = canonical_digest({"source": "turns", "record_id": str(row["turn_id"]), "fields": fields})
                 records.append(EvidenceRecord("turns", str(row["turn_id"]), digest, None, fields))
-            mark = _mark("turns", [mark_row] if mark_row is not None else [], "turn_id", None, None, field_keys=("status", "started_at", "finished_at"))
+            head_cursor = await conn.execute(
+                """SELECT turn_id, status, started_at, finished_at
+                   FROM agent_turns
+                   WHERE principal_id = ? AND project_id = ? AND task_id = ?
+                   ORDER BY started_at DESC, turn_id DESC LIMIT 1""",
+                (request.principal_id, request.project_id, request.task_id),
+            )
+            head_rows = await head_cursor.fetchall()
+            mark = _mark("turns", head_rows, "turn_id", None, None, field_keys=("status", "started_at", "finished_at"))
+            state_cursor = await conn.execute(
+                """SELECT json_group_array(json_object(
+                           'turn_id', turn_id, 'status', status,
+                           'started_at', started_at, 'finished_at', finished_at)) AS state_json
+                   FROM (SELECT turn_id, status, started_at, finished_at
+                         FROM agent_turns
+                         WHERE principal_id = ? AND project_id = ? AND task_id = ?
+                         ORDER BY turn_id ASC)""",
+                (request.principal_id, request.project_id, request.task_id),
+            )
+            state_row = await state_cursor.fetchone()
+            mark = _state_mark(mark, "turns", _row_value(state_row, "state_json") if state_row is not None else None)
             return tuple(records), SourceAvailability("turns", True, truncated, "bounded history" if truncated else ""), mark
         except (sqlite3.Error, KeyError, TypeError, ValueError, EvaluationContractError) as exc:
             return (), SourceAvailability("turns", False, False, type(exc).__name__), SourceHighWaterMark("turns", None, None, None)
@@ -465,7 +611,6 @@ class CapabilityEvidenceService:
         except sqlite3.Error as exc:
             return (), SourceAvailability("memory", False, False, type(exc).__name__), SourceHighWaterMark("memory", None, None, None)
         truncated = len(rows) > limit
-        mark_row = rows[-1] if rows else None
         selected: list[Any] = []
         try:
             for row in rows:
@@ -485,7 +630,33 @@ class CapabilityEvidenceService:
             )
         except (json.JSONDecodeError, TypeError, ValueError, EvaluationContractError) as exc:
             return (), SourceAvailability("memory", False, truncated, type(exc).__name__), SourceHighWaterMark("memory", None, None, None)
-        mark = SourceHighWaterMark("memory", None, str(mark_row["memory_id"]) if mark_row is not None else None, str(mark_row["record_digest"]) if mark_row is not None and _is_digest(str(mark_row["record_digest"] or "")) else (canonical_digest({"memory_id": mark_row["memory_id"]}) if mark_row is not None else None))
+        head_cursor = await conn.execute(
+            """SELECT memory_id, record_digest, source_kind, status, retrieval_count, provenance_json
+               FROM memory_nodes
+               WHERE principal_id = ? AND project_id = ?
+               ORDER BY updated_at DESC, memory_id DESC LIMIT 1""",
+            (request.principal_id, request.project_id),
+        )
+        head_rows = await head_cursor.fetchall()
+        try:
+            mark = _mark("memory", head_rows, "memory_id", None, "record_digest", field_keys=("source_kind", "status", "retrieval_count"), strict_digest=True)
+            state_cursor = await conn.execute(
+                """SELECT json_group_array(json_object(
+                           'memory_id', memory_id, 'record_digest', record_digest,
+                           'source_kind', source_kind, 'status', status,
+                           'retrieval_count', retrieval_count,
+                           'provenance_json', provenance_json)) AS state_json
+                   FROM (SELECT memory_id, record_digest, source_kind, status,
+                                retrieval_count, provenance_json
+                         FROM memory_nodes
+                         WHERE principal_id = ? AND project_id = ?
+                         ORDER BY memory_id ASC)""",
+                (request.principal_id, request.project_id),
+            )
+            state_row = await state_cursor.fetchone()
+            mark = _state_mark(mark, "memory", _row_value(state_row, "state_json") if state_row is not None else None)
+        except (KeyError, TypeError, ValueError, EvaluationContractError) as exc:
+            return (), SourceAvailability("memory", False, truncated, type(exc).__name__), SourceHighWaterMark("memory", None, None, None)
         return records, SourceAvailability("memory", True, truncated, "bounded history" if truncated else ""), mark
 
 
@@ -580,36 +751,36 @@ def _is_digest(value: str) -> bool:
     return len(value) == 64 and all(char in "0123456789abcdef" for char in value)
 
 
-def _mark(source: str, rows: list[Any], id_key: str, sequence_key: str | None, digest_key: str | None, *, field_keys: tuple[str, ...] = ()) -> SourceHighWaterMark:
+def _mark(source: str, rows: list[Any], id_key: str, sequence_key: str | None, digest_key: str | None, *, field_keys: tuple[str, ...] = (), strict_digest: bool = False) -> SourceHighWaterMark:
     row = rows[-1] if rows else None
     if row is None:
         return SourceHighWaterMark(source, None, None, None)
     record_id = str(row[id_key])
     sequence = int(row[sequence_key]) if sequence_key is not None and row[sequence_key] is not None else None
     raw_digest = str(row[digest_key]) if digest_key is not None and row[digest_key] else ""
+    if strict_digest and digest_key is not None and not _is_digest(raw_digest):
+        raise EvaluationContractError(f"{source} newest record digest is malformed")
     if not _is_digest(raw_digest):
         fields = {key: _json_scalar(row[key]) for key in field_keys}
         raw_digest = canonical_digest({"source": source, "record_id": record_id, "sequence": sequence, "fields": fields})
     return SourceHighWaterMark(source, sequence, record_id, raw_digest)
 
 
-def _subagent_run_mark(records: tuple[EvidenceRecord, ...]) -> SourceHighWaterMark:
-    if not records:
-        return SourceHighWaterMark("subagent_runs", None, None, None)
-    latest = records[-1]
-    state_digest = canonical_digest(
-        {
-            "assignment_id": latest.record_id,
-            "run_state": latest.fields.get("run_state"),
-            "run_state_version": latest.fields.get("run_state_version"),
-        }
+def _state_mark(mark: SourceHighWaterMark, source: str, state_value: Any) -> SourceHighWaterMark:
+    return SourceHighWaterMark(
+        source,
+        mark.latest_sequence,
+        mark.latest_record_id,
+        mark.latest_record_digest,
+        canonical_digest({"source": source, "state": state_value or "[]"}),
     )
-    return SourceHighWaterMark("subagent_runs", latest.sequence, latest.record_id, state_digest, state_digest)
 
 
 def _with_state_digest(mark: SourceHighWaterMark, records: tuple[EvidenceRecord, ...]) -> SourceHighWaterMark:
     """Bind a mutable projection HWM to the complete bounded state vector."""
 
+    if mark.state_digest is not None:
+        return mark
     state_digest = canonical_digest([record.to_payload() for record in records])
     return SourceHighWaterMark(
         mark.source,

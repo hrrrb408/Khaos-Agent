@@ -576,6 +576,7 @@ class CapabilityEvaluation:
     security_integrity: SecurityIntegrity
     aggregate_score: float | None
     created_at: str
+    source_availability: tuple[SourceAvailability, ...] = ()
     evaluation_digest: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -590,6 +591,12 @@ class CapabilityEvaluation:
             raise EvaluationContractError("evaluator_schema_version must be positive")
         object.__setattr__(self, "disposition", EvaluationDisposition(self.disposition))
         object.__setattr__(self, "security_integrity", SecurityIntegrity(self.security_integrity))
+        availability = tuple(self.source_availability)
+        if any(type(item) is not SourceAvailability for item in availability):
+            raise EvaluationContractError("source_availability contains invalid evidence")
+        if len({item.source for item in availability}) != len(availability):
+            raise EvaluationContractError("source_availability sources must be unique")
+        object.__setattr__(self, "source_availability", tuple(sorted(availability, key=lambda item: item.source)))
         if self.aggregate_score is not None and type(self.aggregate_score) not in (int, float):
             raise EvaluationContractError("aggregate_score must be numeric or None")
         object.__setattr__(self, "evaluation_digest", canonical_digest(self.semantic_payload()))
@@ -617,6 +624,7 @@ class CapabilityEvaluation:
             "memory_metrics": _metric_payload(self.memory_metrics) if self.memory_metrics is not None else None,
             "security_integrity": self.security_integrity.value,
             "aggregate_score": self.aggregate_score,
+            "source_availability": [item.to_payload() for item in self.source_availability],
         }
 
     def to_payload(self) -> dict[str, object]:
@@ -665,6 +673,7 @@ class CapabilityEvaluation:
             security_integrity=self.security_integrity,
             aggregate_score=self.aggregate_score,
             created_at=created_at,
+            source_availability=self.source_availability,
         )
 
 

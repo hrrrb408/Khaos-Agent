@@ -20,6 +20,7 @@ from khaos.evaluation.models import (
     RecoveryMetrics,
     SafetyMetrics,
     SecurityIntegrity,
+    SourceAvailability,
     VerificationMetrics,
 )
 from khaos.time_utils import utc_now_naive
@@ -177,7 +178,7 @@ def _decode_row(row: Any) -> CapabilityEvaluation:
             "disposition", "outcome_metrics", "planning_metrics", "verification_metrics",
             "recovery_metrics", "execution_metrics", "safety_metrics", "delegation_metrics",
             "efficiency_metrics", "memory_metrics", "security_integrity", "aggregate_score",
-            "evaluation_id", "evaluation_sequence", "created_at", "evaluation_digest",
+            "source_availability", "evaluation_id", "evaluation_sequence", "created_at", "evaluation_digest",
         }
         if set(payload) != expected:
             raise EvaluationContractError("evaluation JSON schema is not closed")
@@ -210,6 +211,9 @@ def _decode_row(row: Any) -> CapabilityEvaluation:
             security_integrity=SecurityIntegrity(payload["security_integrity"]),
             aggregate_score=payload["aggregate_score"],
             created_at=payload["created_at"],
+            source_availability=tuple(
+                SourceAvailability(**item) for item in payload["source_availability"]
+            ),
         )
         _cross_check(row, evaluation)
         if evaluation.canonical_json() != str(row["evaluation_json"]):

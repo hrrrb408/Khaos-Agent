@@ -103,6 +103,7 @@ class CapabilityEvaluator:
             # authority signal.
             aggregate_score=None,
             created_at=snapshot.captured_at,
+            source_availability=snapshot.source_availability,
         )
         if len(canonical_json_bytes(evaluation.to_payload())) > policy.max_evaluation_payload_bytes:
             raise EvaluationContractError("evaluation payload exceeds policy bound")
