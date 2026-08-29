@@ -255,8 +255,62 @@ class PlanStepExecutionRepository:
                 dependency_row = await dependency_cursor.fetchone()
                 if dependency_row is None or dependency_row["state"] != "EXECUTED":
                     raise PermissionError("plan step dependency is not durably EXECUTED")
-            # A route may be fenced exactly once.  The DB transaction is the
-            # cross-runtime TOCTOU barrier; no asyncio lock is relied upon.
+            if binding.plan_step_id is not None:
+                # Re-admit the durable step state before creating the dispatch
+                # fence.  The writer transaction is the cross-runtime TOCTOU
+                # barrier; no asyncio lock is relied upon.  In particular, an
+                # old ALLOW route must never resurrect a terminal step.
+                state_cursor = await conn.execute(
+                    "SELECT state FROM agent_plan_step_states "
+                    "WHERE principal_id = ? AND project_id = ? AND task_id = ? "
+                    "AND execution_epoch_digest = ? AND plan_step_id = ?",
+                    (
+                        owner_principal_id, binding.project_id, binding.task_id,
+                        binding.execution_epoch_digest, binding.plan_step_id,
+                    ),
+                )
+                state_row = await state_cursor.fetchone()
+                if state_row is None:
+                    await conn.execute(
+                        """INSERT INTO agent_plan_step_states (
+                            principal_id, project_id, task_id, execution_epoch_digest,
+                            plan_revision_id, plan_revision_digest, plan_step_id,
+                            plan_step_digest, state, attempt_generation, covered_targets,
+                            covered_targets_digest, active_route_id, active_route_digest,
+                            updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', 1, '[]', ?, ?, ?, ?)
+                        """,
+                        (
+                            owner_principal_id, binding.project_id, binding.task_id,
+                            binding.execution_epoch_digest, binding.plan_revision_id,
+                            binding.plan_revision_digest, binding.plan_step_id,
+                            binding.plan_step_digest, canonical_digest([]),
+                            binding.route_id, binding.route_digest, now,
+                        ),
+                    )
+                else:
+                    if state_row["state"] != "PENDING":
+                        raise PermissionError("plan step is not durably PENDING")
+                    state_update = await conn.execute(
+                        """UPDATE agent_plan_step_states
+                           SET state = 'ACTIVE', active_route_id = ?,
+                               active_route_digest = ?,
+                               attempt_generation = attempt_generation + 1,
+                               updated_at = ?
+                         WHERE principal_id = ? AND project_id = ? AND task_id = ?
+                           AND execution_epoch_digest = ? AND plan_step_id = ?
+                           AND state = 'PENDING'""",
+                        (
+                            binding.route_id, binding.route_digest, now,
+                            owner_principal_id, binding.project_id, binding.task_id,
+                            binding.execution_epoch_digest, binding.plan_step_id,
+                        ),
+                    )
+                    if int(state_update.rowcount or 0) != 1:
+                        raise PermissionError("plan step admission was changed")
+
+            # A route may be fenced exactly once.  State admission above and
+            # this fence insert are one atomic writer transaction.
             await conn.execute(
                 "INSERT INTO agent_plan_dispatch_fences (fence_id, route_id, route_digest, principal_id, project_id, task_id, execution_epoch_digest, plan_revision_id, plan_step_id, workspace_id, workspace_generation, status, created_at, finished_at, effect_status, effect_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, NULL, NULL, NULL)",
                 (
@@ -267,29 +321,6 @@ class PlanStepExecutionRepository:
                     binding.workspace_generation, now,
                 ),
             )
-            if binding.plan_step_id is not None:
-                await conn.execute(
-                    """INSERT INTO agent_plan_step_states (
-                        principal_id, project_id, task_id, execution_epoch_digest,
-                        plan_revision_id, plan_revision_digest, plan_step_id,
-                        plan_step_digest, state, attempt_generation, covered_targets,
-                        covered_targets_digest, active_route_id, active_route_digest,
-                        updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', 1, '[]', ?, ?, ?, ?)
-                    ON CONFLICT(principal_id, project_id, task_id, execution_epoch_digest, plan_step_id)
-                    DO UPDATE SET state = 'ACTIVE', active_route_id = excluded.active_route_id,
-                        active_route_digest = excluded.active_route_digest,
-                        attempt_generation = agent_plan_step_states.attempt_generation + 1,
-                        updated_at = excluded.updated_at
-                    """,
-                    (
-                        owner_principal_id, binding.project_id, binding.task_id,
-                        binding.execution_epoch_digest, binding.plan_revision_id,
-                        binding.plan_revision_digest, binding.plan_step_id,
-                        binding.plan_step_digest, canonical_digest([]),
-                        binding.route_id, binding.route_digest, now,
-                    ),
-                )
         return PlanDispatchFence(
             fence_id, binding.route_id, binding.route_digest,
             owner_principal_id, binding.project_id, binding.task_id,
