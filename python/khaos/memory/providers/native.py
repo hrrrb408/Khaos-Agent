@@ -28,7 +28,9 @@ from khaos.memory.core.contracts import (
     MemoryForgetRequest,
     MemoryHit,
     MemorySearchRequest,
+    MemorySourceKind,
     MemoryStatus,
+    MemoryType,
     MemoryWriteRequest,
     MemoryWriteResult,
     ProviderHealth,
@@ -39,6 +41,7 @@ from khaos.memory.core.contracts import (
     utc_now,
 )
 from khaos.memory.projection import MemoryProjectionReducer
+from khaos.memory.retrieval_policy import memory_record_digest
 
 
 class NativeMemoryProvider:
@@ -139,6 +142,34 @@ class NativeMemoryProvider:
         memory_id = _stable_memory_id(request.candidate_event_id)
         applicability_json = _json(candidate.preconditions)
         environment_json = _json(candidate.environment)
+        source_kind = _source_kind_for_candidate(candidate)
+        provenance = _provenance_for_candidate(runtime, candidate)
+        record = MemoryHit(
+            provider_id=self.provider_id,
+            external_id=memory_id,
+            memory_id=memory_id,
+            content=candidate.claim,
+            raw_score=None,
+            source_type=_source_for_authority(enum_value(request.authority)),
+            source_ref=None,
+            provider_metadata={},
+            authority_hint=enum_value(request.authority),
+            confidence_hint=float(candidate.confidence),
+            status=request.status,
+            principal_id=principal_id,
+            project_id=runtime.project_id,
+            namespace=namespace,
+            scope=candidate.scope,
+            session_id=session_id or None,
+            key=key,
+            sensitivity=candidate.sensitivity,
+            usage_policy=candidate.usage_policy,
+            valid_from=valid_from,
+            valid_to=candidate.valid_to,
+            source_kind=source_kind.value,
+            provenance=provenance,
+        )
+        record_digest = memory_record_digest(record)
 
         async with self._write_transaction() as conn:
             existing_cursor = await conn.execute(
@@ -196,7 +227,7 @@ class NativeMemoryProvider:
                     raise PermissionError("supersession target is outside provider scope")
                 await conn.execute(
                     "UPDATE memory_nodes SET status = 'SUPERSEDED', valid_to = ?, "
-                    "superseded_at = ?, superseded_by = ?, updated_at = ? "
+                    "superseded_at = ?, superseded_by = ?, updated_at = ?, record_digest = '' "
                     "WHERE memory_id IN (" + placeholders + ")",
                     [
                         valid_from.astimezone(UTC).isoformat(),
@@ -215,8 +246,12 @@ class NativeMemoryProvider:
                     content_hash, authority, confidence, sensitivity,
                     usage_policy, applicability_json, environment_json,
                     valid_from, valid_to, superseded_by, created_at, updated_at,
-                    provider_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    provider_id, source_kind, provenance_json, record_digest
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?
+                )
                 """,
                 (
                     memory_id,
@@ -242,6 +277,9 @@ class NativeMemoryProvider:
                     now.astimezone(UTC).isoformat(),
                     now.astimezone(UTC).isoformat(),
                     self.provider_id,
+                    source_kind.value,
+                    _json(provenance),
+                    record_digest,
                 ),
             )
             evidence_added = await self._insert_evidence(conn, request, memory_id, now)
@@ -356,7 +394,7 @@ class NativeMemoryProvider:
     async def get_by_id(self, runtime: Any, memory_id: str) -> MemoryHit | None:
         """Read one canonical node for compatibility projections and UI."""
 
-        clauses, params = _scope_predicate(runtime, include_historical=True)
+        clauses, params = _scope_predicate(runtime, include_historical=True, alias="")
         async with self._db.read_connection() as conn:
             cursor = await conn.execute(
                 "SELECT n.* FROM memory_nodes n WHERE n.memory_id = ? AND "
@@ -442,7 +480,7 @@ class NativeMemoryProvider:
 
         if status not in {MemoryStatus.ACTIVE, MemoryStatus.VERIFIED}:
             raise ValueError("promotion status must be ACTIVE or VERIFIED")
-        clauses, params = _scope_predicate(runtime, include_historical=True)
+        clauses, params = _scope_predicate(runtime, include_historical=True, alias="")
         async with self._db.transaction() as conn:
             cursor = await conn.execute(
                 "UPDATE memory_nodes SET status = ?, authority = ?, updated_at = ? "
@@ -455,7 +493,22 @@ class NativeMemoryProvider:
                     *params,
                 ),
             )
-            return cursor.rowcount > 0
+            if cursor.rowcount <= 0:
+                return False
+            row = await (
+                await conn.execute(
+                    "SELECT * FROM memory_nodes WHERE memory_id = ?",
+                    (memory_id,),
+                )
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("promoted memory disappeared before digest refresh")
+            promoted = await self._row_to_hit(conn, row)
+            await conn.execute(
+                "UPDATE memory_nodes SET record_digest = ? WHERE memory_id = ?",
+                (memory_record_digest(promoted), memory_id),
+            )
+            return True
 
     async def compact(self, runtime: Any, *, limit: int = 256) -> int:
         """Remove only rejected derived rows; canonical events remain intact."""
@@ -1188,6 +1241,8 @@ class NativeMemoryProvider:
             provider_metadata={
                 "canonical_record": True,
                 "broker_authority": str(row["authority"]),
+                "content_hash": str(row["content_hash"]),
+                "provenance": _loads(row["provenance_json"] if "provenance_json" in row_keys else "{}"),
                 "superseded_by": str(row["superseded_by"] or ""),
                 "superseded_at": str(row["superseded_at"] or ""),
                 "retrieval_count": int(row["retrieval_count"]),
@@ -1223,8 +1278,15 @@ class NativeMemoryProvider:
                 for item in evidence_rows
             ),
             source_rank=0,
-            source_kind="memory",
+            source_kind=(
+                str(row["source_kind"])
+                if "source_kind" in row_keys
+                else MemorySourceKind.UNBOUND.value
+            ),
             retrieval_features={"bm25": raw_score} if raw_score is not None else {},
+            provenance=_loads(row["provenance_json"] if "provenance_json" in row_keys else "{}"),
+            record_digest=str(row["record_digest"]) if "record_digest" in row_keys else "",
+            created_at=_parse_datetime(row["created_at"]),
         )
 
 
@@ -1388,6 +1450,12 @@ def _replay_request(
             verification_result_digest=_optional_text(
                 payload.get("verification_result_digest")
             ),
+            source_kind=_optional_text(payload.get("source_kind")),
+            provenance=(
+                dict(payload["provenance"])
+                if isinstance(payload.get("provenance"), Mapping)
+                else {}
+            ),
         )
     except (KeyError, TypeError, ValueError):
         return None
@@ -1406,6 +1474,66 @@ def _optional_text(value: Any) -> str | None:
         return None
     text = str(value)
     return text or None
+
+
+def _source_kind_for_candidate(candidate: MemoryCandidate) -> MemorySourceKind:
+    """Derive a closed provenance category without granting authority."""
+
+    if candidate.source_kind is not None:
+        return MemorySourceKind(enum_value(candidate.source_kind))
+    memory_type = enum_value(candidate.memory_type)
+    authority = enum_value(candidate.authority)
+    if memory_type == MemoryType.USER_MEMORY.value:
+        return MemorySourceKind.USER_PREFERENCE
+    if authority == MemoryAuthority.REPOSITORY_OBSERVED.value:
+        return MemorySourceKind.REPOSITORY_OBSERVATION
+    if authority == MemoryAuthority.TOOL_OBSERVED.value:
+        return MemorySourceKind.TOOL_OBSERVATION
+    if memory_type in {
+        MemoryType.FAILURE_MEMORY.value,
+        MemoryType.DECISION_MEMORY.value,
+        MemoryType.NEGATIVE_MEMORY.value,
+        MemoryType.EPISODIC_MEMORY.value,
+    }:
+        return MemorySourceKind.ENGINEERING_EPISODE
+    if memory_type in {MemoryType.PROFILE_MEMORY.value, MemoryType.CONSTRAINT_MEMORY.value}:
+        return MemorySourceKind.PROJECT_CONVENTION
+    return MemorySourceKind.SUMMARY
+
+
+def _provenance_for_candidate(
+    runtime: RuntimeMemoryContext,
+    candidate: MemoryCandidate,
+) -> dict[str, Any]:
+    """Persist only explicit runtime/candidate provenance identities."""
+
+    values: dict[str, Any] = {
+        "principal_id": runtime.principal_id,
+        "project_id": runtime.project_id,
+        "task_id": runtime.task_id,
+        "session_id": runtime.session_id,
+        "workspace_id": runtime.workspace_id,
+        "repository_id": runtime.repo_id,
+        "base_revision": runtime.commit_sha,
+    }
+    for key, value in candidate.provenance.items():
+        if key in {
+            "source_id",
+            "source_digest",
+            "parent_memory_id",
+            "goal_spec_id",
+            "goal_spec_digest",
+            "plan_revision_id",
+            "plan_revision_digest",
+            "verification_assessment_id",
+            "verification_assessment_digest",
+            "recovery_decision_id",
+            "recovery_decision_digest",
+            "tool_execution_id",
+            "repository_generation",
+        } and isinstance(value, (str, int, float, bool)):
+            values[key] = value
+    return {key: value for key, value in values.items() if value is not None}
 
 
 def _stable_memory_id(candidate_event_id: str | None) -> str:

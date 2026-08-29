@@ -43,6 +43,7 @@ from khaos.memory import (
     MemoryBudget,
     MemoryHost,
     MemoryManager,
+    MemoryRetrievalPolicy,
     MemoryRuntimeBinding,
     MemoryStore,
     RuntimeMemoryContext,
@@ -1382,6 +1383,7 @@ async def build_runtime(
         project_id=project_id,
         audit_logger=audit_logger,
     )
+    memory_retrieval_policy = MemoryRetrievalPolicy.production()
 
     def memory_context(
         session_id: str,
@@ -1449,6 +1451,7 @@ async def build_runtime(
             transfer_service=transfer_service,
             codegraph=codegraph,
             owns_provider_manager=False,
+            retrieval_policy=memory_retrieval_policy,
         )
         memory_manager.profile_registry = profile_registry
         memory_manager.profile_store = profile_store
@@ -1488,6 +1491,7 @@ async def build_runtime(
             transfer_service=transfer_service,
             codegraph=codegraph,
             owns_provider_manager=False,
+            retrieval_policy=memory_retrieval_policy,
         )
         # Keep the profile and registry available to the TUI/RPC composition
         # without creating a second provider path.  All operations still

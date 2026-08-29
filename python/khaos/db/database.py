@@ -937,6 +937,15 @@ class Database:
                 await self._apply_v23_upgrades()
             finally:
                 self._conn = original_conn
+            # M7.7: add provenance/source classification and canonical record
+            # digest columns.  Existing nodes remain explicitly UNBOUND and
+            # are never relabelled as current without evidence.
+            original_conn = self._conn
+            self._conn = _MigrationConnection(conn)
+            try:
+                await self._apply_v24_upgrades()
+            finally:
+                self._conn = original_conn
             # Batch 6.4 §10.4: backfill the historical ledger rows (v1–v5)
             # so the chain is complete from this point on.  Idempotent —
             # uses INSERT OR IGNORE keyed on the version PK.
@@ -1631,6 +1640,37 @@ class Database:
         await self._execute_schema_statements(
             conn,
             migration_path.read_text(encoding="utf-8"),
+        )
+
+    async def _apply_v24_upgrades(self) -> None:
+        """Add additive provenance metadata for bounded M7.7 retrieval."""
+        conn = await self._require_conn()
+        cursor = await conn.execute("PRAGMA table_info(memory_nodes)")
+        columns = {str(row["name"]) for row in await cursor.fetchall()}
+        additions = (
+            (
+                "source_kind",
+                "ALTER TABLE memory_nodes ADD COLUMN source_kind "
+                "TEXT NOT NULL DEFAULT 'UNBOUND'",
+            ),
+            (
+                "provenance_json",
+                "ALTER TABLE memory_nodes ADD COLUMN provenance_json "
+                "TEXT NOT NULL DEFAULT '{}'",
+            ),
+            (
+                "record_digest",
+                "ALTER TABLE memory_nodes ADD COLUMN record_digest "
+                "TEXT NOT NULL DEFAULT ''",
+            ),
+        )
+        for name, statement in additions:
+            if name not in columns:
+                await conn.execute(statement)
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memory_nodes_retrieval_scope "
+            "ON memory_nodes(project_id, principal_id, namespace, session_id, "
+            "source_kind, status, updated_at, memory_id)"
         )
 
     async def _ensure_coding_tasks_last_applied_recovery_decision_column(

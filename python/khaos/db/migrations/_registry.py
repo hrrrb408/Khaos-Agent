@@ -536,6 +536,13 @@ MIGRATIONS: tuple[MigrationSpec, ...] = (
         sql_files=("0023_plan_tool_routing.sql",),
         migrator_symbols=("_apply_v23_upgrades",),
     ),
+    MigrationSpec(
+        version=24,
+        name="m7_7_provenance_bound_memory_retrieval",
+        sha256="25f10c82841e0b3f81def1bfff478ebdfc53cbf8797fb46cb1dd9193524a0f7e",
+        sql_files=("0024_memory_retrieval_provenance.sql",),
+        migrator_symbols=("_apply_v24_upgrades",),
+    ),
 )
 
 

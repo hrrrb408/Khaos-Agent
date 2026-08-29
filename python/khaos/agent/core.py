@@ -2227,6 +2227,10 @@ class AgentLoop:
         )
         messages.extend(self._active_context_facts)
 
+        memory_message = await self._build_memory_message(session_id)
+        if memory_message is not None:
+            messages.append(memory_message)
+
         if self.context_intelligence is not None and self._is_coding_mode():
             relevant = await self._build_context_intelligence_message(user_input)
         else:
@@ -2235,6 +2239,53 @@ class AgentLoop:
             messages.append(relevant)
 
         return messages
+
+    async def _build_memory_message(self, session_id: str) -> Message | None:
+        """Project retrieved memory as bounded, low-trust data context.
+
+        Memory is intentionally not part of the system prompt. The provider
+        boundary may discard Khaos metadata, so the role and explicit envelope
+        are the actual prompt-privilege fence; persisted text never becomes a
+        control instruction merely because it was retrieved locally.
+        """
+        if self.memory_manager is None:
+            return None
+        inject = getattr(self.memory_manager, "inject", None)
+        if not callable(inject):
+            return None
+        try:
+            parameters = inspect.signature(inject).parameters
+            supports_task = any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                or name == "task_id"
+                for name, parameter in parameters.items()
+            )
+            if supports_task:
+                memory_text = await inject(
+                    session_id,
+                    task_id=self._active_task_id,
+                )
+            else:
+                memory_text = await inject(session_id)
+        except Exception:
+            logger.warning(
+                "memory prompt projection unavailable; continuing without memory",
+                exc_info=True,
+            )
+            return None
+        if not memory_text:
+            return None
+        text = str(memory_text)
+        return Message(
+            role="user",
+            content=text,
+            token_count=self.token_engine.count_tokens(text),
+            metadata={
+                "context_layer": "historical-memory",
+                "trusted": False,
+                "authority": "low-trust-data",
+            },
+        )
 
     async def _build_context_intelligence_message(
         self, user_input: str
@@ -2679,10 +2730,6 @@ class AgentLoop:
             if project_ctx:
                 prompt = f"{prompt}\n\n# Project Instructions\n\n{project_ctx}"
 
-        if self.memory_manager is not None:
-            memory_text = await self.memory_manager.inject(session_id)
-            if memory_text:
-                prompt = f"{prompt}\n\n{memory_text}"
         if self.skill_manager is not None:
             mode = self.mode_manager.current_mode.value
             matched = self.skill_manager.match(mode, user_input)
