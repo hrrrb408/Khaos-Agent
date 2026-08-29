@@ -230,7 +230,7 @@ class TestAgentLoopPermissionDenied:
 
 
 class TestAgentLoopMemoryInjection:
-    async def test_memory_manager_injects_memory_into_system_prompt(self, tmp_path):
+    async def test_memory_manager_injects_memory_as_low_trust_user_data(self, tmp_path):
         write_prompts(tmp_path)
         db = await create_test_db(tmp_path / "khaos.db")
         await db.create_session("s-memory")
@@ -257,7 +257,16 @@ class TestAgentLoopMemoryInjection:
 
         [message async for message in loop.run("use memory", "s-memory")]
 
-        assert "Ruibang prefers concise integration tests" in router.last_messages[0].content
+        memory_message = next(
+            message
+            for message in router.last_messages
+            if message.metadata.get("context_layer") == "historical-memory"
+        )
+        assert memory_message.role == "user"
+        assert memory_message.metadata["trusted"] is False
+        assert memory_message.metadata["authority"] == "low-trust-data"
+        assert "Ruibang prefers concise integration tests" in memory_message.content
+        assert "Ruibang prefers concise integration tests" not in router.last_messages[0].content
         await db.close()
 
 
