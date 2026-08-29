@@ -17,8 +17,8 @@
 
 ## Import reachability result
 
-- Reachable repository modules: `282`.
-- Resolved import edges: `2195`.
+- Reachable repository modules: `284`.
+- Resolved import edges: `2212`.
 - Forbidden production edges: `0`.
 - Unresolved internal edges: `0`.
 
@@ -165,6 +165,8 @@
 - `khaos.db.repositories.sessions`
 - `khaos.db.repositories.tool_operations`
 - `khaos.db.state_root`
+- `khaos.evaluation.models`
+- `khaos.evaluation.repository`
 - `khaos.exceptions`
 - `khaos.grpc_server`
 - `khaos.maintenance`

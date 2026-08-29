@@ -71,6 +71,7 @@ KHAOS.md / AGENTS.md
 | Workspace file effect | `coding/workspace/`、file tools | `SafeWorkspaceFS` / mutation authority | patch/ChangeSet/UI | 新代码不能直接用 `Path.write_*` 替代安全 API |
 | Git effect | `coding/workspace/trusted_git.py`、`tools/git_tools.py` | `TrustedGitRunner` + authority receipt | diff/status renderers | read-only Git 也要经过受控执行上下文 |
 | Verification proof | `coding/planning/verification_*` | trusted verification authority/ledger | plan gate、audit/export | 被测代码不能写 canonical input/result |
+| Capability evaluation/metrics | `python/khaos/evaluation/` | `CapabilityEvidenceService`（coherent read snapshot）+ `CapabilityEvaluator`（纯计算）+ `CapabilityEvaluationRepository`（append-only ledger） | report/benchmark/export | 只读观察；不能写 TaskStatus、Gate、approval、verification、recovery、routing 或 prompt authority |
 | Task/workspace identity | `coding/task_manager.py`、`coding/workspace/` | Task/Workspace stores | AgentLoop、TUI、RPC | 客户端只提交引用，不能自报 owner 或 generation |
 | Durable audit | `audit/`、`db/`、authorityd/WORM adapters | 对应写入事务和 append-only ledger | export/query | Python 内存日志不是独立审计权威；authorityd canonical wire encoding 由 `security/protocol_boundary.py` 统一拥有 |
 | Durable memory | `memory/`、`rpc/memory_service.py` | `MemoryStore`（领域门面）+ `MemoryRepository`（持久化端口）+ `MemoryOwner`（principal/project/namespace）+ `MemoryVisibility`（durable/session 视图） | `MemoryManager`、RPC/CLI/TUI | SQL、FTS、TTL、冲突、提取和检索策略不能重新堆回 store；durable list/search/touch/delete 默认排除 session-private；session 访问必须携带同一 session ID；所有 runtime 写入必须携带 owner 和审计 logger |
@@ -268,6 +269,17 @@ REQUESTED -> SNAPSHOT_BOUND -> RUNNING -> PROOF_RECORDED
   owner 分别位于 `python/khaos/scheduler/execution.py` 和
   `python/khaos/scheduler/recovery.py`，不得把执行/恢复实现重新堆回 facade。
 - 删除已经没有调用者的兼容分支，更新 schema/ADR 和迁移文档。
+
+### Phase 4.5：Evidence-based capability evaluation
+
+- M7.9 的 capability evaluation 只消费 owner-scoped immutable evidence snapshot；policy、
+  request、metric vector、benchmark manifest 和报告均为 typed/canonical value objects。
+- `CapabilityEvaluationRepository` 是唯一 evaluation ledger writer；评估结果不能作为
+  Completion Gate、Verification authority、Recovery、Permission、Approval、Routing 或
+  Memory ranking 的输入。关键证据缺失或安全完整性失败必须保留显式状态。
+- 每次 schema/metric 变更都必须更新 ADR-082、versioned migration、确定性/对抗性测试和
+  generated reachability/inventory；本机不能提供的 hosted/kernel/remote CI 证据只能标为
+  blocked、skipped、unknown 或 not run。
 
 ### Phase 5：持续维护
 

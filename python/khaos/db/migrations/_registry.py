@@ -550,6 +550,13 @@ MIGRATIONS: tuple[MigrationSpec, ...] = (
         sql_files=("0025_plan_bound_subagents.sql",),
         migrator_symbols=("_apply_v25_upgrades",),
     ),
+    MigrationSpec(
+        version=26,
+        name="m7_9_capability_evaluations",
+        sha256="6dd2d0023e83164ff2ccbf953896f809b6ea3d6fe834cd38fe3e10ac34f6f9d3",
+        sql_files=("0026_capability_evaluations.sql",),
+        migrator_symbols=("_apply_v26_upgrades",),
+    ),
 )
 
 

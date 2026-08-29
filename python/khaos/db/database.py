@@ -39,6 +39,7 @@ from khaos.db.connection import (
     _AsyncSqliteFallback,  # noqa: F401 - compatibility export
     aiosqlite,  # noqa: F401 - tests patch the shared driver module
 )
+from khaos.evaluation.repository import CapabilityEvaluationRepository
 from khaos.subagents.assignment import SubAgentAssignmentRepository
 
 # Compatibility name for released tests and integrations.  The lifecycle
@@ -277,6 +278,7 @@ class Database:
         self._plan_step_execution_repository = PlanStepExecutionRepository(self)
         self._subagent_assignment_repository = SubAgentAssignmentRepository(self)
         self._verification_assessment_repository = VerificationAssessmentRepository(self)
+        self._capability_evaluation_repository = CapabilityEvaluationRepository(self)
         # F-01: Per-domain locks remain for logical serialization (e.g. two
         # concurrent permission grants must not race on epoch computation).
         self._operation_approval_lock = asyncio.Lock()
@@ -287,6 +289,10 @@ class Database:
         # acquire this lock, preventing cross-domain ``commit()`` 串扰 on the
         # shared single connection. Read-only queries do not need this lock.
         self._write_transaction_lock = asyncio.Lock()
+        # A coherent evaluation snapshot uses one reader transaction.  The
+        # shared reader handle therefore needs a small serialization fence so
+        # unrelated read transactions cannot interleave BEGIN/ROLLBACK.
+        self._read_transaction_lock = asyncio.Lock()
 
     # Compatibility views keep the migration runner and existing integrations
     # source-compatible while ensuring the connection component remains the
@@ -355,6 +361,11 @@ class Database:
     def verification_assessment_repository(self) -> VerificationAssessmentRepository:
         """Return the owner-scoped trusted-verification assessment ledger."""
         return self._verification_assessment_repository
+
+    @property
+    def capability_evaluation_repository(self) -> CapabilityEvaluationRepository:
+        """Return the observation-only M7.9 evaluation ledger owner."""
+        return self._capability_evaluation_repository
 
     @_conn.setter
     def _conn(self, value: Any | None) -> None:
@@ -599,6 +610,21 @@ class Database:
         """
         async with self._read_lease():
             yield await self._require_reader_conn()
+
+    @asynccontextmanager
+    async def read_transaction(self) -> AsyncIterator[Any]:
+        """Yield one coherent, query-only SQLite read transaction.
+
+        This is an observation boundary, not a write transaction.  The
+        reader snapshot is isolated from later writer commits and is always
+        rolled back on exit, including cancellation.
+        """
+        async with self._read_transaction_lock, self.read_connection() as conn:
+            await conn.execute("BEGIN")
+            try:
+                yield conn
+            finally:
+                await conn.rollback()
 
     @asynccontextmanager
     async def _read_lease(self):
@@ -961,6 +987,14 @@ class Database:
             self._conn = _MigrationConnection(conn)
             try:
                 await self._apply_v25_upgrades()
+            finally:
+                self._conn = original_conn
+            # M7.9: capability evaluation is an append-only observation
+            # ledger.  It is intentionally not consumed by any authority.
+            original_conn = self._conn
+            self._conn = _MigrationConnection(conn)
+            try:
+                await self._apply_v26_upgrades()
             finally:
                 self._conn = original_conn
             # Batch 6.4 §10.4: backfill the historical ledger rows (v1–v5)
@@ -1715,6 +1749,15 @@ class Database:
                 await conn.execute(
                     f"ALTER TABLE agent_plan_tool_routes ADD COLUMN {name} {declaration}"
                 )
+
+    async def _apply_v26_upgrades(self) -> None:
+        """Add the immutable M7.9 capability-evaluation observation ledger."""
+        conn = await self._require_conn()
+        migration_path = _MIGRATIONS_DIR / "0026_capability_evaluations.sql"
+        await self._execute_schema_statements(
+            conn,
+            migration_path.read_text(encoding="utf-8"),
+        )
 
     async def _ensure_coding_tasks_last_applied_recovery_decision_column(
         self, conn: Any
