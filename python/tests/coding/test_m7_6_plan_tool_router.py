@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -95,7 +96,10 @@ def _resource(root: Path, *, tool: str, path: str) -> AuthorizationResource:
         task_id=TASK,
         workspace_id=WORKSPACE,
         workspace_generation=1,
-        canonical_target=f'{{"path":"{root / path}","tool":"{tool}"}}',
+        canonical_target=json.dumps(
+            {"path": str(root / path), "tool": tool},
+            separators=(",", ":"),
+        ),
         root_device=1,
         root_inode=2,
         workspace_root=str(root),
@@ -112,10 +116,9 @@ def _process_resource(
         task_id=TASK,
         workspace_id=WORKSPACE,
         workspace_generation=1,
-        canonical_target=(
-            '{"argv":['
-            + ",".join(f'"{item}"' for item in argv)
-            + f'],"cwd":"{root}","tool":"{tool}"}}'
+        canonical_target=json.dumps(
+            {"argv": list(argv), "cwd": str(root), "tool": tool},
+            separators=(",", ":"),
         ),
         root_device=1,
         root_inode=2,
