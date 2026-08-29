@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 from dataclasses import FrozenInstanceError
+from pathlib import Path
 
 import pytest
 from khaos.db import Database
@@ -110,3 +114,23 @@ def test_legacy_invalid_dependency_plan_has_no_executable_layers() -> None:
     assert plan is not None
     assert plan.invalid_reasons
     assert TaskPlanner._topological_layers(plan) == []
+
+
+def test_tools_import_does_not_cycle_through_subagent_package() -> None:
+    python_root = Path(__file__).parents[2]
+    environment = {**os.environ, "PYTHONPATH": str(python_root)}
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from khaos.tools import create_runtime_registry; "
+                "assert create_runtime_registry.__name__ == 'create_runtime_registry'"
+            ),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    assert result.returncode == 0
