@@ -294,12 +294,14 @@ jobs:
           test -s /tmp/identity-proof.json
       - name: Run the full authority transaction E2E
         env:
+          KHAOS_AUTHORITY_PROFILE: native-production
           KHAOS_AUTHORITYD_LAUNCHD_SERVICE: com.khaos.authorityd
           KHAOS_AUTHORITYD_PROTECTED_KEY_REF: khaos-authority-signing-key
           KHAOS_AUTHORITYD_KEYCHAIN_GROUP: ${{ secrets.KHAOS_MACOS_TEAM_ID }}.com.khaos.authority
           KHAOS_AUTHORITYD_AGENT_CODE_SIGNATURE: com.khaos.agent
           KHAOS_AUTHORITYD_AGENT_CODE_REQUIREMENT: identifier "com.khaos.agent" and anchor apple generic and certificate leaf[subject.OU] = ${{ secrets.KHAOS_MACOS_TEAM_ID }}
           KHAOS_AUTHORITYD_PUBLIC_KEY_PATH: /var/run/khaos-authorityd/authorityd.pub
+          KHAOS_TYPED_RESOURCE_CATALOG_PATH: /etc/khaos/native-resource-catalog.json
           KHAOS_MACOS_AUTHORITY_XPC_CLIENT: /usr/local/libexec/khaos-authorityd-xpc-client
           KHAOS_NATIVE_E2E_EFFECT_ROOT: /tmp/khaos-native-e2e-effects
         run: |
@@ -599,9 +601,11 @@ jobs:
             if ($status -ne 'Running') { throw "authority backend service is '$status'" }
 
             New-Item -ItemType Directory -Force native-evidence | Out-Null
+            $env:KHAOS_AUTHORITY_PROFILE = 'native-production'
             $env:KHAOS_AUTHORITYD_NAMED_PIPE = '\\.\pipe\KhaosAuthorityD'
             $env:KHAOS_AUTHORITYD_PROTECTED_KEY_REF = 'khaos-authority-signing-key'
             $env:KHAOS_AUTHORITYD_PUBLIC_KEY_PATH = 'C:\ProgramData\Khaos\authorityd.pub'
+            $env:KHAOS_TYPED_RESOURCE_CATALOG_PATH = 'C:\ProgramData\Khaos\native-resource-catalog.json'
             $env:KHAOS_WINDOWS_AUTHORITY_PIPE_CLIENT = "$env:GITHUB_WORKSPACE\rust\khaos-core\target\release\khaos-authorityd-windows.exe"
             uv run python scripts/run_native_authority_identity_probe.py | Tee-Object -Variable proof | Out-Null
             if (-not $proof) { throw 'native identity probe failed' }
