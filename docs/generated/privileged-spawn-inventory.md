@@ -42,7 +42,7 @@
 - `python/khaos/security/producer_evidence.py:485` `subprocess.check_output` in `<module>.git_head` owner=`ProducerEvidenceGitIdentity` threat-model=`trusted-repository-provenance` boundary=`producer-evidence`
 - `python/khaos/tools/clipboard_tools.py:25` `subprocess.run` in `<module>._clipboard_read_sync` owner=`HostClipboard` threat-model=`foreground-user-host-integration` boundary=`host-integration`
 - `python/khaos/tools/clipboard_tools.py:51` `subprocess.run` in `<module>._clipboard_write_sync` owner=`HostClipboard` threat-model=`foreground-user-host-integration` boundary=`host-integration`
-- `rust/khaos-core/src/bin/khaos-authorityd-backend-windows.rs:221` `Command::new` in `rust::entrypoint` owner=`AuthorityBackendServiceHost` threat-model=`trusted-backend-child-lifecycle` boundary=`windows-authority-backend-service`
+- `rust/khaos-core/src/bin/khaos-authorityd-backend-windows.rs:225` `Command::new` in `rust::entrypoint` owner=`AuthorityBackendServiceHost` threat-model=`trusted-backend-child-lifecycle` boundary=`windows-authority-backend-service`
 - `rust/khaos-core/src/bin/khaos-browser-kernel-helper.rs:963` `Command::new` in `rust::entrypoint` owner=`BrowserKernelHelper` threat-model=`root-owned-browser-kernel` boundary=`browser-kernel`
 - `rust/khaos-core/src/bin/khaos-exec-launcher.rs:193` `Command::new` in `rust::entrypoint` owner=`NativeExecLauncher` threat-model=`fd-bound-executable-authority` boundary=`native-launcher`
 - `rust/khaos-core/src/bin/khaos-exec-launcher.rs:307` `Command::new` in `rust::entrypoint` owner=`NativeExecLauncher` threat-model=`fd-bound-executable-authority` boundary=`native-launcher`
