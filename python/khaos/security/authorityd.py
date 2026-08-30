@@ -2224,6 +2224,14 @@ class AuthorityDaemon:
         # transport check.  It must remain usable before the runtime trust
         # channel exists, while every effect-bearing inner request still
         # requires the normal binding and channel nonce.
+        if inner.get("operation") != "ping":
+            # Do not turn an unbound or mismatched effect request into a
+            # seemingly successful attestation.  Once this trust preflight
+            # passes, _dispatch may still return a signed application-level
+            # rejection (for example, a revoked grant); that distinction is
+            # what lets native clients keep a healthy READY channel after a
+            # legitimate policy/business denial.
+            _require_request_trust_binding(self, inner)
         try:
             response = _dispatch(self, inner, allow_transport_probe=True)
         except RemoteAuditUnavailableError as exc:

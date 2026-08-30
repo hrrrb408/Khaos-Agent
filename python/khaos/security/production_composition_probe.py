@@ -12,14 +12,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from collections.abc import Iterator
-from contextlib import contextmanager
 import hashlib
 import json
 import os
 import stat
 import tempfile
 import time
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 
 from khaos.agent.approval import StepExecutionAuthority
@@ -37,13 +37,14 @@ from khaos.coding.execution import (
 from khaos.coding.execution.authority import ExecutionAuthority
 from khaos.coding.execution.identity import executable_identity
 from khaos.coding.execution.models import ResolvedSpawnPlan
+from khaos.security.authority_broker import AuthorityBroker
 from khaos.security.identity_isolation import (
     IdentityIsolationError,
     LinuxProcessIdentityEvidence,
     read_linux_process_identity,
 )
+from khaos.security.local_closure import canonical_digest
 from khaos.security.principals import PrincipalKind, transport_root_delegation_digest
-from khaos.security.local_closure import LocalEvidenceError, canonical_digest
 from khaos.security.producer_evidence import (
     PRODUCTION_COMPOSITION_PROOF,
     build_runtime_producer_proof,
@@ -352,16 +353,32 @@ async def _run_exact_effect(
     *,
     request: ExecutionRequest,
     job_uid: int,
+    authority_broker: AuthorityBroker,
 ) -> tuple[LinuxProcessIdentityEvidence, ExecutionResult]:
     """Run through ExecutionService -> backend -> supervisor -> native launcher."""
-    supervisor = ProcessSupervisor()
-    backend = LinuxBubblewrapBackend(supervisor)
+    # The probe owns a short-lived execution service, but it must use the
+    # exact READY broker established by the production runtime.  Constructing
+    # an unbound service here would silently create a second authority path;
+    # production execution is deliberately fail-closed when no broker is
+    # supplied.
+    from khaos.runtime_profile import RuntimeProfile
+
+    supervisor = ProcessSupervisor(
+        runtime_profile=RuntimeProfile.PRODUCTION,
+        authority_broker=authority_broker,
+    )
+    backend = LinuxBubblewrapBackend(
+        supervisor,
+        runtime_profile=RuntimeProfile.PRODUCTION,
+    )
     service = ExecutionService(
         backend=backend,
         process_supervisor=supervisor,
         principal_id=_COMPOSE_PRINCIPAL_ID,
         project_id="compose",
         runtime_id=_COMPOSE_RUNTIME_ID,
+        runtime_profile=RuntimeProfile.PRODUCTION,
+        authority_broker=authority_broker,
     )
     execution_id = request.correlation_id
     if execution_id is None:
@@ -474,15 +491,26 @@ def _composition_probe_database_path(workspace_parent: Path) -> Path:
     return database_path
 
 
-async def _build_runtime_manifest(workspace_parent: Path) -> dict[str, object]:
-    """Build and verify the same structural production Runtime factory uses."""
+@asynccontextmanager
+async def _verified_production_runtime(
+    workspace_parent: Path,
+) -> AsyncIterator[tuple[object, dict[str, object]]]:
+    """Yield one live, verified production runtime and its manifest.
+
+    The runtime stays alive while the exact-effect probe runs.  In particular,
+    its READY authority broker remains the sole broker passed to the probe's
+    short-lived supervisor/service, so the proof cannot accidentally fall
+    back to a local broker after composition verification.
+    """
     if not Path("/app/khaos_policy.yaml").is_file():
         raise SystemExit(
             "production composition probe requires the mounted project policy"
         )
     from khaos.db.database import Database
     from khaos.runtime import ProductionRuntimeConfig, build_production_runtime
-    from khaos.security.production_composition_manifest import verify_runtime_composition
+    from khaos.security.production_composition_manifest import (
+        verify_runtime_composition,
+    )
 
     with _production_probe_temp_root(workspace_parent):
         database = Database(_composition_probe_database_path(workspace_parent))
@@ -510,11 +538,52 @@ async def _build_runtime_manifest(workspace_parent: Path) -> dict[str, object]:
                     "production runtime composition is invalid: "
                     + "; ".join(manifest.errors)
                 )
-            return payload
+            yield runtime, payload
         finally:
             if runtime is not None:
                 await runtime.aclose()
             await database.close()
+
+
+async def _build_runtime_manifest(workspace_parent: Path) -> dict[str, object]:
+    """Build and verify the same structural production Runtime factory uses."""
+    async with _verified_production_runtime(workspace_parent) as (_, payload):
+        return payload
+
+
+async def _run_composition_effect(
+    *,
+    workspace_parent: Path,
+    workspace: Path,
+    policy_digest: str,
+    job_uid: int,
+) -> tuple[dict[str, object], LinuxProcessIdentityEvidence, ExecutionResult]:
+    """Run the exact effect while the verified runtime authority is live."""
+    async with _verified_production_runtime(workspace_parent) as (runtime, manifest):
+        authority_broker = getattr(runtime, "authority_broker", None)
+        if not isinstance(authority_broker, AuthorityBroker):
+            raise SystemExit(
+                "production composition probe runtime has no authority broker"
+            )
+        if not authority_broker.ready:
+            raise SystemExit(
+                "production composition probe runtime authority broker is not READY"
+            )
+        request = _probe_request(
+            command=(
+                "/bin/sh",
+                "-c",
+                "printf 'composition-probe\\n'; id -u; id -g; cat /proc/self/uid_map; cat /proc/self/gid_map; sleep 5",
+            ),
+            workspace=workspace,
+            policy_digest=policy_digest,
+        )
+        evidence, result = await _run_exact_effect(
+            request=request,
+            job_uid=job_uid,
+            authority_broker=authority_broker,
+        )
+        return manifest, evidence, result
 
 
 def _runtime_diagnostics(
@@ -654,7 +723,6 @@ def main() -> int:
     )
     if os.getuid() != int(os.environ.get("KHAOS_AGENT_UID", str(os.getuid()))):
         raise SystemExit("production composition probe is running as the wrong Agent UID")
-    runtime_manifest = asyncio.run(_build_runtime_manifest(workspace_parent))
     from khaos.coding.execution.platform import _linux_sandbox_launcher
 
     sandbox_launcher = _linux_sandbox_launcher()
@@ -667,19 +735,14 @@ def main() -> int:
             "exec_launcher": sha256_file(exec_launcher),
         }
     )
-    command = (
-        "/bin/sh",
-        "-c",
-        "printf 'composition-probe\\n'; id -u; id -g; cat /proc/self/uid_map; cat /proc/self/gid_map; sleep 5",
-    )
     try:
-        request = _probe_request(
-            command=command,
-            workspace=workspace,
-            policy_digest=policy_digest,
-        )
-        evidence, result = asyncio.run(
-            _run_exact_effect(request=request, job_uid=int(job_uid))
+        runtime_manifest, evidence, result = asyncio.run(
+            _run_composition_effect(
+                workspace_parent=workspace_parent,
+                workspace=workspace,
+                policy_digest=policy_digest,
+                job_uid=int(job_uid),
+            )
         )
         lines = result.stdout.splitlines()
         if len(lines) < 4 or lines[0] != "composition-probe":

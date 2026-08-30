@@ -26,6 +26,8 @@ from khaos.coding.execution import (
     LinuxBubblewrapBackend,
     ProcessSupervisor,
 )
+from khaos.runtime_profile import RuntimeProfile
+from khaos.security.authority_broker import AuthorityBroker
 from khaos.security.local_closure import canonical_digest
 from khaos.security.producer_evidence import (
     PROCESS_TREE_PROOF,
@@ -37,12 +39,11 @@ from khaos.security.producer_evidence import (
 from khaos.security.production_composition_probe import (
     _COMPOSE_PRINCIPAL_ID,
     _COMPOSE_RUNTIME_ID,
-    _build_runtime_manifest,
     _probe_request,
     _runtime_composition_digest,
     _supervisor_process_tree,
+    _verified_production_runtime,
 )
-
 
 _ACTION_TIMEOUT = 15.0
 _ORACLE_POLL = 0.05
@@ -178,17 +179,26 @@ async def _run_case(
     action: str,
     policy_digest: str,
     workspace_parent: Path,
+    authority_broker: AuthorityBroker,
 ) -> dict[str, object]:
     temporary_homes_before = _temporary_home_paths()
     workspace = Path(tempfile.mkdtemp(prefix=f"khaos-lifecycle-{name}-", dir=workspace_parent))
-    supervisor = ProcessSupervisor()
-    backend = LinuxBubblewrapBackend(supervisor)
+    supervisor = ProcessSupervisor(
+        runtime_profile=RuntimeProfile.PRODUCTION,
+        authority_broker=authority_broker,
+    )
+    backend = LinuxBubblewrapBackend(
+        supervisor,
+        runtime_profile=RuntimeProfile.PRODUCTION,
+    )
     service = ExecutionService(
         backend=backend,
         process_supervisor=supervisor,
         principal_id=_COMPOSE_PRINCIPAL_ID,
         project_id="compose",
         runtime_id=_COMPOSE_RUNTIME_ID,
+        runtime_profile=RuntimeProfile.PRODUCTION,
+        authority_broker=authority_broker,
     )
     request = _probe_request(
         command=_tree_command(),
@@ -221,7 +231,7 @@ async def _run_case(
             actual_result = await asyncio.wait_for(task, timeout=_ACTION_TIMEOUT)
         except asyncio.CancelledError:
             pass
-        except asyncio.TimeoutError:
+        except TimeoutError:
             error = "execution task did not reach a terminal result"
         except BaseException as exc:  # noqa: BLE001 - diagnostics are fail-closed
             error = f"execution task: {type(exc).__name__}: {exc}"
@@ -421,27 +431,39 @@ async def _run() -> int:
         raise SystemExit("production lifecycle probe requires /app/data")
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    runtime_manifest = await _build_runtime_manifest(workspace_parent)
-    cases = [
-        await _run_case(
-            name="cancellation",
-            action="cancel",
-            policy_digest=policy_digest,
-            workspace_parent=workspace_parent,
-        ),
-        await _run_case(
-            name="timeout",
-            action="timeout",
-            policy_digest=policy_digest,
-            workspace_parent=workspace_parent,
-        ),
-        await _run_case(
-            name="shutdown",
-            action="shutdown",
-            policy_digest=policy_digest,
-            workspace_parent=workspace_parent,
-        ),
-    ]
+    async with _verified_production_runtime(workspace_parent) as (runtime, runtime_manifest):
+        authority_broker = getattr(runtime, "authority_broker", None)
+        if not isinstance(authority_broker, AuthorityBroker):
+            raise SystemExit(
+                "production lifecycle runtime has no authority broker"
+            )
+        if not authority_broker.ready:
+            raise SystemExit(
+                "production lifecycle runtime authority broker is not READY"
+            )
+        cases = [
+            await _run_case(
+                name="cancellation",
+                action="cancel",
+                policy_digest=policy_digest,
+                workspace_parent=workspace_parent,
+                authority_broker=authority_broker,
+            ),
+            await _run_case(
+                name="timeout",
+                action="timeout",
+                policy_digest=policy_digest,
+                workspace_parent=workspace_parent,
+                authority_broker=authority_broker,
+            ),
+            await _run_case(
+                name="shutdown",
+                action="shutdown",
+                policy_digest=policy_digest,
+                workspace_parent=workspace_parent,
+                authority_broker=authority_broker,
+            ),
+        ]
     diagnostics = _diagnostics(output_dir, cases)
     identity = _production_identity(runtime_manifest)
     workflow = {
