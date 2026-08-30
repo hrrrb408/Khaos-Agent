@@ -327,6 +327,7 @@ class AuthorityTransportConfig:
             transport=self.transport.value,
             runtime_profile=self.runtime_profile,
             trust_binding=trust_binding,
+            community_local=self.is_community,
         )
 
 

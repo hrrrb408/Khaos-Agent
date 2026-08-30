@@ -264,5 +264,6 @@ def test_darwin_unix_client_does_not_infer_xpc(
         Path.cwd() / "authorityd.sock",
         expected_authority_uid=0,
         transport="unix",
+        runtime_profile=RuntimeProfile.TESTING,
     )
     assert client.request({"operation": "ping"})["transport"] == "unix"

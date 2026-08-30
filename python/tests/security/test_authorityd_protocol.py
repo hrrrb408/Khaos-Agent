@@ -300,6 +300,7 @@ def test_community_client_verifies_receipts_against_local_trust_anchor(
         public_key_path=public_key_path,
         trusted_local_root=root,
         transport="unix",
+        community_local=True,
     )
 
     assert client._verify_receipt(receipt.to_dict()).signature == receipt.signature

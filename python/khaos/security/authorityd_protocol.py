@@ -687,6 +687,7 @@ class AuthorityDaemonClient:
         trusted_local_root: Path | None = None,
         runtime_profile: RuntimeProfile | str | None = None,
         trust_binding: ProductionTrustBinding | None = None,
+        community_local: bool = False,
     ) -> None:
         # The caller (normally AuthorityTransportConfig) selects the
         # transport.  For direct protocol tests, preserve the intuitive
@@ -715,6 +716,8 @@ class AuthorityDaemonClient:
             raise ValueError("authorityd public key path must be absolute")
         if trusted_local_root is not None and not trusted_local_root.is_absolute():
             raise ValueError("authorityd trusted root must be absolute")
+        if type(community_local) is not bool:
+            raise ValueError("community local authority flag is invalid")
         resolved_runtime_profile = resolve_runtime_profile(runtime_profile)
         if (
             trusted_local_root is not None
@@ -724,7 +727,22 @@ class AuthorityDaemonClient:
             raise ValueError(
                 "production Community authorityd trusted root must be the system home root"
             )
-        if resolved_runtime_profile.is_production and trust_binding is None:
+        if (
+            resolved_runtime_profile.is_production
+            and community_local
+            and (
+                selected_transport != "unix"
+                or trusted_local_root is None
+            )
+        ):
+            raise ValueError(
+                "community local authority requires a trusted Unix root"
+            )
+        if (
+            resolved_runtime_profile.is_production
+            and trust_binding is None
+            and not community_local
+        ):
             raise ValueError(
                 "production authorityd client requires an explicit trust binding"
             )

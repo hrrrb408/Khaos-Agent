@@ -185,6 +185,7 @@ def test_community_local_profile_round_trip_uses_real_authorityd(
                 public_key_path=public_key_path,
                 trusted_local_root=root,
                 transport="unix",
+                community_local=True,
             )
             intent = AuthorizationIntent(
                 principal_id="agent",
