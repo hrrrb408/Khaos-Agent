@@ -449,25 +449,25 @@ jobs:
           $agentSid = ([System.Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
           if ([string]::IsNullOrWhiteSpace($agentSid)) { throw 'agent SID unavailable' }
           "KHAOS_AGENT_SID=$agentSid" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-            .\packaging\windows\install-khaos-authorityd.ps1 `
-              -Binary "$env:GITHUB_WORKSPACE\rust\khaos-core\target\release\khaos-authorityd-windows.exe" `
-              -AgentSid $agentSid `
-              -ProtectedKeyPath 'C:\ProgramData\Khaos\authority-key.dpapi' `
-              -ProvisionDpapiKey
-            . (Join-Path $env:GITHUB_WORKSPACE 'packaging\windows\service-sid.ps1')
-            $authoritySid = Get-KhaosServiceSid -ServiceName 'KhaosAuthorityD'
-            "KHAOS_AUTHORITYD_SERVICE_SID=$authoritySid" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-            $catalogOwnerSid = ([System.Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
-            if ([string]::IsNullOrWhiteSpace($catalogOwnerSid)) { throw 'catalog owner SID unavailable' }
-            $trustRoot = 'C:\ProgramData\Khaos'
-            $trustedOwners = "$catalogOwnerSid,$authoritySid,S-1-5-18,S-1-5-32-544"
-            $trustedAclSids = "$authoritySid,$agentSid,S-1-5-18,S-1-5-32-544"
-            $env:KHAOS_WINDOWS_TRUST_ROOT = $trustRoot
-            $env:KHAOS_WINDOWS_TRUSTED_OWNER_SIDS = $trustedOwners
-            $env:KHAOS_WINDOWS_TRUSTED_ACL_SIDS = $trustedAclSids
-            "KHAOS_WINDOWS_TRUST_ROOT=$trustRoot" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-            "KHAOS_WINDOWS_TRUSTED_OWNER_SIDS=$trustedOwners" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-            "KHAOS_WINDOWS_TRUSTED_ACL_SIDS=$trustedAclSids" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          .\packaging\windows\install-khaos-authorityd.ps1 `
+            -Binary "$env:GITHUB_WORKSPACE\rust\khaos-core\target\release\khaos-authorityd-windows.exe" `
+            -AgentSid $agentSid `
+            -ProtectedKeyPath 'C:\ProgramData\Khaos\authority-key.dpapi' `
+            -ProvisionDpapiKey
+          . (Join-Path $env:GITHUB_WORKSPACE 'packaging\windows\service-sid.ps1')
+          $authoritySid = Get-KhaosServiceSid -ServiceName 'KhaosAuthorityD'
+          "KHAOS_AUTHORITYD_SERVICE_SID=$authoritySid" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $catalogOwnerSid = ([System.Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
+          if ([string]::IsNullOrWhiteSpace($catalogOwnerSid)) { throw 'catalog owner SID unavailable' }
+          $trustRoot = 'C:\ProgramData\Khaos'
+          $trustedOwners = "$catalogOwnerSid,$authoritySid,S-1-5-18,S-1-5-32-544"
+          $trustedAclSids = "$authoritySid,$agentSid,S-1-5-18,S-1-5-32-544"
+          $env:KHAOS_WINDOWS_TRUST_ROOT = $trustRoot
+          $env:KHAOS_WINDOWS_TRUSTED_OWNER_SIDS = $trustedOwners
+          $env:KHAOS_WINDOWS_TRUSTED_ACL_SIDS = $trustedAclSids
+          "KHAOS_WINDOWS_TRUST_ROOT=$trustRoot" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "KHAOS_WINDOWS_TRUSTED_OWNER_SIDS=$trustedOwners" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "KHAOS_WINDOWS_TRUSTED_ACL_SIDS=$trustedAclSids" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - name: Run Windows native authority transaction with owned WORM receiver
         shell: pwsh
         run: |
@@ -524,9 +524,9 @@ jobs:
               --catalog-output 'C:\ProgramData\Khaos\native-resource-catalog.json'
             $rootAces = @('SYSTEM:(F)', 'Administrators:(F)', "${catalogOwnerSid}:(F)")
             if ($agentSid -ne $catalogOwnerSid) { $rootAces += "${agentSid}:(RX)" }
-            if ($authoritySid -ne $catalogOwnerSid -and $authoritySid -ne $agentSid) { $rootAces += "${authoritySid}:(RX)" }
+            if ($authoritySid -ne $catalogOwnerSid -and $authoritySid -ne $agentSid) { $rootAces += "*${authoritySid}:(RX)" }
             & "$env:SystemRoot\System32\icacls.exe" $trustRoot /inheritance:r /grant:r $rootAces | Out-Null
-            & "$env:SystemRoot\System32\icacls.exe" 'C:\ProgramData\Khaos\native-resource-catalog.json' /inheritance:r /grant:r 'SYSTEM:(R)' 'Administrators:(F)' "${catalogOwnerSid}:(R)" "${agentSid}:(R)" "${authoritySid}:(R)" | Out-Null
+            & "$env:SystemRoot\System32\icacls.exe" 'C:\ProgramData\Khaos\native-resource-catalog.json' /inheritance:r /grant:r 'SYSTEM:(R)' 'Administrators:(F)' "${catalogOwnerSid}:(R)" "${agentSid}:(R)" "*${authoritySid}:(R)" | Out-Null
             $venvRoot = (Resolve-Path -LiteralPath (Join-Path $env:GITHUB_WORKSPACE '.venv') -ErrorAction Stop).Path
             $venvPython = (Resolve-Path -LiteralPath (Join-Path $venvRoot 'Scripts\python.exe') -ErrorAction Stop).Path
             $venvSite = (Resolve-Path -LiteralPath (Join-Path $venvRoot 'Lib\site-packages') -ErrorAction Stop).Path
@@ -564,8 +564,8 @@ jobs:
             ) | Set-Content -LiteralPath $backendConfig -Encoding ascii
             & "$env:SystemRoot\System32\icacls.exe" $backendConfig /inheritance:r /grant:r 'SYSTEM:(F)' 'Administrators:(F)' | Out-Null
             uv run python -c "from pathlib import Path; from khaos.security.authorityd_protocol import Ed25519KeyStore; k=Ed25519KeyStore.load_or_create(Path(r'C:\ProgramData\Khaos\authorityd.pem'), create=True); Path(r'C:\ProgramData\Khaos\authorityd.pub').write_bytes(k.public_key().public_bytes_raw())"
-            & "$env:SystemRoot\System32\icacls.exe" 'C:\ProgramData\Khaos\authorityd.pem' /inheritance:r /grant:r 'SYSTEM:(F)' 'Administrators:(F)' "${catalogOwnerSid}:(R)" "${agentSid}:(R)" "${authoritySid}:(R)" | Out-Null
-            & "$env:SystemRoot\System32\icacls.exe" 'C:\ProgramData\Khaos\authorityd.pub' /inheritance:r /grant:r 'SYSTEM:(F)' 'Administrators:(F)' "${catalogOwnerSid}:(R)" "${agentSid}:(R)" "${authoritySid}:(R)" | Out-Null
+            & "$env:SystemRoot\System32\icacls.exe" 'C:\ProgramData\Khaos\authorityd.pem' /inheritance:r /grant:r 'SYSTEM:(F)' 'Administrators:(F)' "${catalogOwnerSid}:(R)" "${agentSid}:(R)" "*${authoritySid}:(R)" | Out-Null
+            & "$env:SystemRoot\System32\icacls.exe" 'C:\ProgramData\Khaos\authorityd.pub' /inheritance:r /grant:r 'SYSTEM:(F)' 'Administrators:(F)' "${catalogOwnerSid}:(R)" "${agentSid}:(R)" "*${authoritySid}:(R)" | Out-Null
             $backendBinary = "$env:GITHUB_WORKSPACE\rust\khaos-core\target\release\khaos-authorityd-backend-windows.exe"
             & "$env:SystemRoot\System32\sc.exe" create KhaosAuthorityDBackend binPath= "`"$backendBinary`" --config `"$backendConfig`"" start= auto obj= LocalSystem | Out-Null
             if ($LASTEXITCODE -ne 0) { throw 'failed to create the backend service' }
