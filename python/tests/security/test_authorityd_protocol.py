@@ -48,6 +48,10 @@ from khaos.security.authorityd_protocol import (
 from khaos.security.local_trust import ensure_local_authority_root
 from khaos.security.network_broker import NetworkBroker, NetworkBrokerError
 from khaos.security.principals import transport_root_delegation_digest
+from khaos.security.production_trust import (
+    ProductionTrustBinding,
+    public_key_fingerprint,
+)
 from khaos.security.resource_scope import GitRefScope, TypedResourcePartialOrder
 
 TEST_POLICY_DIGEST = "a" * 64
@@ -266,6 +270,53 @@ def test_public_key_load_is_binary_safe(tmp_path: Path) -> None:
         )
         == payload
     )
+
+
+def test_native_business_rejection_preserves_ready_trust_channel(tmp_path: Path) -> None:
+    key = Ed25519KeyStore.load_or_create(tmp_path / "authorityd.pem", create=True)
+    public_key_path = tmp_path / "authorityd.pub"
+    public_key_path.write_bytes(key.public_key().public_bytes_raw())
+    binding = ProductionTrustBinding.create(
+        protocol_version=AUTHORITYD_PROTOCOL,
+        authority_id="test-authorityd",
+        policy_digest=TEST_POLICY_DIGEST,
+        catalog_digest="b" * 64,
+        public_key_fingerprint=public_key_fingerprint(
+            key.public_key().public_bytes_raw()
+        ),
+        environment_digest="c" * 64,
+    )
+
+    class FakeNativeAdapter:
+        def request(self, payload: dict[str, object]) -> dict[str, object]:
+            if payload["operation"] == "handshake":
+                return {
+                    "ok": True,
+                    "ready": "READY",
+                    "issuer_id": binding.authority_id,
+                    "channel_nonce": "d" * 64,
+                    "runtime_identity": payload["runtime_identity"],
+                    "trust_binding": binding.to_payload(),
+                }
+            return {"ok": False, "error": "authority grant is revoked"}
+
+    client = authorityd_protocol_module.AuthorityDaemonClient(
+        transport="native",
+        native_adapter=FakeNativeAdapter(),
+        runtime_profile="production",
+        public_key_path=public_key_path,
+        trust_binding=binding,
+    )
+    client.handshake(
+        runtime_id="runtime",
+        principal_id="agent",
+        project_id="project",
+        principal_kind="human",
+    )
+
+    with pytest.raises(AuthorityControlPlaneError, match="grant is revoked"):
+        client.request({"operation": "prepare"})
+    assert client.ready
 
 
 @pytest.mark.posix_host

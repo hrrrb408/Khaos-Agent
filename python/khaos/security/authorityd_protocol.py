@@ -848,13 +848,26 @@ class AuthorityDaemonClient:
                     self._invalidate_trust_channel()
                 raise RemoteAuditUnavailableError("native authorityd is unavailable") from exc
             if not isinstance(response, dict) or response.get("ok") is not True:
-                if operation != "handshake":
-                    self._invalidate_trust_channel()
                 if isinstance(response, dict):
                     message = str(response.get("error", "native authorityd rejected request"))
+                    if (
+                        self.trust_binding is not None
+                        and operation != "handshake"
+                        and any(
+                            marker in message
+                            for marker in (
+                                "trust channel",
+                                "trust binding",
+                                "runtime identity",
+                            )
+                        )
+                    ):
+                        self._invalidate_trust_channel()
                     if response.get("error_code") == "remote_audit_unavailable":
                         raise RemoteAuditUnavailableError(message)
                     raise AuthorityControlPlaneError(message)
+                if operation != "handshake":
+                    self._invalidate_trust_channel()
                 raise AuthorityControlPlaneError("native authorityd returned an invalid response")
             return response
         try:
