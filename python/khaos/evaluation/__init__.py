@@ -1,6 +1,8 @@
 """M7.9 deterministic capability evaluation observation plane."""
 
 from khaos.evaluation.benchmark import (
+    BenchmarkExecutionEvidence,
+    BenchmarkOccurrenceKind,
     BenchmarkPredicate,
     BenchmarkPredicateKind,
     BenchmarkSecurityInvariant,
@@ -53,6 +55,8 @@ from khaos.evaluation.service import (
 )
 
 __all__ = [
+    "BenchmarkExecutionEvidence",
+    "BenchmarkOccurrenceKind",
     "BenchmarkPredicate",
     "BenchmarkPredicateKind",
     "BenchmarkSecurityInvariant",
