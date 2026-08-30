@@ -2224,7 +2224,24 @@ class AuthorityDaemon:
         # transport check.  It must remain usable before the runtime trust
         # channel exists, while every effect-bearing inner request still
         # requires the normal binding and channel nonce.
-        response = _dispatch(self, inner, allow_transport_probe=True)
+        try:
+            response = _dispatch(self, inner, allow_transport_probe=True)
+        except RemoteAuditUnavailableError as exc:
+            # Keep the transport attestation intact while carrying a durable
+            # audit failure as an application-level UNKNOWN response.  The
+            # native client must be able to distinguish a trusted authority
+            # rejection from a broken native transport and retain its READY
+            # channel for the next bounded request.
+            response = {
+                "ok": False,
+                "error": str(exc),
+                "error_code": "remote_audit_unavailable",
+            }
+        except (AuthorityControlPlaneError, ProtocolBoundaryError, OSError, ValueError, TypeError) as exc:
+            # Native transports sign this response envelope, so ordinary
+            # business/policy rejection does not masquerade as a transport
+            # identity failure at the adapter boundary.
+            response = {"ok": False, "error": str(exc)}
         return {
             "ok": True,
             "response": response,

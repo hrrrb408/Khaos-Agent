@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -52,6 +53,7 @@ from khaos.security.production_trust import (
     ProductionTrustBinding,
     public_key_fingerprint,
 )
+from khaos.security.protocol_boundary import canonical_json_bytes
 from khaos.security.resource_scope import GitRefScope, TypedResourcePartialOrder
 
 TEST_POLICY_DIGEST = "a" * 64
@@ -317,6 +319,52 @@ def test_native_business_rejection_preserves_ready_trust_channel(tmp_path: Path)
     with pytest.raises(AuthorityControlPlaneError, match="grant is revoked"):
         client.request({"operation": "prepare"})
     assert client.ready
+
+
+def test_native_attestation_keeps_business_rejection_inside_signed_envelope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    key = Ed25519KeyStore.load_or_create(tmp_path / "authorityd.pem", create=True)
+    daemon = AuthorityDaemon(
+        socket_path=tmp_path / "authorityd.sock",
+        signing_key=key,
+        audit_writer=_MemoryWorm(),
+        issuer_id="test-authorityd",
+        policy=lambda _intent: None,
+    )
+
+    def reject_dispatch(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise AuthorityControlPlaneError("authority grant is revoked")
+
+    monkeypatch.setattr(authorityd_module, "_dispatch", reject_dispatch)
+    raw_request = canonical_json_bytes(
+        {"protocol": AUTHORITYD_PROTOCOL, "operation": "ping"}
+    )
+    response = daemon.attest(
+        proof_fields={
+            "platform": "win32",
+            "transport": "named-pipe",
+            "service_id": "KhaosAuthorityD",
+            "service_pid": "1",
+            "service_identity": "S-1-5-18",
+            "peer_identity": "S-1-5-21-test",
+            "peer_team_id": "S-1-5-21-test",
+            "peer_cdhash": "",
+            "designated_requirement_digest": "a" * 64,
+            "service_instance_id": "b" * 32,
+            "protected_key_ref": "test-key",
+        },
+        challenge_nonce="c" * 64,
+        request_raw_hex=raw_request.hex(),
+        request_digest=hashlib.sha256(raw_request).hexdigest(),
+    )
+
+    assert response["ok"] is True
+    assert response["response"] == {
+        "ok": False,
+        "error": "authority grant is revoked",
+    }
+    assert isinstance(response["attestation"], dict)
 
 
 @pytest.mark.posix_host
