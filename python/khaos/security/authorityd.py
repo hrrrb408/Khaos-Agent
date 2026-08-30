@@ -2224,7 +2224,7 @@ class AuthorityDaemon:
         # transport check.  It must remain usable before the runtime trust
         # channel exists, while every effect-bearing inner request still
         # requires the normal binding and channel nonce.
-        if inner.get("operation") != "ping":
+        if inner.get("operation") not in {"ping", "handshake"}:
             # Do not turn an unbound or mismatched effect request into a
             # seemingly successful attestation.  Once this trust preflight
             # passes, _dispatch may still return a signed application-level
