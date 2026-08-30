@@ -239,6 +239,16 @@ def test_windows_product_suite_declares_posix_host_applicability_boundary():
     assert "explicitly marked ``posix_host`` tests" in product
 
 
+def test_cross_platform_contract_matrix_filters_posix_host_on_windows():
+    """The Windows matrix cell must not execute Unix-only contract tests."""
+    contract = (WORKFLOWS / "security-contract-matrix.yml").read_text(
+        encoding="utf-8"
+    )
+    assert "runner.os == 'Windows'" in contract
+    assert "'not posix_host'" in contract
+    assert "'not posix_host or posix_host'" in contract
+
+
 def test_windows_product_suite_runs_complete_collection_in_isolated_shards():
     """Windows sharding must isolate resources without shrinking coverage."""
     product = (WORKFLOWS / "product-integrity-gate.yml").read_text(

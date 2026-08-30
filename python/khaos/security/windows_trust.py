@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +37,7 @@ _WRITE_DAC = 0x00040000
 _WRITE_OWNER = 0x00080000
 _GENERIC_WRITE = 0x40000000
 _GENERIC_ALL = 0x10000000
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 _WRITE_MASK = (
     _FILE_WRITE_DATA
     | _FILE_APPEND_DATA
@@ -122,6 +124,39 @@ def _trusted_configuration(path: Path) -> tuple[Path, set[str], set[str]]:
     ):
         raise WindowsTrustError("Windows trust ACL contains an invalid SID")
     return root, owner_sids, allowed_write_sids
+
+
+def _windows_path_components(path: Path) -> tuple[Path, ...]:
+    """Return every lexical component from the volume root to ``path``."""
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        raise WindowsTrustError("Windows trust paths must be absolute")
+    current = Path(candidate.anchor)
+    components = [current]
+    for part in candidate.parts[1:]:
+        current /= part
+        components.append(current)
+    return tuple(components)
+
+
+def reject_windows_reparse_points(path: Path) -> None:
+    """Reject symlinks and other reparse points in a trust-material path."""
+    if os.name != "nt":
+        return
+    for component in _windows_path_components(path):
+        try:
+            metadata = component.lstat()
+        except OSError as exc:
+            raise WindowsTrustError(
+                f"Windows trust path is unavailable: {component}"
+            ) from exc
+        if stat.S_ISLNK(metadata.st_mode) or bool(
+            getattr(metadata, "st_file_attributes", 0)
+            & _FILE_ATTRIBUTE_REPARSE_POINT
+        ):
+            raise WindowsTrustError(
+                "Windows trust path contains a symlink or reparse point"
+            )
 
 
 def _bindings() -> tuple[Any, Any]:
@@ -315,6 +350,7 @@ def validate_windows_trusted_path(path: Path, *, kind: str) -> None:
     if kind not in {"catalog", "key", "public-key"}:
         raise WindowsTrustError("Windows trust material kind is invalid")
     root, owner_sids, allowed_write_sids = _trusted_configuration(path)
+    reject_windows_reparse_points(path)
     advapi32, kernel32 = _bindings()
     candidate = Path(path).expanduser()
     relative = candidate.relative_to(root)
@@ -357,6 +393,7 @@ def validate_windows_trusted_descriptor(fd: int, *, path: Path, kind: str) -> No
 
 __all__ = [
     "WindowsTrustError",
+    "reject_windows_reparse_points",
     "validate_windows_trusted_descriptor",
     "validate_windows_trusted_path",
 ]

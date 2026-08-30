@@ -78,7 +78,7 @@
 - `python/khaos/security/production_trust.py`: `50d6c57952e2aaad131de39795c7fe2fcd45908a3243c4273b9070e4a7445b4f`
 - `python/khaos/security/authorityd.py`: `1a7174a05e8cbdcb7483b9bb3a955c120ebf149ddd70dc75d458f62c96a122ae`
 - `python/khaos/security/authorityd_main.py`: `342e4113e71e3e9703cd6a1fefa51447149e3abd5595e3ed6be0be3b6ca6fc5c`
-- `python/khaos/security/authorityd_protocol.py`: `2564954bebfbdda4b3652a5d2c5205bec2fa02f454ee324a2c9645bf4d873af7`
+- `python/khaos/security/authorityd_protocol.py`: `5e47e865767c1b89924c1e71140bf64979882a2fab525faa97214554c0cc0d96`
 - `python/khaos/security/authorityd_windows.py`: `8d5cbd61c1c90aaf62ab2f9d89033b3cc6b14f90b9cab32d5411ea10006147a7`
 - `python/khaos/security/authority_transport.py`: `708fe644d8dd09cde487343820759205b1a6e0509204b5b627dd5e27517bb443`
 - `python/khaos/security/local_trust.py`: `5b21528a9e76fdf31fe897b43c4aef15c00ea6f1cf95ba758a7dc0f35f67c291`
@@ -90,7 +90,7 @@
 - `python/khaos/security/production_composition_probe.py`: `b430df5d8424e3fd591bc54bcd2600a255ad833aafe3be05cebffe2291a6be6f`
 - `python/khaos/security/remote_audit.py`: `f4dd34928f14ce485203ec97755a245e45b8bad37c2eddc0fdb6757db94b7601`
 - `python/khaos/security/network_broker.py`: `1aa226efb60197b19d6163f5bc77fbdd0a1fa2f94388694e04723b3d5ceeee9e`
-- `python/khaos/security/resource_scope.py`: `ca02b4e7c205c4d6069014955e259badeb2090fbe5ded0ba34e2ec27eaf7f837`
+- `python/khaos/security/resource_scope.py`: `24dfaa928b28fb3f5261b0d36ff49eb4acbcc0d1a8167fc301bd8e18d1ca7d9a`
 - `python/khaos/security/principals.py`: `cc81b10ffa5a2a54b413a3b5cc37a85fe428253c7687be4dbf30b61610b4f8b0`
 - `python/khaos/security/shell_semantics.py`: `a44d1b70e10e94fb612fe0f9bd134b660ffae1a26d12949f3f4f5b08c9a3ff6b`
 - `python/khaos/coding/planning/security_identities.py`: `bcafd43a2920e087f4c064091d9faa04184739a4a8a6454aa654ffd134790a38`

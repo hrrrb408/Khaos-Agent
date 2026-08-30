@@ -689,6 +689,14 @@ class AuthorityDaemonClient:
         trust_binding: ProductionTrustBinding | None = None,
         community_local: bool = False,
     ) -> None:
+        if type(community_local) is not bool:
+            raise ValueError("community local authority flag is invalid")
+        resolved_runtime_profile = resolve_runtime_profile(runtime_profile)
+        requires_explicit_binding = (
+            resolved_runtime_profile.is_production
+            and trust_binding is None
+            and not community_local
+        )
         # The caller (normally AuthorityTransportConfig) selects the
         # transport.  For direct protocol tests, preserve the intuitive
         # shape: an injected adapter means native; a socket path means Unix.
@@ -697,6 +705,13 @@ class AuthorityDaemonClient:
         )
         if selected_transport not in {"unix", "native"}:
             raise ValueError("authorityd transport is invalid")
+        if (
+            requires_explicit_binding
+            and sys.platform.startswith(("win", "cygwin", "msys"))
+        ):
+            raise ValueError(
+                "production authorityd client requires an explicit trust binding"
+            )
         if selected_transport == "unix" and sys.platform.startswith(
             ("win", "cygwin", "msys")
         ):
@@ -716,9 +731,6 @@ class AuthorityDaemonClient:
             raise ValueError("authorityd public key path must be absolute")
         if trusted_local_root is not None and not trusted_local_root.is_absolute():
             raise ValueError("authorityd trusted root must be absolute")
-        if type(community_local) is not bool:
-            raise ValueError("community local authority flag is invalid")
-        resolved_runtime_profile = resolve_runtime_profile(runtime_profile)
         if (
             trusted_local_root is not None
             and resolved_runtime_profile.is_production
@@ -738,11 +750,7 @@ class AuthorityDaemonClient:
             raise ValueError(
                 "community local authority requires a trusted Unix root"
             )
-        if (
-            resolved_runtime_profile.is_production
-            and trust_binding is None
-            and not community_local
-        ):
+        if requires_explicit_binding:
             raise ValueError(
                 "production authorityd client requires an explicit trust binding"
             )

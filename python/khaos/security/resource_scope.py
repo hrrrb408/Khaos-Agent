@@ -32,6 +32,7 @@ from khaos.coding.planning.security_identities import CanonicalWorkspaceId
 from khaos.security.protocol_boundary import canonical_digest, strict_json_loads
 from khaos.security.windows_trust import (
     WindowsTrustError,
+    reject_windows_reparse_points,
     validate_windows_trusted_descriptor,
     validate_windows_trusted_path,
 )
@@ -969,6 +970,8 @@ def _open_trusted_catalog(path: Path, *, require_windows_acl: bool = False) -> i
         try:
             if require_windows_acl:
                 validate_windows_trusted_path(candidate, kind="catalog")
+            else:
+                reject_windows_reparse_points(candidate)
             descriptor = os.open(
                 str(candidate), os.O_RDONLY | no_follow | close_on_exec | _O_BINARY
             )
