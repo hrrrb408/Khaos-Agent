@@ -461,7 +461,6 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($catalogOwnerSid)) { throw 'catalog owner SID unavailable' }
           $trustRoot = 'C:\ProgramData\Khaos'
           $auditTrustedDir = Join-Path $trustRoot '.khaos\audit'
-          New-Item -ItemType Directory -Force -Path $auditTrustedDir | Out-Null
           $trustedOwners = "$catalogOwnerSid,$authoritySid,S-1-5-18,S-1-5-32-544"
           $trustedAclSids = "$authoritySid,$catalogOwnerSid,$agentSid,S-1-5-18,S-1-5-32-544"
           $env:KHAOS_WINDOWS_TRUST_ROOT = $trustRoot
@@ -550,7 +549,6 @@ jobs:
             if ($agentSid -ne $catalogOwnerSid) { $rootAces += "*${agentSid}:(RX)" }
             if ($authoritySid -ne $catalogOwnerSid -and $authoritySid -ne $agentSid) { $rootAces += "*${authoritySid}:(RX)" }
             Set-KhaosAcl -Path $trustRoot -Aces $rootAces
-            Set-KhaosAcl -Path $auditTrustedDir -Aces @('SYSTEM:(F)', 'Administrators:(F)', "*${catalogOwnerSid}:(F)", "*${agentSid}:(RX)", "*${authoritySid}:(RX)")
             Set-KhaosAcl -Path 'C:\ProgramData\Khaos\native-resource-catalog.json' -Aces @('SYSTEM:(R)', 'Administrators:(F)', "*${catalogOwnerSid}:(R)", "*${agentSid}:(R)", "*${authoritySid}:(R)")
             $venvRoot = (Resolve-Path -LiteralPath (Join-Path $env:GITHUB_WORKSPACE '.venv') -ErrorAction Stop).Path
             $venvPython = (Resolve-Path -LiteralPath (Join-Path $venvRoot 'Scripts\python.exe') -ErrorAction Stop).Path
