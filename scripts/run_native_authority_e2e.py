@@ -168,6 +168,16 @@ def _build_client() -> AuthorityDaemonClient:
     )
 
 
+def _handshake(client: AuthorityDaemonClient) -> None:
+    """Establish the production trust channel before any authority request."""
+    client.handshake(
+        runtime_id="e2e-runtime",
+        principal_id=E2E_PRINCIPAL_ID,
+        project_id=E2E_PROJECT_ID,
+        principal_kind=E2E_PRINCIPAL_KIND,
+    )
+
+
 def _delegation_digest(runtime_id: str, policy_digest: str) -> str:
     """Return the canonical identity commitment used by the native E2E."""
     return transport_root_delegation_digest(
@@ -300,6 +310,7 @@ def run_e2e(*, expect_unavailable: bool) -> dict[str, object]:
         # The backend is deliberately absent.  The only acceptable result is
         # an explicit unavailable/UNKNOWN error; success would be fail-open.
         try:
+            _handshake(client)
             _grant(
                 client,
                 policy_digest=policy_digest,
@@ -320,6 +331,8 @@ def run_e2e(*, expect_unavailable: bool) -> dict[str, object]:
             file=sys.stderr,
         )
         raise SystemExit(1)
+
+    _handshake(client)
 
     # Scenario 1: full transaction with a bounded test effect.
     effect_root = _prepare_effect_root()

@@ -579,6 +579,37 @@ def test_native_e2e_client_does_not_require_a_unix_socket(
     assert client.trust_binding is not None
 
 
+def test_native_e2e_handshakes_before_transaction_requests() -> None:
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "run_native_authority_e2e_handshake",
+        Path(__file__).resolve().parents[2].parent
+        / "scripts"
+        / "run_native_authority_e2e.py",
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.identity: dict[str, str] | None = None
+
+        def handshake(self, **identity: str) -> None:
+            self.identity = identity
+
+    client = FakeClient()
+    module._handshake(client)
+
+    assert client.identity == {
+        "runtime_id": "e2e-runtime",
+        "principal_id": module.E2E_PRINCIPAL_ID,
+        "project_id": module.E2E_PROJECT_ID,
+        "principal_kind": module.E2E_PRINCIPAL_KIND,
+    }
+
+
 def test_e2e_intent_reuses_the_grant_owner_context() -> None:
     import importlib.util
 
