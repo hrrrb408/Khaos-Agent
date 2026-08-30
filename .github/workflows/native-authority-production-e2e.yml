@@ -460,18 +460,34 @@ jobs:
           $catalogOwnerSid = ([System.Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
           if ([string]::IsNullOrWhiteSpace($catalogOwnerSid)) { throw 'catalog owner SID unavailable' }
           $trustRoot = 'C:\ProgramData\Khaos'
+          $auditTrustedDir = Join-Path $trustRoot '.khaos\audit'
+          New-Item -ItemType Directory -Force -Path $auditTrustedDir | Out-Null
           $trustedOwners = "$catalogOwnerSid,$authoritySid,S-1-5-18,S-1-5-32-544"
           $trustedAclSids = "$authoritySid,$agentSid,S-1-5-18,S-1-5-32-544"
           $env:KHAOS_WINDOWS_TRUST_ROOT = $trustRoot
           $env:KHAOS_WINDOWS_TRUSTED_OWNER_SIDS = $trustedOwners
           $env:KHAOS_WINDOWS_TRUSTED_ACL_SIDS = $trustedAclSids
+          $env:KHAOS_AUDIT_TRUSTED_DIR = $auditTrustedDir
           "KHAOS_WINDOWS_TRUST_ROOT=$trustRoot" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "KHAOS_WINDOWS_TRUSTED_OWNER_SIDS=$trustedOwners" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "KHAOS_WINDOWS_TRUSTED_ACL_SIDS=$trustedAclSids" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "KHAOS_AUDIT_TRUSTED_DIR=$auditTrustedDir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - name: Run Windows native authority transaction with owned WORM receiver
         shell: pwsh
         run: |
           $env:PYTHONPATH = "$env:GITHUB_WORKSPACE\python"
+          $trustRoot = $env:KHAOS_WINDOWS_TRUST_ROOT
+          $agentSid = $env:KHAOS_AGENT_SID
+          $authoritySid = $env:KHAOS_AUTHORITYD_SERVICE_SID
+          $catalogOwnerSid = ([System.Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
+          $auditTrustedDir = $env:KHAOS_AUDIT_TRUSTED_DIR
+          if ([string]::IsNullOrWhiteSpace($trustRoot) -or
+              [string]::IsNullOrWhiteSpace($agentSid) -or
+              [string]::IsNullOrWhiteSpace($authoritySid) -or
+              [string]::IsNullOrWhiteSpace($catalogOwnerSid) -or
+              [string]::IsNullOrWhiteSpace($auditTrustedDir)) {
+            throw 'Windows authority trust identity environment is incomplete'
+          }
           $caPath = 'C:\ProgramData\Khaos\worm-ca.pem'
           $wormLog = 'C:\ProgramData\Khaos\worm-receiver.log'
           $wormErrorLog = 'C:\ProgramData\Khaos\worm-receiver.err.log'
@@ -557,6 +573,7 @@ jobs:
                 "KHAOS_WINDOWS_TRUST_ROOT=$env:KHAOS_WINDOWS_TRUST_ROOT"
                 "KHAOS_WINDOWS_TRUSTED_OWNER_SIDS=$env:KHAOS_WINDOWS_TRUSTED_OWNER_SIDS"
                 "KHAOS_WINDOWS_TRUSTED_ACL_SIDS=$env:KHAOS_WINDOWS_TRUSTED_ACL_SIDS"
+                "KHAOS_AUDIT_TRUSTED_DIR=$env:KHAOS_AUDIT_TRUSTED_DIR"
                 'KHAOS_AUTHORITYD_PROTECTED_KEY_REF=khaos-authority-signing-key'
                 "KHAOS_AUDIT_WORM_ENDPOINT=$env:KHAOS_AUDIT_WORM_ENDPOINT"
                 "KHAOS_AUDIT_WORM_CA_FILE=$env:KHAOS_AUDIT_WORM_CA_FILE"

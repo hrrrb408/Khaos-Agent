@@ -62,6 +62,10 @@ def test_windows_workflow_uses_the_native_backend_host() -> None:
     assert "KHAOS_AUTHORITY_PROFILE=native-production" in source
     assert "KHAOS_AUTHORITYD_BACKEND_PIPE=\\\\.\\pipe\\KhaosAuthorityDBackend" in source
     assert "KHAOS_AUDIT_WORM_CA_FILE=$env:KHAOS_AUDIT_WORM_CA_FILE" in source
+    assert "KHAOS_AUDIT_TRUSTED_DIR=$env:KHAOS_AUDIT_TRUSTED_DIR" in source
+    assert "$trustRoot = $env:KHAOS_WINDOWS_TRUST_ROOT" in source
+    assert "$authoritySid = $env:KHAOS_AUTHORITYD_SERVICE_SID" in source
+    assert "KHAOS_AUDIT_TRUSTED_DIR" in source
     assert "-SkipCertificateCheck" in source
     assert "start_worm_audit_receiver.ps1" in source
     assert "stop_worm_audit_receiver.ps1" in source

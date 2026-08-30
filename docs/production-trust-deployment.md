@@ -24,13 +24,16 @@ the native platform or protected-branch release gates.
    profile diagnostic sink.
 
 On Windows, also provision `KHAOS_WINDOWS_TRUST_ROOT`,
-`KHAOS_WINDOWS_TRUSTED_OWNER_SIDS`, and the explicit
-`KHAOS_WINDOWS_TRUSTED_ACL_SIDS` set in the authority-owned service
-configuration. Apply an inheritance-disabled ACL to the root, catalog, key,
-and public-key paths before starting the backend. The runtime and authorityd
-use Win32 security-descriptor/handle checks; missing variables, an unknown
-owner, an unparsed ACE, or an untrusted write ACE rejects startup. POSIX mode
-bits are not used as a Windows substitute.
+`KHAOS_WINDOWS_TRUSTED_OWNER_SIDS`, the explicit
+`KHAOS_WINDOWS_TRUSTED_ACL_SIDS`, and an authority-owned
+`KHAOS_AUDIT_TRUSTED_DIR` under the service configuration. The latter is
+required because a LocalSystem/Service-SID process may have no user home; it
+must name a `.khaos/audit` directory and is not selected by a task or
+workspace. Apply an inheritance-disabled ACL to the root, catalog, key, and
+public-key paths before starting the backend. The runtime and authorityd use
+Win32 security-descriptor/handle checks; missing variables, an unknown owner,
+an unparsed ACE, or an untrusted write ACE rejects startup. POSIX mode bits are
+not used as a Windows substitute.
 
 ## Startup verification
 
