@@ -463,7 +463,7 @@ jobs:
           $auditTrustedDir = Join-Path $trustRoot '.khaos\audit'
           New-Item -ItemType Directory -Force -Path $auditTrustedDir | Out-Null
           $trustedOwners = "$catalogOwnerSid,$authoritySid,S-1-5-18,S-1-5-32-544"
-          $trustedAclSids = "$authoritySid,$agentSid,S-1-5-18,S-1-5-32-544"
+          $trustedAclSids = "$authoritySid,$catalogOwnerSid,$agentSid,S-1-5-18,S-1-5-32-544"
           $env:KHAOS_WINDOWS_TRUST_ROOT = $trustRoot
           $env:KHAOS_WINDOWS_TRUSTED_OWNER_SIDS = $trustedOwners
           $env:KHAOS_WINDOWS_TRUSTED_ACL_SIDS = $trustedAclSids
@@ -487,6 +487,14 @@ jobs:
               [string]::IsNullOrWhiteSpace($catalogOwnerSid) -or
               [string]::IsNullOrWhiteSpace($auditTrustedDir)) {
             throw 'Windows authority trust identity environment is incomplete'
+          }
+          function Set-KhaosAcl {
+            param(
+              [Parameter(Mandatory = $true)][string]$Path,
+              [Parameter(Mandatory = $true)][string[]]$Aces
+            )
+            & "$env:SystemRoot\System32\icacls.exe" $Path /inheritance:r /grant:r $Aces | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "failed to apply authority ACL to $Path" }
           }
           $caPath = 'C:\ProgramData\Khaos\worm-ca.pem'
           $wormLog = 'C:\ProgramData\Khaos\worm-receiver.log'
@@ -538,11 +546,12 @@ jobs:
             New-Item -ItemType Directory -Force -Path $backendDir, $backendSite, C:\ProgramData\Khaos | Out-Null
             uv run python scripts/run_native_authority_e2e.py `
               --catalog-output 'C:\ProgramData\Khaos\native-resource-catalog.json'
-            $rootAces = @('SYSTEM:(F)', 'Administrators:(F)', "${catalogOwnerSid}:(F)")
-            if ($agentSid -ne $catalogOwnerSid) { $rootAces += "${agentSid}:(RX)" }
+            $rootAces = @('SYSTEM:(F)', 'Administrators:(F)', "*${catalogOwnerSid}:(F)")
+            if ($agentSid -ne $catalogOwnerSid) { $rootAces += "*${agentSid}:(RX)" }
             if ($authoritySid -ne $catalogOwnerSid -and $authoritySid -ne $agentSid) { $rootAces += "*${authoritySid}:(RX)" }
-            & "$env:SystemRoot\System32\icacls.exe" $trustRoot /inheritance:r /grant:r $rootAces | Out-Null
-            & "$env:SystemRoot\System32\icacls.exe" 'C:\ProgramData\Khaos\native-resource-catalog.json' /inheritance:r /grant:r 'SYSTEM:(R)' 'Administrators:(F)' "${catalogOwnerSid}:(R)" "${agentSid}:(R)" "*${authoritySid}:(R)" | Out-Null
+            Set-KhaosAcl -Path $trustRoot -Aces $rootAces
+            Set-KhaosAcl -Path $auditTrustedDir -Aces @('SYSTEM:(F)', 'Administrators:(F)', "*${catalogOwnerSid}:(F)", "*${agentSid}:(RX)", "*${authoritySid}:(RX)")
+            Set-KhaosAcl -Path 'C:\ProgramData\Khaos\native-resource-catalog.json' -Aces @('SYSTEM:(R)', 'Administrators:(F)', "*${catalogOwnerSid}:(R)", "*${agentSid}:(R)", "*${authoritySid}:(R)")
             $venvRoot = (Resolve-Path -LiteralPath (Join-Path $env:GITHUB_WORKSPACE '.venv') -ErrorAction Stop).Path
             $venvPython = (Resolve-Path -LiteralPath (Join-Path $venvRoot 'Scripts\python.exe') -ErrorAction Stop).Path
             $venvSite = (Resolve-Path -LiteralPath (Join-Path $venvRoot 'Lib\site-packages') -ErrorAction Stop).Path
@@ -579,10 +588,10 @@ jobs:
                 "KHAOS_AUDIT_WORM_CA_FILE=$env:KHAOS_AUDIT_WORM_CA_FILE"
                 'KHAOS_AUTHORITYD_CONNECTION_TIMEOUT=5'
             ) | Set-Content -LiteralPath $backendConfig -Encoding ascii
-            & "$env:SystemRoot\System32\icacls.exe" $backendConfig /inheritance:r /grant:r 'SYSTEM:(F)' 'Administrators:(F)' | Out-Null
+            Set-KhaosAcl -Path $backendConfig -Aces @('SYSTEM:(F)', 'Administrators:(F)')
             uv run python -c "from pathlib import Path; from khaos.security.authorityd_protocol import Ed25519KeyStore; k=Ed25519KeyStore.load_or_create(Path(r'C:\ProgramData\Khaos\authorityd.pem'), create=True); Path(r'C:\ProgramData\Khaos\authorityd.pub').write_bytes(k.public_key().public_bytes_raw())"
-            & "$env:SystemRoot\System32\icacls.exe" 'C:\ProgramData\Khaos\authorityd.pem' /inheritance:r /grant:r 'SYSTEM:(F)' 'Administrators:(F)' "${catalogOwnerSid}:(R)" "${agentSid}:(R)" "*${authoritySid}:(R)" | Out-Null
-            & "$env:SystemRoot\System32\icacls.exe" 'C:\ProgramData\Khaos\authorityd.pub' /inheritance:r /grant:r 'SYSTEM:(F)' 'Administrators:(F)' "${catalogOwnerSid}:(R)" "${agentSid}:(R)" "*${authoritySid}:(R)" | Out-Null
+            Set-KhaosAcl -Path 'C:\ProgramData\Khaos\authorityd.pem' -Aces @('SYSTEM:(F)', 'Administrators:(F)', "*${catalogOwnerSid}:(R)", "*${agentSid}:(R)", "*${authoritySid}:(R)")
+            Set-KhaosAcl -Path 'C:\ProgramData\Khaos\authorityd.pub' -Aces @('SYSTEM:(F)', 'Administrators:(F)', "*${catalogOwnerSid}:(R)", "*${agentSid}:(R)", "*${authoritySid}:(R)")
             $backendBinary = "$env:GITHUB_WORKSPACE\rust\khaos-core\target\release\khaos-authorityd-backend-windows.exe"
             & "$env:SystemRoot\System32\sc.exe" create KhaosAuthorityDBackend binPath= "`"$backendBinary`" --config `"$backendConfig`"" start= auto obj= LocalSystem | Out-Null
             if ($LASTEXITCODE -ne 0) { throw 'failed to create the backend service' }

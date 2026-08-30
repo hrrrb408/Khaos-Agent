@@ -66,6 +66,8 @@ def test_windows_workflow_uses_the_native_backend_host() -> None:
     assert "$trustRoot = $env:KHAOS_WINDOWS_TRUST_ROOT" in source
     assert "$authoritySid = $env:KHAOS_AUTHORITYD_SERVICE_SID" in source
     assert "KHAOS_AUDIT_TRUSTED_DIR" in source
+    assert "function Set-KhaosAcl" in source
+    assert "failed to apply authority ACL" in source
     assert "-SkipCertificateCheck" in source
     assert "start_worm_audit_receiver.ps1" in source
     assert "stop_worm_audit_receiver.ps1" in source
