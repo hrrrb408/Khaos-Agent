@@ -105,9 +105,10 @@ class CapabilityEvidenceService:
                 raise EvaluationCaptureError("GoalSpec identity changed before evidence capture")
 
             state, task_valid = _decode_state(task_row)
-            workspace_id = _optional_text(state.get("workspace_id"))
-            repository_id = _optional_text(state.get("repository_id"))
-            base_revision = _optional_text(state.get("base_revision"))
+            metadata: dict[str, Any] = state.get("metadata") if type(state.get("metadata")) is dict else {}  # type: ignore[assignment]
+            workspace_id = _optional_text(state.get("workspace_id") or metadata.get("workspace_id"))
+            repository_id = _optional_text(state.get("repository_id") or metadata.get("repository_id"))
+            base_revision = _optional_text(state.get("base_revision") or metadata.get("base_sha") or metadata.get("base_revision"))
             published_plan = _optional_text(_row_value(task_row, "published_plan_revision_id"))
             task_digest = canonical_digest(
                 {
@@ -217,20 +218,33 @@ class CapabilityEvidenceService:
             routes, availability["routes"], marks["routes"] = await self._records(
                 conn,
                 source="routes",
-                query="""SELECT route_id, route_sequence, route_digest, route_disposition, reason_code
+                query="""SELECT route_id, route_sequence, route_digest, route_disposition, reason_code,
+                                principal_id, task_owner_principal_id, execution_principal_id,
+                                project_id, task_id, execution_epoch_digest, plan_revision_id,
+                                plan_revision_digest, plan_step_id, plan_step_digest,
+                                subagent_assignment_id, subagent_assignment_digest, tool_name
                          FROM agent_plan_tool_routes
-                         WHERE principal_id = ? AND project_id = ? AND task_id = ?
+                         WHERE (principal_id = ? OR task_owner_principal_id = ?)
+                           AND project_id = ? AND task_id = ?
                          ORDER BY route_sequence ASC LIMIT ?""",
-                head_query="""SELECT route_id, route_sequence, route_digest, route_disposition, reason_code
+                head_query="""SELECT route_id, route_sequence, route_digest, route_disposition, reason_code,
+                                     principal_id, task_owner_principal_id, execution_principal_id,
+                                     project_id, task_id, execution_epoch_digest, plan_revision_id,
+                                     plan_revision_digest, plan_step_id, plan_step_digest,
+                                     subagent_assignment_id, subagent_assignment_digest, tool_name
                               FROM agent_plan_tool_routes
-                              WHERE principal_id = ? AND project_id = ? AND task_id = ?
+                              WHERE (principal_id = ? OR task_owner_principal_id = ?)
+                                AND project_id = ? AND task_id = ?
                               ORDER BY route_sequence DESC LIMIT 1""",
-                params=(request.principal_id, request.project_id, request.task_id),
+                params=(request.principal_id, request.principal_id, request.project_id, request.task_id),
                 limit=limit,
                 id_key="route_id",
                 sequence_key="route_sequence",
                 digest_key="route_digest",
-                field_keys=("route_disposition", "reason_code"),
+                field_keys=("route_disposition", "reason_code", "principal_id", "task_owner_principal_id",
+                            "execution_principal_id", "project_id", "task_id", "execution_epoch_digest",
+                            "plan_revision_id", "plan_revision_digest", "plan_step_id", "plan_step_digest",
+                            "subagent_assignment_id", "subagent_assignment_digest", "tool_name"),
             )
             steps, availability["step_states"], marks["step_states"] = await self._records(
                 conn,
@@ -268,12 +282,16 @@ class CapabilityEvidenceService:
             fences, availability["dispatch_fences"], marks["dispatch_fences"] = await self._records(
                 conn,
                 source="dispatch_fences",
-                query="""SELECT fence_id, route_digest, status, effect_status, effect_id,
+                query="""SELECT fence_id, route_id, route_digest, status, effect_status, effect_id,
+                                principal_id, project_id, task_id, execution_epoch_digest,
+                                plan_revision_id, plan_step_id, workspace_id, workspace_generation,
                                 created_at
                          FROM agent_plan_dispatch_fences
                          WHERE principal_id = ? AND project_id = ? AND task_id = ?
                          ORDER BY created_at ASC, fence_id ASC LIMIT ?""",
-                head_query="""SELECT fence_id, route_digest, status, effect_status, effect_id,
+                head_query="""SELECT fence_id, route_id, route_digest, status, effect_status, effect_id,
+                                     principal_id, project_id, task_id, execution_epoch_digest,
+                                     plan_revision_id, plan_step_id, workspace_id, workspace_generation,
                                      created_at
                               FROM agent_plan_dispatch_fences
                               WHERE principal_id = ? AND project_id = ? AND task_id = ?
@@ -283,7 +301,9 @@ class CapabilityEvidenceService:
                 id_key="fence_id",
                 sequence_key=None,
                 digest_key="route_digest",
-                field_keys=("status", "effect_status", "effect_id", "created_at"),
+                field_keys=("route_id", "status", "effect_status", "effect_id", "principal_id", "project_id",
+                            "task_id", "execution_epoch_digest", "plan_revision_id", "plan_step_id",
+                            "workspace_id", "workspace_generation", "created_at"),
                 state_query="""SELECT json_group_array(json_object(
                                       'fence_id', fence_id,
                                       'route_digest', route_digest,
@@ -304,7 +324,11 @@ class CapabilityEvidenceService:
                 query="""SELECT a.assignment_id, a.assignment_sequence, a.assignment_digest,
                                 a.plan_step_id, r.state AS run_state,
                                 r.state_version AS run_state_version,
-                                s.state AS parent_step_state
+                                s.state AS parent_step_state,
+                                a.task_owner_principal_id, a.project_id, a.parent_task_id,
+                                a.goal_spec_id, a.published_plan_revision_id,
+                                a.execution_epoch_digest, a.plan_step_digest,
+                                a.child_execution_principal_id, a.child_runtime_id
                          FROM agent_subagent_assignments a
                          LEFT JOIN agent_subagent_runs r ON r.assignment_id = a.assignment_id
                          LEFT JOIN agent_plan_step_states s
@@ -319,7 +343,11 @@ class CapabilityEvidenceService:
                 head_query="""SELECT a.assignment_id, a.assignment_sequence, a.assignment_digest,
                                      a.plan_step_id, r.state AS run_state,
                                      r.state_version AS run_state_version,
-                                     s.state AS parent_step_state
+                                     s.state AS parent_step_state,
+                                     a.task_owner_principal_id, a.project_id, a.parent_task_id,
+                                     a.goal_spec_id, a.published_plan_revision_id,
+                                     a.execution_epoch_digest, a.plan_step_digest,
+                                     a.child_execution_principal_id, a.child_runtime_id
                               FROM agent_subagent_assignments a
                               LEFT JOIN agent_subagent_runs r ON r.assignment_id = a.assignment_id
                               LEFT JOIN agent_plan_step_states s
@@ -336,7 +364,10 @@ class CapabilityEvidenceService:
                 id_key="assignment_id",
                 sequence_key="assignment_sequence",
                 digest_key="assignment_digest",
-                field_keys=("plan_step_id", "run_state", "run_state_version", "parent_step_state"),
+                field_keys=("plan_step_id", "run_state", "run_state_version", "parent_step_state",
+                            "task_owner_principal_id", "project_id", "parent_task_id", "goal_spec_id",
+                            "published_plan_revision_id", "execution_epoch_digest", "plan_step_digest",
+                            "child_execution_principal_id", "child_runtime_id"),
                 state_query="""SELECT json_group_array(json_object(
                                       'assignment_id', assignment_id,
                                       'assignment_digest', assignment_digest,

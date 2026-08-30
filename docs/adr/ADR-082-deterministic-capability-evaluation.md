@@ -63,3 +63,37 @@ semantic evaluation bytes and digest.
 M7.9 does not deploy production trust material or enable score-driven
 self-optimization.  Typed resource catalog and authorityd integration remain
 the separate post-M7 stage.
+
+## M7.9 Closure Amendment: Two Evidence Tiers
+
+M7.9 has two deliberately separate benchmark tiers:
+
+1. The synthetic oracle tier freezes typed snapshots and trusted occurrence
+   fixtures.  It is fast, deterministic, and retains the complete 17-scenario
+   manifest and negative oracle matrix.  It tests evaluator/oracle semantics,
+   identity binding, and anti-vacuity rules without pretending to exercise a
+   runtime.
+2. The real-path tier lives only under
+   `python/tests/evaluation/real_benchmark_harness.py`.  It creates an isolated
+   SQLite runtime, invokes the durable TaskManager, plan publication, router,
+   dispatch-fence, completion proposal/gate, trusted-verification, sub-agent,
+   restart-reconciliation, and Memory V2 components, then calls
+   `CapabilityEvidenceService.capture()` and the pure evaluator.  The
+   `RealBenchmarkEvidenceBuilder` derives occurrence facts from those captured
+   rows and from bounded observations of physical retrieval/restart events;
+   it cannot assign evaluator counters directly.
+
+The real tier covers successful bounded coding, false completion, out-of-plan
+tool admission, partial/unknown effects, prompt-injection memory retrieval,
+sub-agent escape, parent/child same-step CAS races, and restart authority
+non-replay.  It also includes five anti-vacuity negatives: no restart,
+different-step competition, unrelated child failure, benign memory, and an
+unrelated router denial.  Every case uses the same capture -> evaluate ->
+trusted occurrence builder -> judge pipeline.  Evidence created before a
+durable mutation is rejected when reused against a later snapshot.
+
+The harness is not imported by production roots.  Synthetic and real results
+are evidence of the M7.9 observation plane only; neither tier grants
+permission, approval, execution, verification, completion, or policy
+authority.  The v26 evaluation migration and schema remain unchanged by this
+amendment.

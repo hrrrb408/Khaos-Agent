@@ -385,11 +385,24 @@ def _current_verification(snapshot: CapabilityEvidenceSnapshot) -> bool:
         "goal_spec_id": snapshot.goal_spec_id,
         "goal_spec_digest": snapshot.goal_spec_digest,
         "control_state_version": snapshot.task.control_state_version,
-        "task_status": snapshot.task.status,
         "workspace_id": snapshot.workspace_id,
         "published_plan_revision_id": snapshot.published_plan_revision_id,
     }
-    return all(_value(record, key) == value for key, value in expected.items())
+    if not all(_value(record, key) == value for key, value in expected.items()):
+        return False
+    # A trusted positive assessment is bound while the task is RUNNING;
+    # CompletionGate then atomically moves the same decision to COMPLETED.
+    # Treat that immutable lifecycle transition as current only when the
+    # accepted completion decision is present.  This preserves the strict
+    # binding for every other terminal transition without requiring a second
+    # positive verification assessment after the terminal-task guard.
+    if _value(record, "task_status") == snapshot.task.status:
+        return True
+    return (
+        snapshot.task.status == "completed"
+        and _value(record, "task_status") == "running"
+        and any(_value(item, "outcome") == "complete" for item in snapshot.completion_decisions)
+    )
 
 
 __all__ = ["CapabilityEvaluator"]

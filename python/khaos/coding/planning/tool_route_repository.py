@@ -147,24 +147,28 @@ def _validate_binding(binding: PlanToolRouteBinding) -> None:
             raise ValueError(f"route binding field {name} is invalid")
     if type(binding.disposition) is not PlanRouteDisposition:
         raise ValueError("route disposition is invalid")
-    plan_fields = (
+    plan_identity = (
         binding.plan_revision_id,
         binding.plan_revision_digest,
-        binding.plan_step_id,
-        binding.plan_step_digest,
         binding.execution_epoch_digest,
     )
-    if any(value is not None for value in plan_fields) and not all(
-        type(value) is str and bool(value) for value in plan_fields
+    step_identity = (binding.plan_step_id, binding.plan_step_digest)
+    if any(value is not None for value in plan_identity) and not all(
+        type(value) is str and bool(value) for value in plan_identity
     ):
-        raise ValueError("route plan binding is incomplete")
+        raise ValueError("route plan identity is incomplete")
+    if any(value is not None for value in step_identity) and not all(
+        type(value) is str and bool(value) for value in step_identity
+    ):
+        raise ValueError("route step identity is incomplete")
     if binding.disposition is PlanRouteDisposition.ALLOW and not all(
-        type(value) is str and bool(value) for value in plan_fields
+        type(value) is str and bool(value)
+        for value in (*plan_identity, *step_identity)
     ):
         raise ValueError("ALLOW route lacks a complete plan binding")
     if (
         binding.disposition is PlanRouteDisposition.SUPPORTING_READ
-        and any(value is not None for value in plan_fields)
+        and any(value is not None for value in (*plan_identity, *step_identity))
     ):
         raise ValueError("supporting-read route cannot carry a plan step binding")
     expected = binding.recompute_digest()
