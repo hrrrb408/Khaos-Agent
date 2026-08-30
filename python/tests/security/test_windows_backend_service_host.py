@@ -88,6 +88,11 @@ def test_windows_workflow_uses_the_native_backend_host() -> None:
         in source
     )
     assert "$entry = uv run python scripts/run_native_authority_e2e.py --emit-catalog" not in source
+    assert transaction_source.index("Set-KhaosAcl -Path $trustRoot") < transaction_source.index(
+        "start_worm_audit_receiver.ps1"
+    )
+    assert "Set-KhaosAcl -Path $caPath" in transaction_source
+    assert "$wormFileAces" in transaction_source
 
 
 def test_windows_backend_uses_the_named_pipe_as_its_control_plane_transport(

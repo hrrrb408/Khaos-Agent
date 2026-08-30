@@ -501,7 +501,27 @@ jobs:
           $wormLog = 'C:\ProgramData\Khaos\worm-receiver.log'
           $wormErrorLog = 'C:\ProgramData\Khaos\worm-receiver.err.log'
           $wormPidPath = 'C:\ProgramData\Khaos\worm-receiver.pid'
-          Remove-Item -LiteralPath $caPath, $wormLog, $wormErrorLog -Force -ErrorAction SilentlyContinue
+          $rootAces = @('SYSTEM:(F)', 'Administrators:(F)', "*${catalogOwnerSid}:(F)")
+          if ($agentSid -ne $catalogOwnerSid) { $rootAces += "*${agentSid}:(RX)" }
+          if ($authoritySid -ne $catalogOwnerSid -and $authoritySid -ne $agentSid) { $rootAces += "*${authoritySid}:(RX)" }
+          $wormFileAces = @('SYSTEM:(F)', 'Administrators:(F)', "*${catalogOwnerSid}:(F)")
+          New-Item -ItemType Directory -Force -Path $trustRoot | Out-Null
+          # Lock the trust root before creating the WORM process files.  The
+          # receiver is runner-owned, but the backend runs as LocalSystem and
+          # must be able to read the emitted CA; pre-provisioning also keeps
+          # runner cleanup able to read the PID/log files after the root is
+          # switched to explicit ACLs.
+          Set-KhaosAcl -Path $trustRoot -Aces $rootAces
+          foreach ($path in @($caPath, $wormLog, $wormErrorLog, $wormPidPath)) {
+            if (Test-Path -LiteralPath $path -PathType Leaf) {
+              Set-KhaosAcl -Path $path -Aces $wormFileAces
+              Remove-Item -LiteralPath $path -Force
+            }
+          }
+          foreach ($path in @($caPath, $wormLog, $wormErrorLog)) {
+            New-Item -ItemType File -Force -Path $path | Out-Null
+            Set-KhaosAcl -Path $path -Aces $wormFileAces
+          }
           try {
             & "$env:GITHUB_WORKSPACE\scripts\start_worm_audit_receiver.ps1" `
               -Workspace $env:GITHUB_WORKSPACE `
@@ -511,12 +531,14 @@ jobs:
               -ErrorLogPath $wormErrorLog `
               -PidPath $wormPidPath `
               -Port 8443
+            Set-KhaosAcl -Path $wormPidPath -Aces $wormFileAces
             $deadline = (Get-Date).AddSeconds(60)
             while ((Get-Date) -lt $deadline -and -not (Test-Path $caPath)) { Start-Sleep -Milliseconds 500 }
             if (-not (Test-Path $caPath)) {
               Get-Content -LiteralPath $wormLog, $wormErrorLog -ErrorAction SilentlyContinue
               throw 'WORM receiver did not start'
             }
+            Set-KhaosAcl -Path $caPath -Aces @('SYSTEM:(R)', 'Administrators:(F)', "*${catalogOwnerSid}:(R)")
             Import-Certificate -FilePath $caPath -CertStoreLocation Cert:\LocalMachine\Root | Out-Null
             $healthDeadline = (Get-Date).AddSeconds(30)
             $healthy = $false
@@ -544,13 +566,9 @@ jobs:
 
             $backendDir = 'C:\Program Files\Khaos'
             $backendSite = Join-Path $backendDir 'backend-site'
-            New-Item -ItemType Directory -Force -Path $backendDir, $backendSite, C:\ProgramData\Khaos | Out-Null
+            New-Item -ItemType Directory -Force -Path $backendDir, $backendSite | Out-Null
             uv run python scripts/run_native_authority_e2e.py `
               --catalog-output 'C:\ProgramData\Khaos\native-resource-catalog.json'
-            $rootAces = @('SYSTEM:(F)', 'Administrators:(F)', "*${catalogOwnerSid}:(F)")
-            if ($agentSid -ne $catalogOwnerSid) { $rootAces += "*${agentSid}:(RX)" }
-            if ($authoritySid -ne $catalogOwnerSid -and $authoritySid -ne $agentSid) { $rootAces += "*${authoritySid}:(RX)" }
-            Set-KhaosAcl -Path $trustRoot -Aces $rootAces
             Set-KhaosAcl -Path 'C:\ProgramData\Khaos\native-resource-catalog.json' -Aces @('SYSTEM:(R)', 'Administrators:(F)', "*${catalogOwnerSid}:(R)", "*${agentSid}:(R)", "*${authoritySid}:(R)")
             $venvRoot = (Resolve-Path -LiteralPath (Join-Path $env:GITHUB_WORKSPACE '.venv') -ErrorAction Stop).Path
             $venvPython = (Resolve-Path -LiteralPath (Join-Path $venvRoot 'Scripts\python.exe') -ErrorAction Stop).Path
