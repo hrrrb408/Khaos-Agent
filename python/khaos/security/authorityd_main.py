@@ -6,6 +6,7 @@ import os
 import stat
 from pathlib import Path, PureWindowsPath
 
+from khaos.runtime_profile import RuntimeProfile
 from khaos.security.authority_transport import (
     AuthorityProfile,
     AuthorityTransportConfig,
@@ -18,7 +19,6 @@ from khaos.security.authorityd import (
 )
 from khaos.security.authorityd_protocol import _O_BINARY
 from khaos.security.identity_isolation import read_contract_from_environment
-from khaos.runtime_profile import RuntimeProfile
 from khaos.security.local_trust import (
     LocalTrustRootError,
     local_authority_root,
@@ -62,6 +62,7 @@ def main() -> int:
         resource_order = TypedResourcePartialOrder.from_json_file(
             Path(catalog_value),
             expected_policy_digest=os.environ.get("KHAOS_EFFECTIVE_POLICY_DIGEST"),
+            require_windows_acl=os.name == "nt",
         )
     except ResourceScopeError as exc:
         raise SystemExit(f"typed resource catalog is invalid: {exc}") from exc
@@ -80,6 +81,7 @@ def main() -> int:
             socket_path=transport_path,
             key_path=Path(key_value),
             audit_writer=JsonlAuditWriter(audit_path),
+            issuer_id=deployment.authority_id(),
             resource_order=resource_order,
         )
     else:
@@ -87,11 +89,17 @@ def main() -> int:
             socket_path=transport_path,
             key_path=Path(key_value),
             audit_writer=writer_from_environment(),
+            issuer_id=deployment.authority_id(),
             resource_order=resource_order,
+        )
+    if daemon.trust_binding is None:
+        raise SystemExit(
+            "authorityd production startup could not establish its trust binding"
         )
     _publish_public_key(
         Path(public_key_value or str(transport_path.with_name("authorityd.pub"))),
         daemon.public_key_bytes,
+        require_windows_acl=os.name == "nt",
     )
     if os.name == "nt":
         # Windows production: serve the Named-Pipe backend consumed by the
@@ -169,10 +177,19 @@ def _validate_community_paths(
         raise SystemExit(f"Community authority path is not trusted: {exc}") from exc
 
 
-def _publish_public_key(path: Path, payload: bytes) -> None:
+def _publish_public_key(
+    path: Path, payload: bytes, *, require_windows_acl: bool = False
+) -> None:
     """Publish an immutable public trust anchor for the agent client."""
     path = path.expanduser().absolute()
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if require_windows_acl and os.name == "nt":
+        from khaos.security.windows_trust import validate_windows_trusted_path
+
+        try:
+            validate_windows_trusted_path(path.parent, kind="public-key")
+        except PermissionError as exc:
+            raise SystemExit(str(exc)) from exc
     try:
         info = path.lstat()
     except FileNotFoundError:
@@ -184,6 +201,14 @@ def _publish_public_key(path: Path, payload: bytes) -> None:
             raise SystemExit("authorityd public key is not a regular file")
         descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | _O_BINARY)
         try:
+            if require_windows_acl and os.name == "nt":
+                from khaos.security.windows_trust import (
+                    validate_windows_trusted_descriptor,
+                )
+
+                validate_windows_trusted_descriptor(
+                    descriptor, path=path, kind="public-key"
+                )
             existing = os.read(descriptor, len(payload) + 1)
         finally:
             os.close(descriptor)
@@ -200,6 +225,14 @@ def _publish_public_key(path: Path, payload: bytes) -> None:
         0o644,
     )
     try:
+        if require_windows_acl and os.name == "nt":
+            from khaos.security.windows_trust import (
+                validate_windows_trusted_descriptor,
+            )
+
+            validate_windows_trusted_descriptor(
+                descriptor, path=path, kind="public-key"
+            )
         written = 0
         while written < len(payload):
             count = os.write(descriptor, payload[written:])

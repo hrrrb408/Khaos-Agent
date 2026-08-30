@@ -17,8 +17,8 @@
 
 ## Import reachability result
 
-- Reachable repository modules: `284`.
-- Resolved import edges: `2213`.
+- Reachable repository modules: `286`.
+- Resolved import edges: `2247`.
 - Forbidden production edges: `0`.
 - Unresolved internal edges: `0`.
 
@@ -281,12 +281,14 @@
 - `khaos.security.policy`
 - `khaos.security.principals`
 - `khaos.security.production_composition_manifest`
+- `khaos.security.production_trust`
 - `khaos.security.protocol_boundary`
 - `khaos.security.resource_scope`
 - `khaos.security.sandbox`
 - `khaos.security.secret_scanner`
 - `khaos.security.shell_semantics`
 - `khaos.security.windows_native_ffi`
+- `khaos.security.windows_trust`
 - `khaos.skills`
 - `khaos.skills.generator`
 - `khaos.skills.loader`

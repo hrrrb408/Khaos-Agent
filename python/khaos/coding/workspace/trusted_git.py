@@ -32,6 +32,7 @@ from khaos.coding.workspace.git_process import (
     TrustedGitProcessOwner,
     TrustedGitProcessState,
 )
+from khaos.runtime_profile import RuntimeProfile, resolve_runtime_profile
 from khaos.security.authority import AuthorityEnvelope
 from khaos.security.authority_broker import (
     AuthorityBroker,
@@ -789,7 +790,13 @@ class TrustedGitRunner:
         *,
         authority_broker: AuthorityBroker | None = None,
         resource_order: TypedResourcePartialOrder | None = None,
+        runtime_profile: RuntimeProfile | str | None = None,
     ) -> TrustedGitRunner:
+        profile = resolve_runtime_profile(runtime_profile)
+        if profile.is_production and authority_broker is None:
+            raise TrustedGitError(
+                "production TrustedGitRunner requires the runtime authority broker"
+            )
         executable, identity, digest = resolve_trusted_git()
         return cls(
             executable,
@@ -797,7 +804,8 @@ class TrustedGitRunner:
             digest,
             root,
             root_identity,
-            authority_broker or AuthorityBroker.default(),
+            authority_broker
+            or AuthorityBroker.default(runtime_profile=profile),
             resource_order,
         )
 

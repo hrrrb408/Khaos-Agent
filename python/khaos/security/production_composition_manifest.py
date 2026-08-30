@@ -303,6 +303,54 @@ def _verify_construction_manifest(
     }
 
 
+def _verify_production_authority_channel(
+    runtime: Any,
+    errors: list[str],
+    components: dict[str, str],
+) -> None:
+    """Verify the READY authority channel and every effect consumer binding."""
+    profile = getattr(runtime, "profile", None)
+    if not bool(getattr(profile, "is_production", False)):
+        return
+
+    authority = getattr(runtime, "authority_broker", None)
+    if authority is None:
+        errors.append("production runtime authority broker is missing")
+        return
+    components["production_authority_channel"] = _exact_type_name(authority)
+    if not bool(getattr(authority, "ready", False)):
+        errors.append("production authority broker is not READY")
+    binding = getattr(authority, "trust_binding", None)
+    if binding is None:
+        errors.append("production authority broker has no trust binding")
+        return
+
+    seal = getattr(runtime, "authority_seal", None)
+    if seal is None or getattr(seal, "policy_digest", None) != binding.policy_digest:
+        errors.append("production authority binding does not match the runtime policy")
+
+    loop = getattr(runtime, "loop", None)
+    workspace = getattr(loop, "workspace_manager", None)
+    catalog = getattr(getattr(workspace, "resource_order", None), "catalog_semantic_digest", None)
+    if catalog != binding.catalog_semantic_digest:
+        errors.append("production authority binding does not match the runtime catalog")
+
+    scheduler = getattr(runtime, "tool_scheduler", None)
+    network_factory = getattr(scheduler, "network_broker_factory", None)
+    execution_service = getattr(runtime, "execution_service", None)
+    supervisor = getattr(execution_service, "process_supervisor", None)
+    for label, consumer in (
+        ("workspace", workspace),
+        ("network", network_factory),
+        ("execution", execution_service),
+        ("supervisor", supervisor),
+    ):
+        if getattr(consumer, "authority_broker", None) is not authority:
+            errors.append(
+                f"production {label} consumer is not bound to the runtime authority broker"
+            )
+
+
 def verify_runtime_composition(runtime: Any) -> CompositionManifest:
     """Verify the exact production composition of one real runtime.
 
@@ -436,6 +484,8 @@ def verify_runtime_composition(runtime: Any) -> CompositionManifest:
         components["verification_backend"] = (
             f"{VerifyFixLoop.__module__}.{VerifyFixLoop.__qualname__}"
         )
+
+    _verify_production_authority_channel(runtime, errors, components)
 
     # Authority-bound child spawn: the execution service must actually be
     # bound to the runtime authority (the flag flips in bind_runtime_

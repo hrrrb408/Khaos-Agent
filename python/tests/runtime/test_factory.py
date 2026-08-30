@@ -1,8 +1,12 @@
+import json
+from types import SimpleNamespace
+
 import pytest
 from khaos.agent.control.completion_flow import CompletionProposalController
 from khaos.agent.control.completion_recovery import CompletionRecoveryService
 from khaos.db import Database
 from khaos.runtime import RuntimeConfig, build_runtime
+from khaos.security.effective_policy import load_effective_policy
 
 
 async def test_factory_requires_db():
@@ -39,6 +43,31 @@ async def test_factory_rejects_mock_router_outside_explicit_dev_mode(
     def unavailable(*_args, **_kwargs):
         raise ValueError("invalid model configuration")
 
+    # Production startup now reaches router construction only after the
+    # independently loaded catalog and READY authority channel pass.  Supply
+    # those trusted inputs through narrow test doubles so this regression
+    # continues to exercise the no-mock-router fallback itself.
+    effective_policy = load_effective_policy(tmp_path)
+    assert effective_policy.resource_order is not None
+    catalog_path = tmp_path / "typed-resource-catalog.json"
+    catalog_path.write_text(
+        json.dumps(effective_policy.resource_order.manifest()), encoding="utf-8"
+    )
+    catalog_path.chmod(0o640)
+    monkeypatch.setenv("KHAOS_TYPED_RESOURCE_CATALOG_PATH", str(catalog_path))
+    monkeypatch.setenv("KHAOS_AUTHORITY_PROFILE", "native-production")
+    authority = SimpleNamespace(
+        ready=True,
+        trust_binding=SimpleNamespace(
+            policy_digest=effective_policy.digest,
+            catalog_semantic_digest=effective_policy.resource_order.catalog_semantic_digest,
+        ),
+        close=lambda: None,
+    )
+    monkeypatch.setattr(
+        "khaos.runtime.factory.AuthorityBroker.for_production",
+        classmethod(lambda _cls, **_kwargs: authority),
+    )
     monkeypatch.setattr("khaos.rpc.composition.load_router_from_config", unavailable)
     with pytest.raises(ValueError, match="invalid model configuration"):
         await build_runtime(
@@ -46,6 +75,7 @@ async def test_factory_rejects_mock_router_outside_explicit_dev_mode(
                 db=db,
                 project_root=tmp_path,
                 principal_id="local-uid:test",
+                source_transport="tui",
             )
         )
     await db.close()

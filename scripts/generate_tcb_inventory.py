@@ -52,6 +52,11 @@ TCB_OWNERS: dict[str, tuple[tuple[str, str, str], ...]] = {
             "canonical serialization + receipt transition legality",
             "pure functions with Hypothesis coverage",
         ),
+        (
+            "python/khaos/security/production_trust.py",
+            "protocol, authority, policy, catalog, key, and environment binding",
+            "immutable secret-free startup witness; mismatch fails closed",
+        ),
     ),
     "Mutable security state owners": (
         (

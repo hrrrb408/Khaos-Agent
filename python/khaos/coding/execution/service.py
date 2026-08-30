@@ -45,6 +45,7 @@ from khaos.coding.workspace.storage import (
     capture_workspace_snapshot,
 )
 from khaos.runtime_profile import RuntimeProfile, resolve_runtime_profile
+from khaos.security.authority_broker import AuthorityBroker
 
 if TYPE_CHECKING:
     from khaos.coding.workspace.manager import WorkspaceManager
@@ -78,11 +79,23 @@ class ExecutionService:
         project_id: str = "",
         runtime_id: str = "",
         runtime_profile: RuntimeProfile | str | None = None,
+        authority_broker: AuthorityBroker | None = None,
     ) -> None:
         self.runtime_profile = resolve_runtime_profile(runtime_profile)
+        self.authority_broker = authority_broker
         self.process_supervisor = process_supervisor or ProcessSupervisor(
-            runtime_profile=self.runtime_profile
+            runtime_profile=self.runtime_profile,
+            authority_broker=authority_broker,
         )
+        supervisor_broker = getattr(self.process_supervisor, "authority_broker", None)
+        if authority_broker is not None:
+            if supervisor_broker is not None and supervisor_broker is not authority_broker:
+                raise PermissionError(
+                    "ExecutionService and ProcessSupervisor use different authority brokers"
+                )
+            self.process_supervisor.authority_broker = authority_broker
+        elif supervisor_broker is not None:
+            self.authority_broker = supervisor_broker
         self.backend = backend
         self.backend_selector = backend_selector
         self.workspace_manager = workspace_manager

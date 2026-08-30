@@ -39,12 +39,12 @@ from khaos.coding.workspace.storage import (
     WorkspaceStorageSnapshot,
     capture_workspace_snapshot,
 )
+from khaos.runtime_profile import RuntimeProfile, resolve_runtime_profile
 from khaos.security.authority_broker import (
     AuthorityBroker,
     AuthorityBrokerError,
     EffectCapability,
 )
-from khaos.runtime_profile import RuntimeProfile, resolve_runtime_profile
 
 logger = logging.getLogger(__name__)
 
@@ -115,11 +115,13 @@ class ProcessSupervisor:
         termination_grace_seconds: float = 2.0,
         storage_authority: WorkspaceStorageAuthority | None = None,
         runtime_profile: RuntimeProfile | str | None = None,
+        authority_broker: AuthorityBroker | None = None,
     ) -> None:
         if termination_grace_seconds <= 0:
             raise ValueError("termination grace period must be positive")
         self.termination_grace_seconds = termination_grace_seconds
         self.runtime_profile = resolve_runtime_profile(runtime_profile)
+        self.authority_broker = authority_broker
         self.storage_authority = storage_authority or WorkspaceStorageAuthority()
         self._active: dict[str, _ActiveProcess] = {}
         self._pending_spawns: dict[str, _PendingSpawn] = {}
@@ -399,6 +401,7 @@ class ProcessSupervisor:
                             executable_authority=authority,
                         ),
                         runtime_profile=self.runtime_profile,
+                        authority_broker=self.authority_broker,
                     )
                     if not os.environ.get("KHAOS_AUTHORITYD_PUBLIC_KEY_PATH"):
                         raise PermissionError(
@@ -1683,6 +1686,7 @@ def _issue_execution_capability(
     *,
     resource_digest: str,
     runtime_profile: RuntimeProfile | str | None = None,
+    authority_broker: AuthorityBroker | None = None,
 ) -> EffectCapability:
     """Issue one exact host-execution receipt for the native launch binding."""
     authority = request.execution_authority
@@ -1707,7 +1711,13 @@ def _issue_execution_capability(
         != authority.spawn_plan.authorization_resource_digest
     ):
         raise PermissionError("execution authority effect binding diverged")
-    broker = AuthorityBroker.default(runtime_profile=runtime_profile)
+    if resolve_runtime_profile(runtime_profile).is_production and authority_broker is None:
+        raise PermissionError(
+            "production native execution requires the runtime authority broker"
+        )
+    broker = authority_broker or AuthorityBroker.default(
+        runtime_profile=runtime_profile
+    )
     envelope = broker.envelope(
         principal_id=step.principal_id,
         project_id=step.project_id,

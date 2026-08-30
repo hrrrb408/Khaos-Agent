@@ -2093,6 +2093,16 @@ class ToolScheduler:
                 else None
             ),
             blocked_domains=frozenset(str(domain) for domain in blocked_domains),
+            principal_kind=str(tool_context.get("principal_kind") or ""),
+            parent_principal_id=str(
+                tool_context.get("parent_principal_id") or ""
+            ),
+            session_id=str(tool_context.get("session_id") or ""),
+            delegation_digest=str(tool_context.get("delegation_digest") or ""),
+            source_transport=str(tool_context.get("source_transport") or ""),
+            delegation_resource=str(
+                tool_context.get("delegation_resource") or ""
+            ),
         )
         call["_network_broker"] = broker
         call["_network_lease"] = lease

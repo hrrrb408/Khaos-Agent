@@ -25,12 +25,12 @@ from khaos.security.producer_evidence import (
     write_producer_proof,
 )
 
-
 PRODUCER_TESTS: dict[str, tuple[str, ...]] = {
     "community_authority": (
         "python/tests/security/test_local_trust.py",
         "python/tests/security/test_authority_transport.py",
         "python/tests/security/test_authorityd_protocol.py",
+        "python/tests/security/test_post_m7_production_trust.py",
         "python/tests/security/test_identity_isolation.py",
     ),
     "platform_kernel": (

@@ -14,6 +14,7 @@
 | `python/khaos/security/effective_policy.py` | EffectiveSecurityPolicy compilation (user ∩ project ∩ platform) | compiled once, immutable at runtime |
 | `python/khaos/permissions/engine.py` | PermissionEngine admission + commands_require_approval gate | rule matching over the compiled policy |
 | `python/khaos/security/protocol_boundary.py` | canonical serialization + receipt transition legality | pure functions with Hypothesis coverage |
+| `python/khaos/security/production_trust.py` | protocol, authority, policy, catalog, key, and environment binding | immutable secret-free startup witness; mismatch fails closed |
 
 ## Mutable security state owners
 
@@ -83,4 +84,4 @@
   (protocol_boundary, principals, shell_semantics) with property tests.
 - The native frontends are the only platform TCB transports; both are
   fail-closed with no Python/same-UID fallback.
-- Total curated TCB owners: `31`.
+- Total curated TCB owners: `32`.

@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from khaos.coding.workspace.trusted_git import TrustedGitError, TrustedGitRunner
+from khaos.runtime_profile import RuntimeProfile
 from khaos.security.authority import AuthorityEnvelope
 from khaos.security.authority_broker import AuthorityBroker
 
@@ -20,7 +21,12 @@ class OrphanWorkspace:
     reason: str
 
 
-def discover_orphans(root: Path) -> tuple[OrphanWorkspace, ...]:
+def discover_orphans(
+    root: Path,
+    *,
+    authority_broker: AuthorityBroker | None = None,
+    runtime_profile: RuntimeProfile | str | None = None,
+) -> tuple[OrphanWorkspace, ...]:
     found: list[OrphanWorkspace] = []
     if not root.exists():
         return ()
@@ -46,6 +52,8 @@ def discover_orphans(root: Path) -> tuple[OrphanWorkspace, ...]:
                 int(root_info.st_uid),
                 int(root_info.st_mode),
             ),
+            authority_broker=authority_broker,
+            runtime_profile=runtime_profile,
         )
     except (OSError, TrustedGitError) as exc:
         for path in root.iterdir():
@@ -58,7 +66,7 @@ def discover_orphans(root: Path) -> tuple[OrphanWorkspace, ...]:
                     )
                 )
         return tuple(found)
-    broker = AuthorityBroker.default()
+    broker = authority_broker or AuthorityBroker.default(runtime_profile=runtime_profile)
     for path in root.iterdir():
         if not path.is_dir() or path.is_symlink():
             continue

@@ -71,6 +71,7 @@ from khaos.runtime.authority import RuntimeAuthoritySeal
 from khaos.runtime.lifecycle import CloseState
 from khaos.runtime_profile import RuntimeProfile, resolve_runtime_profile
 from khaos.rust_bridge import get_token_engine
+from khaos.security.authority_broker import AuthorityBroker
 from khaos.security.credential_broker import CredentialBroker
 from khaos.security.effective_policy import EffectiveSecurityPolicy
 from khaos.security.middleware import SecurityMiddleware
@@ -391,6 +392,17 @@ class RuntimeResult:
     # that server rather than one chat runtime.
     credential_broker: CredentialBroker | None = None
     owns_credential_broker: bool = True
+    # The production authorityd client is a runtime-owned trust channel.
+    # Every workspace, network, and native-execution consumer receives this
+    # exact object; it is closed only after those consumers have quiesced.
+    # ``init=False`` preserves the long-standing positional RuntimeResult
+    # constructor contract.  The factory attaches these fields immediately
+    # after construction, just like ``memory_host`` and the other composed
+    # control-plane owners.
+    authority_broker: AuthorityBroker | None = field(
+        default=None, init=False, repr=False
+    )
+    owns_authority_broker: bool = field(default=True, init=False, repr=False)
     # H1: the principal that owns this runtime.  ``aclose`` uses it to
     # release the principal's per-session ``BrowserContext`` so cookies /
     # DOM / page state cannot leak into a subsequent run by a different
@@ -559,6 +571,10 @@ class RuntimeResult:
                 self.credential_broker if self.owns_credential_broker else None,
             ),
             (
+                "authority_broker",
+                self.authority_broker if self.owns_authority_broker else None,
+            ),
+            (
                 "office_authority",
                 self.office_authority if self.owns_office_authority else None,
             ),
@@ -601,6 +617,10 @@ class RuntimeResult:
             (
                 "credential_broker",
                 self.credential_broker if self.owns_credential_broker else None,
+            ),
+            (
+                "authority_broker",
+                self.authority_broker if self.owns_authority_broker else None,
             ),
             (
                 "office_authority",
@@ -890,6 +910,18 @@ class RuntimeResult:
                 except Exception:
                     failed = True
                     logger.debug("credential broker close failed", exc_info=True)
+            # The authority channel is closed only after every consumer has
+            # stopped issuing/releasing capabilities.  A failed close keeps
+            # the runtime retryable and therefore cannot be reported as a
+            # clean shutdown while the trusted channel remains reachable.
+            if self.authority_broker is not None and self.owns_authority_broker:
+                try:
+                    close = getattr(self.authority_broker, "close", None)
+                    if callable(close):
+                        close()
+                except Exception:
+                    failed = True
+                    logger.debug("authority broker close failed", exc_info=True)
             # H2: close the AuditLogger LAST — audit logging may be needed
             # during component shutdown (e.g. to record the shutdown event
             # itself), so the file descriptor must remain open until every
@@ -1048,47 +1080,69 @@ def _enforce_borrowed_authority_match(
 
 
 def _load_production_resource_order(
-    effective_policy: EffectiveSecurityPolicy,
+    effective_policy: EffectiveSecurityPolicy | None,
     runtime_profile: RuntimeProfile,
+    *,
+    preloaded: TypedResourcePartialOrder | None = None,
 ) -> TypedResourcePartialOrder | None:
-    """Load the host-reviewed typed catalog used by production authorities."""
+    """Load and, when available, bind the host-reviewed typed catalog.
+
+    The production composition root calls this once before compiling the
+    effective policy and once after it.  The first call performs the
+    independent catalog validation and computes its semantic digest; the
+    second call binds that immutable snapshot to the effective policy without
+    rereading a file that could have been replaced between the two phases.
+    """
     if not runtime_profile.is_production:
         return None
-    catalog_path = os.environ.get("KHAOS_TYPED_RESOURCE_CATALOG_PATH")
-    if not catalog_path:
-        raise PermissionError(
-            "production runtime requires KHAOS_TYPED_RESOURCE_CATALOG_PATH"
-        )
-    from khaos.security.authority_transport import AuthorityTransportConfig
-    from khaos.security.local_trust import (
-        LocalTrustRootError,
-        local_authority_root,
-        validate_trusted_local_path,
-    )
-
-    deployment = AuthorityTransportConfig.from_environment(
-        runtime_profile=runtime_profile
-    )
-    if deployment.is_community:
-        try:
-            validate_trusted_local_path(
-                Path(catalog_path),
-                kind="file",
-                root=local_authority_root(),
-            )
-        except LocalTrustRootError as exc:
+    loaded = preloaded
+    if loaded is None:
+        catalog_path = os.environ.get("KHAOS_TYPED_RESOURCE_CATALOG_PATH")
+        if not catalog_path:
             raise PermissionError(
-                "Community production catalog must be under the trusted local authority root"
-            ) from exc
-    try:
-        loaded = TypedResourcePartialOrder.from_json_file(
-            Path(catalog_path),
-            expected_policy_digest=effective_policy.digest,
+                "production runtime requires KHAOS_TYPED_RESOURCE_CATALOG_PATH"
+            )
+        from khaos.security.authority_transport import AuthorityTransportConfig
+        from khaos.security.local_trust import (
+            LocalTrustRootError,
+            local_authority_root,
+            validate_trusted_local_path,
         )
-    except ResourceScopeError as exc:
+
+        deployment = AuthorityTransportConfig.from_environment(
+            runtime_profile=runtime_profile
+        )
+        if deployment.is_community:
+            try:
+                validate_trusted_local_path(
+                    Path(catalog_path),
+                    kind="file",
+                    root=local_authority_root(),
+                )
+            except LocalTrustRootError as exc:
+                raise PermissionError(
+                    "Community production catalog must be under the trusted local authority root"
+                ) from exc
+        try:
+            loaded = TypedResourcePartialOrder.from_json_file(
+                Path(catalog_path),
+                expected_policy_digest=(
+                    effective_policy.digest
+                    if effective_policy is not None
+                    else None
+                ),
+                require_windows_acl=True,
+            )
+        except ResourceScopeError as exc:
+            raise PermissionError(
+                f"production typed resource catalog is invalid: {exc}"
+            ) from exc
+    if effective_policy is None:
+        return loaded
+    if loaded.policy_digest != effective_policy.digest:
         raise PermissionError(
-            f"production typed resource catalog is invalid: {exc}"
-        ) from exc
+            "production typed resource catalog is not bound to the effective policy"
+        )
     compiled = effective_policy.resource_order
     if compiled is None or loaded.catalog_digest != compiled.catalog_digest:
         raise PermissionError(
@@ -1261,39 +1315,26 @@ async def build_runtime(
         _enforce_no_testing_composition(cfg)
         _enforce_no_security_injection(cfg)
     root = cfg.project_root.expanduser().resolve()
-    mode_manager = cfg.mode_manager or ModeManager(
-        cfg.db, project_root=root,
-        principal_id=cfg.principal_id, session_id=cfg.session_id,
-        project_id=cfg.project_id,
-    )
-    if cfg.mode_manager is None:
-        await mode_manager.load()
-    if cfg.mode_override:
-        await mode_manager.switch(ModeManager.parse(cfg.mode_override))
-    router = cfg.router
-    if router is None:
-        try:
-            from khaos.rpc.composition import load_router_from_config
-
-            router = load_router_from_config(cfg.config_path or root / "config.yaml", project_root=root)
-        except (OSError, ValueError, KeyError):
-            # Production-safe behaviour is the default.  Mock routing is a
-            # test/development fixture only, never an implicit result of a
-            # missing KHAOS_ENV deployment variable.
-            if runtime_profile.is_production:
-                logger.error("runtime config router unavailable; refusing mock fallback")
-                raise
-            logger.warning("development runtime config router unavailable; using mock", exc_info=True)
-            router = create_default_router()
     # B1: load and compile the *layered* effective policy — user (∼/.khaos/
     # policy.yaml) ∩ project (<repo>/khaos_policy.yaml) ∩ platform — so it is
     # the single source of truth that every runtime component is built from.
     # No component may consult the raw project policy for enforcement.
     from khaos.security.effective_policy import load_effective_policy
+
+    # Production reads the operator-owned catalog before compiling the policy.
+    # The snapshot is then compared to the policy compiler's independently
+    # derived catalog; it is never reread after the policy stage.
+    independent_catalog = (
+        _load_production_resource_order(None, runtime_profile)
+        if runtime_profile.is_production
+        else None
+    )
     effective_policy = load_effective_policy(root)
     logger.info("effective security policy digest: %s", effective_policy.digest)
     typed_resource_order = _load_production_resource_order(
-        effective_policy, runtime_profile
+        effective_policy,
+        runtime_profile,
+        preloaded=independent_catalog,
     )
     # A2-3: bind the PermissionEngine to (principal_id, project_id,
     # policy_digest, runtime_id).  Rules loaded, granted, or revoked
@@ -1323,700 +1364,823 @@ async def build_runtime(
     )
     if production_mode:
         _enforce_borrowed_authority_match(cfg, authority_seal)
-    credential_broker = cfg.credential_broker
-    if credential_broker is None and cfg.tool_scheduler is not None:
-        shared_broker = getattr(cfg.tool_scheduler, "credential_broker", None)
-        if isinstance(shared_broker, CredentialBroker):
-            credential_broker = shared_broker
-    owns_credential_broker = credential_broker is None
-    if credential_broker is None:
-        credential_broker = CredentialBroker(
-            policy_digest=effective_policy.digest,
-            principal_id=cfg.principal_id,
-            # Production accepts only provider loaders registered by a trusted
-            # server adapter.  Development keeps the migration adapter available
-            # for existing tests, but it is never enabled by the production type.
-            allow_context_adoption=not production_mode,
+    # Production authority is established once, at the composition root,
+    # after the independent catalog/policy snapshot is loaded and before any
+    # workspace, network, or execution owner is constructed.  Those owners
+    # receive this exact READY broker below; they must not call
+    # ``AuthorityBroker.default`` and create a second trust path.
+    authority_broker: AuthorityBroker | None = None
+    owns_authority_broker = False
+    authority_principal_kind = cfg.principal_kind
+    if production_mode:
+        if typed_resource_order is None:
+            raise PermissionError(
+                "production runtime requires an independently loaded typed resource catalog"
+            )
+        if not authority_principal_kind:
+            authority_principal_kind = principal_for_transport(
+                cfg.principal_id, cfg.source_transport
+            ).kind.value
+        inherited_authority = (
+            getattr(cfg.delegated_workspace_manager, "authority_broker", None)
+            if cfg.delegated_execution_context is not None
+            else None
         )
-    credential_broker.bind_runtime(
-        policy_digest=effective_policy.digest,
-        principal_id=cfg.principal_id,
-    )
-    # Round-14 §7: derive the exec-tool name set from the live registry so
-    # the commands_require_approval gate covers every exec-style tool
-    # (permission_level == "execute"), not a hard-coded literal.  Built once
-    # here and reused for the scheduler registry below.
-    if cfg.tool_allowlist is not None:
-        runtime_registry = create_runtime_registry().prune(cfg.tool_allowlist)
-    else:
-        runtime_registry = create_runtime_registry()
-    exec_tool_names = runtime_registry.exec_tool_names()
-    # Construct the shared audit repository before any component that can
-    # emit audit events.  Permission and error paths must use this same
-    # anchored writer; constructing it later allowed direct DB writers to
-    # bypass the chain authority.
-    audit_logger = cfg.audit_logger
-    owns_audit_logger = audit_logger is None
-    if audit_logger is None and effective_policy.audit_enabled:
-        audit_logger = AuditLogger(
+        if inherited_authority is not None:
+            # Delegated children are attached to the parent's already verified
+            # authority channel. Reusing that exact broker keeps one daemon
+            # trust root for the parent/delegated-child control tree while the
+            # child still carries its own principal/runtime in every grant.
+            authority_broker = inherited_authority
+            owns_authority_broker = False
+        else:
+            authority_broker = AuthorityBroker.for_production(
+                policy_digest=effective_policy.digest,
+                catalog_digest=typed_resource_order.catalog_semantic_digest,
+                runtime_id=cfg.runtime_id,
+                principal_id=cfg.principal_id,
+                project_id=project_id,
+                principal_kind=authority_principal_kind,
+            )
+            owns_authority_broker = True
+        if not authority_broker.ready:
+            if owns_authority_broker:
+                authority_broker.close()
+            raise PermissionError(
+                "production authorityd trust channel did not reach READY"
+            )
+        binding = authority_broker.trust_binding
+        if (
+            binding is None
+            or binding.policy_digest != effective_policy.digest
+            or binding.catalog_semantic_digest
+            != typed_resource_order.catalog_semantic_digest
+        ):
+            if owns_authority_broker:
+                authority_broker.close()
+            raise PermissionError(
+                "production authorityd trust binding does not match runtime policy/catalog"
+            )
+    try:
+        # The runtime's ordinary mode/router components are constructed only
+        # after the independently loaded policy/catalog and, in production,
+        # the READY authority channel have passed their startup gates.
+        mode_manager = cfg.mode_manager or ModeManager(
             cfg.db,
-            log_path=resolve_safe_audit_log_path(effective_policy.audit_log_path),
-            anchor_path=(
-                resolve_safe_audit_anchor_path(project_id)
-                if runtime_profile.is_production
-                else None
-            ),
-            principal_id=cfg.principal_id,
-            runtime_id=cfg.runtime_id,
-            policy_digest=effective_policy.digest,
-            project_id=project_id,
-        )
-        await audit_logger.verify_anchor()
-    permission_engine = PermissionEngine(
-        cfg.db,
-        commands_require_approval=effective_policy.commands_require_approval,
-        principal_id=cfg.principal_id,
-        project_id=project_id,
-        policy_digest=effective_policy.digest,
-        runtime_id=cfg.runtime_id,
-        exec_tool_names=exec_tool_names,
-        audit_logger=audit_logger,
-    )
-    await permission_engine.load_rules()
-    memory_store = MemoryStore(
-        SqliteMemoryRepository(cfg.db),
-        principal_id=cfg.principal_id,
-        project_id=project_id,
-        audit_logger=audit_logger,
-    )
-    memory_retrieval_policy = MemoryRetrievalPolicy.production()
-
-    def memory_context(
-        session_id: str,
-        *,
-        task_id: str | None = None,
-        workspace_id: str | None = None,
-        repo_id: str | None = None,
-        commit_sha: str | None = None,
-        branch: str | None = None,
-    ) -> RuntimeMemoryContext:
-        """Bind the complete host/runtime identity before Broker access."""
-
-        binding = MemoryRuntimeBinding(
-            principal_id=cfg.principal_id,
-            project_id=project_id,
-            session_id=session_id or cfg.session_id or None,
-            task_id=task_id or cfg.task_id or None,
-            workspace_id=workspace_id or cfg.workspace_id or None,
-            mode=mode_manager.current_mode.value,
-            available_capabilities=cfg.available_capabilities,
-            environment_fingerprint=cfg.environment_fingerprint or "runtime:default",
-            repo_id=(
-                repo_id
-                or cfg.repo_id
-                or (repository_id_for_root(root) if mode_manager.current_mode.value == "coding" else None)
-            ),
-            commit_sha=(
-                commit_sha
-                or cfg.commit_sha
-                or ("working-tree" if mode_manager.current_mode.value == "coding" else None)
-            ),
-            branch=branch or cfg.branch or None,
-            environment={
-                **cfg.environment,
-                "source_transport": cfg.source_transport,
-                "runtime_id": cfg.runtime_id,
-            },
-        )
-        return binding.context()
-
-    memory_host = cfg.memory_host
-    owns_memory_host = False
-    if cfg.memory_manager is None and cfg.memory_host is not None:
-        # Shared application composition: use the already initialized host;
-        # this branch never constructs a provider, registry, or Broker.
-        memory_host = cfg.memory_host
-        profile = memory_host.profile
-        if profile is None:
-            raise ValueError("memory host has no resolved profile")
-        profile_registry = memory_host.profile_registry
-        profile_store = memory_host.profile_store
-        memory_broker = memory_host.broker
-        provider_manager = memory_host.provider_manager
-        transfer_service = memory_host.transfer_service
-        codegraph = memory_host.codegraph
-        memory_manager = MemoryManager(
-            memory_store,
-            budget=profile.budget(MemoryBudget()),
-            mode_getter=lambda: mode_manager.current_mode,
-            intent_getter=lambda: getattr(mode_manager, "_intent_buffer", ""),
-            broker=memory_broker,
-            runtime_context_factory=memory_context,
-            provider_manager=provider_manager,
-            profile=profile,
-            transfer_service=transfer_service,
-            codegraph=codegraph,
-            owns_provider_manager=False,
-            retrieval_policy=memory_retrieval_policy,
-        )
-        memory_manager.profile_registry = profile_registry
-        memory_manager.profile_store = profile_store
-        memory_manager.observability = getattr(memory_broker, "observability", None)
-    elif cfg.memory_manager is None:
-        memory_host = await build_memory_host(
-            db=cfg.db,
             project_root=root,
-            config_path=cfg.config_path or root / "config.yaml",
-            mode=mode_manager.current_mode.value,
+            principal_id=cfg.principal_id,
+            session_id=cfg.session_id,
+            project_id=project_id,
+        )
+        if cfg.mode_manager is None:
+            await mode_manager.load()
+        if cfg.mode_override:
+            await mode_manager.switch(ModeManager.parse(cfg.mode_override))
+        router = cfg.router
+        if router is None:
+            try:
+                from khaos.rpc.composition import load_router_from_config
+
+                router = load_router_from_config(
+                    cfg.config_path or root / "config.yaml",
+                    project_root=root,
+                )
+            except (OSError, ValueError, KeyError):
+                # Production-safe behaviour is the default.  Mock routing is a
+                # test/development fixture only, never an implicit result of a
+                # missing KHAOS_ENV deployment variable.
+                if runtime_profile.is_production:
+                    logger.error(
+                        "runtime config router unavailable; refusing mock fallback"
+                    )
+                    raise
+                logger.warning(
+                    "development runtime config router unavailable; using mock",
+                    exc_info=True,
+                )
+                router = create_default_router()
+        credential_broker = cfg.credential_broker
+        if credential_broker is None and cfg.tool_scheduler is not None:
+            shared_broker = getattr(cfg.tool_scheduler, "credential_broker", None)
+            if isinstance(shared_broker, CredentialBroker):
+                credential_broker = shared_broker
+        owns_credential_broker = credential_broker is None
+        if credential_broker is None:
+            credential_broker = CredentialBroker(
+                policy_digest=effective_policy.digest,
+                principal_id=cfg.principal_id,
+                # Production accepts only provider loaders registered by a trusted
+                # server adapter.  Development keeps the migration adapter available
+                # for existing tests, but it is never enabled by the production type.
+                allow_context_adoption=not production_mode,
+            )
+        credential_broker.bind_runtime(
+            policy_digest=effective_policy.digest,
+            principal_id=cfg.principal_id,
+        )
+        # Round-14 §7: derive the exec-tool name set from the live registry so
+        # the commands_require_approval gate covers every exec-style tool
+        # (permission_level == "execute"), not a hard-coded literal.  Built once
+        # here and reused for the scheduler registry below.
+        if cfg.tool_allowlist is not None:
+            runtime_registry = create_runtime_registry().prune(cfg.tool_allowlist)
+        else:
+            runtime_registry = create_runtime_registry()
+        exec_tool_names = runtime_registry.exec_tool_names()
+        # Construct the shared audit repository before any component that can
+        # emit audit events.  Permission and error paths must use this same
+        # anchored writer; constructing it later allowed direct DB writers to
+        # bypass the chain authority.
+        audit_logger = cfg.audit_logger
+        owns_audit_logger = audit_logger is None
+        if audit_logger is None and effective_policy.audit_enabled:
+            audit_logger = AuditLogger(
+                cfg.db,
+                log_path=resolve_safe_audit_log_path(effective_policy.audit_log_path),
+                anchor_path=(
+                    resolve_safe_audit_anchor_path(project_id)
+                    if runtime_profile.is_production
+                    else None
+                ),
+                principal_id=cfg.principal_id,
+                runtime_id=cfg.runtime_id,
+                policy_digest=effective_policy.digest,
+                project_id=project_id,
+            )
+            await audit_logger.verify_anchor()
+        permission_engine = PermissionEngine(
+            cfg.db,
+            commands_require_approval=effective_policy.commands_require_approval,
             principal_id=cfg.principal_id,
             project_id=project_id,
-            repo_id=cfg.repo_id,
-            commit_sha=cfg.commit_sha,
+            policy_digest=effective_policy.digest,
+            runtime_id=cfg.runtime_id,
+            exec_tool_names=exec_tool_names,
             audit_logger=audit_logger,
-            effective_policy=effective_policy,
         )
-        owns_memory_host = True
-        profile = memory_host.profile
-        if profile is None:
-            raise RuntimeError("canonical memory host has no active profile")
-        profile_registry = memory_host.profile_registry
-        profile_store = memory_host.profile_store
-        memory_broker = memory_host.broker
-        provider_manager = memory_host.provider_manager
-        transfer_service = memory_host.transfer_service
-        codegraph = memory_host.codegraph
-        memory_manager = MemoryManager(
-            memory_store,
-            budget=profile.budget(MemoryBudget()),
-            mode_getter=lambda: mode_manager.current_mode,
-            intent_getter=lambda: getattr(mode_manager, "_intent_buffer", ""),
-            broker=memory_broker,
-            runtime_context_factory=memory_context,
-            provider_manager=provider_manager,
-            profile=profile,
-            transfer_service=transfer_service,
-            codegraph=codegraph,
-            owns_provider_manager=False,
-            retrieval_policy=memory_retrieval_policy,
-        )
-        # Keep the profile and registry available to the TUI/RPC composition
-        # without creating a second provider path.  All operations still
-        # enter through the same Broker instance above.
-        memory_manager.profile_registry = profile_registry
-        memory_manager.profile_store = profile_store
-        memory_manager.observability = getattr(memory_broker, "observability", None)
-    else:
-        memory_manager = cfg.memory_manager
-
-    if cfg.memory_manager is not None:
-        memory_host = getattr(cfg.memory_manager, "memory_host", None)
-    if memory_host is not None:
-        memory_manager.memory_host = memory_host
-    skill_manager = cfg.skill_manager or SkillManager()
-    skills_dir = root / "skills"
-    if len(skill_manager.registry) == 0 and skills_dir.is_dir():
-        skill_manager.load_from_dir(skills_dir)
-    task_manager = cfg.task_manager
-    if task_manager is None:
-        # A3-5: bind the TaskManager to the runtime's principal so every
-        # coding task is owned by exactly one principal for its entire
-        # lifecycle.  An unauthenticated runtime (``principal_id='legacy'``)
-        # can only see its own 'legacy' tasks (quarantined to
-        # ``status='failed'`` by the migration helper), so it can never
-        # execute or surface an authenticated principal's tasks.
-        #
-        # M4 batch 3.1.16A-5-1b: also stamp ``project_id`` so coding
-        # tasks are project-scoped (see A-5-1a schema closure).
-        task_manager = TaskManager(
-            db=cfg.db, principal_id=cfg.principal_id,
+        await permission_engine.load_rules()
+        memory_store = MemoryStore(
+            SqliteMemoryRepository(cfg.db),
+            principal_id=cfg.principal_id,
             project_id=project_id,
+            audit_logger=audit_logger,
         )
-        await task_manager.load()
-    if (
-        cfg.delegated_execution_context is not None
-        and cfg.delegated_workspace_manager is None
-    ):
-        raise RuntimeError(
-            "delegated runtime requires the exact parent workspace manager"
-        )
-    workspace_manager = (
-        cfg.delegated_workspace_manager
-        if cfg.delegated_execution_context is not None
-        else cfg.workspace_manager
-    ) or WorkspaceManager(
-        policy_digest=effective_policy.digest,
-        authorization_epoch=await permission_engine.authorization_snapshot(),
-        resource_order=typed_resource_order,
-        runtime_profile=runtime_profile,
-    )
-    injected_workspace_policy = getattr(workspace_manager, "policy_digest", None)
-    if (
-        production_mode
-        and injected_workspace_policy is not None
-        and injected_workspace_policy != effective_policy.digest
-    ):
-        raise PermissionError(
-            "WorkspaceManager authority policy digest does not match the "
-            "runtime effective policy; host Git control-plane effects cannot "
-            "borrow a different policy authority."
-        )
-    execution_service = cfg.execution_service or ExecutionService(
-        workspace_manager=workspace_manager,
-        backend_selector=BackendSelector(runtime_profile=runtime_profile),
-        principal_id=cfg.principal_id,
-        project_id=project_id,
-        runtime_id=cfg.runtime_id,
-        runtime_profile=runtime_profile,
-    )
-    execution_service.bind_runtime_authority(
-        principal_id=cfg.principal_id,
-        project_id=project_id,
-        runtime_id=cfg.runtime_id,
-    )
-    # M7.2: production context is composed from the runtime-owned workspace
-    # authority.  ProductionRuntimeConfig intentionally has no reader/index
-    # injection seam, so model-controlled or host-path readers cannot replace
-    # SafeWorkspaceFS here.
-    context_intelligence = (
-        ContextIntelligenceService(workspace_manager)
-        if production_mode
-        else None
-    )
-    # B1: the OfficeMutationAuthority is a server/project-lifecycle object.
-    # When ``cfg.office_authority`` is injected (AgentService / SubAgentService
-    # share one across every turn), reuse it so the aggregate storage baseline
-    # persists across turns (closing the cross-turn quota bypass) and the
-    # lifecycle is owned by the caller.  When not injected, create a new one
-    # owned by this RuntimeResult (closed in aclose).
-    # B1: when a shared ToolScheduler is passed in that already holds an
-    # authority, reuse that authority too — never silently replace it.
-    owns_office_authority = True
-    if cfg.office_authority is not None:
-        office_authority = cfg.office_authority
-        owns_office_authority = False
-    elif (
-        cfg.tool_scheduler is not None
-        and getattr(cfg.tool_scheduler, "office_authority", None) is not None
-    ):
-        # B1: shared scheduler already has an authority — reuse it rather
-        # than silently replacing it with a fresh instance (which would
-        # both lose the baseline and race with concurrent runtimes).
-        office_authority = cfg.tool_scheduler.office_authority
-        owns_office_authority = False
-    else:
-        office_authority = OfficeMutationAuthority()
-    # B1: every security component is built from the *effective* policy,
-    # not the raw project policy.  B2: root_capabilities is always installed
-    # (even when empty) so an empty set means "deny all", not "no restriction".
-    if cfg.sandbox is not None:
-        sandbox = cfg.sandbox
-    else:
-        sandbox = Sandbox(
-            mode=effective_policy.mode,
-            workspace_root=root,
-            root_capabilities=effective_policy.root_capabilities,
-        )
-    if cfg.network_guard is not None:
-        network_guard = cfg.network_guard
-    else:
-        network_guard = NetworkGuard(
-            network_enabled=effective_policy.network_enabled,
-            # H3: three-state — pass ``None`` through unchanged so
-            # NetworkGuard distinguishes "no allowlist" (unrestricted) from
-            # "empty allowlist" (deny all).  ``list(None)`` would raise, so
-            # only convert when non-None.
-            allowed_domains=(
-                list(effective_policy.network_allowed_domains)
-                if effective_policy.network_allowed_domains is not None
-                else None
-            ),
-            blocked_domains=list(effective_policy.network_blocked_domains),
-        )
-    # H2: resolve the AuditLogger BEFORE the scheduler block so it is in
-    # scope for both the ``cfg.tool_scheduler is None`` branch (where it
-    # is wired into the SecurityMiddleware) AND the RuntimeResult at the
-    # end (where it is stored so ``aclose`` can close its fd).  Previously
-    # the variable was only assigned inside the ``if scheduler is None``
-    # block, so RuntimeResult couldn't reference it — the fd leaked.
-    scheduler = cfg.tool_scheduler
-    plan_repository_for_router = getattr(cfg.db, "plan_revision_repository", None)
-    route_repository_for_router = getattr(cfg.db, "plan_tool_route_repository", None)
-    assignment_repository_for_router = getattr(cfg.db, "subagent_assignment_repository", None)
-    plan_router = None
-    if plan_repository_for_router is not None and route_repository_for_router is not None:
-        plan_router = PlanToolRouter(
-            plan_repository_for_router, route_repository_for_router,
-            assignment_repository_for_router,
-        )
-    elif production_mode:
-        raise RuntimeError(
-            "production coding runtime requires published-plan routing repositories"
-        )
-    if scheduler is None:
-        # B1: when a tool allowlist is configured (SubAgent path), prune the
-        # full runtime registry down to exactly the declared tool subset so
-        # the subagent cannot invoke tools outside its declared scope.  The
-        # pruned registry is wired into a fresh ToolScheduler whose
-        # SecurityMiddleware carries the same EffectivePolicy / Sandbox /
-        # NetworkGuard / AuditLogger as the main runtime — closing the
-        # parallel-scheduler bypass where a subagent ran without any
-        # security stack at all.
-        # Round-14 §7: reuse the registry already built for exec_tool_names
-        # derivation above, instead of constructing a second identical one.
-        registry = runtime_registry
-        scheduler = ToolScheduler(
-            registry, permission_engine,
-            operation_repository=cfg.db.tool_operation_repository,
-            security_middleware=SecurityMiddleware(
-                sandbox=sandbox,
-                network_guard=network_guard,
+        memory_retrieval_policy = MemoryRetrievalPolicy.production()
+
+        def memory_context(
+            session_id: str,
+            *,
+            task_id: str | None = None,
+            workspace_id: str | None = None,
+            repo_id: str | None = None,
+            commit_sha: str | None = None,
+            branch: str | None = None,
+        ) -> RuntimeMemoryContext:
+            """Bind the complete host/runtime identity before Broker access."""
+
+            binding = MemoryRuntimeBinding(
+                principal_id=cfg.principal_id,
+                project_id=project_id,
+                session_id=session_id or cfg.session_id or None,
+                task_id=task_id or cfg.task_id or None,
+                workspace_id=workspace_id or cfg.workspace_id or None,
+                mode=mode_manager.current_mode.value,
+                available_capabilities=cfg.available_capabilities,
+                environment_fingerprint=cfg.environment_fingerprint or "runtime:default",
+                repo_id=(
+                    repo_id
+                    or cfg.repo_id
+                    or (repository_id_for_root(root) if mode_manager.current_mode.value == "coding" else None)
+                ),
+                commit_sha=(
+                    commit_sha
+                    or cfg.commit_sha
+                    or ("working-tree" if mode_manager.current_mode.value == "coding" else None)
+                ),
+                branch=branch or cfg.branch or None,
+                environment={
+                    **cfg.environment,
+                    "source_transport": cfg.source_transport,
+                    "runtime_id": cfg.runtime_id,
+                },
+            )
+            return binding.context()
+
+        memory_host = cfg.memory_host
+        owns_memory_host = False
+        if cfg.memory_manager is None and cfg.memory_host is not None:
+            # Shared application composition: use the already initialized host;
+            # this branch never constructs a provider, registry, or Broker.
+            memory_host = cfg.memory_host
+            profile = memory_host.profile
+            if profile is None:
+                raise ValueError("memory host has no resolved profile")
+            profile_registry = memory_host.profile_registry
+            profile_store = memory_host.profile_store
+            memory_broker = memory_host.broker
+            provider_manager = memory_host.provider_manager
+            transfer_service = memory_host.transfer_service
+            codegraph = memory_host.codegraph
+            memory_manager = MemoryManager(
+                memory_store,
+                budget=profile.budget(MemoryBudget()),
+                mode_getter=lambda: mode_manager.current_mode,
+                intent_getter=lambda: getattr(mode_manager, "_intent_buffer", ""),
+                broker=memory_broker,
+                runtime_context_factory=memory_context,
+                provider_manager=provider_manager,
+                profile=profile,
+                transfer_service=transfer_service,
+                codegraph=codegraph,
+                owns_provider_manager=False,
+                retrieval_policy=memory_retrieval_policy,
+            )
+            memory_manager.profile_registry = profile_registry
+            memory_manager.profile_store = profile_store
+            memory_manager.observability = getattr(memory_broker, "observability", None)
+        elif cfg.memory_manager is None:
+            memory_host = await build_memory_host(
+                db=cfg.db,
+                project_root=root,
+                config_path=cfg.config_path or root / "config.yaml",
+                mode=mode_manager.current_mode.value,
+                principal_id=cfg.principal_id,
+                project_id=project_id,
+                repo_id=cfg.repo_id,
+                commit_sha=cfg.commit_sha,
                 audit_logger=audit_logger,
                 effective_policy=effective_policy,
-            ),
-            # H5: the runtime_id identifies this runtime to the
-            # BrowserManager so two concurrent local sessions under the
-            # same UID get independent BrowserContexts.  The broker uses
-            # it (together with session_id + principal_id) to key the
-            # per-session context.
-            runtime_id=cfg.runtime_id,
-            network_broker_factory=NetworkBrokerFactory(
-                resource_order=typed_resource_order,
-                runtime_profile=runtime_profile,
-            ),
-            credential_broker=credential_broker,
-            plan_router=plan_router,
-        )
-    elif production_mode:
-        if not isinstance(getattr(scheduler, "plan_router", None), PlanToolRouter):
-            raise RuntimeError(
-                "injected production ToolScheduler must use PublishedPlanToolRouter"
             )
-    if production_mode:
-        scheduler_resource_order = getattr(
-            getattr(scheduler, "network_broker_factory", None),
-            "resource_order",
-            None,
-        )
+            owns_memory_host = True
+            profile = memory_host.profile
+            if profile is None:
+                raise RuntimeError("canonical memory host has no active profile")
+            profile_registry = memory_host.profile_registry
+            profile_store = memory_host.profile_store
+            memory_broker = memory_host.broker
+            provider_manager = memory_host.provider_manager
+            transfer_service = memory_host.transfer_service
+            codegraph = memory_host.codegraph
+            memory_manager = MemoryManager(
+                memory_store,
+                budget=profile.budget(MemoryBudget()),
+                mode_getter=lambda: mode_manager.current_mode,
+                intent_getter=lambda: getattr(mode_manager, "_intent_buffer", ""),
+                broker=memory_broker,
+                runtime_context_factory=memory_context,
+                provider_manager=provider_manager,
+                profile=profile,
+                transfer_service=transfer_service,
+                codegraph=codegraph,
+                owns_provider_manager=False,
+                retrieval_policy=memory_retrieval_policy,
+            )
+            # Keep the profile and registry available to the TUI/RPC composition
+            # without creating a second provider path.  All operations still
+            # enter through the same Broker instance above.
+            memory_manager.profile_registry = profile_registry
+            memory_manager.profile_store = profile_store
+            memory_manager.observability = getattr(memory_broker, "observability", None)
+        else:
+            memory_manager = cfg.memory_manager
+
+        if cfg.memory_manager is not None:
+            memory_host = getattr(cfg.memory_manager, "memory_host", None)
+        if memory_host is not None:
+            memory_manager.memory_host = memory_host
+        skill_manager = cfg.skill_manager or SkillManager()
+        skills_dir = root / "skills"
+        if len(skill_manager.registry) == 0 and skills_dir.is_dir():
+            skill_manager.load_from_dir(skills_dir)
+        task_manager = cfg.task_manager
+        if task_manager is None:
+            # A3-5: bind the TaskManager to the runtime's principal so every
+            # coding task is owned by exactly one principal for its entire
+            # lifecycle.  An unauthenticated runtime (``principal_id='legacy'``)
+            # can only see its own 'legacy' tasks (quarantined to
+            # ``status='failed'`` by the migration helper), so it can never
+            # execute or surface an authenticated principal's tasks.
+            #
+            # M4 batch 3.1.16A-5-1b: also stamp ``project_id`` so coding
+            # tasks are project-scoped (see A-5-1a schema closure).
+            task_manager = TaskManager(
+                db=cfg.db, principal_id=cfg.principal_id,
+                project_id=project_id,
+            )
+            await task_manager.load()
         if (
-            typed_resource_order is None
-            or scheduler_resource_order is None
-            or scheduler_resource_order.catalog_digest
-            != typed_resource_order.catalog_digest
+            cfg.delegated_execution_context is not None
+            and cfg.delegated_workspace_manager is None
+        ):
+            raise RuntimeError(
+                "delegated runtime requires the exact parent workspace manager"
+            )
+        workspace_manager = (
+            cfg.delegated_workspace_manager
+            if cfg.delegated_execution_context is not None
+            else cfg.workspace_manager
+        ) or WorkspaceManager(
+            policy_digest=effective_policy.digest,
+            authorization_epoch=await permission_engine.authorization_snapshot(),
+            resource_order=typed_resource_order,
+            runtime_profile=runtime_profile,
+            authority_broker=authority_broker,
+            principal_id=cfg.principal_id,
+            principal_kind=authority_principal_kind,
+            parent_principal_id=cfg.parent_principal_id,
+            delegation_digest=cfg.delegation_digest,
+            session_id=cfg.session_id,
+            source_transport=cfg.source_transport,
+            project_id=project_id,
+            runtime_id=cfg.runtime_id,
+        )
+        injected_workspace_policy = getattr(workspace_manager, "policy_digest", None)
+        if (
+            production_mode
+            and injected_workspace_policy is not None
+            and injected_workspace_policy != effective_policy.digest
         ):
             raise PermissionError(
-                "production ToolScheduler must use the effective typed resource catalog"
+                "WorkspaceManager authority policy digest does not match the "
+                "runtime effective policy; host Git control-plane effects cannot "
+                "borrow a different policy authority."
             )
-    scheduler.set_office_authority(office_authority)
-    scheduler.credential_broker = credential_broker
-    if cfg.browser_manager is None:
-        from khaos.tools.browser_tools import BrowserManager
+        if production_mode:
+            workspace_authority = getattr(workspace_manager, "authority_broker", None)
+            if workspace_authority is not authority_broker:
+                raise PermissionError(
+                    "production WorkspaceManager is not bound to the runtime authority broker"
+                )
+        execution_service = cfg.execution_service or ExecutionService(
+            workspace_manager=workspace_manager,
+            backend_selector=BackendSelector(runtime_profile=runtime_profile),
+            principal_id=cfg.principal_id,
+            project_id=project_id,
+            runtime_id=cfg.runtime_id,
+            runtime_profile=runtime_profile,
+            authority_broker=authority_broker,
+        )
+        execution_service.bind_runtime_authority(
+            principal_id=cfg.principal_id,
+            project_id=project_id,
+            runtime_id=cfg.runtime_id,
+        )
+        # M7.2: production context is composed from the runtime-owned workspace
+        # authority.  ProductionRuntimeConfig intentionally has no reader/index
+        # injection seam, so model-controlled or host-path readers cannot replace
+        # SafeWorkspaceFS here.
+        context_intelligence = (
+            ContextIntelligenceService(workspace_manager)
+            if production_mode
+            else None
+        )
+        # B1: the OfficeMutationAuthority is a server/project-lifecycle object.
+        # When ``cfg.office_authority`` is injected (AgentService / SubAgentService
+        # share one across every turn), reuse it so the aggregate storage baseline
+        # persists across turns (closing the cross-turn quota bypass) and the
+        # lifecycle is owned by the caller.  When not injected, create a new one
+        # owned by this RuntimeResult (closed in aclose).
+        # B1: when a shared ToolScheduler is passed in that already holds an
+        # authority, reuse that authority too — never silently replace it.
+        owns_office_authority = True
+        if cfg.office_authority is not None:
+            office_authority = cfg.office_authority
+            owns_office_authority = False
+        elif (
+            cfg.tool_scheduler is not None
+            and getattr(cfg.tool_scheduler, "office_authority", None) is not None
+        ):
+            # B1: shared scheduler already has an authority — reuse it rather
+            # than silently replacing it with a fresh instance (which would
+            # both lose the baseline and race with concurrent runtimes).
+            office_authority = cfg.tool_scheduler.office_authority
+            owns_office_authority = False
+        else:
+            office_authority = OfficeMutationAuthority()
+        # B1: every security component is built from the *effective* policy,
+        # not the raw project policy.  B2: root_capabilities is always installed
+        # (even when empty) so an empty set means "deny all", not "no restriction".
+        if cfg.sandbox is not None:
+            sandbox = cfg.sandbox
+        else:
+            sandbox = Sandbox(
+                mode=effective_policy.mode,
+                workspace_root=root,
+                root_capabilities=effective_policy.root_capabilities,
+            )
+        if cfg.network_guard is not None:
+            network_guard = cfg.network_guard
+        else:
+            network_guard = NetworkGuard(
+                network_enabled=effective_policy.network_enabled,
+                # H3: three-state — pass ``None`` through unchanged so
+                # NetworkGuard distinguishes "no allowlist" (unrestricted) from
+                # "empty allowlist" (deny all).  ``list(None)`` would raise, so
+                # only convert when non-None.
+                allowed_domains=(
+                    list(effective_policy.network_allowed_domains)
+                    if effective_policy.network_allowed_domains is not None
+                    else None
+                ),
+                blocked_domains=list(effective_policy.network_blocked_domains),
+            )
+        # H2: resolve the AuditLogger BEFORE the scheduler block so it is in
+        # scope for both the ``cfg.tool_scheduler is None`` branch (where it
+        # is wired into the SecurityMiddleware) AND the RuntimeResult at the
+        # end (where it is stored so ``aclose`` can close its fd).  Previously
+        # the variable was only assigned inside the ``if scheduler is None``
+        # block, so RuntimeResult couldn't reference it — the fd leaked.
+        scheduler = cfg.tool_scheduler
+        plan_repository_for_router = getattr(cfg.db, "plan_revision_repository", None)
+        route_repository_for_router = getattr(cfg.db, "plan_tool_route_repository", None)
+        assignment_repository_for_router = getattr(cfg.db, "subagent_assignment_repository", None)
+        plan_router = None
+        if plan_repository_for_router is not None and route_repository_for_router is not None:
+            plan_router = PlanToolRouter(
+                plan_repository_for_router, route_repository_for_router,
+                assignment_repository_for_router,
+            )
+        elif production_mode:
+            raise RuntimeError(
+                "production coding runtime requires published-plan routing repositories"
+            )
+        if scheduler is None:
+            # B1: when a tool allowlist is configured (SubAgent path), prune the
+            # full runtime registry down to exactly the declared tool subset so
+            # the subagent cannot invoke tools outside its declared scope.  The
+            # pruned registry is wired into a fresh ToolScheduler whose
+            # SecurityMiddleware carries the same EffectivePolicy / Sandbox /
+            # NetworkGuard / AuditLogger as the main runtime — closing the
+            # parallel-scheduler bypass where a subagent ran without any
+            # security stack at all.
+            # Round-14 §7: reuse the registry already built for exec_tool_names
+            # derivation above, instead of constructing a second identical one.
+            registry = runtime_registry
+            scheduler = ToolScheduler(
+                registry, permission_engine,
+                operation_repository=cfg.db.tool_operation_repository,
+                security_middleware=SecurityMiddleware(
+                    sandbox=sandbox,
+                    network_guard=network_guard,
+                    audit_logger=audit_logger,
+                    effective_policy=effective_policy,
+                ),
+                # H5: the runtime_id identifies this runtime to the
+                # BrowserManager so two concurrent local sessions under the
+                # same UID get independent BrowserContexts.  The broker uses
+                # it (together with session_id + principal_id) to key the
+                # per-session context.
+                runtime_id=cfg.runtime_id,
+                network_broker_factory=NetworkBrokerFactory(
+                    authority_broker=authority_broker,
+                    resource_order=typed_resource_order,
+                    runtime_profile=runtime_profile,
+                ),
+                credential_broker=credential_broker,
+                plan_router=plan_router,
+            )
+        elif production_mode:
+            if not isinstance(getattr(scheduler, "plan_router", None), PlanToolRouter):
+                raise RuntimeError(
+                    "injected production ToolScheduler must use PublishedPlanToolRouter"
+                )
+        if production_mode:
+            scheduler_resource_order = getattr(
+                getattr(scheduler, "network_broker_factory", None),
+                "resource_order",
+                None,
+            )
+            if (
+                typed_resource_order is None
+                or scheduler_resource_order is None
+                or scheduler_resource_order.catalog_digest
+                != typed_resource_order.catalog_digest
+            ):
+                raise PermissionError(
+                    "production ToolScheduler must use the effective typed resource catalog"
+                )
+        scheduler.set_office_authority(office_authority)
+        scheduler.credential_broker = credential_broker
+        if cfg.browser_manager is None:
+            from khaos.tools.browser_tools import BrowserManager
 
-        browser_manager = BrowserManager(runtime_profile=runtime_profile)
-    else:
-        browser_manager = cfg.browser_manager
-    # B1: register the authority on the scheduler only (instance attribute).
-    # The previous module-global ``file_tools._office_authority`` was removed
-    # — direct callers must pass ``office_authority`` explicitly or fall back
-    # to the legacy unfenced path (only safe for trusted inputs in tests).
-    # M4 batch 3.1.16A-4-4-1 (CRITICAL): the principal-scoped
-    # PermissionEngine + AuditLogger are no longer wired into module-
-    # global holders (the old ``init_permission_tools`` call).  The five
-    # permission tools now receive them per-call via the
-    # ``permission.read`` / ``permission.manage`` broker injection from
-    # ``tool_context`` (assembled by ``AgentLoop`` from
-    # ``tool_scheduler.permission_engine`` and
-    # ``tool_scheduler.security_middleware.audit_logger``).  This closes
-    # the cross-principal race where concurrent ``build_runtime`` calls
-    # overwrote each other's holder — see ``permission_tools.py``
-    # docstring for the race description.
-    compressor = ContextCompressor(router, memory_manager=memory_manager)
-    verify_factory = VerifyFixLoop
-    skill_generator = SkillGenerator()
-    cleanup_authority = cfg.cleanup_authority or RuntimeCleanupAuthority()
-    from khaos.agent.control.completion_flow import (
-        CompletionProposalController,
-    )
-    from khaos.agent.control.completion_gate import CompletionGate
-    from khaos.agent.control.completion_recovery import (
-        CompletionRecoveryService,
-        DatabaseCompletionGateHistoryReader,
-    )
-    from khaos.agent.control.recovery import RecoveryPolicy
-    from khaos.agent.control.recovery_control import RecoveryControlCoordinator
-    from khaos.agent.control.recovery_gate import RecoveryGate
-    goal_spec_repository = getattr(task_manager, "goal_spec_repository", None)
-    if goal_spec_repository is None:
-        goal_spec_repository = getattr(cfg.db, "goal_spec_repository", None)
-    decision_repository = getattr(cfg.db, "completion_decision_repository", None)
-    if goal_spec_repository is None or decision_repository is None:
-        raise RuntimeError(
-            "completion control repositories are unavailable in runtime composition"
+            browser_manager = BrowserManager(runtime_profile=runtime_profile)
+        else:
+            browser_manager = cfg.browser_manager
+        # B1: register the authority on the scheduler only (instance attribute).
+        # The previous module-global ``file_tools._office_authority`` was removed
+        # — direct callers must pass ``office_authority`` explicitly or fall back
+        # to the legacy unfenced path (only safe for trusted inputs in tests).
+        # M4 batch 3.1.16A-4-4-1 (CRITICAL): the principal-scoped
+        # PermissionEngine + AuditLogger are no longer wired into module-
+        # global holders (the old ``init_permission_tools`` call).  The five
+        # permission tools now receive them per-call via the
+        # ``permission.read`` / ``permission.manage`` broker injection from
+        # ``tool_context`` (assembled by ``AgentLoop`` from
+        # ``tool_scheduler.permission_engine`` and
+        # ``tool_scheduler.security_middleware.audit_logger``).  This closes
+        # the cross-principal race where concurrent ``build_runtime`` calls
+        # overwrote each other's holder — see ``permission_tools.py``
+        # docstring for the race description.
+        compressor = ContextCompressor(router, memory_manager=memory_manager)
+        verify_factory = VerifyFixLoop
+        skill_generator = SkillGenerator()
+        cleanup_authority = cfg.cleanup_authority or RuntimeCleanupAuthority()
+        from khaos.agent.control.completion_flow import (
+            CompletionProposalController,
         )
-    verification_assessment_repository = getattr(
-        cfg.db, "verification_assessment_repository", None
-    )
-    if verification_assessment_repository is None:
-        raise RuntimeError(
-            "trusted verification assessment repository is unavailable in runtime composition"
+        from khaos.agent.control.completion_gate import CompletionGate
+        from khaos.agent.control.completion_recovery import (
+            CompletionRecoveryService,
+            DatabaseCompletionGateHistoryReader,
         )
-    trusted_verification_authority = TrustedVerificationAuthority()
-    trusted_verification_service = TrustedVerificationService(
-        authority=trusted_verification_authority,
-        repository=verification_assessment_repository,
-    )
-    fact_provider = cfg.completion_fact_provider
-    if fact_provider is None:
-        fact_provider = TrustedVerificationFactProvider(
+        from khaos.agent.control.recovery import RecoveryPolicy
+        from khaos.agent.control.recovery_control import RecoveryControlCoordinator
+        from khaos.agent.control.recovery_gate import RecoveryGate
+        goal_spec_repository = getattr(task_manager, "goal_spec_repository", None)
+        if goal_spec_repository is None:
+            goal_spec_repository = getattr(cfg.db, "goal_spec_repository", None)
+        decision_repository = getattr(cfg.db, "completion_decision_repository", None)
+        if goal_spec_repository is None or decision_repository is None:
+            raise RuntimeError(
+                "completion control repositories are unavailable in runtime composition"
+            )
+        verification_assessment_repository = getattr(
+            cfg.db, "verification_assessment_repository", None
+        )
+        if verification_assessment_repository is None:
+            raise RuntimeError(
+                "trusted verification assessment repository is unavailable in runtime composition"
+            )
+        trusted_verification_authority = TrustedVerificationAuthority()
+        trusted_verification_service = TrustedVerificationService(
+            authority=trusted_verification_authority,
             repository=verification_assessment_repository,
+        )
+        fact_provider = cfg.completion_fact_provider
+        if fact_provider is None:
+            fact_provider = TrustedVerificationFactProvider(
+                repository=verification_assessment_repository,
+                principal_id=cfg.principal_id,
+                project_id=project_id,
+            )
+        completion_controller = CompletionProposalController(
+            goal_spec_repository=goal_spec_repository,
+            decision_repository=decision_repository,
+            principal_id=cfg.principal_id,
+            project_id=project_id,
+            fact_provider=fact_provider,
+        )
+        # The production authority policy is intentionally the Gate's fail-closed
+        # default. RuntimeConfig exposes no arbitrary authority-policy injection;
+        # trusted evidence composition belongs to its designated later batch.
+        completion_gate = CompletionGate(
+            decision_repository=decision_repository,
+            goal_spec_repository=goal_spec_repository,
+            principal_id=cfg.principal_id,
+            project_id=project_id,
+            task_projection=task_manager,
+            active_subagent_reader=getattr(cfg.db, "subagent_assignment_repository", None),
+        )
+        completion_recovery = CompletionRecoveryService(
+            decision_repository=decision_repository,
+            goal_spec_repository=goal_spec_repository,
+            gate_history_reader=DatabaseCompletionGateHistoryReader(cfg.db),
             principal_id=cfg.principal_id,
             project_id=project_id,
         )
-    completion_controller = CompletionProposalController(
-        goal_spec_repository=goal_spec_repository,
-        decision_repository=decision_repository,
-        principal_id=cfg.principal_id,
-        project_id=project_id,
-        fact_provider=fact_provider,
-    )
-    # The production authority policy is intentionally the Gate's fail-closed
-    # default. RuntimeConfig exposes no arbitrary authority-policy injection;
-    # trusted evidence composition belongs to its designated later batch.
-    completion_gate = CompletionGate(
-        decision_repository=decision_repository,
-        goal_spec_repository=goal_spec_repository,
-        principal_id=cfg.principal_id,
-        project_id=project_id,
-        task_projection=task_manager,
-        active_subagent_reader=getattr(cfg.db, "subagent_assignment_repository", None),
-    )
-    completion_recovery = CompletionRecoveryService(
-        decision_repository=decision_repository,
-        goal_spec_repository=goal_spec_repository,
-        gate_history_reader=DatabaseCompletionGateHistoryReader(cfg.db),
-        principal_id=cfg.principal_id,
-        project_id=project_id,
-    )
-    # M7.3: production planning is composed around the M7.2 context owner.
-    # The deterministic service is deliberately constructed without its
-    # legacy path/index query port; the production entry is
-    # ``plan_from_context`` and receives only a fresh ContextBundle.
-    # The plan ledger remains an owner-scoped durable read boundary even when
-    # the optional context/planning composition is unavailable.  Recovery
-    # must never lose strict published/latest-plan validation merely because
-    # its planner is not composed in a particular runtime profile.
-    plan_repository = getattr(cfg.db, "plan_revision_repository", None)
-    control_state_repository = getattr(
-        cfg.db, "agent_control_state_repository", None
-    )
-    planning_coordinator = None
-    if context_intelligence is not None:
-        if plan_repository is None or control_state_repository is None:
-            raise RuntimeError(
-                "planning control repositories are unavailable in runtime composition"
-            )
-        planning_service = DeterministicPlanningService(
-            None,
-            repositories={},
+        # M7.3: production planning is composed around the M7.2 context owner.
+        # The deterministic service is deliberately constructed without its
+        # legacy path/index query port; the production entry is
+        # ``plan_from_context`` and receives only a fresh ContextBundle.
+        # The plan ledger remains an owner-scoped durable read boundary even when
+        # the optional context/planning composition is unavailable.  Recovery
+        # must never lose strict published/latest-plan validation merely because
+        # its planner is not composed in a particular runtime profile.
+        plan_repository = getattr(cfg.db, "plan_revision_repository", None)
+        control_state_repository = getattr(
+            cfg.db, "agent_control_state_repository", None
         )
-        planning_coordinator = PlanningControlCoordinator(
-            planning_service=planning_service,
-            context_intelligence=context_intelligence,
+        planning_coordinator = None
+        if context_intelligence is not None:
+            if plan_repository is None or control_state_repository is None:
+                raise RuntimeError(
+                    "planning control repositories are unavailable in runtime composition"
+                )
+            planning_service = DeterministicPlanningService(
+                None,
+                repositories={},
+            )
+            planning_coordinator = PlanningControlCoordinator(
+                planning_service=planning_service,
+                context_intelligence=context_intelligence,
+                goal_spec_repository=goal_spec_repository,
+                plan_revision_repository=plan_repository,
+                control_state_repository=control_state_repository,
+                principal_id=cfg.principal_id,
+                project_id=project_id,
+            )
+        # M7.8: compose the plan-bound delegation authority only for a parent
+        # runtime.  A delegated child deliberately receives no coordinator, so a
+        # child cannot create a second control tree or recursively delegate.
+        subagent_control_coordinator = None
+        assignment_repository = getattr(cfg.db, "subagent_assignment_repository", None)
+        if (
+            cfg.subagent_spawner is not None
+            and cfg.delegated_execution_context is None
+            and plan_repository is not None
+            and assignment_repository is not None
+            and goal_spec_repository is not None
+            and workspace_manager is not None
+            and getattr(scheduler, "registry", None) is not None
+        ):
+            from khaos.subagents.assignment import SubAgentControlCoordinator
+
+            subagent_control_coordinator = SubAgentControlCoordinator(
+                plan_repository=plan_repository,
+                assignment_repository=assignment_repository,
+                goal_spec_repository=goal_spec_repository,
+                workspace_manager=workspace_manager,
+                registry=scheduler.registry,
+                spawner=cfg.subagent_spawner,
+            )
+        recovery_decision_repository = getattr(
+            cfg.db, "recovery_decision_repository", None
+        )
+        recovery_gate_repository = getattr(cfg.db, "recovery_gate_repository", None)
+        if recovery_decision_repository is None or recovery_gate_repository is None:
+            raise RuntimeError(
+                "recovery control repositories are unavailable in runtime composition"
+            )
+        recovery_gate = RecoveryGate(
+            gate_repository=recovery_gate_repository,
+            principal_id=cfg.principal_id,
+            project_id=project_id,
+        )
+        recovery_control = RecoveryControlCoordinator(
+            recovery_repository=recovery_decision_repository,
+            recovery_gate=recovery_gate,
+            principal_id=cfg.principal_id,
+            project_id=project_id,
+            policy=RecoveryPolicy.production_default(),
             goal_spec_repository=goal_spec_repository,
             plan_revision_repository=plan_repository,
+            verification_assessment_repository=verification_assessment_repository,
+            completion_recovery=completion_recovery,
+            planning_coordinator=planning_coordinator,
             control_state_repository=control_state_repository,
-            principal_id=cfg.principal_id,
-            project_id=project_id,
         )
-    # M7.8: compose the plan-bound delegation authority only for a parent
-    # runtime.  A delegated child deliberately receives no coordinator, so a
-    # child cannot create a second control tree or recursively delegate.
-    subagent_control_coordinator = None
-    assignment_repository = getattr(cfg.db, "subagent_assignment_repository", None)
-    if (
-        cfg.subagent_spawner is not None
-        and cfg.delegated_execution_context is None
-        and plan_repository is not None
-        and assignment_repository is not None
-        and goal_spec_repository is not None
-        and workspace_manager is not None
-        and getattr(scheduler, "registry", None) is not None
-    ):
-        from khaos.subagents.assignment import SubAgentControlCoordinator
-
-        subagent_control_coordinator = SubAgentControlCoordinator(
-            plan_repository=plan_repository,
-            assignment_repository=assignment_repository,
-            goal_spec_repository=goal_spec_repository,
+        loop = AgentLoop(
+            cfg.agent_config or AgentConfig(), mode_manager, router, cfg.db,
+            tool_scheduler=scheduler, confirm_callback=cfg.confirm_callback,
+            context_compressor=compressor, memory_manager=memory_manager,
+            error_handler=ErrorHandler(
+                db=cfg.db,
+                router=router,
+                compressor=compressor,
+                principal_id=cfg.principal_id,
+                project_id=project_id,
+                audit_logger=audit_logger,
+            ),
+            token_engine=get_token_engine(),
+            skill_manager=skill_manager if len(skill_manager.registry) else None,
+            verify_fix_factory=verify_factory,
+            task_manager=(
+                None if cfg.delegated_execution_context is not None else task_manager
+            ),
+            skill_generator=skill_generator, project_root=root,
+            coding_context_builder=(
+                cfg.coding_context_builder if not production_mode else None
+            ),
+            context_intelligence=context_intelligence,
             workspace_manager=workspace_manager,
-            registry=scheduler.registry,
-            spawner=cfg.subagent_spawner,
-        )
-    recovery_decision_repository = getattr(
-        cfg.db, "recovery_decision_repository", None
-    )
-    recovery_gate_repository = getattr(cfg.db, "recovery_gate_repository", None)
-    if recovery_decision_repository is None or recovery_gate_repository is None:
-        raise RuntimeError(
-            "recovery control repositories are unavailable in runtime composition"
-        )
-    recovery_gate = RecoveryGate(
-        gate_repository=recovery_gate_repository,
-        principal_id=cfg.principal_id,
-        project_id=project_id,
-    )
-    recovery_control = RecoveryControlCoordinator(
-        recovery_repository=recovery_decision_repository,
-        recovery_gate=recovery_gate,
-        principal_id=cfg.principal_id,
-        project_id=project_id,
-        policy=RecoveryPolicy.production_default(),
-        goal_spec_repository=goal_spec_repository,
-        plan_revision_repository=plan_repository,
-        verification_assessment_repository=verification_assessment_repository,
-        completion_recovery=completion_recovery,
-        planning_coordinator=planning_coordinator,
-        control_state_repository=control_state_repository,
-    )
-    loop = AgentLoop(
-        cfg.agent_config or AgentConfig(), mode_manager, router, cfg.db,
-        tool_scheduler=scheduler, confirm_callback=cfg.confirm_callback,
-        context_compressor=compressor, memory_manager=memory_manager,
-        error_handler=ErrorHandler(
-            db=cfg.db,
-            router=router,
-            compressor=compressor,
+            execution_service=execution_service,
+            approval_broker=cfg.approval_broker,
             principal_id=cfg.principal_id,
+            principal_kind=authority_principal_kind,
+            parent_principal_id=cfg.parent_principal_id,
+            delegation_digest=cfg.delegation_digest,
+            source_transport=cfg.source_transport,
+            foreground_session=cfg.foreground_session,
+            # H5: carry the runtime_id + session_id into the AgentLoop so the
+            # tool_context it builds for the broker includes them — the broker
+            # injects them into browser tools so two concurrent sessions get
+            # independent BrowserContexts (closing one runtime's context does
+            # NOT close a concurrent runtime's page).
+            runtime_id=cfg.runtime_id,
+            session_id=cfg.session_id,
+            # M4 batch 3.1.16A-4-4-3: carry the channel registry + admin
+            # allowlist into the AgentLoop so ``tool_context`` exposes them
+            # to the broker — the four channel tools read them via the
+            # ``channel.read`` / ``channel.manage`` capability injection.
+            channel_registry=cfg.channel_registry,
+            channel_admins=cfg.channel_admins,
+            cron_engine=cfg.cron_engine,
+            browser_manager=browser_manager,
+            subagent_spawner=cfg.subagent_spawner,
+            subagent_control_coordinator=subagent_control_coordinator,
+            credential_broker=credential_broker,
+            completion_controller=completion_controller,
+            completion_gate=(
+                None if cfg.delegated_execution_context is not None else completion_gate
+            ),
+            completion_recovery=(
+                None
+                if cfg.delegated_execution_context is not None
+                else completion_recovery
+            ),
+            planning_coordinator=(
+                None
+                if cfg.delegated_execution_context is not None
+                else planning_coordinator
+            ),
+            recovery_control=(
+                None if cfg.delegated_execution_context is not None else recovery_control
+            ),
+            delegated_execution_context=cfg.delegated_execution_context,
+            trusted_verification_authority=trusted_verification_authority,
+            trusted_verification_service=trusted_verification_service,
+            # M4 batch 3.1.16A-5-1b (CRITICAL): carry the RPC-verified
+            # project identity into the AgentLoop so every message / turn
+            # write is stamped with it.  ``self._bound_project_id`` (set
+            # from this kwarg) is the value the RPC dispatcher compares
+            # against ``ctx.project_id`` for drift detection (fail-closed
+            # rejection).
             project_id=project_id,
-            audit_logger=audit_logger,
-        ),
-        token_engine=get_token_engine(),
-        skill_manager=skill_manager if len(skill_manager.registry) else None,
-        verify_fix_factory=verify_factory,
-        task_manager=(
-            None if cfg.delegated_execution_context is not None else task_manager
-        ),
-        skill_generator=skill_generator, project_root=root,
-        coding_context_builder=(
-            cfg.coding_context_builder if not production_mode else None
-        ),
-        context_intelligence=context_intelligence,
-        workspace_manager=workspace_manager,
-        execution_service=execution_service,
-        approval_broker=cfg.approval_broker,
-        principal_id=cfg.principal_id,
-        principal_kind=cfg.principal_kind,
-        parent_principal_id=cfg.parent_principal_id,
-        delegation_digest=cfg.delegation_digest,
-        source_transport=cfg.source_transport,
-        foreground_session=cfg.foreground_session,
-        # H5: carry the runtime_id + session_id into the AgentLoop so the
-        # tool_context it builds for the broker includes them — the broker
-        # injects them into browser tools so two concurrent sessions get
-        # independent BrowserContexts (closing one runtime's context does
-        # NOT close a concurrent runtime's page).
-        runtime_id=cfg.runtime_id,
-        session_id=cfg.session_id,
-        # M4 batch 3.1.16A-4-4-3: carry the channel registry + admin
-        # allowlist into the AgentLoop so ``tool_context`` exposes them
-        # to the broker — the four channel tools read them via the
-        # ``channel.read`` / ``channel.manage`` capability injection.
-        channel_registry=cfg.channel_registry,
-        channel_admins=cfg.channel_admins,
-        cron_engine=cfg.cron_engine,
-        browser_manager=browser_manager,
-        subagent_spawner=cfg.subagent_spawner,
-        subagent_control_coordinator=subagent_control_coordinator,
-        credential_broker=credential_broker,
-        completion_controller=completion_controller,
-        completion_gate=(
-            None if cfg.delegated_execution_context is not None else completion_gate
-        ),
-        completion_recovery=(
-            None
-            if cfg.delegated_execution_context is not None
-            else completion_recovery
-        ),
-        planning_coordinator=(
-            None
-            if cfg.delegated_execution_context is not None
-            else planning_coordinator
-        ),
-        recovery_control=(
-            None if cfg.delegated_execution_context is not None else recovery_control
-        ),
-        delegated_execution_context=cfg.delegated_execution_context,
-        trusted_verification_authority=trusted_verification_authority,
-        trusted_verification_service=trusted_verification_service,
-        # M4 batch 3.1.16A-5-1b (CRITICAL): carry the RPC-verified
-        # project identity into the AgentLoop so every message / turn
-        # write is stamped with it.  ``self._bound_project_id`` (set
-        # from this kwarg) is the value the RPC dispatcher compares
-        # against ``ctx.project_id`` for drift detection (fail-closed
-        # rejection).
-        project_id=project_id,
-        runtime_profile=runtime_profile,
-    )
-    from khaos.security.production_composition_manifest import (
-        build_construction_manifest,
-    )
+            runtime_profile=runtime_profile,
+        )
+        from khaos.security.production_composition_manifest import (
+            build_construction_manifest,
+        )
 
-    composition_manifest = build_construction_manifest(
-        {
-            "tool_scheduler": scheduler,
-            "security_middleware": scheduler.security_middleware,
-            "sandbox_backend": sandbox,
-            "network_guard": network_guard,
-            "local_audit_logger": audit_logger,
-            "execution_service": execution_service,
-            "workspace_authority": workspace_manager,
-            "office_mutation_authority": office_authority,
-            "credential_broker": credential_broker,
-            "network_broker": scheduler.network_broker_factory,
-            "approval_broker": loop.approval_broker,
-            "process_supervisor": execution_service.process_supervisor,
-            "execution_backend_selector": execution_service.backend_selector,
-            "verification_backend": verify_factory,
-        }
-    )
-    runtime = RuntimeResult(
-        loop=loop,
-        mode_manager=mode_manager,
-        task_manager=task_manager,
-        skill_generator=skill_generator,
-        tool_scheduler=scheduler,
-        memory_manager=memory_manager,
-        skill_manager=skill_manager,
-        new_verify_fix_loop=verify_factory,
-        profile=runtime_profile,
-        execution_service=execution_service,
-        office_authority=office_authority,
-        owns_office_authority=owns_office_authority,
-        credential_broker=credential_broker,
-        owns_credential_broker=owns_credential_broker,
-        planning_coordinator=planning_coordinator,
-        principal_id=cfg.principal_id,
-        principal_kind=cfg.principal_kind,
-        parent_principal_id=cfg.parent_principal_id,
-        delegation_digest=cfg.delegation_digest,
-        # H5: carry session_id + runtime_id so ``aclose`` can release the
-        # per-session BrowserContext keyed by (principal, session, runtime).
-        session_id=cfg.session_id,
-        runtime_id=cfg.runtime_id,
-        browser_manager=browser_manager,
-        cleanup_authority=cleanup_authority,
-        # H2: carry the AuditLogger so ``aclose`` can close its fd —
-        # without this, configuring a file audit path would leak the fd
-        # for the process's lifetime.
-        audit_logger=audit_logger,
-        owns_audit_logger=owns_audit_logger,
-        # P1-1: stamp the authority seal so callers can verify the runtime
-        # was built under a known (principal, project, policy, runtime) tuple.
-    )._with_seal(authority_seal)
-    runtime.memory_host = memory_host
-    runtime.owns_memory_host = owns_memory_host
-    runtime.recovery_control = recovery_control
-    runtime.composition_manifest = composition_manifest
-    return runtime
+        composition_manifest = build_construction_manifest(
+            {
+                "tool_scheduler": scheduler,
+                "security_middleware": scheduler.security_middleware,
+                "sandbox_backend": sandbox,
+                "network_guard": network_guard,
+                "local_audit_logger": audit_logger,
+                "execution_service": execution_service,
+                "workspace_authority": workspace_manager,
+                "office_mutation_authority": office_authority,
+                "credential_broker": credential_broker,
+                "network_broker": scheduler.network_broker_factory,
+                "approval_broker": loop.approval_broker,
+                "process_supervisor": execution_service.process_supervisor,
+                "execution_backend_selector": execution_service.backend_selector,
+                "verification_backend": verify_factory,
+            }
+        )
+        runtime = RuntimeResult(
+            loop=loop,
+            mode_manager=mode_manager,
+            task_manager=task_manager,
+            skill_generator=skill_generator,
+            tool_scheduler=scheduler,
+            memory_manager=memory_manager,
+            skill_manager=skill_manager,
+            new_verify_fix_loop=verify_factory,
+            profile=runtime_profile,
+            execution_service=execution_service,
+            office_authority=office_authority,
+            owns_office_authority=owns_office_authority,
+            credential_broker=credential_broker,
+            owns_credential_broker=owns_credential_broker,
+            planning_coordinator=planning_coordinator,
+            principal_id=cfg.principal_id,
+            principal_kind=authority_principal_kind,
+            parent_principal_id=cfg.parent_principal_id,
+            delegation_digest=cfg.delegation_digest,
+            # H5: carry session_id + runtime_id so ``aclose`` can release the
+            # per-session BrowserContext keyed by (principal, session, runtime).
+            session_id=cfg.session_id,
+            runtime_id=cfg.runtime_id,
+            browser_manager=browser_manager,
+            cleanup_authority=cleanup_authority,
+            # H2: carry the AuditLogger so ``aclose`` can close its fd —
+            # without this, configuring a file audit path would leak the fd
+            # for the process's lifetime.
+            audit_logger=audit_logger,
+            owns_audit_logger=owns_audit_logger,
+            # P1-1: stamp the authority seal so callers can verify the runtime
+            # was built under a known (principal, project, policy, runtime) tuple.
+        )._with_seal(authority_seal)
+        runtime.authority_broker = authority_broker
+        runtime.owns_authority_broker = owns_authority_broker
+        runtime.memory_host = memory_host
+        runtime.owns_memory_host = owns_memory_host
+        runtime.recovery_control = recovery_control
+        runtime.composition_manifest = composition_manifest
+        return runtime
+    except BaseException:
+        if authority_broker is not None and owns_authority_broker:
+            try:
+                authority_broker.close()
+            except Exception:
+                logger.exception(
+                    "authority broker cleanup failed during runtime startup",
+                )
+        raise
 
 
 async def build_production_runtime(cfg: ProductionRuntimeConfig) -> RuntimeResult:

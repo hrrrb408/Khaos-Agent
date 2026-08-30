@@ -40,6 +40,7 @@ from khaos.security.identity_isolation import (
     IdentityIsolationError,
     read_contract_from_environment,
 )
+from khaos.security.protocol_boundary import strict_json_loads
 from khaos.security.windows_native_ffi import (
     ERROR_OPERATION_ABORTED,
     LPWSTR,
@@ -443,6 +444,10 @@ def serve_windows_backend(daemon: AuthorityDaemon, *, production: bool = True) -
         raise IdentityIsolationError(
             "the Windows authority backend transport requires Windows"
         )
+    if production and daemon.trust_binding is None:
+        raise IdentityIsolationError(
+            "production Windows authorityd requires a trust binding"
+        )
     contract = read_contract_from_environment()
     if production:
         contract.validate(production=True)
@@ -583,8 +588,8 @@ def _serve_one_connection(
             raise OSError("backend pipe read timed out or failed")
         request = buffer.raw[:transferred]
         try:
-            message = json.loads(request.decode("utf-8", errors="strict"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            message = strict_json_loads(request, max_bytes=MAX_MESSAGE_BYTES)
+        except ValueError as exc:
             raise ValueError("backend pipe request is not valid JSON") from exc
         try:
             response = dispatch_pool.submit(_dispatch, daemon, message).result(

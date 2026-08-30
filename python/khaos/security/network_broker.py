@@ -391,6 +391,10 @@ class NetworkBroker:
         normalized_blocked = frozenset(_normalize_domain(domain) for domain in blocked_domains)
         self._capability = capability
         self.runtime_profile = resolve_runtime_profile(runtime_profile)
+        if authority_broker is None and self.runtime_profile.is_production:
+            raise NetworkBrokerError(
+                "production network broker requires the runtime authority broker"
+            )
         self._authority_broker = authority_broker or AuthorityBroker.default(
             runtime_profile=self.runtime_profile
         )
@@ -1085,6 +1089,10 @@ class NetworkBrokerFactory:
         runtime_profile: RuntimeProfile | str | None = None,
     ) -> None:
         self.runtime_profile = resolve_runtime_profile(runtime_profile)
+        if authority_broker is None and self.runtime_profile.is_production:
+            raise NetworkBrokerError(
+                "production network broker requires the runtime authority broker"
+            )
         self.authority_broker = authority_broker or AuthorityBroker.default(
             runtime_profile=self.runtime_profile
         )
@@ -1110,6 +1118,12 @@ class NetworkBrokerFactory:
         authorization_epoch: int,
         allowed_domains: frozenset[str] | None,
         blocked_domains: frozenset[str],
+        principal_kind: str = "",
+        parent_principal_id: str = "",
+        session_id: str = "",
+        delegation_digest: str = "",
+        source_transport: str = "",
+        delegation_resource: str = "",
     ) -> tuple[NetworkBroker, NetworkLease]:
         """Start one capability-bound broker for an execution step."""
         if allowed_domains is not None and not allowed_domains:
@@ -1131,6 +1145,12 @@ class NetworkBrokerFactory:
             operation_class="network.connect",
             resource_digest=policy_resource,
             authorization_epoch=authorization_epoch,
+            principal_kind=principal_kind,
+            parent_principal_id=parent_principal_id,
+            session_id=session_id,
+            delegation_digest=delegation_digest,
+            source_transport=source_transport,
+            delegation_resource=delegation_resource,
         )
         capability = self.authority_broker.issue(
             authority,
