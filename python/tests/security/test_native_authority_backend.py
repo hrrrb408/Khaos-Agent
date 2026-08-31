@@ -571,6 +571,47 @@ def test_native_e2e_client_does_not_require_a_unix_socket(
         lambda *, production, contract: adapter,
     )
 
+    # _build_client is a production composition helper, but this regression
+    # only asserts native transport selection.  The real Windows ACL loading
+    # of the catalog and public key belongs to the deployed native E2E; keep
+    # the real readers and omit only that deployment ACL check for a pytest
+    # temp directory.  The assertions prove production requested the check.
+    original_catalog_loader = module.TypedResourcePartialOrder.from_json_file
+
+    def load_test_catalog(
+        cls,
+        path,
+        *,
+        expected_policy_digest=None,
+        require_windows_acl=False,
+    ):
+        assert path == catalog_path
+        assert expected_policy_digest == policy_digest
+        assert require_windows_acl is (os.name == "nt")
+        return original_catalog_loader(
+            path,
+            expected_policy_digest=expected_policy_digest,
+            require_windows_acl=False,
+        )
+
+    original_public_key_loader = module.Ed25519KeyStore.load_public_key
+
+    def load_test_public_key(path, *, require_windows_acl=False):
+        assert path == public_key_path
+        assert require_windows_acl is (os.name == "nt")
+        return original_public_key_loader(path, require_windows_acl=False)
+
+    monkeypatch.setattr(
+        module.TypedResourcePartialOrder,
+        "from_json_file",
+        classmethod(load_test_catalog),
+    )
+    monkeypatch.setattr(
+        module.Ed25519KeyStore,
+        "load_public_key",
+        staticmethod(load_test_public_key),
+    )
+
     client = module._build_client()
 
     assert client.socket_path is None

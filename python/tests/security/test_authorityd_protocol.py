@@ -274,7 +274,9 @@ def test_public_key_load_is_binary_safe(tmp_path: Path) -> None:
     )
 
 
-def test_native_business_rejection_preserves_ready_trust_channel(tmp_path: Path) -> None:
+def test_native_business_rejection_preserves_ready_trust_channel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     key = Ed25519KeyStore.load_or_create(tmp_path / "authorityd.pem", create=True)
     public_key_path = tmp_path / "authorityd.pub"
     public_key_path.write_bytes(key.public_key().public_bytes_raw())
@@ -302,6 +304,25 @@ def test_native_business_rejection_preserves_ready_trust_channel(tmp_path: Path)
                 }
             return {"ok": False, "error": "authority grant is revoked"}
 
+    # This test uses an in-process adapter to isolate the protocol state
+    # machine.  The deployed Windows ACL trust-anchor contract is covered by
+    # the native production E2E, so retain the real key reader but omit only
+    # its deployment ACL check for this pytest temp file.  The assertion below
+    # still proves that production requests that check.
+    original_load_public_key = authorityd_protocol_module.Ed25519KeyStore.load_public_key
+
+    def load_test_public_key(
+        path: Path, *, require_windows_acl: bool = False
+    ):
+        assert path == public_key_path
+        assert require_windows_acl is True
+        return original_load_public_key(path, require_windows_acl=False)
+
+    monkeypatch.setattr(
+        authorityd_protocol_module.Ed25519KeyStore,
+        "load_public_key",
+        staticmethod(load_test_public_key),
+    )
     client = authorityd_protocol_module.AuthorityDaemonClient(
         transport="native",
         native_adapter=FakeNativeAdapter(),

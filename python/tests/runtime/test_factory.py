@@ -7,6 +7,7 @@ from khaos.agent.control.completion_recovery import CompletionRecoveryService
 from khaos.db import Database
 from khaos.runtime import RuntimeConfig, build_runtime
 from khaos.security.effective_policy import load_effective_policy
+from khaos.security.resource_scope import TypedResourcePartialOrder
 
 
 async def test_factory_requires_db():
@@ -56,6 +57,25 @@ async def test_factory_rejects_mock_router_outside_explicit_dev_mode(
     catalog_path.chmod(0o640)
     monkeypatch.setenv("KHAOS_TYPED_RESOURCE_CATALOG_PATH", str(catalog_path))
     monkeypatch.setenv("KHAOS_AUTHORITY_PROFILE", "native-production")
+    # The catalog reader's real Windows ACL contract is exercised by the
+    # native deployment workflow.  This regression is narrower: it verifies
+    # that a production runtime never falls back to a mock router.  Retain
+    # the real catalog parser and only omit the deployment-only ACL check so
+    # a pytest temp directory is not mistaken for a provisioned trust root.
+    def load_test_catalog(policy, profile, *, preloaded=None):
+        assert profile.is_production
+        if preloaded is not None:
+            return preloaded
+        return TypedResourcePartialOrder.from_json_file(
+            catalog_path,
+            expected_policy_digest=policy.digest if policy is not None else None,
+            require_windows_acl=False,
+        )
+
+    monkeypatch.setattr(
+        "khaos.runtime.factory._load_production_resource_order",
+        load_test_catalog,
+    )
     authority = SimpleNamespace(
         ready=True,
         trust_binding=SimpleNamespace(
