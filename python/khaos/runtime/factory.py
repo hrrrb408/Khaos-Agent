@@ -1403,6 +1403,10 @@ async def build_runtime(
                 principal_kind=authority_principal_kind,
             )
             owns_authority_broker = True
+        if authority_broker is None:
+            raise PermissionError(
+                "production authorityd trust channel was not constructed"
+            )
         if not authority_broker.ready:
             if owns_authority_broker:
                 authority_broker.close()
