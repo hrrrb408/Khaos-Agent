@@ -457,6 +457,7 @@ def _verify_security_artifact(
         "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
         "commit_attestation_verified": True,
         "policy_digest": manifest["policy_digest"],
+        "schema_digest": manifest["schema_digest"],
         "tests": sorted(tests),
     }
 
