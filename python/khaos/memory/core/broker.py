@@ -224,6 +224,8 @@ class MemoryBroker:
                 "valid_to": candidate.valid_to.isoformat() if candidate.valid_to else "",
                 "verification_run_id": candidate.verification_run_id or "",
                 "verification_result_digest": candidate.verification_result_digest or "",
+                "source_kind": enum_value(candidate.source_kind) if candidate.source_kind else "",
+                "provenance": dict(candidate.provenance),
                 "mode": runtime.mode,
                 "environment_fingerprint": runtime.environment_fingerprint,
                 "runtime_environment": dict(runtime.environment),
@@ -444,12 +446,15 @@ class MemoryBroker:
             ):
                 metadata = dict(hit.provider_metadata)
                 metadata["retrieval_source"] = source_kind
+                retained_source_kind = hit.source_kind
+                if not retained_source_kind or retained_source_kind == "memory":
+                    retained_source_kind = source_kind
                 raw_hits.append(
                     replace(
                         hit,
                         provider_metadata=metadata,
                         source_rank=rank,
-                        source_kind=source_kind,
+                        source_kind=retained_source_kind,
                     )
                 )
         if not raw_hits and provider_error is not None:
@@ -1881,6 +1886,8 @@ def _candidate_size(candidate: MemoryCandidate) -> int:
         ],
         "preconditions": dict(candidate.preconditions),
         "environment": dict(candidate.environment),
+        "source_kind": enum_value(candidate.source_kind) if candidate.source_kind else None,
+        "provenance": dict(candidate.provenance),
     }
     return len(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8"))
 

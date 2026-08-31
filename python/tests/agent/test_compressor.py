@@ -46,6 +46,25 @@ async def test_context_collapse_creates_required_summary_format():
     assert collapsed[0].content.endswith("[摘要结束]")
 
 
+async def test_untrusted_context_observation_never_gains_instruction_role():
+    marker = "REPOSITORY_UNTRUSTED_OBSERVATION"
+    observation = Message(
+        role="user",
+        content=marker,
+        metadata={"trusted": False, "context_layer": "workspace-context"},
+    )
+    messages = [observation] + [
+        Message(role="user", content=f"history-{index}") for index in range(4)
+    ]
+    compressor = ContextCompressor(create_default_router())
+
+    result = await compressor.compress(messages, threshold=4)
+
+    observed = [message for message in result.messages if marker in message.content]
+    assert observed
+    assert all(message.role not in {"system", "developer"} for message in observed)
+
+
 async def test_tool_call_and_result_pair_are_preserved():
     call = Message(role="assistant", content="", tool_calls=[{"id": "call_1", "name": "read_file"}])
     result = Message(role="tool", content="result", tool_call_id="call_1")

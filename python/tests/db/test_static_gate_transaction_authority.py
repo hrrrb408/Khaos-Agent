@@ -14,7 +14,8 @@ This test parses ``python/khaos/db/database.py`` with AST and verifies
 that every ``conn.commit()``, ``conn.rollback()`` and
 ``conn.execute("BEGIN …")`` call is inside a whitelisted function:
 
-  - ``transaction``              — the Transaction Authority entry point
+  - ``transaction``              — the write Transaction Authority entry point
+  - ``read_transaction``        — the query-only observation transaction entry point
   - ``_commit_if_owner``         — the authority's bare-write helper
   - ``run_migrations``           — the migration runner
   - ``_run_legacy_schema_upgrades`` — legacy ALTER TABLE helpers caller
@@ -43,6 +44,7 @@ MIGRATIONS_CLI_PY = DB_DIR / "migrations_cli.py"
 # Functions in database.py that are allowed to issue BEGIN / COMMIT / ROLLBACK.
 WHITELIST_NAMES = {
     "transaction",           # the Authority entry point
+    "read_transaction",      # query-only observation transaction boundary
     "_commit_if_owner",      # bare-write commit helper
     "run_migrations",        # migration runner
     "_run_legacy_schema_upgrades",
@@ -224,10 +226,9 @@ class BareWriterCallFinder(ast.NodeVisitor):
                 # Allowed in migration runner and _commit_if_owner.
                 if enclosing not in ("run_migrations", "_commit_if_owner"):
                     self.bare_writer_calls.append((enclosing, node.lineno))
-        elif isinstance(func, ast.Name):
-            if func.id == "_commit_if_owner":
-                enclosing = self._func_stack[-1] if self._func_stack else "<module>"
-                self.commit_owner_calls.append((enclosing, node.lineno))
+        elif isinstance(func, ast.Name) and func.id == "_commit_if_owner":
+            enclosing = self._func_stack[-1] if self._func_stack else "<module>"
+            self.commit_owner_calls.append((enclosing, node.lineno))
         self.generic_visit(node)
 
 

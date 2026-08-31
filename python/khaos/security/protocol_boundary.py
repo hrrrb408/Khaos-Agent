@@ -39,6 +39,66 @@ def canonical_digest(value: object) -> str:
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
 
 
+def strict_json_loads(payload: bytes | str, *, max_bytes: int | None = None) -> object:
+    """Decode JSON while rejecting duplicate object keys.
+
+    A JSON object with duplicate keys has no portable meaning: Python's
+    default decoder keeps the last value while other protocol implementations
+    may keep the first or reject the object.  Security-boundary inputs must
+    therefore use one parser contract before semantic validation and digesting.
+    The optional byte bound is checked before decoding so a hostile input
+    cannot allocate an unbounded Unicode string during startup.
+    """
+    if isinstance(payload, bytes):
+        raw = payload
+        if max_bytes is not None:
+            if max_bytes <= 0:
+                raise ValueError("JSON payload maximum must be positive")
+            if len(raw) > max_bytes:
+                raise ProtocolBoundaryError("JSON payload exceeds its size bound")
+        try:
+            text = payload.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ProtocolBoundaryError("JSON payload is not UTF-8") from exc
+    elif isinstance(payload, str):
+        text = payload
+        raw = payload.encode("utf-8")
+    else:
+        raise ProtocolBoundaryError("JSON payload must be bytes or text")
+    if max_bytes is not None:
+        if max_bytes <= 0:
+            raise ValueError("JSON payload maximum must be positive")
+        if len(raw) > max_bytes:
+            raise ProtocolBoundaryError("JSON payload exceeds its size bound")
+    try:
+        return json.loads(
+            text,
+            object_pairs_hook=_reject_duplicate_json_pairs,
+            parse_constant=_reject_nonstandard_json_constant,
+        )
+    except ProtocolBoundaryError:
+        raise
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise ProtocolBoundaryError("JSON payload is malformed") from exc
+
+
+def _reject_duplicate_json_pairs(
+    pairs: list[tuple[object, object]],
+) -> dict[object, object]:
+    """Build one JSON object or reject ambiguous duplicate keys."""
+    result: dict[object, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ProtocolBoundaryError("JSON object contains duplicate keys")
+        result[key] = value
+    return result
+
+
+def _reject_nonstandard_json_constant(value: str) -> object:
+    """Reject NaN/Infinity extensions accepted by Python's JSON decoder."""
+    raise ProtocolBoundaryError(f"JSON payload contains non-standard number: {value}")
+
+
 def validate_object_schema(
     value: object,
     *,
@@ -256,5 +316,6 @@ __all__ = [
     "read_bounded_line",
     "require_owner_transition",
     "require_receipt_transition",
+    "strict_json_loads",
     "validate_object_schema",
 ]

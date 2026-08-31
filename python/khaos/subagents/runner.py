@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 from khaos.agent.core import AgentConfig, Message, SimpleTokenEngine
 from khaos.db.state_root import project_id as compute_project_id
 from khaos.runtime_profile import RuntimeProfile, resolve_runtime_profile
+from khaos.subagents.assignment import DelegatedExecutionContext
 from khaos.subagents.spawner import SubAgentTask
 
 if TYPE_CHECKING:
@@ -19,6 +20,32 @@ if TYPE_CHECKING:
     from khaos.skills.manager import SkillManager
 
 logger = logging.getLogger(__name__)
+
+
+class _DelegatedWorkspaceManager:
+    """Narrow read/attach view over the already-owned parent workspace."""
+
+    def __init__(self, manager: Any, context: DelegatedExecutionContext) -> None:
+        self._manager = manager
+        self._context = context
+
+    def get(self, workspace_id: str) -> Any:
+        if workspace_id != self._context.workspace_id:
+            return None
+        workspace = self._manager.get(workspace_id)
+        if workspace is None or workspace.task_id != self._context.parent_task_id:
+            return None
+        return workspace
+
+    def require(self, workspace_id: str, *, task_id: str, principal_id: str, project_id: str, runtime_id: str) -> Any:
+        del principal_id, runtime_id
+        workspace = self.get(workspace_id)
+        if workspace is None or task_id != self._context.parent_task_id or project_id != self._context.project_id:
+            raise PermissionError("delegated workspace attachment is outside the assignment")
+        return workspace
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._manager, name)
 
 
 class SubAgentRunner:
@@ -61,6 +88,8 @@ class SubAgentRunner:
         cleanup_authority: Any | None = None,
         memory_host: MemoryHost | None = None,
         runtime_profile: RuntimeProfile | str | None = None,
+        workspace_manager: Any | None = None,
+        assignment_repository: Any | None = None,
     ):
         self.router = router
         self.db = db
@@ -110,6 +139,8 @@ class SubAgentRunner:
         self.cleanup_authority = cleanup_authority
         self.memory_host = memory_host
         self.runtime_profile = resolve_runtime_profile(runtime_profile)
+        self.workspace_manager = workspace_manager
+        self.assignment_repository = assignment_repository
 
     async def run(self, task: SubAgentTask) -> str:
         """执行子任务并返回结果字符串。
@@ -127,6 +158,45 @@ class SubAgentRunner:
         共享 ``office_authority`` 是借用的，``aclose`` 不会关闭它。
         """
         session_id = task.session_id or f"{task.parent_session_id}/{task.id}"
+        # M7.8: assignment-bound children are structurally distinct from the
+        # legacy free-form office runner.  The coordinator supplies all
+        # identities; no prompt or RPC payload can construct this context.
+        delegated_context: DelegatedExecutionContext | None = None
+        if task.assignment_id:
+            if not task.assignment_digest or not task.task_owner_principal_id or not task.execution_principal_id:
+                raise PermissionError("delegated child is missing its trusted assignment context")
+            if self.assignment_repository is None:
+                raise PermissionError("delegated child assignment repository is unavailable")
+            parent_workspace_manager = (
+                self.workspace_manager or task.parent_workspace_manager
+            )
+            if parent_workspace_manager is None:
+                raise PermissionError("delegated child parent workspace is unavailable")
+            if not await self.assignment_repository.validate_active_for_route(
+                assignment_id=task.assignment_id,
+                assignment_digest=task.assignment_digest,
+                child_execution_principal_id=task.execution_principal_id,
+                task_owner_principal_id=task.task_owner_principal_id,
+                project_id=task.project_id,
+                parent_task_id=task.parent_task_id,
+                workspace_id=task.workspace_id,
+                published_plan_revision_id=task.published_plan_revision_id,
+                plan_step_id=task.plan_step_id,
+                execution_epoch_digest=task.execution_epoch_digest,
+            ):
+                raise PermissionError("delegated child assignment is not active")
+            delegated_context = DelegatedExecutionContext(
+                assignment_id=task.assignment_id,
+                assignment_digest=task.assignment_digest,
+                task_owner_principal_id=task.task_owner_principal_id,
+                parent_task_id=task.parent_task_id,
+                child_execution_principal_id=task.execution_principal_id,
+                project_id=task.project_id,
+                workspace_id=task.workspace_id,
+                published_plan_revision_id=task.published_plan_revision_id,
+                plan_step_id=task.plan_step_id,
+                execution_epoch_digest=task.execution_epoch_digest,
+            )
         project_root = self.project_root or Path.cwd()
         effective_project_id = task.project_id or compute_project_id(project_root)
         config = AgentConfig(
@@ -164,7 +234,7 @@ class SubAgentRunner:
         # if both task.principal_id and self.principal_id are empty
         # the runtime construction raises ValueError.  No implicit
         # local-uid fallback in the build_runtime path.
-        principal_id = task.principal_id or self.principal_id
+        principal_id = task.execution_principal_id if delegated_context is not None else (task.principal_id or self.principal_id)
         if task.delegation_digest:
             # The child delegation was issued to the typed execution
             # subject ``subagent:<owner>:<task-id>``; the runtime's
@@ -184,6 +254,12 @@ class SubAgentRunner:
             and not (self.inherit_memory and self.memory_manager is not None)
             else RuntimeConfig
         )
+        parent_workspace_manager = self.workspace_manager or task.parent_workspace_manager
+        delegated_workspace_manager = (
+            _DelegatedWorkspaceManager(parent_workspace_manager, delegated_context)
+            if delegated_context is not None and parent_workspace_manager is not None
+            else None
+        )
         runtime_kwargs: dict[str, Any] = {
             "db": self.db,
             # C-1-5b: pass ``mode_manager=None`` (production path) so
@@ -195,7 +271,6 @@ class SubAgentRunner:
             "tool_allowlist": (task.tools if self.tool_scheduler is None else None),
             "skill_manager": self.skill_manager,
             "agent_config": config,
-            "coding_context_builder": self.coding_context_builder,
             "office_authority": self.office_authority,
             # B1: inherit the server-level approval broker / audit logger.
             "approval_broker": self.approval_broker,
@@ -209,15 +284,25 @@ class SubAgentRunner:
             "runtime_id": task.runtime_id or uuid.uuid4().hex,
             "audit_logger": self.audit_logger,
             "project_id": effective_project_id,
+            # Legacy free-form children are permanently office-scoped.  A
+            # coding child may enter coding mode only through the structural
+            # assignment path, where the parent task/workspace/plan binding
+            # is already present.
+            "mode_override": "coding" if delegated_context is not None else "office",
+            "task_id": task.parent_task_id if delegated_context is not None else "",
+            "workspace_id": task.workspace_id if delegated_context is not None else "",
             # B1: inherit the same project policy/config root.
             "project_root": project_root,
             "config_path": self.config_path,
             "cleanup_authority": self.cleanup_authority,
             "memory_host": self.memory_host,
+            "delegated_execution_context": delegated_context,
+            "delegated_workspace_manager": delegated_workspace_manager,
         }
         if runtime_config_type is RuntimeConfig:
             # Explicit legacy/test adapters may inject these components; the
             # production structural type has no fields for them.
+            runtime_kwargs["coding_context_builder"] = self.coding_context_builder
             runtime_kwargs["tool_scheduler"] = self.tool_scheduler
             runtime_kwargs["memory_manager"] = (
                 self.memory_manager if self.inherit_memory else None
@@ -252,8 +337,14 @@ class SubAgentRunner:
             )
 
             messages: list[Message] = []
-            async for message in runtime.loop.run(task.goal, session_id):
-                messages.append(message)
+            if delegated_context is not None:
+                async for message in runtime.loop.run(
+                    task.goal, session_id, task_id=delegated_context.parent_task_id
+                ):
+                    messages.append(message)
+            else:
+                async for message in runtime.loop.run(task.goal, session_id):
+                    messages.append(message)
 
             return await self._collect_result(messages)
         finally:

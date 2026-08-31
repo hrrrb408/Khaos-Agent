@@ -187,6 +187,55 @@ class PlanExecutionReadModel:
             raise RuntimeError("final mutation attestation digest mismatch")
         return normalized
 
+    def get_verification_step(self, step_run_id: str) -> Any | None:
+        """Return one persisted verification step through the read model.
+
+        M7.4 uses this narrow read-only surface to bind an evidence descriptor
+        to the exact requirement, command digest, terminal status, exit code,
+        output digests, and truncation flag recorded by M4.  It never returns
+        raw stdout/stderr or exposes the underlying connection.
+        """
+        row = self._conn.execute(
+            "SELECT * FROM plan_verification_steps WHERE step_run_id=?",
+            (step_run_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        from khaos.coding.planning.verification_execution_models import (
+            VerificationStepRun,
+            VerificationStepStatus,
+        )
+
+        try:
+            resource_usage = json.loads(row["resource_usage_json"])
+            if type(resource_usage) is not dict:
+                raise ValueError("verification step resource usage is not an object")
+            return VerificationStepRun(
+                step_run_id=row["step_run_id"],
+                verification_run_id=row["verification_run_id"],
+                requirement_id=row["requirement_id"],
+                command_id=row["command_id"],
+                command_digest=row["command_digest"],
+                ordinal=int(row["ordinal"]),
+                status=VerificationStepStatus(row["status"]),
+                exit_code=row["exit_code"],
+                signal=row["signal"],
+                started_at=row["started_at"],
+                completed_at=row["completed_at"],
+                duration_ms=int(row["duration_ms"]),
+                timeout_ms=int(row["timeout_ms"]),
+                stdout_digest=row["stdout_digest"],
+                stderr_digest=row["stderr_digest"],
+                output_artifact_id=row["output_artifact_id"],
+                output_truncated=bool(row["output_truncated"]),
+                sandbox_instance_id=row["sandbox_instance_id"],
+                sandbox_image_digest=row["sandbox_image_digest"],
+                resource_usage=resource_usage,
+                failure_code=row["failure_code"],
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError("verification step is corrupt") from exc
+
     def get_rollback_final_attestation(self, execution_run_id: str) -> Any | None:
         row = self._conn.execute(
             "SELECT * FROM plan_execution_rollback_attestations WHERE execution_run_id=?",

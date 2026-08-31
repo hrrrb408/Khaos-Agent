@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import json
 import os
 import secrets
 import subprocess
@@ -42,7 +41,7 @@ from khaos.security.identity_isolation import (
     IdentityIsolationError,
     read_contract_from_environment,
 )
-from khaos.security.protocol_boundary import canonical_json_bytes
+from khaos.security.protocol_boundary import canonical_json_bytes, strict_json_loads
 from khaos.security.windows_native_ffi import (
     assign_process_to_job,
     close_handle,
@@ -504,8 +503,8 @@ def _close_job(job_handle: object | None) -> None:
 
 def _decode_native_response(raw: bytes) -> dict[str, object]:
     try:
-        value = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        value = strict_json_loads(raw, max_bytes=MAX_NATIVE_OUTPUT_BYTES)
+    except ValueError as exc:
         raise NativeAuthorityError("native authority response is malformed JSON") from exc
     if not isinstance(value, dict):
         raise NativeAuthorityError("native authority response is not an object")

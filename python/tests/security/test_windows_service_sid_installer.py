@@ -26,3 +26,4 @@ def test_installer_and_workflow_share_service_sid_resolution() -> None:
     assert "service-sid.ps1" in workflow
     assert "Get-KhaosServiceSid" in workflow
     assert "NTAccount('NT SERVICE\\KhaosAuthorityD')" not in workflow
+    assert '$authorityAce = "*${authoritySid}:(R)"' in installer

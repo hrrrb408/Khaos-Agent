@@ -1,7 +1,6 @@
 from pathlib import Path
 
 import pytest
-
 from khaos.security import production_composition_probe
 from khaos.security.identity_isolation import IdentityIsolationError
 
@@ -87,7 +86,22 @@ def test_lifecycle_producer_reuses_verified_production_workspace() -> None:
     from khaos.security import production_lifecycle_probe
 
     source = Path(production_lifecycle_probe.__file__).read_text(encoding="utf-8")
-    assert "_build_runtime_manifest(workspace_parent)" in source
+    assert "_verified_production_runtime(workspace_parent)" in source
+
+
+def test_production_probes_bind_execution_services_to_verified_authority() -> None:
+    composition_source = Path(
+        production_composition_probe.__file__
+    ).read_text(encoding="utf-8")
+    from khaos.security import production_lifecycle_probe
+
+    lifecycle_source = Path(
+        production_lifecycle_probe.__file__
+    ).read_text(encoding="utf-8")
+
+    for source in (composition_source, lifecycle_source):
+        assert "runtime_profile=RuntimeProfile.PRODUCTION" in source
+        assert "authority_broker=authority_broker" in source
 
 
 def test_production_producers_share_one_runtime_composition_digest_recipe() -> None:

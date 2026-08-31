@@ -24,6 +24,11 @@ from khaos.security.local_trust import (
     local_authority_root,
     validate_trusted_local_path,
 )
+from khaos.security.production_trust import (
+    ProductionTrustBinding,
+    ProductionTrustError,
+    deployment_environment_digest,
+)
 
 if TYPE_CHECKING:
     from khaos.security.authorityd_protocol import AuthorityDaemonClient
@@ -238,12 +243,58 @@ class AuthorityTransportConfig:
             return os.geteuid()
         return None
 
+    def authority_id(self) -> str:
+        """Return the operator-selected authority identity for this profile."""
+        configured = os.environ.get("KHAOS_AUTHORITYD_ISSUER_ID", "").strip()
+        if configured:
+            return configured
+        return (
+            "khaos-authorityd-community"
+            if self.is_community
+            else "khaos-authorityd"
+        )
+
+    def environment_digest(self) -> str:
+        """Return the canonical platform/transport deployment digest."""
+        configured = os.environ.get(
+            "KHAOS_AUTHORITYD_ENVIRONMENT_DIGEST", ""
+        ).strip()
+        if configured:
+            return configured
+        return deployment_environment_digest(
+            platform_name=self.platform_name,
+            profile=self.profile.value,
+            transport=self.transport.value,
+        )
+
     def client(
-        self, contract: AuthorityIdentityContract
+        self,
+        contract: AuthorityIdentityContract,
+        *,
+        trust_binding: ProductionTrustBinding | None = None,
     ) -> AuthorityDaemonClient:
         """Build the one client shape allowed by this deployment profile."""
 
         from khaos.security.authorityd_protocol import AuthorityDaemonClient
+
+        if trust_binding is not None:
+            if trust_binding.authority_id != self.authority_id():
+                raise AuthorityTransportError(
+                    "authority trust binding identity does not match the deployment"
+                )
+            try:
+                if trust_binding.environment_digest != self.environment_digest():
+                    raise AuthorityTransportError(
+                        "authority trust binding environment does not match the deployment"
+                    )
+            except ProductionTrustError as exc:
+                raise AuthorityTransportError(
+                    "authority trust binding environment is invalid"
+                ) from exc
+            if self.runtime_profile.is_production and self.public_key_path() is None:
+                raise AuthorityTransportError(
+                    "production authority trust handshake requires a public key"
+                )
 
         if self.is_native:
             from khaos.security.native_authority import (
@@ -259,6 +310,8 @@ class AuthorityTransportConfig:
                 native_adapter=adapter,
                 transport=self.transport.value,
                 runtime_profile=self.runtime_profile,
+                public_key_path=self.public_key_path(),
+                trust_binding=trust_binding,
             )
 
         socket_path = self.socket_path()
@@ -273,6 +326,8 @@ class AuthorityTransportConfig:
             ),
             transport=self.transport.value,
             runtime_profile=self.runtime_profile,
+            trust_binding=trust_binding,
+            community_local=self.is_community,
         )
 
 

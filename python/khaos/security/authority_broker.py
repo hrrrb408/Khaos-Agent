@@ -19,8 +19,8 @@ from __future__ import annotations
 import atexit
 import hashlib
 import hmac
+import logging
 import multiprocessing
-import os
 import secrets
 import threading
 import time
@@ -28,25 +28,39 @@ from dataclasses import dataclass
 from multiprocessing.connection import Connection
 from typing import Any
 
+from khaos.runtime_profile import RuntimeProfile, resolve_runtime_profile
 from khaos.security.authority import AuthorityEnvelope
-from khaos.security.authority_transport import AuthorityTransportConfig
+from khaos.security.authority_transport import (
+    AuthorityTransportConfig,
+    AuthorityTransportError,
+)
 from khaos.security.authorityd_protocol import (
+    AUTHORITYD_PROTOCOL,
     AuthorityControlPlaneError,
     AuthorityDaemonClient,
     AuthorizationIntent,
+    Ed25519KeyStore,
     SignedAuthorizationReceipt,
 )
 from khaos.security.identity_isolation import (
     read_contract_from_environment,
     require_distinct_linux_identities,
 )
-from khaos.runtime_profile import RuntimeProfile, resolve_runtime_profile
+from khaos.security.principals import DelegationScope
+from khaos.security.production_trust import (
+    ProductionTrustBinding,
+    ProductionTrustError,
+    compare_trust_bindings,
+    public_key_fingerprint,
+)
 
 _BROKER_PROTOCOL = 1
 _DEFAULT_TTL_SECONDS = 300.0
 _MAX_TTL_SECONDS = 3600.0
 _DEFAULT_GRANT_TTL_SECONDS = 60 * 60.0
 _CAPABILITY_ISSUER = object()
+
+logger = logging.getLogger(__name__)
 
 
 class AuthorityBrokerError(PermissionError):
@@ -611,19 +625,130 @@ class AuthorityBroker:
         self._closed = False
 
     @classmethod
+    def for_production(
+        cls,
+        *,
+        policy_digest: str,
+        catalog_digest: str,
+        runtime_id: str,
+        principal_id: str,
+        project_id: str,
+        principal_kind: str,
+    ) -> AuthorityDaemonBroker:
+        """Connect one runtime to the independently deployed authorityd.
+
+        The caller supplies only values already derived by the production
+        composition root.  This method loads the operator-provisioned public
+        key, builds the complete non-secret trust binding, and performs the
+        READY handshake before returning a broker.  There is deliberately no
+        local/test broker fallback in this path.
+        """
+        for field, value in (
+            ("runtime_id", runtime_id),
+            ("principal_id", principal_id),
+            ("project_id", project_id),
+            ("principal_kind", principal_kind),
+        ):
+            if (
+                type(value) is not str
+                or not value
+                or "\x00" in value
+                or len(value) > 256
+            ):
+                raise AuthorityBrokerError(
+                    f"production authority {field} is invalid"
+                )
+        client: AuthorityDaemonClient | None = None
+        try:
+            deployment = AuthorityTransportConfig.from_environment(
+                runtime_profile=RuntimeProfile.PRODUCTION
+            )
+            contract = read_contract_from_environment()
+            deployment.validate_contract(contract)
+            if (
+                deployment.platform_name.startswith("linux")
+                and not deployment.is_community
+            ):
+                if (
+                    contract.agent_uid is None
+                    or contract.authority_uid is None
+                    or contract.job_uid is None
+                ):
+                    raise AuthorityBrokerError(
+                        "Linux authority contract is missing execution UIDs"
+                    )
+                require_distinct_linux_identities(
+                    agent_uid=contract.agent_uid,
+                    authority_uid=contract.authority_uid,
+                    job_uid=contract.job_uid,
+                )
+            public_key_path = deployment.public_key_path()
+            if public_key_path is None:
+                raise AuthorityBrokerError(
+                    "production authorityd public key is required"
+                )
+            public_key = Ed25519KeyStore.load_public_key(
+                public_key_path, require_windows_acl=True
+            )
+            binding = ProductionTrustBinding.create(
+                protocol_version=AUTHORITYD_PROTOCOL,
+                authority_id=deployment.authority_id(),
+                policy_digest=policy_digest,
+                catalog_digest=catalog_digest,
+                public_key_fingerprint=public_key_fingerprint(
+                    public_key.public_bytes_raw()
+                ),
+                environment_digest=deployment.environment_digest(),
+            )
+            client = deployment.client(contract, trust_binding=binding)
+            observed = client.handshake(
+                runtime_id=runtime_id,
+                principal_id=principal_id,
+                project_id=project_id,
+                principal_kind=principal_kind,
+            )
+            compare_trust_bindings(binding, observed)
+        except (
+            AuthorityControlPlaneError,
+            AuthorityTransportError,
+            ProductionTrustError,
+            OSError,
+            PermissionError,
+            ValueError,
+        ) as exc:
+            if client is not None:
+                try:
+                    client.close_trust_channel()
+                except Exception as cleanup_error:
+                    logger.debug(
+                        "failed to close rejected production authority channel",
+                        exc_info=cleanup_error,
+                    )
+            raise AuthorityBrokerError(
+                "production authorityd trust handshake failed"
+            ) from exc
+        if client is None:  # pragma: no cover - deployment.client always returns a client or raises
+            raise AuthorityBrokerError("production authorityd client was not created")
+        return AuthorityDaemonBroker(client)
+
+    @classmethod
     def default(
         cls, *, runtime_profile: RuntimeProfile | str | None = None
     ) -> AuthorityBroker:
         """Return the process-wide control-plane broker.
 
-        Production is fail-closed: the default broker is always a client of
-        an independently deployed ``khaos-authorityd`` selected by
-        ``AuthorityTransportConfig``.  The local HMAC broker remains
-        available only when the test/development profile is explicit
-        (``KHAOS_DEV_MODE=1``) or when a caller constructs ``AuthorityBroker()``
-        directly for unit tests.
+        Production has no default broker: the composition root must call
+        :meth:`for_production` with the independently loaded policy/catalog
+        snapshot and complete the READY handshake before effect consumers are
+        constructed.  The local HMAC broker remains available only when the
+        test/development profile is explicit (``KHAOS_DEV_MODE=1``) or when a
+        caller constructs ``AuthorityBroker()`` directly for unit tests.
         """
         profile = resolve_runtime_profile(runtime_profile)
+        if profile.is_production:
+            raise AuthorityBrokerError(
+                "production authority broker requires an explicit catalog/policy handshake"
+            )
         with cls._default_lock:
             if (
                 cls._default is not None
@@ -633,40 +758,7 @@ class AuthorityBroker:
                 cls._default.close()
                 cls._default = None
             if cls._default is None or cls._default.closed:
-                if not profile.is_production:
-                    cls._default = cls()
-                else:
-                    try:
-                        deployment = AuthorityTransportConfig.from_environment(
-                            runtime_profile=profile
-                        )
-                        contract = read_contract_from_environment()
-                        deployment.validate_contract(contract)
-                        if (
-                            deployment.platform_name.startswith("linux")
-                            and not deployment.is_community
-                        ):
-                            if (
-                                contract.agent_uid is None
-                                or contract.authority_uid is None
-                                or contract.job_uid is None
-                            ):
-                                raise AuthorityBrokerError(
-                                    "Linux authority contract is missing execution UIDs"
-                                )
-                            require_distinct_linux_identities(
-                                agent_uid=contract.agent_uid,
-                                authority_uid=contract.authority_uid,
-                                job_uid=contract.job_uid,
-                            )
-                        client = deployment.client(contract)
-                    except (OSError, PermissionError, ValueError) as exc:
-                        raise AuthorityBrokerError(
-                            "production AuthorityBroker transport configuration is invalid"
-                        ) from exc
-                    cls._default = AuthorityDaemonBroker(
-                        client
-                    )
+                cls._default = cls()
                 cls._default_profile = profile
                 atexit.register(cls._close_default)
             return cls._default
@@ -682,6 +774,29 @@ class AuthorityBroker:
     @property
     def closed(self) -> bool:
         return self._closed or not self._process.is_alive()
+
+    @property
+    def ready(self) -> bool:
+        """Return whether this broker can serve effect requests."""
+        return not self.closed
+
+    @property
+    def trust_binding(self) -> ProductionTrustBinding | None:
+        """Return the production binding, if this broker has one."""
+        return None
+
+    @property
+    def terminal_closed(self) -> bool:
+        """Return whether broker shutdown has reached a terminal state."""
+        return self.closed
+
+    def owned_resources(self) -> tuple[str, ...]:
+        """Expose the broker channel to the runtime close proof."""
+        return () if self.closed else ("authority-channel",)
+
+    def terminal_postcondition(self) -> bool:
+        """Return the independent broker terminal proof."""
+        return self.closed and not self.owned_resources()
 
     def issue(
         self,
@@ -1054,6 +1169,41 @@ class AuthorityDaemonBroker(AuthorityBroker):
         self._lock = threading.RLock()
         self._closed = False
 
+    def _require_ready(self) -> None:
+        """Reject production effects until the trust channel is READY."""
+        if self._closed:
+            raise AuthorityBrokerError("authority broker is closed")
+        runtime_profile = getattr(
+            self._authorityd, "runtime_profile", RuntimeProfile.TESTING
+        )
+        if resolve_runtime_profile(runtime_profile).is_production:
+            if getattr(self._authorityd, "trust_binding", None) is None:
+                raise AuthorityBrokerError(
+                    "production authorityd trust handshake is required"
+                )
+            if not bool(getattr(self._authorityd, "ready", False)):
+                raise AuthorityBrokerError(
+                    "production authorityd trust channel is not READY"
+                )
+
+    @property
+    def ready(self) -> bool:
+        """Return whether the daemon client has a verified READY channel."""
+        if self._closed:
+            return False
+        runtime_profile = resolve_runtime_profile(
+            getattr(self._authorityd, "runtime_profile", RuntimeProfile.TESTING)
+        )
+        if runtime_profile.is_production and self.trust_binding is None:
+            return False
+        return bool(getattr(self._authorityd, "ready", True))
+
+    @property
+    def trust_binding(self) -> ProductionTrustBinding | None:
+        """Return the immutable binding verified by authorityd."""
+        binding = getattr(self._authorityd, "trust_binding", None)
+        return binding if isinstance(binding, ProductionTrustBinding) else None
+
     @property
     def closed(self) -> bool:
         return self._closed
@@ -1079,6 +1229,7 @@ class AuthorityDaemonBroker(AuthorityBroker):
         source_transport: str = "",
         delegation_resource: str = "",
     ) -> AuthorityEnvelope:
+        self._require_ready()
         grant = getattr(self._authorityd, "grant", None)
         if callable(grant):
             grant_id, grant_expires_at = grant(
@@ -1132,6 +1283,7 @@ class AuthorityDaemonBroker(AuthorityBroker):
             raise AuthorityBrokerError("authority envelope is invalid") from exc
 
     def revoke_grant(self, authority: AuthorityEnvelope) -> None:
+        self._require_ready()
         if not isinstance(authority, AuthorityEnvelope) or authority._broker is not self:
             raise AuthorityBrokerError("authority grant was not created by this broker")
         try:
@@ -1152,6 +1304,7 @@ class AuthorityDaemonBroker(AuthorityBroker):
         workspace_id: str,
         authorization_epoch: int,
     ) -> None:
+        self._require_ready()
         try:
             rotate = getattr(self._authorityd, "rotate_authorization_epoch", None)
             if not callable(rotate):
@@ -1175,6 +1328,7 @@ class AuthorityDaemonBroker(AuthorityBroker):
         workspace_id: str,
         workspace_generation: int,
     ) -> None:
+        self._require_ready()
         try:
             rotate = getattr(self._authorityd, "rotate_workspace_generation", None)
             if not callable(rotate):
@@ -1190,6 +1344,46 @@ class AuthorityDaemonBroker(AuthorityBroker):
         except AuthorityControlPlaneError as exc:
             raise AuthorityBrokerError(str(exc)) from exc
 
+    def delegation_register_root(self, scope: DelegationScope) -> str:
+        """Register a delegation root through this READY authority channel."""
+        self._require_ready()
+        try:
+            return self._authorityd.delegation_register_root(scope)
+        except (AuthorityControlPlaneError, KeyError, TypeError, ValueError) as exc:
+            raise AuthorityBrokerError(str(exc)) from exc
+
+    def delegation_issue_child(
+        self,
+        parent: DelegationScope,
+        child_principal_id: str,
+        child_principal_kind: str,
+        *,
+        operation_family: str,
+        resource_scope: list[str],
+        expires_at: float,
+        session_id: str | None = None,
+        runtime_id: str | None = None,
+        task_id: str | None = None,
+        workspace_id: str | None = None,
+    ) -> DelegationScope:
+        """Issue a narrow child delegation through this READY channel."""
+        self._require_ready()
+        try:
+            return self._authorityd.delegation_issue_child(
+                parent,
+                child_principal_id,
+                child_principal_kind,
+                operation_family=operation_family,
+                resource_scope=resource_scope,
+                expires_at=expires_at,
+                session_id=session_id,
+                runtime_id=runtime_id,
+                task_id=task_id,
+                workspace_id=workspace_id,
+            )
+        except (AuthorityControlPlaneError, TypeError, ValueError) as exc:
+            raise AuthorityBrokerError(str(exc)) from exc
+
     def issue(
         self,
         authority: AuthorityEnvelope,
@@ -1198,6 +1392,7 @@ class AuthorityDaemonBroker(AuthorityBroker):
         resource_digest: str | None = None,
         ttl_seconds: float = _DEFAULT_TTL_SECONDS,
     ) -> EffectCapability:
+        self._require_ready()
         if not isinstance(authority, AuthorityEnvelope) or authority._broker is not self:
             raise AuthorityBrokerError("authority envelope was not created by this broker")
         operation = allowed_operation or authority.operation_class
@@ -1303,6 +1498,7 @@ class AuthorityDaemonBroker(AuthorityBroker):
         expected_operation: str | None = None,
         expected_resource_digest: str | None = None,
     ) -> None:
+        self._require_ready()
         if not isinstance(capability, EffectCapability) or capability.receipt is None:
             raise AuthorityBrokerError("effect boundary requires a signed receipt")
         try:
@@ -1316,6 +1512,7 @@ class AuthorityDaemonBroker(AuthorityBroker):
             raise AuthorityBrokerError(str(exc)) from exc
 
     def claim(self, capability: EffectCapability) -> None:
+        self._require_ready()
         if not isinstance(capability, EffectCapability) or capability.receipt is None:
             raise AuthorityBrokerError("effect claim requires a signed receipt")
         try:
@@ -1334,6 +1531,7 @@ class AuthorityDaemonBroker(AuthorityBroker):
             raise AuthorityBrokerError(str(exc)) from exc
 
     def revoke(self, capability: EffectCapability) -> None:
+        self._require_ready()
         if not isinstance(capability, EffectCapability) or capability.receipt is None:
             raise AuthorityBrokerError("cannot revoke a non-receipt capability")
         try:
@@ -1349,6 +1547,7 @@ class AuthorityDaemonBroker(AuthorityBroker):
         result_digest: str,
     ) -> None:
         """Commit the native execution result through the external authority."""
+        self._require_ready()
         if not isinstance(capability, EffectCapability) or capability.receipt is None:
             raise AuthorityBrokerError("execution result requires a signed receipt")
         try:
@@ -1361,7 +1560,14 @@ class AuthorityDaemonBroker(AuthorityBroker):
             raise AuthorityBrokerError(str(exc)) from exc
 
     def close(self) -> None:
-        self._closed = True
+        if self._closed:
+            return
+        try:
+            close_channel = getattr(self._authorityd, "close_trust_channel", None)
+            if callable(close_channel):
+                close_channel()
+        finally:
+            self._closed = True
 
 
 def _valid_operation(operation: str) -> bool:

@@ -17,8 +17,7 @@ import time
 from pathlib import Path
 
 import pytest
-
-from khaos.agent.approval import ApprovalBroker, ApprovalBinding
+from khaos.agent.approval import ApprovalBinding, ApprovalBroker
 from khaos.coding.task_manager import CodingTask, TaskManager, TaskStatus
 from khaos.db import Database
 from khaos.db.database import OwnerMismatchError
@@ -107,7 +106,12 @@ async def test_d02_update_coding_task_owner_bound(tmp_path):
     # UPDATE with foreign project → OwnerMismatchError.
     task_dict["goal"] = "updated"
     with pytest.raises(OwnerMismatchError):
-        await db.update_coding_task(task_dict, principal_id=_PRINCIPAL, project_id=_PROJ_B)
+        await db.update_coding_task(
+            task_dict,
+            principal_id=_PRINCIPAL,
+            project_id=_PROJ_B,
+            expected_status="pending",
+        )
     # Original row untouched.
     rows = await db.list_coding_tasks(principal_id=_PRINCIPAL, project_id=_PROJ_A)
     assert len(rows) == 1
@@ -124,11 +128,16 @@ async def test_d02_update_coding_task_same_owner(tmp_path):
     }
     await db.insert_coding_task(task_dict, principal_id=_PRINCIPAL, project_id=_PROJ_A)
     task_dict["goal"] = "updated"
-    task_dict["status"] = "completed"
-    await db.update_coding_task(task_dict, principal_id=_PRINCIPAL, project_id=_PROJ_A)
+    task_dict["status"] = "failed"
+    await db.update_coding_task(
+        task_dict,
+        principal_id=_PRINCIPAL,
+        project_id=_PROJ_A,
+        expected_status="pending",
+    )
     rows = await db.list_coding_tasks(principal_id=_PRINCIPAL, project_id=_PROJ_A)
     assert rows[0]["goal"] == "updated"
-    assert rows[0]["status"] == "completed"
+    assert rows[0]["status"] == "failed"
     await db.close()
 
 
@@ -139,10 +148,10 @@ async def test_d02_task_manager_persist_uses_insert_then_update(tmp_path):
     task = await manager.create("test goal")
     assert task._persisted is True
     # Subsequent update uses UPDATE (not INSERT).
-    await manager.update_status(task.id, TaskStatus.COMPLETED)
+    await manager.update_status(task.id, TaskStatus.FAILED)
     rows = await db.list_coding_tasks(principal_id=_PRINCIPAL, project_id=_PROJ_A)
     assert len(rows) == 1
-    assert rows[0]["status"] == "completed"
+    assert rows[0]["status"] == "failed"
     await db.close()
 
 
@@ -153,7 +162,7 @@ async def test_d02_task_manager_foreign_project_rebind_raises(tmp_path):
     task = await manager_a.create("cross-project takeover")
     manager_b = TaskManager(db=db, principal_id=_PRINCIPAL, project_id=_PROJ_B)
     with pytest.raises(OwnerMismatchError):
-        await manager_b._persist(task)
+        await manager_b._persist(task, expected_status=task.status)
     await db.close()
 
 

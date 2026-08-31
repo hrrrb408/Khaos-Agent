@@ -14,9 +14,23 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+if TYPE_CHECKING:
+    from khaos.agent.control.completion_recovery import CompletionGateHistoryRecord
+
+from khaos.agent.control.completion_repository import CompletionDecisionRepository
+from khaos.agent.control.goal_repository import GoalSpecRepository
+from khaos.agent.control.recovery_gate_repository import RecoveryGateRepository
+from khaos.agent.control.recovery_repository import RecoveryDecisionRepository
+from khaos.agent.control.state_repository import AgentControlStateRepository
 from khaos.agent.core import Message
+from khaos.coding.planning.repository import PlanRevisionRepository
+from khaos.coding.planning.step_execution_repository import PlanStepExecutionRepository
+from khaos.coding.planning.tool_route_repository import PlanToolRouteRepository
+from khaos.coding.planning.verification_assessment_repository import (
+    VerificationAssessmentRepository,
+)
 from khaos.db.connection import (
     READER_DRAIN_TIMEOUT,
     DatabaseClosingError,  # noqa: F401 - compatibility export
@@ -25,6 +39,8 @@ from khaos.db.connection import (
     _AsyncSqliteFallback,  # noqa: F401 - compatibility export
     aiosqlite,  # noqa: F401 - tests patch the shared driver module
 )
+from khaos.evaluation.repository import CapabilityEvaluationRepository
+from khaos.subagents.assignment import SubAgentAssignmentRepository
 
 # Compatibility name for released tests and integrations.  The lifecycle
 # owner is ``db.connection.READER_DRAIN_TIMEOUT``; this alias must not become
@@ -139,6 +155,16 @@ class OwnerMismatchError(RuntimeError):
     """
 
 
+class TaskLifecycleConflictError(RuntimeError):
+    """A coding-task lifecycle CAS did not match the durable row.
+
+    This is deliberately separate from :class:`OwnerMismatchError`.  The
+    latter means the owner-scoped row is unavailable to the caller; this
+    error means the caller was correctly scoped but its cached lifecycle
+    status is stale, or it attempted a forbidden generic lifecycle write.
+    """
+
+
 class ChatStreamTerminalError(RuntimeError):
     """Round-5 Batch 5.2 (C-05): attempt to append to an already-terminal stream.
 
@@ -242,6 +268,17 @@ class Database:
         self._audit_repository = AuditRepository(self)
         self._scheduler_repository = SchedulerRepository(self)
         self._tool_operation_repository = ToolOperationRepository(self)
+        self._goal_spec_repository = GoalSpecRepository(self)
+        self._agent_control_state_repository = AgentControlStateRepository(self)
+        self._completion_decision_repository = CompletionDecisionRepository(self)
+        self._recovery_decision_repository = RecoveryDecisionRepository(self)
+        self._recovery_gate_repository = RecoveryGateRepository(self)
+        self._plan_revision_repository = PlanRevisionRepository(self)
+        self._plan_tool_route_repository = PlanToolRouteRepository(self)
+        self._plan_step_execution_repository = PlanStepExecutionRepository(self)
+        self._subagent_assignment_repository = SubAgentAssignmentRepository(self)
+        self._verification_assessment_repository = VerificationAssessmentRepository(self)
+        self._capability_evaluation_repository = CapabilityEvaluationRepository(self)
         # F-01: Per-domain locks remain for logical serialization (e.g. two
         # concurrent permission grants must not race on epoch computation).
         self._operation_approval_lock = asyncio.Lock()
@@ -252,6 +289,10 @@ class Database:
         # acquire this lock, preventing cross-domain ``commit()`` 串扰 on the
         # shared single connection. Read-only queries do not need this lock.
         self._write_transaction_lock = asyncio.Lock()
+        # A coherent evaluation snapshot uses one reader transaction.  The
+        # shared reader handle therefore needs a small serialization fence so
+        # unrelated read transactions cannot interleave BEGIN/ROLLBACK.
+        self._read_transaction_lock = asyncio.Lock()
 
     # Compatibility views keep the migration runner and existing integrations
     # source-compatible while ensuring the connection component remains the
@@ -270,6 +311,61 @@ class Database:
         a second persistence boundary.
         """
         return self._tool_operation_repository
+
+    @property
+    def goal_spec_repository(self) -> GoalSpecRepository:
+        """Return the sole owner-scoped GoalSpec persistence boundary."""
+        return self._goal_spec_repository
+
+    @property
+    def agent_control_state_repository(self) -> AgentControlStateRepository:
+        """Return the sole SQL owner for cognitive-state CAS transitions."""
+        return self._agent_control_state_repository
+
+    @property
+    def completion_decision_repository(self) -> CompletionDecisionRepository:
+        """Return the sole owner-scoped completion-decision ledger."""
+        return self._completion_decision_repository
+
+    @property
+    def recovery_decision_repository(self) -> RecoveryDecisionRepository:
+        """Return the sole owner-scoped recovery-decision ledger."""
+        return self._recovery_decision_repository
+
+    @property
+    def recovery_gate_repository(self) -> RecoveryGateRepository:
+        """Return the atomic owner for recovery cognitive projections."""
+        return self._recovery_gate_repository
+
+    @property
+    def plan_revision_repository(self) -> PlanRevisionRepository:
+        """Return the sole owner-scoped immutable planning-revision ledger."""
+        return self._plan_revision_repository
+
+    @property
+    def plan_tool_route_repository(self) -> PlanToolRouteRepository:
+        """Return the append-only M7.6 route ledger owner."""
+        return self._plan_tool_route_repository
+
+    @property
+    def plan_step_execution_repository(self) -> PlanStepExecutionRepository:
+        """Return the M7.6 step/fence projection owner."""
+        return self._plan_step_execution_repository
+
+    @property
+    def subagent_assignment_repository(self) -> SubAgentAssignmentRepository:
+        """Return the M7.8 assignment/run persistence owner."""
+        return self._subagent_assignment_repository
+
+    @property
+    def verification_assessment_repository(self) -> VerificationAssessmentRepository:
+        """Return the owner-scoped trusted-verification assessment ledger."""
+        return self._verification_assessment_repository
+
+    @property
+    def capability_evaluation_repository(self) -> CapabilityEvaluationRepository:
+        """Return the observation-only M7.9 evaluation ledger owner."""
+        return self._capability_evaluation_repository
 
     @_conn.setter
     def _conn(self, value: Any | None) -> None:
@@ -516,6 +612,21 @@ class Database:
             yield await self._require_reader_conn()
 
     @asynccontextmanager
+    async def read_transaction(self) -> AsyncIterator[Any]:
+        """Yield one coherent, query-only SQLite read transaction.
+
+        This is an observation boundary, not a write transaction.  The
+        reader snapshot is isolated from later writer commits and is always
+        rolled back on exit, including cancellation.
+        """
+        async with self._read_transaction_lock, self.read_connection() as conn:
+            await conn.execute("BEGIN")
+            try:
+                yield conn
+            finally:
+                await conn.rollback()
+
+    @asynccontextmanager
     async def _read_lease(self):
         """Hold a reader-operation lease owned by ``DatabaseConnection``."""
         async with self._connection.read_lease():
@@ -680,9 +791,12 @@ class Database:
             if SCHEMA_MIGRATION_VERSION in applied_versions:
                 # Latest version is already applied and verified against the
                 # registry.  (Batch 6.4: we still backfill any missing
-                # historical rows below for ledger completeness — but only if
-                # they are absent, so this path is a true no-op once full.)
+                # historical rows below for ledger completeness.)  M7.1.2
+                # also validates/backfills the GoalSpec projection on every
+                # startup so a task inserted through an older compatibility
+                # facade cannot become loadable without its canonical goal.
                 await self._backfill_historical_ledger_rows(conn, applied_versions)
+                await self._backfill_legacy_goal_specs(conn)
                 await conn.commit()
                 return
 
@@ -784,6 +898,103 @@ class Database:
             self._conn = _MigrationConnection(conn)
             try:
                 await self._apply_v15_upgrades()
+            finally:
+                self._conn = original_conn
+            # M7.1.2: create the immutable GoalSpec table and backfill every
+            # existing coding task before publishing the v16 ledger row.
+            original_conn = self._conn
+            self._conn = _MigrationConnection(conn)
+            try:
+                await self._apply_v16_upgrades()
+            finally:
+                self._conn = original_conn
+            # M7.1.3: add the independent cognitive-state/version columns.
+            # The delta is applied after v16 GoalSpec backfill so every
+            # existing coding task receives the conservative UNINITIALIZED/0
+            # defaults in the same outer migration transaction.
+            original_conn = self._conn
+            self._conn = _MigrationConnection(conn)
+            try:
+                await self._apply_v17_upgrades()
+            finally:
+                self._conn = original_conn
+            # M7.1.4: add the passive, append-only completion-decision
+            # ledger.  No historical decisions are synthesized from legacy
+            # TaskStatus, test results, or assistant text.
+            original_conn = self._conn
+            self._conn = _MigrationConnection(conn)
+            try:
+                await self._apply_v18_upgrades()
+            finally:
+                self._conn = original_conn
+            # M7.3: add the passive, append-only deterministic planning
+            # revision ledger.  No plan is inferred from legacy task history.
+            original_conn = self._conn
+            self._conn = _MigrationConnection(conn)
+            try:
+                await self._apply_v19_upgrades()
+            finally:
+                self._conn = original_conn
+            # M7.3 closure amendment: add the physical, descriptive
+            # publication identity used to atomically bind IMPLEMENTING to
+            # one READY plan-revision ledger head.
+            original_conn = self._conn
+            self._conn = _MigrationConnection(conn)
+            try:
+                await self._apply_v20_upgrades()
+            finally:
+                self._conn = original_conn
+            # M7.4: add the immutable, owner/task-scoped trusted-verification
+            # assessment ledger.  No historical verification result is
+            # synthesized from legacy task/test/model state.
+            original_conn = self._conn
+            self._conn = _MigrationConnection(conn)
+            try:
+                await self._apply_v21_upgrades()
+            finally:
+                self._conn = original_conn
+            # M7.5: add the immutable recovery-decision ledger and the
+            # descriptive causal projection for recovery-gate applications.
+            # No historical recovery decision is synthesized.
+            original_conn = self._conn
+            self._conn = _MigrationConnection(conn)
+            try:
+                await self._apply_v22_upgrades()
+            finally:
+                self._conn = original_conn
+            # M7.6: connect published-plan routing to durable step state and
+            # dispatch fencing before any production tool can use the seam.
+            original_conn = self._conn
+            self._conn = _MigrationConnection(conn)
+            try:
+                await self._apply_v23_upgrades()
+            finally:
+                self._conn = original_conn
+            # M7.7: add provenance/source classification and canonical record
+            # digest columns.  Existing nodes remain explicitly UNBOUND and
+            # are never relabelled as current without evidence.
+            original_conn = self._conn
+            self._conn = _MigrationConnection(conn)
+            try:
+                await self._apply_v24_upgrades()
+            finally:
+                self._conn = original_conn
+            # M7.8: immutable plan-bound sub-agent assignments and run CAS
+            # projections.  Legacy subagent_tasks are intentionally not
+            # backfilled: their provenance is unbound and cannot become
+            # coding authority.
+            original_conn = self._conn
+            self._conn = _MigrationConnection(conn)
+            try:
+                await self._apply_v25_upgrades()
+            finally:
+                self._conn = original_conn
+            # M7.9: capability evaluation is an append-only observation
+            # ledger.  It is intentionally not consumed by any authority.
+            original_conn = self._conn
+            self._conn = _MigrationConnection(conn)
+            try:
+                await self._apply_v26_upgrades()
             finally:
                 self._conn = original_conn
             # Batch 6.4 §10.4: backfill the historical ledger rows (v1–v5)
@@ -1403,6 +1614,410 @@ class Database:
             conn,
             migration_path.read_text(encoding="utf-8"),
         )
+
+    async def _apply_v16_upgrades(self) -> None:
+        """Create and backfill the M7.1.2 immutable GoalSpec contract."""
+
+        conn = await self._require_conn()
+        migration_path = _MIGRATIONS_DIR / "0016_goal_specs.sql"
+        await self._execute_schema_statements(
+            conn,
+            migration_path.read_text(encoding="utf-8"),
+        )
+        await self._backfill_legacy_goal_specs(conn)
+
+    async def _apply_v17_upgrades(self) -> None:
+        """Add the M7.1.3 independent cognitive-state CAS columns."""
+
+        conn = await self._require_conn()
+        await self._ensure_coding_tasks_cognitive_state_columns(conn)
+
+    async def _apply_v18_upgrades(self) -> None:
+        """Add the M7.1.4 immutable completion-decision ledger."""
+
+        conn = await self._require_conn()
+        migration_path = _MIGRATIONS_DIR / "0018_completion_decisions.sql"
+        await self._execute_schema_statements(
+            conn,
+            migration_path.read_text(encoding="utf-8"),
+        )
+
+    async def _apply_v19_upgrades(self) -> None:
+        """Add the M7.3 immutable deterministic planning ledger."""
+
+        conn = await self._require_conn()
+        migration_path = _MIGRATIONS_DIR / "0019_plan_revisions.sql"
+        await self._execute_schema_statements(
+            conn,
+            migration_path.read_text(encoding="utf-8"),
+        )
+
+    async def _apply_v20_upgrades(self) -> None:
+        """Add the M7.3 atomic plan-publication projection."""
+
+        conn = await self._require_conn()
+        await self._ensure_coding_tasks_published_plan_revision_column(conn)
+        migration_path = _MIGRATIONS_DIR / "0020_plan_publication_fence.sql"
+        await self._execute_schema_statements(
+            conn,
+            migration_path.read_text(encoding="utf-8"),
+        )
+
+    async def _apply_v21_upgrades(self) -> None:
+        """Add the M7.4 immutable trusted-verification assessment ledger."""
+
+        conn = await self._require_conn()
+        migration_path = _MIGRATIONS_DIR / "0021_trusted_verification_assessments.sql"
+        await self._execute_schema_statements(
+            conn,
+            migration_path.read_text(encoding="utf-8"),
+        )
+
+    async def _apply_v22_upgrades(self) -> None:
+        """Add the M7.5 immutable recovery ledger and causal projection."""
+
+        conn = await self._require_conn()
+        await self._ensure_coding_tasks_last_applied_recovery_decision_column(conn)
+        migration_path = _MIGRATIONS_DIR / "0022_recovery_control_plane.sql"
+        await self._execute_schema_statements(
+            conn,
+            migration_path.read_text(encoding="utf-8"),
+        )
+
+    async def _apply_v23_upgrades(self) -> None:
+        """Add the M7.6 route, step-state, and dispatch-fence ledgers."""
+        conn = await self._require_conn()
+        migration_path = _MIGRATIONS_DIR / "0023_plan_tool_routing.sql"
+        await self._execute_schema_statements(
+            conn,
+            migration_path.read_text(encoding="utf-8"),
+        )
+
+    async def _apply_v24_upgrades(self) -> None:
+        """Add additive provenance metadata for bounded M7.7 retrieval."""
+        conn = await self._require_conn()
+        cursor = await conn.execute("PRAGMA table_info(memory_nodes)")
+        columns = {str(row["name"]) for row in await cursor.fetchall()}
+        additions = (
+            (
+                "source_kind",
+                "ALTER TABLE memory_nodes ADD COLUMN source_kind "
+                "TEXT NOT NULL DEFAULT 'UNBOUND'",
+            ),
+            (
+                "provenance_json",
+                "ALTER TABLE memory_nodes ADD COLUMN provenance_json "
+                "TEXT NOT NULL DEFAULT '{}'",
+            ),
+            (
+                "record_digest",
+                "ALTER TABLE memory_nodes ADD COLUMN record_digest "
+                "TEXT NOT NULL DEFAULT ''",
+            ),
+        )
+        for name, statement in additions:
+            if name not in columns:
+                await conn.execute(statement)
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memory_nodes_retrieval_scope "
+            "ON memory_nodes(project_id, principal_id, namespace, session_id, "
+            "source_kind, status, updated_at, memory_id)"
+        )
+
+    async def _apply_v25_upgrades(self) -> None:
+        """Add M7.8 assignment/run ledgers and route actor identity."""
+        conn = await self._require_conn()
+        migration_path = _MIGRATIONS_DIR / "0025_plan_bound_subagents.sql"
+        text = migration_path.read_text(encoding="utf-8")
+        # Execute the CREATE statements through the normal statement parser;
+        # trigger bodies contain semicolons and must not be split manually.
+        create_text = "\n".join(
+            line for line in text.splitlines()
+            if not line.lstrip().upper().startswith("ALTER TABLE AGENT_PLAN_TOOL_ROUTES")
+        )
+        await self._execute_schema_statements(conn, create_text)
+        cursor = await conn.execute("PRAGMA table_info(agent_plan_tool_routes)")
+        columns = {str(row["name"]) for row in await cursor.fetchall()}
+        additions = (
+            ("task_owner_principal_id", "TEXT NOT NULL DEFAULT ''"),
+            ("execution_principal_id", "TEXT NOT NULL DEFAULT ''"),
+            ("subagent_assignment_id", "TEXT"),
+            ("subagent_assignment_digest", "TEXT"),
+        )
+        for name, declaration in additions:
+            if name not in columns:
+                await conn.execute(
+                    f"ALTER TABLE agent_plan_tool_routes ADD COLUMN {name} {declaration}"
+                )
+
+    async def _apply_v26_upgrades(self) -> None:
+        """Add the immutable M7.9 capability-evaluation observation ledger."""
+        conn = await self._require_conn()
+        migration_path = _MIGRATIONS_DIR / "0026_capability_evaluations.sql"
+        await self._execute_schema_statements(
+            conn,
+            migration_path.read_text(encoding="utf-8"),
+        )
+
+    async def _ensure_coding_tasks_last_applied_recovery_decision_column(
+        self, conn: Any
+    ) -> None:
+        """Add the descriptive recovery-gate causal projection once.
+
+        The column records which durable RecoveryDecision caused the last
+        recovery control transition.  It is not a capability, approval, or
+        lifecycle authority, and legacy rows remain NULL.
+        """
+        cursor = await conn.execute("PRAGMA table_info(coding_tasks)")
+        columns = {str(row["name"]) for row in await cursor.fetchall()}
+        if "last_applied_recovery_decision_id" in columns:
+            return
+        await conn.execute(
+            "ALTER TABLE coding_tasks ADD COLUMN last_applied_recovery_decision_id TEXT"
+        )
+
+    async def _ensure_coding_tasks_published_plan_revision_column(
+        self, conn: Any
+    ) -> None:
+        """Idempotently add the v20 published-plan identity column.
+
+        SQLite has no portable ``ADD COLUMN IF NOT EXISTS``.  The helper is
+        deliberately limited to this one additive column and performs no
+        inference from task status, plan history, or model output.  A legacy
+        task therefore starts with ``NULL``: it has no published plan until a
+        planning publication transaction records one.
+        """
+        cursor = await conn.execute("PRAGMA table_info(coding_tasks)")
+        columns = {str(row["name"]) for row in await cursor.fetchall()}
+        if "published_plan_revision_id" in columns:
+            return
+        await conn.execute(
+            "ALTER TABLE coding_tasks ADD COLUMN published_plan_revision_id TEXT"
+        )
+
+    async def _ensure_coding_tasks_cognitive_state_columns(
+        self, conn: Any
+    ) -> None:
+        """Idempotently add the v17 control-state columns.
+
+        The normal path executes the checked-in v17 SQL artifact verbatim.
+        The per-column fallback handles a process that was interrupted after
+        one additive ALTER in a non-versioned/hand-repaired database.  Only
+        the two exact v17 columns are accepted; no task history is used to
+        infer a cognitive phase.
+        """
+        cursor = await conn.execute("PRAGMA table_info(coding_tasks)")
+        columns = {str(row["name"]) for row in await cursor.fetchall()}
+        required = {"cognitive_state", "control_state_version"}
+        missing = required - columns
+        if not missing:
+            return
+
+        migration_path = _MIGRATIONS_DIR / "0017_agent_cognitive_state.sql"
+        migration_sql = migration_path.read_text(encoding="utf-8")
+        if missing == required:
+            await self._execute_schema_statements(conn, migration_sql)
+            return
+
+        # SQLite has no portable ``ADD COLUMN IF NOT EXISTS``.  When a
+        # partial additive operation is observed, execute only the missing
+        # statement while retaining the same schema contract as the artifact.
+        if "cognitive_state" in missing:
+            await conn.execute(
+                "ALTER TABLE coding_tasks ADD COLUMN cognitive_state TEXT "
+                "NOT NULL DEFAULT 'uninitialized' CHECK (cognitive_state IN "
+                "('uninitialized', 'understanding', 'exploring', 'planning', "
+                "'implementing', 'verifying', 'diagnosing', 'recovering', "
+                "'replanning', 'reviewing', 'completion_check'))"
+            )
+        if "control_state_version" in missing:
+            await conn.execute(
+                "ALTER TABLE coding_tasks ADD COLUMN control_state_version "
+                "INTEGER NOT NULL DEFAULT 0 CHECK (control_state_version >= 0)"
+            )
+
+    async def _backfill_legacy_goal_specs(self, conn: Any) -> None:
+        """Backfill and validate one conservative GoalSpec per task.
+
+        This method runs inside the outer migration transaction.  It uses
+        direct SQL intentionally: invoking a repository transaction here
+        would create a second transaction owner during migration.  Existing
+        canonical rows are validated, never replaced; missing projection
+        references are added to ``coding_tasks.state_json`` only.
+        """
+        from khaos.agent.control.goal import GoalSpec
+
+        task_cursor = await conn.execute(
+            """
+            SELECT id, goal, state_json, principal_id, project_id
+            FROM coding_tasks
+            ORDER BY id
+            """
+        )
+        task_rows = await task_cursor.fetchall()
+        for task_row in task_rows:
+            task_id = task_row["id"]
+            raw_goal = task_row["goal"]
+            principal_id = task_row["principal_id"]
+            project_id = task_row["project_id"]
+            if (
+                type(task_id) is not str
+                or not task_id
+                or type(raw_goal) is not str
+                or not raw_goal
+                or type(principal_id) is not str
+                or not principal_id
+                or type(project_id) is not str
+            ):
+                raise RuntimeError(
+                    f"cannot backfill GoalSpec for malformed coding task {task_id!r}"
+                )
+            try:
+                state = json.loads(str(task_row["state_json"]))
+            except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"coding task {task_id!r} has malformed state_json; "
+                    "GoalSpec backfill refused"
+                ) from exc
+            if type(state) is not dict:
+                raise RuntimeError(
+                    f"coding task {task_id!r} state_json is not an object; "
+                    "GoalSpec backfill refused"
+                )
+            state_goal = state.get("goal")
+            if state_goal is not None and (
+                type(state_goal) is not str or state_goal != raw_goal
+            ):
+                raise RuntimeError(
+                    f"coding task {task_id!r} goal projection disagrees with row"
+                )
+
+            spec_cursor = await conn.execute(
+                """
+                SELECT goal_spec_id, task_id, principal_id, project_id,
+                       schema_version, semantic_digest, canonical_json
+                FROM agent_goal_specs
+                WHERE task_id = ?
+                """,
+                (task_id,),
+            )
+            spec_row = await spec_cursor.fetchone()
+            if spec_row is None:
+                # The task id is part of the identity only for persistence;
+                # it is deliberately excluded from semantic_digest.
+                spec = GoalSpec.from_user_goal(
+                    raw_goal,
+                    goal_spec_id=f"legacy-{task_id}",
+                )
+                try:
+                    await conn.execute(
+                        """
+                        INSERT INTO agent_goal_specs (
+                            goal_spec_id, task_id, principal_id, project_id,
+                            schema_version, semantic_digest, canonical_json, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            spec.goal_spec_id,
+                            task_id,
+                            principal_id,
+                            project_id,
+                            spec.schema_version,
+                            spec.semantic_digest,
+                            spec.canonical_json(),
+                            utc_now_naive().isoformat(),
+                        ),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise RuntimeError(
+                        f"GoalSpec backfill conflict for coding task {task_id!r}"
+                    ) from exc
+            else:
+                if (
+                    type(spec_row["goal_spec_id"]) is not str
+                    or not spec_row["goal_spec_id"]
+                    or type(spec_row["task_id"]) is not str
+                    or not spec_row["task_id"]
+                    or type(spec_row["principal_id"]) is not str
+                    or not spec_row["principal_id"]
+                    or type(spec_row["project_id"]) is not str
+                    or type(spec_row["semantic_digest"]) is not str
+                    or not spec_row["semantic_digest"]
+                    or type(spec_row["canonical_json"]) is not str
+                    or type(spec_row["schema_version"]) is not int
+                ):
+                    raise RuntimeError(
+                        f"GoalSpec row for coding task {task_id!r} has invalid owner, identity, or payload fields"
+                    )
+                if (
+                    spec_row["task_id"] != task_id
+                    or spec_row["principal_id"] != principal_id
+                    or spec_row["project_id"] != project_id
+                ):
+                    raise RuntimeError(
+                        f"GoalSpec owner/task mismatch for coding task {task_id!r}"
+                    )
+                try:
+                    spec = GoalSpec.from_canonical_json(
+                        spec_row["canonical_json"],
+                        expected_digest=spec_row["semantic_digest"],
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        f"GoalSpec row for coding task {task_id!r} failed integrity validation"
+                    ) from exc
+                if (
+                    spec.schema_version != spec_row["schema_version"]
+                    or spec.raw_goal != raw_goal
+                    or spec.goal_spec_id != spec_row["goal_spec_id"]
+                ):
+                    raise RuntimeError(
+                        f"GoalSpec row for coding task {task_id!r} disagrees with task"
+                    )
+
+            expected_id = spec.goal_spec_id
+            expected_digest = spec.semantic_digest
+            for field_name, expected_value in (
+                ("goal_spec_id", expected_id),
+                ("goal_spec_digest", expected_digest),
+            ):
+                projected_value = state.get(field_name)
+                if projected_value is not None and projected_value != expected_value:
+                    raise RuntimeError(
+                        f"coding task {task_id!r} has conflicting {field_name} projection"
+                    )
+            if (
+                state.get("goal_spec_id") != expected_id
+                or state.get("goal_spec_digest") != expected_digest
+            ):
+                state["goal_spec_id"] = expected_id
+                state["goal_spec_digest"] = expected_digest
+                await conn.execute(
+                    "UPDATE coding_tasks SET state_json = ? WHERE id = ?",
+                    (
+                        json.dumps(
+                            state,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        task_id,
+                    ),
+                )
+
+        orphan_cursor = await conn.execute(
+            """
+            SELECT specs.goal_spec_id
+            FROM agent_goal_specs AS specs
+            LEFT JOIN coding_tasks AS tasks ON tasks.id = specs.task_id
+            WHERE tasks.id IS NULL
+            """
+        )
+        orphan = await orphan_cursor.fetchone()
+        if orphan is not None:
+            raise RuntimeError(
+                f"orphan GoalSpec {str(orphan['goal_spec_id'])!r} detected"
+            )
 
     async def _ensure_memory_nodes_superseded_at(self) -> None:
         """Add the temporal supersession marker to existing v13 databases."""
@@ -3690,24 +4305,81 @@ class Database:
 
     async def update_coding_task(
         self, task: dict[str, Any], *, principal_id: str,
-        project_id: str,
+        project_id: str, expected_status: str,
     ) -> None:
-        """UPDATE an existing coding task row with Owner-Match predicate.
+        """Update a coding task with owner and lifecycle CAS predicates.
 
-        Round-4 review Batch 4 (§八): updates use a standalone
-        ``UPDATE ... WHERE id=? AND principal_id=? AND project_id=?``
-        so a foreign caller cannot mutate another owner's task.
-        If the predicate matches zero rows, ``OwnerMismatchError`` is
-        raised — the caller fails loudly instead of silently touching
-        another owner's row.
+        Existing task persistence is a lifecycle compare-and-swap.  The
+        caller must state the durable status it read *before* applying its
+        in-memory mutation; the SQL update then requires that status to
+        remain current.  This prevents a stale TaskManager cache from
+        overwriting a Gate-committed terminal status.
+
+        Owner mismatch and lifecycle conflict are intentionally distinct:
+        an owner-scoped row that cannot be selected raises
+        ``OwnerMismatchError``; a selected row whose status no longer
+        matches ``expected_status`` raises ``TaskLifecycleConflictError``.
+        The owner-scoped probe does not disclose whether an unowned id
+        exists.
 
         Unlike ``insert_coding_task``, this method does NOT re-stamp
         ``principal_id`` or ``project_id`` — ownership is immutable
         after creation.  Only ``goal``, ``status``, ``state_json``,
         and ``updated_at`` are updated.
+
+        The generic path is never a successful completion authority:
+        active-to-``completed`` and terminal-to-different-status writes are
+        rejected even when the supplied expected status happens to match.
+        CompletionGateRepository owns the dedicated successful projection
+        SQL.
         """
         persisted_task = dict(task)
+        task_id = persisted_task["id"]
+        new_status = persisted_task["status"]
+        if type(expected_status) is not str or not expected_status:
+            raise ValueError("expected_status must be a non-empty status string")
+        if type(new_status) is not str or not new_status:
+            raise ValueError("task status must be a non-empty status string")
+
         async with self.transaction() as conn:
+            owner_cursor = await conn.execute(
+                """
+                SELECT status FROM coding_tasks
+                WHERE id = ? AND principal_id = ? AND project_id = ?
+                """,
+                (task_id, principal_id, project_id),
+            )
+            owner_row = await owner_cursor.fetchone()
+            if owner_row is None:
+                raise OwnerMismatchError(
+                    f"coding task {task_id!r} does not exist "
+                    "or is owned by a different (principal_id, project_id)"
+                )
+
+            current_status = owner_row["status"]
+            if current_status != expected_status:
+                raise TaskLifecycleConflictError(
+                    f"coding task {task_id!r} lifecycle is stale: "
+                    f"expected {expected_status!r}, current {current_status!r}"
+                )
+
+            # Terminal states are monotonic in the generic persistence
+            # domain.  Same-status metadata projections are allowed, but no
+            # stale or direct caller can move a terminal row elsewhere.
+            if (
+                current_status in {"completed", "failed", "cancelled"}
+                and new_status != current_status
+            ):
+                raise TaskLifecycleConflictError(
+                    f"coding task {task_id!r} terminal status "
+                    f"{current_status!r} cannot change to {new_status!r}"
+                )
+            if new_status == "completed" and current_status != "completed":
+                raise TaskLifecycleConflictError(
+                    "generic coding-task persistence cannot transition an "
+                    "active task to completed; CompletionGate owns that write"
+                )
+
             cursor = await conn.execute(
                 """
                 UPDATE coding_tasks SET
@@ -3716,6 +4388,7 @@ class Database:
                     state_json = ?,
                     updated_at = ?
                 WHERE id = ? AND principal_id = ? AND project_id = ?
+                  AND status = ?
                 """,
                 (
                     persisted_task["goal"],
@@ -3725,12 +4398,12 @@ class Database:
                     persisted_task["id"],
                     principal_id,
                     project_id,
+                    expected_status,
                 ),
             )
-            if cursor.rowcount == 0:
-                raise OwnerMismatchError(
-                    f"coding task {persisted_task['id']!r} does not exist "
-                    f"or is owned by a different (principal_id, project_id)"
+            if cursor.rowcount != 1:
+                raise TaskLifecycleConflictError(
+                    f"coding task {task_id!r} lifecycle changed during update"
                 )
 
     async def list_coding_tasks(
@@ -3762,10 +4435,42 @@ class Database:
                 params.append(project_id)
             where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
             cursor = await conn.execute(
-                f"SELECT state_json FROM coding_tasks {where} ORDER BY created_at",
+                f"SELECT id, goal, status, state_json, created_at, updated_at, "
+                f"principal_id, project_id, cognitive_state, "
+                f"control_state_version FROM coding_tasks {where} "
+                "ORDER BY created_at",
                 tuple(params),
             )
-            return [json.loads(str(row["state_json"])) for row in await cursor.fetchall()]
+            rows = await cursor.fetchall()
+            result: list[dict[str, Any]] = []
+            for row in rows:
+                state = json.loads(str(row["state_json"]))
+                if type(state) is not dict:
+                    raise ValueError(
+                        f"coding task {row['id']!r} state_json is not an object"
+                    )
+                for field_name, physical_value in (
+                    ("id", row["id"]),
+                    ("goal", row["goal"]),
+                    ("status", row["status"]),
+                    ("created_at", row["created_at"]),
+                    ("updated_at", row["updated_at"]),
+                ):
+                    if field_name in state and state[field_name] != physical_value:
+                        raise ValueError(
+                            f"coding task {row['id']!r} {field_name} projection disagrees"
+                        )
+                    state[field_name] = physical_value
+                # Owner columns are authoritative even if an old state JSON
+                # payload contains a stale or forged projection.
+                state["principal_id"] = row["principal_id"]
+                # M7.1.3: cognitive state/version are a separate SQL CAS
+                # domain.  The state_json values are only a compatibility
+                # projection and are overwritten by the canonical columns.
+                state["cognitive_state"] = row["cognitive_state"]
+                state["control_state_version"] = row["control_state_version"]
+                result.append(state)
+            return result
 
     async def search_sessions(
         self,
@@ -4583,6 +5288,86 @@ class Database:
                 (turn_id,),
             )
             return [dict(row) for row in await cursor.fetchall()]
+
+    async def list_completion_gate_history(
+        self,
+        task_id: str,
+        *,
+        principal_id: str,
+        project_id: str,
+    ) -> tuple[CompletionGateHistoryRecord, ...]:
+        """Read owner-scoped ``completion.gated`` events for one task.
+
+        M7.1.8 reuses the existing durable turn-event ledger rather than
+        introducing a second gate-history table.  The task/owner predicates
+        are applied to ``agent_turns`` before a bounded newest tail is handed
+        to the recovery decoder; oversized bodies are replaced by an empty
+        transport value plus their byte count.  The decoder, not this
+        generic DB facade, owns the event payload schema.
+        """
+        if type(task_id) is not str or not task_id:
+            raise ValueError("task_id must be a non-empty string")
+        if type(principal_id) is not str or not principal_id:
+            raise ValueError("principal_id must be a non-empty string")
+        if type(project_id) is not str:
+            raise ValueError("project_id must be a string")
+        from khaos.agent.control.completion_recovery import (
+            MAX_COMPLETION_GATE_HISTORY_RECORDS,
+            MAX_COMPLETION_GATE_PAYLOAD_BYTES,
+            CompletionGateHistoryRecord,
+        )
+
+        async with self._read_lease():
+            conn = await self._require_conn()
+            cursor = await conn.execute(
+                """
+                SELECT t.turn_id, t.attempt_id, t.task_id, t.started_at,
+                       e.sequence, e.event_type,
+                       CASE
+                           WHEN length(CAST(e.payload_json AS BLOB)) <= ?
+                           THEN e.payload_json
+                           ELSE ''
+                       END AS payload_json,
+                       COALESCE(length(CAST(e.payload_json AS BLOB)), -1)
+                           AS payload_bytes,
+                       e.created_at
+                FROM agent_turns AS t
+                JOIN agent_turn_events AS e ON e.turn_id = t.turn_id
+                WHERE t.task_id = ?
+                  AND t.principal_id = ?
+                  AND t.project_id = ?
+                  AND e.event_type = 'completion.gated'
+                ORDER BY e.created_at DESC, t.started_at DESC,
+                         t.turn_id DESC, e.sequence DESC
+                LIMIT ?
+                """,
+                (
+                    MAX_COMPLETION_GATE_PAYLOAD_BYTES,
+                    task_id,
+                    principal_id,
+                    project_id,
+                    MAX_COMPLETION_GATE_HISTORY_RECORDS,
+                ),
+            )
+            rows = await cursor.fetchall()
+        # The query reads the newest bounded tail so a current gate result is
+        # retained while memory use remains fixed.  Restore chronological
+        # order for callers that inspect the history deterministically.
+        rows.reverse()
+        return tuple(
+            CompletionGateHistoryRecord(
+                turn_id=row["turn_id"],
+                attempt_id=row["attempt_id"],
+                task_id=row["task_id"],
+                event_sequence=row["sequence"],
+                event_type=row["event_type"],
+                payload_json=row["payload_json"],
+                payload_bytes=row["payload_bytes"],
+                created_at=row["created_at"],
+                turn_started_at=row["started_at"],
+            )
+            for row in rows
+        )
 
     async def prune_terminal_agent_turns(
         self, *, older_than_seconds: float, now: float, limit: int = 256

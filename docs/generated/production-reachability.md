@@ -17,8 +17,8 @@
 
 ## Import reachability result
 
-- Reachable repository modules: `247`.
-- Resolved import edges: `1723`.
+- Reachable repository modules: `286`.
+- Resolved import edges: `2248`.
 - Forbidden production edges: `0`.
 - Unresolved internal edges: `0`.
 
@@ -36,6 +36,22 @@
 - `khaos.agent.approval`
 - `khaos.agent.compressor`
 - `khaos.agent.context_facts`
+- `khaos.agent.control.completion`
+- `khaos.agent.control.completion_evaluator`
+- `khaos.agent.control.completion_flow`
+- `khaos.agent.control.completion_gate`
+- `khaos.agent.control.completion_gate_repository`
+- `khaos.agent.control.completion_recovery`
+- `khaos.agent.control.completion_repository`
+- `khaos.agent.control.goal`
+- `khaos.agent.control.goal_repository`
+- `khaos.agent.control.recovery`
+- `khaos.agent.control.recovery_control`
+- `khaos.agent.control.recovery_gate`
+- `khaos.agent.control.recovery_gate_repository`
+- `khaos.agent.control.recovery_repository`
+- `khaos.agent.control.state`
+- `khaos.agent.control.state_repository`
 - `khaos.agent.core`
 - `khaos.agent.error_handler`
 - `khaos.agent.events`
@@ -49,7 +65,6 @@
 - `khaos.channels.models`
 - `khaos.channels.registry`
 - `khaos.channels.webhook`
-- `khaos.coding.context`
 - `khaos.coding.cost_tracker`
 - `khaos.coding.execution`
 - `khaos.coding.execution.authority`
@@ -67,7 +82,11 @@
 - `khaos.coding.execution.service`
 - `khaos.coding.execution.supervisor`
 - `khaos.coding.fingerprint`
-- `khaos.coding.indexer`
+- `khaos.coding.intelligence.adapters`
+- `khaos.coding.intelligence.context`
+- `khaos.coding.intelligence.models`
+- `khaos.coding.intelligence.query_service`
+- `khaos.coding.intelligence.registry`
 - `khaos.coding.parser`
 - `khaos.coding.planning.approval.execution_contract`
 - `khaos.coding.planning.approval.execution_journal_writer`
@@ -85,15 +104,32 @@
 - `khaos.coding.planning.approval.service`
 - `khaos.coding.planning.approval.store`
 - `khaos.coding.planning.approval.validator`
+- `khaos.coding.planning.context_planner`
 - `khaos.coding.planning.contracts`
+- `khaos.coding.planning.coordinator`
+- `khaos.coding.planning.dag`
 - `khaos.coding.planning.execution_models`
 - `khaos.coding.planning.git_state`
+- `khaos.coding.planning.limits`
 - `khaos.coding.planning.recovery_directory`
+- `khaos.coding.planning.repository`
+- `khaos.coding.planning.revision`
+- `khaos.coding.planning.risk`
 - `khaos.coding.planning.safe_identifiers`
 - `khaos.coding.planning.safe_workspace_path`
 - `khaos.coding.planning.security_identities`
+- `khaos.coding.planning.service`
+- `khaos.coding.planning.step_execution_repository`
+- `khaos.coding.planning.tool_route_repository`
+- `khaos.coding.planning.tool_router`
+- `khaos.coding.planning.tool_routing`
 - `khaos.coding.planning.trusted_verification`
+- `khaos.coding.planning.trusted_verification_authority`
 - `khaos.coding.planning.trusted_verification_runner`
+- `khaos.coding.planning.trusted_verification_service`
+- `khaos.coding.planning.verification`
+- `khaos.coding.planning.verification_assessment`
+- `khaos.coding.planning.verification_assessment_repository`
 - `khaos.coding.planning.verification_authority`
 - `khaos.coding.planning.verification_catalog`
 - `khaos.coding.planning.verification_execution_models`
@@ -129,6 +165,8 @@
 - `khaos.db.repositories.sessions`
 - `khaos.db.repositories.tool_operations`
 - `khaos.db.state_root`
+- `khaos.evaluation.models`
+- `khaos.evaluation.repository`
 - `khaos.exceptions`
 - `khaos.grpc_server`
 - `khaos.maintenance`
@@ -167,6 +205,7 @@
 - `khaos.memory.providers.native`
 - `khaos.memory.repository`
 - `khaos.memory.retrieval`
+- `khaos.memory.retrieval_policy`
 - `khaos.memory.runtime`
 - `khaos.memory.store`
 - `khaos.memory.transfer`
@@ -242,12 +281,14 @@
 - `khaos.security.policy`
 - `khaos.security.principals`
 - `khaos.security.production_composition_manifest`
+- `khaos.security.production_trust`
 - `khaos.security.protocol_boundary`
 - `khaos.security.resource_scope`
 - `khaos.security.sandbox`
 - `khaos.security.secret_scanner`
 - `khaos.security.shell_semantics`
 - `khaos.security.windows_native_ffi`
+- `khaos.security.windows_trust`
 - `khaos.skills`
 - `khaos.skills.generator`
 - `khaos.skills.loader`
@@ -255,9 +296,7 @@
 - `khaos.skills.registry`
 - `khaos.skills.skill`
 - `khaos.subagents`
-- `khaos.subagents.planner`
-- `khaos.subagents.runner`
-- `khaos.subagents.service`
+- `khaos.subagents.assignment`
 - `khaos.subagents.spawner`
 - `khaos.time_utils`
 - `khaos.tools`

@@ -39,10 +39,22 @@ from khaos.security.local_trust import (
     validate_trusted_local_path,
 )
 from khaos.security.principals import DelegationScope, PrincipalKind
-from khaos.security.protocol_boundary import canonical_digest, canonical_json_bytes
+from khaos.security.production_trust import (
+    ProductionTrustBinding,
+    ProductionTrustError,
+    compare_trust_bindings,
+    public_key_fingerprint,
+)
+from khaos.security.protocol_boundary import (
+    canonical_digest,
+    canonical_json_bytes,
+    strict_json_loads,
+)
 
 AUTHORITYD_PROTOCOL = 1
 MAX_MESSAGE_BYTES = 1024 * 1024
+AUTHORITY_HANDSHAKE_SCHEMA_VERSION = 1
+MAX_TRUST_CHANNELS = 1024
 
 # Windows os.open defaults to CRT text mode when neither O_BINARY nor O_TEXT
 # is passed: 0x1A acts as EOF (truncating ~12% of random 32-byte Ed25519
@@ -494,9 +506,18 @@ class Ed25519KeyStore:
     """Load or create a daemon-owned Ed25519 private key with safe permissions."""
 
     @staticmethod
-    def load_public_key(path: Path) -> Ed25519PublicKey:
+    def load_public_key(
+        path: Path, *, require_windows_acl: bool = False
+    ) -> Ed25519PublicKey:
         """Load the deployment trust anchor without following a symlink."""
         path = path.expanduser().absolute()
+        if require_windows_acl and os.name == "nt":
+            from khaos.security.windows_trust import validate_windows_trusted_path
+
+            try:
+                validate_windows_trusted_path(path, kind="public-key")
+            except PermissionError as exc:
+                raise AuthorityControlPlaneError(str(exc)) from exc
         try:
             info = path.lstat()
             if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
@@ -515,7 +536,25 @@ class Ed25519KeyStore:
                 path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | _O_BINARY
             )
             try:
+                opened = os.fstat(descriptor)
+                if not _same_file_snapshot(info, opened):
+                    raise AuthorityControlPlaneError(
+                        "authority public key changed while opening"
+                    )
+                if require_windows_acl and os.name == "nt":
+                    from khaos.security.windows_trust import (
+                        validate_windows_trusted_descriptor,
+                    )
+
+                    validate_windows_trusted_descriptor(
+                        descriptor, path=path, kind="public-key"
+                    )
                 payload = _read_descriptor(descriptor, 4096)
+                closed = os.fstat(descriptor)
+                if not _same_file_snapshot(opened, closed):
+                    raise AuthorityControlPlaneError(
+                        "authority public key changed while reading"
+                    )
             finally:
                 os.close(descriptor)
         except OSError as exc:
@@ -535,9 +574,21 @@ class Ed25519KeyStore:
         return key
 
     @staticmethod
-    def load_or_create(path: Path, *, create: bool = False) -> Ed25519PrivateKey:
+    def load_or_create(
+        path: Path,
+        *,
+        create: bool = False,
+        require_windows_acl: bool = False,
+    ) -> Ed25519PrivateKey:
         path = path.expanduser().absolute()
         if path.exists():
+            if require_windows_acl and os.name == "nt":
+                from khaos.security.windows_trust import validate_windows_trusted_path
+
+                try:
+                    validate_windows_trusted_path(path, kind="key")
+                except PermissionError as exc:
+                    raise AuthorityControlPlaneError(str(exc)) from exc
             info = path.lstat()
             if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
                 raise AuthorityControlPlaneError(
@@ -552,7 +603,26 @@ class Ed25519KeyStore:
                 path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | _O_BINARY
             )
             try:
-                key = serialization.load_pem_private_key(os.read(descriptor, 64 * 1024), password=None)
+                opened = os.fstat(descriptor)
+                if not _same_file_snapshot(info, opened):
+                    raise AuthorityControlPlaneError(
+                        "authority signing key changed while opening"
+                    )
+                if require_windows_acl and os.name == "nt":
+                    from khaos.security.windows_trust import (
+                        validate_windows_trusted_descriptor,
+                    )
+
+                    validate_windows_trusted_descriptor(
+                        descriptor, path=path, kind="key"
+                    )
+                payload = _read_descriptor(descriptor, 64 * 1024)
+                closed = os.fstat(descriptor)
+                if not _same_file_snapshot(opened, closed):
+                    raise AuthorityControlPlaneError(
+                        "authority signing key changed while reading"
+                    )
+                key = serialization.load_pem_private_key(payload, password=None)
             finally:
                 os.close(descriptor)
             if not isinstance(key, Ed25519PrivateKey):
@@ -561,6 +631,13 @@ class Ed25519KeyStore:
         if not create:
             raise AuthorityControlPlaneError("authority signing key is unavailable")
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if require_windows_acl and os.name == "nt":
+            from khaos.security.windows_trust import validate_windows_trusted_path
+
+            try:
+                validate_windows_trusted_path(path.parent, kind="key")
+            except PermissionError as exc:
+                raise AuthorityControlPlaneError(str(exc)) from exc
         key = Ed25519PrivateKey.generate()
         payload = key.private_bytes(
             serialization.Encoding.PEM,
@@ -577,6 +654,12 @@ class Ed25519KeyStore:
             0o600,
         )
         try:
+            if require_windows_acl and os.name == "nt":
+                from khaos.security.windows_trust import (
+                    validate_windows_trusted_descriptor,
+                )
+
+                validate_windows_trusted_descriptor(descriptor, path=path, kind="key")
             offset = 0
             while offset < len(payload):
                 written = os.write(descriptor, payload[offset:])
@@ -603,7 +686,17 @@ class AuthorityDaemonClient:
         public_key_path: Path | None = None,
         trusted_local_root: Path | None = None,
         runtime_profile: RuntimeProfile | str | None = None,
+        trust_binding: ProductionTrustBinding | None = None,
+        community_local: bool = False,
     ) -> None:
+        if type(community_local) is not bool:
+            raise ValueError("community local authority flag is invalid")
+        resolved_runtime_profile = resolve_runtime_profile(runtime_profile)
+        requires_explicit_binding = (
+            resolved_runtime_profile.is_production
+            and trust_binding is None
+            and not community_local
+        )
         # The caller (normally AuthorityTransportConfig) selects the
         # transport.  For direct protocol tests, preserve the intuitive
         # shape: an injected adapter means native; a socket path means Unix.
@@ -612,6 +705,13 @@ class AuthorityDaemonClient:
         )
         if selected_transport not in {"unix", "native"}:
             raise ValueError("authorityd transport is invalid")
+        if (
+            requires_explicit_binding
+            and sys.platform.startswith(("win", "cygwin", "msys"))
+        ):
+            raise ValueError(
+                "production authorityd client requires an explicit trust binding"
+            )
         if selected_transport == "unix" and sys.platform.startswith(
             ("win", "cygwin", "msys")
         ):
@@ -633,11 +733,26 @@ class AuthorityDaemonClient:
             raise ValueError("authorityd trusted root must be absolute")
         if (
             trusted_local_root is not None
-            and resolve_runtime_profile(runtime_profile).is_production
+            and resolved_runtime_profile.is_production
             and trusted_local_root != local_authority_root()
         ):
             raise ValueError(
                 "production Community authorityd trusted root must be the system home root"
+            )
+        if (
+            resolved_runtime_profile.is_production
+            and community_local
+            and (
+                selected_transport != "unix"
+                or trusted_local_root is None
+            )
+        ):
+            raise ValueError(
+                "community local authority requires a trusted Unix root"
+            )
+        if requires_explicit_binding:
+            raise ValueError(
+                "production authorityd client requires an explicit trust binding"
             )
         self.socket_path = socket_path
         self.timeout_seconds = timeout_seconds
@@ -646,7 +761,27 @@ class AuthorityDaemonClient:
         self.transport = selected_transport
         self.public_key_path = public_key_path
         self.trusted_local_root = trusted_local_root
-        self.runtime_profile = resolve_runtime_profile(runtime_profile)
+        self.runtime_profile = resolved_runtime_profile
+        if trust_binding is not None and not isinstance(
+            trust_binding, ProductionTrustBinding
+        ):
+            raise ValueError("authorityd trust binding is invalid")
+        self.trust_binding = trust_binding
+        self._ready = trust_binding is None
+        self._channel_nonce: str | None = None
+        self._runtime_identity: dict[str, str] | None = None
+
+    @property
+    def ready(self) -> bool:
+        """Return whether the configured production trust handshake completed."""
+        return self._ready
+
+    def _invalidate_trust_channel(self) -> None:
+        """Forget a channel that no longer has a live authorityd peer."""
+        if self.trust_binding is not None:
+            self._ready = False
+            self._channel_nonce = None
+            self._runtime_identity = None
 
     def _verify_receipt(self, value: object) -> SignedAuthorizationReceipt:
         """Parse and verify a receipt against the configured local trust anchor."""
@@ -660,7 +795,10 @@ class AuthorityDaemonClient:
                         kind="file",
                         root=self.trusted_local_root,
                     )
-                public_key = Ed25519KeyStore.load_public_key(self.public_key_path)
+                public_key = Ed25519KeyStore.load_public_key(
+                    self.public_key_path,
+                    require_windows_acl=self.runtime_profile.is_production,
+                )
                 receipt.verify(public_key)
             except (AuthorityControlPlaneError, LocalTrustRootError) as exc:
                 raise AuthorityControlPlaneError(
@@ -669,7 +807,30 @@ class AuthorityDaemonClient:
         return receipt
 
     def request(self, payload: dict[str, object]) -> dict[str, object]:
-        body = canonical_json_bytes({"protocol": AUTHORITYD_PROTOCOL, **payload}) + b"\n"
+        operation = payload.get("operation")
+        wire_payload = dict(payload)
+        if self.trust_binding is not None and operation != "handshake":
+            if not self._ready:
+                raise AuthorityControlPlaneError(
+                    "authorityd trust handshake is required before requests"
+                )
+            if any(
+                field in wire_payload
+                for field in ("trust_binding", "channel_nonce", "runtime_identity")
+            ):
+                raise AuthorityControlPlaneError(
+                    "authorityd trust channel binding is client-owned"
+                )
+            if self._channel_nonce is None or self._runtime_identity is None:
+                raise AuthorityControlPlaneError(
+                    "authorityd trust handshake channel is unavailable"
+                )
+            wire_payload["trust_binding"] = self.trust_binding.to_payload()
+            wire_payload["channel_nonce"] = self._channel_nonce
+            wire_payload["runtime_identity"] = dict(self._runtime_identity)
+        body = canonical_json_bytes(
+            {"protocol": AUTHORITYD_PROTOCOL, **wire_payload}
+        ) + b"\n"
         if len(body) > MAX_MESSAGE_BYTES:
             raise AuthorityControlPlaneError("authorityd request is too large")
         if self.transport == "native":
@@ -681,19 +842,40 @@ class AuthorityDaemonClient:
                     )
 
                     adapter = build_native_authority_adapter(production=True)
-                response = adapter.request({"protocol": AUTHORITYD_PROTOCOL, **payload})
+                response = adapter.request(
+                    {"protocol": AUTHORITYD_PROTOCOL, **wire_payload}
+                )
             except IdentityIsolationError as exc:
+                if operation != "handshake":
+                    self._invalidate_trust_channel()
                 raise AuthorityControlPlaneError(
                     "native authority transport identity is invalid"
                 ) from exc
             except OSError as exc:
+                if operation != "handshake":
+                    self._invalidate_trust_channel()
                 raise RemoteAuditUnavailableError("native authorityd is unavailable") from exc
             if not isinstance(response, dict) or response.get("ok") is not True:
                 if isinstance(response, dict):
                     message = str(response.get("error", "native authorityd rejected request"))
+                    if (
+                        self.trust_binding is not None
+                        and operation != "handshake"
+                        and any(
+                            marker in message
+                            for marker in (
+                                "trust channel",
+                                "trust binding",
+                                "runtime identity",
+                            )
+                        )
+                    ):
+                        self._invalidate_trust_channel()
                     if response.get("error_code") == "remote_audit_unavailable":
                         raise RemoteAuditUnavailableError(message)
                     raise AuthorityControlPlaneError(message)
+                if operation != "handshake":
+                    self._invalidate_trust_channel()
                 raise AuthorityControlPlaneError("native authorityd returned an invalid response")
             return response
         try:
@@ -723,23 +905,154 @@ class AuthorityDaemonClient:
                 connection.sendall(body)
                 response = _recv_line(connection)
         except IdentityIsolationError as exc:
+            if self.trust_binding is not None and operation != "handshake":
+                self._invalidate_trust_channel()
             raise AuthorityControlPlaneError(
                 "authorityd transport identity is invalid"
             ) from exc
+        except AuthorityControlPlaneError:
+            if self.trust_binding is not None and operation != "handshake":
+                self._invalidate_trust_channel()
+            raise
         except (OSError, TimeoutError) as exc:
+            if self.trust_binding is not None and operation != "handshake":
+                self._invalidate_trust_channel()
             raise RemoteAuditUnavailableError("authorityd is unavailable") from exc
         try:
-            decoded = json.loads(response.decode("utf-8"))
-        except (UnicodeError, json.JSONDecodeError) as exc:
+            decoded = strict_json_loads(response, max_bytes=MAX_MESSAGE_BYTES)
+        except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
+            if self.trust_binding is not None and operation != "handshake":
+                self._invalidate_trust_channel()
             raise AuthorityControlPlaneError("authorityd returned malformed data") from exc
         if not isinstance(decoded, dict) or decoded.get("ok") is not True:
             if isinstance(decoded, dict):
                 message = str(decoded.get("error", "authorityd rejected request"))
+                if (
+                    self.trust_binding is not None
+                    and operation != "handshake"
+                    and any(
+                        marker in message
+                        for marker in (
+                            "trust channel",
+                            "trust binding",
+                            "runtime identity",
+                        )
+                    )
+                ):
+                    self._invalidate_trust_channel()
                 if decoded.get("error_code") == "remote_audit_unavailable":
                     raise RemoteAuditUnavailableError(message)
                 raise AuthorityControlPlaneError(message)
+            if self.trust_binding is not None and operation != "handshake":
+                self._invalidate_trust_channel()
             raise AuthorityControlPlaneError("authorityd returned an invalid response")
         return decoded
+
+    def handshake(
+        self,
+        *,
+        runtime_id: str,
+        principal_id: str,
+        project_id: str,
+        principal_kind: str,
+    ) -> ProductionTrustBinding:
+        """Authenticate the runtime against the complete authority snapshot."""
+        binding = self.trust_binding
+        if binding is None:
+            raise AuthorityControlPlaneError(
+                "authorityd handshake requires a configured trust binding"
+            )
+        identity = {
+            "runtime_id": runtime_id,
+            "principal_id": principal_id,
+            "project_id": project_id,
+            "principal_kind": principal_kind,
+        }
+        if any(
+            type(value) is not str or not value or "\x00" in value or len(value) > 256
+            for value in identity.values()
+        ):
+            raise AuthorityControlPlaneError("authorityd runtime identity is invalid")
+        if self.public_key_path is None:
+            raise AuthorityControlPlaneError(
+                "authorityd public key is required for trust handshake"
+            )
+        try:
+            public_key = Ed25519KeyStore.load_public_key(
+                self.public_key_path,
+                require_windows_acl=self.runtime_profile.is_production,
+            )
+            local_fingerprint = public_key_fingerprint(public_key.public_bytes_raw())
+        except (AuthorityControlPlaneError, ProductionTrustError) as exc:
+            raise AuthorityControlPlaneError(
+                "authorityd public key trust anchor is unavailable"
+            ) from exc
+        if local_fingerprint != binding.public_key_fingerprint:
+            raise AuthorityControlPlaneError(
+                "authorityd public key fingerprint does not match the trust binding"
+            )
+        # A re-handshake replaces the previous runtime channel.  Release the
+        # old server-side nonce before clearing local state so repeated
+        # renegotiation cannot exhaust the authorityd channel quota.
+        if self._ready and self._channel_nonce is not None:
+            self.close_trust_channel()
+        else:
+            self._invalidate_trust_channel()
+        response = self.request(
+            {
+                "operation": "handshake",
+                "handshake_schema_version": AUTHORITY_HANDSHAKE_SCHEMA_VERSION,
+                "protocol_version": AUTHORITYD_PROTOCOL,
+                "runtime_identity": identity,
+                "trust_binding": binding.to_payload(),
+            }
+        )
+        if response.get("ready") != "READY":
+            raise AuthorityControlPlaneError(
+                "authorityd did not establish a READY trust channel"
+            )
+        if response.get("runtime_identity") != identity:
+            raise AuthorityControlPlaneError(
+                "authorityd runtime identity does not match the handshake"
+            )
+        try:
+            observed = ProductionTrustBinding.from_payload(
+                response.get("trust_binding")
+            )
+            compare_trust_bindings(binding, observed)
+        except ProductionTrustError as exc:
+            raise AuthorityControlPlaneError(
+                "authorityd trust binding does not match the runtime"
+            ) from exc
+        if response.get("issuer_id") != binding.authority_id:
+            raise AuthorityControlPlaneError(
+                "authorityd authority identity does not match the trust binding"
+            )
+        channel_nonce = response.get("channel_nonce")
+        if (
+            type(channel_nonce) is not str
+            or len(channel_nonce) != 64
+            or any(character not in "0123456789abcdef" for character in channel_nonce)
+        ):
+            raise AuthorityControlPlaneError(
+                "authorityd trust channel nonce is malformed"
+            )
+        self._channel_nonce = channel_nonce
+        self._runtime_identity = identity
+        self._ready = True
+        return observed
+
+    def close_trust_channel(self) -> None:
+        """Release this client's authorityd channel and invalidate locally."""
+        try:
+            if self.trust_binding is not None and self._ready and self._channel_nonce:
+                self.request({"operation": "close_trust_channel"})
+        except (AuthorityControlPlaneError, RemoteAuditUnavailableError):
+            # A dead/restarted authority has already discarded the channel;
+            # the local invalidation below is the required postcondition.
+            pass
+        finally:
+            self._invalidate_trust_channel()
 
     def prepare(self, intent: AuthorizationIntent) -> SignedAuthorizationReceipt:
         response = self.request({"operation": "prepare", "intent": intent.payload()})
@@ -1059,8 +1372,22 @@ def _read_descriptor(descriptor: int, maximum: int) -> bytes:
     raise AuthorityControlPlaneError("authority descriptor exceeds its bound")
 
 
+def _same_file_snapshot(before: os.stat_result, after: os.stat_result) -> bool:
+    """Compare the identity and bounded-size snapshot of an opened key file."""
+    return (
+        before.st_dev == after.st_dev
+        and before.st_ino == after.st_ino
+        and before.st_nlink == after.st_nlink
+        and before.st_size == after.st_size
+        and before.st_mtime_ns == after.st_mtime_ns
+        and before.st_ctime_ns == after.st_ctime_ns
+    )
+
+
 __all__ = [
     "AUTHORITYD_PROTOCOL",
+    "AUTHORITY_HANDSHAKE_SCHEMA_VERSION",
+    "MAX_TRUST_CHANNELS",
     "AuditWriter",
     "AuthorityControlPlaneError",
     "AuthorityDaemonClient",

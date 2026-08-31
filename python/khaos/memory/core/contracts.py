@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -90,6 +91,29 @@ class MemoryType(str, Enum):
     CONSTRAINT_MEMORY = "CONSTRAINT_MEMORY"
     PROFILE_MEMORY = "PROFILE_MEMORY"
     NEGATIVE_MEMORY = "NEGATIVE_MEMORY"
+
+
+class MemorySourceKind(str, Enum):
+    """Closed provenance vocabulary for retrievable memory evidence.
+
+    These values describe where a memory came from.  They are never an
+    authority level; even verification, plan, and recovery history remain
+    historical evidence when they cross the memory boundary.
+    """
+
+    USER_MESSAGE = "USER_MESSAGE"
+    ASSISTANT_MESSAGE = "ASSISTANT_MESSAGE"
+    USER_PREFERENCE = "USER_PREFERENCE"
+    PROJECT_CONVENTION = "PROJECT_CONVENTION"
+    REPOSITORY_OBSERVATION = "REPOSITORY_OBSERVATION"
+    ENGINEERING_EPISODE = "ENGINEERING_EPISODE"
+    TOOL_OBSERVATION = "TOOL_OBSERVATION"
+    RUNTIME_EVENT = "RUNTIME_EVENT"
+    PLAN_HISTORY = "PLAN_HISTORY"
+    VERIFICATION_HISTORY = "VERIFICATION_HISTORY"
+    RECOVERY_HISTORY = "RECOVERY_HISTORY"
+    SUMMARY = "SUMMARY"
+    UNBOUND = "UNBOUND"
 
 
 class MemoryStatus(str, Enum):
@@ -226,6 +250,47 @@ def payload_digest(payload: Mapping[str, Any]) -> str:
     return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
 
 
+_EVENT_SECRET_FIELDS = frozenset(
+    {
+        "api_key",
+        "access_token",
+        "approval_receipt",
+        "approval_token",
+        "authorization",
+        "bearer_token",
+        "capability_handle",
+        "credential_handle",
+        "dispatch_token",
+        "password",
+        "private_key",
+        "sandbox_token",
+        "secret",
+        "verification_proof",
+    }
+)
+_EVENT_SECRET_TEXT = re.compile(
+    r"(?i)\b(?:Bearer\s+[A-Za-z0-9._~+/=-]+|"
+    r"(?:api[_ -]?key|access[_ -]?token|secret|password)\s*[:=]\s*[^\s,;]+)"
+)
+
+
+def sanitize_event_payload(value: Any, *, field_name: str = "") -> Any:
+    """Remove known authority-bearing fields before hashing/persistence."""
+
+    if field_name.casefold() in _EVENT_SECRET_FIELDS:
+        return "[REDACTED_SECRET]"
+    if isinstance(value, str):
+        return _EVENT_SECRET_TEXT.sub("[REDACTED_SECRET]", value)
+    if isinstance(value, Mapping):
+        return {
+            str(key): sanitize_event_payload(item, field_name=str(key))
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [sanitize_event_payload(item) for item in value]
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class MemoryEvent:
     """One append-only fact in the canonical event ledger."""
@@ -259,7 +324,9 @@ class MemoryEvent:
                 raise ValueError(f"{name} must be a non-empty string")
         if not isinstance(self.payload, Mapping):
             raise TypeError("payload must be a mapping")
-        normalized_hash = payload_digest(self.payload)
+        sanitized_payload = sanitize_event_payload(self.payload)
+        object.__setattr__(self, "payload", sanitized_payload)
+        normalized_hash = payload_digest(sanitized_payload)
         if self.payload_hash and self.payload_hash != normalized_hash:
             raise ValueError("payload_hash does not match payload")
         object.__setattr__(self, "payload_hash", normalized_hash)
@@ -435,12 +502,15 @@ class MemoryCandidate:
     verification_run_id: str | None = None
     verification_result_digest: str | None = None
     verification_proof: str | None = None
+    source_kind: MemorySourceKind | str | None = None
+    provenance: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """Validate bounded candidate input before policy evaluation."""
 
         if not self.claim or len(self.claim) > 64 * 1024:
             raise ValueError("memory candidate claim is empty or oversized")
+        object.__setattr__(self, "claim", sanitize_event_payload(self.claim))
         if not 0.0 <= float(self.confidence) <= 1.0:
             raise ValueError("memory candidate confidence must be between 0 and 1")
         if self.namespace not in {"private", "session", "project", "shared"}:
@@ -450,9 +520,16 @@ class MemoryCandidate:
         for name, value in (
             ("preconditions", self.preconditions),
             ("environment", self.environment),
+            ("provenance", self.provenance),
         ):
             if not isinstance(value, Mapping):
                 raise TypeError(f"memory candidate {name} must be a mapping")
+            object.__setattr__(self, name, sanitize_event_payload(value))
+        for name, value in (
+            ("preconditions", self.preconditions),
+            ("environment", self.environment),
+            ("provenance", self.provenance),
+        ):
             try:
                 canonical_json(value)
             except (TypeError, ValueError) as exc:
@@ -603,6 +680,9 @@ class MemoryHit:
     source_rank: int = 0
     source_kind: str = "memory"
     retrieval_features: Mapping[str, float] = field(default_factory=dict)
+    provenance: Mapping[str, Any] = field(default_factory=dict)
+    record_digest: str = ""
+    created_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -711,6 +791,7 @@ __all__ = [
     "MemoryObjectIdentity",
     "MemoryProvider",
     "MemorySearchRequest",
+    "MemorySourceKind",
     "MemoryStatus",
     "MemoryType",
     "MemoryWriteRequest",
@@ -726,5 +807,6 @@ __all__ = [
     "canonical_json",
     "enum_value",
     "payload_digest",
+    "sanitize_event_payload",
     "utc_now",
 ]

@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import json
 
-from khaos.coding.verify_fix import DEFAULT_MAX_FIX_ATTEMPTS, VerifyFixLoop
+import pytest
+from khaos.coding.verify_fix import (
+    DEFAULT_MAX_FIX_ATTEMPTS,
+    VerificationState,
+    VerifyFixLoop,
+)
 
 
 def _failed_test_result(
@@ -58,6 +63,9 @@ def _passed_test_result() -> dict:
 def test_should_enter_loop_on_test_failure() -> None:
     loop = VerifyFixLoop()
     assert loop.should_enter_loop(_failed_test_result()) is True
+    # The predicate is side-effect free; observation is explicit.
+    assert loop.verification_history == ()
+    assert loop.attempt_count == 0
 
 
 def test_should_not_enter_on_success() -> None:
@@ -81,16 +89,28 @@ def test_should_not_enter_on_errors_only_when_failed_zero() -> None:
 def test_loop_exhausted_after_max_attempts() -> None:
     loop = VerifyFixLoop(max_fix_attempts=2)
     failed = _failed_test_result()
-    # First attempt.
-    assert loop.should_enter_loop(failed) is True
-    loop.build_failure_context(failed)
+    # The first failure authorizes repair #1.
+    first = loop.observe_test_result(failed)
+    assert first is not None
+    assert first.state is VerificationState.FAILING
+    assert loop.should_enter_loop(failed, observation=first) is True
+    loop.build_failure_context(failed, observation=first)
     assert loop.is_loop_exhausted() is False
-    # Second attempt.
-    assert loop.should_enter_loop(failed) is True
-    loop.build_failure_context(failed)
+    # The second failure authorizes repair #2. Merely reaching the repair
+    # count does not make the latest failure terminal.
+    second = loop.observe_test_result(failed)
+    assert second is not None
+    assert second.state is VerificationState.FAILING
+    assert loop.should_enter_loop(failed, observation=second) is True
+    loop.build_failure_context(failed, observation=second)
+    assert loop.attempt_count == 2
+    assert loop.is_loop_exhausted() is False
+    # The next failure is the first observation with no repair remaining.
+    terminal = loop.observe_test_result(failed)
+    assert terminal is not None
+    assert terminal.state is VerificationState.EXHAUSTED_FAILURE
     assert loop.is_loop_exhausted() is True
-    # Budget exhausted: no further entry.
-    assert loop.should_enter_loop(failed) is False
+    assert loop.should_enter_loop(failed, observation=terminal) is False
 
 
 def test_build_failure_context_format() -> None:
@@ -111,10 +131,14 @@ def test_build_failure_context_format() -> None:
 def test_final_report_content() -> None:
     loop = VerifyFixLoop(max_fix_attempts=2)
     failed = _failed_test_result()
-    loop.build_failure_context(failed)
-    loop.build_failure_context(failed)
+    for _ in range(2):
+        observation = loop.observe_test_result(failed)
+        assert observation is not None
+        loop.build_failure_context(failed, observation=observation)
+    loop.observe_test_result(failed)
     report = loop.get_final_report()
-    assert "共 2 次尝试" in report
+    assert "共 2 次修复尝试" in report
+    assert "exhausted_failure" in report
     assert "仍然失败" in report
     assert "test_add_file" in report
     assert "请由用户决策" in report
@@ -122,12 +146,18 @@ def test_final_report_content() -> None:
 
 def test_final_report_when_all_pass() -> None:
     loop = VerifyFixLoop(max_fix_attempts=3)
-    loop.build_failure_context(_failed_test_result())
-    # Second attempt passes.
-    loop.build_failure_context(_failed_test_result(failed=0, passed=10, failed_cases=[]))
+    failed = _failed_test_result()
+    first = loop.observe_test_result(failed)
+    assert first is not None
+    loop.build_failure_context(failed, observation=first)
+    # The second observation passes; it is authoritative even if historical
+    # repair accounting is later exhausted.
+    passed = loop.observe_test_result(_passed_test_result())
+    assert passed is not None
+    assert passed.state is VerificationState.PASSED
     report = loop.get_final_report()
-    # The last attempt had no failures, so the report declares success.
-    assert "所有测试" in report or "通过" in report
+    assert "最新验证观察已通过" in report
+    assert "最新验证仍然失败" not in report
 
 
 def test_max_fix_attempts_default() -> None:
@@ -137,9 +167,19 @@ def test_max_fix_attempts_default() -> None:
 
 def test_with_zero_max_attempts() -> None:
     loop = VerifyFixLoop(max_fix_attempts=0)
-    assert loop.should_enter_loop(_failed_test_result()) is False
+    failed = _failed_test_result()
+    observation = loop.observe_test_result(failed)
+    assert observation is not None
+    assert observation.state is VerificationState.EXHAUSTED_FAILURE
+    assert loop.should_enter_loop(failed, observation=observation) is False
     assert loop.is_loop_exhausted() is True
-    assert "no attempts" in loop.get_final_report()
+    assert "达到最大自动修复次数" in loop.get_final_report()
+
+    passing_loop = VerifyFixLoop(max_fix_attempts=0)
+    passing = passing_loop.observe_test_result(_passed_test_result())
+    assert passing is not None
+    assert passing.state is VerificationState.PASSED
+    assert passing_loop.is_loop_exhausted() is False
 
 
 def test_should_not_enter_on_unparseable_output() -> None:
@@ -158,15 +198,19 @@ def test_should_not_enter_when_output_is_none() -> None:
 def test_build_failure_context_increments_attempt_count() -> None:
     loop = VerifyFixLoop(max_fix_attempts=3)
     assert loop.attempt_count == 0
-    loop.build_failure_context(_failed_test_result())
+    first = loop.observe_test_result(_failed_test_result())
+    assert first is not None
+    loop.build_failure_context(_failed_test_result(), observation=first)
     assert loop.attempt_count == 1
-    loop.build_failure_context(_failed_test_result())
+    second = loop.observe_test_result(_failed_test_result())
+    assert second is not None
+    loop.build_failure_context(_failed_test_result(), observation=second)
     assert loop.attempt_count == 2
+    assert len(loop.verification_history) == 2
+    assert len(loop.repair_history) == 2
 
 
 def test_negative_max_attempts_raises() -> None:
-    import pytest
-
     with pytest.raises(ValueError):
         VerifyFixLoop(max_fix_attempts=-1)
 
@@ -174,6 +218,81 @@ def test_negative_max_attempts_raises() -> None:
 def test_no_progress_signal_after_repeated_failures() -> None:
     loop = VerifyFixLoop(max_fix_attempts=3)
     failed = _failed_test_result()
-    loop.build_failure_context(failed)
-    loop.build_failure_context(failed)
+    loop.observe_test_result(failed)
+    loop.observe_test_result(failed)
+    signal = loop.no_progress_signal()
+    assert signal.detected is True
+    assert signal.observation_indices == (1, 2)
+    assert signal.reason == "identical_failure_signature"
     assert loop.should_stop_no_progress() is True
+
+
+@pytest.mark.parametrize(
+    ("max_attempts", "sequence", "expected_states", "expected_repairs"),
+    [
+        (
+            3,
+            ("fail", "pass"),
+            (VerificationState.FAILING, VerificationState.PASSED),
+            1,
+        ),
+        (
+            3,
+            ("fail", "fail", "pass"),
+            (
+                VerificationState.FAILING,
+                VerificationState.FAILING,
+                VerificationState.PASSED,
+            ),
+            2,
+        ),
+        (
+            3,
+            ("fail", "fail", "fail", "pass"),
+            (
+                VerificationState.FAILING,
+                VerificationState.FAILING,
+                VerificationState.FAILING,
+                VerificationState.PASSED,
+            ),
+            3,
+        ),
+        (
+            3,
+            ("fail", "fail", "fail", "fail"),
+            (
+                VerificationState.FAILING,
+                VerificationState.FAILING,
+                VerificationState.FAILING,
+                VerificationState.EXHAUSTED_FAILURE,
+            ),
+            3,
+        ),
+        (0, ("fail",), (VerificationState.EXHAUSTED_FAILURE,), 0),
+        (0, ("pass",), (VerificationState.PASSED,), 0),
+    ],
+)
+def test_observation_and_repair_state_matrix(
+    max_attempts: int,
+    sequence: tuple[str, ...],
+    expected_states: tuple[VerificationState, ...],
+    expected_repairs: int,
+) -> None:
+    """Verification observations and repair issuance have separate counts."""
+    loop = VerifyFixLoop(max_fix_attempts=max_attempts)
+    states: list[VerificationState] = []
+    failed = _failed_test_result()
+    for result_kind in sequence:
+        result = failed if result_kind == "fail" else _passed_test_result()
+        observation = loop.observe_test_result(result)
+        assert observation is not None
+        states.append(observation.state)
+        if result_kind == "fail" and loop.should_enter_loop(
+            result, observation=observation
+        ):
+            assert loop.build_failure_context(result, observation=observation)
+
+    assert tuple(states) == expected_states
+    assert loop.attempt_count == expected_repairs
+    assert len(loop.verification_history) == len(sequence)
+    assert len(loop.repair_history) == expected_repairs

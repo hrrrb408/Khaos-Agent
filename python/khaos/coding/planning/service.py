@@ -5,15 +5,23 @@ import re
 from dataclasses import asdict, dataclass
 from typing import Any
 
-from khaos.coding.intelligence.query import CodeQueryService
+from khaos.agent.control.goal import GoalSpec
+from khaos.coding.intelligence.context import ContextBundle
 from khaos.coding.planning.contracts import *
 from khaos.coding.planning.dag import validate_steps
 from khaos.coding.planning.limits import PlanningLimits
+from khaos.coding.planning.revision import PlanningInput, PlanRevision
 from khaos.coding.planning.risk import RiskEvaluator
 from khaos.coding.planning.verification import TrustedVerificationSelector
 from khaos.coding.planning.verification_catalog import VerificationCatalog
 
 MAX_GOAL_LENGTH = 4096
+_EXPLICIT_PATH_TOKEN_RE = re.compile(
+    r"(?<![\w/])(?:[^\s`'\"<>(),;:/]+/)*"
+    r"[^\s`'\"<>(),;:/]+\.(?:py|pyi|js|jsx|ts|tsx|go|rs|java|c|cc|cpp|h|hpp|sql|toml|yaml|yml|json|md|rst|txt)"
+    r"(?![\w.-])",
+    re.IGNORECASE,
+)
 
 @dataclass(frozen=True)
 class ParsedGoalTarget:
@@ -47,7 +55,11 @@ class DeterministicPlanningService:
     """No tools, shell, writes, ChangeSets, or approval transitions are exposed here."""
     def __init__(
         self,
-        query: CodeQueryService,
+        # ``query`` is the compatibility-only legacy index facade.  The
+        # context-bound production entry passes ``None`` and never reaches
+        # these methods; keeping the boundary untyped avoids importing the
+        # path-oriented CodeQueryService into the production module graph.
+        query: Any,
         *,
         repositories: dict[str, dict[str, Any]],
         max_depth: int = 3,
@@ -72,6 +84,64 @@ class DeterministicPlanningService:
         self._verification_selector = TrustedVerificationSelector()
         self._risk_evaluator = RiskEvaluator()
         self._catalogs: dict[str, VerificationCatalog] = {}
+
+    def plan_from_context(
+        self,
+        *,
+        goal_spec: GoalSpec,
+        planning_input: PlanningInput,
+        context_bundle: ContextBundle,
+    ) -> PlanRevision:
+        """Build the M7.3 plan from one fresh M7.2 context snapshot.
+
+        The existing ``classify_goal``/``analyze_impacts``/``plan`` methods
+        remain available for their released, path-indexed compatibility API.
+        The production M7.3 path enters through this adapter and never asks
+        the legacy ``CodeQueryService`` or repository-root catalog to read
+        current source bytes.
+        """
+        from khaos.coding.planning.context_planner import (
+            ContextBoundPlanningAdapter,
+        )
+
+        adapter = ContextBoundPlanningAdapter(
+            risk_evaluator=self._risk_evaluator,
+            verification_selector=self._verification_selector,
+            limits=self._limits,
+        )
+        return adapter.build(
+            goal_spec=goal_spec,
+            planning_input=planning_input,
+            context_bundle=context_bundle,
+        )
+
+    def explicit_target_hints(
+        self, user_goal: str
+    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """Extract only conservative, user-visible target tokens.
+
+        This helper is deliberately lexical and never resolves a token against
+        the repository.  A path/symbol becomes a planning target only after
+        the workspace-bound context service proves that it exists in the
+        current snapshot.  No target is synthesized from a bare keyword.
+        """
+        normalized = " ".join(user_goal.split())
+        parsed = self._parse_target(normalized)
+        files: set[str] = set()
+        symbols: set[str] = set()
+        if not parsed.diagnostics:
+            if parsed.explicit_kind == "file" and parsed.requested_path:
+                files.add(parsed.requested_path)
+            elif (
+                parsed.explicit_kind in {"function", "symbol", "type", "module"}
+                and parsed.requested_symbol
+            ):
+                symbols.add(parsed.requested_symbol)
+            elif parsed.requested_path and "." in parsed.requested_path:
+                files.add(parsed.requested_path)
+        for match in _EXPLICIT_PATH_TOKEN_RE.finditer(normalized):
+            files.add(match.group(0))
+        return tuple(sorted(files)), tuple(sorted(symbols))
 
     def _get_catalog(self, repository_id: str) -> VerificationCatalog:
         """Build (or refresh) a VerificationCatalog for the repository.

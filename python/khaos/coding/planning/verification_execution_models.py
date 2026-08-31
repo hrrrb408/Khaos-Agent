@@ -137,6 +137,49 @@ class VerificationExecutionRun:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True, slots=True)
+class VerificationRunBinding:
+    """Narrow immutable M4 read projection for one verification run.
+
+    This projection deliberately contains only the identity and digest facts
+    that an external authority adapter may join with a ``PlanExecutionRun``.
+    It is not a writable run object, does not expose output, and does not
+    imply trusted success until the owning ``VerificationReadHandle`` has
+    revalidated the canonical success record.
+    """
+
+    verification_run_id: str
+    execution_run_id: str
+    plan_id: str
+    plan_content_hash: str
+    task_id: str
+    workspace_id: str
+    repository_id: str
+    final_mutation_attestation_digest: str
+    verification_plan_digest: str
+    trusted_catalog_fingerprint: str
+    status: VerificationRunStatus
+
+    def __post_init__(self) -> None:
+        for name in (
+            "verification_run_id",
+            "execution_run_id",
+            "plan_id",
+            "plan_content_hash",
+            "task_id",
+            "workspace_id",
+            "repository_id",
+            "final_mutation_attestation_digest",
+            "verification_plan_digest",
+            "trusted_catalog_fingerprint",
+        ):
+            value = getattr(self, name)
+            if type(value) is not str or not value:
+                raise ValueError(f"{name} must be a non-empty string")
+        if type(self.status) is not VerificationRunStatus:
+            raise ValueError("status must be a VerificationRunStatus")
+
+
 @dataclass(frozen=True)
 class VerificationStepRun:
     step_run_id: str

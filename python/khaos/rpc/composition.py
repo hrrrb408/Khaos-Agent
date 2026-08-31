@@ -7,7 +7,6 @@ loading. It deliberately does not own transport framing or request dispatch.
 from __future__ import annotations
 
 import logging
-import os
 from pathlib import Path
 from typing import Any
 
@@ -112,50 +111,42 @@ async def _build_subagent_service(
         project_root=root,
         config_path=resolved_config,
         runtime_profile=resolved_runtime_profile,
+        assignment_repository=getattr(db, "subagent_assignment_repository", None),
     )
     spawner = SubAgentSpawner(
         SubAgentConfig(max_concurrent=3, max_spawn_depth=1, allow_nesting=False),
         db,
         runner=runner.run,
         registry=create_runtime_registry(),
+        assignment_repository=getattr(db, "subagent_assignment_repository", None),
     )
     # M6.9 BATCH 4: production spawns receive authority-owned narrow child
-    # delegations when an authority daemon is deployed.  Without one the
-    # issuer stays absent and children run with a fresh transport-root
-    # commitment instead of the parent's digest — never a silent
-    # parent-digest reuse.
+    # delegations.  The issuer performs a short-lived READY handshake per
+    # authenticated ingress request because this service is built before a
+    # child runtime exists.  A production path must never construct an
+    # unbound AuthorityDaemonClient or silently fall back to a local broker.
     delegation_issuer = None
-    authority_configured = any(
-        os.environ.get(name)
-        for name in (
-            "KHAOS_AUTHORITYD_SOCKET",
-            "KHAOS_AUTHORITYD_BACKEND_SOCKET",
-            "KHAOS_AUTHORITYD_BACKEND_PIPE",
-            "KHAOS_MACOS_AUTHORITY_XPC_CLIENT",
-            "KHAOS_WINDOWS_AUTHORITY_PIPE_CLIENT",
+    if resolved_runtime_profile.is_production:
+        from khaos.db.state_root import project_id as compute_project_id
+        from khaos.runtime.factory import _load_production_resource_order
+        from khaos.security.delegation_issuer import (
+            ProductionSubAgentDelegationIssuer,
         )
-    )
-    if authority_configured and resolved_runtime_profile.is_production:
-        try:
-            from khaos.security.authority_transport import (
-                AuthorityTransportConfig,
-            )
-            from khaos.security.delegation_issuer import AuthorityDelegationIssuer
-            from khaos.security.identity_isolation import (
-                read_contract_from_environment,
-            )
+        from khaos.security.effective_policy import load_effective_policy
 
-            contract = read_contract_from_environment()
-            deployment = AuthorityTransportConfig.from_environment(
-                runtime_profile=resolved_runtime_profile
+        effective_policy = load_effective_policy(root)
+        resource_order = _load_production_resource_order(
+            effective_policy, resolved_runtime_profile
+        )
+        if resource_order is None:
+            raise PermissionError(
+                "production subagent service requires a typed resource catalog"
             )
-            deployment.validate_contract(contract)
-            delegation_issuer = AuthorityDelegationIssuer(
-                deployment.client(contract)
-            )
-        except (OSError, PermissionError, ValueError) as exc:
-            logger.warning("subagent delegation issuer unavailable: %s", exc)
-            delegation_issuer = None
+        delegation_issuer = ProductionSubAgentDelegationIssuer(
+            policy_digest=effective_policy.digest,
+            catalog_digest=resource_order.catalog_semantic_digest,
+            project_id=compute_project_id(root),
+        )
     return SubAgentService(spawner, runner, delegation_issuer=delegation_issuer)
 
 

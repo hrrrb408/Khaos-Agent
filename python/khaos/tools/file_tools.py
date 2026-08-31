@@ -82,6 +82,31 @@ async def write_file(path: str, content: str, workspace_manager=None, task_id: s
     raise PermissionError("write_file requires a Workspace root capability")
 
 
+async def delete_file(
+    path: str,
+    workspace_manager=None,
+    task_id: str | None = None,
+    workspace_id: str | None = None,
+    workspace_root: Path | None = None,
+) -> dict[str, Any]:
+    """Delete one coding-workspace path through the storage authority."""
+    if workspace_manager is None:
+        raise PermissionError("delete_file requires a coding TaskWorkspace")
+    workspace = workspace_manager.get(workspace_id or "")
+    if workspace is None or workspace.task_id != task_id:
+        raise PermissionError("coding delete requires matching active TaskWorkspace")
+    return await _workspace_mutate(
+        workspace_manager,
+        workspace,
+        task_id or "",
+        lambda: _workspace_delete_sync(
+            workspace.worktree_path,
+            workspace_manager.file_recovery_root(workspace.id),
+            path,
+        ),
+    )
+
+
 async def patch(path: str, old: str, new: str, fuzzy: bool = True, workspace_manager=None, task_id: str | None = None, workspace_id: str | None = None, workspace_root: Path | None = None, office_authority=None) -> dict[str, Any]:
     """Atomically replace text in a file, with optional fuzzy block matching."""
     if workspace_manager is not None:
@@ -374,6 +399,37 @@ def _workspace_write_sync(
     )
 
 
+def _workspace_delete_sync(root: Path, recovery_root: Path, path: str) -> object:
+    from khaos.coding.workspace.boundary import SafeWorkspaceFS
+    from khaos.coding.workspace.storage import WorkspaceMutation
+
+    with SafeWorkspaceFS(root) as filesystem:
+        relative = filesystem.relative(path)
+        before = filesystem.snapshot_file(path, recovery_root=recovery_root)
+        try:
+            if not before.exists:
+                raise FileNotFoundError(path)
+            filesystem.delete_file(path, expected=before)
+        except Exception:
+            before.cleanup()
+            raise
+        value = {"path": str(filesystem.root / relative), "deleted": True}
+    return WorkspaceMutation(
+        value,
+        lambda: _restore_deleted_file(root, path, before),
+        before.cleanup,
+    )
+
+
+def _restore_deleted_file(root: Path, path: str, before: Any) -> None:
+    from khaos.coding.workspace.boundary import SafeWorkspaceFS
+
+    with SafeWorkspaceFS(root) as filesystem:
+        from khaos.coding.workspace.boundary import WorkspaceFileSnapshot
+
+        filesystem.restore_file(path, before, expected=WorkspaceFileSnapshot(False))
+
+
 def _office_write_sync(root: Path, path: str, content: str) -> dict[str, Any]:
     from khaos.coding.workspace.boundary import SafeWorkspaceFS
 
@@ -654,11 +710,11 @@ def _with_recovery_cleanup(
 def _office_write_mutation(
     root: Path, path: str, content: str, *, cancel_event=None
 ) -> object:
+    from khaos.coding.workspace.boundary import SafeWorkspaceFS
+
     recovery_root = _private_recovery_root()
     created_parents = ()
     try:
-        from khaos.coding.workspace.boundary import SafeWorkspaceFS
-
         with SafeWorkspaceFS(root) as filesystem:
             created_parents = filesystem.ensure_parent_directories(path)
         mutation = _workspace_write_sync(

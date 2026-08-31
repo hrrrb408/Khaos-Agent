@@ -456,6 +456,107 @@ MIGRATIONS: tuple[MigrationSpec, ...] = (
         sql_files=("0015_memory_v2_closure.sql",),
         migrator_symbols=("_apply_v15_upgrades",),
     ),
+    MigrationSpec(
+        version=16,
+        name="m7_1_2_goal_spec_durable_contract",
+        # Release-time manifest over the v16 SQL and backfill migrator.
+        sha256="2901e287a0e73f78276169e37e8f842f80d4b02a44fa31f12faaf189cc8821fc",
+        sql_files=("0016_goal_specs.sql",),
+        migrator_symbols=("_apply_v16_upgrades", "_backfill_legacy_goal_specs"),
+    ),
+    MigrationSpec(
+        version=17,
+        name="m7_1_3_agent_cognitive_state_cas",
+        # Release-time manifest over the additive v17 SQL and its idempotent
+        # column migrator.  Future edits must add a new migration version.
+        sha256="6405eca2774dcf12592d0ff9069021f4d6fc27984084858d0c36c980be55484e",
+        sql_files=("0017_agent_cognitive_state.sql",),
+        migrator_symbols=(
+            "_apply_v17_upgrades",
+            "_ensure_coding_tasks_cognitive_state_columns",
+        ),
+    ),
+    MigrationSpec(
+        version=18,
+        name="m7_1_4_completion_decision_ledger",
+        # Release-time manifest over the additive v18 SQL and migrator.  The
+        # literal is intentionally pinned so later changes require a new
+        # migration version.
+        sha256="ceeff204ab946b1efc1a2177cedf49042f4b9d019d1eb39658dc0c591dc95f17",
+        sql_files=("0018_completion_decisions.sql",),
+        migrator_symbols=("_apply_v18_upgrades",),
+    ),
+    MigrationSpec(
+        version=19,
+        name="m7_3_deterministic_plan_revisions",
+        # Release-time manifest over the additive v19 SQL and migrator.
+        sha256="c0568e0d408215aeed18a6b4a84ff2777b1ed7b9c4534dc2acfaa4ecb23f5f7a",
+        sql_files=("0019_plan_revisions.sql",),
+        migrator_symbols=("_apply_v19_upgrades",),
+    ),
+    MigrationSpec(
+        version=20,
+        name="m7_3_atomic_plan_publication_fence",
+        # Release-time manifest over the additive v20 index artifact and its
+        # idempotent physical-column migrator.  Future changes must add a new
+        # migration version instead of editing this contract.
+        sha256="696b84f04e5a2d9a08f244ccbdf6c917c3aa3605ecea1f4ea63dd4b2e5026bc8",
+        sql_files=("0020_plan_publication_fence.sql",),
+        migrator_symbols=(
+            "_apply_v20_upgrades",
+            "_ensure_coding_tasks_published_plan_revision_column",
+        ),
+    ),
+    MigrationSpec(
+        version=21,
+        name="m7_4_trusted_verification_assessments",
+        # Release-time manifest over the additive M7.4 assessment ledger and
+        # its migration owner.  Future edits require a new migration version.
+        sha256="8db1179cfb689f23aba89511c89d73583a9442ebc0b26fb3ad9a62547c3239c0",
+        sql_files=("0021_trusted_verification_assessments.sql",),
+        migrator_symbols=("_apply_v21_upgrades",),
+    ),
+    MigrationSpec(
+        version=22,
+        name="m7_5_recovery_control_plane",
+        # Release-time manifest over the immutable recovery ledger and its
+        # additive causal projection.  This literal is filled from the
+        # checked-in source after the migration owner is complete.
+        sha256="e61679ec6faa5b88a4312bbe702bc2ac3322f670a56e7ce6fb64b92a8b3314db",
+        sql_files=("0022_recovery_control_plane.sql",),
+        migrator_symbols=(
+            "_apply_v22_upgrades",
+            "_ensure_coding_tasks_last_applied_recovery_decision_column",
+        ),
+    ),
+    MigrationSpec(
+        version=23,
+        name="m7_6_published_plan_tool_routing",
+        sha256="6191a01e7394f93b4b2effb04a35f8d977ca211f911485b0a64130e676029529",
+        sql_files=("0023_plan_tool_routing.sql",),
+        migrator_symbols=("_apply_v23_upgrades",),
+    ),
+    MigrationSpec(
+        version=24,
+        name="m7_7_provenance_bound_memory_retrieval",
+        sha256="25f10c82841e0b3f81def1bfff478ebdfc53cbf8797fb46cb1dd9193524a0f7e",
+        sql_files=("0024_memory_retrieval_provenance.sql",),
+        migrator_symbols=("_apply_v24_upgrades",),
+    ),
+    MigrationSpec(
+        version=25,
+        name="m7_8_plan_bound_subagents",
+        sha256="1240f556cd02352c76b460e6c028002a0d426da6069c23ff9fc5a5875377391c",
+        sql_files=("0025_plan_bound_subagents.sql",),
+        migrator_symbols=("_apply_v25_upgrades",),
+    ),
+    MigrationSpec(
+        version=26,
+        name="m7_9_capability_evaluations",
+        sha256="6dd2d0023e83164ff2ccbf953896f809b6ea3d6fe834cd38fe3e10ac34f6f9d3",
+        sql_files=("0026_capability_evaluations.sql",),
+        migrator_symbols=("_apply_v26_upgrades",),
+    ),
 )
 
 

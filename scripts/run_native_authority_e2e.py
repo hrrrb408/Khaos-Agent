@@ -31,16 +31,23 @@ import uuid
 from pathlib import Path
 
 from khaos.security.authority_context import AuthorityContextV1
+from khaos.security.authority_transport import AuthorityTransportConfig
 from khaos.security.authorityd_protocol import (
+    AUTHORITYD_PROTOCOL,
     AuthorityControlPlaneError,
     AuthorityDaemonClient,
     AuthorizationIntent,
+    Ed25519KeyStore,
     RemoteAuditUnavailableError,
     UnknownExecutionError,
 )
 from khaos.security.identity_isolation import read_contract_from_environment
 from khaos.security.native_authority import build_native_authority_adapter
 from khaos.security.principals import transport_root_delegation_digest
+from khaos.security.production_trust import (
+    ProductionTrustBinding,
+    public_key_fingerprint,
+)
 from khaos.security.resource_scope import ExecutionScope, TypedResourcePartialOrder
 
 E2E_WORKSPACE = "native-e2e-workspace"
@@ -120,11 +127,54 @@ def _prepare_effect_root() -> Path:
 
 
 def _build_client() -> AuthorityDaemonClient:
+    """Build a native client from the independently loaded trust snapshot."""
     contract = read_contract_from_environment()
+    deployment = AuthorityTransportConfig.from_environment(
+        runtime_profile="production"
+    )
+    deployment.validate_contract(contract)
+    if not deployment.is_native:
+        raise SystemExit("native authority E2E requires a native authority transport")
+    policy_digest = _require("KHAOS_EFFECTIVE_POLICY_DIGEST")
+    catalog_path = Path(_require("KHAOS_TYPED_RESOURCE_CATALOG_PATH"))
+    catalog = TypedResourcePartialOrder.from_json_file(
+        catalog_path,
+        expected_policy_digest=policy_digest,
+        require_windows_acl=os.name == "nt",
+    )
+    public_key_path = deployment.public_key_path()
+    if public_key_path is None:
+        raise SystemExit("native authority E2E requires a public key path")
+    public_key = Ed25519KeyStore.load_public_key(
+        public_key_path,
+        require_windows_acl=os.name == "nt",
+    )
+    binding = ProductionTrustBinding.create(
+        protocol_version=AUTHORITYD_PROTOCOL,
+        authority_id=deployment.authority_id(),
+        policy_digest=policy_digest,
+        catalog_digest=catalog.catalog_semantic_digest,
+        public_key_fingerprint=public_key_fingerprint(public_key.public_bytes_raw()),
+        environment_digest=deployment.environment_digest(),
+    )
     adapter = build_native_authority_adapter(production=True, contract=contract)
     return AuthorityDaemonClient(
-        expected_authority_uid=contract.authority_uid,
+        expected_authority_uid=deployment.expected_authority_uid(contract),
         native_adapter=adapter,
+        transport=deployment.transport.value,
+        runtime_profile=deployment.runtime_profile,
+        public_key_path=public_key_path,
+        trust_binding=binding,
+    )
+
+
+def _handshake(client: AuthorityDaemonClient) -> None:
+    """Establish the production trust channel before any authority request."""
+    client.handshake(
+        runtime_id="e2e-runtime",
+        principal_id=E2E_PRINCIPAL_ID,
+        project_id=E2E_PROJECT_ID,
+        principal_kind=E2E_PRINCIPAL_KIND,
     )
 
 
@@ -260,6 +310,7 @@ def run_e2e(*, expect_unavailable: bool) -> dict[str, object]:
         # The backend is deliberately absent.  The only acceptable result is
         # an explicit unavailable/UNKNOWN error; success would be fail-open.
         try:
+            _handshake(client)
             _grant(
                 client,
                 policy_digest=policy_digest,
@@ -280,6 +331,8 @@ def run_e2e(*, expect_unavailable: bool) -> dict[str, object]:
             file=sys.stderr,
         )
         raise SystemExit(1)
+
+    _handshake(client)
 
     # Scenario 1: full transaction with a bounded test effect.
     effect_root = _prepare_effect_root()

@@ -297,6 +297,27 @@ tool_scheduler_state_machine:
   unknown_effect: effect_status_unknown_and_retry_safe_false
 tcb_boundaries:
   pure_module: python/khaos/security/protocol_boundary.py
+  production_trust_binding:
+    owner: python/khaos/security/production_trust.py
+    responsibility: protocol_authority_policy_catalog_key_environment_binding
+    consumers:
+      - python/khaos/runtime/factory.py
+      - python/khaos/security/authorityd.py
+      - python/khaos/security/authorityd_protocol.py
+    startup_handshake: exact_ready_before_effect_composition
+    mutability: immutable_for_runtime_lifetime_restart_on_change
+  typed_catalog_loader:
+    owner: python/khaos/security/resource_scope.py
+    responsibility: bounded_no_follow_owner_checked_independent_catalog_snapshot
+    regression_tests:
+      - python/tests/security/test_resource_scope.py
+      - python/tests/security/test_post_m7_production_trust.py
+  production_composition_authority:
+    owner: python/khaos/runtime/factory.py
+    responsibility: one_ready_broker_shared_by_workspace_network_execution
+    regression_tests:
+      - python/tests/security/test_production_composition_manifest.py
+      - python/tests/security/test_post_m7_production_trust.py
   owns:
     - canonical_serialization
     - bounded_schema_validation

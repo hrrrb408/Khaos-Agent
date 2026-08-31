@@ -294,12 +294,14 @@ jobs:
           test -s /tmp/identity-proof.json
       - name: Run the full authority transaction E2E
         env:
+          KHAOS_AUTHORITY_PROFILE: native-production
           KHAOS_AUTHORITYD_LAUNCHD_SERVICE: com.khaos.authorityd
           KHAOS_AUTHORITYD_PROTECTED_KEY_REF: khaos-authority-signing-key
           KHAOS_AUTHORITYD_KEYCHAIN_GROUP: ${{ secrets.KHAOS_MACOS_TEAM_ID }}.com.khaos.authority
           KHAOS_AUTHORITYD_AGENT_CODE_SIGNATURE: com.khaos.agent
           KHAOS_AUTHORITYD_AGENT_CODE_REQUIREMENT: identifier "com.khaos.agent" and anchor apple generic and certificate leaf[subject.OU] = ${{ secrets.KHAOS_MACOS_TEAM_ID }}
           KHAOS_AUTHORITYD_PUBLIC_KEY_PATH: /var/run/khaos-authorityd/authorityd.pub
+          KHAOS_TYPED_RESOURCE_CATALOG_PATH: /etc/khaos/native-resource-catalog.json
           KHAOS_MACOS_AUTHORITY_XPC_CLIENT: /usr/local/libexec/khaos-authorityd-xpc-client
           KHAOS_NATIVE_E2E_EFFECT_ROOT: /tmp/khaos-native-e2e-effects
         run: |
@@ -457,15 +459,69 @@ jobs:
           . (Join-Path $env:GITHUB_WORKSPACE 'packaging\windows\service-sid.ps1')
           $authoritySid = Get-KhaosServiceSid -ServiceName 'KhaosAuthorityD'
           "KHAOS_AUTHORITYD_SERVICE_SID=$authoritySid" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $catalogOwnerSid = ([System.Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
+          if ([string]::IsNullOrWhiteSpace($catalogOwnerSid)) { throw 'catalog owner SID unavailable' }
+          $trustRoot = 'C:\ProgramData\Khaos'
+          $auditTrustedDir = Join-Path $trustRoot '.khaos\audit'
+          $trustedOwners = "$catalogOwnerSid,$authoritySid,S-1-5-18,S-1-5-32-544"
+          $trustedAclSids = "$authoritySid,$catalogOwnerSid,$agentSid,S-1-5-18,S-1-5-32-544"
+          $env:KHAOS_WINDOWS_TRUST_ROOT = $trustRoot
+          $env:KHAOS_WINDOWS_TRUSTED_OWNER_SIDS = $trustedOwners
+          $env:KHAOS_WINDOWS_TRUSTED_ACL_SIDS = $trustedAclSids
+          $env:KHAOS_AUDIT_TRUSTED_DIR = $auditTrustedDir
+          "KHAOS_WINDOWS_TRUST_ROOT=$trustRoot" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "KHAOS_WINDOWS_TRUSTED_OWNER_SIDS=$trustedOwners" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "KHAOS_WINDOWS_TRUSTED_ACL_SIDS=$trustedAclSids" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "KHAOS_AUDIT_TRUSTED_DIR=$auditTrustedDir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - name: Run Windows native authority transaction with owned WORM receiver
         shell: pwsh
         run: |
           $env:PYTHONPATH = "$env:GITHUB_WORKSPACE\python"
+          $trustRoot = $env:KHAOS_WINDOWS_TRUST_ROOT
+          $agentSid = $env:KHAOS_AGENT_SID
+          $authoritySid = $env:KHAOS_AUTHORITYD_SERVICE_SID
+          $catalogOwnerSid = ([System.Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
+          $auditTrustedDir = $env:KHAOS_AUDIT_TRUSTED_DIR
+          if ([string]::IsNullOrWhiteSpace($trustRoot) -or
+              [string]::IsNullOrWhiteSpace($agentSid) -or
+              [string]::IsNullOrWhiteSpace($authoritySid) -or
+              [string]::IsNullOrWhiteSpace($catalogOwnerSid) -or
+              [string]::IsNullOrWhiteSpace($auditTrustedDir)) {
+            throw 'Windows authority trust identity environment is incomplete'
+          }
+          function Set-KhaosAcl {
+            param(
+              [Parameter(Mandatory = $true)][string]$Path,
+              [Parameter(Mandatory = $true)][string[]]$Aces
+            )
+            & "$env:SystemRoot\System32\icacls.exe" $Path /inheritance:r /grant:r $Aces | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "failed to apply authority ACL to $Path" }
+          }
           $caPath = 'C:\ProgramData\Khaos\worm-ca.pem'
           $wormLog = 'C:\ProgramData\Khaos\worm-receiver.log'
           $wormErrorLog = 'C:\ProgramData\Khaos\worm-receiver.err.log'
           $wormPidPath = 'C:\ProgramData\Khaos\worm-receiver.pid'
-          Remove-Item -LiteralPath $caPath, $wormLog, $wormErrorLog -Force -ErrorAction SilentlyContinue
+          $rootAces = @('SYSTEM:(F)', 'Administrators:(F)', "*${catalogOwnerSid}:(F)")
+          if ($agentSid -ne $catalogOwnerSid) { $rootAces += "*${agentSid}:(RX)" }
+          if ($authoritySid -ne $catalogOwnerSid -and $authoritySid -ne $agentSid) { $rootAces += "*${authoritySid}:(RX)" }
+          $wormFileAces = @('SYSTEM:(F)', 'Administrators:(F)', "*${catalogOwnerSid}:(F)")
+          New-Item -ItemType Directory -Force -Path $trustRoot | Out-Null
+          # Lock the trust root before creating the WORM process files.  The
+          # receiver is runner-owned, but the backend runs as LocalSystem and
+          # must be able to read the emitted CA; pre-provisioning also keeps
+          # runner cleanup able to read the PID/log files after the root is
+          # switched to explicit ACLs.
+          Set-KhaosAcl -Path $trustRoot -Aces $rootAces
+          foreach ($path in @($caPath, $wormLog, $wormErrorLog, $wormPidPath)) {
+            if (Test-Path -LiteralPath $path -PathType Leaf) {
+              Set-KhaosAcl -Path $path -Aces $wormFileAces
+              Remove-Item -LiteralPath $path -Force
+            }
+          }
+          foreach ($path in @($caPath, $wormLog, $wormErrorLog)) {
+            New-Item -ItemType File -Force -Path $path | Out-Null
+            Set-KhaosAcl -Path $path -Aces $wormFileAces
+          }
           try {
             & "$env:GITHUB_WORKSPACE\scripts\start_worm_audit_receiver.ps1" `
               -Workspace $env:GITHUB_WORKSPACE `
@@ -475,12 +531,14 @@ jobs:
               -ErrorLogPath $wormErrorLog `
               -PidPath $wormPidPath `
               -Port 8443
+            Set-KhaosAcl -Path $wormPidPath -Aces $wormFileAces
             $deadline = (Get-Date).AddSeconds(60)
             while ((Get-Date) -lt $deadline -and -not (Test-Path $caPath)) { Start-Sleep -Milliseconds 500 }
             if (-not (Test-Path $caPath)) {
               Get-Content -LiteralPath $wormLog, $wormErrorLog -ErrorAction SilentlyContinue
               throw 'WORM receiver did not start'
             }
+            Set-KhaosAcl -Path $caPath -Aces @('SYSTEM:(R)', 'Administrators:(F)', "*${catalogOwnerSid}:(R)")
             Import-Certificate -FilePath $caPath -CertStoreLocation Cert:\LocalMachine\Root | Out-Null
             $healthDeadline = (Get-Date).AddSeconds(30)
             $healthy = $false
@@ -508,9 +566,10 @@ jobs:
 
             $backendDir = 'C:\Program Files\Khaos'
             $backendSite = Join-Path $backendDir 'backend-site'
-            New-Item -ItemType Directory -Force -Path $backendDir, $backendSite, C:\ProgramData\Khaos | Out-Null
+            New-Item -ItemType Directory -Force -Path $backendDir, $backendSite | Out-Null
             uv run python scripts/run_native_authority_e2e.py `
               --catalog-output 'C:\ProgramData\Khaos\native-resource-catalog.json'
+            Set-KhaosAcl -Path 'C:\ProgramData\Khaos\native-resource-catalog.json' -Aces @('SYSTEM:(R)', 'Administrators:(F)', "*${catalogOwnerSid}:(R)", "*${agentSid}:(R)", "*${authoritySid}:(R)")
             $venvRoot = (Resolve-Path -LiteralPath (Join-Path $env:GITHUB_WORKSPACE '.venv') -ErrorAction Stop).Path
             $venvPython = (Resolve-Path -LiteralPath (Join-Path $venvRoot 'Scripts\python.exe') -ErrorAction Stop).Path
             $venvSite = (Resolve-Path -LiteralPath (Join-Path $venvRoot 'Lib\site-packages') -ErrorAction Stop).Path
@@ -538,13 +597,19 @@ jobs:
                 "KHAOS_EFFECTIVE_POLICY_DIGEST=$env:KHAOS_EFFECTIVE_POLICY_DIGEST"
                 "KHAOS_AUTHORITYD_SERVICE_SID=$env:KHAOS_AUTHORITYD_SERVICE_SID"
                 "KHAOS_AGENT_SID=$env:KHAOS_AGENT_SID"
+                "KHAOS_WINDOWS_TRUST_ROOT=$env:KHAOS_WINDOWS_TRUST_ROOT"
+                "KHAOS_WINDOWS_TRUSTED_OWNER_SIDS=$env:KHAOS_WINDOWS_TRUSTED_OWNER_SIDS"
+                "KHAOS_WINDOWS_TRUSTED_ACL_SIDS=$env:KHAOS_WINDOWS_TRUSTED_ACL_SIDS"
+                "KHAOS_AUDIT_TRUSTED_DIR=$env:KHAOS_AUDIT_TRUSTED_DIR"
                 'KHAOS_AUTHORITYD_PROTECTED_KEY_REF=khaos-authority-signing-key'
                 "KHAOS_AUDIT_WORM_ENDPOINT=$env:KHAOS_AUDIT_WORM_ENDPOINT"
                 "KHAOS_AUDIT_WORM_CA_FILE=$env:KHAOS_AUDIT_WORM_CA_FILE"
                 'KHAOS_AUTHORITYD_CONNECTION_TIMEOUT=5'
             ) | Set-Content -LiteralPath $backendConfig -Encoding ascii
-            & "$env:SystemRoot\System32\icacls.exe" $backendConfig /inheritance:r /grant:r 'SYSTEM:(F)' 'Administrators:(F)' | Out-Null
+            Set-KhaosAcl -Path $backendConfig -Aces @('SYSTEM:(F)', 'Administrators:(F)')
             uv run python -c "from pathlib import Path; from khaos.security.authorityd_protocol import Ed25519KeyStore; k=Ed25519KeyStore.load_or_create(Path(r'C:\ProgramData\Khaos\authorityd.pem'), create=True); Path(r'C:\ProgramData\Khaos\authorityd.pub').write_bytes(k.public_key().public_bytes_raw())"
+            Set-KhaosAcl -Path 'C:\ProgramData\Khaos\authorityd.pem' -Aces @('SYSTEM:(F)', 'Administrators:(F)', "*${catalogOwnerSid}:(R)", "*${agentSid}:(R)", "*${authoritySid}:(R)")
+            Set-KhaosAcl -Path 'C:\ProgramData\Khaos\authorityd.pub' -Aces @('SYSTEM:(F)', 'Administrators:(F)', "*${catalogOwnerSid}:(R)", "*${agentSid}:(R)", "*${authoritySid}:(R)")
             $backendBinary = "$env:GITHUB_WORKSPACE\rust\khaos-core\target\release\khaos-authorityd-backend-windows.exe"
             & "$env:SystemRoot\System32\sc.exe" create KhaosAuthorityDBackend binPath= "`"$backendBinary`" --config `"$backendConfig`"" start= auto obj= LocalSystem | Out-Null
             if ($LASTEXITCODE -ne 0) { throw 'failed to create the backend service' }
@@ -554,9 +619,11 @@ jobs:
             if ($status -ne 'Running') { throw "authority backend service is '$status'" }
 
             New-Item -ItemType Directory -Force native-evidence | Out-Null
+            $env:KHAOS_AUTHORITY_PROFILE = 'native-production'
             $env:KHAOS_AUTHORITYD_NAMED_PIPE = '\\.\pipe\KhaosAuthorityD'
             $env:KHAOS_AUTHORITYD_PROTECTED_KEY_REF = 'khaos-authority-signing-key'
             $env:KHAOS_AUTHORITYD_PUBLIC_KEY_PATH = 'C:\ProgramData\Khaos\authorityd.pub'
+            $env:KHAOS_TYPED_RESOURCE_CATALOG_PATH = 'C:\ProgramData\Khaos\native-resource-catalog.json'
             $env:KHAOS_WINDOWS_AUTHORITY_PIPE_CLIENT = "$env:GITHUB_WORKSPACE\rust\khaos-core\target\release\khaos-authorityd-windows.exe"
             uv run python scripts/run_native_authority_identity_probe.py | Tee-Object -Variable proof | Out-Null
             if (-not $proof) { throw 'native identity probe failed' }

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -46,7 +47,16 @@ from khaos.security.authorityd_protocol import (
     derive_resource_digest,
 )
 from khaos.security.local_trust import ensure_local_authority_root
+from khaos.security.network_broker import NetworkBroker, NetworkBrokerError
 from khaos.security.principals import transport_root_delegation_digest
+from khaos.security.production_trust import (
+    ProductionTrustBinding,
+    public_key_fingerprint,
+)
+from khaos.security.protocol_boundary import canonical_json_bytes
+from khaos.security.resource_scope import GitRefScope, TypedResourcePartialOrder
+
+TEST_POLICY_DIGEST = "a" * 64
 
 # Canonical transport-root commitment for the standard typed-principal test
 # context: grants must recompute and match exactly this (an arbitrary
@@ -59,10 +69,8 @@ _TEST_TRANSPORT_DELEGATION = transport_root_delegation_digest(
     session_id="session",
     runtime_id="runtime",
     source_transport="pytest",
-    policy_digest="policy-digest",
+    policy_digest=TEST_POLICY_DIGEST,
 )
-from khaos.security.network_broker import NetworkBroker, NetworkBrokerError
-from khaos.security.resource_scope import GitRefScope, TypedResourcePartialOrder
 
 
 class _MemoryWorm:
@@ -101,7 +109,7 @@ class _SelectiveWorm(_MemoryWorm):
 
 
 def _typed_git_order(
-    policy_digest: str = "policy-digest",
+    policy_digest: str = TEST_POLICY_DIGEST,
 ) -> tuple[TypedResourcePartialOrder, GitRefScope, GitRefScope]:
     parent = GitRefScope(
         repository="khaos",
@@ -132,7 +140,7 @@ def _intent() -> AuthorizationIntent:
         workspace_id="workspace",
         operation="git.workspace",
         resource_digest="workspace-digest",
-        policy_digest="policy-digest",
+        policy_digest=TEST_POLICY_DIGEST,
         nonce="nonce-1",
         authorization_epoch=2,
     )
@@ -158,7 +166,7 @@ def _authority_context_digest(
         task_id="task",
         workspace_id="workspace",
         workspace_generation=1,
-        policy_digest="policy-digest",
+        policy_digest=TEST_POLICY_DIGEST,
         authorization_epoch=2,
         delegation_digest=delegation_digest,
     ).digest()
@@ -178,7 +186,7 @@ def _live_grant_parent(
         task_id="task",
         workspace_id="workspace",
         workspace_generation=1,
-        policy_digest="policy-digest",
+        policy_digest=TEST_POLICY_DIGEST,
         operation_class="git.workspace",
         resource_digest="workspace-digest",
         authorization_epoch=2,
@@ -266,6 +274,120 @@ def test_public_key_load_is_binary_safe(tmp_path: Path) -> None:
     )
 
 
+def test_native_business_rejection_preserves_ready_trust_channel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    key = Ed25519KeyStore.load_or_create(tmp_path / "authorityd.pem", create=True)
+    public_key_path = tmp_path / "authorityd.pub"
+    public_key_path.write_bytes(key.public_key().public_bytes_raw())
+    binding = ProductionTrustBinding.create(
+        protocol_version=AUTHORITYD_PROTOCOL,
+        authority_id="test-authorityd",
+        policy_digest=TEST_POLICY_DIGEST,
+        catalog_digest="b" * 64,
+        public_key_fingerprint=public_key_fingerprint(
+            key.public_key().public_bytes_raw()
+        ),
+        environment_digest="c" * 64,
+    )
+
+    class FakeNativeAdapter:
+        def request(self, payload: dict[str, object]) -> dict[str, object]:
+            if payload["operation"] == "handshake":
+                return {
+                    "ok": True,
+                    "ready": "READY",
+                    "issuer_id": binding.authority_id,
+                    "channel_nonce": "d" * 64,
+                    "runtime_identity": payload["runtime_identity"],
+                    "trust_binding": binding.to_payload(),
+                }
+            return {"ok": False, "error": "authority grant is revoked"}
+
+    # This test uses an in-process adapter to isolate the protocol state
+    # machine.  The deployed Windows ACL trust-anchor contract is covered by
+    # the native production E2E, so retain the real key reader but omit only
+    # its deployment ACL check for this pytest temp file.  The assertion below
+    # still proves that production requests that check.
+    original_load_public_key = authorityd_protocol_module.Ed25519KeyStore.load_public_key
+
+    def load_test_public_key(
+        path: Path, *, require_windows_acl: bool = False
+    ):
+        assert path == public_key_path
+        assert require_windows_acl is True
+        return original_load_public_key(path, require_windows_acl=False)
+
+    monkeypatch.setattr(
+        authorityd_protocol_module.Ed25519KeyStore,
+        "load_public_key",
+        staticmethod(load_test_public_key),
+    )
+    client = authorityd_protocol_module.AuthorityDaemonClient(
+        transport="native",
+        native_adapter=FakeNativeAdapter(),
+        runtime_profile="production",
+        public_key_path=public_key_path,
+        trust_binding=binding,
+    )
+    client.handshake(
+        runtime_id="runtime",
+        principal_id="agent",
+        project_id="project",
+        principal_kind="human",
+    )
+
+    with pytest.raises(AuthorityControlPlaneError, match="grant is revoked"):
+        client.request({"operation": "prepare"})
+    assert client.ready
+
+
+def test_native_attestation_keeps_business_rejection_inside_signed_envelope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    key = Ed25519KeyStore.load_or_create(tmp_path / "authorityd.pem", create=True)
+    daemon = AuthorityDaemon(
+        socket_path=tmp_path / "authorityd.sock",
+        signing_key=key,
+        audit_writer=_MemoryWorm(),
+        issuer_id="test-authorityd",
+        policy=lambda _intent: None,
+    )
+
+    def reject_dispatch(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise AuthorityControlPlaneError("authority grant is revoked")
+
+    monkeypatch.setattr(authorityd_module, "_dispatch", reject_dispatch)
+    raw_request = canonical_json_bytes(
+        {"protocol": AUTHORITYD_PROTOCOL, "operation": "ping"}
+    )
+    response = daemon.attest(
+        proof_fields={
+            "platform": "win32",
+            "transport": "named-pipe",
+            "service_id": "KhaosAuthorityD",
+            "service_pid": "1",
+            "service_identity": "S-1-5-18",
+            "peer_identity": "S-1-5-21-test",
+            "peer_team_id": "S-1-5-21-test",
+            "peer_cdhash": "",
+            "designated_requirement_digest": "a" * 64,
+            "service_instance_id": "b" * 32,
+            "protected_key_ref": "test-key",
+        },
+        challenge_nonce="c" * 64,
+        request_raw_hex=raw_request.hex(),
+        request_digest=hashlib.sha256(raw_request).hexdigest(),
+    )
+
+    assert response["ok"] is True
+    assert response["response"] == {
+        "ok": False,
+        "error": "authority grant is revoked",
+    }
+    assert isinstance(response["attestation"], dict)
+
+
 @pytest.mark.posix_host
 def test_community_client_verifies_receipts_against_local_trust_anchor(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -298,6 +420,7 @@ def test_community_client_verifies_receipts_against_local_trust_anchor(
         public_key_path=public_key_path,
         trusted_local_root=root,
         transport="unix",
+        community_local=True,
     )
 
     assert client._verify_receipt(receipt.to_dict()).signature == receipt.signature
@@ -311,7 +434,7 @@ def test_community_client_verifies_receipts_against_local_trust_anchor(
 def test_typed_kernel_keeps_native_execution_binding_exact() -> None:
     order, _parent_scope, _child_scope = _typed_git_order()
     kernel = AuthorityPolicyKernel(
-        expected_policy_digest="policy-digest",
+        expected_policy_digest=TEST_POLICY_DIGEST,
         resource_order=order,
     )
     binding = "a" * 64
@@ -539,7 +662,7 @@ def test_transport_root_provenance_is_not_consumed_as_child_delegation(
         task_id="task",
         workspace_id="workspace",
         workspace_generation=1,
-        policy_digest="policy-digest",
+        policy_digest=TEST_POLICY_DIGEST,
         operation_class="git.workspace",
         resource_digest="workspace-digest",
         authorization_epoch=2,
@@ -838,7 +961,7 @@ def test_community_daemon_keeps_policy_boundary_without_remote_worm(
 ) -> None:
     key_path = tmp_path / "authorityd.pem"
     Ed25519KeyStore.load_or_create(key_path, create=True)
-    monkeypatch.setenv("KHAOS_EFFECTIVE_POLICY_DIGEST", "policy-digest")
+    monkeypatch.setenv("KHAOS_EFFECTIVE_POLICY_DIGEST", TEST_POLICY_DIGEST)
     resource_order, _parent_scope, _child_scope = _typed_git_order()
 
     daemon = build_local_daemon(
@@ -864,7 +987,7 @@ def test_production_daemon_requires_its_compiled_policy_digest(
             key_path=key_path,
             audit_writer=_MemoryWorm(),
         )
-    monkeypatch.setenv("KHAOS_EFFECTIVE_POLICY_DIGEST", "policy-digest")
+    monkeypatch.setenv("KHAOS_EFFECTIVE_POLICY_DIGEST", TEST_POLICY_DIGEST)
     resource_order, _parent_scope, _child_scope = _typed_git_order()
     daemon = build_production_daemon(
         socket_path=tmp_path / "authorityd.sock",
@@ -877,12 +1000,37 @@ def test_production_daemon_requires_its_compiled_policy_digest(
 
 
 @pytest.mark.posix_host
-def test_production_daemon_requires_live_grant_and_same_operation_family(
+def test_authorityd_builders_reject_symbolic_trust_material(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     key_path = tmp_path / "authorityd.pem"
     Ed25519KeyStore.load_or_create(key_path, create=True)
     monkeypatch.setenv("KHAOS_EFFECTIVE_POLICY_DIGEST", "policy-digest")
+    resource_order, _parent_scope, _child_scope = _typed_git_order("policy-digest")
+
+    with pytest.raises(AuthorityControlPlaneError, match="canonical SHA-256"):
+        build_local_daemon(
+            socket_path=tmp_path / "community.sock",
+            key_path=key_path,
+            audit_writer=_MemoryWorm(),
+            resource_order=resource_order,
+        )
+    with pytest.raises(AuthorityControlPlaneError, match="canonical SHA-256"):
+        build_production_daemon(
+            socket_path=tmp_path / "production.sock",
+            key_path=key_path,
+            audit_writer=_MemoryWorm(),
+            resource_order=resource_order,
+        )
+
+
+@pytest.mark.posix_host
+def test_production_daemon_requires_live_grant_and_same_operation_family(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    key_path = tmp_path / "authorityd.pem"
+    Ed25519KeyStore.load_or_create(key_path, create=True)
+    monkeypatch.setenv("KHAOS_EFFECTIVE_POLICY_DIGEST", TEST_POLICY_DIGEST)
     worm = _MemoryWorm()
     resource_order, parent_scope, child_scope = _typed_git_order()
     daemon = build_production_daemon(
@@ -898,7 +1046,7 @@ def test_production_daemon_requires_live_grant_and_same_operation_family(
         task_id="task",
         workspace_id="workspace",
         workspace_generation=1,
-        policy_digest="policy-digest",
+        policy_digest=TEST_POLICY_DIGEST,
         operation_class="git.workspace",
         resource_digest=parent_scope.digest(),
         authorization_epoch=2,
@@ -923,7 +1071,7 @@ def test_production_daemon_requires_live_grant_and_same_operation_family(
         workspace_id="workspace",
         operation="git.hash",
         resource_digest=parent_scope.digest(),
-        policy_digest="policy-digest",
+        policy_digest=TEST_POLICY_DIGEST,
         nonce="live-grant-nonce",
         authorization_epoch=2,
         workspace_generation=1,
@@ -962,7 +1110,7 @@ def test_expired_typed_child_receipt_renews_only_issued_action_and_scope(
     monkeypatch.setattr(authorityd_protocol_module.time, "time", lambda: clock[0])
     key_path = tmp_path / "authorityd.pem"
     Ed25519KeyStore.load_or_create(key_path, create=True)
-    monkeypatch.setenv("KHAOS_EFFECTIVE_POLICY_DIGEST", "policy-digest")
+    monkeypatch.setenv("KHAOS_EFFECTIVE_POLICY_DIGEST", TEST_POLICY_DIGEST)
     resource_order, parent_scope, child_scope = _typed_git_order()
     unrelated_scope = GitRefScope(
         repository="other-repository",
@@ -975,7 +1123,7 @@ def test_expired_typed_child_receipt_renews_only_issued_action_and_scope(
             child_scope.digest(): child_scope,
             unrelated_scope.digest(): unrelated_scope,
         },
-        policy_digest="policy-digest",
+        policy_digest=TEST_POLICY_DIGEST,
     )
     daemon = build_production_daemon(
         socket_path=tmp_path / "authorityd.sock",
@@ -990,7 +1138,7 @@ def test_expired_typed_child_receipt_renews_only_issued_action_and_scope(
         task_id="task",
         workspace_id="workspace",
         workspace_generation=1,
-        policy_digest="policy-digest",
+        policy_digest=TEST_POLICY_DIGEST,
         operation_class="git.workspace",
         resource_digest=parent_scope.digest(),
         authorization_epoch=2,
@@ -1016,7 +1164,7 @@ def test_expired_typed_child_receipt_renews_only_issued_action_and_scope(
         workspace_id="workspace",
         operation="git.workspace",
         resource_digest=parent_scope.digest(),
-        policy_digest="policy-digest",
+        policy_digest=TEST_POLICY_DIGEST,
         nonce="typed-parent",
         authorization_epoch=2,
         workspace_generation=1,
@@ -1088,7 +1236,7 @@ def test_expired_live_grant_is_terminally_audited_before_rejection(
         task_id="task",
         workspace_id="workspace",
         workspace_generation=1,
-        policy_digest="policy-digest",
+        policy_digest=TEST_POLICY_DIGEST,
         operation_class="git.workspace",
         resource_digest="grant-resource",
         authorization_epoch=2,
@@ -1101,7 +1249,7 @@ def test_expired_live_grant_is_terminally_audited_before_rejection(
             replace(
                 _intent(),
                 nonce="expired-grant",
-                policy_digest="policy-digest",
+                policy_digest=TEST_POLICY_DIGEST,
                 grant_id=grant_id,
                 grant_context_digest=context_digest,
             )
@@ -1135,7 +1283,7 @@ def test_grant_revoke_invalidates_prepared_receipts_but_not_claimed_receipts(
             task_id="task",
             workspace_id="workspace",
             workspace_generation=1,
-            policy_digest="policy-digest",
+            policy_digest=TEST_POLICY_DIGEST,
             operation_class="git.workspace",
             resource_digest="workspace-digest",
             authorization_epoch=2,
@@ -1190,7 +1338,7 @@ def test_epoch_rotation_invalidates_prepared_grant_receipts(
         task_id="task",
         workspace_id="workspace",
         workspace_generation=1,
-        policy_digest="policy-digest",
+        policy_digest=TEST_POLICY_DIGEST,
         operation_class="git.workspace",
         resource_digest="workspace-digest",
         authorization_epoch=2,
@@ -1235,7 +1383,7 @@ def test_workspace_generation_rotation_invalidates_prepared_grant_receipts(
         task_id="task",
         workspace_id="workspace",
         workspace_generation=1,
-        policy_digest="policy-digest",
+        policy_digest=TEST_POLICY_DIGEST,
         operation_class="git.workspace",
         resource_digest="workspace-digest",
         authorization_epoch=2,
@@ -1287,7 +1435,7 @@ def test_grant_expiry_invalidates_prepared_receipt_before_claim(
         task_id="task",
         workspace_id="workspace",
         workspace_generation=1,
-        policy_digest="policy-digest",
+        policy_digest=TEST_POLICY_DIGEST,
         operation_class="git.workspace",
         resource_digest="workspace-digest",
         authorization_epoch=2,
@@ -1327,7 +1475,7 @@ def test_authority_policy_kernel_closes_unregistered_and_cross_family_narrowing(
 
 
 def test_authority_policy_kernel_binds_compiled_policy_digest() -> None:
-    kernel = AuthorityPolicyKernel(expected_policy_digest="policy-digest")
+    kernel = AuthorityPolicyKernel(expected_policy_digest=TEST_POLICY_DIGEST)
     kernel(_intent())
     with pytest.raises(AuthorityControlPlaneError, match="compiled policy"):
         kernel(replace(_intent(), policy_digest="other-policy"))

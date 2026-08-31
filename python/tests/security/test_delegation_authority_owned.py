@@ -24,7 +24,10 @@ from khaos.security.authorityd_protocol import (
     AUTHORITYD_PROTOCOL,
     Ed25519KeyStore,
 )
-from khaos.security.delegation_issuer import AuthorityDelegationIssuer
+from khaos.security.delegation_issuer import (
+    AuthorityDelegationIssuer,
+    ProductionSubAgentDelegationIssuer,
+)
 from khaos.security.principals import (
     PRINCIPAL_DELEGATION_FAMILY,
     DelegationAuthority,
@@ -510,6 +513,9 @@ class _AuthorityClientDouble:
             workspace_id=workspace_id,
         )
 
+    def close(self) -> None:
+        self.closed = True
+
 
 def test_issuer_binds_delegation_to_the_real_child_execution_context() -> None:
     client = _AuthorityClientDouble()
@@ -532,6 +538,51 @@ def test_issuer_binds_delegation_to_the_real_child_execution_context() -> None:
     assert child.session_id == session_id
     assert child.runtime_id == runtime_id
     assert child.parent_principal.identity == ctx.parent_principal_id
+
+
+def test_production_subagent_issuer_uses_a_bound_short_lived_broker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Production delegation issuance never creates an unbound client."""
+    from khaos.security.authority_broker import AuthorityBroker
+
+    client = _AuthorityClientDouble()
+    calls: dict[str, object] = {}
+
+    def fake_for_production(cls, **kwargs):
+        _ = cls
+        calls.update(kwargs)
+        return client
+
+    monkeypatch.setattr(
+        AuthorityBroker,
+        "for_production",
+        classmethod(fake_for_production),
+    )
+    issuer = ProductionSubAgentDelegationIssuer(
+        policy_digest="a" * 64,
+        catalog_digest="b" * 64,
+        project_id="proj",
+    )
+    digest = issuer.issue_subagent_delegation(
+        _ctx(),
+        task_id="task_child",
+        tools=["tool.a"],
+        timeout_seconds=60,
+        session_id="subagent:gateway:api-key/task_child",
+        runtime_id="runtime_child",
+    )
+
+    assert digest
+    assert calls == {
+        "policy_digest": "a" * 64,
+        "catalog_digest": "b" * 64,
+        "runtime_id": "delegation:runtime_child",
+        "principal_id": "gateway:api-key",
+        "project_id": "proj",
+        "principal_kind": "gateway",
+    }
+    assert getattr(client, "closed", False) is True
 
 
 def test_principal_delegation_rejects_the_wrong_parent_identity() -> None:

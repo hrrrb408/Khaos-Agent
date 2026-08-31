@@ -65,8 +65,37 @@ RESULT_EXPIRED = "expired"
 # an arbitrary host file (``~/.ssh/authorized_keys``, a FIFO that blocks the
 # event loop, a device file, …).  Only the user layer (``~/.khaos/policy.yaml``)
 # is allowed to set ``audit.log_path``; the effective policy compiler drops
-# the project layer's ``audit_log_path`` entirely.
-AUDIT_LOG_TRUSTED_DIR = Path.home() / ".khaos" / "audit"
+# the project layer's ``audit_log_path`` entirely.  Native authority services
+# may run as a service identity without a user home directory; those
+# deployments must provide an explicit authority-owned path so importing the
+# audit module does not depend on ambient account metadata.
+
+
+def _resolve_audit_trusted_dir() -> Path:
+    """Resolve the audit trust root without inventing a service home."""
+    configured = os.environ.get("KHAOS_AUDIT_TRUSTED_DIR")
+    if configured is not None:
+        if not configured.strip():
+            raise RuntimeError("KHAOS_AUDIT_TRUSTED_DIR must not be empty")
+        trusted = Path(configured)
+        if not trusted.is_absolute():
+            raise RuntimeError(
+                "KHAOS_AUDIT_TRUSTED_DIR must be an absolute path"
+            )
+        if trusted.name != "audit" or trusted.parent.name != ".khaos":
+            raise RuntimeError(
+                "KHAOS_AUDIT_TRUSTED_DIR must name a .khaos/audit directory"
+            )
+        return trusted
+    try:
+        return Path.home() / ".khaos" / "audit"
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "KHAOS_AUDIT_TRUSTED_DIR is required when no user home exists"
+        ) from exc
+
+
+AUDIT_LOG_TRUSTED_DIR = _resolve_audit_trusted_dir()
 # The SQLite hash chain remains the authoritative ordered record.  The file
 # trail is segmented before it becomes an operationally dangerous append-only
 # blob; segments are retained in the same trusted directory for export/archive
@@ -508,7 +537,7 @@ class AuditLogger:
         """H1: open and validate the audit log file via an ``openat``
         dirfd chain that does NOT follow symlinks at any component.
 
-        * Starts from ``Path.home()`` opened with
+        * Starts from the configured trusted audit parent opened with
           ``O_DIRECTORY | O_NOFOLLOW``.
         * Opens ``.khaos`` and ``audit`` relative to their parent dirfd
           using ``openat(dirfd, name, O_DIRECTORY | O_NOFOLLOW)`` so a
@@ -562,9 +591,9 @@ class AuditLogger:
         # Track every open dirfd so we can close them on every exit path.
         dirfds: list[int] = []
         try:
-            # 1. Start from Path.home() opened with O_DIRECTORY | O_NOFOLLOW.
-            #    O_NOFOLLOW on the home path rejects a symlink at the home
-            #    level (defense in depth).
+            # 1. Start from the configured audit trust parent opened with
+            #    O_DIRECTORY | O_NOFOLLOW.  O_NOFOLLOW rejects a symlink at
+            #    the trust-root level (defense in depth).
             try:
                 trusted = AUDIT_LOG_TRUSTED_DIR.expanduser()
                 if trusted.name != "audit" or trusted.parent.name != ".khaos":

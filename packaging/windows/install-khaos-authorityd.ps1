@@ -108,9 +108,11 @@ if ($LASTEXITCODE -ne 0) { throw 'failed to bind the service to its authority-ow
 
 # The config and DPAPI marker are authority-owned; the Agent only gets the
 # pipe name.  A missing or weak ACL is a deployment failure.
-$authorityAce = "${authoritySid}:(R)"
+$authorityAce = "*${authoritySid}:(R)"
 & "$env:SystemRoot\System32\icacls.exe" $envFile /inheritance:r /grant:r "SYSTEM:(R)" "Administrators:(R)" $authorityAce | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'failed to protect the authority environment file' }
 & "$env:SystemRoot\System32\icacls.exe" $ProtectedKeyPath /inheritance:r /grant:r "SYSTEM:(R)" "Administrators:(R)" $authorityAce | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'failed to protect the authority DPAPI marker' }
 
 Start-Service -Name 'KhaosAuthorityD'
 Get-Service -Name 'KhaosAuthorityD' | Where-Object Status -eq 'Running' | Out-Null

@@ -18,15 +18,15 @@ inject → re-run link is actually wired.
 from __future__ import annotations
 
 import json
+from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import AsyncIterator
 
 from khaos.agent import AgentConfig, AgentLoop, Message
+from khaos.coding.task_manager import TaskManager, TaskStatus
 from khaos.coding.verify_fix import VerifyFixLoop
 from khaos.db import Database
 from khaos.modes import Mode, ModeManager
 from khaos.tools.scheduler import SchedulerEvent, ToolResult
-
 
 # ---------------------------------------------------------------------------
 # Scaffolding helpers (inlined to stay self-contained — the repo's other
@@ -261,9 +261,11 @@ class TestVerifyFixLoopWired:
         )
 
         # Model keeps re-running the tests; scheduler always fails.
-        # max_fix_attempts=2 → after 2 fixes the loop is exhausted.
+        # max_fix_attempts=2 means the third observed failure is exhausted:
+        # failures 1 and 2 authorize repairs 1 and 2 first.
         router = MockRouter(
             [
+                [Message(role="assistant", content="", tool_calls=[run_tests_call], stop_reason="tool_use")],
                 [Message(role="assistant", content="", tool_calls=[run_tests_call], stop_reason="tool_use")],
                 [Message(role="assistant", content="", tool_calls=[run_tests_call], stop_reason="tool_use")],
                 [Message(role="assistant", content="giving up", stop_reason="end_turn")],
@@ -271,6 +273,8 @@ class TestVerifyFixLoopWired:
         )
         scheduler = SequencedToolScheduler(
             [
+                [SchedulerEvent(event="tool_result", result=ToolResult(
+                    tool_call_id="call-run", name="test_run", success=False, output=failed_output))],
                 [SchedulerEvent(event="tool_result", result=ToolResult(
                     tool_call_id="call-run", name="test_run", success=False, output=failed_output))],
                 [SchedulerEvent(event="tool_result", result=ToolResult(
@@ -288,12 +292,56 @@ class TestVerifyFixLoopWired:
 
         events = [message async for message in loop.run("fix it", "s-vf-exhaust")]
 
-        # Two guidance injections (one per failed attempt), then a report.
+        # Two guidance injections (one per admitted repair), then the third
+        # observed failure produces a terminal exhaustion report.
         assert len([m for m in events if m.event == "verify_fix"]) == 2
         report_events = [m for m in events if m.event == "verify_fix_report"]
         assert len(report_events) == 1
-        assert "共 2 次尝试" in report_events[0].content
+        assert "共 2 次修复尝试" in report_events[0].content
         assert "仍然失败" in report_events[0].content
+        await db.close()
+
+    async def test_latest_failing_result_blocks_task_completion_on_end_turn(self, tmp_path):
+        """A model's END_TURN cannot override a latest failing observation."""
+        write_prompts(tmp_path)
+        db = await create_test_db(tmp_path / "khaos.db")
+        await db.create_session("s-vf-failing-end", mode="coding")
+
+        run_tests_call = {
+            "id": "call-run",
+            "name": "test_run",
+            "arguments": {"command": "pytest", "cwd": "."},
+        }
+        failed_output = _test_result_output(failed=1, passed=0)
+        router = MockRouter(
+            [
+                [Message(role="assistant", content="", tool_calls=[run_tests_call], stop_reason="tool_use")],
+                [Message(role="assistant", content="done", stop_reason="end_turn")],
+            ]
+        )
+        scheduler = SequencedToolScheduler(
+            [[SchedulerEvent(event="tool_result", result=ToolResult(
+                tool_call_id="call-run", name="test_run", success=False, output=failed_output))]]
+        )
+        task_manager = TaskManager()
+        verify_fix = VerifyFixLoop(max_fix_attempts=3)
+        loop = AgentLoop(
+            AgentConfig(),
+            await create_mode_manager(db, tmp_path, Mode.CODING),
+            router,
+            db,
+            tool_scheduler=scheduler,
+            verify_fix_loop=verify_fix,
+            task_manager=task_manager,
+        )
+
+        events = [message async for message in loop.run("fix it", "s-vf-failing-end")]
+
+        del events
+        tasks = await task_manager.list_all()
+        assert len(tasks) == 1
+        assert tasks[0]["status"] == TaskStatus.FAILED.value
+        assert verify_fix.verification_state.value == "failing"
         await db.close()
 
     async def test_passing_test_does_not_trigger_loop(self, tmp_path):

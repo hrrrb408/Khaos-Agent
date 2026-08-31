@@ -28,6 +28,15 @@ from khaos.memory.extraction import (
 from khaos.memory.models import Memory, MemoryScope
 from khaos.memory.ownership import MemoryVisibility
 from khaos.memory.retrieval import MemoryRetriever
+from khaos.memory.retrieval_policy import (
+    MemoryRetrievalNeed,
+    MemoryRetrievalPolicy,
+    MemoryRetrievalRequest,
+    MemoryRetrievalScope,
+    MemoryRetrievalService,
+    MemoryRetrievalUnavailable,
+    format_memory_bundle,
+)
 from khaos.memory.store import MemoryStore
 from khaos.modes import Mode
 
@@ -56,6 +65,8 @@ class MemoryManager:
         transfer_service: Any = None,
         codegraph: Any = None,
         owns_provider_manager: bool = True,
+        retrieval_policy: MemoryRetrievalPolicy | None = None,
+        retrieval_service: MemoryRetrievalService | None = None,
     ) -> None:
         self.store = store
         self.budget = budget or MemoryBudget()
@@ -77,8 +88,20 @@ class MemoryManager:
         self.memory_host: Any = None
         self.context_assembler = ContextAssembler(self.token_engine)
         self.event_bridge = MemoryEventBridge(broker) if broker is not None else None
+        self.retrieval_policy = retrieval_policy or MemoryRetrievalPolicy.production()
+        self.retrieval_service = retrieval_service or (
+            MemoryRetrievalService(broker, self.retrieval_policy)
+            if broker is not None
+            else None
+        )
 
-    async def inject(self, session_id: str) -> str:
+    async def inject(
+        self,
+        session_id: str,
+        *,
+        task_id: str | None = None,
+        repository_generation: str | None = None,
+    ) -> str:
         """Return durable L0/L1/L2 memory text within the total budget.
 
         Session-private rows are intentionally excluded from generic prompt
@@ -88,13 +111,31 @@ class MemoryManager:
         """
 
         if self.broker is not None:
-            runtime = self._runtime_context(session_id)
+            runtime = self._runtime_context(session_id, task_id=task_id)
             query = self.intent_getter() if self.intent_getter is not None else ""
-            resolution = await self.broker.search(query, runtime, self.budget)
-            return self.context_assembler.build(
-                resolution,
-                self.budget,
+            if self.retrieval_service is None:
+                return ""
+            request = MemoryRetrievalRequest.from_runtime(
+                runtime,
+                policy=self.retrieval_policy,
                 query=query,
+                scope=MemoryRetrievalScope.PROJECT_HISTORY,
+                needs=(
+                    MemoryRetrievalNeed.USER_PREFERENCES,
+                    MemoryRetrievalNeed.PROJECT_CONVENTIONS,
+                    MemoryRetrievalNeed.PRIOR_ENGINEERING_EPISODES,
+                    MemoryRetrievalNeed.REPOSITORY_HINTS,
+                ),
+                repository_generation=repository_generation,
+            )
+            try:
+                bundle = await self.retrieval_service.retrieve(request, runtime)
+            except (MemoryRetrievalUnavailable, PermissionError, ValueError):
+                logger.warning("memory retrieval unavailable; continuing without memory", exc_info=True)
+                return ""
+            return self._truncate_to_tokens(
+                format_memory_bundle(bundle),
+                self.budget.total_tokens,
             )
         durable_view = MemoryVisibility.durable()
         current_mode = self._current_scope()

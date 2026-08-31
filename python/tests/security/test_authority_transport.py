@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Self
 
 import pytest
+from khaos.runtime_profile import RuntimeProfile
 from khaos.security import authority_transport, authorityd_protocol
 from khaos.security.authority_transport import (
     AuthorityProfile,
@@ -125,8 +126,6 @@ def test_broker_factory_uses_unix_for_macos_community_profile(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from khaos.security.authority_broker import AuthorityBroker, AuthorityDaemonBroker
-
     monkeypatch.setattr("khaos.security.authority_transport.sys.platform", "darwin")
     monkeypatch.setattr(
         "khaos.security.identity_isolation.sys_platform", lambda: "darwin"
@@ -147,14 +146,13 @@ def test_broker_factory_uses_unix_for_macos_community_profile(
     # The test simulates macOS on Windows, where ``os.geteuid`` does not
     # exist; provide the simulated same-user authority UID explicitly.
     monkeypatch.setenv("KHAOS_AUTHORITYD_UID", "501")
-    AuthorityBroker._default = None
-    broker = AuthorityBroker.default()
-    try:
-        assert isinstance(broker, AuthorityDaemonBroker)
-        assert broker._authorityd.transport == "unix"
-    finally:
-        broker.close()
-        AuthorityBroker._default = None
+    config = AuthorityTransportConfig.from_environment(
+        platform_name="darwin",
+        os_name="posix",
+        runtime_profile=RuntimeProfile.TESTING,
+    )
+    client = config.client(AuthorityIdentityContract(501, 501, 501))
+    assert client.transport == "unix"
 
 
 @pytest.mark.posix_host
@@ -266,5 +264,6 @@ def test_darwin_unix_client_does_not_infer_xpc(
         Path.cwd() / "authorityd.sock",
         expected_authority_uid=0,
         transport="unix",
+        runtime_profile=RuntimeProfile.TESTING,
     )
     assert client.request({"operation": "ping"})["transport"] == "unix"

@@ -60,6 +60,36 @@ async def test_anchor_verifies_incremental_suffix_after_multiple_rows(tmp_path, 
     await db.close()
 
 
+def test_explicit_audit_trust_root_does_not_require_user_home(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Service identities may supply an authority-owned audit trust root."""
+    trusted = tmp_path / ".khaos" / "audit"
+
+    def no_home() -> Path:
+        raise RuntimeError("home unavailable")
+
+    monkeypatch.setenv("KHAOS_AUDIT_TRUSTED_DIR", str(trusted))
+    monkeypatch.setattr(logger_module.Path, "home", staticmethod(no_home))
+
+    assert logger_module._resolve_audit_trusted_dir() == trusted
+
+
+def test_missing_audit_trust_root_does_not_invent_a_home(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A service without an explicit root fails closed instead of guessing."""
+
+    def no_home() -> Path:
+        raise RuntimeError("home unavailable")
+
+    monkeypatch.delenv("KHAOS_AUDIT_TRUSTED_DIR", raising=False)
+    monkeypatch.setattr(logger_module.Path, "home", staticmethod(no_home))
+
+    with pytest.raises(RuntimeError, match="required when no user home exists"):
+        logger_module._resolve_audit_trusted_dir()
+
+
 async def test_query_filters_by_action(tmp_path):
     db = await _db(tmp_path)
     audit = AuditLogger(db)

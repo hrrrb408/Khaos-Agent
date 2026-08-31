@@ -69,13 +69,13 @@ from khaos.coding.workspace.trusted_git import (
     WorkspaceBootstrapLimits,
     _parse_index_listing,
 )
+from khaos.runtime_profile import RuntimeProfile, resolve_runtime_profile
 from khaos.security.authority import AuthorityEnvelope
 from khaos.security.authority_broker import (
     AuthorityBroker,
     AuthorityBrokerError,
     EffectCapability,
 )
-from khaos.runtime_profile import RuntimeProfile, resolve_runtime_profile
 from khaos.security.resource_scope import (
     GIT_SCOPE_OPERATIONS,
     GitRefScope,
@@ -259,6 +259,15 @@ class WorkspaceManager:
         authorization_epoch: int = 1,
         resource_order: TypedResourcePartialOrder | None = None,
         runtime_profile: RuntimeProfile | str | None = None,
+        authority_broker: AuthorityBroker | None = None,
+        principal_id: str = "",
+        principal_kind: str = "",
+        parent_principal_id: str = "",
+        delegation_digest: str = "",
+        session_id: str = "",
+        source_transport: str = "",
+        project_id: str = "",
+        runtime_id: str = "",
     ) -> None:
         if root is None:
             try:
@@ -270,6 +279,11 @@ class WorkspaceManager:
         else:
             configured_root = root
         configured_root = configured_root.expanduser().absolute()
+        self.runtime_profile = resolve_runtime_profile(runtime_profile)
+        if self.runtime_profile.is_production and authority_broker is None:
+            raise WorkspaceError(
+                "production WorkspaceManager requires the runtime authority broker"
+            )
         self._typed_git_worktree_bound = bool(
             resource_order is not None
             and any(
@@ -280,16 +294,24 @@ class WorkspaceManager:
         self.root, self._root_identity = _open_private_authority_root(
             configured_root
         )
-        self.runtime_profile = resolve_runtime_profile(runtime_profile)
-        self._authority_broker = AuthorityBroker.default(
+        self._authority_broker = authority_broker or AuthorityBroker.default(
             runtime_profile=self.runtime_profile
         )
+        self._principal_id = principal_id
+        self._principal_kind = principal_kind
+        self._parent_principal_id = parent_principal_id
+        self._delegation_digest = delegation_digest
+        self._session_id = session_id
+        self._source_transport = source_transport
+        self._project_id = project_id
+        self._runtime_id = runtime_id
         try:
             self._git_runner = TrustedGitRunner.for_authority_root(
                 self.root,
                 self._root_identity,
                 authority_broker=self._authority_broker,
                 resource_order=resource_order,
+                runtime_profile=self.runtime_profile,
             )
         except TrustedGitError as exc:
             raise WorkspaceError(str(exc)) from exc
@@ -318,6 +340,7 @@ class WorkspaceManager:
         self._quarantined_bootstraps: dict[str, WorkspaceBootstrapTransaction] = {}
         self._lock = asyncio.Lock()
         self._storage_mutation_locks: dict[str, asyncio.Lock] = {}
+
         # Batch 2.5 §4: optional lease invalidation hook. When set
         # (by ApprovalRuntime / WorkspaceExecutionLeaseCoordinator),
         # cleanup() calls it BEFORE removing the worktree so the ACTIVE
@@ -328,6 +351,11 @@ class WorkspaceManager:
         # cleanup is serialized with active lease acquisition / Batch 3
         # execution / RepositoryIndexer generation updates.
         self._mutation_fence: Any = None
+
+    @property
+    def authority_broker(self) -> AuthorityBroker:
+        """Return the one runtime authority used by every workspace effect."""
+        return self._authority_broker
 
     def set_lease_invalidation_hook(self, hook: Any) -> None:
         """Register a callable invoked during cleanup to release execution leases."""
@@ -467,9 +495,9 @@ class WorkspaceManager:
 
     def _default_git_authority(self, repository: Path) -> AuthorityEnvelope:
         return self._authority_broker.envelope(
-            principal_id="legacy",
-            project_id="local",
-            runtime_id="workspace-manager",
+            principal_id=self._principal_id or "legacy",
+            project_id=self._project_id or "local",
+            runtime_id=self._runtime_id or "workspace-manager",
             task_id="host-git",
             workspace_id=repository.name or "repository",
             workspace_generation=1,
@@ -477,6 +505,11 @@ class WorkspaceManager:
             operation_class="git.host",
             authorization_epoch=self.authorization_epoch,
             resource_digest=self._git_resource_digest(repository),
+            principal_kind=self._principal_kind,
+            parent_principal_id=self._parent_principal_id,
+            session_id=self._session_id,
+            delegation_digest=self._delegation_digest,
+            source_transport=self._source_transport,
         )
 
     def _git_resource_digest(self, repository: Path) -> str:
@@ -1073,6 +1106,11 @@ class WorkspaceManager:
                 operation_class="git.bootstrap",
                 authorization_epoch=self.authorization_epoch,
                 resource_digest=self._git_resource_digest(repository),
+                principal_kind=self._principal_kind,
+                parent_principal_id=self._parent_principal_id,
+                session_id=self._session_id,
+                delegation_digest=self._delegation_digest,
+                source_transport=self._source_transport,
             )
             branch = f"khaos/task/{task_id}"
             path = (self.root / workspace_id).resolve()

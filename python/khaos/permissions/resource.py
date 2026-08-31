@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shlex
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from enum import Enum
@@ -92,6 +93,7 @@ def resolve_authorization_resource(
         raise PermissionError("tool authorization requires complete workspace identity")
     if workspace_manager is None:
         raise PermissionError("tool authorization requires WorkspaceManager")
+    workspace: Any
     require = getattr(workspace_manager, "require", None)
     if callable(require):
         workspace = require(
@@ -172,6 +174,43 @@ def resolve_terminal_argv(
         isinstance(item, str) and item for item in argv
     ):
         raise PermissionError("terminal argv is invalid")
+    cwd = _resolve_workspace_path(root, arguments.get("cwd", "."))
+    semantic = analyze_argv(argv)
+    if semantic.status is ShellSemanticStatus.BLOCKED:
+        raise PermissionError(semantic.reason)
+    return (
+        _canonical_json(
+            {
+                "tool": tool_name,
+                "argv": argv,
+                "cwd": cwd,
+                "semantic_status": semantic.status.value,
+                "semantic_digest": semantic.semantic_digest,
+            }
+        ),
+        AuthorizationResourceKind.PROCESS_ARGV,
+    )
+
+
+def resolve_test_command(
+    tool_name: str, arguments: dict[str, Any], root: Path
+) -> tuple[str, AuthorizationResourceKind]:
+    """Resolve ``test_run`` exactly as the handler executes it.
+
+    ``test_run`` uses ``shlex.split`` and the supervised argv execution
+    service; it never invokes a shell.  The resource therefore carries an
+    argv identity, so routing compares the exact executed vector rather than
+    treating a command string as shell authority.
+    """
+    command = arguments.get("command")
+    if not isinstance(command, str) or not command.strip():
+        raise PermissionError("test command is invalid")
+    try:
+        argv = shlex.split(command)
+    except ValueError as exc:
+        raise PermissionError("test command is invalid") from exc
+    if not argv or not all(isinstance(item, str) and item for item in argv):
+        raise PermissionError("test command is invalid")
     cwd = _resolve_workspace_path(root, arguments.get("cwd", "."))
     semantic = analyze_argv(argv)
     if semantic.status is ShellSemanticStatus.BLOCKED:

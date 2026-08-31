@@ -555,12 +555,259 @@ CREATE TABLE IF NOT EXISTS coding_tasks (
     -- authenticated principal's TaskManager.
     principal_id   TEXT NOT NULL DEFAULT 'legacy',
     -- M4 batch 3.1.16A-5-1: project identity closure (see ``sessions``).
-    project_id     TEXT NOT NULL DEFAULT ''
+    project_id     TEXT NOT NULL DEFAULT '',
+    -- M7.1.3: canonical durable cognitive phase and its independent CAS
+    -- version.  Runtime migration source: migrations/0017_*.sql.
+    cognitive_state TEXT NOT NULL DEFAULT 'uninitialized'
+        CHECK (cognitive_state IN (
+            'uninitialized', 'understanding', 'exploring', 'planning',
+            'implementing', 'verifying', 'diagnosing', 'recovering',
+            'replanning', 'reviewing', 'completion_check'
+        )),
+    control_state_version INTEGER NOT NULL DEFAULT 0
+        CHECK (control_state_version >= 0),
+    -- M7.3 closure amendment: exact READY revision that caused the current
+    -- IMPLEMENTING cognitive phase.  This is descriptive control state, not
+    -- execution/approval/workspace authority; runtime migration source is
+    -- migrations/0020_plan_publication_fence.sql.
+    published_plan_revision_id TEXT,
+    -- M7.5: descriptive identity of the RecoveryDecision that caused the
+    -- latest recovery-control transition.  This is not execution, approval,
+    -- or lifecycle authority; runtime migration source is v22.
+    last_applied_recovery_decision_id TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_coding_tasks_status ON coding_tasks(status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_coding_tasks_principal ON coding_tasks(principal_id, status);
 -- M4 batch 3.1.16A-5-1: project-scoped index created by migration helper.
+
+-- M7.6: canonical plan-tool route history and execution projections. Runtime
+-- source of truth is migrations/0023_plan_tool_routing.sql.
+CREATE TABLE IF NOT EXISTS agent_plan_tool_routes (
+    route_id TEXT PRIMARY KEY,
+    route_sequence INTEGER NOT NULL CHECK (route_sequence >= 1),
+    principal_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    execution_epoch_digest TEXT,
+    plan_revision_id TEXT,
+    plan_revision_digest TEXT,
+    plan_step_id TEXT,
+    plan_step_digest TEXT,
+    tool_name TEXT NOT NULL,
+    tool_security_digest TEXT NOT NULL,
+    arguments_digest TEXT NOT NULL,
+    authorization_resource_digest TEXT NOT NULL,
+    route_disposition TEXT NOT NULL,
+    reason_code TEXT NOT NULL,
+    route_input_digest TEXT NOT NULL,
+    route_digest TEXT NOT NULL,
+    task_owner_principal_id TEXT NOT NULL DEFAULT '',
+    execution_principal_id TEXT NOT NULL DEFAULT '',
+    subagent_assignment_id TEXT,
+    subagent_assignment_digest TEXT,
+    canonical_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (principal_id, project_id, task_id, route_sequence)
+);
+CREATE TABLE IF NOT EXISTS agent_plan_step_states (
+    principal_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    execution_epoch_digest TEXT NOT NULL,
+    plan_revision_id TEXT NOT NULL,
+    plan_revision_digest TEXT NOT NULL,
+    plan_step_id TEXT NOT NULL,
+    plan_step_digest TEXT NOT NULL,
+    state TEXT NOT NULL,
+    attempt_generation INTEGER NOT NULL,
+    covered_targets TEXT NOT NULL,
+    covered_targets_digest TEXT NOT NULL,
+    active_route_id TEXT,
+    active_route_digest TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (principal_id, project_id, task_id, execution_epoch_digest, plan_step_id)
+);
+CREATE TABLE IF NOT EXISTS agent_plan_dispatch_fences (
+    fence_id TEXT PRIMARY KEY,
+    route_id TEXT NOT NULL,
+    route_digest TEXT NOT NULL,
+    principal_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    execution_epoch_digest TEXT NOT NULL,
+    plan_revision_id TEXT NOT NULL,
+    plan_step_id TEXT,
+    workspace_id TEXT NOT NULL,
+    workspace_generation INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    finished_at TEXT,
+    effect_status TEXT,
+    effect_id TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_plan_dispatch_fences_route
+    ON agent_plan_dispatch_fences(route_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_plan_dispatch_fences_active_step
+    ON agent_plan_dispatch_fences(
+        principal_id, project_id, task_id, execution_epoch_digest, plan_step_id
+    )
+    WHERE status = 'ACTIVE' AND plan_step_id IS NOT NULL;
+
+-- M7.8: immutable plan-bound sub-agent assignments and mutable run state.
+CREATE TABLE IF NOT EXISTS agent_subagent_assignments (
+    assignment_id TEXT PRIMARY KEY,
+    assignment_sequence INTEGER NOT NULL CHECK (assignment_sequence >= 1),
+    task_owner_principal_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    parent_task_id TEXT NOT NULL,
+    goal_spec_id TEXT NOT NULL,
+    goal_spec_digest TEXT NOT NULL,
+    parent_task_status TEXT NOT NULL,
+    parent_cognitive_state TEXT NOT NULL,
+    parent_control_state_version INTEGER NOT NULL CHECK (parent_control_state_version >= 0),
+    workspace_id TEXT NOT NULL,
+    repository_id TEXT NOT NULL,
+    base_revision TEXT,
+    workspace_generation INTEGER NOT NULL CHECK (workspace_generation > 0),
+    published_plan_revision_id TEXT NOT NULL,
+    published_plan_revision_digest TEXT NOT NULL,
+    execution_epoch_digest TEXT NOT NULL,
+    plan_step_id TEXT NOT NULL,
+    plan_step_digest TEXT NOT NULL,
+    plan_operation TEXT NOT NULL,
+    allowed_tools TEXT NOT NULL,
+    child_execution_principal_id TEXT NOT NULL,
+    child_session_id TEXT NOT NULL,
+    child_runtime_id TEXT NOT NULL,
+    depth INTEGER NOT NULL CHECK (depth = 1),
+    policy_digest TEXT NOT NULL,
+    assignment_json TEXT NOT NULL,
+    assignment_digest TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT,
+    UNIQUE (task_owner_principal_id, project_id, parent_task_id, execution_epoch_digest, plan_step_id)
+);
+CREATE TABLE IF NOT EXISTS agent_subagent_runs (
+    assignment_id TEXT PRIMARY KEY REFERENCES agent_subagent_assignments(assignment_id),
+    state TEXT NOT NULL CHECK (state IN ('PENDING', 'ACTIVE', 'COMPLETED', 'FAILED', 'CANCELLED', 'STALE', 'ORPHANED')),
+    state_version INTEGER NOT NULL CHECK (state_version >= 0),
+    started_at TEXT,
+    finished_at TEXT,
+    error TEXT
+);
+
+-- M7.1.2: canonical immutable user-goal declaration.  The runtime migration
+-- source is migrations/0016_goal_specs.sql; this aggregate schema is retained
+-- for tooling and documentation only.
+CREATE TABLE IF NOT EXISTS agent_goal_specs (
+    goal_spec_id    TEXT PRIMARY KEY,
+    task_id         TEXT NOT NULL UNIQUE,
+    principal_id    TEXT NOT NULL,
+    project_id      TEXT NOT NULL,
+    schema_version  INTEGER NOT NULL,
+    semantic_digest TEXT NOT NULL,
+    canonical_json  TEXT NOT NULL,
+    created_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_goal_specs_owner_task
+    ON agent_goal_specs(principal_id, project_id, task_id);
+CREATE INDEX IF NOT EXISTS idx_agent_goal_specs_owner_digest
+    ON agent_goal_specs(principal_id, project_id, semantic_digest);
+
+-- M7.1.4: passive immutable completion-evaluation ledger.  The runtime
+-- migration source is migrations/0018_completion_decisions.sql; no legacy
+-- TaskStatus is backfilled into this table.
+CREATE TABLE IF NOT EXISTS agent_completion_decisions (
+    decision_id       TEXT PRIMARY KEY,
+    task_id           TEXT NOT NULL,
+    principal_id      TEXT NOT NULL,
+    project_id        TEXT NOT NULL,
+    decision_sequence INTEGER NOT NULL
+        CHECK (decision_sequence >= 1),
+    schema_version    INTEGER NOT NULL
+        CHECK (schema_version >= 1),
+    decision_digest   TEXT NOT NULL,
+    canonical_json    TEXT NOT NULL,
+    created_at        TEXT NOT NULL,
+    UNIQUE (task_id, decision_sequence)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_completion_decisions_owner_task_sequence
+    ON agent_completion_decisions(
+        principal_id, project_id, task_id, decision_sequence
+    );
+
+CREATE TRIGGER IF NOT EXISTS trg_agent_completion_decisions_immutable_update
+BEFORE UPDATE ON agent_completion_decisions
+BEGIN
+    SELECT RAISE(
+        ABORT,
+        'agent_completion_decisions is append-only: updates are forbidden'
+    );
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_agent_completion_decisions_immutable_delete
+BEFORE DELETE ON agent_completion_decisions
+BEGIN
+    SELECT RAISE(
+        ABORT,
+        'agent_completion_decisions is append-only: deletes are forbidden'
+    );
+END;
+
+-- M7.3: passive immutable deterministic planning-revision ledger.  The
+-- runtime migration source is migrations/0019_plan_revisions.sql; this
+-- aggregate schema is retained for tooling and documentation only.
+CREATE TABLE IF NOT EXISTS agent_plan_revisions (
+    plan_revision_id       TEXT PRIMARY KEY,
+    task_id                TEXT NOT NULL,
+    principal_id           TEXT NOT NULL,
+    project_id             TEXT NOT NULL,
+    revision_sequence      INTEGER NOT NULL CHECK (revision_sequence >= 1),
+    parent_revision_id     TEXT,
+    schema_version         INTEGER NOT NULL CHECK (schema_version >= 1),
+    planner_schema_version INTEGER NOT NULL CHECK (planner_schema_version >= 1),
+    planner_algorithm_version TEXT NOT NULL,
+    goal_spec_id           TEXT NOT NULL,
+    goal_spec_digest       TEXT NOT NULL,
+    workspace_id           TEXT NOT NULL,
+    repository_id          TEXT NOT NULL,
+    base_revision           TEXT,
+    context_bundle_id      TEXT NOT NULL,
+    context_bundle_digest  TEXT NOT NULL,
+    context_request_digest TEXT NOT NULL,
+    repository_generation  TEXT NOT NULL,
+    index_generation       TEXT NOT NULL,
+    context_freshness      TEXT NOT NULL CHECK (
+        context_freshness IN ('fresh', 'stale', 'mixed_generation', 'unavailable')
+    ),
+    cognitive_state        TEXT NOT NULL,
+    control_state_version  INTEGER NOT NULL CHECK (control_state_version >= 0),
+    task_status            TEXT NOT NULL,
+    disposition             TEXT NOT NULL CHECK (
+        disposition IN ('ready', 'blocked', 'stale', 'invalid')
+    ),
+    planning_input_digest  TEXT NOT NULL,
+    plan_semantic_digest   TEXT NOT NULL,
+    canonical_json         TEXT NOT NULL,
+    created_at             TEXT NOT NULL,
+    UNIQUE (task_id, principal_id, project_id, revision_sequence)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_plan_revisions_owner_task_sequence
+    ON agent_plan_revisions(principal_id, project_id, task_id, revision_sequence);
+CREATE INDEX IF NOT EXISTS idx_agent_plan_revisions_owner_parent
+    ON agent_plan_revisions(principal_id, project_id, task_id, parent_revision_id);
+
+CREATE TRIGGER IF NOT EXISTS trg_agent_plan_revisions_immutable_update
+BEFORE UPDATE ON agent_plan_revisions
+BEGIN
+    SELECT RAISE(ABORT, 'agent_plan_revisions is append-only: updates are forbidden');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_agent_plan_revisions_immutable_delete
+BEFORE DELETE ON agent_plan_revisions
+BEGIN
+    SELECT RAISE(ABORT, 'agent_plan_revisions is append-only: deletes are forbidden');
+END;
 
 -- Hermes batch 2: session history FTS5 search over messages.
 -- Separate FTS5 table (rowid mirrors messages.id) populated manually by
@@ -998,3 +1245,194 @@ CREATE TABLE IF NOT EXISTS webhook_replay_watermarks (
     updated_at REAL NOT NULL,
     PRIMARY KEY (channel_id, platform)
 );
+
+-- M7.4: immutable trusted-verification assessment history.  The runtime
+-- migration source is migrations/0021_trusted_verification_assessments.sql;
+-- this aggregate schema is retained for tooling and documentation only.
+CREATE TABLE IF NOT EXISTS agent_verification_assessments (
+    assessment_id                       TEXT PRIMARY KEY,
+    task_id                              TEXT NOT NULL,
+    principal_id                         TEXT NOT NULL,
+    project_id                           TEXT NOT NULL,
+    assessment_sequence                  INTEGER NOT NULL CHECK (assessment_sequence >= 1),
+    schema_version                       INTEGER NOT NULL CHECK (schema_version >= 1),
+    goal_spec_id                         TEXT NOT NULL,
+    goal_spec_digest                     TEXT NOT NULL,
+    cognitive_state                      TEXT NOT NULL,
+    control_state_version                INTEGER NOT NULL CHECK (control_state_version >= 0),
+    task_status                          TEXT NOT NULL,
+    workspace_id                         TEXT NOT NULL,
+    repository_id                        TEXT NOT NULL,
+    base_revision                        TEXT,
+    published_plan_revision_id           TEXT,
+    published_plan_revision_digest       TEXT,
+    repository_generation                TEXT,
+    change_identity                      TEXT,
+    policy_digest                        TEXT NOT NULL,
+    catalog_fingerprint                  TEXT NOT NULL,
+    verification_algorithm_version      TEXT NOT NULL,
+    input_digest                         TEXT NOT NULL,
+    disposition                          TEXT NOT NULL CHECK (
+        disposition IN ('satisfied', 'failed', 'inconclusive', 'unavailable', 'stale')
+    ),
+    assessment_digest                   TEXT NOT NULL,
+    canonical_json                       TEXT NOT NULL,
+    created_at                           TEXT NOT NULL,
+    CHECK (
+        (published_plan_revision_id IS NULL AND published_plan_revision_digest IS NULL)
+        OR (published_plan_revision_id IS NOT NULL AND published_plan_revision_digest IS NOT NULL)
+    ),
+    CHECK (repository_generation IS NOT NULL OR change_identity IS NOT NULL),
+    UNIQUE (task_id, principal_id, project_id, assessment_sequence)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_verification_assessments_owner_task_sequence
+    ON agent_verification_assessments(
+        principal_id, project_id, task_id, assessment_sequence
+    );
+CREATE INDEX IF NOT EXISTS idx_agent_verification_assessments_owner_digest
+    ON agent_verification_assessments(
+        principal_id, project_id, assessment_digest
+    );
+CREATE TRIGGER IF NOT EXISTS trg_agent_verification_assessments_immutable_update
+BEFORE UPDATE ON agent_verification_assessments
+BEGIN
+    SELECT RAISE(
+        ABORT,
+        'agent_verification_assessments is append-only: updates are forbidden'
+    );
+END;
+CREATE TRIGGER IF NOT EXISTS trg_agent_verification_assessments_immutable_delete
+BEFORE DELETE ON agent_verification_assessments
+BEGIN
+    SELECT RAISE(
+        ABORT,
+        'agent_verification_assessments is append-only: deletes are forbidden'
+    );
+END;
+
+-- M7.5: immutable recovery-decision history.  The runtime migration source
+-- is migrations/0022_recovery_control_plane.sql; this aggregate schema is
+-- retained for tooling and documentation only.
+CREATE TABLE IF NOT EXISTS agent_recovery_decisions (
+    recovery_decision_id                 TEXT PRIMARY KEY,
+    task_id                              TEXT NOT NULL,
+    principal_id                         TEXT NOT NULL,
+    project_id                           TEXT NOT NULL,
+    recovery_sequence                    INTEGER NOT NULL CHECK (recovery_sequence >= 1),
+    schema_version                       INTEGER NOT NULL CHECK (schema_version >= 1),
+    goal_spec_id                         TEXT NOT NULL,
+    goal_spec_digest                     TEXT NOT NULL,
+    source_cognitive_state               TEXT NOT NULL,
+    source_control_state_version         INTEGER NOT NULL CHECK (source_control_state_version >= 0),
+    source_task_status                   TEXT NOT NULL,
+    workspace_id                         TEXT,
+    repository_id                        TEXT,
+    base_revision                        TEXT,
+    published_plan_revision_id           TEXT,
+    published_plan_revision_digest       TEXT,
+    latest_plan_revision_id              TEXT,
+    latest_plan_revision_sequence        INTEGER,
+    verification_assessment_id           TEXT,
+    verification_assessment_digest       TEXT,
+    verification_disposition             TEXT,
+    verification_repository_generation   TEXT,
+    verification_change_identity         TEXT,
+    completion_decision_id               TEXT,
+    completion_decision_digest           TEXT,
+    completion_decision_sequence         INTEGER,
+    completion_outcome                   TEXT,
+    completion_continuation_state        TEXT,
+    failure_signature_digest             TEXT,
+    identical_failure_streak             INTEGER NOT NULL CHECK (identical_failure_streak >= 0),
+    recovery_attempt_count               INTEGER NOT NULL CHECK (recovery_attempt_count >= 0),
+    replan_count                         INTEGER NOT NULL CHECK (replan_count >= 0),
+    total_recovery_count                 INTEGER NOT NULL CHECK (total_recovery_count >= 0),
+    planning_status                      TEXT NOT NULL,
+    policy_schema_version                INTEGER NOT NULL CHECK (policy_schema_version >= 1),
+    policy_max_recovery_attempts_per_plan INTEGER NOT NULL CHECK (policy_max_recovery_attempts_per_plan >= 0),
+    policy_identical_failure_threshold   INTEGER NOT NULL CHECK (policy_identical_failure_threshold >= 0),
+    policy_max_replans_per_task          INTEGER NOT NULL CHECK (policy_max_replans_per_task >= 0),
+    policy_max_recovery_cycles_per_turn  INTEGER NOT NULL CHECK (policy_max_recovery_cycles_per_turn >= 0),
+    policy_max_history_records           INTEGER NOT NULL CHECK (policy_max_history_records >= 0),
+    policy_digest                        TEXT NOT NULL,
+    action                              TEXT NOT NULL CHECK (
+        action IN ('no_action', 'recover_current_plan', 'replan', 'block')
+    ),
+    reason_code                         TEXT NOT NULL,
+    subject_ids_json                     TEXT NOT NULL,
+    input_digest                         TEXT NOT NULL,
+    decision_digest                      TEXT NOT NULL,
+    canonical_json                       TEXT NOT NULL,
+    created_at                           TEXT NOT NULL,
+    CHECK (
+        (published_plan_revision_id IS NULL AND published_plan_revision_digest IS NULL)
+        OR (published_plan_revision_id IS NOT NULL AND published_plan_revision_digest IS NOT NULL)
+    ),
+    CHECK (
+        (latest_plan_revision_id IS NULL AND latest_plan_revision_sequence IS NULL)
+        OR (latest_plan_revision_id IS NOT NULL AND latest_plan_revision_sequence IS NOT NULL)
+    ),
+    CHECK (
+        (verification_assessment_id IS NULL AND verification_assessment_digest IS NULL)
+        OR (verification_assessment_id IS NOT NULL AND verification_assessment_digest IS NOT NULL)
+    ),
+    CHECK (
+        (completion_decision_id IS NULL AND completion_decision_digest IS NULL
+            AND completion_decision_sequence IS NULL AND completion_outcome IS NULL
+            AND completion_continuation_state IS NULL)
+        OR (completion_decision_id IS NOT NULL AND completion_decision_digest IS NOT NULL
+            AND completion_decision_sequence IS NOT NULL AND completion_outcome IS NOT NULL
+            AND completion_continuation_state IS NOT NULL)
+    ),
+    UNIQUE (task_id, principal_id, project_id, recovery_sequence)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_recovery_decisions_owner_task_sequence
+    ON agent_recovery_decisions(principal_id, project_id, task_id, recovery_sequence);
+CREATE INDEX IF NOT EXISTS idx_agent_recovery_decisions_owner_digest
+    ON agent_recovery_decisions(principal_id, project_id, decision_digest);
+CREATE TRIGGER IF NOT EXISTS trg_agent_recovery_decisions_immutable_update
+BEFORE UPDATE ON agent_recovery_decisions
+BEGIN
+    SELECT RAISE(ABORT, 'agent_recovery_decisions is append-only: updates are forbidden');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_agent_recovery_decisions_immutable_delete
+BEFORE DELETE ON agent_recovery_decisions
+BEGIN
+    SELECT RAISE(ABORT, 'agent_recovery_decisions is append-only: deletes are forbidden');
+END;
+
+-- M7.9: capability evaluation is descriptive history, never authority.
+CREATE TABLE IF NOT EXISTS agent_capability_evaluations (
+    evaluation_id                 TEXT PRIMARY KEY,
+    principal_id                  TEXT NOT NULL,
+    project_id                    TEXT NOT NULL,
+    task_id                       TEXT NOT NULL,
+    evaluation_sequence           INTEGER NOT NULL CHECK (evaluation_sequence >= 1),
+    goal_spec_id                  TEXT NOT NULL,
+    goal_spec_digest              TEXT NOT NULL,
+    snapshot_digest               TEXT NOT NULL,
+    policy_digest                 TEXT NOT NULL,
+    evaluator_schema_version      INTEGER NOT NULL CHECK (evaluator_schema_version >= 1),
+    evaluator_algorithm_version   TEXT NOT NULL,
+    disposition                   TEXT NOT NULL CHECK (
+        disposition IN ('EVALUATED', 'INSUFFICIENT_EVIDENCE', 'STALE', 'INVALID')
+    ),
+    evaluation_json               TEXT NOT NULL,
+    evaluation_digest             TEXT NOT NULL,
+    created_at                    TEXT NOT NULL,
+    UNIQUE (principal_id, project_id, task_id, evaluation_sequence)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_capability_evaluations_scope
+    ON agent_capability_evaluations(principal_id, project_id, task_id, evaluation_sequence);
+CREATE INDEX IF NOT EXISTS idx_agent_capability_evaluations_snapshot
+    ON agent_capability_evaluations(principal_id, project_id, snapshot_digest);
+CREATE TRIGGER IF NOT EXISTS trg_agent_capability_evaluations_immutable_update
+BEFORE UPDATE ON agent_capability_evaluations
+BEGIN
+    SELECT RAISE(ABORT, 'agent_capability_evaluations is append-only: updates are forbidden');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_agent_capability_evaluations_immutable_delete
+BEFORE DELETE ON agent_capability_evaluations
+BEGIN
+    SELECT RAISE(ABORT, 'agent_capability_evaluations is append-only: deletes are forbidden');
+END;

@@ -72,6 +72,20 @@ class SubAgentTask:
     session_id: str = ""
     runtime_id: str = ""
     workspace_id: str = ""
+    # M7.8: these fields are populated only by the trusted
+    # SubAgentControlCoordinator.  Generic office Spawn never receives an
+    # assignment and therefore cannot enter delegated coding mode.
+    assignment_id: str = ""
+    assignment_digest: str = ""
+    task_owner_principal_id: str = ""
+    execution_principal_id: str = ""
+    parent_task_id: str = ""
+    published_plan_revision_id: str = ""
+    plan_step_id: str = ""
+    execution_epoch_digest: str = ""
+    # Internal-only reference installed by the trusted coordinator. It is
+    # never read from RPC/model payloads or persisted as authority data.
+    parent_workspace_manager: object | None = None
 
 
 Runner = Callable[[SubAgentTask], Awaitable[str]]
@@ -93,11 +107,13 @@ class SubAgentSpawner:
         db,
         runner: Runner | None = None,
         registry=None,  # ToolRegistry，可选
+        assignment_repository=None,
     ):
         self.config = config
         self.db = db
         self.runner = runner or self._default_runner
         self.registry = registry
+        self.assignment_repository = assignment_repository
         self._active_tasks: dict[str, asyncio.Task] = {}
         self._tasks: dict[str, SubAgentTask] = {}
         # H1: once shutdown begins, every subsequent spawn is rejected so a
@@ -1008,6 +1024,7 @@ class SubAgentSpawner:
                 current.uncancel()
             try:
                 await self._persist_terminal(task)
+                await self._finish_assignment(task, "CANCELLED", "cancelled")
             except BaseException:
                 # Cancellation may propagate through the DB write;
                 # _pending_persistence is already set so reconcile retries.
@@ -1026,13 +1043,44 @@ class SubAgentSpawner:
         # fire-and-forget asyncio Task; an unhandled exception would only
         # be logged at GC time and the terminal state would never be
         # retried.
+        persisted = True
         try:
             await self._persist_terminal(task)
         except Exception:
+            persisted = False
             logger.exception(
                 "subagent task %s terminal state could not be persisted; "
                 "will retry on next shutdown reconcile",
                 task.id
+            )
+        if persisted:
+            await self._finish_assignment(
+                task,
+                "COMPLETED" if task.status == "completed" else "FAILED",
+                task.error,
+            )
+
+    async def _finish_assignment(
+        self, task: SubAgentTask, state: str, error: str | None
+    ) -> None:
+        """Project the delegated run terminal state after task durability."""
+        if self.assignment_repository is None or not task.assignment_id:
+            return
+        from khaos.subagents.assignment import AssignmentRunState
+
+        try:
+            await self.assignment_repository.transition(
+                task.assignment_id,
+                expected_version=1,
+                state=AssignmentRunState(state),
+                error=error,
+            )
+        except Exception:
+            # A missed transition is reconciled as ORPHANED on restart; it
+            # must never be reported as a successful child lifecycle proof.
+            logger.exception(
+                "delegated assignment %s terminal projection failed",
+                task.assignment_id,
             )
 
     async def _default_runner(self, task: SubAgentTask) -> str:

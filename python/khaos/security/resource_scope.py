@@ -16,8 +16,7 @@ policy decision cannot change underneath a signed receipt.
 
 from __future__ import annotations
 
-import hashlib
-import json
+import errno
 import os
 import posixpath
 import stat
@@ -30,6 +29,13 @@ from types import MappingProxyType
 from typing import Final, cast
 
 from khaos.coding.planning.security_identities import CanonicalWorkspaceId
+from khaos.security.protocol_boundary import canonical_digest, strict_json_loads
+from khaos.security.windows_trust import (
+    WindowsTrustError,
+    reject_windows_reparse_points,
+    validate_windows_trusted_descriptor,
+    validate_windows_trusted_path,
+)
 
 
 class ResourceScopeError(ValueError):
@@ -47,8 +53,10 @@ class ResourceScopeKind(str, Enum):
 
 
 _SCHEMA_VERSION: Final = 1
+MAX_TYPED_RESOURCE_CATALOG_BYTES: Final = 4 * 1024 * 1024
 _HEX_DIGITS: Final = frozenset("0123456789abcdef")
 _WILDCARD_CHARS: Final = frozenset("*?[]")
+_O_BINARY: Final = getattr(os, "O_BINARY", 0)
 GIT_WORKTREE_AUTHORITY_ROOT_ENV: Final = "KHAOS_WORKTREE_AUTHORITY_ROOT"
 GIT_SCOPE_OPERATIONS: Final = frozenset(
     {
@@ -210,10 +218,7 @@ class ResourceScope(ABC):
             "kind": self.kind.value,
             "scope": self.canonical(),
         }
-        encoded = json.dumps(
-            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-        ).encode("utf-8")
-        return hashlib.sha256(encoded).hexdigest()
+        return canonical_digest(payload)
 
     def manifest(self) -> dict[str, object]:
         """Return the canonical, JSON-safe catalog entry for this scope."""
@@ -542,6 +547,11 @@ class TypedResourcePartialOrder:
         return self._catalog_digest
 
     @property
+    def catalog_semantic_digest(self) -> str:
+        """Return the digest independently recomputed from catalog semantics."""
+        return self._catalog_digest
+
+    @property
     def scopes(self) -> Mapping[str, ResourceScope]:
         """Return the read-only policy snapshot."""
         return self._scopes
@@ -606,6 +616,10 @@ class TypedResourcePartialOrder:
             body = entry.get("scope")
             if not isinstance(digest, str) or not isinstance(kind, str):
                 raise ResourceScopeError("resource catalog entry identity is invalid")
+            if digest != digest.lower() or len(digest) != 64 or any(
+                char not in _HEX_DIGITS for char in digest
+            ):
+                raise ResourceScopeError("resource catalog entry digest is invalid")
             if digest in scopes:
                 raise ResourceScopeError("resource catalog contains a duplicate digest")
             scope = _scope_from_manifest(kind, body)
@@ -622,28 +636,48 @@ class TypedResourcePartialOrder:
         path: Path,
         *,
         expected_policy_digest: str | None = None,
+        require_windows_acl: bool = False,
     ) -> TypedResourcePartialOrder:
         """Load a catalog from a JSON file and fail closed on any mismatch."""
-        path = _trusted_catalog_path(path)
-        descriptor = -1
+        descriptor = _open_trusted_catalog(
+            path, require_windows_acl=require_windows_acl
+        )
         try:
-            descriptor = os.open(
-                path.expanduser().absolute(),
-                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-            )
             info = os.fstat(descriptor)
-            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_nlink != 1
+                or info.st_size < 0
+                or info.st_size > MAX_TYPED_RESOURCE_CATALOG_BYTES
+            ):
                 raise ResourceScopeError("resource catalog must be a regular file")
-            with os.fdopen(descriptor, "r", encoding="utf-8") as stream:
-                descriptor = -1
-                payload = json.load(stream)
+            raw = _read_catalog_descriptor(
+                descriptor, maximum=MAX_TYPED_RESOURCE_CATALOG_BYTES
+            )
+            after = os.fstat(descriptor)
+            if (
+                after.st_dev != info.st_dev
+                or after.st_ino != info.st_ino
+                or after.st_nlink != info.st_nlink
+                or after.st_size != info.st_size
+                or after.st_mtime_ns != info.st_mtime_ns
+                or after.st_ctime_ns != info.st_ctime_ns
+            ):
+                raise ResourceScopeError(
+                    "resource catalog changed while it was being read"
+                )
         except ResourceScopeError:
             raise
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        except OSError as exc:
             raise ResourceScopeError("resource catalog cannot be read") from exc
         finally:
-            if descriptor >= 0:
-                os.close(descriptor)
+            os.close(descriptor)
+        try:
+            payload = strict_json_loads(
+                raw, max_bytes=MAX_TYPED_RESOURCE_CATALOG_BYTES
+            )
+        except ValueError as exc:
+            raise ResourceScopeError("resource catalog contains malformed JSON") from exc
         return cls.from_manifest(
             payload,
             expected_policy_digest=expected_policy_digest,
@@ -891,65 +925,165 @@ def _catalog_digest(
             for digest, scope in sorted(scopes.items())
         ],
     }
-    encoded = json.dumps(
-        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    return canonical_digest(payload)
 
 
 def _trusted_catalog_path(path: Path) -> Path:
-    """Validate the standalone catalog file and every parent directory.
+    """Validate catalog path syntax without resolving it through a workspace.
 
-    The JSON digest authenticates contents, not the pathname used to open the
-    file.  Production callers therefore also need a no-symlink parent chain,
-    a single-link regular file, and a non-writable owner boundary.  Root-owned
-    deployment files and a current-user-owned development file are both
-    supported; group/other-writable locations fail closed.
+    The actual loader uses :func:`_open_trusted_catalog`, which walks the
+    parent chain with directory descriptors.  This small helper remains the
+    single lexical path gate for callers that need to validate a path before
+    opening it.
     """
     candidate = Path(path).expanduser()
     if not candidate.is_absolute():
         raise ResourceScopeError("resource catalog path must be absolute")
     if any(part == ".." for part in candidate.parts):
         raise ResourceScopeError("resource catalog path contains parent traversal")
-    if os.name == "nt":
-        # Windows production uses the native deployment ACL rather than POSIX
-        # uid/mode bits.  The final open still uses no-follow where available.
-        return candidate
-    allowed_uids = {0, os.getuid()}
-    current = Path(candidate.anchor)
-    for part in candidate.parts[1:]:
-        current /= part
-        try:
-            info = os.lstat(current)
-        except OSError as exc:
-            raise ResourceScopeError("resource catalog path is unavailable") from exc
-        if stat.S_ISLNK(info.st_mode):
-            raise ResourceScopeError("resource catalog path contains a symlink")
-        sticky_system_directory = (
-            stat.S_ISDIR(info.st_mode)
-            and info.st_uid == 0
-            and bool(info.st_mode & 0o1000)
-        )
-        if (
-            (info.st_uid not in allowed_uids or info.st_mode & 0o022)
-            and not sticky_system_directory
-        ):
-            raise ResourceScopeError(
-                "resource catalog path is not owned by a trusted non-writable identity"
-            )
-        if current != candidate and not stat.S_ISDIR(info.st_mode):
-            raise ResourceScopeError("resource catalog parent is not a directory")
-    try:
-        info = os.lstat(candidate)
-    except OSError as exc:
-        raise ResourceScopeError("resource catalog is unavailable") from exc
-    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-        raise ResourceScopeError("resource catalog must be a single-link regular file")
-    if info.st_uid not in allowed_uids or info.st_mode & 0o022:
-        raise ResourceScopeError(
-            "resource catalog is not owned by a trusted non-writable identity"
-        )
     return candidate
+
+
+def _trusted_owner_directory(info: os.stat_result) -> bool:
+    """Return whether one opened catalog parent has an allowed owner/mode."""
+    if os.name == "nt":
+        # Windows production uses ``windows_trust``.  POSIX mode bits are not
+        # an equivalent ACL and must never silently admit a catalog here.
+        return False
+    allowed_uids = {0, os.getuid()}
+    sticky_system_directory = (
+        stat.S_ISDIR(info.st_mode)
+        and info.st_uid == 0
+        and bool(info.st_mode & 0o1000)
+    )
+    return (
+        info.st_uid in allowed_uids and not info.st_mode & 0o022
+    ) or sticky_system_directory
+
+
+def _open_trusted_catalog(path: Path, *, require_windows_acl: bool = False) -> int:
+    """Open a catalog through a no-follow, descriptor-relative path walk."""
+    candidate = _trusted_catalog_path(path)
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    close_on_exec = getattr(os, "O_CLOEXEC", 0)
+    if os.name == "nt":
+        try:
+            if require_windows_acl:
+                validate_windows_trusted_path(candidate, kind="catalog")
+            else:
+                reject_windows_reparse_points(candidate)
+            descriptor = os.open(
+                str(candidate), os.O_RDONLY | no_follow | close_on_exec | _O_BINARY
+            )
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                os.close(descriptor)
+                raise ResourceScopeError(
+                    "resource catalog must be a single-link regular file"
+                )
+            if require_windows_acl:
+                validate_windows_trusted_descriptor(
+                    descriptor, path=candidate, kind="catalog"
+                )
+            return descriptor
+        except WindowsTrustError as exc:
+            raise ResourceScopeError(str(exc)) from exc
+        except ResourceScopeError:
+            raise
+        except OSError as exc:
+            raise ResourceScopeError("resource catalog cannot be opened") from exc
+
+    directory_flag = getattr(os, "O_DIRECTORY", 0)
+    directory_descriptors: list[int] = []
+    try:
+        root_descriptor = os.open(
+            str(candidate.anchor),
+            os.O_RDONLY | directory_flag | no_follow | close_on_exec,
+        )
+        directory_descriptors.append(root_descriptor)
+        current_descriptor = root_descriptor
+        for part in candidate.parts[1:-1]:
+            try:
+                next_descriptor = os.open(
+                    part,
+                    os.O_RDONLY | directory_flag | no_follow | close_on_exec,
+                    dir_fd=current_descriptor,
+                )
+            except OSError as exc:
+                if getattr(exc, "errno", None) in {errno.ELOOP, errno.ENOTDIR}:
+                    try:
+                        parent_info = os.stat(
+                            part,
+                            dir_fd=current_descriptor,
+                            follow_symlinks=False,
+                        )
+                    except OSError:
+                        parent_info = None
+                    if parent_info is not None and stat.S_ISLNK(
+                        parent_info.st_mode
+                    ):
+                        raise ResourceScopeError(
+                            "resource catalog path contains a symlink"
+                        ) from exc
+                if getattr(exc, "errno", None) == errno.ELOOP:
+                    raise ResourceScopeError(
+                        "resource catalog path contains a symlink"
+                    ) from exc
+                raise ResourceScopeError("resource catalog path is unavailable") from exc
+            info = os.fstat(next_descriptor)
+            if not stat.S_ISDIR(info.st_mode):
+                os.close(next_descriptor)
+                raise ResourceScopeError("resource catalog parent is not a directory")
+            if not _trusted_owner_directory(info):
+                os.close(next_descriptor)
+                raise ResourceScopeError(
+                    "resource catalog path is not owned by a trusted non-writable identity"
+                )
+            directory_descriptors.append(next_descriptor)
+            current_descriptor = next_descriptor
+
+        try:
+            descriptor = os.open(
+                candidate.parts[-1],
+                os.O_RDONLY | no_follow | close_on_exec | _O_BINARY,
+                dir_fd=current_descriptor,
+            )
+        except OSError as exc:
+            if getattr(exc, "errno", None) == errno.ELOOP:
+                raise ResourceScopeError(
+                    "resource catalog path contains a symlink"
+                ) from exc
+            raise ResourceScopeError("resource catalog cannot be opened") from exc
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            os.close(descriptor)
+            raise ResourceScopeError(
+                "resource catalog must be a single-link regular file"
+            )
+        if not _trusted_owner_directory(info):
+            os.close(descriptor)
+            raise ResourceScopeError(
+                "resource catalog is not owned by a trusted non-writable identity"
+            )
+        return descriptor
+    finally:
+        for descriptor in reversed(directory_descriptors):
+            os.close(descriptor)
+
+
+def _read_catalog_descriptor(descriptor: int, *, maximum: int) -> bytes:
+    """Read one opened catalog descriptor with a hard byte limit."""
+    chunks: list[bytes] = []
+    total = 0
+    while total <= maximum:
+        chunk = os.read(descriptor, min(64 * 1024, maximum + 1 - total))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > maximum:
+            raise ResourceScopeError("resource catalog exceeds its size bound")
+    return b"".join(chunks)
 
 
 def compile_typed_resource_catalog(

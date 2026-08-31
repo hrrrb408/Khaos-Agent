@@ -508,6 +508,7 @@ def test_native_e2e_creates_configured_effect_root(
 
 def test_native_e2e_client_does_not_require_a_unix_socket(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     import importlib.util
 
@@ -521,19 +522,133 @@ def test_native_e2e_client_does_not_require_a_unix_socket(
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
 
+    policy_digest = "a" * 64
+    catalog_path = tmp_path / "native-resource-catalog.json"
+    module.write_e2e_catalog(catalog_path, policy_digest)
+    key = Ed25519KeyStore.load_or_create(tmp_path / "authorityd.pem", create=True)
+    public_key_path = tmp_path / "authorityd.pub"
+    public_key_path.write_bytes(key.public_key().public_bytes_raw())
     contract = AuthorityIdentityContract(501, 502, 503)
     adapter = object()
+    monkeypatch.setenv("KHAOS_EFFECTIVE_POLICY_DIGEST", policy_digest)
+    monkeypatch.setenv("KHAOS_TYPED_RESOURCE_CATALOG_PATH", str(catalog_path))
+    monkeypatch.setenv("KHAOS_AUTHORITYD_PUBLIC_KEY_PATH", str(public_key_path))
+
+    class FakeDeployment:
+        is_native = True
+        transport = type("Transport", (), {"value": "native"})()
+        runtime_profile = "production"
+
+        @staticmethod
+        def validate_contract(_contract) -> None:
+            return None
+
+        @staticmethod
+        def public_key_path() -> Path:
+            return public_key_path
+
+        @staticmethod
+        def authority_id() -> str:
+            return "khaos-authorityd"
+
+        @staticmethod
+        def environment_digest() -> str:
+            return "e" * 64
+
+        @staticmethod
+        def expected_authority_uid(_contract) -> int:
+            return 502
+
     monkeypatch.setattr(module, "read_contract_from_environment", lambda: contract)
+    monkeypatch.setattr(
+        module.AuthorityTransportConfig,
+        "from_environment",
+        classmethod(lambda cls, **_kwargs: FakeDeployment()),
+    )
     monkeypatch.setattr(
         module,
         "build_native_authority_adapter",
         lambda *, production, contract: adapter,
     )
 
+    # _build_client is a production composition helper, but this regression
+    # only asserts native transport selection.  The real Windows ACL loading
+    # of the catalog and public key belongs to the deployed native E2E; keep
+    # the real readers and omit only that deployment ACL check for a pytest
+    # temp directory.  The assertions prove production requested the check.
+    original_catalog_loader = module.TypedResourcePartialOrder.from_json_file
+
+    def load_test_catalog(
+        cls,
+        path,
+        *,
+        expected_policy_digest=None,
+        require_windows_acl=False,
+    ):
+        assert path == catalog_path
+        assert expected_policy_digest == policy_digest
+        assert require_windows_acl is (os.name == "nt")
+        return original_catalog_loader(
+            path,
+            expected_policy_digest=expected_policy_digest,
+            require_windows_acl=False,
+        )
+
+    original_public_key_loader = module.Ed25519KeyStore.load_public_key
+
+    def load_test_public_key(path, *, require_windows_acl=False):
+        assert path == public_key_path
+        assert require_windows_acl is (os.name == "nt")
+        return original_public_key_loader(path, require_windows_acl=False)
+
+    monkeypatch.setattr(
+        module.TypedResourcePartialOrder,
+        "from_json_file",
+        classmethod(load_test_catalog),
+    )
+    monkeypatch.setattr(
+        module.Ed25519KeyStore,
+        "load_public_key",
+        staticmethod(load_test_public_key),
+    )
+
     client = module._build_client()
 
     assert client.socket_path is None
     assert client.native_adapter is adapter
+    assert client.transport == "native"
+    assert client.trust_binding is not None
+
+
+def test_native_e2e_handshakes_before_transaction_requests() -> None:
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "run_native_authority_e2e_handshake",
+        Path(__file__).resolve().parents[2].parent
+        / "scripts"
+        / "run_native_authority_e2e.py",
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.identity: dict[str, str] | None = None
+
+        def handshake(self, **identity: str) -> None:
+            self.identity = identity
+
+    client = FakeClient()
+    module._handshake(client)
+
+    assert client.identity == {
+        "runtime_id": "e2e-runtime",
+        "principal_id": module.E2E_PRINCIPAL_ID,
+        "project_id": module.E2E_PROJECT_ID,
+        "principal_kind": module.E2E_PRINCIPAL_KIND,
+    }
 
 
 def test_e2e_intent_reuses_the_grant_owner_context() -> None:

@@ -33,9 +33,11 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from khaos.security.authority_context import AuthorityContextV1
 from khaos.security.authorityd_protocol import (
+    AUTHORITY_HANDSHAKE_SCHEMA_VERSION,
     AUTHORITYD_PROTOCOL,
     MAX_GRANT_TTL_SECONDS,
     MAX_MESSAGE_BYTES,
+    MAX_TRUST_CHANNELS,
     AuditWriter,
     AuthorityControlPlaneError,
     AuthorizationIntent,
@@ -63,9 +65,17 @@ from khaos.security.principals import (
     DelegationAuthority,
     DelegationScope,
     PrincipalDelegationError,
+    PrincipalKind,
     _operation_is_narrower,
     principal_from_kind,
     transport_root_delegation_digest,
+)
+from khaos.security.production_trust import (
+    ProductionTrustBinding,
+    ProductionTrustError,
+    compare_trust_bindings,
+    deployment_environment_digest,
+    public_key_fingerprint,
 )
 from khaos.security.protocol_boundary import (
     ProtocolBoundaryError,
@@ -73,6 +83,7 @@ from khaos.security.protocol_boundary import (
     canonical_json_bytes,
     read_bounded_line,
     require_receipt_transition,
+    strict_json_loads,
 )
 from khaos.security.resource_scope import (
     ResourceScopeError,
@@ -207,6 +218,7 @@ class AuthorityDaemon:
         max_audit_obligations: int | None = None,
         require_live_grants: bool = False,
         require_typed_principals: bool = False,
+        trust_binding: ProductionTrustBinding | None = None,
     ) -> None:
         if not socket_path.is_absolute() or audit_writer is None:
             raise AuthorityControlPlaneError(
@@ -226,6 +238,20 @@ class AuthorityDaemon:
         self.signing_key = signing_key
         self.audit_writer = audit_writer
         self.issuer_id = issuer_id
+        if trust_binding is not None:
+            if trust_binding.authority_id != issuer_id:
+                raise AuthorityControlPlaneError(
+                    "authorityd trust binding authority identity does not match issuer"
+                )
+            expected_fingerprint = public_key_fingerprint(
+                signing_key.public_key().public_bytes_raw()
+            )
+            if trust_binding.public_key_fingerprint != expected_fingerprint:
+                raise AuthorityControlPlaneError(
+                    "authorityd trust binding key fingerprint does not match signer"
+                )
+        self.trust_binding = trust_binding
+        self._trust_channels: dict[str, dict[str, str]] = {}
         self.policy = policy
         self._lock = threading.RLock()
         self._audit_lock = threading.Lock()
@@ -2142,8 +2168,8 @@ class AuthorityDaemon:
                 "authority attestation request digest does not match the payload"
             )
         try:
-            inner = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            inner = strict_json_loads(raw, max_bytes=MAX_MESSAGE_BYTES)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
             raise AuthorityControlPlaneError(
                 "authority attestation request is malformed JSON"
             ) from exc
@@ -2194,12 +2220,50 @@ class AuthorityDaemon:
         signature = base64.b64encode(
             self.signing_key.sign(canonical_json_bytes(payload))
         ).decode("ascii")
-        response = _dispatch(self, inner)
+        # The native frontend's identity probe is a signed, non-effect
+        # transport check.  It must remain usable before the runtime trust
+        # channel exists, while every effect-bearing inner request still
+        # requires the normal binding and channel nonce.
+        if inner.get("operation") not in {"ping", "handshake"}:
+            # Do not turn an unbound or mismatched effect request into a
+            # seemingly successful attestation.  Once this trust preflight
+            # passes, _dispatch may still return a signed application-level
+            # rejection (for example, a revoked grant); that distinction is
+            # what lets native clients keep a healthy READY channel after a
+            # legitimate policy/business denial.
+            _require_request_trust_binding(self, inner)
+        try:
+            response = _dispatch(self, inner, allow_transport_probe=True)
+        except RemoteAuditUnavailableError as exc:
+            # Keep the transport attestation intact while carrying a durable
+            # audit failure as an application-level UNKNOWN response.  The
+            # native client must be able to distinguish a trusted authority
+            # rejection from a broken native transport and retain its READY
+            # channel for the next bounded request.
+            response = {
+                "ok": False,
+                "error": str(exc),
+                "error_code": "remote_audit_unavailable",
+            }
+        except (AuthorityControlPlaneError, ProtocolBoundaryError, OSError, ValueError, TypeError) as exc:
+            # Native transports sign this response envelope, so ordinary
+            # business/policy rejection does not masquerade as a transport
+            # identity failure at the adapter boundary.
+            response = {"ok": False, "error": str(exc)}
         return {
             "ok": True,
             "response": response,
             "attestation": {**payload, "signature": signature},
         }
+
+    def close_trust_channel(self, channel_nonce: str) -> None:
+        """Release one runtime channel without touching any effect grant."""
+        if not _is_hex(channel_nonce, 64):
+            raise AuthorityControlPlaneError(
+                "authority trust channel nonce is malformed"
+            )
+        with self._lock:
+            self._trust_channels.pop(channel_nonce, None)
 
     def delegation_root(self, scope: DelegationScope) -> str:
         """Register one ingress root delegation (idempotent by digest)."""
@@ -2433,7 +2497,15 @@ def _build_policy_bound_daemon(
         raise AuthorityControlPlaneError(
             "production typed resource catalog is not bound to the effective policy"
         )
-    key = Ed25519KeyStore.load_or_create(key_path, create=False)
+    key = Ed25519KeyStore.load_or_create(
+        key_path, create=False, require_windows_acl=os.name == "nt"
+    )
+    trust_binding = _build_trust_binding(
+        issuer_id=issuer_id,
+        signing_key=key,
+        policy_digest=expected_policy_digest,
+        catalog_digest=resource_order.catalog_semantic_digest,
+    )
     kernel = AuthorityPolicyKernel(
         expected_policy_digest=expected_policy_digest,
         resource_order=resource_order,
@@ -2451,7 +2523,60 @@ def _build_policy_bound_daemon(
         policy=selected_policy,
         require_live_grants=True,
         require_typed_principals=True,
+        trust_binding=trust_binding,
     )
+
+
+def _build_trust_binding(
+    *,
+    issuer_id: str,
+    signing_key: Ed25519PrivateKey,
+    policy_digest: str,
+    catalog_digest: str,
+) -> ProductionTrustBinding:
+    """Build the immutable trust witness required by both deployment profiles."""
+    if (
+        len(policy_digest) != 64
+        or policy_digest != policy_digest.lower()
+        or any(character not in _HEX_DIGITS for character in policy_digest)
+        or len(catalog_digest) != 64
+        or catalog_digest != catalog_digest.lower()
+        or any(character not in _HEX_DIGITS for character in catalog_digest)
+    ):
+        raise AuthorityControlPlaneError(
+            "authorityd trust binding requires canonical SHA-256 policy and catalog digests"
+        )
+    raw_profile = os.environ.get("KHAOS_AUTHORITY_PROFILE", "").strip()
+    profile = raw_profile or ("community" if sys.platform == "darwin" else "native-production")
+    if profile == "community":
+        transport = "unix"
+    elif sys.platform == "darwin" or os.name == "nt":
+        transport = "native"
+    else:
+        transport = "unix"
+    configured_environment_digest = os.environ.get(
+        "KHAOS_AUTHORITYD_ENVIRONMENT_DIGEST", ""
+    ).strip()
+    environment_digest = configured_environment_digest or deployment_environment_digest(
+        platform_name=sys.platform,
+        profile=profile,
+        transport=transport,
+    )
+    try:
+        return ProductionTrustBinding.create(
+            protocol_version=AUTHORITYD_PROTOCOL,
+            authority_id=issuer_id,
+            policy_digest=policy_digest,
+            catalog_digest=catalog_digest,
+            public_key_fingerprint=public_key_fingerprint(
+                signing_key.public_key().public_bytes_raw()
+            ),
+            environment_digest=environment_digest,
+        )
+    except ProductionTrustError as exc:
+        raise AuthorityControlPlaneError(
+            "authorityd production trust binding is invalid"
+        ) from exc
 
 
 def build_production_daemon(
@@ -3005,7 +3130,7 @@ def _serve_connection(
                 body = read_bounded_line(
                     connection, max_bytes=MAX_MESSAGE_BYTES
                 )
-                request = json.loads(body.decode("utf-8"))
+                request = strict_json_loads(body, max_bytes=MAX_MESSAGE_BYTES)
                 response = _dispatch(daemon, request)
             except RemoteAuditUnavailableError as exc:
                 response = {
@@ -3030,10 +3155,25 @@ def _serve_connection(
             slots.release()
 
 
-def _dispatch(daemon: AuthorityDaemon, request: object) -> dict[str, object]:
+def _dispatch(
+    daemon: AuthorityDaemon,
+    request: object,
+    *,
+    allow_transport_probe: bool = False,
+) -> dict[str, object]:
     if not isinstance(request, dict) or request.get("protocol") != AUTHORITYD_PROTOCOL:
         raise AuthorityControlPlaneError("invalid authorityd request")
     operation = request.get("operation")
+    if operation == "handshake":
+        return _dispatch_handshake(daemon, request)
+    channel_identity: dict[str, str] | None = None
+    if operation != "attest" and not (
+        allow_transport_probe and operation == "ping"
+    ):
+        channel_identity = _require_request_trust_binding(daemon, request)
+    if operation == "close_trust_channel":
+        daemon.close_trust_channel(str(request.get("channel_nonce", "")))
+        return {"ok": True}
     if operation == "grant":
         grant_id, expires_at = daemon.grant(
             principal_id=str(request.get("principal_id", "")),
@@ -3128,10 +3268,12 @@ def _dispatch(daemon: AuthorityDaemon, request: object) -> dict[str, object]:
         )
     if operation == "delegation_root":
         scope = DelegationScope.from_payload(request.get("scope"))
+        _require_delegation_channel_owner(channel_identity, scope)
         digest = daemon.delegation_root(scope)
         return {"ok": True, "delegation_digest": digest}
     if operation == "delegation_child":
         parent = DelegationScope.from_payload(request.get("parent"))
+        _require_delegation_channel_owner(channel_identity, parent)
         child = daemon.delegation_child(
             parent,
             str(request.get("child_principal_id", "")),
@@ -3166,6 +3308,142 @@ def _dispatch(daemon: AuthorityDaemon, request: object) -> dict[str, object]:
         daemon.delegation_revoke(delegation)
         return {"ok": True}
     raise AuthorityControlPlaneError("unknown authorityd operation")
+
+
+def _dispatch_handshake(
+    daemon: AuthorityDaemon, request: dict[object, object]
+) -> dict[str, object]:
+    """Validate and acknowledge one complete runtime trust binding."""
+    if daemon.trust_binding is None:
+        raise AuthorityControlPlaneError(
+            "authorityd has no production trust binding"
+        )
+    expected_fields = {
+        "protocol",
+        "operation",
+        "handshake_schema_version",
+        "protocol_version",
+        "runtime_identity",
+        "trust_binding",
+    }
+    if set(request) != expected_fields:
+        raise AuthorityControlPlaneError("authorityd handshake fields are not exact")
+    if request.get("handshake_schema_version") != AUTHORITY_HANDSHAKE_SCHEMA_VERSION:
+        raise AuthorityControlPlaneError("authorityd handshake schema is unsupported")
+    if request.get("protocol_version") != AUTHORITYD_PROTOCOL:
+        raise AuthorityControlPlaneError("authorityd handshake protocol is unsupported")
+    identity = request.get("runtime_identity")
+    if not isinstance(identity, dict) or set(identity) != {
+        "runtime_id",
+        "principal_id",
+        "project_id",
+        "principal_kind",
+    }:
+        raise AuthorityControlPlaneError("authorityd runtime identity is malformed")
+    if any(
+        type(value) is not str or not value or "\x00" in value or len(value) > 256
+        for value in identity.values()
+    ):
+        raise AuthorityControlPlaneError("authorityd runtime identity is invalid")
+    try:
+        PrincipalKind(identity["principal_kind"])
+    except ValueError as exc:
+        raise AuthorityControlPlaneError(
+            "authorityd runtime principal kind is invalid"
+        ) from exc
+    try:
+        requested = ProductionTrustBinding.from_payload(request["trust_binding"])
+        compare_trust_bindings(daemon.trust_binding, requested)
+    except ProductionTrustError as exc:
+        raise AuthorityControlPlaneError(
+            "authorityd handshake trust binding mismatch"
+        ) from exc
+    with daemon._lock:
+        # One live channel per exact runtime identity prevents repeated
+        # handshakes (including a client that never receives the response)
+        # from consuming the bounded channel table indefinitely.  Replacing
+        # the old nonce also makes the old channel fail closed immediately.
+        for existing_nonce, existing_identity in tuple(daemon._trust_channels.items()):
+            if existing_identity == identity:
+                daemon._trust_channels.pop(existing_nonce, None)
+        if len(daemon._trust_channels) >= MAX_TRUST_CHANNELS:
+            raise AuthorityControlPlaneError(
+                "authorityd trust channel quota is exhausted"
+            )
+        channel_nonce = secrets.token_hex(32)
+        daemon._trust_channels[channel_nonce] = dict(identity)
+    return {
+        "ok": True,
+        "ready": "READY",
+        "issuer_id": daemon.issuer_id,
+        "runtime_identity": dict(identity),
+        "trust_binding": daemon.trust_binding.to_payload(),
+        "channel_nonce": channel_nonce,
+        # Keep the semantic name explicit in startup evidence.  It is an
+        # alias, not a second digest authority.
+        "catalog_semantic_digest": daemon.trust_binding.catalog_semantic_digest,
+    }
+
+
+def _require_request_trust_binding(
+    daemon: AuthorityDaemon, request: dict[object, object]
+) -> dict[str, str] | None:
+    """Require the startup binding on every post-handshake authority request."""
+    if daemon.trust_binding is None:
+        return None
+    try:
+        requested = ProductionTrustBinding.from_payload(request.get("trust_binding"))
+        compare_trust_bindings(daemon.trust_binding, requested)
+    except ProductionTrustError as exc:
+        raise AuthorityControlPlaneError(
+            "authorityd request trust binding mismatch"
+        ) from exc
+    channel_nonce = request.get("channel_nonce")
+    if (
+        type(channel_nonce) is not str
+        or len(channel_nonce) != 64
+        or any(character not in _HEX_DIGITS for character in channel_nonce)
+    ):
+        raise AuthorityControlPlaneError("authorityd trust channel is missing")
+    with daemon._lock:
+        channel_identity = daemon._trust_channels.get(channel_nonce)
+        if channel_identity is None:
+            raise AuthorityControlPlaneError("authorityd trust channel is unknown")
+    identity = request.get("runtime_identity")
+    if not isinstance(identity, dict) or set(identity) != {
+        "runtime_id",
+        "principal_id",
+        "project_id",
+        "principal_kind",
+    }:
+        raise AuthorityControlPlaneError("authorityd request runtime identity is missing")
+    if any(
+        type(value) is not str or not value or "\x00" in value or len(value) > 256
+        for value in identity.values()
+    ):
+        raise AuthorityControlPlaneError("authorityd request runtime identity is invalid")
+    if identity != channel_identity:
+        raise AuthorityControlPlaneError(
+            "authorityd request runtime identity does not match the trust channel"
+        )
+    return channel_identity
+
+
+def _require_delegation_channel_owner(
+    channel_identity: dict[str, str] | None,
+    scope: DelegationScope,
+) -> None:
+    """Keep delegation roots owned by the authenticated ingress channel."""
+    if channel_identity is None:
+        return
+    if (
+        scope.subject.principal_id != channel_identity["principal_id"]
+        or scope.subject.kind.value != channel_identity["principal_kind"]
+        or scope.project_id != channel_identity["project_id"]
+    ):
+        raise AuthorityControlPlaneError(
+            "delegation scope owner does not match the authority trust channel"
+        )
 
 
 def _mapping(value: object) -> dict[str, Any]:

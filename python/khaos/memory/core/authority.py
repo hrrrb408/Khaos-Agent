@@ -87,6 +87,8 @@ def candidate_digest(candidate: MemoryCandidate) -> str:
         "usage_policy": enum_value(candidate.usage_policy),
         "verification_run_id": candidate.verification_run_id,
         "verification_result_digest": candidate.verification_result_digest,
+        "source_kind": enum_value(candidate.source_kind) if candidate.source_kind else None,
+        "provenance": dict(candidate.provenance),
     }
     return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
 

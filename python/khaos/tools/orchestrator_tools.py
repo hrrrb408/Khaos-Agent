@@ -41,6 +41,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
+from khaos.subagents.assignment import AssignmentDisposition
 from khaos.tools.scheduler import (
     EFFECT_APPLIED,
     EFFECT_NOT_APPLIED,
@@ -196,6 +197,50 @@ async def spawn_subagent(
     except Exception as exc:  # noqa: BLE001 — 工具层兜底，转为结构化错误
         logger.error("Failed to spawn subagent: %s", exc)
         return _failure({"ok": False, "error": str(exc)})
+
+
+async def delegate_plan_step(
+    plan_step_id: str,
+    *,
+    principal_id: str = "",
+    project_id: str = "",
+    task_id: str = "",
+    subagent_control_coordinator: Any = None,
+) -> ToolExecutionOutcome:
+    """Delegate one current published coding-plan step.
+
+    The model supplies only the step identifier.  The coordinator reloads
+    GoalSpec, the published revision, workspace identity, dependency state,
+    reviewed tool metadata, and the parent owner from trusted state.
+    """
+    if not principal_id or not project_id or not task_id or not plan_step_id:
+        return _failure({"ok": False, "error": "delegation identity is incomplete"})
+    if subagent_control_coordinator is None:
+        return _failure({"ok": False, "error": "plan-bound delegation is unavailable"})
+    try:
+        result = await subagent_control_coordinator.request(
+            task_owner_principal_id=principal_id,
+            project_id=project_id,
+            parent_task_id=task_id,
+            plan_step_id=plan_step_id,
+        )
+    except Exception as exc:
+        logger.exception("plan-bound delegation failed")
+        return _failure({"ok": False, "error": type(exc).__name__})
+    output: dict[str, Any] = {
+        "ok": result.disposition is AssignmentDisposition.CREATED,
+        "disposition": result.disposition.value,
+        "reason_code": result.reason_code,
+        "reason": result.reason,
+    }
+    if result.assignment is not None:
+        output.update({
+            "assignment_id": result.assignment.assignment_id,
+            "assignment_digest": result.assignment.assignment_digest,
+            "child_execution_principal_id": result.assignment.child_execution_principal_id,
+            "plan_step_id": result.assignment.plan_step_id,
+        })
+    return _success(output) if output["ok"] else _failure(output)
 
 
 async def collect_results(

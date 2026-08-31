@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 from collections.abc import Mapping
 from datetime import datetime
 from typing import Any
@@ -194,7 +195,9 @@ def _bound_payload(payload: Mapping[str, Any], max_bytes: int) -> dict[str, Any]
 
     if not isinstance(payload, Mapping):
         raise TypeError("event payload must be a mapping")
-    bounded = {str(key): _bound_value(value) for key, value in payload.items()}
+    bounded = {
+        str(key): _bound_value(value, key=str(key)) for key, value in payload.items()
+    }
     encoded = canonical_json(bounded).encode("utf-8")
     if len(encoded) <= max_bytes:
         return bounded
@@ -209,11 +212,47 @@ def _bound_payload(payload: Mapping[str, Any], max_bytes: int) -> dict[str, Any]
     return summary
 
 
-def _bound_value(value: Any) -> Any:
+_SECRET_FIELD_NAMES = frozenset(
+    {
+        "api_key",
+        "apikey",
+        "access_token",
+        "authorization",
+        "bearer_token",
+        "cookie",
+        "credential",
+        "credentials",
+        "dispatch_token",
+        "password",
+        "private_key",
+        "secret",
+        "secret_value",
+        "sandbox_token",
+        "approval_receipt",
+        "approval_token",
+        "capability_handle",
+        "credential_handle",
+        "verification_proof",
+    }
+)
+_SECRET_TEXT_PATTERNS = (
+    re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+"),
+    re.compile(r"(?i)\b(?:api[_ -]?key|access[_ -]?token|secret|password)\s*[:=]\s*[^\s,;]+"),
+)
+
+
+def _bound_value(value: Any, *, key: str = "") -> Any:
+    """Bound values and remove known authority/secret material."""
+
+    if key.casefold() in _SECRET_FIELD_NAMES:
+        return "[REDACTED_SECRET]"
     if isinstance(value, str):
-        if len(value.encode("utf-8")) <= 4096:
-            return value
-        encoded = value.encode("utf-8")
+        sanitized = value
+        for pattern in _SECRET_TEXT_PATTERNS:
+            sanitized = pattern.sub("[REDACTED_SECRET]", sanitized)
+        if len(sanitized.encode("utf-8")) <= 4096:
+            return sanitized
+        encoded = sanitized.encode("utf-8")
         return {
             "truncated": True,
             "sha256": hashlib.sha256(encoded).hexdigest(),
@@ -221,7 +260,10 @@ def _bound_value(value: Any) -> Any:
             "preview": encoded[:1024].decode("utf-8", errors="replace"),
         }
     if isinstance(value, Mapping):
-        return {str(key): _bound_value(item) for key, item in list(value.items())[:256]}
+        return {
+            str(key): _bound_value(item, key=str(key))
+            for key, item in list(value.items())[:256]
+        }
     if isinstance(value, (list, tuple)):
         return [_bound_value(item) for item in list(value)[:256]]
     if value is None or isinstance(value, (bool, int, float)):

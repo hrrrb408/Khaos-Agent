@@ -4,8 +4,9 @@ from khaos.coding.task_manager import TaskManager, TaskStatus, TransitionResult
 async def test_terminal_states_are_strictly_immutable():
     manager = TaskManager()
     task = await manager.create("terminal")
-    assert await manager.update_status(task.id, TaskStatus.COMPLETED) == TransitionResult.UPDATED
-    assert await manager.update_status(task.id, TaskStatus.FAILED) == TransitionResult.INVALID_TRANSITION
+    assert await manager.update_status(task.id, TaskStatus.FAILED) == TransitionResult.UPDATED
+    assert await manager.update_status(task.id, TaskStatus.COMPLETED) == TransitionResult.INVALID_TRANSITION
+    assert await manager.update_status(task.id, TaskStatus.FAILED) == TransitionResult.UNCHANGED
     assert await manager.cancel(task.id) == TransitionResult.INVALID_TRANSITION
 
 

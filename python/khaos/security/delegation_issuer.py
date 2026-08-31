@@ -14,7 +14,6 @@ import time
 from typing import Protocol
 
 from khaos.runtime.context import RequestContext
-from khaos.security.authorityd_protocol import AuthorityDaemonClient
 from khaos.security.principals import (
     PRINCIPAL_DELEGATION_FAMILY,
     DelegationScope,
@@ -43,10 +42,35 @@ class SubAgentDelegationIssuer(Protocol):
     ) -> str: ...
 
 
+class DelegationAuthorityClient(Protocol):
+    """Minimal authority surface required to issue a child delegation."""
+
+    def delegation_register_root(self, scope: DelegationScope) -> str:
+        """Register an ingress root with the independent authority."""
+        ...
+
+    def delegation_issue_child(
+        self,
+        parent: DelegationScope,
+        child_principal_id: str,
+        child_principal_kind: str,
+        *,
+        operation_family: str,
+        resource_scope: list[str],
+        expires_at: float,
+        session_id: str | None = None,
+        runtime_id: str | None = None,
+        task_id: str | None = None,
+        workspace_id: str | None = None,
+    ) -> DelegationScope:
+        """Issue one narrow child delegation."""
+        ...
+
+
 class AuthorityDelegationIssuer:
     """Production issuer backed by the independent authority daemon."""
 
-    def __init__(self, client: AuthorityDaemonClient) -> None:
+    def __init__(self, client: DelegationAuthorityClient) -> None:
         self._client = client
 
     def _root_scope(
@@ -120,4 +144,95 @@ class AuthorityDelegationIssuer:
         return child.digest
 
 
-__all__ = ["AuthorityDelegationIssuer", "SubAgentDelegationIssuer"]
+class ProductionSubAgentDelegationIssuer:
+    """Issue delegations through a short-lived, bound production channel.
+
+    RPC subagent admission happens before a child runtime exists, so the
+    issuer cannot borrow that child's effect broker.  It therefore creates a
+    separate authority channel bound to the authenticated ingress principal
+    and the child execution identity, issues the narrow delegation, and
+    releases the channel immediately.  The child then creates its own READY
+    broker for all effects.  Crucially, this path never constructs an
+    unbound production ``AuthorityDaemonClient``.
+    """
+
+    def __init__(
+        self,
+        *,
+        policy_digest: str,
+        catalog_digest: str,
+        project_id: str,
+    ) -> None:
+        if (
+            type(policy_digest) is not str
+            or len(policy_digest) != 64
+            or any(character not in "0123456789abcdef" for character in policy_digest)
+        ):
+            raise ValueError("production delegation policy digest is invalid")
+        if (
+            type(catalog_digest) is not str
+            or len(catalog_digest) != 64
+            or any(character not in "0123456789abcdef" for character in catalog_digest)
+        ):
+            raise ValueError("production delegation catalog digest is invalid")
+        if type(project_id) is not str or not project_id or "\x00" in project_id:
+            raise ValueError("production delegation project_id is invalid")
+        self._policy_digest = policy_digest
+        self._catalog_digest = catalog_digest
+        self._project_id = project_id
+
+    def issue_subagent_delegation(
+        self,
+        ctx: RequestContext,
+        *,
+        task_id: str,
+        tools: list[str],
+        timeout_seconds: int,
+        session_id: str = "",
+        runtime_id: str = "",
+        workspace_id: str = "",
+    ) -> str:
+        if ctx.project_id != self._project_id:
+            raise PermissionError(
+                "subagent delegation project does not match the production binding"
+            )
+        if ctx.policy_digest != self._policy_digest:
+            raise PermissionError(
+                "subagent delegation policy does not match the production binding"
+            )
+        if not runtime_id:
+            raise ValueError("subagent delegation runtime_id is required")
+        # The channel is authenticated as the ingress principal.  The child
+        # runtime receives its own channel later; the two channels must not be
+        # conflated because the authority uses the runtime identity as part of
+        # the trust binding.
+        from khaos.security.authority_broker import AuthorityBroker
+
+        broker = AuthorityBroker.for_production(
+            policy_digest=self._policy_digest,
+            catalog_digest=self._catalog_digest,
+            runtime_id=f"delegation:{runtime_id}",
+            principal_id=ctx.principal_id,
+            project_id=self._project_id,
+            principal_kind=ctx.principal_kind,
+        )
+        try:
+            return AuthorityDelegationIssuer(broker).issue_subagent_delegation(
+                ctx,
+                task_id=task_id,
+                tools=tools,
+                timeout_seconds=timeout_seconds,
+                session_id=session_id,
+                runtime_id=runtime_id,
+                workspace_id=workspace_id,
+            )
+        finally:
+            broker.close()
+
+
+__all__ = [
+    "AuthorityDelegationIssuer",
+    "DelegationAuthorityClient",
+    "ProductionSubAgentDelegationIssuer",
+    "SubAgentDelegationIssuer",
+]

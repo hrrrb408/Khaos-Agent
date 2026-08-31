@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 import logging
@@ -14,9 +15,24 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
+from khaos.agent.control.state import AgentCognitiveState
+
 if TYPE_CHECKING:
+    from khaos.agent.control.completion_flow import (
+        CompletionFactProvider,
+        CompletionProposalController,
+        CompletionProposalResult,
+    )
+    from khaos.agent.control.completion_gate import (
+        CompletionGate,
+        CompletionGateResult,
+    )
+    from khaos.agent.control.completion_recovery import CompletionRecoveryService
+    from khaos.agent.control.recovery import NormalizedFailureSignature
+    from khaos.agent.control.recovery_control import RecoveryControlCoordinator
     from khaos.coding.cost_tracker import CostTracker
     from khaos.coding.fingerprint import FileFingerprintCache
+    from khaos.coding.intelligence.query_service import ContextIntelligenceService
     from khaos.coding.task_manager import TaskManager
     from khaos.coding.verify_fix import VerifyFixLoop
     from khaos.project_context import ProjectContextLoader
@@ -65,6 +81,13 @@ class AgentConfig:
     compression_threshold: int = 128000
     # Token budget for the injected project-structure tree (coding mode only).
     project_structure_token_budget: int = 2000
+    # M7.2 bounded workspace context limits.  These are disclosure/compute
+    # bounds, never filesystem or execution authority.
+    context_token_budget: int = 12_000
+    context_max_files: int = 16
+    context_max_symbols: int = 128
+    context_max_bytes: int = 256 * 1024
+    context_max_file_bytes: int = 64 * 1024
 
 
 @dataclass
@@ -109,6 +132,7 @@ class AgentLoop:
         skill_manager=None,
         project_root=None,
         coding_context_builder=None,
+        context_intelligence: ContextIntelligenceService | None = None,
         project_context_loader: ProjectContextLoader | None = None,
         file_fingerprint_cache: FileFingerprintCache | None = None,
         cost_tracker: CostTracker | None = None,
@@ -144,6 +168,7 @@ class AgentLoop:
         cron_engine=None,
         browser_manager=None,
         subagent_spawner=None,
+        subagent_control_coordinator=None,
         credential_broker=None,
         # M4 batch 3.1.16A-5-1b (CRITICAL): project identity stamp.
         # Bound at construction from ``RuntimeConfig.project_id`` (set by
@@ -155,6 +180,15 @@ class AgentLoop:
         # for drift detection (fail-closed rejection).
         project_id: str = "",
         runtime_profile: RuntimeProfile | str | None = None,
+        completion_controller: CompletionProposalController | None = None,
+        completion_fact_provider: CompletionFactProvider | None = None,
+        completion_gate: CompletionGate | None = None,
+        completion_recovery: CompletionRecoveryService | None = None,
+        planning_coordinator: Any = None,
+        trusted_verification_authority: Any = None,
+        trusted_verification_service: Any = None,
+        recovery_control: RecoveryControlCoordinator | None = None,
+        delegated_execution_context: Any = None,
     ):
         self.config = config
         self.mode_manager = mode_manager
@@ -177,6 +211,10 @@ class AgentLoop:
         # left as-is (not resolved) so callers can pass relative paths.
         self.project_root = project_root
         self.coding_context_builder = coding_context_builder
+        # M7.2: production coding context is built through the
+        # owner-scoped, SafeWorkspaceFS-backed service.  The legacy builder
+        # remains available for explicitly injected development/test loops.
+        self.context_intelligence = context_intelligence
         # Phase 6: 项目约定文件加载器（KHAOS.md / AGENTS.md）。注入优先级
         # 高于 memory / skill，因为它们是项目级硬规则。
         self.project_context_loader = project_context_loader
@@ -192,11 +230,36 @@ class AgentLoop:
         # Long-task tracking: record files viewed/modified and test outcomes.
         self.task_manager = task_manager
         self.task_id = task_id
+        # M7.1.6: a coding END_TURN is a completion proposal, not a task
+        # lifecycle transition.  The controller is a narrow orchestration
+        # port; it owns no tool, approval, workspace, or sandbox authority.
+        self.completion_controller = completion_controller
+        self.completion_fact_provider = completion_fact_provider
+        self.completion_gate = completion_gate
+        self.completion_recovery = completion_recovery
+        # M7.3: planning is an explicit control-plane coordinator.  The loop
+        # only invokes the composed owner; it does not infer plans from tool
+        # names or implement planner/risk/DAG logic itself.
+        self.planning_coordinator = planning_coordinator
+        # M7.4: trusted verification is a passive evidence/assessment
+        # composition. These references do not grant execution authority and
+        # are not lifecycle writers.
+        self.trusted_verification_authority = trusted_verification_authority
+        self.trusted_verification_service = trusted_verification_service
+        # M7.5: recovery is an explicit control-plane seam.  It only consumes
+        # durable facts and can project cognitive recovery state; it never
+        # grants tools/approval/workspace authority or changes TaskStatus.
+        self.recovery_control = recovery_control
+        # M7.8: a delegated loop is a worker attached to a parent control
+        # plane.  This structural marker is never inferred from prompt text.
+        self.delegated_execution_context = delegated_execution_context
+        self._active_planning_result: Any = None
         self.skill_generator = skill_generator
         self.workspace_manager = workspace_manager
         self.active_workspace = None
         self._active_session_id = ""
         self._active_task_id: str | None = None
+        self._recovery_cycles_this_turn = 0
         self.execution_service = execution_service
         if approval_broker is None:
             from khaos.agent.approval import ApprovalBroker
@@ -231,6 +294,7 @@ class AgentLoop:
         self.cron_engine = cron_engine
         self.browser_manager = browser_manager
         self.subagent_spawner = subagent_spawner
+        self.subagent_control_coordinator = subagent_control_coordinator
         self.credential_broker = credential_broker
         self.channel_admins = (
             channel_admins if channel_admins is not None else frozenset()
@@ -318,17 +382,34 @@ class AgentLoop:
         active_task_id = task_id or self.task_id
         self._active_task_id = active_task_id
         self._active_session_id = session_id
+        if self.delegated_execution_context is not None:
+            if self.workspace_manager is None:
+                raise PermissionError("delegated execution requires the parent workspace authority")
+            self.active_workspace = self.workspace_manager.get(
+                self.delegated_execution_context.workspace_id
+            )
+            if self.active_workspace is None:
+                raise PermissionError("delegated execution cannot attach the parent workspace")
+        self._recovery_cycles_this_turn = 0
         is_coding = self.mode_manager.current_mode.value == "coding"
         if is_coding and self._verify_fix_factory is not None:
             self.verify_fix_loop = self._verify_fix_factory()
         elif not is_coding:
             self.verify_fix_loop = None
-        if self.task_manager is not None and is_coding:
+        if self.task_manager is not None and is_coding and self.delegated_execution_context is None:
             if active_task_id is None:
                 task = await self.task_manager.create(user_input)
                 active_task_id = task.id
                 self._active_task_id = active_task_id
                 await self.task_manager.update_status(active_task_id, "running")
+                cognitive_result = await self.task_manager.initialize_cognitive_state(
+                    active_task_id
+                )
+                if not cognitive_result.updated:
+                    raise RuntimeError(
+                        "new coding task could not initialize cognitive state: "
+                        f"{cognitive_result.status.value}"
+                    )
                 await self._record_memory_runtime_event(
                     "TASK_CREATED",
                     session_id=session_id,
@@ -351,6 +432,13 @@ class AgentLoop:
                             workspace_id=self.active_workspace.id,
                             worktree_path=str(self.active_workspace.worktree_path),
                             base_sha=self.active_workspace.base_sha,
+                            repository_id=(
+                                self.context_intelligence.repository_id_for_workspace(
+                                    self.active_workspace
+                                )
+                                if self.context_intelligence is not None
+                                else None
+                            ),
                         )
                         await self._record_memory_runtime_event(
                             "WORKSPACE_CREATED",
@@ -381,6 +469,31 @@ class AgentLoop:
             # agent_turns row.
             project_id=self.project_id,
         )
+        if (
+            is_coding
+            and active_task_id is not None
+            and self.planning_coordinator is not None
+            and self.active_workspace is not None
+            and self.delegated_execution_context is None
+            and (
+                self._active_planning_result is None
+                or getattr(self._active_planning_result, "task_id", None)
+                != active_task_id
+            )
+        ):
+            self._active_planning_result = await self.planning_coordinator.plan(
+                active_task_id,
+                workspace=self.active_workspace,
+                query=user_input,
+                runtime_id=self.runtime_id,
+                event_sink=turn,
+            )
+            # The coordinator owns the physical cognitive CAS.  Refresh only
+            # the in-memory projection so the task facts below do not expose a
+            # stale pre-CAS state; this is not restart ``load()`` semantics.
+            refresh = getattr(self.task_manager, "refresh_projection", None)
+            if refresh is not None:
+                await refresh(active_task_id)
         self._active_context_facts = await self._build_durable_task_facts(
             active_task_id
         )
@@ -393,6 +506,7 @@ class AgentLoop:
         total_tokens = 0
         budget_exhausted = False
         stop_reason: str | None = None
+        recovery_result: Any = None
         try:
             messages = await self._build_context(session_id, user_input)
             user_msg = Message(
@@ -683,6 +797,22 @@ class AgentLoop:
                         "credential_broker": self.credential_broker,
                         "requester": session_id,
                         "principal_id": self.principal_id,
+                        "execution_principal_id": self.principal_id,
+                        "task_owner_principal_id": (
+                            self.delegated_execution_context.task_owner_principal_id
+                            if self.delegated_execution_context is not None
+                            else self.principal_id
+                        ),
+                        "subagent_assignment_id": (
+                            self.delegated_execution_context.assignment_id
+                            if self.delegated_execution_context is not None
+                            else None
+                        ),
+                        "subagent_assignment_digest": (
+                            self.delegated_execution_context.assignment_digest
+                            if self.delegated_execution_context is not None
+                            else None
+                        ),
                         "principal_kind": self.principal_kind,
                         "parent_principal_id": self.parent_principal_id,
                         "delegation_digest": self.delegation_digest,
@@ -758,6 +888,9 @@ class AgentLoop:
                         "browser_manager": getattr(self, "browser_manager", None),
                         "subagent_spawner": getattr(
                             self, "subagent_spawner", None
+                        ),
+                        "subagent_control_coordinator": getattr(
+                            self, "subagent_control_coordinator", None
                         ),
                     },
                 }
@@ -909,6 +1042,17 @@ class AgentLoop:
                             stop_reason = StopReason.MAX_BUDGET.value
                         # Long-task observability: record what this turn touched.
                         await self._record_task_activity(result, active_task_id)
+                        if (
+                            result.success
+                            and self.context_intelligence is not None
+                            and active_task_id
+                            and self.active_workspace is not None
+                        ):
+                            self.context_intelligence.invalidate_from_tool_result(
+                                workspace_id=self.active_workspace.id,
+                                tool_name=result.name,
+                                arguments=result.arguments or {},
+                            )
                         if result.name == "test_run" and self.task_manager is not None and active_task_id:
                             await self.task_manager.update_status(active_task_id, "waiting_test")
                         if self.task_manager is not None and active_task_id:
@@ -926,10 +1070,83 @@ class AgentLoop:
                                 "output": result.output,
                                 "error": result.error,
                             }
-                            if self.verify_fix_loop.should_enter_loop(result_dict):
+                            # Observation is deliberately first and is not
+                            # hidden inside should_enter_loop(). This records
+                            # every parseable test result, including results
+                            # received after the repair budget is exhausted.
+                            verification_observation = (
+                                self.verify_fix_loop.observe_test_result(
+                                    result_dict
+                                )
+                            )
+                            recovery_for_observation = None
+                            no_progress = self.verify_fix_loop.no_progress_signal()
+                            if (
+                                no_progress.detected
+                                and verification_observation is not None
+                                and active_task_id is not None
+                            ):
+                                normalized_failure = (
+                                    self._normalize_verify_fix_failure(
+                                        verification_observation
+                                    )
+                                )
+                                await turn.emit(
+                                    "recovery.no_progress",
+                                    {
+                                        "task_id": active_task_id,
+                                        "observation_indices": list(
+                                            no_progress.observation_indices
+                                        ),
+                                        "failure_signature_digest": (
+                                            normalized_failure.failure_signature_digest
+                                        ),
+                                        "reason": "identical_failure_signature",
+                                    },
+                                )
+                                recovery_for_observation = (
+                                    await self._recover_after_no_progress(
+                                        turn=turn,
+                                        task_id=active_task_id,
+                                        failure_signature=normalized_failure,
+                                        query=user_input,
+                                    )
+                                )
+                                if recovery_for_observation is not None:
+                                    recovery_result = recovery_for_observation
+                            recovery_status = getattr(
+                                getattr(
+                                    recovery_for_observation,
+                                    "status",
+                                    None,
+                                ),
+                                "value",
+                                None,
+                            )
+                            recovery_action = getattr(
+                                getattr(
+                                    recovery_for_observation,
+                                    "action",
+                                    None,
+                                ),
+                                "value",
+                                None,
+                            )
+                            suppress_legacy_repair = (
+                                recovery_status in {"applied", "blocked"}
+                                and recovery_action in {"replan", "block"}
+                            )
+                            if (
+                                not suppress_legacy_repair
+                                and self.verify_fix_loop.should_enter_loop(
+                                    result_dict,
+                                    observation=verification_observation,
+                                )
+                            ):
                                 failure_context = (
                                     self.verify_fix_loop.build_failure_context(
-                                        result_dict
+                                        result_dict,
+                                        observation=verification_observation,
                                     )
                                 )
                                 if failure_context:
@@ -977,14 +1194,22 @@ class AgentLoop:
                                             fix_attempts=self.verify_fix_loop.attempt_count,
                                         )
                                     yield fix_msg
-                                    if self.verify_fix_loop.is_loop_exhausted():
-                                        report = self.verify_fix_loop.get_final_report()
-                                        yield Message(
-                                            role="system",
-                                            content=report,
-                                            event="verify_fix_report",
-                                            created_at=time.time(),
-                                        )
+                            # Exhaustion is a terminal interpretation of the
+                            # latest observed failure, not of the repair count
+                            # alone. Emit the report once, after observation,
+                            # even when no further repair can be admitted.
+                            if (
+                                self.verify_fix_loop.is_loop_exhausted()
+                                and not self.verify_fix_loop.report_emitted
+                            ):
+                                report = self.verify_fix_loop.get_final_report()
+                                self.verify_fix_loop.mark_report_emitted()
+                                yield Message(
+                                    role="system",
+                                    content=report,
+                                    event="verify_fix_report",
+                                    created_at=time.time(),
+                                )
                         yield tool_msg
 
                 if budget_exhausted:
@@ -993,8 +1218,61 @@ class AgentLoop:
             else:
                 stop_reason = StopReason.MAX_TURNS.value
 
+            coding_completion_proposed = (
+                is_coding
+                and active_task_id is not None
+                and stop_reason == StopReason.END_TURN.value
+                and self.delegated_execution_context is None
+            )
+            if coding_completion_proposed:
+                assert active_task_id is not None
+                completion_result = await self._propose_completion(
+                    turn=turn,
+                    task_id=active_task_id,
+                )
+                yield self._completion_result_message(
+                    result=completion_result,
+                    turn_id=turn.turn_id,
+                    attempt_id=turn.attempt_id,
+                    task_id=active_task_id,
+                )
+                from khaos.agent.control.completion_flow import (
+                    CompletionProposalStatus,
+                )
+
+                if completion_result.status is CompletionProposalStatus.RECORDED:
+                    assert completion_result.decision is not None
+                    gate_result = await self._evaluate_completion_gate(
+                        turn=turn,
+                        task_id=active_task_id,
+                        decision_id=completion_result.decision.decision_id,
+                    )
+                    yield self._completion_gate_message(
+                        result=gate_result,
+                        turn_id=turn.turn_id,
+                        attempt_id=turn.attempt_id,
+                        task_id=active_task_id,
+                    )
+                    recovery_result = await self._recover_after_completion(
+                        turn=turn,
+                        task_id=active_task_id,
+                        decision_outcome=completion_result.decision.outcome.value,
+                        query=user_input,
+                    )
+                    if recovery_result is not None:
+                        yield self._recovery_result_message(
+                            result=recovery_result,
+                            turn_id=turn.turn_id,
+                            attempt_id=turn.attempt_id,
+                            task_id=active_task_id,
+                        )
+
             if self.task_manager is not None and active_task_id:
-                await self._finalize_task(active_task_id, stop_reason)
+                await self._finalize_task(
+                    active_task_id,
+                    stop_reason,
+                    recovery_result=recovery_result,
+                )
 
             # Non-terminal accounting events must precede the durable terminal.
             if self.cost_tracker is not None:
@@ -1259,6 +1537,582 @@ class AgentLoop:
             )
         return exceeded
 
+    def _ensure_completion_controller(self) -> CompletionProposalController | None:
+        """Build the default proposal controller for a DB-backed coding task.
+
+        The runtime factory normally injects this controller explicitly.  The
+        lazy fallback keeps direct, authenticated AgentLoop construction
+        compatible while still requiring the existing composed repositories;
+        it never creates a new database or authority owner.
+        """
+        controller = self.completion_controller
+        if controller is not None:
+            return controller
+        if self.db is None or self.task_manager is None:
+            return None
+
+        from khaos.agent.control.completion_flow import (
+            CompletionProposalController,
+            EmptyCompletionFactProvider,
+        )
+
+        goal_spec_repository = getattr(
+            self.task_manager,
+            "goal_spec_repository",
+            None,
+        )
+        if goal_spec_repository is None:
+            goal_spec_repository = getattr(self.db, "goal_spec_repository", None)
+        decision_repository = getattr(
+            self.db,
+            "completion_decision_repository",
+            None,
+        )
+        if goal_spec_repository is None or decision_repository is None:
+            return None
+
+        fact_provider = self.completion_fact_provider
+        if fact_provider is None:
+            fact_provider = EmptyCompletionFactProvider()
+        controller = CompletionProposalController(
+            goal_spec_repository=goal_spec_repository,
+            decision_repository=decision_repository,
+            principal_id=self.principal_id,
+            project_id=self.project_id,
+            fact_provider=fact_provider,
+        )
+        self.completion_controller = controller
+        return controller
+
+    def _ensure_completion_gate(self) -> CompletionGate | None:
+        """Build the fail-closed Gate from the existing DB repositories."""
+        gate = self.completion_gate
+        if gate is not None:
+            return gate
+        if self.db is None or self.task_manager is None:
+            return None
+
+        from khaos.agent.control.completion_gate import CompletionGate
+
+        goal_spec_repository = getattr(
+            self.task_manager,
+            "goal_spec_repository",
+            None,
+        )
+        if goal_spec_repository is None:
+            goal_spec_repository = getattr(self.db, "goal_spec_repository", None)
+        decision_repository = getattr(
+            self.db,
+            "completion_decision_repository",
+            None,
+        )
+        if goal_spec_repository is None or decision_repository is None:
+            return None
+        gate = CompletionGate(
+            decision_repository=decision_repository,
+            goal_spec_repository=goal_spec_repository,
+            principal_id=self.principal_id,
+            project_id=self.project_id,
+        )
+        self.completion_gate = gate
+        return gate
+
+    def _ensure_completion_recovery(self) -> CompletionRecoveryService | None:
+        """Build the read-only durable continuation service when needed.
+
+        Recovery is deliberately lazy for direct AgentLoop construction, but
+        the runtime factory composes the same service explicitly.  This
+        fallback only wires owner-scoped readers; it cannot invoke a model,
+        planner, evaluator, gate, or task lifecycle writer.
+        """
+        recovery = self.completion_recovery
+        if recovery is not None:
+            return recovery
+        if self.db is None:
+            return None
+
+        from khaos.agent.control.completion_recovery import (
+            CompletionRecoveryService,
+            DatabaseCompletionGateHistoryReader,
+        )
+
+        goal_spec_repository = getattr(
+            self.task_manager,
+            "goal_spec_repository",
+            None,
+        )
+        if goal_spec_repository is None:
+            goal_spec_repository = getattr(self.db, "goal_spec_repository", None)
+        decision_repository = getattr(
+            self.db,
+            "completion_decision_repository",
+            None,
+        )
+        if goal_spec_repository is None or decision_repository is None:
+            return None
+        recovery = CompletionRecoveryService(
+            decision_repository=decision_repository,
+            goal_spec_repository=goal_spec_repository,
+            gate_history_reader=DatabaseCompletionGateHistoryReader(self.db),
+            principal_id=self.principal_id,
+            project_id=self.project_id,
+        )
+        self.completion_recovery = recovery
+        return recovery
+
+    def _ensure_recovery_control(self) -> RecoveryControlCoordinator | None:
+        """Build the owner-scoped M7.5 control seam for direct loop callers.
+
+        The runtime factory composes this coordinator explicitly.  This small
+        fallback keeps older/test AgentLoop construction sites functional while
+        still requiring the database-owned repositories; it never invents an
+        authority policy or turns recovery history into a TaskStatus write.
+        """
+        control = self.recovery_control
+        if control is not None:
+            return control
+        if self.db is None or not self.principal_id:
+            return None
+
+        from khaos.agent.control.recovery import RecoveryPolicy
+        from khaos.agent.control.recovery_control import RecoveryControlCoordinator
+        from khaos.agent.control.recovery_gate import RecoveryGate
+
+        recovery_repository = getattr(self.db, "recovery_decision_repository", None)
+        gate_repository = getattr(self.db, "recovery_gate_repository", None)
+        if recovery_repository is None or gate_repository is None:
+            return None
+        goal_spec_repository = getattr(
+            self.task_manager, "goal_spec_repository", None
+        )
+        if goal_spec_repository is None:
+            goal_spec_repository = getattr(self.db, "goal_spec_repository", None)
+        if goal_spec_repository is None:
+            return None
+        control = RecoveryControlCoordinator(
+            recovery_repository=recovery_repository,
+            recovery_gate=RecoveryGate(
+                gate_repository=gate_repository,
+                principal_id=self.principal_id,
+                project_id=self.project_id,
+            ),
+            principal_id=self.principal_id,
+            project_id=self.project_id,
+            policy=RecoveryPolicy.production_default(),
+            goal_spec_repository=goal_spec_repository,
+            plan_revision_repository=getattr(
+                self.db, "plan_revision_repository", None
+            ),
+            verification_assessment_repository=getattr(
+                self.db, "verification_assessment_repository", None
+            ),
+            completion_recovery=self._ensure_completion_recovery(),
+            planning_coordinator=self.planning_coordinator,
+            control_state_repository=getattr(
+                self.db, "agent_control_state_repository", None
+            ),
+        )
+        self.recovery_control = control
+        return control
+
+    async def _propose_completion(
+        self,
+        *,
+        turn: Any,
+        task_id: str,
+    ) -> CompletionProposalResult:
+        """Evaluate a structured END_TURN proposal without task projection."""
+        from khaos.agent.control.completion_flow import (
+            CompletionProposal,
+            CompletionProposalResult,
+            CompletionProposalStatus,
+            CompletionProposalTrigger,
+        )
+
+        proposal = CompletionProposal(
+            task_id=task_id,
+            turn_id=turn.turn_id,
+            attempt_id=turn.attempt_id,
+            trigger=CompletionProposalTrigger.MODEL_END_TURN,
+        )
+        await turn.emit(
+            "completion.proposed",
+            {
+                "task_id": proposal.task_id,
+                "turn_id": proposal.turn_id,
+                "attempt_id": proposal.attempt_id,
+                "trigger": proposal.trigger.value,
+            },
+        )
+
+        controller = self._ensure_completion_controller()
+        if controller is None:
+            result = CompletionProposalResult(
+                status=CompletionProposalStatus.REJECTED,
+                decision=None,
+                decision_sequence=None,
+                reason="completion controller is unavailable.",
+            )
+        else:
+            result = await controller.propose(proposal)
+
+        payload: dict[str, Any] = {
+            "task_id": proposal.task_id,
+            "turn_id": proposal.turn_id,
+            "attempt_id": proposal.attempt_id,
+            "status": result.status.value,
+        }
+        if result.decision is not None:
+            payload.update(
+                {
+                    "decision_id": result.decision.decision_id,
+                    "decision_digest": result.decision.decision_digest,
+                    "decision_sequence": result.decision_sequence,
+                    "outcome": result.decision.outcome.value,
+                }
+            )
+        if result.reason:
+            payload["reason"] = result.reason
+        await turn.emit("completion.evaluated", payload)
+        return result
+
+    async def _evaluate_completion_gate(
+        self,
+        *,
+        turn: Any,
+        task_id: str,
+        decision_id: str,
+    ) -> CompletionGateResult:
+        """Run the Gate after a recorded proposal and emit its bounded event."""
+        from khaos.agent.control.completion_gate import (
+            CompletionGateResult,
+            CompletionGateStatus,
+        )
+
+        gate = self._ensure_completion_gate()
+        if gate is None:
+            result = CompletionGateResult(
+                status=CompletionGateStatus.ERROR,
+                decision_id=decision_id,
+                decision_digest=None,
+                task_status=None,
+                reason="completion gate is unavailable",
+            )
+        else:
+            result = await gate.evaluate(decision_id)
+        await turn.emit(
+            "completion.gated",
+            {
+                "task_id": task_id,
+                "decision_id": result.decision_id,
+                "decision_digest": result.decision_digest,
+                "gate_status": result.status.value,
+                "resulting_task_status": result.task_status,
+                **({"reason": result.reason} if result.reason else {}),
+            },
+        )
+        return result
+
+    async def _recover_after_completion(
+        self,
+        *,
+        turn: Any,
+        task_id: str,
+        decision_outcome: str,
+        query: str,
+    ) -> Any:
+        """Handle only negative completion outcomes at an explicit boundary.
+
+        ``COMPLETE`` remains the Completion Gate's concern.  A recorded
+        ``REPLAN``, ``BLOCKED``, or ``FAILED`` decision is a deterministic
+        recovery signal; the recovery coordinator may persist/apply its
+        cognitive control decision and, when safely composed, invoke the
+        existing planning coordinator.  No model prose is inspected and no
+        recovery path writes TaskStatus.
+        """
+        if decision_outcome == "complete":
+            return None
+        control = self._ensure_recovery_control()
+        if control is None:
+            return None
+        if not self._admit_recovery_cycle(control):
+            result = self._recovery_cycle_limit_result(task_id)
+            await self._emit_recovery_blocked(turn, task_id, result)
+            return result
+        result = await control.evaluate_current(
+            task_id,
+            workspace=self.active_workspace,
+            query=query,
+            runtime_id=self.runtime_id,
+            event_sink=turn,
+        )
+        if (
+            getattr(getattr(result, "action", None), "value", None) == "block"
+            or getattr(getattr(result, "status", None), "value", None) == "blocked"
+        ):
+            await self._emit_recovery_blocked(turn, task_id, result)
+        refresh = getattr(self.task_manager, "refresh_projection", None)
+        if refresh is not None and result.cognitive_state is not None:
+            await refresh(task_id)
+        return result
+
+    async def _recover_after_no_progress(
+        self,
+        *,
+        turn: Any,
+        task_id: str,
+        failure_signature: NormalizedFailureSignature,
+        query: str,
+    ) -> Any:
+        """Apply one bounded recovery decision for a repeated failure.
+
+        VerifyFixLoop remains the low-level observation/repair strategy.  This
+        boundary only forwards its typed negative signal to M7.5; it never
+        treats test output as successful verification or completion authority.
+        """
+        control = self._ensure_recovery_control()
+        if control is None:
+            return None
+        if not self._admit_recovery_cycle(control):
+            result = self._recovery_cycle_limit_result(task_id)
+            await self._emit_recovery_blocked(turn, task_id, result)
+            return result
+        result = await control.evaluate_current(
+            task_id,
+            failure_signature=failure_signature,
+            no_progress_detected=True,
+            workspace=self.active_workspace,
+            query=query,
+            runtime_id=self.runtime_id,
+            event_sink=turn,
+        )
+        if getattr(result, "gate_status", None) is not None:
+            refresh = getattr(self.task_manager, "refresh_projection", None)
+            if refresh is not None and result.cognitive_state is not None:
+                await refresh(task_id)
+        if (
+            getattr(getattr(result, "action", None), "value", None) == "block"
+            or getattr(getattr(result, "status", None), "value", None) == "blocked"
+        ):
+            await self._emit_recovery_blocked(turn, task_id, result)
+        return result
+
+    def _admit_recovery_cycle(self, control: Any) -> bool:
+        """Consume one bounded recovery cycle for the current user turn."""
+        limit = getattr(
+            getattr(control, "policy", None),
+            "max_recovery_cycles_per_turn",
+            0,
+        )
+        if type(limit) is not int or limit < 0:
+            return False
+        if self._recovery_cycles_this_turn >= limit:
+            return False
+        self._recovery_cycles_this_turn += 1
+        return True
+
+    @staticmethod
+    def _recovery_cycle_limit_result(task_id: str) -> Any:
+        """Return a bounded non-authoritative result when the turn budget ends."""
+        from khaos.agent.control.recovery import RecoveryAction, RecoveryReasonCode
+        from khaos.agent.control.recovery_control import (
+            RecoveryControlResult,
+            RecoveryControlStatus,
+        )
+
+        return RecoveryControlResult(
+            status=RecoveryControlStatus.BLOCKED,
+            task_id=task_id,
+            action=RecoveryAction.BLOCK,
+            reason_code=RecoveryReasonCode.RECOVERY_ATTEMPT_BUDGET_EXHAUSTED,
+            reason="per-turn recovery cycle budget is exhausted",
+        )
+
+    @staticmethod
+    async def _emit_recovery_blocked(
+        turn: Any,
+        task_id: str,
+        result: Any,
+    ) -> None:
+        """Emit a bounded observability event for an explicit recovery stop."""
+        await turn.emit(
+            "recovery.blocked",
+            {
+                "task_id": task_id,
+                "recovery_decision_id": getattr(
+                    result, "recovery_decision_id", None
+                ),
+                "recovery_sequence": getattr(result, "recovery_sequence", None),
+                "action": getattr(
+                    getattr(result, "action", None), "value", None
+                ),
+                "reason_code": getattr(
+                    getattr(result, "reason_code", None), "value", None
+                ),
+                "status": getattr(
+                    getattr(result, "status", None), "value", None
+                ),
+            },
+        )
+
+    @staticmethod
+    def _normalize_verify_fix_failure(
+        observation: Any,
+    ) -> NormalizedFailureSignature:
+        """Convert VerifyFix observations to bounded M7.5 failure identity."""
+        from khaos.agent.control.recovery import (
+            NormalizedFailureCase,
+            NormalizedFailureSignature,
+            RecoveryFailureSource,
+        )
+
+        cases: list[NormalizedFailureCase] = []
+        for index, raw_case in enumerate(getattr(observation, "failed_cases", ())):
+            if not isinstance(raw_case, dict):
+                continue
+            name = raw_case.get("name")
+            subject_id = str(name)[:512] if name else f"test-case:{index + 1}"
+            file_value = raw_case.get("file")
+            file_identity = (
+                str(file_value)[:512] if isinstance(file_value, str) and file_value else None
+            )
+            line_value = raw_case.get("line")
+            line = line_value if type(line_value) is int and line_value > 0 else None
+            error_value = raw_case.get("error")
+            error_digest = None
+            if isinstance(error_value, str) and error_value:
+                error_digest = hashlib.sha256(
+                    error_value[:4096].encode("utf-8", errors="replace")
+                ).hexdigest()
+            cases.append(
+                NormalizedFailureCase(
+                    subject_id=subject_id,
+                    check_id=subject_id,
+                    file_identity=file_identity,
+                    line=line,
+                    error_digest=error_digest,
+                    result_status="failed",
+                )
+            )
+        if not cases:
+            cases.append(
+                NormalizedFailureCase(
+                    subject_id="test-run:unresolved-failure",
+                    result_status="failed",
+                )
+            )
+        check_ids = tuple(
+            case.check_id for case in cases if case.check_id is not None
+        )
+        return NormalizedFailureSignature.from_cases(
+            source=RecoveryFailureSource.VERIFY_FIX,
+            failed_count=int(getattr(observation, "failed", 0)),
+            error_count=int(getattr(observation, "errors", 0)),
+            failed_cases=tuple(cases),
+            verification_check_ids=check_ids,
+            result_statuses=("failed",),
+        )
+
+    @staticmethod
+    def _recovery_result_message(
+        *,
+        result: Any,
+        turn_id: str,
+        attempt_id: str,
+        task_id: str,
+    ) -> Message:
+        """Expose a bounded recovery result without injecting raw history."""
+        metadata: dict[str, Any] = {
+            "task_id": task_id,
+            "turn_id": turn_id,
+            "attempt_id": attempt_id,
+            "status": getattr(getattr(result, "status", None), "value", None),
+            "recovery_decision_id": getattr(result, "recovery_decision_id", None),
+            "recovery_sequence": getattr(result, "recovery_sequence", None),
+            "action": getattr(
+                getattr(result, "action", None), "value", None
+            ),
+            "reason_code": getattr(
+                getattr(result, "reason_code", None), "value", None
+            ),
+            "gate_status": getattr(
+                getattr(result, "gate_status", None), "value", None
+            ),
+            "planning_status": getattr(result, "planning_status", None),
+            "planning_revision_id": getattr(result, "planning_revision_id", None),
+        }
+        if getattr(result, "reason", ""):
+            metadata["reason"] = result.reason
+        return Message(
+            role="system",
+            content="recovery control evaluated",
+            event="recovery_control",
+            metadata=metadata,
+            created_at=time.time(),
+        )
+
+    @staticmethod
+    def _completion_result_message(
+        *,
+        result: CompletionProposalResult,
+        turn_id: str,
+        attempt_id: str,
+        task_id: str,
+    ) -> Message:
+        """Expose a bounded passive proposal result to turn consumers."""
+        metadata: dict[str, Any] = {
+            "task_id": task_id,
+            "turn_id": turn_id,
+            "attempt_id": attempt_id,
+            "status": result.status.value,
+        }
+        if result.decision is not None:
+            metadata.update(
+                {
+                    "decision_id": result.decision.decision_id,
+                    "decision_digest": result.decision.decision_digest,
+                    "decision_sequence": result.decision_sequence,
+                    "outcome": result.decision.outcome.value,
+                }
+            )
+        if result.reason:
+            metadata["reason"] = result.reason
+        return Message(
+            role="system",
+            content="completion proposal evaluated",
+            event="completion_evaluated",
+            metadata=metadata,
+            created_at=time.time(),
+        )
+
+    @staticmethod
+    def _completion_gate_message(
+        *,
+        result: CompletionGateResult,
+        turn_id: str,
+        attempt_id: str,
+        task_id: str,
+    ) -> Message:
+        """Expose a bounded passive Gate result to turn consumers."""
+        metadata: dict[str, Any] = {
+            "task_id": task_id,
+            "turn_id": turn_id,
+            "attempt_id": attempt_id,
+            "status": result.status.value,
+            "decision_id": result.decision_id,
+            "decision_digest": result.decision_digest,
+            "task_status": result.task_status,
+        }
+        if result.reason:
+            metadata["reason"] = result.reason
+        return Message(
+            role="system",
+            content="completion gate evaluated",
+            event="completion_gated",
+            metadata=metadata,
+            created_at=time.time(),
+        )
+
     async def _analyze_task_skill(self, task_id: str) -> None:
         if self.skill_generator is None or self.task_manager is None:
             return
@@ -1295,9 +2149,20 @@ class AgentLoop:
                 source_type="TASK",
             )
 
-    async def _finalize_task(self, task_id: str, stop_reason: str | None) -> None:
-        """Apply terminal task semantics and run successful-task observation."""
+    async def _finalize_task(
+        self,
+        task_id: str,
+        stop_reason: str | None,
+        recovery_result: Any = None,
+    ) -> None:
+        """Apply non-success terminal semantics after a turn.
+
+        Successful coding-task projection is intentionally absent here.  The
+        Completion Gate is the sole control-plane owner of COMPLETE ->
+        ``TaskStatus.COMPLETED``.
+        """
         from khaos.coding.task_manager import TaskStatus
+        from khaos.coding.verify_fix import VerificationState
 
         if stop_reason == StopReason.MAX_TURNS.value:
             await self.task_manager.update_status(task_id, TaskStatus.FAILED, error="max_turns exhausted without completion")
@@ -1307,10 +2172,39 @@ class AgentLoop:
                 TaskStatus.FAILED,
                 error="token budget exhausted without completion",
             )
-        elif self.verify_fix_loop is not None and self.verify_fix_loop.is_loop_exhausted():
-            await self.task_manager.update_status(task_id, TaskStatus.FAILED, error="verify-fix loop exhausted, tests still failing")
-        else:
-            await self.task_manager.update_status(task_id, TaskStatus.COMPLETED)
+        elif self.verify_fix_loop is not None:
+            verification_state = self.verify_fix_loop.verification_state
+            recovery_replanned = (
+                getattr(getattr(recovery_result, "action", None), "value", None)
+                == "replan"
+                and getattr(
+                    getattr(recovery_result, "status", None), "value", None
+                )
+                == "applied"
+            )
+            if (
+                verification_state is VerificationState.EXHAUSTED_FAILURE
+                and not recovery_replanned
+            ):
+                await self.task_manager.update_status(
+                    task_id,
+                    TaskStatus.FAILED,
+                    error="verify-fix loop exhausted, tests still failing",
+                )
+            elif (
+                verification_state is VerificationState.FAILING
+                and not recovery_replanned
+            ):
+                # A model END_TURN cannot erase the latest known failing
+                # verification result. UNKNOWN remains legacy-compatible until
+                # the M7 Completion Gate owns this decision.
+                await self.task_manager.update_status(
+                    task_id,
+                    TaskStatus.FAILED,
+                    error="latest verification is failing; task did not complete",
+                )
+            # A passing/unknown verification result does not authorize task
+            # completion. The Gate owns the successful lifecycle projection.
         await self._analyze_task_skill(task_id)
         task = await self.task_manager.get(task_id)
         await self._record_memory_runtime_event(
@@ -1326,7 +2220,11 @@ class AgentLoop:
                     "value",
                     getattr(task, "status", ""),
                 ),
-                "rationale": stop_reason or "task completed",
+                "rationale": (
+                    "turn finalized; completion projection is Gate-owned"
+                    if stop_reason == StopReason.END_TURN.value
+                    else stop_reason or "turn finalized"
+                ),
             },
             source_type="TASK",
         )
@@ -1337,9 +2235,9 @@ class AgentLoop:
 
         1. The project structure tree into the *system* prompt (see
            :meth:`_build_system_prompt`) — kept small (≤ token budget).
-        2. The contents of files relevant to ``user_input`` as an extra
-           ``# Relevant Files`` system message appended *after* the persisted
-           history, so the model sees them just before the current turn.
+        2. The contents of files relevant to ``user_input`` as a lower-trust
+           user observation appended *after* the persisted history, so the
+           authenticated current user request remains the final turn input.
 
         Neither injection happens in office mode or when ``project_root`` is
         unset, so non-coding behaviour is unchanged.
@@ -1364,27 +2262,283 @@ class AgentLoop:
         )
         messages.extend(self._active_context_facts)
 
-        relevant = self._build_relevant_files_message(user_input)
+        memory_message = await self._build_memory_message(session_id)
+        if memory_message is not None:
+            messages.append(memory_message)
+
+        if self.context_intelligence is not None and self._is_coding_mode():
+            relevant = await self._build_context_intelligence_message(user_input)
+        else:
+            relevant = self._build_relevant_files_message(user_input)
         if relevant is not None:
             messages.append(relevant)
 
         return messages
 
+    async def _build_memory_message(self, session_id: str) -> Message | None:
+        """Project retrieved memory as bounded, low-trust data context.
+
+        Memory is intentionally not part of the system prompt. The provider
+        boundary may discard Khaos metadata, so the role and explicit envelope
+        are the actual prompt-privilege fence; persisted text never becomes a
+        control instruction merely because it was retrieved locally.
+        """
+        if self.memory_manager is None:
+            return None
+        inject = getattr(self.memory_manager, "inject", None)
+        if not callable(inject):
+            return None
+        try:
+            parameters = inspect.signature(inject).parameters
+            supports_task = any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                or name == "task_id"
+                for name, parameter in parameters.items()
+            )
+            if supports_task:
+                memory_text = await inject(
+                    session_id,
+                    task_id=self._active_task_id,
+                )
+            else:
+                memory_text = await inject(session_id)
+        except Exception:
+            logger.warning(
+                "memory prompt projection unavailable; continuing without memory",
+                exc_info=True,
+            )
+            return None
+        if not memory_text:
+            return None
+        text = str(memory_text)
+        return Message(
+            role="user",
+            content=text,
+            token_count=self.token_engine.count_tokens(text),
+            metadata={
+                "context_layer": "historical-memory",
+                "trusted": False,
+                "authority": "low-trust-data",
+            },
+        )
+
+    async def _build_context_intelligence_message(
+        self, user_input: str
+    ) -> Message | None:
+        """Build a bounded projection from the canonical GoalSpec/workspace.
+
+        A missing or invalid TaskWorkspace is intentionally unavailable: this
+        path never falls back to ``project_root`` or to the legacy builder.
+        """
+
+        task_id = self._active_task_id
+        workspace = self.active_workspace
+        if task_id is None or workspace is None or self.task_manager is None:
+            logger.warning(
+                "workspace-bound context unavailable: task=%s workspace=%s",
+                task_id,
+                getattr(workspace, "id", None),
+            )
+            return None
+        goal_repository = getattr(self.task_manager, "goal_spec_repository", None)
+        if goal_repository is None:
+            logger.warning("workspace-bound context unavailable: GoalSpec repository missing")
+            return None
+        try:
+            goal_spec = await goal_repository.get_for_task(
+                task_id,
+                principal_id=self.principal_id,
+                project_id=self.project_id,
+            )
+            if goal_spec is None:
+                logger.warning("workspace-bound context unavailable: GoalSpec missing for %s", task_id)
+                return None
+            service = self.context_intelligence
+            if service is None:
+                return None
+            repository_id = service.repository_id_for_workspace(workspace)
+            from khaos.coding.intelligence.context import (
+                ContextFreshness,
+                ContextRequest,
+            )
+
+            request = ContextRequest(
+                task_id=task_id,
+                principal_id=self.principal_id,
+                project_id=self.project_id,
+                goal_spec_id=goal_spec.goal_spec_id,
+                goal_spec_digest=goal_spec.semantic_digest,
+                workspace_id=workspace.id,
+                repository_id=repository_id,
+                base_revision=getattr(workspace, "base_sha", None),
+                query=user_input or goal_spec.normalized_goal,
+                runtime_id=self.runtime_id,
+                token_budget=max(
+                    1,
+                    int(getattr(self.config, "context_token_budget", 12_000)),
+                ),
+                max_bytes=max(
+                    1,
+                    int(getattr(self.config, "context_max_bytes", 256 * 1024)),
+                ),
+                max_file_bytes=max(
+                    1,
+                    int(getattr(self.config, "context_max_file_bytes", 64 * 1024)),
+                ),
+                max_files=max(
+                    1,
+                    int(getattr(self.config, "context_max_files", 16)),
+                ),
+                max_symbols=max(
+                    1,
+                    int(getattr(self.config, "context_max_symbols", 128)),
+                ),
+            )
+            bundle = await service.retrieve(request, goal_spec)
+        except Exception as exc:  # noqa: BLE001 - context is non-fatal and fail-closed
+            logger.warning("workspace-bound context build failed: %s", exc)
+            return None
+        if bundle.freshness is not ContextFreshness.FRESH:
+            logger.warning(
+                "workspace-bound context is not fresh: task=%s freshness=%s",
+                task_id,
+                bundle.freshness.value,
+            )
+            return None
+        blocks = [
+            "# Context Bundle",
+            "",
+            "<untrusted_workspace_context>",
+            (
+                f"bundle_digest={bundle.bundle_digest} "
+                f"workspace_id={bundle.workspace_id} "
+                f"repository_id={bundle.repository_id} "
+                f"base_revision={bundle.base_revision or ''} "
+                f"repository_generation={bundle.repository_generation} "
+                f"index_generation={bundle.index_generation} "
+                f"truncated={str(bundle.truncated).lower()}"
+            ),
+        ]
+        if bundle.structure_paths:
+            blocks.extend(["", "## Workspace Structure", "", *bundle.structure_paths])
+        if bundle.documents:
+            blocks.extend(["", "## Relevant Files", ""])
+            for document in bundle.documents:
+                language = document.language if document.language != "text" else ""
+                blocks.extend(
+                    [
+                        f"### {document.relative_path}",
+                        f"```{language}",
+                        document.content,
+                        "```",
+                    ]
+                )
+        if bundle.symbols:
+            blocks.extend(["", "## Relevant Symbols", ""])
+            blocks.extend(
+                f"- {symbol.relative_path}:{symbol.start_line + 1} "
+                f"{symbol.qualified_name} ({symbol.kind})"
+                for symbol in bundle.symbols
+            )
+        blocks.append("</untrusted_workspace_context>")
+        content = "\n".join(blocks)
+        render_truncated = False
+        render_budget = max(
+            1, int(getattr(self.config, "context_token_budget", 12_000))
+        )
+        if self.token_engine.count_tokens(content) > render_budget:
+            render_truncated = True
+            # Keep the projection bounded even when the token engine is more
+            # precise than the byte-based service bound.  The service bundle
+            # remains immutable; this is only a smaller prompt projection.
+            closing = "</untrusted_workspace_context>"
+            marker = "... (context projection truncated)"
+            prefix_budget = max(
+                1,
+                render_budget
+                - self.token_engine.count_tokens(f"{marker}\n{closing}"),
+            )
+            prefix = self._trim_to_budget("\n".join(blocks[:-1]), prefix_budget).rstrip()
+            content = f"{prefix}\n{marker}\n{closing}"
+            while self.token_engine.count_tokens(content) > render_budget:
+                prefix_lines = prefix.splitlines()
+                if len(prefix_lines) <= 1:
+                    break
+                prefix = "\n".join(prefix_lines[:-1]).rstrip()
+                content = f"{prefix}\n{marker}\n{closing}"
+        # Repository/workspace bytes are data.  The OpenAI-compatible client
+        # forwards Message.role and does not forward Khaos metadata, so this
+        # must remain a user-level observation rather than a system message.
+        return Message(
+            role="user",
+            content=content,
+            token_count=self.token_engine.count_tokens(content),
+            metadata={
+                "context_layer": "workspace-bound-observation",
+                "trusted": False,
+                "context_bundle_id": bundle.bundle_id,
+                "context_bundle_digest": bundle.bundle_digest,
+                "workspace_id": bundle.workspace_id,
+                "repository_id": bundle.repository_id,
+                "base_revision": bundle.base_revision,
+                "repository_generation": bundle.repository_generation,
+                "index_generation": bundle.index_generation,
+                "truncated": bundle.truncated or render_truncated,
+                "freshness": bundle.freshness.value,
+            },
+        )
+
     async def _build_durable_task_facts(
         self, task_id: str | None
     ) -> list[Message]:
         """Reconstruct authoritative Task/approval facts outside summaries."""
-        if task_id is None or self.task_manager is None:
+        if task_id is None:
             return []
-        task = await self.task_manager.get(task_id)
-        if task is None:
+        recovery = self._ensure_completion_recovery()
+        recovery_state = (
+            await recovery.recover(task_id) if recovery is not None else None
+        )
+        recovery_control = self._ensure_recovery_control()
+        recovery_control_fact = (
+            await recovery_control.recover(task_id)
+            if recovery_control is not None
+            else None
+        )
+        task = (
+            await self.task_manager.get(task_id)
+            if self.task_manager is not None
+            else None
+        )
+        if task is None and recovery_state is None:
             return []
-        raw = task.to_dict(include_internal=True)
+        raw = task.to_dict(include_internal=True) if task is not None else {}
         metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
+        goal_spec = getattr(task, "goal_spec", None) if task is not None else None
         facts = {
-            "task_id": raw.get("id"),
+            "task_id": raw.get("id", task_id),
             "goal": raw.get("goal"),
             "status": raw.get("status"),
+            "cognitive_state": getattr(
+                getattr(task, "cognitive_state", None)
+                if task is not None
+                else None,
+                "value",
+                None,
+            ),
+            "control_state_version": (
+                getattr(task, "control_state_version", None)
+                if task is not None
+                else None
+            ),
+            # M7.1.2: these are bounded durable references/projections.  The
+            # canonical GoalSpec body remains in agent_goal_specs and is not
+            # copied into task metadata or injected wholesale.
+            "goal_spec_id": (
+                getattr(task, "goal_spec_id", None) if task is not None else None
+            ),
+            "goal_spec_digest": (
+                getattr(task, "goal_spec_digest", None) if task is not None else None
+            ),
             "workspace_id": metadata.get("workspace_id"),
             "base_sha": metadata.get("base_sha"),
             "pending_approval": metadata.get("pending_approval"),
@@ -1392,6 +2546,179 @@ class AgentLoop:
             "changeset_id": metadata.get("changeset_id"),
             "verification_run_id": metadata.get("verification_run_id"),
         }
+        # M7.3: expose only a bounded read projection of the durable plan
+        # history.  The canonical revision remains in the owner-scoped
+        # ledger; no raw plan JSON or repository text is injected here.
+        plan_repository = getattr(self.db, "plan_revision_repository", None)
+        if plan_repository is not None:
+            try:
+                current_plan_snapshot = (
+                    await plan_repository.get_current_task_snapshot(
+                        task_id,
+                        principal_id=self.principal_id,
+                        project_id=self.project_id,
+                    )
+                )
+                latest_plan = await plan_repository.get_latest_for_task(
+                    task_id,
+                    principal_id=self.principal_id,
+                    project_id=self.project_id,
+                )
+                published_plan = None
+                published_plan_revision_id = (
+                    current_plan_snapshot.published_plan_revision_id
+                    if current_plan_snapshot is not None
+                    else None
+                )
+                if published_plan_revision_id is not None:
+                    # This strict reader resolves the physical publication
+                    # identity to its exact owner/task-scoped ledger row.  A
+                    # missing or malformed published row is an integrity
+                    # failure; latest history is never a fallback.
+                    published_plan = await plan_repository.get_published_for_task(
+                        task_id,
+                        principal_id=self.principal_id,
+                        project_id=self.project_id,
+                    )
+            except Exception as exc:  # noqa: BLE001 - facts fail closed
+                logger.warning(
+                    "durable planning facts unavailable: task=%s error=%s",
+                    task_id,
+                    type(exc).__name__,
+                )
+                facts["planning_integrity"] = "unavailable"
+            else:
+                facts["latest_plan_revision_id"] = (
+                    latest_plan.plan_revision_id if latest_plan is not None else None
+                )
+                facts["published_plan_revision_id"] = published_plan_revision_id
+                is_implementing = (
+                    current_plan_snapshot is not None
+                    and current_plan_snapshot.cognitive_state
+                    is AgentCognitiveState.IMPLEMENTING
+                )
+                if is_implementing and published_plan_revision_id is None:
+                    # An IMPLEMENTING task must have a durable publication
+                    # identity.  The latest history head is not an
+                    # implementation-plan authority and must not be
+                    # projected into the current-plan fact when the
+                    # publication projection is absent.
+                    facts["planning_integrity"] = (
+                        "legacy_unpublished_implementation_plan"
+                    )
+                    facts["plan_revision_source"] = "none"
+                    selected_plan = None
+                else:
+                    selected_plan = (
+                        published_plan
+                        if published_plan_revision_id is not None
+                        else latest_plan
+                    )
+                if published_plan_revision_id is not None and published_plan is None:
+                    facts["planning_integrity"] = "unavailable"
+                elif selected_plan is not None:
+                    revision = selected_plan.revision
+                    facts["plan_revision_source"] = (
+                        "published"
+                        if published_plan_revision_id is not None
+                        else "latest"
+                    )
+                    facts["plan_revision"] = {
+                        "plan_revision_id": revision.plan_revision_id,
+                        "revision_sequence": selected_plan.revision_sequence,
+                        "plan_semantic_digest": revision.plan_semantic_digest,
+                        "status": revision.disposition.value,
+                        "disposition": revision.disposition.value,
+                        "planning_input_digest": revision.planning_input_digest,
+                        "goal_spec_digest": revision.goal_spec_digest,
+                        "workspace_id": revision.workspace_id,
+                        "repository_id": revision.repository_id,
+                        "base_revision": revision.base_revision,
+                        "context_bundle_id": revision.context_bundle_id,
+                        "context_bundle_digest": revision.context_bundle_digest,
+                        "repository_generation": revision.repository_generation,
+                        "index_generation": revision.index_generation,
+                        "target_files": tuple(
+                            item.path for item in revision.affected_files[:32]
+                        ),
+                        "target_symbols": tuple(
+                            item.symbol_id for item in revision.affected_symbols[:64]
+                        ),
+                        "step_ids": tuple(
+                            item.step_id for item in revision.steps[:32]
+                        ),
+                        "step_operations": tuple(
+                            item.operation.value for item in revision.steps[:32]
+                        ),
+                        "step_titles": tuple(
+                            item.title[:512] for item in revision.steps[:32]
+                        ),
+                        "step_targets": tuple(
+                            {
+                                "step_id": item.step_id,
+                                "target_files": tuple(item.target_files[:32]),
+                                "target_symbols": tuple(item.target_symbols[:64]),
+                            }
+                            for item in revision.steps[:32]
+                        ),
+                        "diagnostic_codes": tuple(
+                            item.code for item in revision.diagnostics[:32]
+                        ),
+                        "context_truncated": any(
+                            item.code == "context-truncated"
+                            for item in revision.diagnostics
+                        ),
+                    }
+        # M7.1.8: expose only a bounded read-only continuation projection.
+        # Recovery never invokes a planner/model/gate and never projects a
+        # lifecycle status.
+        if recovery_state is not None:
+            facts["completion_recovery"] = recovery_state.to_bounded_fact()
+            # The recovery service reads the physical SQL task snapshot.  If
+            # the in-memory projection is stale, keep these bounded top-level
+            # facts aligned with the durable source without mutating it.
+            if recovery_state.task_status is not None:
+                facts["status"] = recovery_state.task_status
+            if recovery_state.cognitive_state is not None:
+                facts["cognitive_state"] = recovery_state.cognitive_state.value
+            if recovery_state.control_state_version is not None:
+                facts["control_state_version"] = (
+                    recovery_state.control_state_version
+                )
+            facts["workspace_id"] = recovery_state.workspace_id
+        if recovery_control_fact is not None:
+            facts["recovery_control"] = recovery_control_fact.to_bounded_fact()
+            # RecoveryControlCoordinator reads the same physical task row and
+            # is therefore another safe source for correcting a stale cache
+            # projection.  It is read-only and never applies recovery here.
+            facts["status"] = recovery_control_fact.task_status
+            facts["cognitive_state"] = recovery_control_fact.cognitive_state
+            facts["control_state_version"] = (
+                recovery_control_fact.control_state_version
+            )
+        if goal_spec is not None:
+            max_goal_fact_chars = 4096
+            facts["goal_spec_raw_goal"] = goal_spec.raw_goal[:max_goal_fact_chars]
+            facts["goal_spec_normalized_goal"] = goal_spec.normalized_goal[
+                :max_goal_fact_chars
+            ]
+            facts["goal_spec_raw_goal_truncated"] = len(
+                goal_spec.raw_goal
+            ) > max_goal_fact_chars
+            facts["goal_spec_requirements"] = [
+                {
+                    "requirement_id": requirement.requirement_id,
+                    "description": requirement.description[:max_goal_fact_chars],
+                    "required": requirement.required,
+                    "source": requirement.source.value,
+                    "description_truncated": len(requirement.description)
+                    > max_goal_fact_chars,
+                }
+                for requirement in goal_spec.requirements[:32]
+            ]
+            facts["goal_spec_requirements_truncated"] = len(
+                goal_spec.requirements
+            ) > 32
         content = "# Durable Task Facts\n" + json.dumps(
             facts, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         )
@@ -1438,10 +2765,6 @@ class AgentLoop:
             if project_ctx:
                 prompt = f"{prompt}\n\n# Project Instructions\n\n{project_ctx}"
 
-        if self.memory_manager is not None:
-            memory_text = await self.memory_manager.inject(session_id)
-            if memory_text:
-                prompt = f"{prompt}\n\n{memory_text}"
         if self.skill_manager is not None:
             mode = self.mode_manager.current_mode.value
             matched = self.skill_manager.match(mode, user_input)
@@ -1472,6 +2795,8 @@ class AgentLoop:
         """
         if not self._is_coding_mode():
             return ""
+        if self.context_intelligence is not None:
+            return ""
         builder = self.coding_context_builder
         if builder is None:
             return ""
@@ -1493,7 +2818,7 @@ class AgentLoop:
         return f"# Project Structure\n\n{trimmed}"
 
     def _build_relevant_files_message(self, user_input: str):
-        """Return a ``# Relevant Files`` system Message, or None.
+        """Return a ``# Relevant Files`` user observation, or None.
 
         Aggregates the file contents collected by the coding context builder
         into one fenced block per file. Returns None outside coding mode or
@@ -1505,6 +2830,8 @@ class AgentLoop:
         status: ``(changed)`` or ``(cached)``.
         """
         if not self._is_coding_mode():
+            return None
+        if self.context_intelligence is not None:
             return None
         builder = self.coding_context_builder
         if builder is None:

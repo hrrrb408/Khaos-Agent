@@ -28,6 +28,11 @@ from khaos.coding.execution.models import (
     ResolvedSpawnPlan,
     ResourceBudget,
 )
+from khaos.coding.planning.tool_router import PlanToolRouter, PlanToolRouterError
+from khaos.coding.planning.tool_routing import (
+    PlanRouteDisposition,
+    relative_resource_targets,
+)
 from khaos.db.repositories.tool_operations import ToolOperationRepository
 from khaos.exceptions import PermissionDeniedError
 from khaos.permissions import (
@@ -134,6 +139,7 @@ class ToolScheduler:
         network_broker_factory: NetworkBrokerFactory | None = None,
         credential_broker: CredentialBroker | None = None,
         operation_repository: ToolOperationRepository | None = None,
+        plan_router: PlanToolRouter | None = None,
     ):
         self.registry = registry
         self.admission = ToolAdmission(registry)
@@ -189,6 +195,7 @@ class ToolScheduler:
         # scheduler only projects PermissionRequest and consumes its result.
         self._approval_runner = ApprovalCallbackRunner()
         self._tool_authorization = ToolAuthorization(permission_engine)
+        self.plan_router = plan_router
 
     def set_office_authority(self, authority: Any) -> None:
         """Register the shared OfficeMutationAuthority (called at startup)."""
@@ -393,6 +400,25 @@ class ToolScheduler:
                     ),
                 )
                 continue
+            if (
+                mode == "coding"
+                and tool_context.get("production_runtime")
+                and not tool_context.get("coding_workspace_enforced")
+            ):
+                yield SchedulerEvent(
+                    event="tool_result",
+                    result=ToolResult(
+                        tool_call_id=normalized["id"],
+                        name=tool.name,
+                        success=False,
+                        error=(
+                            "production coding execution requires a task-workspace "
+                            "resource boundary"
+                        ),
+                        arguments=normalized["arguments"],
+                    ),
+                )
+                continue
             resource: AuthorizationResource | None = None
             if tool_context.get("coding_workspace_enforced"):
                 try:
@@ -425,6 +451,68 @@ class ToolScheduler:
                 ToolPhase.RESOURCE_RESOLVED,
                 resource_digest=resource.digest() if resource is not None else "",
             )
+
+            if (
+                mode == "coding"
+                and tool_context.get("production_runtime")
+                and tool_context.get("coding_workspace_enforced")
+            ):
+                route_error = "router returned no decision"
+                if (
+                    tool_context.get("production_runtime")
+                    and not isinstance(self.plan_router, PlanToolRouter)
+                ):
+                    yield SchedulerEvent(
+                        event="tool_result",
+                        result=ToolResult(
+                            tool_call_id=normalized["id"], name=tool.name,
+                            success=False,
+                            error="PublishedPlanToolRouter is required in production coding runtime",
+                            arguments=normalized["arguments"],
+                        ),
+                    )
+                    continue
+                if self.plan_router is not None:
+                    try:
+                        route = await self.plan_router.route(
+                            tool=tool,
+                            arguments=normalized["arguments"],
+                            resource=resource,
+                            mode=mode,
+                            tool_context=tool_context,
+                        )
+                    except (PlanToolRouterError, PermissionError, ValueError) as exc:
+                        route = None
+                        route_error = str(exc)
+                    if route is None:
+                        yield SchedulerEvent(
+                            event="tool_result",
+                            result=ToolResult(
+                                tool_call_id=normalized["id"], name=tool.name,
+                                success=False,
+                                error=f"Plan route rejected: {route_error}",
+                                arguments=normalized["arguments"],
+                            ),
+                        )
+                        continue
+                    normalized["_plan_route_decision"] = route
+                    normalized["_plan_route_binding"] = route.binding
+                    normalized["_plan_requires_approval"] = route.requires_approval
+                    if route.disposition not in {
+                        PlanRouteDisposition.ALLOW,
+                        PlanRouteDisposition.SUPPORTING_READ,
+                    }:
+                        yield SchedulerEvent(
+                            event="tool_result",
+                            result=ToolResult(
+                                tool_call_id=normalized["id"], name=tool.name,
+                                success=False,
+                                error=f"Plan route {route.disposition.value}: {route.reason}",
+                                error_code=route.reason_code.upper(),
+                                arguments=normalized["arguments"],
+                            ),
+                        )
+                        continue
 
             execution_error = self._execution_preflight_error(
                 tool, mode, tool_context
@@ -614,7 +702,11 @@ class ToolScheduler:
             normalized["_step_authority_scope_digest"] = step_authority.scope_digest()
             normalized["_step_execution_digest"] = step_authority.digest()
 
-            if decision.requires_user_confirm or destructive_context is not None:
+            if (
+                decision.requires_user_confirm
+                or destructive_context is not None
+                or bool(normalized.get("_plan_requires_approval"))
+            ):
                 principal_id = str(tool_context.get("principal_id") or "")
                 current_session = str(session_id or "")
                 if not principal_id or not current_session:
@@ -652,6 +744,7 @@ class ToolScheduler:
                     authorization_epoch=authorization_epoch,
                     policy_digest=self.permission_engine.policy_digest,
                     step_authority_digest=step_authority.scope_digest(),
+                    plan_binding=normalized.get("_plan_route_binding"),
                 )
                 broker = tool_context.get("approval_broker")
                 if broker is None:
@@ -940,6 +1033,15 @@ class ToolScheduler:
         handler_retry_safe = True
         effect_id = ""
         effect_status = EFFECT_NOT_STARTED
+        plan_dispatch_fence = None
+        plan_dispatch_finished = False
+        plan_router = self.plan_router
+        plan_effect_targets: tuple[str, ...] = ()
+        if resource is not None:
+            try:
+                plan_effect_targets = relative_resource_targets(resource)
+            except (TypeError, ValueError, OSError):
+                plan_effect_targets = ()
         reconciliation_hint = str(getattr(tool, "reconciliation_hint", "") or "")
         operation_claim: OperationClaim | None = None
         step_authority = call.get("_step_authority")
@@ -1080,6 +1182,13 @@ class ToolScheduler:
                     duration_ms=int((time.monotonic() - start) * 1000),
                 )
 
+            route_decision = call.get("_plan_route_decision")
+            if (
+                self.plan_router is not None
+                and route_decision is not None
+                and route_decision.disposition is PlanRouteDisposition.ALLOW
+            ):
+                plan_dispatch_fence = await self.plan_router.begin_dispatch(route_decision)
             # The effect ID is allocated immediately before entering the
             # handler.  If the handler times out or raises after a partial
             # mutation, the caller still receives an identifier that must not
@@ -1114,8 +1223,28 @@ class ToolScheduler:
             reconciliation_hint = outcome.reconciliation_hint
             if operation_claim is not None:
                 await self._operation_store.update_effect_id(operation_claim, effect_id)
+            if plan_router is not None and plan_dispatch_fence is not None:
+                await plan_router.finish_dispatch(
+                    plan_dispatch_fence,
+                    effect_status=effect_status,
+                    effect_id=effect_id,
+                    affected_targets=(
+                        plan_effect_targets if effect_status == EFFECT_APPLIED else ()
+                    ),
+                )
+                plan_dispatch_finished = True
         except asyncio.CancelledError:
             await self._release_best_effort(reservation)
+            if plan_router is not None and plan_dispatch_fence is not None and not plan_dispatch_finished:
+                try:
+                    await plan_router.finish_dispatch(
+                        plan_dispatch_fence,
+                        effect_status=EFFECT_UNKNOWN,
+                        effect_id=effect_id,
+                        affected_targets=(),
+                    )
+                except Exception:
+                    logger.exception("failed to close plan dispatch fence after cancellation")
             if handler_started:
                 effect_status = self._interrupted_effect_status(tool)
                 audit_error = await self._result_finalizer.audit_best_effort(
@@ -1177,6 +1306,16 @@ class ToolScheduler:
             )
         except Exception as exc:  # noqa: BLE001 - tool execution is an error result boundary
             await self._release_best_effort(reservation)
+            if plan_router is not None and plan_dispatch_fence is not None and not plan_dispatch_finished:
+                try:
+                    await plan_router.finish_dispatch(
+                        plan_dispatch_fence,
+                        effect_status=EFFECT_UNKNOWN,
+                        effect_id=effect_id,
+                        affected_targets=(),
+                    )
+                except Exception:
+                    logger.exception("failed to close plan dispatch fence after error")
             if handler_started:
                 effect_status = self._exception_effect_status(tool)
             audit_error = await self._result_finalizer.audit_best_effort(
@@ -1696,6 +1835,32 @@ class ToolScheduler:
         elif not isinstance(spawn_plan, ResolvedSpawnPlan):
             raise PermissionDeniedError("resolved spawn plan is not immutable")
         permission_profile_digest = spawn_plan.permission_profile_digest
+        route_binding = call.get("_plan_route_binding")
+        route_decision = call.get("_plan_route_decision")
+        if (
+            tool_context.get("production_runtime")
+            and tool_context.get("coding_workspace_enforced")
+            and route_decision is not None
+            and route_decision.disposition is PlanRouteDisposition.ALLOW
+            and (
+                route_binding is None
+                or not all(
+                    getattr(route_binding, field, None)
+                    for field in (
+                        "plan_revision_id",
+                        "plan_revision_digest",
+                        "plan_step_id",
+                        "plan_step_digest",
+                        "execution_epoch_digest",
+                        "route_id",
+                        "route_digest",
+                    )
+                )
+            )
+        ):
+            raise PermissionDeniedError(
+                "production coding execution requires a complete plan route binding"
+            )
         return StepExecutionAuthority(
             principal_id=principal_id,
             project_id=project_id,
@@ -1732,6 +1897,13 @@ class ToolScheduler:
             delegation_digest=delegation_digest,
             source_transport=step_source_transport,
             runtime_id=step_runtime_id or session_id,
+            plan_revision_id=str(getattr(route_binding, "plan_revision_id", "") or ""),
+            plan_revision_digest=str(getattr(route_binding, "plan_revision_digest", "") or ""),
+            plan_step_id=str(getattr(route_binding, "plan_step_id", "") or ""),
+            plan_step_digest=str(getattr(route_binding, "plan_step_digest", "") or ""),
+            plan_execution_epoch_digest=str(getattr(route_binding, "execution_epoch_digest", "") or ""),
+            plan_route_id=str(getattr(route_binding, "route_id", "") or ""),
+            plan_route_digest=str(getattr(route_binding, "route_digest", "") or ""),
         )
 
     async def _prepare_sandbox_authority_inputs(
@@ -1921,6 +2093,16 @@ class ToolScheduler:
                 else None
             ),
             blocked_domains=frozenset(str(domain) for domain in blocked_domains),
+            principal_kind=str(tool_context.get("principal_kind") or ""),
+            parent_principal_id=str(
+                tool_context.get("parent_principal_id") or ""
+            ),
+            session_id=str(tool_context.get("session_id") or ""),
+            delegation_digest=str(tool_context.get("delegation_digest") or ""),
+            source_transport=str(tool_context.get("source_transport") or ""),
+            delegation_resource=str(
+                tool_context.get("delegation_resource") or ""
+            ),
         )
         call["_network_broker"] = broker
         call["_network_lease"] = lease
