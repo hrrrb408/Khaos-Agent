@@ -5,7 +5,6 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[3]
 SCRIPT = ROOT / "scripts" / "validate_community_local_preclosure.py"
 
@@ -83,9 +82,14 @@ def test_main_closure_still_requires_verified_github_provenance():
     report = (ROOT / "scripts/build_local_security_closure_report.py").read_text(
         encoding="utf-8"
     )
-    assert "push:" in workflow
+    assert "workflow_run:" in workflow
+    assert 'workflows: ["Security Closure Gate"]' in workflow
+    assert "types: [completed]" in workflow
     assert "branches: [main]" in workflow
-    assert '--commit "$GITHUB_SHA"' in workflow
+    assert "github.event.workflow_run.head_sha" in workflow
+    assert '--commit "$UPSTREAM_HEAD_SHA"' in workflow
+    assert '--run-id "$UPSTREAM_RUN_ID"' in workflow
+    assert "aggregation-manifest.json" in workflow
     assert "VerifiedGitHubProvenance" in report
     assert "verify_release_gates_for_closure" in report
 

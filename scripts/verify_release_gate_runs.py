@@ -15,23 +15,23 @@ import io
 import json
 import re
 import zipfile
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from khaos.security.evidence_provenance import gh_api_bytes
 from khaos.security.local_closure import (
+    _VERIFIER_SEAL,
     COMMUNITY_LOCAL_REQUIRED_PROOFS,
     ClosureEvidence,
     LocalEvidenceError,
     VerifiedGitHubProvenance,
-    _VERIFIER_SEAL,
     issue_verified_github_provenance,
 )
 from khaos.security.producer_evidence import (
     PROCESS_TREE_PROOF,
     PRODUCTION_COMPOSITION_PROOF,
-    PRODUCER_EVIDENCE_SCHEMA,
     RESOURCE_OWNER_PROOF,
     validate_producer_proof,
 )
@@ -51,6 +51,12 @@ COMMUNITY_LOCAL_GATES = {
     "community_local": "community-local-closure.yml",
 }
 COMMUNITY_LOCAL_ARTIFACT = "local-security-evidence-{}"
+COMMUNITY_LOCAL_AGGREGATION_MANIFEST = "aggregation-manifest.json"
+COMMUNITY_LOCAL_WORKFLOW_NAME = "Community Local Security Closure"
+COMMUNITY_LOCAL_WORKFLOW_PATH = ".github/workflows/community-local-closure.yml"
+COMMUNITY_LOCAL_AGGREGATION_SCHEMA = "khaos.community-local-aggregation-manifest.v1"
+SECURITY_CLOSURE_WORKFLOW_NAME = "Security Closure Gate"
+SECURITY_CLOSURE_WORKFLOW_PATH = ".github/workflows/security-closure-gate.yml"
 PRODUCER_ARTIFACTS = {
     "ordinary": "community-local-test-producer-evidence-{}",
     PRODUCTION_COMPOSITION_PROOF: "production-composition-evidence-{}",
@@ -84,6 +90,7 @@ SECURITY_EVIDENCE_TESTS = frozenset(
     }
 )
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 
 _NATIVE_ARTIFACT_CONTRACTS = {
     "native-authority-macos-proof": {
@@ -154,7 +161,8 @@ def _select_successful_run(
         # A rerun can be green after an earlier attempt failed.  Release
         # provenance must bind the original exact-commit gate attempt unless
         # an explicit, separately reviewed exception is added to policy.
-        and int(run.get("run_attempt") or 0) == 1
+        and type(run.get("run_attempt")) is int
+        and run.get("run_attempt") == 1
     ]
     if not candidates:
         raise RuntimeError(
@@ -190,6 +198,142 @@ def _artifact_records(repo: str, run_id: int) -> list[dict[str, Any]]:
             }
         )
     return sorted(records, key=lambda item: str(item.get("name") or ""))
+
+
+def _positive_run_id(value: object, label: str) -> str:
+    text = str(value or "")
+    if not text.isdigit() or int(text) <= 0:
+        raise RuntimeError(f"{label} must be a positive numeric run id")
+    return text
+
+
+def _verify_aggregation_manifest(
+    value: object,
+    *,
+    repo: str,
+    run_id: int,
+    commit: str,
+    observer_head_sha: str | None = None,
+) -> dict[str, Any]:
+    """Verify both identities in the observer's sidecar manifest."""
+    if not isinstance(value, dict):
+        raise RuntimeError("Community Local aggregation manifest is not an object")
+    unsigned = dict(value)
+    supplied = unsigned.pop("manifest_digest", None)
+    expected_keys = {
+        "schema",
+        "target_sha",
+        "evidence_status",
+        "reason",
+        "upstream_security_closure",
+        "aggregator",
+        "producer_manifest_digest",
+    }
+    if set(unsigned) != expected_keys:
+        raise RuntimeError("Community Local aggregation manifest fields are not exact")
+    if (
+        unsigned.get("schema") != COMMUNITY_LOCAL_AGGREGATION_SCHEMA
+        or unsigned.get("target_sha") != commit
+        or unsigned.get("evidence_status") != "PROVEN"
+        or unsigned.get("reason") != "all required producer-owned proofs passed"
+        or not _SHA256_RE.fullmatch(str(unsigned.get("producer_manifest_digest") or ""))
+        or not isinstance(supplied, str)
+        or supplied != _canonical_digest(unsigned)
+    ):
+        raise RuntimeError("Community Local aggregation manifest digest or status is invalid")
+
+    upstream = unsigned.get("upstream_security_closure")
+    if not isinstance(upstream, dict):
+        raise RuntimeError("Community Local aggregation manifest lacks upstream identity")
+    expected_upstream_keys = {
+        "repository",
+        "workflow",
+        "workflow_name",
+        "workflow_file",
+        "workflow_path",
+        "workflow_id",
+        "run_id",
+        "run_attempt",
+        "event",
+        "head_branch",
+        "head_sha",
+        "ref",
+        "status",
+        "conclusion",
+        "html_url",
+    }
+    if set(upstream) != expected_upstream_keys:
+        raise RuntimeError("Community Local upstream identity fields are not exact")
+    upstream_expected = {
+        "repository": repo,
+        "workflow": SECURITY_CLOSURE_WORKFLOW_NAME,
+        "workflow_name": SECURITY_CLOSURE_WORKFLOW_NAME,
+        "workflow_file": "security-closure-gate.yml",
+        "workflow_path": SECURITY_CLOSURE_WORKFLOW_PATH,
+        "ref": "refs/heads/main",
+        "event": "push",
+        "head_branch": "main",
+        "head_sha": commit,
+        "run_attempt": 1,
+        "status": "completed",
+        "conclusion": "success",
+    }
+    for field, expected in upstream_expected.items():
+        if upstream.get(field) != expected:
+            raise RuntimeError(f"Community Local upstream identity mismatch: {field}")
+    if type(upstream.get("run_attempt")) is not int:
+        raise RuntimeError("Community Local upstream attempt is malformed")
+    _positive_run_id(upstream.get("run_id"), "Community Local upstream run")
+    if type(upstream.get("workflow_id")) is not int or upstream["workflow_id"] <= 0:
+        raise RuntimeError("Community Local upstream workflow id is missing")
+    if not isinstance(upstream.get("html_url"), str) or not upstream["html_url"]:
+        raise RuntimeError("Community Local upstream run URL is missing")
+
+    aggregator = unsigned.get("aggregator")
+    if not isinstance(aggregator, dict):
+        raise RuntimeError("Community Local aggregation manifest lacks aggregator identity")
+    expected_aggregator_keys = {
+        "repository",
+        "workflow",
+        "workflow_file",
+        "run_id",
+        "run_attempt",
+        "event",
+        "ref",
+        "head_branch",
+        "head_sha",
+        "runner_os",
+        "job",
+    }
+    if set(aggregator) != expected_aggregator_keys:
+        raise RuntimeError("Community Local aggregator identity fields are not exact")
+    aggregator_expected = {
+        "repository": repo,
+        "workflow": COMMUNITY_LOCAL_WORKFLOW_NAME,
+        "workflow_file": "community-local-closure.yml",
+        "run_id": str(run_id),
+        "run_attempt": 1,
+        "event": "workflow_run",
+        "ref": "refs/heads/main",
+        "head_branch": "main",
+    }
+    for field, expected in aggregator_expected.items():
+        if aggregator.get(field) != expected:
+            raise RuntimeError(f"Community Local aggregator identity mismatch: {field}")
+    if type(aggregator.get("run_attempt")) is not int:
+        raise RuntimeError("Community Local aggregator attempt is malformed")
+    for field in ("runner_os", "job"):
+        if not isinstance(aggregator.get(field), str) or not aggregator[field]:
+            raise RuntimeError(f"Community Local aggregator identity lacks {field}")
+    aggregator_sha = aggregator.get("head_sha")
+    if not isinstance(aggregator_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", aggregator_sha):
+        raise RuntimeError("Community Local aggregator head SHA is malformed")
+    if observer_head_sha is not None and aggregator_sha != observer_head_sha:
+        raise RuntimeError("Community Local aggregator head SHA does not match its run")
+
+    result = dict(value)
+    result["manifest_digest"] = supplied
+    return result
 
 
 def _reject_duplicate_json_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -437,8 +581,9 @@ def _verify_local_artifact(
     run_id: int,
     commit: str,
     artifacts: list[dict[str, Any]],
+    observer_run: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Verify the producer-owned Community Local JSON artifact in its zip."""
+    """Verify the observer artifact and its exact upstream-run sidecar."""
     expected_name = COMMUNITY_LOCAL_ARTIFACT.format(commit)
     matching = [artifact for artifact in artifacts if artifact.get("name") == expected_name]
     if len(matching) != 1:
@@ -461,23 +606,88 @@ def _verify_local_artifact(
     api_digest = str(artifact.get("digest") or "").removeprefix("sha256:")
     if not api_digest or api_digest != digest:
         raise RuntimeError(f"local closure artifact {expected_name} digest does not match GitHub metadata")
+    workflow_run = artifact.get("workflow_run")
+    if not isinstance(workflow_run, dict) or str(workflow_run.get("id")) != str(run_id):
+        raise RuntimeError(f"local closure artifact {expected_name} is not bound to run {run_id}")
+    observer_head_sha: str | None = None
+    if observer_run is not None:
+        observer_id = observer_run.get("database_id") or observer_run.get("id")
+        if str(observer_id) != str(run_id):
+            raise RuntimeError("Community Local observer metadata is not bound to its run")
+        observer_repository = observer_run.get("repository")
+        observer_head_repository = observer_run.get("head_repository")
+        if (
+            observer_run.get("name") != COMMUNITY_LOCAL_WORKFLOW_NAME
+            or observer_run.get("path") != COMMUNITY_LOCAL_WORKFLOW_PATH
+            or not isinstance(observer_repository, dict)
+            or observer_repository.get("full_name") != repo
+            or not isinstance(observer_head_repository, dict)
+            or observer_head_repository.get("full_name") != repo
+            or observer_run.get("event") != "workflow_run"
+            or observer_run.get("head_branch") != "main"
+            or observer_run.get("status") != "completed"
+            or observer_run.get("conclusion") != "success"
+            or type(observer_run.get("run_attempt")) is not int
+            or observer_run.get("run_attempt") != 1
+        ):
+            raise RuntimeError("Community Local observer metadata is not an exact successful run")
+        observer_head_sha = observer_run.get("head_sha")
+        if not isinstance(observer_head_sha, str) or not re.fullmatch(
+            r"[0-9a-f]{40}", observer_head_sha
+        ):
+            raise RuntimeError("Community Local observer head SHA is malformed")
     try:
         with zipfile.ZipFile(io.BytesIO(payload)) as archive:
             names = [name for name in archive.namelist() if not name.endswith("/")]
-            if names != ["local-security-evidence.json"]:
+            expected_names = {
+                "local-security-evidence.json",
+                COMMUNITY_LOCAL_AGGREGATION_MANIFEST,
+            }
+            if len(names) != len(expected_names) or set(names) != expected_names:
                 raise RuntimeError("local closure artifact contains unexpected files")
-            with archive.open(names[0], "r") as stream:
+            with archive.open(COMMUNITY_LOCAL_AGGREGATION_MANIFEST, "r") as stream:
+                aggregation_raw = stream.read(MAX_ARTIFACT_BYTES + 1)
+            with archive.open("local-security-evidence.json", "r") as stream:
                 raw = stream.read(MAX_ARTIFACT_BYTES + 1)
         if len(raw) > MAX_ARTIFACT_BYTES:
             raise RuntimeError("local closure evidence JSON exceeds the download limit")
-        value = json.loads(raw.decode("utf-8"))
+        if len(aggregation_raw) > MAX_ARTIFACT_BYTES:
+            raise RuntimeError("Community Local aggregation manifest exceeds the download limit")
+        aggregation_value = json.loads(
+            aggregation_raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_json_pairs
+        )
+        aggregation = _verify_aggregation_manifest(
+            aggregation_value,
+            repo=repo,
+            run_id=run_id,
+            commit=commit,
+            observer_head_sha=observer_head_sha,
+        )
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_json_pairs)
         evidence = ClosureEvidence.from_payload(value)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, zipfile.BadZipFile, LocalEvidenceError) as exc:
+    except (
+        OSError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        zipfile.BadZipFile,
+        LocalEvidenceError,
+    ) as exc:
         raise RuntimeError(f"local closure artifact evidence is invalid: {exc}") from exc
     if evidence.commit != commit or evidence.profile.value != "community-local":
         raise RuntimeError("local closure artifact profile or commit is not exact")
-    if str(evidence.workflow.get("run_id")) != str(run_id):
-        raise RuntimeError("local closure evidence is not bound to its producer run")
+    upstream = aggregation["upstream_security_closure"]
+    assert isinstance(upstream, dict)
+    for field, expected in (
+        ("repository", repo),
+        ("workflow", SECURITY_CLOSURE_WORKFLOW_NAME),
+        ("run_id", str(upstream["run_id"])),
+        ("run_attempt", 1),
+        ("event", "push"),
+        ("ref", "refs/heads/main"),
+        ("head_sha", commit),
+    ):
+        if evidence.workflow.get(field) != expected:
+            raise RuntimeError(f"local closure evidence upstream identity mismatch: {field}")
     return {
         "artifact_id": artifact_id,
         "artifact_name": expected_name,
@@ -487,12 +697,135 @@ def _verify_local_artifact(
         "profile_status": dict(evidence.profile_status),
         "residual_risks": list(evidence.residual_risks),
         "proof_names": [proof.name for proof in evidence.proofs],
+        "evidence_status": aggregation["evidence_status"],
+        "reason": aggregation["reason"],
+        "aggregation_manifest_digest": aggregation["manifest_digest"],
+        "upstream_security_closure": dict(aggregation["upstream_security_closure"]),
+        "aggregator": dict(aggregation["aggregator"]),
         "proof_payloads": [
             dict(item)
             for item in value.get("proofs", [])
             if isinstance(item, dict)
         ],
     }
+
+
+def _select_community_local_run(
+    repo: str, workflow: str, commit: str
+) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
+    """Select one successful observer run by its exact target artifact.
+
+    A ``workflow_run`` observer's own GitHub ``head_sha`` is the default branch
+    revision, not necessarily the upstream run's SHA.  The target commit is
+    therefore selected from the digest-bound sidecar, while the candidate run
+    itself is still required to be an original successful main workflow_run.
+    """
+    if workflow != "community-local-closure.yml":
+        raise RuntimeError("Community Local workflow file is not exact")
+    if not _COMMIT_RE.fullmatch(commit):
+        raise RuntimeError("Community Local target commit must be a full lowercase SHA")
+    payload = _run_gh_api(
+        repo,
+        f"actions/workflows/{workflow}/runs?event=workflow_run&branch=main&per_page=100",
+    )
+    raw_runs = payload.get("workflow_runs")
+    if (
+        not isinstance(raw_runs, list)
+        or int(payload.get("total_count", len(raw_runs)) or 0) > 100
+    ):
+        raise RuntimeError("Community Local workflow runs are missing or paginated")
+    expected_artifact = COMMUNITY_LOCAL_ARTIFACT.format(commit)
+    matches: list[tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]] = []
+    for raw_run in raw_runs:
+        if not isinstance(raw_run, dict):
+            continue
+        repository = raw_run.get("repository")
+        head_repository = raw_run.get("head_repository")
+        if (
+            raw_run.get("name") != COMMUNITY_LOCAL_WORKFLOW_NAME
+            or raw_run.get("path") != COMMUNITY_LOCAL_WORKFLOW_PATH
+            or not isinstance(repository, dict)
+            or repository.get("full_name") != repo
+            or not isinstance(head_repository, dict)
+            or head_repository.get("full_name") != repo
+            or raw_run.get("event") != "workflow_run"
+            or raw_run.get("head_branch") != "main"
+            or raw_run.get("status") != "completed"
+            or raw_run.get("conclusion") != "success"
+            or type(raw_run.get("run_attempt")) is not int
+            or raw_run.get("run_attempt") != 1
+        ):
+            continue
+        raw_id = raw_run.get("id")
+        database_id = raw_run.get("database_id")
+        if database_id is not None and str(database_id) != str(raw_id):
+            raise RuntimeError(f"Community Local run {raw_id} has inconsistent API ids")
+        try:
+            run_id = int(_positive_run_id(raw_id, "Community Local run"))
+        except RuntimeError:
+            continue
+        artifacts = _artifact_records(repo, run_id)
+        exact = [artifact for artifact in artifacts if artifact.get("name") == expected_artifact]
+        if not exact:
+            continue
+        if len(exact) != 1:
+            raise RuntimeError(f"Community Local run {run_id} has duplicate exact artifacts")
+        local_proof = _verify_local_artifact(
+            repo,
+            run_id=run_id,
+            commit=commit,
+            artifacts=artifacts,
+            observer_run=raw_run,
+        )
+        matches.append((raw_run, artifacts, local_proof))
+    if len(matches) != 1:
+        raise RuntimeError(
+            "exact successful original Community Local workflow_run is not unique "
+            f"for commit {commit}"
+        )
+    return matches[0]
+
+
+def _verify_local_upstream_binding(
+    repo: str,
+    *,
+    security_record: dict[str, Any],
+    local_record: dict[str, Any],
+    commit: str,
+) -> None:
+    """Require the observer sidecar to name the selected Security Closure run."""
+    local_proof = local_record.get("local_proof")
+    if not isinstance(local_proof, dict):
+        raise RuntimeError("Community Local record has no aggregation binding")
+    upstream = local_proof.get("upstream_security_closure")
+    if not isinstance(upstream, dict):
+        raise RuntimeError("Community Local record has no upstream Security Closure identity")
+    expected = {
+        "repository": repo,
+        "workflow": str(security_record.get("workflow_name") or ""),
+        "workflow_name": str(security_record.get("workflow_name") or ""),
+        "workflow_file": str(security_record.get("workflow") or ""),
+        "workflow_path": f".github/workflows/{security_record.get('workflow') or ''}",
+        "workflow_id": security_record.get("workflow_id"),
+        "run_id": str(security_record.get("run_id") or ""),
+        "run_attempt": security_record.get("run_attempt"),
+        "event": security_record.get("event"),
+        "head_branch": security_record.get("head_branch"),
+        "head_sha": commit,
+        "ref": "refs/heads/main",
+        "status": security_record.get("status"),
+        "conclusion": security_record.get("conclusion"),
+    }
+    if type(expected["workflow_id"]) is not int or expected["workflow_id"] <= 0:
+        raise RuntimeError("Security Closure record has no valid workflow id")
+    for field, value in expected.items():
+        if upstream.get(field) != value:
+            raise RuntimeError(
+                "Community Local upstream binding does not match Security Closure: "
+                + field
+            )
+    if local_record.get("target_sha") != commit:
+        raise RuntimeError("Community Local target SHA is not exact")
 
 
 def _producer_archive_files(payload: bytes) -> dict[str, bytes]:
@@ -867,17 +1200,25 @@ def _verify_external_producers(
 
 
 def _gate_record(repo: str, workflow: str, commit: str) -> dict[str, Any]:
-    payload = _run_gh_api(
-        repo,
-        f"actions/workflows/{workflow}/runs?head_sha={commit}&per_page=100",
-    )
-    run = _select_successful_run(
-        [item for item in payload.get("workflow_runs", []) if isinstance(item, dict)],
-        commit=commit,
-        workflow=workflow,
-    )
-    run_id = int(run.get("database_id") or run["id"])
-    artifacts = _artifact_records(repo, run_id)
+    local_proof: dict[str, Any] | None = None
+    if workflow == COMMUNITY_LOCAL_GATES["community_local"]:
+        run, artifacts, local_proof = _select_community_local_run(repo, workflow, commit)
+        run_id = int(run.get("database_id") or run["id"])
+    else:
+        payload = _run_gh_api(
+            repo,
+            f"actions/workflows/{workflow}/runs?head_sha={commit}&per_page=100",
+        )
+        run = _select_successful_run(
+            [item for item in payload.get("workflow_runs", []) if isinstance(item, dict)],
+            commit=commit,
+            workflow=workflow,
+        )
+        run_id = int(run.get("database_id") or run["id"])
+        artifacts = _artifact_records(repo, run_id)
+    workflow_id = run.get("workflow_id")
+    if type(workflow_id) is not int or workflow_id <= 0:
+        raise RuntimeError(f"workflow run {run_id} has no valid workflow id")
     security_proof: dict[str, Any] | None = None
     if workflow == REQUIRED_GATES["security_closure"]:
         expected_name = f"security-evidence-{commit}"
@@ -911,14 +1252,6 @@ def _gate_record(repo: str, workflow: str, commit: str) -> dict[str, Any]:
                 f"security evidence artifact {expected_name} digest does not match GitHub metadata"
             )
         security_proof = _verify_security_artifact(payload, commit=commit)
-    local_proof: dict[str, Any] | None = None
-    if workflow == COMMUNITY_LOCAL_GATES["community_local"]:
-        local_proof = _verify_local_artifact(
-            repo,
-            run_id=run_id,
-            commit=commit,
-            artifacts=artifacts,
-        )
     if workflow == REQUIRED_GATES["native_authority"]:
         expected_names = set(_REQUIRED_NATIVE_ARTIFACTS)
         for expected_name in sorted(expected_names):
@@ -972,6 +1305,7 @@ def _gate_record(repo: str, workflow: str, commit: str) -> dict[str, Any]:
     record = {
         "workflow": workflow,
         "workflow_name": str(run.get("name") or workflow),
+        "workflow_id": run.get("workflow_id"),
         "run_id": run_id,
         "run_attempt": int(run["run_attempt"]),
         "head_sha": run.get("head_sha"),
@@ -986,6 +1320,12 @@ def _gate_record(repo: str, workflow: str, commit: str) -> dict[str, Any]:
         "security_proof": security_proof or {},
         "native_proofs": native_proofs,
     }
+    if local_proof is not None:
+        # ``head_sha`` is the GitHub observer run's own metadata.  A
+        # workflow_run observer can have the default branch SHA there, so the
+        # exact evidence target is carried separately and checked against the
+        # sidecar plus the selected upstream run.
+        record["target_sha"] = commit
     record["run_evidence_digest"] = _canonical_digest(record)
     record["evidence_digest"] = record["run_evidence_digest"]
     if local_proof is not None:
@@ -1063,6 +1403,12 @@ def verify_release_gates(
             raise RuntimeError(
                 "security and Community Local evidence use different policy digests"
             )
+        _verify_local_upstream_binding(
+            repo,
+            security_record=gates["security_closure"],
+            local_record=gates["community_local"],
+            commit=commit,
+        )
         producer_proofs = _verify_external_producers(
             repo,
             security_record=gates["security_closure"],

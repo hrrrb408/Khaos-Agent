@@ -124,7 +124,7 @@
 - `packaging/macos/khaos-authorityd-xpc-client.c`: `3c751b9936b8665140f68466af9b77138efd538cb3b41f3687b3135b595a9f8d`
 - `rust/khaos-core/src/bin/khaos-authorityd-windows.rs`: `4a80c965d472c5d35a1350f24c725a4b313b6eb1debee0e5b5dc486dc287d63f`
 - `scripts/build_m6_closure_report.py`: `fa806b5fb0781be1972073c851a0b505386bd154b00e4ced1245e94dc25a744c`
-- `scripts/validate_community_local_preclosure.py`: `f5a2faa70a48069ed22a67b4e86ffb71e92edb7dd7fa0c65906df803240a7073`
+- `scripts/validate_community_local_preclosure.py`: `d1f46da64e96fdaad11246a4b1f3f0fe14b4b894255d59795cbbdc249ff8f8f1`
 - `scripts/validate_m6_governance.py`: `a5786ce2c82f0b70f242ff1ccebf93017de43a14b51c7f7799748ffd79820719`
 - `scripts/watch_upstream_codex_security.py`: `9bc79e5afc851ce3f2e1a069aa917610489deadd0524f9b7a35f63c2aad45d2a`
 - `scripts/github-m6-hardened-ruleset.json`: `a18c3a613c1f5c536d1c589d84177be4cd43bde69d9418efa513c8c3ff60989e`

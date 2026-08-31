@@ -107,12 +107,13 @@ def test_release_provenance_binds_exact_required_gates_and_forbids_replacement()
     assert 'run.get("head_branch") == "main"' in verifier
     assert "main ancestry" in verifier
     assert 'evidence.get("main_ancestry")' in generator
-    assert 'record.get("event") != "push"' in generator
-    assert 'record.get("head_branch") != "main"' in generator
-    assert 'run.get("run_attempt") or 0' in verifier
+    assert 'record.get("event") == "workflow_run"' in generator
+    assert 'record.get("target_sha") == commit' in generator
+    assert 'record.get("head_branch") == "main"' in generator
+    assert 'type(run.get("run_attempt")) is int' in verifier
     assert 'security-evidence-{commit}' in verifier
     assert 'artifact.get("expired") is not False' in verifier
-    assert 'record.get("run_attempt") != 1' in generator
+    assert 'record.get("run_attempt") == 1' in generator
     assert "required_gates" in generator
     assert "run_id" in generator
     assert "evidence_digest" in generator

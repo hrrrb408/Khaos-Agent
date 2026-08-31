@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Fetch exact producer artifacts from the Security Closure Gate run.
+"""Fetch exact producer artifacts from one completed Security Closure run.
 
-The Community Local workflow uses this bounded poller to avoid a cross-workflow
-race.  It never reruns a failed workflow and records GitHub's artifact digest;
-the release verifier downloads and checks the same bytes again later.
+The Community Local workflow is triggered by the upstream ``workflow_run``
+completion event.  This command therefore consumes the event's run id and
+re-validates that run through the GitHub API; it never searches for a latest
+successful run and never waits for the upstream workflow to finish.  A short,
+bounded retry is retained only for Actions artifact eventual consistency after
+the already-completed run becomes observable.
 """
 
 from __future__ import annotations
@@ -12,7 +15,7 @@ import argparse
 import hashlib
 import io
 import json
-import os
+import re
 import stat
 import time
 import zipfile
@@ -23,7 +26,6 @@ from khaos.security.evidence_provenance import gh_api_bytes
 from khaos.security.local_closure import canonical_digest
 from khaos.security.producer_evidence import validate_producer_proof
 
-
 MANIFEST_SCHEMA = "khaos.local-security-producer-artifact-manifest.v1"
 ARTIFACT_PATTERNS = (
     "community-local-test-producer-evidence-{commit}",
@@ -32,17 +34,22 @@ ARTIFACT_PATTERNS = (
 )
 MAX_ARCHIVE_BYTES = 64 * 1024 * 1024
 MAX_FILE_BYTES = 8 * 1024 * 1024
+ARTIFACT_RETRY_ATTEMPTS = 5
+ARTIFACT_RETRY_DELAY_SECONDS = 2.0
+SECURITY_WORKFLOW_NAME = "Security Closure Gate"
+SECURITY_WORKFLOW_PATH = ".github/workflows/security-closure-gate.yml"
+_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+_RUN_ID_RE = re.compile(r"^[1-9][0-9]*$")
 
 
 def _args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo", required=True)
     parser.add_argument("--commit", required=True)
+    parser.add_argument("--run-id", required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--workflow", default="security-closure-gate.yml")
-    parser.add_argument("--poll-seconds", type=float, default=10.0)
-    parser.add_argument("--timeout-seconds", type=float, default=1800.0)
     return parser.parse_args()
 
 
@@ -53,46 +60,68 @@ def _json(repo: str, endpoint: str) -> dict[str, Any]:
     return value
 
 
-def _select_security_run(repo: str, workflow: str, commit: str) -> dict[str, Any]:
-    payload = _json(
-        repo,
-        f"actions/workflows/{workflow}/runs?head_sha={commit}&per_page=100",
+def _select_security_run(
+    repo: str, workflow: str, commit: str, run_id: str
+) -> dict[str, Any]:
+    """Load and validate the exact upstream run named by the event.
+
+    The run id is an input to identify the event's upstream run, not a trust
+    decision.  Every security-relevant field is checked against the live API
+    response before any artifact is downloaded.
+    """
+    if not _COMMIT_RE.fullmatch(commit):
+        raise RuntimeError("Security Closure commit must be a full lowercase SHA")
+    if not _RUN_ID_RE.fullmatch(run_id):
+        raise RuntimeError("Security Closure run id must be a positive integer")
+    selected = _json(repo, f"actions/runs/{run_id}")
+    selected_id = str(selected.get("id") or "")
+    if selected_id != run_id:
+        raise RuntimeError("Security Closure API returned a different run id")
+    database_id = selected.get("database_id")
+    if database_id is not None and str(database_id) != run_id:
+        raise RuntimeError("Security Closure API database id differs from run id")
+    repository = selected.get("repository")
+    head_repository = selected.get("head_repository")
+    repository_name = repository.get("full_name") if isinstance(repository, dict) else None
+    head_repository_name = (
+        head_repository.get("full_name") if isinstance(head_repository, dict) else None
     )
-    runs = payload.get("workflow_runs")
-    if not isinstance(runs, list):
-        raise RuntimeError("Security Closure Gate run list is malformed")
-    candidates = [
-        run
-        for run in runs
-        if isinstance(run, dict)
-        and run.get("head_sha") == commit
-        and run.get("event") == "push"
-        and run.get("head_branch") == "main"
-        and int(run.get("run_attempt") or 0) == 1
-    ]
-    if not candidates:
-        raise RuntimeError("Security Closure Gate run is not available yet")
-    active = [run for run in candidates if run.get("status") != "completed"]
-    if active:
-        raise RuntimeError("Security Closure Gate is still running")
-    successful = [run for run in candidates if run.get("conclusion") == "success"]
-    if len(successful) > 1:
+    if repository_name != repo or head_repository_name != repo:
+        raise RuntimeError("Security Closure run is not produced by the trusted repository")
+    if selected.get("name") != SECURITY_WORKFLOW_NAME:
+        raise RuntimeError("Security Closure run has the wrong workflow name")
+    if selected.get("path") != SECURITY_WORKFLOW_PATH or workflow != "security-closure-gate.yml":
+        raise RuntimeError("Security Closure run has the wrong workflow file")
+    workflow_id = selected.get("workflow_id")
+    if type(workflow_id) is not int or workflow_id <= 0:
+        raise RuntimeError("Security Closure run has no valid workflow id")
+    if (
+        selected.get("head_sha") != commit
+        or selected.get("event") != "push"
+        or selected.get("head_branch") != "main"
+        or selected.get("status") != "completed"
+        or selected.get("conclusion") != "success"
+        or type(selected.get("run_attempt")) is not int
+        or selected.get("run_attempt") != 1
+    ):
         raise RuntimeError(
-            "multiple successful Security Closure Gate attempt-1 runs exist "
-            "for the exact commit"
+            "exact Security Closure attempt 1 is not a successful completed main push"
         )
-    if len(successful) != 1:
-        conclusions = ",".join(str(run.get("conclusion")) for run in candidates)
-        raise RuntimeError(f"exact Security Closure Gate attempt-1 did not succeed: {conclusions}")
-    selected = successful[0]
     return {
-        "run_id": str(selected.get("database_id") or selected.get("id") or ""),
+        "repository": repo,
+        "workflow": SECURITY_WORKFLOW_NAME,
+        "workflow_name": SECURITY_WORKFLOW_NAME,
+        "workflow_file": workflow,
+        "workflow_path": selected["path"],
+        "workflow_id": workflow_id,
+        "run_id": run_id,
         "run_attempt": 1,
         "event": "push",
         "head_branch": "main",
         "head_sha": commit,
-        "workflow": str(selected.get("name") or workflow),
-        "workflow_file": workflow,
+        "ref": "refs/heads/main",
+        "status": "completed",
+        "conclusion": "success",
         "html_url": selected.get("html_url"),
     }
 
@@ -103,6 +132,42 @@ def _artifacts(repo: str, run_id: str) -> list[dict[str, Any]]:
     if not isinstance(values, list) or int(payload.get("total_count") or 0) > 100:
         raise RuntimeError("Security Closure artifact list is malformed or paginated")
     return [value for value in values if isinstance(value, dict)]
+
+
+def _wait_for_expected_artifacts(
+    repo: str, run_id: str, expected_names: set[str]
+) -> dict[str, dict[str, Any]]:
+    """Allow only a short post-completion artifact visibility retry."""
+    missing = set(expected_names)
+    for attempt in range(ARTIFACT_RETRY_ATTEMPTS):
+        available: dict[str, dict[str, Any]] = {}
+        for artifact in _artifacts(repo, run_id):
+            name = artifact.get("name")
+            if not isinstance(name, str):
+                continue
+            if name in available:
+                raise RuntimeError(f"Security Closure artifact name is duplicated: {name}")
+            available[name] = artifact
+        missing = expected_names - set(available)
+        if not missing:
+            ids = [str(available[name].get("id") or "") for name in expected_names]
+            if any(not _RUN_ID_RE.fullmatch(item) for item in ids):
+                raise RuntimeError("Security Closure producer artifact id is malformed")
+            if len(ids) != len(set(ids)):
+                raise RuntimeError("Security Closure producer artifacts reuse an id")
+            return {name: available[name] for name in sorted(expected_names)}
+        if attempt + 1 < ARTIFACT_RETRY_ATTEMPTS:
+            print(
+                "retrying exact completed-run artifact lookup "
+                f"({attempt + 1}/{ARTIFACT_RETRY_ATTEMPTS - 1}); missing: "
+                + ", ".join(sorted(missing))
+            )
+            time.sleep(ARTIFACT_RETRY_DELAY_SECONDS)
+    raise RuntimeError(
+        "Security Closure run is missing producer artifact(s) after bounded "
+        "post-completion consistency retries: "
+        + ", ".join(sorted(missing))
+    )
 
 
 def _safe_extract(payload: bytes, destination: Path) -> list[str]:
@@ -149,7 +214,7 @@ def _download_one(
 ) -> dict[str, object]:
     name = artifact.get("name")
     artifact_id = str(artifact.get("id") or "")
-    if not isinstance(name, str) or not name or not artifact_id.isdigit():
+    if not isinstance(name, str) or not name or not _RUN_ID_RE.fullmatch(artifact_id):
         raise RuntimeError("producer artifact identity is malformed")
     if artifact.get("expired") is not False:
         raise RuntimeError(f"producer artifact {name} is expired or unverifiable")
@@ -215,44 +280,16 @@ def _download_one(
 
 def main() -> int:
     args = _args()
-    deadline = time.monotonic() + args.timeout_seconds
-    while True:
-        try:
-            run = _select_security_run(args.repo, args.workflow, args.commit)
-            break
-        except RuntimeError as exc:
-            if time.monotonic() >= deadline:
-                raise
-            if "did not succeed" in str(exc):
-                raise
-            print(f"waiting for exact Security Closure Gate: {exc}")
-            time.sleep(max(0.5, min(args.poll_seconds, 60.0)))
+    run = _select_security_run(args.repo, args.workflow, args.commit, args.run_id)
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    expected_names = [pattern.format(commit=args.commit) for pattern in ARTIFACT_PATTERNS]
-    while True:
-        available = {
-            str(artifact.get("name")): artifact
-            for artifact in _artifacts(args.repo, str(run["run_id"]))
-        }
-        missing = set(expected_names) - set(available)
-        if not missing:
-            break
-        if time.monotonic() >= deadline:
-            raise RuntimeError(
-                "Security Closure run is missing producer artifact(s): "
-                + ", ".join(sorted(missing))
-            )
-        print(
-            "waiting for exact producer artifacts: "
-            + ", ".join(sorted(missing))
-        )
-        time.sleep(max(0.5, min(args.poll_seconds, 60.0)))
+    expected_names = {pattern.format(commit=args.commit) for pattern in ARTIFACT_PATTERNS}
+    available = _wait_for_expected_artifacts(args.repo, str(run["run_id"]), expected_names)
     records = [
         _download_one(args.repo, available[name], run, args.output_dir, args.commit)
-        for name in expected_names
+        for name in sorted(expected_names)
     ]
     manifest: dict[str, object] = {
-        "schema": "khaos.local-security-producer-artifact-manifest.v1",
+        "schema": MANIFEST_SCHEMA,
         "commit": args.commit,
         "security_run": run,
         "artifacts": records,

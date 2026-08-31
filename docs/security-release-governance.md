@@ -84,8 +84,11 @@ The Security Closure Gate also runs the structural
 `COMMUNITY_LOCAL_PRE_CLOSURE` contract on pull requests. It may report only
 `PASS` or `FAIL`; it checks proof and artifact wiring but does not certify a
 main push or create live provenance. Final Community Local certification still
-comes from `community-local-closure.yml` after an exact `main` push, original
-attempt, producer artifacts, and live GitHub verification.
+comes from `community-local-closure.yml` as an original-attempt `workflow_run`
+observer after the exact successful original-attempt `Security Closure Gate`
+main push, its producer artifacts, a digest-bound aggregation sidecar, and live
+GitHub verification. The observer cannot substitute a rerun or a latest
+successful run.
 
 ## Runtime profile authority
 

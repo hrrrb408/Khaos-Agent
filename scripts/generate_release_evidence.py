@@ -255,15 +255,29 @@ def _load_gate_evidence(
         record = gates.get(name)
         if not isinstance(record, dict):
             raise SystemExit(f"missing required release gate: {name}")
-        if (
-            record.get("workflow") != workflow
-            or record.get("head_sha") != commit
-            or record.get("status") != "completed"
-            or record.get("conclusion") != "success"
-            or record.get("run_attempt") != 1
-            or record.get("event") != "push"
-            or record.get("head_branch") != "main"
-        ):
+        if name == "community_local":
+            exact_run = (
+                record.get("workflow") == workflow
+                and record.get("target_sha") == commit
+                and record.get("status") == "completed"
+                and record.get("conclusion") == "success"
+                and type(record.get("run_attempt")) is int
+                and record.get("run_attempt") == 1
+                and record.get("event") == "workflow_run"
+                and record.get("head_branch") == "main"
+            )
+        else:
+            exact_run = (
+                record.get("workflow") == workflow
+                and record.get("head_sha") == commit
+                and record.get("status") == "completed"
+                and record.get("conclusion") == "success"
+                and type(record.get("run_attempt")) is int
+                and record.get("run_attempt") == 1
+                and record.get("event") == "push"
+                and record.get("head_branch") == "main"
+            )
+        if not exact_run:
             raise SystemExit(f"required release gate is not successful: {name}")
         if name == "security_closure":
             expected_artifact = f"security-evidence-{commit}"

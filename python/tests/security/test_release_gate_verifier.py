@@ -10,7 +10,10 @@ import zipfile
 from pathlib import Path
 
 import pytest
-from khaos.security.local_closure import COMMUNITY_LOCAL_REQUIRED_PROOFS, canonical_digest
+from khaos.security.local_closure import (
+    COMMUNITY_LOCAL_REQUIRED_PROOFS,
+    canonical_digest,
+)
 
 ROOT = Path(__file__).resolve().parents[3]
 SPEC = importlib.util.spec_from_file_location(
@@ -30,6 +33,7 @@ def _run(*, run_id: int, attempt: int) -> dict[str, object]:
         "id": run_id,
         "database_id": run_id,
         "head_sha": COMMIT,
+        "workflow_id": 322127705 + run_id,
         "status": "completed",
         "conclusion": "success",
         "run_attempt": attempt,
@@ -183,17 +187,17 @@ def _native_payloads() -> dict[str, bytes]:
     }
 
 
-def _local_evidence_payload(run_id: int = 1) -> dict[str, object]:
+def _local_evidence_payload(upstream_run_id: int = 1) -> dict[str, object]:
     policy = "b" * 64
     workflow = {
         "repository": "hrrrb408/Khaos-Agent",
-        "workflow": "Community Local Security Closure",
-        "run_id": str(run_id),
+        "workflow": "Security Closure Gate",
+        "run_id": str(upstream_run_id),
         "run_attempt": 1,
         "event": "push",
         "ref": "refs/heads/main",
         "head_sha": COMMIT,
-        "runner_os": "Ubuntu",
+        "runner_os": "GitHub Actions",
     }
     proofs = [
         {
@@ -235,12 +239,58 @@ def _local_evidence_payload(run_id: int = 1) -> dict[str, object]:
     return payload
 
 
-def _local_archive(payload: dict[str, object]) -> bytes:
+def _local_archive(
+    payload: dict[str, object], *, observer_run_id: int = 1, observer_head_sha: str = "d" * 40
+) -> bytes:
+    workflow = payload["workflow"]
+    assert isinstance(workflow, dict)
+    aggregation = {
+        "schema": MODULE.COMMUNITY_LOCAL_AGGREGATION_SCHEMA,
+        "target_sha": COMMIT,
+        "evidence_status": "PROVEN",
+        "reason": "all required producer-owned proofs passed",
+        "upstream_security_closure": {
+            "repository": "hrrrb408/Khaos-Agent",
+            "workflow": "Security Closure Gate",
+            "workflow_name": "Security Closure Gate",
+            "workflow_file": "security-closure-gate.yml",
+            "workflow_path": ".github/workflows/security-closure-gate.yml",
+            "workflow_id": 322127705,
+            "run_id": str(workflow["run_id"]),
+            "run_attempt": 1,
+            "event": "push",
+            "head_branch": "main",
+            "head_sha": COMMIT,
+            "ref": "refs/heads/main",
+            "status": "completed",
+            "conclusion": "success",
+            "html_url": "https://example.invalid/security",
+        },
+        "aggregator": {
+            "repository": "hrrrb408/Khaos-Agent",
+            "workflow": "Community Local Security Closure",
+            "workflow_file": "community-local-closure.yml",
+            "run_id": str(observer_run_id),
+            "run_attempt": 1,
+            "event": "workflow_run",
+            "ref": "refs/heads/main",
+            "head_branch": "main",
+            "head_sha": observer_head_sha,
+            "runner_os": "Ubuntu",
+            "job": "community-local-closure",
+        },
+        "producer_manifest_digest": "e" * 64,
+    }
+    aggregation["manifest_digest"] = canonical_digest(aggregation)
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr(
             "local-security-evidence.json",
             json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(),
+        )
+        archive.writestr(
+            "aggregation-manifest.json",
+            json.dumps(aggregation, sort_keys=True, separators=(",", ":")).encode(),
         )
     return output.getvalue()
 
@@ -475,6 +525,7 @@ def test_community_local_artifact_requires_exact_digest_and_producer_run(
         "size_in_bytes": len(archive),
         "expired": False,
         "digest": f"sha256:{hashlib.sha256(archive).hexdigest()}",
+        "workflow_run": {"id": 1},
     }
     monkeypatch.setattr(MODULE, "gh_api_bytes", lambda *_args, **_kwargs: archive)
 

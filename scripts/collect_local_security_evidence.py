@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -24,14 +25,20 @@ from khaos.security.local_closure import (
 )
 from khaos.security.producer_evidence import (
     PROCESS_TREE_PROOF,
-    PRODUCTION_COMPOSITION_PROOF,
     PRODUCER_EVIDENCE_SCHEMA,
+    PRODUCTION_COMPOSITION_PROOF,
     RESOURCE_OWNER_PROOF,
     validate_producer_proof,
 )
 
-
 MANIFEST_SCHEMA = "khaos.local-security-producer-artifact-manifest.v1"
+AGGREGATION_MANIFEST_SCHEMA = "khaos.community-local-aggregation-manifest.v1"
+SECURITY_WORKFLOW_NAME = "Security Closure Gate"
+SECURITY_WORKFLOW_FILE = "security-closure-gate.yml"
+COMMUNITY_WORKFLOW_NAME = "Community Local Security Closure"
+COMMUNITY_WORKFLOW_FILE = "community-local-closure.yml"
+_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+_RUN_ID_RE = re.compile(r"^[1-9][0-9]*$")
 EXPECTED_PRODUCER_ARTIFACTS = frozenset(
     {
         "community-local-test-producer-evidence-{commit}",
@@ -50,6 +57,7 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--producer-dir", type=Path, required=True)
     parser.add_argument("--producer-manifest", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--aggregation-manifest", type=Path, default=None)
     parser.add_argument("--commit", required=True)
     return parser.parse_args()
 
@@ -62,45 +70,72 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _identity(commit: str) -> dict[str, object]:
+def _identity(
+    commit: str, manifest: dict[str, Any]
+) -> tuple[dict[str, object], dict[str, object]]:
     import os
 
-    expected = {
-        "repository": REPOSITORY,
-        "event": "push",
-        "ref": "refs/heads/main",
-        "head_sha": commit,
-    }
+    if not _COMMIT_RE.fullmatch(commit):
+        raise RuntimeError("Community Local aggregator requires a full lowercase SHA")
     actual = {
         "repository": os.environ.get("GITHUB_REPOSITORY", ""),
         "event": os.environ.get("GITHUB_EVENT_NAME", ""),
         "ref": os.environ.get("GITHUB_REF", ""),
-        "head_sha": os.environ.get("GITHUB_SHA", ""),
     }
-    if actual != expected:
+    if actual != {
+        "repository": REPOSITORY,
+        "event": "workflow_run",
+        "ref": "refs/heads/main",
+    }:
         raise RuntimeError(
-            "Community Local aggregator requires the exact main push: "
+            "Community Local aggregator requires the exact main workflow_run: "
             + json.dumps(actual, sort_keys=True)
         )
+    observer_sha = os.environ.get("GITHUB_SHA", "")
+    if not _COMMIT_RE.fullmatch(observer_sha):
+        raise RuntimeError("Community Local aggregator requires a valid observer SHA")
     if os.environ.get("GITHUB_RUN_ATTEMPT") != "1":
         raise RuntimeError("Community Local aggregator requires attempt 1")
     run_id = os.environ.get("GITHUB_RUN_ID", "")
-    if not run_id.isdigit() or int(run_id) <= 0:
+    if not _RUN_ID_RE.fullmatch(run_id):
         raise RuntimeError("Community Local aggregator requires a numeric run id")
-    for key in ("GITHUB_WORKFLOW", "RUNNER_OS", "GITHUB_JOB"):
+    if os.environ.get("GITHUB_WORKFLOW") != COMMUNITY_WORKFLOW_NAME:
+        raise RuntimeError("Community Local aggregator has the wrong workflow name")
+    for key in ("RUNNER_OS", "GITHUB_JOB"):
         if not os.environ.get(key, "").strip():
             raise RuntimeError(f"Community Local aggregator requires {key}")
-    return {
+
+    security_run = manifest["security_run"]
+    assert isinstance(security_run, dict)
+    upstream = {
         "repository": REPOSITORY,
-        "workflow": os.environ["GITHUB_WORKFLOW"],
-        "run_id": run_id,
+        "workflow": security_run["workflow"],
+        "run_id": str(security_run["run_id"]),
         "run_attempt": 1,
         "event": "push",
         "ref": "refs/heads/main",
         "head_sha": commit,
+        # The producer proof records carry the concrete runner identities;
+        # this top-level identity names the aggregate upstream run.
+        "runner_os": "GitHub Actions",
+        "job": "security-closure-gate",
+    }
+    aggregator = {
+        "repository": REPOSITORY,
+        "workflow": COMMUNITY_WORKFLOW_NAME,
+        "workflow_file": COMMUNITY_WORKFLOW_FILE,
+        "run_id": run_id,
+        "run_attempt": 1,
+        "event": "workflow_run",
+        "ref": "refs/heads/main",
+        "head_branch": "main",
+        # For workflow_run, GITHUB_SHA identifies the observer's default-branch
+        # revision.  The outer target_sha is the upstream commit being proved.
+        "head_sha": observer_sha,
         "runner_os": os.environ["RUNNER_OS"],
         "job": os.environ["GITHUB_JOB"],
     }
+    return upstream, aggregator
 
 
 def _load_manifest(path: Path, commit: str) -> dict[str, Any]:
@@ -110,29 +145,43 @@ def _load_manifest(path: Path, commit: str) -> dict[str, Any]:
         raise RuntimeError(f"producer artifact manifest is unreadable: {path}") from exc
     if not isinstance(payload, dict):
         raise RuntimeError("producer artifact manifest is not an object")
-    supplied = payload.pop("manifest_digest", None)
+    supplied = payload.get("manifest_digest")
+    unsigned = dict(payload)
+    unsigned.pop("manifest_digest", None)
     if (
-        payload.get("schema") != MANIFEST_SCHEMA
-        or payload.get("commit") != commit
-        or not isinstance(payload.get("security_run"), dict)
-        or not isinstance(payload.get("artifacts"), list)
+        unsigned.get("schema") != MANIFEST_SCHEMA
+        or unsigned.get("commit") != commit
+        or not isinstance(unsigned.get("security_run"), dict)
+        or not isinstance(unsigned.get("artifacts"), list)
         or not isinstance(supplied, str)
-        or supplied != canonical_digest(payload)
+        or supplied != canonical_digest(unsigned)
     ):
         raise RuntimeError("producer artifact manifest identity or digest is invalid")
-    payload["manifest_digest"] = supplied
-    security_run = payload["security_run"]
+    security_run = unsigned["security_run"]
     assert isinstance(security_run, dict)
     if (
-        security_run.get("event") != "push"
+        security_run.get("repository") != REPOSITORY
+        or security_run.get("workflow") != SECURITY_WORKFLOW_NAME
+        or security_run.get("workflow_name") != SECURITY_WORKFLOW_NAME
+        or security_run.get("workflow_file") != SECURITY_WORKFLOW_FILE
+        or security_run.get("workflow_path")
+        != f".github/workflows/{SECURITY_WORKFLOW_FILE}"
+        or security_run.get("ref") != "refs/heads/main"
+        or security_run.get("event") != "push"
         or security_run.get("head_branch") != "main"
         or security_run.get("head_sha") != commit
+        or type(security_run.get("run_attempt")) is not int
         or security_run.get("run_attempt") != 1
-        or not str(security_run.get("run_id") or "").isdigit()
+        or security_run.get("status") != "completed"
+        or security_run.get("conclusion") != "success"
+        or not isinstance(security_run.get("run_id"), str)
+        or not _RUN_ID_RE.fullmatch(security_run.get("run_id", ""))
+        or type(security_run.get("workflow_id")) is not int
+        or security_run.get("workflow_id") <= 0
     ):
         raise RuntimeError("producer artifact manifest is not exact-main attempt 1")
     names: set[str] = set()
-    for artifact in payload["artifacts"]:
+    for artifact in unsigned["artifacts"]:
         if not isinstance(artifact, dict):
             raise RuntimeError("producer artifact record is malformed")
         name = artifact.get("name")
@@ -168,7 +217,37 @@ def _load_manifest(path: Path, commit: str) -> dict[str, Any]:
             "producer artifact set is not exact: "
             f"missing={sorted(expected_names - names)} unexpected={sorted(names - expected_names)}"
         )
-    return payload
+    unsigned["manifest_digest"] = supplied
+    return unsigned
+
+
+def _build_aggregation_manifest(
+    *,
+    commit: str,
+    upstream: dict[str, object],
+    aggregator: dict[str, object],
+    producer_manifest: dict[str, Any],
+) -> dict[str, object]:
+    """Bind the observer run to its exact upstream evidence run."""
+    unsigned: dict[str, object] = {
+        "schema": AGGREGATION_MANIFEST_SCHEMA,
+        "target_sha": commit,
+        "evidence_status": "PROVEN",
+        "reason": "all required producer-owned proofs passed",
+        "upstream_security_closure": dict(producer_manifest["security_run"]),
+        "aggregator": aggregator,
+        "producer_manifest_digest": producer_manifest["manifest_digest"],
+    }
+    result = dict(unsigned)
+    result["manifest_digest"] = canonical_digest(unsigned)
+    security_run = producer_manifest["security_run"]
+    if (
+        not isinstance(security_run, dict)
+        or security_run.get("run_id") != upstream.get("run_id")
+        or security_run.get("head_sha") != commit
+    ):
+        raise RuntimeError("aggregation manifest upstream identity is inconsistent")
+    return result
 
 
 def _producer_files(
@@ -227,6 +306,7 @@ def _producer_files(
             or workflow.get("event") != "push"
             or workflow.get("ref") != "refs/heads/main"
             or workflow.get("head_sha") != commit
+            or type(workflow.get("run_attempt")) is not int
             or workflow.get("run_attempt") != 1
         ):
             raise RuntimeError(f"producer {name} provenance is not exact-main")
@@ -279,8 +359,8 @@ def main() -> int:
     args = _args()
     repo_root = args.repo_root.resolve()
     commit = args.commit
-    identity = _identity(commit)
     manifest = _load_manifest(args.producer_manifest.resolve(), commit)
+    upstream, aggregator = _identity(commit, manifest)
     producers = _producer_files(args.producer_dir.resolve(), manifest, commit)
     required = set(COMMUNITY_LOCAL_REQUIRED_PROOFS)
     if set(producers) != required:
@@ -309,7 +389,7 @@ def main() -> int:
             repo_root / "docs/generated/production-reachability.md"
         ),
         "production_composition_digest": composition_digest,
-        "workflow": identity,
+        "workflow": upstream,
         "proofs": proofs,
         "profile_status": {
             "apple_developer_program": "NOT_APPLICABLE",
@@ -329,12 +409,27 @@ def main() -> int:
     payload["evidence_digest"] = canonical_digest(payload)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    aggregation_manifest = _build_aggregation_manifest(
+        commit=commit,
+        upstream=upstream,
+        aggregator=aggregator,
+        producer_manifest=manifest,
+    )
+    aggregation_path = args.aggregation_manifest or args.output.with_name(
+        "aggregation-manifest.json"
+    )
+    aggregation_path.parent.mkdir(parents=True, exist_ok=True)
+    aggregation_path.write_text(
+        json.dumps(aggregation_manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
     print(
         "aggregated exact producer proofs: "
         + ", ".join(
             f"{proof['name']} artifact={proof['producer_artifact_name']}"
             for proof in proofs
         )
+        + f" upstream_run={upstream['run_id']} aggregator_run={aggregator['run_id']}"
     )
     return 0
 

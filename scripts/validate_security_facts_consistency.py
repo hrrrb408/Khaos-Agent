@@ -131,9 +131,19 @@ def validate(root: Path = ROOT) -> list[str]:
         if f"`{gate}`" not in required_status_doc:
             errors.append(f"required-status-checks.md omits aggregate gate: {gate}")
     if required_gates.get("exact_push_event") != "push":
-        errors.append("Community Local exact event must be push")
+        errors.append("upstream exact event must be push")
     if required_gates.get("exact_main_ref") != "refs/heads/main":
-        errors.append("Community Local exact ref must be refs/heads/main")
+        errors.append("exact protected ref must be refs/heads/main")
+    if required_gates.get("community_local_aggregator_event") != "workflow_run":
+        errors.append("Community Local aggregator event must be workflow_run")
+    if required_gates.get("community_local_trigger_workflow") != "Security Closure Gate":
+        errors.append("Community Local aggregator must trigger from Security Closure Gate")
+    if required_gates.get("community_local_upstream_event") != "push":
+        errors.append("Community Local upstream event must be push")
+    if required_gates.get("community_local_upstream_workflow") != (
+        ".github/workflows/security-closure-gate.yml"
+    ):
+        errors.append("Community Local upstream workflow path is not exact")
 
     residuals = _list(facts_map.get("accepted_residuals"), "accepted_residuals", errors)
     residual_ids: set[str] = set()

@@ -15,7 +15,6 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, cast
 
-
 BUNDLE_SCHEMA = "khaos.community-local-closure-bundle.v1"
 RELEASE_EVIDENCE_SCHEMA = "khaos.release-gate-evidence.v1"
 PROFILE = "community-local"
@@ -53,16 +52,54 @@ def _run_identity(record: Mapping[str, Any], label: str, commit: str) -> dict[st
         if field not in record:
             raise ValueError(f"{label} is missing {field}")
         identity[field] = record[field]
+    workflow_id = record.get("workflow_id")
+    if type(workflow_id) is not int or workflow_id <= 0:
+        raise ValueError(f"{label} has no valid workflow id")
+    identity["workflow_id"] = workflow_id
     if identity["head_sha"] != commit:
         raise ValueError(f"{label} is not bound to the exact commit")
     if (
-        identity["run_attempt"] != 1
+        type(identity["run_attempt"]) is not int
+        or identity["run_attempt"] != 1
         or identity["event"] != "push"
         or identity["head_branch"] != "main"
         or identity["status"] != "completed"
         or identity["conclusion"] != "success"
     ):
         raise ValueError(f"{label} is not a successful original main-push run")
+    return identity
+
+
+def _observer_identity(
+    record: Mapping[str, Any], label: str, commit: str
+) -> dict[str, Any]:
+    """Validate the Community Local workflow_run observer identity."""
+    identity: dict[str, Any] = {}
+    for field in REQUIRED_RUN_FIELDS:
+        if field not in record:
+            raise ValueError(f"{label} is missing {field}")
+        identity[field] = record[field]
+    workflow_id = record.get("workflow_id")
+    if type(workflow_id) is not int or workflow_id <= 0:
+        raise ValueError(f"{label} has no valid workflow id")
+    identity["workflow_id"] = workflow_id
+    if (
+        identity["workflow"] != "community-local-closure.yml"
+        or identity["workflow_name"] != "Community Local Security Closure"
+    ):
+        raise ValueError(f"{label} workflow identity is not exact")
+    if record.get("target_sha") != commit:
+        raise ValueError(f"{label} target is not bound to the exact commit")
+    if (
+        type(identity["run_attempt"]) is not int
+        or identity["run_attempt"] != 1
+        or identity["event"] != "workflow_run"
+        or identity["head_branch"] != "main"
+        or identity["status"] != "completed"
+        or identity["conclusion"] != "success"
+    ):
+        raise ValueError(f"{label} is not a successful original main workflow_run")
+    identity["target_sha"] = commit
     return identity
 
 
@@ -115,7 +152,7 @@ def build_bundle(evidence: Mapping[str, Any]) -> dict[str, Any]:
     local = _mapping(gates.get("community_local"), "Community Local gate")
     security_identity = _run_identity(security, "Security Closure gate", commit)
     product_identity = _run_identity(product, "Product Integrity gate", commit)
-    local_identity = _run_identity(local, "Community Local gate", commit)
+    local_identity = _observer_identity(local, "Community Local gate", commit)
 
     security_proof = _mapping(security.get("security_proof"), "Security Closure proof")
     local_proof = _mapping(local.get("local_proof"), "Community Local proof")
@@ -125,6 +162,41 @@ def build_bundle(evidence: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("closure bundle lacks policy or schema digest")
     if local_proof.get("policy_digest") != policy_digest:
         raise ValueError("closure bundle policy digest is inconsistent")
+    aggregation_digest = local_proof.get("aggregation_manifest_digest")
+    if (
+        not isinstance(aggregation_digest, str)
+        or len(aggregation_digest) != 64
+        or any(character not in "0123456789abcdef" for character in aggregation_digest)
+        or local_proof.get("evidence_status") != "PROVEN"
+        or local_proof.get("reason") != "all required producer-owned proofs passed"
+    ):
+        raise ValueError("closure bundle lacks the proven aggregation manifest")
+    upstream = _mapping(
+        local_proof.get("upstream_security_closure"),
+        "Community Local upstream Security Closure",
+    )
+    for field, expected in {
+        "repository": "hrrrb408/Khaos-Agent",
+        "workflow": "Security Closure Gate",
+        "workflow_name": "Security Closure Gate",
+        "workflow_file": "security-closure-gate.yml",
+        "workflow_path": ".github/workflows/security-closure-gate.yml",
+        "ref": "refs/heads/main",
+        "event": "push",
+        "head_branch": "main",
+        "head_sha": commit,
+        "run_attempt": 1,
+        "status": "completed",
+        "conclusion": "success",
+    }.items():
+        if upstream.get(field) != expected:
+            raise ValueError(f"Community Local upstream run has an invalid {field}")
+    if str(upstream.get("run_id")) != str(security_identity["run_id"]):
+        raise ValueError("Community Local upstream run is not the selected Security Closure run")
+    if upstream.get("workflow_id") != security.get("workflow_id"):
+        raise ValueError("Community Local upstream workflow is not the selected workflow")
+    if type(upstream.get("workflow_id")) is not int or upstream["workflow_id"] <= 0:
+        raise ValueError("Community Local upstream workflow id is invalid")
     producer_digests = _producer_digests(local)
     if {item["policy_digest"] for item in producer_digests} != {policy_digest}:
         raise ValueError("producer policy digests are inconsistent")
@@ -196,6 +268,12 @@ def build_bundle(evidence: Mapping[str, Any]) -> dict[str, Any]:
         "security_closure_run": security_identity,
         "product_integrity_run": product_identity,
         "community_local_run": local_identity,
+        "community_local_upstream_run": dict(upstream),
+        "community_local_aggregation": {
+            "manifest_digest": aggregation_digest,
+            "evidence_status": local_proof.get("evidence_status"),
+            "reason": local_proof.get("reason"),
+        },
         "producer_artifact_digests": sorted(
             artifacts, key=lambda item: (str(item["gate"]), str(item["name"]))
         ),
