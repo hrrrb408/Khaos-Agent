@@ -369,6 +369,7 @@ def test_security_gate_records_exact_artifact_and_attempt(monkeypatch: pytest.Mo
     record = MODULE._gate_record("owner/repo", "security-closure-gate.yml", COMMIT)
     assert record["run_attempt"] == 1
     assert record["security_proof"]["commit_attestation_verified"] is True
+    assert record["security_proof"]["schema_digest"] == "c" * 64
     assert any(
         artifact["name"] == f"security-evidence-{COMMIT}"
         for artifact in record["artifacts"]
