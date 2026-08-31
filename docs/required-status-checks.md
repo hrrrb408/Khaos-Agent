@@ -37,10 +37,12 @@ not regressed. The detailed checks below are diagnostic dependencies of the
 aggregates — they remain visible but are no longer direct merge authorities.
 
 Release provenance has one additional Community Local exact-commit gate: the
-`Community Local Security Closure` workflow must have a completed successful
-`push` run for the same protected `main` commit with the
-`local-security-evidence-${commit}` artifact live and digest-bound. A green
-aggregate without that producer artifact cannot close Community Local.
+`Community Local Security Closure` workflow is a `workflow_run` observer of the
+completed, successful original-attempt `Security Closure Gate` `push` on
+protected `main`. Its `local-security-evidence-${commit}` artifact and
+`aggregation-manifest.json` sidecar must be live, digest-bound, and name that
+exact upstream run. A green aggregate without that binding cannot close
+Community Local.
 `Native Authority Production E2E` remains a separate platform workflow;
 macOS Signed Distribution is optional and reports
 `OPTIONAL_PROFILE_NOT_ENABLED` when it is not enabled.

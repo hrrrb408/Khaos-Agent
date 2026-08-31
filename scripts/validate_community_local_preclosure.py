@@ -19,7 +19,6 @@ from typing import Any
 
 import yaml
 
-
 ROOT = Path(__file__).resolve().parents[1]
 PYTHON_ROOT = ROOT / "python"
 PRE_CLOSURE_LABEL = "COMMUNITY_LOCAL_PRE_CLOSURE"
@@ -231,6 +230,18 @@ def validate_preclosure(root: Path = ROOT) -> list[str]:
         errors.append("pre-closure local evidence schema is stale")
     if preclosure_facts.get("producer_evidence_schema") != producer_evidence.PRODUCER_EVIDENCE_SCHEMA:
         errors.append("pre-closure producer evidence schema is stale")
+    if preclosure_facts.get("aggregator_event") != "workflow_run":
+        errors.append("pre-closure must use workflow_run aggregation")
+    if preclosure_facts.get("upstream_workflow") != "Security Closure Gate":
+        errors.append("pre-closure must name Security Closure Gate as upstream")
+    if preclosure_facts.get("upstream_commit_environment") != "github.event.workflow_run.head_sha":
+        errors.append("pre-closure upstream commit binding is stale")
+    if preclosure_facts.get("aggregation_manifest_schema") != (
+        "khaos.community-local-aggregation-manifest.v1"
+    ):
+        errors.append("pre-closure aggregation manifest schema is stale")
+    if preclosure_facts.get("aggregation_manifest_file") != "aggregation-manifest.json":
+        errors.append("pre-closure aggregation manifest file is stale")
 
     try:
         validator_signature = inspect.signature(producer_evidence.validate_producer_proof)
@@ -275,14 +286,28 @@ def validate_preclosure(root: Path = ROOT) -> list[str]:
         root / ".github" / "workflows" / "community-local-closure.yml"
     ).read_text(encoding="utf-8")
     for required_text in (
-        "push:",
+        "workflow_run:",
+        'workflows: ["Security Closure Gate"]',
+        "types: [completed]",
         "branches: [main]",
-        '--commit "$GITHUB_SHA"',
+        "github.event.workflow_run.head_sha",
+        '--commit "$UPSTREAM_HEAD_SHA"',
+        '--run-id "$UPSTREAM_RUN_ID"',
         "fetch_security_producer_artifacts.py",
         "collect_local_security_evidence.py",
+        "aggregation-manifest.json",
     ):
         if required_text not in closure_workflow:
             errors.append(f"main Community Local workflow is missing: {required_text}")
+    if "  push:" in closure_workflow or "workflow_dispatch:" in closure_workflow:
+        errors.append("main Community Local workflow has an unapproved trigger")
+
+    fetcher_source = (root / "scripts" / "fetch_security_producer_artifacts.py").read_text(
+        encoding="utf-8"
+    )
+    for forbidden in ("while True", "--timeout-seconds", "--poll-seconds"):
+        if forbidden in fetcher_source:
+            errors.append(f"producer fetcher contains unbounded polling contract: {forbidden}")
 
     report_source = (
         root / "scripts" / "build_local_security_closure_report.py"

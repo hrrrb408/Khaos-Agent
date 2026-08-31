@@ -1,7 +1,9 @@
 name: Community Local Security Closure
 
 on:
-  push:
+  workflow_run:
+    workflows: ["Security Closure Gate"]
+    types: [completed]
     branches: [main]
 
 permissions:
@@ -9,7 +11,9 @@ permissions:
   actions: read
 
 concurrency:
-  group: community-local-closure-${{ github.sha }}
+  # One observer run is tied to one immutable upstream workflow run.  A
+  # completed upstream event is the dependency; no wall-clock polling is used.
+  group: community-local-closure-${{ github.event.workflow_run.id }}
   cancel-in-progress: false
 
 jobs:
@@ -19,10 +23,38 @@ jobs:
     timeout-minutes: 35
     env:
       KHAOS_DEV_MODE: "0"
+      UPSTREAM_REPOSITORY: ${{ github.event.workflow_run.repository.full_name }}
+      UPSTREAM_HEAD_REPOSITORY: ${{ github.event.workflow_run.head_repository.full_name }}
+      UPSTREAM_WORKFLOW: ${{ github.event.workflow_run.name }}
+      UPSTREAM_RUN_ID: ${{ github.event.workflow_run.id }}
+      UPSTREAM_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+      UPSTREAM_EVENT: ${{ github.event.workflow_run.event }}
+      UPSTREAM_BRANCH: ${{ github.event.workflow_run.head_branch }}
+      UPSTREAM_STATUS: ${{ github.event.workflow_run.status }}
+      UPSTREAM_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+      UPSTREAM_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
     steps:
+      # This preflight is intentionally shell-only and runs before checkout:
+      # workflow_run may access a token, so no event-controlled revision is
+      # executed until the upstream identity is exact and successful.
+      - name: Validate exact upstream completion identity
+        run: |
+          test "$UPSTREAM_REPOSITORY" = "$GITHUB_REPOSITORY"
+          test "$UPSTREAM_HEAD_REPOSITORY" = "$GITHUB_REPOSITORY"
+          test "$UPSTREAM_WORKFLOW" = "Security Closure Gate"
+          case "$UPSTREAM_RUN_ID" in (''|*[!0-9]*) exit 1;; esac
+          test "$UPSTREAM_RUN_ID" -gt 0
+          test "$UPSTREAM_RUN_ATTEMPT" = "1"
+          test "$UPSTREAM_EVENT" = "push"
+          test "$UPSTREAM_BRANCH" = "main"
+          test "$UPSTREAM_STATUS" = "completed"
+          test "$UPSTREAM_CONCLUSION" = "success"
+          test "${#UPSTREAM_HEAD_SHA}" -eq 40
+          case "$UPSTREAM_HEAD_SHA" in (*[!0-9a-f]*) exit 1;; esac
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
+          ref: ${{ github.event.workflow_run.head_sha }}
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.11"
@@ -39,7 +71,8 @@ jobs:
           mkdir -p producer-input
           PYTHONPATH=python python scripts/fetch_security_producer_artifacts.py \
             --repo "$GITHUB_REPOSITORY" \
-            --commit "$GITHUB_SHA" \
+            --commit "$UPSTREAM_HEAD_SHA" \
+            --run-id "$UPSTREAM_RUN_ID" \
             --output-dir producer-input \
             --manifest producer-input/producer-artifact-manifest.json
       - name: Aggregate producer-owned Community Local evidence
@@ -48,12 +81,15 @@ jobs:
             --repo-root "$GITHUB_WORKSPACE" \
             --producer-dir producer-input \
             --producer-manifest producer-input/producer-artifact-manifest.json \
-            --commit "$GITHUB_SHA" \
+            --commit "$UPSTREAM_HEAD_SHA" \
+            --aggregation-manifest aggregation-manifest.json \
             --output local-security-evidence.json
       - name: Upload exact-SHA local closure evidence
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
-          name: local-security-evidence-${{ github.sha }}
-          path: local-security-evidence.json
+          name: local-security-evidence-${{ github.event.workflow_run.head_sha }}
+          path: |
+            local-security-evidence.json
+            aggregation-manifest.json
           if-no-files-found: error
           retention-days: 90

@@ -7,7 +7,6 @@ from pathlib import Path
 
 import pytest
 
-
 ROOT = Path(__file__).resolve().parents[3]
 SPEC = importlib.util.spec_from_file_location(
     "build_community_local_closure_bundle",
@@ -24,8 +23,13 @@ SCHEMA = "c" * 64
 
 
 def _run(name: str) -> dict[str, object]:
+    workflow_file = {
+        "Security Closure Gate": "security-closure-gate.yml",
+        "Product Integrity Gate": "product-integrity-gate.yml",
+        "Community Local Security Closure": "community-local-closure.yml",
+    }[name]
     return {
-        "workflow": f"{name}.yml",
+        "workflow": workflow_file,
         "workflow_name": name,
         "run_id": 10,
         "run_attempt": 1,
@@ -34,6 +38,10 @@ def _run(name: str) -> dict[str, object]:
         "head_branch": "main",
         "status": "completed",
         "conclusion": "success",
+        "repository": "hrrrb408/Khaos-Agent",
+        "workflow_id": 322127705,
+        "workflow_path": f".github/workflows/{workflow_file}",
+        "ref": "refs/heads/main",
         "url": f"https://example.invalid/{name}",
         "evidence_digest": "d" * 64,
         "artifacts": [
@@ -55,9 +63,22 @@ def _evidence() -> dict[str, object]:
     }
     product = _run("Product Integrity Gate")
     local = _run("Community Local Security Closure")
+    local["head_sha"] = "d" * 40
+    local["event"] = "workflow_run"
+    local["target_sha"] = COMMIT
     local["local_proof"] = {
         "local_evidence_digest": "f" * 64,
         "policy_digest": POLICY,
+        "aggregation_manifest_digest": "a" * 64,
+        "evidence_status": "PROVEN",
+        "reason": "all required producer-owned proofs passed",
+        "upstream_security_closure": {
+            **security,
+            "workflow": "Security Closure Gate",
+            "workflow_name": "Security Closure Gate",
+            "workflow_file": "security-closure-gate.yml",
+            "workflow_path": ".github/workflows/security-closure-gate.yml",
+        },
         "profile_status": {"macos_signed_distribution": "OPTIONAL_PROFILE_NOT_ENABLED"},
         "residual_risks": ["hostile_same_uid_isolation: NOT_CLAIMED"],
     }

@@ -172,6 +172,10 @@ required_gates:
   release_verifier: scripts/verify_release_gate_runs.py
   exact_push_event: push
   exact_main_ref: refs/heads/main
+  community_local_aggregator_event: workflow_run
+  community_local_trigger_workflow: Security Closure Gate
+  community_local_upstream_event: push
+  community_local_upstream_workflow: .github/workflows/security-closure-gate.yml
 required_proof_names:
   community_local:
     - community_authority
@@ -378,6 +382,10 @@ local_security_closure:
     - protected_main_branch
     - original_run_attempt
     - protected_main_ancestry
+    - upstream_security_closure_run_id
+    - upstream_security_closure_workflow_identity
+    - community_local_aggregator_run_id
+    - community_local_aggregation_manifest_digest
   community_local_prerequisites:
     apple_developer_program: not_required
     apple_team_id: not_required
@@ -407,6 +415,11 @@ local_security_closure:
     producer_evidence_schema: khaos.local-security-producer-proof.v1
     accepts_saved_release_record_as_live_provenance: false
     final_certification_workflow: .github/workflows/community-local-closure.yml
+    aggregator_event: workflow_run
+    upstream_workflow: Security Closure Gate
+    upstream_commit_environment: github.event.workflow_run.head_sha
+    aggregation_manifest_schema: khaos.community-local-aggregation-manifest.v1
+    aggregation_manifest_file: aggregation-manifest.json
 evidence_retention:
   critical_minimum_days: 90
   saved_evidence_is_audit_only: true
@@ -426,7 +439,7 @@ evidence_retention:
       name: security-test-evidence-browser-dns-rebinding
       class: closure-critical
     - workflow: .github/workflows/community-local-closure.yml
-      name: 'local-security-evidence-${{ github.sha }}'
+      name: 'local-security-evidence-${{ github.event.workflow_run.head_sha }}'
       class: release-critical
     - workflow: .github/workflows/docker-security.yml
       name: 'production-composition-evidence-${{ github.sha }}'
