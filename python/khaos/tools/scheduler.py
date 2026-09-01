@@ -34,7 +34,7 @@ from khaos.coding.planning.tool_routing import (
     relative_resource_targets,
 )
 from khaos.db.repositories.tool_operations import ToolOperationRepository
-from khaos.exceptions import PermissionDeniedError
+from khaos.exceptions import PermissionDeniedError, ToolNotFoundError
 from khaos.permissions import (
     ApprovalMode,
 )
@@ -222,7 +222,14 @@ class ToolScheduler:
         prepared.pop("idempotency_key", None)
         prepared.pop("_idempotency_key", None)
         name = str(prepared.get("name") or "")
-        tool = self.registry.get(name)
+        try:
+            tool = self.registry.get(name)
+        except ToolNotFoundError:
+            # A model may propose a name outside a pruned runtime registry.
+            # Keep the call unbound so ToolAdmission can return a bounded
+            # denial result; unknown model input must not escape the scheduler
+            # as an infrastructure exception.
+            return prepared
         if self._declared_effect_status(tool) != EFFECT_NOT_APPLIED:
             context = dict(tool_context or {})
             prepared["_idempotency_key"] = server_operation_key(

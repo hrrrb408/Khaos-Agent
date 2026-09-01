@@ -557,6 +557,14 @@ MIGRATIONS: tuple[MigrationSpec, ...] = (
         sql_files=("0026_capability_evaluations.sql",),
         migrator_symbols=("_apply_v26_upgrades",),
     ),
+    MigrationSpec(
+        version=27,
+        name="m8_0_coding_evaluation_runs",
+        # Release-time manifest over the isolated Coding evaluation ledger.
+        sha256="aa21fcdef825a59738147ad310bd947754bad89a7a9781f3d475f9186d49303c",
+        sql_files=("0027_coding_evaluation_runs.sql",),
+        migrator_symbols=("_apply_v27_upgrades",),
+    ),
 )
 
 

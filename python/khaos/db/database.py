@@ -997,6 +997,15 @@ class Database:
                 await self._apply_v26_upgrades()
             finally:
                 self._conn = original_conn
+            # M8.0: Coding capability evaluation is a separate append-only
+            # experiment ledger.  It is descriptive evidence only and is not
+            # consumed by any control-plane authority.
+            original_conn = self._conn
+            self._conn = _MigrationConnection(conn)
+            try:
+                await self._apply_v27_upgrades()
+            finally:
+                self._conn = original_conn
             # Batch 6.4 §10.4: backfill the historical ledger rows (v1–v5)
             # so the chain is complete from this point on.  Idempotent —
             # uses INSERT OR IGNORE keyed on the version PK.
@@ -1754,6 +1763,15 @@ class Database:
         """Add the immutable M7.9 capability-evaluation observation ledger."""
         conn = await self._require_conn()
         migration_path = _MIGRATIONS_DIR / "0026_capability_evaluations.sql"
+        await self._execute_schema_statements(
+            conn,
+            migration_path.read_text(encoding="utf-8"),
+        )
+
+    async def _apply_v27_upgrades(self) -> None:
+        """Add the isolated M8.0 Coding evaluation run ledger."""
+        conn = await self._require_conn()
+        migration_path = _MIGRATIONS_DIR / "0027_coding_evaluation_runs.sql"
         await self._execute_schema_statements(
             conn,
             migration_path.read_text(encoding="utf-8"),

@@ -329,6 +329,59 @@ def build_command_parser() -> argparse.ArgumentParser:
     import_parser.add_argument("path", type=Path)
     import_parser.add_argument("--no-rebuild", action="store_true")
 
+    eval_parser = subparsers.add_parser(
+        "eval",
+        help="Run observation-only capability evaluations",
+    )
+    eval_sub = eval_parser.add_subparsers(dest="eval_command")
+    coding_eval_parser = eval_sub.add_parser(
+        "coding",
+        help="M8.0 Coding capability evaluation",
+    )
+    coding_sub = coding_eval_parser.add_subparsers(dest="coding_command")
+
+    coding_list = coding_sub.add_parser("list", help="List immutable Coding scenarios")
+    coding_list.add_argument("--manifest", type=Path)
+    coding_list.add_argument("--tag")
+    coding_list.add_argument("--json", action="store_true", dest="as_json")
+
+    coding_run = coding_sub.add_parser("run", help="Run one or more Coding scenarios")
+    coding_run.add_argument("scenario_id", nargs="?")
+    coding_run_group = coding_run.add_mutually_exclusive_group(required=False)
+    coding_run_group.add_argument("--tag")
+    coding_run_group.add_argument("--all", action="store_true", dest="all_scenarios")
+    coding_run_group.add_argument("--scenario", dest="scenario_option")
+    coding_run.add_argument("--manifest", type=Path)
+    coding_run.add_argument("--project-root", type=Path)
+    coding_run.add_argument("--db")
+    coding_run.add_argument("--config", type=Path)
+    coding_run.add_argument("--principal-id")
+    coding_run.add_argument("--project-id")
+    coding_run.add_argument("--model")
+    coding_run.add_argument("--provider")
+    coding_run.add_argument("--khaos-source-sha")
+    coding_run.add_argument("--json", action="store_true", dest="as_json")
+
+    coding_report = coding_sub.add_parser("report", help="Report persisted Coding runs")
+    coding_report.add_argument("run_id_positional", nargs="?", help="Run id to report")
+    coding_report.add_argument("--run-id")
+    coding_report.add_argument("--scenario-id")
+    coding_report.add_argument("--manifest", type=Path)
+    coding_report.add_argument("--project-root", type=Path)
+    coding_report.add_argument("--db")
+    coding_report.add_argument("--principal-id")
+    coding_report.add_argument("--project-id")
+    coding_report.add_argument("--limit", type=int, default=100)
+    coding_report.add_argument("--format", choices=["markdown", "json"], default="markdown")
+
+    coding_compare = coding_sub.add_parser("compare", help="Compare two runs of one scenario version")
+    coding_compare.add_argument("baseline_run_id")
+    coding_compare.add_argument("candidate_run_id")
+    coding_compare.add_argument("--project-root", type=Path)
+    coding_compare.add_argument("--db")
+    coding_compare.add_argument("--principal-id")
+    coding_compare.add_argument("--project-id")
+
     return parser
 
 
@@ -1034,7 +1087,7 @@ def main() -> None:
       2. Legacy flags such as ``--message`` for scriptable SSE output.
     """
     argv = sys.argv[1:]
-    command_names = {"start", "chat", "test", "config", "version", "migrate", "memory"}
+    command_names = {"start", "chat", "test", "config", "version", "migrate", "memory", "eval"}
     if not argv:
         parser = build_command_parser()
         parser.print_help()
@@ -1058,6 +1111,10 @@ def main() -> None:
             raise SystemExit(cmd_migrate(args))
         elif args.command == "memory":
             raise SystemExit(cmd_memory(args))
+        elif args.command == "eval":
+            from khaos.cli.eval_commands import cmd_eval
+
+            raise SystemExit(cmd_eval(args))
         return
 
     parser = build_parser()
