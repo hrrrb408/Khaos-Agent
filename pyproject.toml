@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68.0", "wheel"]
+requires = ["setuptools>=84.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -10,7 +10,7 @@ requires-python = ">=3.11"
 dependencies = [
     "aiosqlite>=0.19",
     "httpx>=0.28",
-    "cryptography>=50.0.0",
+    "cryptography>=50.0.1",
     "PyYAML>=6",
     "google-re2>=1",
 ]
@@ -34,7 +34,7 @@ tui = [
 # WebSocket bypass closure) was only added in 1.48.  Older builds fail
 # closed at runtime via a ``hasattr`` probe in ``_install_route_guard``.
 browser = [
-    "playwright>=1.48",
+    "playwright>=1.62.0",
 ]
 tree-sitter = [
     "tree-sitter==0.26.0",
