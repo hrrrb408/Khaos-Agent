@@ -32,7 +32,7 @@
 
 ## GitHub Actions governance
 
-- Workflow action references inspected: `103`; immutable SHA-pinned/local references: `103`.
+- Workflow action references inspected: `111`; immutable SHA-pinned/local references: `111`.
 - Unpinned third-party actions (must remain empty): none.
 - Security-sensitive paths are covered by `.github/CODEOWNERS`; the repository reference ruleset preserves sole-maintainer liveness, while `scripts/github-m6-hardened-ruleset.json` prepares independent approval for a second maintainer. Independent approval is not verified locally.
 
@@ -94,7 +94,7 @@
 - `python/khaos/security/principals.py`: `cc81b10ffa5a2a54b413a3b5cc37a85fe428253c7687be4dbf30b61610b4f8b0`
 - `python/khaos/security/shell_semantics.py`: `a44d1b70e10e94fb612fe0f9bd134b660ffae1a26d12949f3f4f5b08c9a3ff6b`
 - `python/khaos/coding/planning/security_identities.py`: `bcafd43a2920e087f4c064091d9faa04184739a4a8a6454aa654ffd134790a38`
-- `python/khaos/coding/workspace/boundary.py`: `5dcfcbad54001279f3baa0b0d60d6d28816180f7eba4ff49cc09f48136724367`
+- `python/khaos/coding/workspace/boundary.py`: `f066d82694d7790d30b4b7bc61d7446fa934f46c4d14bb8475c5df4aef3577fe`
 - `python/khaos/coding/workspace/policy.py`: `7081f370dfd94078abfba0b03ecdd35cb1945e585df40b593f8436b207163b13`
 - `python/khaos/db/connection.py`: `ffc70a5796101cd2a629e5e05af0eaae865ac980e799dca3fec6330d0cb1005d`
 - `python/khaos/db/repositories/sessions.py`: `dfbaa4c24ac56fbec89a254ac24a55279b58e5ef305abe41e82e44d9c257b554`

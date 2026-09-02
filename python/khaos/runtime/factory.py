@@ -487,6 +487,14 @@ class RuntimeResult:
     composition_manifest: dict[str, object] | None = field(
         init=False, default=None
     )
+    # M8.1: repository intelligence is attached by the composition root so
+    # lifecycle cleanup does not infer ownership from the AgentLoop object.
+    # ``init=False`` preserves the established positional construction
+    # contract used by direct tests and compatibility adapters.
+    context_intelligence: Any = field(init=False, default=None, repr=False)
+    owns_context_intelligence: bool = field(
+        init=False, default=False, repr=False
+    )
     # M7.3: production-composed planning control coordinator.  It is an
     # orchestration owner only; plan revisions remain passive and TaskStatus
     # lifecycle writes remain owned by their existing control boundaries.
@@ -875,19 +883,25 @@ class RuntimeResult:
                     logger.debug("memory host close failed", exc_info=True)
             # M8.1 repository intelligence owns only derived index resources;
             # close its persistent connection after memory and before the
-            # execution authority.  A shared/injected facade remains owned by
-            # its composing lifecycle and its close method is a no-op.
-            context_intelligence = getattr(self.loop, "context_intelligence", None)
-            context_close = getattr(context_intelligence, "close", None)
-            if callable(context_close):
-                try:
-                    close_context = cast(
-                        Callable[[], Awaitable[object]], context_close
-                    )
-                    await close_context()
-                except Exception:
-                    failed = True
-                    logger.debug("context intelligence close failed", exc_info=True)
+            # execution authority.  The factory records the explicit owner on
+            # RuntimeResult; direct compatibility constructions leave it
+            # unset, so arbitrary loop attributes cannot affect shutdown.
+            if (
+                self.context_intelligence is not None
+                and self.owns_context_intelligence
+            ):
+                context_close = getattr(self.context_intelligence, "close", None)
+                if callable(context_close):
+                    try:
+                        close_context = cast(
+                            Callable[[], Awaitable[object]], context_close
+                        )
+                        await close_context()
+                    except Exception:
+                        failed = True
+                        logger.debug(
+                            "context intelligence close failed", exc_info=True
+                        )
             if self.execution_service is not None:
                 try:
                     await self.tool_scheduler.aclose()
@@ -2210,6 +2224,8 @@ async def build_runtime(
         runtime.owns_authority_broker = owns_authority_broker
         runtime.memory_host = memory_host
         runtime.owns_memory_host = owns_memory_host
+        runtime.context_intelligence = context_intelligence
+        runtime.owns_context_intelligence = context_intelligence is not None
         runtime.recovery_control = recovery_control
         runtime.composition_manifest = composition_manifest
         return runtime

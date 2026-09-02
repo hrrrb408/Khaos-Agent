@@ -1,3 +1,4 @@
+# KHAOS-PRIVILEGED-SPAWN owner=FixtureManager threat-model=private-fixture-git boundary=coding-evaluation-fixture
 """Immutable fixture materialization and oracle-only workspace isolation."""
 
 from __future__ import annotations

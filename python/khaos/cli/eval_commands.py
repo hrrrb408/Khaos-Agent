@@ -1,3 +1,4 @@
+# KHAOS-PRIVILEGED-SPAWN owner=CodingEvaluationCLI threat-model=trusted-source-git-provenance boundary=coding-evaluation-cli
 """CLI handlers for the M8.0 Coding capability evaluation plane."""
 
 from __future__ import annotations
