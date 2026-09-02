@@ -12,6 +12,7 @@ from typing import Any
 
 from khaos.agent import AgentConfig
 from khaos.coding.execution import BackendSelector, ExecutionService, ProcessSupervisor
+from khaos.coding.intelligence.query_service import ContextIntelligenceService
 from khaos.coding.workspace import WorkspaceManager
 from khaos.evaluation.coding.contracts import CodingScenario
 from khaos.evaluation.coding.fixtures import MaterializedFixture
@@ -117,6 +118,14 @@ class RuntimeCodingAgentInvoker:
             runtime_id=runtime_id,
             runtime_profile=RuntimeProfile.TESTING,
         )
+        # M8.0 must exercise the production-shaped repository-intelligence
+        # facade, including its generation-bound index and metrics.  This is
+        # an explicit testing composition seam; production composition is
+        # still owned by build_runtime and cannot receive this injection.
+        context_intelligence = ContextIntelligenceService(
+            workspace_manager,
+            index_database=fixture._private_root / "repo-intelligence.db",
+        )
         runtime = await build_runtime(
             RuntimeConfig(
                 project_root=fixture.agent_root,
@@ -128,6 +137,7 @@ class RuntimeCodingAgentInvoker:
                 mode_manager=mode_manager,
                 workspace_manager=workspace_manager,
                 execution_service=execution_service,
+                context_intelligence=context_intelligence,
                 principal_id=self.principal_id,
                 principal_kind="human",
                 parent_principal_id=f"human:{self.principal_id}",
@@ -191,6 +201,10 @@ class RuntimeCodingAgentInvoker:
         except Exception as exc:
             status = "ERROR"
             error = _safe_error(exc)
+        repository_metrics = getattr(runtime.loop, "repo_intelligence", None)
+        snapshot = getattr(repository_metrics, "metrics_snapshot", None)
+        if callable(snapshot):
+            trace.record_repository_metrics(snapshot())
         active_workspace = runtime.loop.active_workspace
         final_root = (
             active_workspace.worktree_path

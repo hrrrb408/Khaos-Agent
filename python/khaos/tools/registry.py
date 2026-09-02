@@ -1065,6 +1065,10 @@ class ToolInvocationBroker:
             handler_params["workspace_manager"] = context.get("workspace_manager")
             handler_params["task_id"] = context.get("task_id")
             handler_params["workspace_id"] = context.get("workspace_id")
+            if name in {"code_search", "code_symbols"}:
+                handler_params["repo_intelligence"] = context.get("repo_intelligence")
+                handler_params["principal_id"] = context.get("principal_id", "")
+                handler_params["project_id"] = context.get("project_id", "")
         if mode == "office" and name in _OFFICE_WORKSPACE_FILE_TOOLS:
             workspace_root = context.get("office_workspace_root")
             if workspace_root is None:
@@ -2284,7 +2288,7 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
     registry.register(
         ToolDefinition(
             name="code_search",
-            description="Search code files for text.",
+            description="Search the workspace repository index semantically, with bounded lexical fallback.",
             parameters={
                 "type": "object",
                 "properties": {
@@ -2292,6 +2296,7 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
                     "query": {"type": "string"},
                     "glob": {"type": "string"},
                     "limit": {"type": "integer"},
+                    "language": {"type": "string"},
                 },
                 "required": ["query"],
             },
@@ -2303,7 +2308,7 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
     registry.register(
         ToolDefinition(
             name="code_symbols",
-            description="Extract symbols from a Python source file.",
+            description="Extract repository-indexed symbols from a supported source file.",
             parameters={
                 "type": "object",
                 "properties": {"path": {"type": "string"}},

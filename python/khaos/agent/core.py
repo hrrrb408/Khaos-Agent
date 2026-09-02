@@ -189,6 +189,7 @@ class AgentLoop:
         trusted_verification_service: Any = None,
         recovery_control: RecoveryControlCoordinator | None = None,
         delegated_execution_context: Any = None,
+        repo_intelligence=None,
     ):
         self.config = config
         self.mode_manager = mode_manager
@@ -215,6 +216,9 @@ class AgentLoop:
         # owner-scoped, SafeWorkspaceFS-backed service.  The legacy builder
         # remains available for explicitly injected development/test loops.
         self.context_intelligence = context_intelligence
+        self.repo_intelligence = repo_intelligence or getattr(
+            context_intelligence, "repo_intelligence", None
+        )
         # Phase 6: 项目约定文件加载器（KHAOS.md / AGENTS.md）。注入优先级
         # 高于 memory / skill，因为它们是项目级硬规则。
         self.project_context_loader = project_context_loader
@@ -791,6 +795,7 @@ class AgentLoop:
                         },
                         "sandbox_backend": execution_backend_identity,
                         "workspace_manager": self.workspace_manager,
+                        "repo_intelligence": self.repo_intelligence,
                         "coding_workspace_enforced": self.active_workspace is not None,
                         "production_runtime": self.runtime_profile.is_production,
                         "approval_broker": self.approval_broker,

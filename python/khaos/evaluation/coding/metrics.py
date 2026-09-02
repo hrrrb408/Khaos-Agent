@@ -178,6 +178,19 @@ class CodingMetrics:
     context_stale_count: int | None = None
     context_cache_hits: int | None = None
     context_cache_misses: int | None = None
+    repo_intelligence_queries: int | None = None
+    repo_intelligence_cache_hits: int | None = None
+    repo_intelligence_cache_misses: int | None = None
+    repo_index_full_refreshes: int | None = None
+    repo_index_incremental_refreshes: int | None = None
+    repo_files_parsed: int | None = None
+    repo_files_reparsed: int | None = None
+    semantic_queries: int | None = None
+    lexical_fallback_queries: int | None = None
+    stale_query_count: int | None = None
+    context_candidate_count: int | None = None
+    context_selected_file_count: int | None = None
+    context_selected_symbol_count: int | None = None
     replan_count: int = 0
     recovery_count: int = 0
     no_progress_count: int = 0
@@ -298,6 +311,19 @@ class CodingMetrics:
             "context_stale_count",
             "context_cache_hits",
             "context_cache_misses",
+            "repo_intelligence_queries",
+            "repo_intelligence_cache_hits",
+            "repo_intelligence_cache_misses",
+            "repo_index_full_refreshes",
+            "repo_index_incremental_refreshes",
+            "repo_files_parsed",
+            "repo_files_reparsed",
+            "semantic_queries",
+            "lexical_fallback_queries",
+            "stale_query_count",
+            "context_candidate_count",
+            "context_selected_file_count",
+            "context_selected_symbol_count",
         ):
             value = getattr(self, name)
             if value is not None and (type(value) is not int or value < 0):
@@ -379,6 +405,19 @@ class CodingMetrics:
             "context_stale_count": self.context_stale_count,
             "context_cache_hits": self.context_cache_hits,
             "context_cache_misses": self.context_cache_misses,
+            "repo_intelligence_queries": self.repo_intelligence_queries,
+            "repo_intelligence_cache_hits": self.repo_intelligence_cache_hits,
+            "repo_intelligence_cache_misses": self.repo_intelligence_cache_misses,
+            "repo_index_full_refreshes": self.repo_index_full_refreshes,
+            "repo_index_incremental_refreshes": self.repo_index_incremental_refreshes,
+            "repo_files_parsed": self.repo_files_parsed,
+            "repo_files_reparsed": self.repo_files_reparsed,
+            "semantic_queries": self.semantic_queries,
+            "lexical_fallback_queries": self.lexical_fallback_queries,
+            "stale_query_count": self.stale_query_count,
+            "context_candidate_count": self.context_candidate_count,
+            "context_selected_file_count": self.context_selected_file_count,
+            "context_selected_symbol_count": self.context_selected_symbol_count,
             "replan_count": self.replan_count,
             "recovery_count": self.recovery_count,
             "no_progress_count": self.no_progress_count,
@@ -442,6 +481,7 @@ class CodingTraceCollector:
         self._completion_rejections = 0
         self._completion_acceptances = 0
         self._permission_denials = 0
+        self._repo_metrics: dict[str, int] | None = None
         self._started = time.monotonic()
 
     @property
@@ -543,6 +583,35 @@ class CodingTraceCollector:
             self._record_agent_event(event)
             self._record("agent_event", event)
 
+    def record_repository_metrics(self, metrics: object) -> None:
+        """Attach a bounded repository-intelligence metrics snapshot.
+
+        Only numeric counters are retained; source text, paths, and query
+        payloads never enter the evaluation ledger.
+        """
+        fields = {
+            "repo_intelligence_queries": "query_count",
+            "repo_intelligence_cache_hits": "cache_hit_count",
+            "repo_intelligence_cache_misses": "cache_miss_count",
+            "repo_index_full_refreshes": "full_index_count",
+            "repo_index_incremental_refreshes": "incremental_refresh_count",
+            "repo_files_parsed": "parsed_file_count",
+            "repo_files_reparsed": "reparsed_file_count",
+            "semantic_queries": "semantic_query_count",
+            "lexical_fallback_queries": "lexical_fallback_count",
+            "stale_query_count": "stale_query_count",
+            "context_candidate_count": "context_candidate_file_count",
+            "context_selected_file_count": "context_selected_file_count",
+            "context_selected_symbol_count": "context_selected_symbol_count",
+        }
+        observed: dict[str, int] = {}
+        for destination, source in fields.items():
+            value = getattr(metrics, source, None)
+            if type(value) is not int or value < 0:
+                return
+            observed[destination] = value
+        self._repo_metrics = observed
+
     def record(
         self,
         kind: str,
@@ -573,6 +642,7 @@ class CodingTraceCollector:
     ) -> CodingMetrics:
         tool_names = dict(self._tool_names)
         category = dict(self._tool_categories)
+        repo_metrics = self._repo_metrics or {}
         detailed = {
             "read_file_calls": tool_names.get("read_file", 0),
             "search_calls": tool_names.get("search_files", 0),
@@ -644,6 +714,19 @@ class CodingTraceCollector:
             time_to_first_edit_ms=self._first_edit_ms,
             time_to_first_test_ms=self._first_test_ms,
             time_to_first_green_ms=self._first_green_ms,
+            repo_intelligence_queries=repo_metrics.get("repo_intelligence_queries"),
+            repo_intelligence_cache_hits=repo_metrics.get("repo_intelligence_cache_hits"),
+            repo_intelligence_cache_misses=repo_metrics.get("repo_intelligence_cache_misses"),
+            repo_index_full_refreshes=repo_metrics.get("repo_index_full_refreshes"),
+            repo_index_incremental_refreshes=repo_metrics.get("repo_index_incremental_refreshes"),
+            repo_files_parsed=repo_metrics.get("repo_files_parsed"),
+            repo_files_reparsed=repo_metrics.get("repo_files_reparsed"),
+            semantic_queries=repo_metrics.get("semantic_queries"),
+            lexical_fallback_queries=repo_metrics.get("lexical_fallback_queries"),
+            stale_query_count=repo_metrics.get("stale_query_count"),
+            context_candidate_count=repo_metrics.get("context_candidate_count"),
+            context_selected_file_count=repo_metrics.get("context_selected_file_count"),
+            context_selected_symbol_count=repo_metrics.get("context_selected_symbol_count"),
             replan_count=self._replan_count,
             recovery_count=self._recovery_count,
             no_progress_count=self._no_progress_count,

@@ -255,6 +255,11 @@ class RuntimeConfig:
     # ProductionRuntimeConfig deliberately does not expose this hook; its
     # default is the conservative empty provider.
     completion_fact_provider: Any = None
+    # M8.1: a trusted development/evaluation composition may inject the
+    # workspace-bound repository-intelligence facade.  The structural
+    # ProductionRuntimeConfig deliberately omits this field, so the
+    # production factory remains the sole owner of the canonical facade.
+    context_intelligence: Any = None
 
 
 @dataclass(frozen=True)
@@ -868,6 +873,21 @@ class RuntimeResult:
                 except Exception:
                     failed = True
                     logger.debug("memory host close failed", exc_info=True)
+            # M8.1 repository intelligence owns only derived index resources;
+            # close its persistent connection after memory and before the
+            # execution authority.  A shared/injected facade remains owned by
+            # its composing lifecycle and its close method is a no-op.
+            context_intelligence = getattr(self.loop, "context_intelligence", None)
+            context_close = getattr(context_intelligence, "close", None)
+            if callable(context_close):
+                try:
+                    close_context = cast(
+                        Callable[[], Awaitable[object]], context_close
+                    )
+                    await close_context()
+                except Exception:
+                    failed = True
+                    logger.debug("context intelligence close failed", exc_info=True)
             if self.execution_service is not None:
                 try:
                     await self.tool_scheduler.aclose()
@@ -1733,11 +1753,23 @@ async def build_runtime(
         # authority.  ProductionRuntimeConfig intentionally has no reader/index
         # injection seam, so model-controlled or host-path readers cannot replace
         # SafeWorkspaceFS here.
-        context_intelligence = (
-            ContextIntelligenceService(workspace_manager)
-            if production_mode
-            else None
-        )
+        context_index_database = None
+        if production_mode and getattr(cfg.db, "path", ":memory:") != ":memory:":
+            # Repository intelligence is derived state, but it must survive a
+            # runtime restart. Keep it in the trusted state directory beside
+            # the lifecycle DB, never under the model-writable worktree.
+            context_index_database = Path(cfg.db.path).with_name("repo-intelligence.db")
+        if production_mode:
+            context_intelligence = ContextIntelligenceService(
+                workspace_manager,
+                index_database=context_index_database,
+            )
+        else:
+            # Test/development composition may provide the same facade used
+            # by the M8 evaluator.  No fallback intelligence path is created
+            # when it is absent; legacy adapters remain explicit at their
+            # compatibility boundaries.
+            context_intelligence = cfg.context_intelligence
         # B1: the OfficeMutationAuthority is a server/project-lifecycle object.
         # When ``cfg.office_authority`` is injected (AgentService / SubAgentService
         # share one across every turn), reuse it so the aggregate storage baseline
@@ -2057,6 +2089,11 @@ async def build_runtime(
                 cfg.coding_context_builder if not production_mode else None
             ),
             context_intelligence=context_intelligence,
+            repo_intelligence=(
+                getattr(context_intelligence, "repo_intelligence", None)
+                if context_intelligence is not None
+                else None
+            ),
             workspace_manager=workspace_manager,
             execution_service=execution_service,
             approval_broker=cfg.approval_broker,

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from khaos.agent import Message
 from khaos.evaluation.coding import CodingTraceCollector, CodingVerdict
 
@@ -91,6 +93,39 @@ def test_trace_collector_deduplicates_streamed_assistant_chunks() -> None:
 
     assert metrics.model_calls == 1
     assert metrics.model_turns == 1
+
+
+def test_trace_metrics_capture_repository_intelligence_counters() -> None:
+    collector = CodingTraceCollector(max_events=32, max_model_turns=4, max_tool_calls=8)
+    collector.record_repository_metrics(
+        SimpleNamespace(
+            query_count=7,
+            cache_hit_count=2,
+            cache_miss_count=5,
+            full_index_count=1,
+            incremental_refresh_count=3,
+            parsed_file_count=12,
+            reparsed_file_count=3,
+            semantic_query_count=6,
+            lexical_fallback_count=1,
+            stale_query_count=0,
+            context_candidate_file_count=18,
+            context_selected_file_count=4,
+            context_selected_symbol_count=9,
+        )
+    )
+
+    metrics = collector.finish(
+        verdict=CodingVerdict.PASS,
+        agent_status="COMPLETED",
+        completion_status="completed",
+    )
+
+    assert metrics.to_payload()["repo_intelligence_queries"] == 7
+    assert metrics.repo_intelligence_cache_hits == 2
+    assert metrics.repo_index_incremental_refreshes == 3
+    assert metrics.repo_files_reparsed == 3
+    assert metrics.context_selected_symbol_count == 9
 
 
 def test_trace_limits_fail_closed() -> None:

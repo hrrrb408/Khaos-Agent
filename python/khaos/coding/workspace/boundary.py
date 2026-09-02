@@ -6,6 +6,7 @@ import hashlib
 import os
 import stat
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -487,8 +488,25 @@ class SafeWorkspaceFS:
         *,
         max_entries: int = DEFAULT_TREE_ENTRIES,
         max_depth: int = DEFAULT_TREE_DEPTH,
+        ignored_dirs: set[str] | None = None,
+        max_duration_seconds: float | None = None,
     ) -> list[tuple[str, bool]]:
         """Return safe regular files and directories below ``target``."""
+        if type(max_entries) is not int or max_entries <= 0:
+            raise ValueError("max_entries must be positive")
+        if type(max_depth) is not int or max_depth < 0:
+            raise ValueError("max_depth must be non-negative")
+        if max_duration_seconds is not None and (
+            type(max_duration_seconds) not in (int, float)
+            or max_duration_seconds <= 0
+        ):
+            raise ValueError("max_duration_seconds must be positive")
+        ignored = {str(name).casefold() for name in (ignored_dirs or set())}
+        deadline = (
+            time.monotonic() + float(max_duration_seconds)
+            if max_duration_seconds is not None
+            else None
+        )
         directory = self._open_directory(target)
         base = self._directory_relative(target)
         root_parts = tuple(base.split("/")) if base else ()
@@ -499,12 +517,22 @@ class SafeWorkspaceFS:
         observed = 0
         try:
             while stack:
+                if deadline is not None and time.monotonic() > deadline:
+                    raise WorkspaceBoundaryError(
+                        "directory traversal exceeds the duration limit"
+                    )
                 descriptor, prefix, depth = stack.pop()
                 try:
                     names = sorted(os.listdir(descriptor), key=str.casefold)
                     children: list[tuple[int, tuple[str, ...], int]] = []
                     for name in names:
+                        if deadline is not None and time.monotonic() > deadline:
+                            raise WorkspaceBoundaryError(
+                                "directory traversal exceeds the duration limit"
+                            )
                         if name.casefold() in PROTECTED_WORKSPACE_NAMES_CASEFOLD:
+                            continue
+                        if name.casefold() in ignored:
                             continue
                         observed += 1
                         if observed > max_entries:
