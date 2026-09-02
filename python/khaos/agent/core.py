@@ -60,6 +60,146 @@ def _default_runtime_environment(key: str) -> str:
     return ""
 
 
+def _observable_text_digest(value: object) -> dict[str, object] | None:
+    """Return bounded metadata for text that must not enter task telemetry."""
+    if not isinstance(value, str):
+        return None
+    encoded = value.encode("utf-8")
+    return {"bytes": len(encoded), "sha256": hashlib.sha256(encoded).hexdigest()}
+
+
+def _sanitize_tool_activity_arguments(
+    tool_name: str,
+    arguments: object,
+) -> object:
+    """Remove edit source/replacement text from persisted observability data.
+
+    The model-facing approval/tool contract retains its original arguments,
+    but task traces, runtime memory events, and tool-result metadata only need
+    path and digest evidence.  Keeping hashes and bounded offsets preserves
+    replay/audit usefulness without duplicating source material or secrets in
+    long-lived telemetry.
+    """
+    if tool_name not in {"apply_edit_transaction", "preview_edit_transaction"}:
+        return arguments
+    if not isinstance(arguments, dict):
+        return {}
+    sanitized: dict[str, object] = {}
+    for field_name in (
+        "transaction_id",
+        "base_generation",
+        "expected_workspace_digest",
+    ):
+        value = arguments.get(field_name)
+        if value is not None:
+            sanitized[field_name] = value
+    intent_digest = _observable_text_digest(arguments.get("intent"))
+    if intent_digest is not None:
+        sanitized["intent"] = intent_digest
+
+    operations = arguments.get("operations")
+    if not isinstance(operations, list):
+        sanitized["operation_count"] = 0
+        return sanitized
+    sanitized_operations: list[dict[str, object]] = []
+    for operation in operations[:64]:
+        if not isinstance(operation, dict):
+            continue
+        projection: dict[str, object] = {}
+        for field_name in (
+            "operation",
+            "path",
+            "destination_path",
+            "expected_exists",
+            "expected_digest",
+        ):
+            value = operation.get(field_name)
+            if value is not None:
+                projection[field_name] = value
+        content_digest = _observable_text_digest(operation.get("content"))
+        if content_digest is not None:
+            projection["content"] = content_digest
+        edits = operation.get("text_edits")
+        if isinstance(edits, list):
+            projection["text_edits"] = [
+                {
+                    "start": edit.get("start"),
+                    "end": edit.get("end"),
+                    "replacement": _observable_text_digest(edit.get("replacement")),
+                }
+                for edit in edits[:256]
+                if isinstance(edit, dict)
+            ]
+        sanitized_operations.append(projection)
+    sanitized["operations"] = sanitized_operations
+    sanitized["operation_count"] = len(operations)
+    if len(operations) > 64:
+        sanitized["operations_truncated"] = True
+    return sanitized
+
+
+def _sanitize_tool_activity_output(
+    tool_name: str,
+    output: object,
+    error: object = "",
+    *,
+    max_chars: int = 2048,
+) -> str:
+    """Return a bounded task-telemetry summary without preview source text."""
+    if tool_name not in {"apply_edit_transaction", "preview_edit_transaction"}:
+        return str(output or error)[:max_chars]
+    if isinstance(output, dict):
+        safe: dict[str, object] = {}
+        for field_name in (
+            "status",
+            "transaction_id",
+            "workspace_id",
+            "base_generation",
+            "resulting_generation",
+            "transaction_digest",
+            "before_workspace_digest",
+            "after_workspace_digest",
+            "predicted_workspace_digest",
+        ):
+            value = output.get(field_name)
+            if value is not None:
+                safe[field_name] = value
+        operations = output.get("operations")
+        if isinstance(operations, list):
+            safe_operations: list[dict[str, object]] = []
+            for operation in operations[:64]:
+                if not isinstance(operation, dict):
+                    continue
+                safe_operation: dict[str, object] = {}
+                for field_name in (
+                    "index",
+                    "operation",
+                    "path",
+                    "destination_path",
+                    "before_exists",
+                    "after_exists",
+                    "before_digest",
+                    "after_digest",
+                ):
+                    value = operation.get(field_name)
+                    if value is not None:
+                        safe_operation[field_name] = value
+                safe_operations.append(safe_operation)
+            safe["operations"] = safe_operations
+            safe["operation_count"] = len(operations)
+            if len(operations) > 64:
+                safe["operations_truncated"] = True
+        summary = safe
+    else:
+        summary = {
+            "output_type": type(output).__name__,
+            "output_digest": _observable_text_digest(output),
+        }
+    if error:
+        summary["error"] = str(error)[:512]
+    return json.dumps(summary, ensure_ascii=False, sort_keys=True)[:max_chars]
+
+
 class StopReason(Enum):
     """Reasons an agent turn can stop."""
 
@@ -190,6 +330,7 @@ class AgentLoop:
         recovery_control: RecoveryControlCoordinator | None = None,
         delegated_execution_context: Any = None,
         repo_intelligence=None,
+        edit_transaction_service=None,
     ):
         self.config = config
         self.mode_manager = mode_manager
@@ -219,6 +360,7 @@ class AgentLoop:
         self.repo_intelligence = repo_intelligence or getattr(
             context_intelligence, "repo_intelligence", None
         )
+        self.edit_transaction_service = edit_transaction_service
         # Phase 6: 项目约定文件加载器（KHAOS.md / AGENTS.md）。注入优先级
         # 高于 memory / skill，因为它们是项目级硬规则。
         self.project_context_loader = project_context_loader
@@ -796,6 +938,7 @@ class AgentLoop:
                         "sandbox_backend": execution_backend_identity,
                         "workspace_manager": self.workspace_manager,
                         "repo_intelligence": self.repo_intelligence,
+                        "edit_transaction_service": self.edit_transaction_service,
                         "coding_workspace_enforced": self.active_workspace is not None,
                         "production_runtime": self.runtime_profile.is_production,
                         "approval_broker": self.approval_broker,
@@ -1001,7 +1144,9 @@ class AgentLoop:
                                 "error": result.error,
                                 "error_code": result.error_code,
                                 "duration_ms": result.duration_ms,
-                                "arguments": result.arguments or {},
+                                "arguments": _sanitize_tool_activity_arguments(
+                                    result.name, result.arguments or {}
+                                ),
                                 "effect_status": result.effect_status,
                                 "delivery_status": result.delivery_status,
                                 "warning": result.warning,
@@ -1063,7 +1208,20 @@ class AgentLoop:
                         if self.task_manager is not None and active_task_id:
                             await self.task_manager.record_trace(
                                 active_task_id,
-                                {"tool_name": result.name, "arguments": result.arguments or {}, "success": result.success, "result_summary": str(result.output or result.error)[:500], "timestamp": time.time()},
+                                {
+                                    "tool_name": result.name,
+                                    "arguments": _sanitize_tool_activity_arguments(
+                                        result.name, result.arguments or {}
+                                    ),
+                                    "success": result.success,
+                                    "result_summary": _sanitize_tool_activity_output(
+                                        result.name,
+                                        result.output,
+                                        result.error,
+                                        max_chars=500,
+                                    ),
+                                    "timestamp": time.time(),
+                                },
                             )
                         # Verify-fix loop: when a test_run result contains
                         # failures, inject a guidance message so the model
@@ -2972,6 +3130,7 @@ class AgentLoop:
         try:
             name = result.name
             args = result.arguments or {}
+            activity_args = _sanitize_tool_activity_arguments(name, args)
             output = result.output
             if name in {"read_file", "list_directory"}:
                 path = args.get("path") or args.get("cwd")
@@ -2981,6 +3140,18 @@ class AgentLoop:
                 path = args.get("path")
                 if path:
                     await self.task_manager.track_file_modified(task_id, str(path))
+            elif name == "apply_edit_transaction":
+                for operation in args.get("operations", []):
+                    if not isinstance(operation, dict):
+                        continue
+                    for path in (
+                        operation.get("path"),
+                        operation.get("destination_path"),
+                    ):
+                        if path:
+                            await self.task_manager.track_file_modified(
+                                task_id, str(path)
+                            )
             elif name == "test_run":
                 await self.task_manager.add_test_result(
                     task_id, {"success": result.success, "output": output}
@@ -2991,6 +3162,7 @@ class AgentLoop:
                 "write_file": "PATCH_APPLIED",
                 "patch": "PATCH_APPLIED",
                 "multi_edit": "PATCH_APPLIED",
+                "apply_edit_transaction": "PATCH_APPLIED",
                 "test_run": "VERIFICATION_RESULT",
                 "git_commit": "COMMIT_OBSERVED",
                 "commit": "COMMIT_OBSERVED",
@@ -3000,8 +3172,10 @@ class AgentLoop:
                 event_payload = {
                     "tool_name": name,
                     "success": bool(result.success),
-                    "arguments": args,
-                    "output_summary": str(output or result.error)[:2048],
+                    "arguments": activity_args,
+                    "output_summary": _sanitize_tool_activity_output(
+                        name, output, result.error
+                    ),
                 }
                 if event_type == "PLAN_CREATED":
                     event_payload["plan"] = args.get(

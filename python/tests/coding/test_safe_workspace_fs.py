@@ -4,7 +4,6 @@ import sys
 from types import SimpleNamespace
 
 import pytest
-
 from khaos.coding.workspace.boundary import (
     DEFAULT_FILE_TOOL_BYTES,
     SafeWorkspaceFS,
@@ -15,6 +14,7 @@ from khaos.coding.workspace.models import TaskWorkspace, WorkspaceState
 from khaos.coding.workspace.storage import capture_workspace_snapshot
 from khaos.tools.file_tools import (
     copy_file,
+    delete_file,
     file_search_content,
     list_directory,
     move_file,
@@ -25,7 +25,6 @@ from khaos.tools.file_tools import (
     tree_view,
     write_file,
 )
-
 
 pytestmark = pytest.mark.skipif(
     sys.platform == "win32",
@@ -75,9 +74,10 @@ def test_safe_workspace_fs_atomic_create_update_and_read(tmp_path):
     ],
 )
 def test_safe_workspace_fs_rejects_protected_metadata(tmp_path, protected):
-    with SafeWorkspaceFS(tmp_path) as filesystem:
-        with pytest.raises(WorkspaceBoundaryError, match="protected"):
-            filesystem.write_bytes(protected, b"blocked")
+    with SafeWorkspaceFS(tmp_path) as filesystem, pytest.raises(
+        WorkspaceBoundaryError, match="protected"
+    ):
+        filesystem.write_bytes(protected, b"blocked")
 
 
 @pytest.mark.parametrize(
@@ -97,9 +97,10 @@ def test_safe_workspace_fs_rejects_nested_protected_metadata(tmp_path, nested):
     # Create the parent directories so the path is valid.
     nested_path = tmp_path / nested
     nested_path.parent.mkdir(parents=True, exist_ok=True)
-    with SafeWorkspaceFS(tmp_path) as filesystem:
-        with pytest.raises(WorkspaceBoundaryError, match="protected"):
-            filesystem.write_bytes(nested, b"blocked")
+    with SafeWorkspaceFS(tmp_path) as filesystem, pytest.raises(
+        WorkspaceBoundaryError, match="protected"
+    ):
+        filesystem.write_bytes(nested, b"blocked")
 
 
 def test_safe_workspace_fs_rejects_traversal_symlink_and_hardlink(tmp_path):
@@ -186,6 +187,179 @@ async def test_coding_file_tools_share_safe_workspace_capability(tmp_path):
     assert (await move_file("b.txt", "c.txt", **context))["ok"] is True
     assert (tmp_path / "a.txt").read_text(encoding="utf-8") == "omega gamma"
     assert (tmp_path / "c.txt").read_text(encoding="utf-8") == "omega gamma"
+
+
+@pytest.mark.asyncio
+async def test_coding_write_rolls_back_when_adapter_fails_after_publish(
+    tmp_path, monkeypatch
+):
+    target = tmp_path / "target.txt"
+    target.write_text("before", encoding="utf-8")
+    manager = _workspace_manager(tmp_path)
+    original = SafeWorkspaceFS.write_bytes
+
+    def fail_after_publish(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        raise OSError("injected post-publish write failure")
+
+    monkeypatch.setattr(SafeWorkspaceFS, "write_bytes", fail_after_publish)
+    with pytest.raises(OSError, match="post-publish write"):
+        await write_file(
+            "target.txt", "after", workspace_manager=manager,
+            task_id="task", workspace_id="ws",
+        )
+
+    assert target.read_text(encoding="utf-8") == "before"
+    assert manager.get("ws").generation == 1
+
+
+@pytest.mark.asyncio
+async def test_coding_patch_rolls_back_when_adapter_fails_after_publish(
+    tmp_path, monkeypatch
+):
+    target = tmp_path / "target.txt"
+    target.write_text("before", encoding="utf-8")
+    manager = _workspace_manager(tmp_path)
+    original = SafeWorkspaceFS.transform_text
+
+    def fail_after_publish(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        raise OSError("injected post-publish patch failure")
+
+    monkeypatch.setattr(SafeWorkspaceFS, "transform_text", fail_after_publish)
+    with pytest.raises(OSError, match="post-publish patch"):
+        await patch(
+            "target.txt", "before", "after", fuzzy=False,
+            workspace_manager=manager, task_id="task", workspace_id="ws",
+        )
+
+    assert target.read_text(encoding="utf-8") == "before"
+    assert manager.get("ws").generation == 1
+
+
+@pytest.mark.asyncio
+async def test_coding_multi_edit_rolls_back_when_adapter_fails_after_publish(
+    tmp_path, monkeypatch
+):
+    target = tmp_path / "target.txt"
+    target.write_text("before", encoding="utf-8")
+    manager = _workspace_manager(tmp_path)
+    original = SafeWorkspaceFS.write_bytes
+
+    def fail_after_publish(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        raise OSError("injected post-publish multi-edit failure")
+
+    monkeypatch.setattr(SafeWorkspaceFS, "write_bytes", fail_after_publish)
+    with pytest.raises(OSError, match="post-publish multi-edit"):
+        await multi_edit(
+            "target.txt", [{"old_text": "before", "new_text": "after"}],
+            workspace_manager=manager, task_id="task", workspace_id="ws",
+        )
+
+    assert target.read_text(encoding="utf-8") == "before"
+    assert manager.get("ws").generation == 1
+
+
+@pytest.mark.asyncio
+async def test_coding_multi_edit_noop_does_not_advance_generation(tmp_path):
+    target = tmp_path / "target.txt"
+    target.write_text("before", encoding="utf-8")
+    manager = _workspace_manager(tmp_path)
+
+    result = json.loads(
+        await multi_edit(
+            "target.txt",
+            [{"old_text": "missing", "new_text": "after"}],
+            workspace_manager=manager,
+            task_id="task",
+            workspace_id="ws",
+        )
+    )
+
+    assert result["applied"] == 0
+    assert target.read_text(encoding="utf-8") == "before"
+    assert manager.get("ws").generation == 1
+
+
+@pytest.mark.asyncio
+async def test_coding_delete_rolls_back_when_adapter_fails_after_publish(
+    tmp_path, monkeypatch
+):
+    target = tmp_path / "target.txt"
+    target.write_text("before", encoding="utf-8")
+    manager = _workspace_manager(tmp_path)
+    original = SafeWorkspaceFS.delete_file
+
+    def fail_after_publish(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        raise OSError("injected post-publish delete failure")
+
+    monkeypatch.setattr(SafeWorkspaceFS, "delete_file", fail_after_publish)
+    with pytest.raises(OSError, match="post-publish delete"):
+        await delete_file(
+            "target.txt", workspace_manager=manager,
+            task_id="task", workspace_id="ws",
+        )
+
+    assert target.read_text(encoding="utf-8") == "before"
+    assert manager.get("ws").generation == 1
+
+
+@pytest.mark.asyncio
+async def test_coding_copy_rolls_back_when_adapter_fails_after_publish(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "source.txt"
+    destination = tmp_path / "destination.txt"
+    source.write_text("source", encoding="utf-8")
+    manager = _workspace_manager(tmp_path)
+    original = SafeWorkspaceFS.copy_file
+
+    def fail_after_publish(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        raise OSError("injected post-publish copy failure")
+
+    monkeypatch.setattr(SafeWorkspaceFS, "copy_file", fail_after_publish)
+    with pytest.raises(OSError, match="post-publish copy"):
+        await copy_file(
+            "source.txt", "destination.txt", workspace_manager=manager,
+            task_id="task", workspace_id="ws",
+        )
+
+    assert source.read_text(encoding="utf-8") == "source"
+    assert not destination.exists()
+    assert manager.get("ws").generation == 1
+
+
+@pytest.mark.asyncio
+async def test_coding_move_rolls_back_when_adapter_fails_after_publish(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "source.txt"
+    destination = tmp_path / "destination.txt"
+    source.write_text("source", encoding="utf-8")
+    manager = _workspace_manager(tmp_path)
+    original = SafeWorkspaceFS.move_file
+    failed = False
+
+    def fail_after_publish(self, *args, **kwargs):
+        nonlocal failed
+        original(self, *args, **kwargs)
+        if not failed:
+            failed = True
+            raise OSError("injected post-publish move failure")
+
+    monkeypatch.setattr(SafeWorkspaceFS, "move_file", fail_after_publish)
+    with pytest.raises(OSError, match="post-publish move"):
+        await move_file(
+            "source.txt", "destination.txt", workspace_manager=manager,
+            task_id="task", workspace_id="ws",
+        )
+
+    assert source.read_text(encoding="utf-8") == "source"
+    assert not destination.exists()
+    assert manager.get("ws").generation == 1
 
 
 async def test_coding_file_tools_reject_symlink_parent(tmp_path):

@@ -4,6 +4,10 @@ import json
 import pytest
 from khaos.agent import AgentConfig, AgentLoop, Message
 from khaos.agent.compressor import CompressionLevel, CompressionResult
+from khaos.agent.core import (
+    _sanitize_tool_activity_arguments,
+    _sanitize_tool_activity_output,
+)
 from khaos.coding.task_manager import TaskManager, TaskStatus
 from khaos.db import Database
 from khaos.modes import Mode, ModeManager
@@ -39,6 +43,64 @@ async def test_task_activity_uses_original_tool_arguments():
 
     assert loop.task_manager.viewed == [("task-1", "src/a.py")]
     assert loop.task_manager.modified == [("task-1", "src/b.py")]
+
+
+def test_edit_transaction_activity_redacts_source_and_replacement_text():
+    payload = _sanitize_tool_activity_arguments(
+        "apply_edit_transaction",
+        {
+            "transaction_id": "tx-1",
+            "base_generation": 3,
+            "intent": "private implementation detail",
+            "operations": [
+                {
+                    "operation": "update",
+                    "path": "src/app.py",
+                    "expected_exists": True,
+                    "expected_digest": "a" * 64,
+                    "content": "secret source text",
+                    "text_edits": [
+                        {"start": 1, "end": 4, "replacement": "secret replacement"}
+                    ],
+                }
+            ],
+        },
+    )
+
+    serialized = json.dumps(payload, ensure_ascii=False)
+    assert "secret source text" not in serialized
+    assert "secret replacement" not in serialized
+    assert payload["operations"][0]["content"]["bytes"] == len(
+        b"secret source text"
+    )
+    assert payload["operations"][0]["text_edits"][0]["start"] == 1
+
+
+def test_edit_transaction_activity_output_redacts_preview_diff():
+    summary = _sanitize_tool_activity_output(
+        "preview_edit_transaction",
+        {
+            "status": "previewed",
+            "transaction_id": "tx-1",
+            "predicted_workspace_digest": "b" * 64,
+            "operations": [
+                {
+                    "index": 0,
+                    "operation": "update",
+                    "path": "src/app.py",
+                    "before_exists": True,
+                    "after_exists": True,
+                    "before_digest": "a" * 64,
+                    "after_digest": "b" * 64,
+                    "diff": "-secret source\n+secret replacement\n",
+                }
+            ],
+        },
+    )
+
+    assert "secret source" not in summary
+    assert "secret replacement" not in summary
+    assert "predicted_workspace_digest" in summary
 
 
 async def test_agent_loop_streams_and_persists_messages(tmp_path):

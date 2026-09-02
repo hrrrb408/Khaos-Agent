@@ -164,6 +164,7 @@ class ContextIntelligenceService:
             "write_file": MutationType.UPDATE,
             "patch": MutationType.UPDATE,
             "multi_edit": MutationType.UPDATE,
+            "apply_edit_transaction": MutationType.UPDATE,
             "copy_file": MutationType.COPY,
             "move_file": MutationType.MOVE,
             "delete_file": MutationType.DELETE,
@@ -176,8 +177,16 @@ class ContextIntelligenceService:
         if mutation_type is None:
             return
 
+        transaction_events: tuple[MutationEvent, ...] | None = None
         raw_paths: list[object]
-        if tool_name in {"copy_file"}:
+        if tool_name in {"apply_edit_transaction"}:
+            transaction_events = self._transaction_mutation_events(
+                workspace_id, arguments
+            )
+            # ``None`` means the typed projection was not safely recoverable;
+            # retain the existing no-path full-refresh fallback.
+            raw_paths = []
+        elif tool_name in {"copy_file"}:
             raw_paths = [arguments.get("dst")] if isinstance(arguments, dict) else []
         elif tool_name in {"move_file"}:
             raw_paths = (
@@ -221,15 +230,80 @@ class ContextIntelligenceService:
 
         try:
             self._cache.invalidate_workspace(workspace_id)
-            self.repo_intelligence.mark_dirty(
-                MutationEvent(
-                    workspace_id,
-                    mutation_type,
-                    tuple(paths),
+            if transaction_events is not None:
+                for event in transaction_events:
+                    self.repo_intelligence.mark_dirty(event)
+            else:
+                self.repo_intelligence.mark_dirty(
+                    MutationEvent(
+                        workspace_id,
+                        mutation_type,
+                        tuple(paths),
+                    )
                 )
-            )
         except (RepoIntelligenceUnavailableError, ValueError):
             logger.debug("repository intelligence mutation observation unavailable", exc_info=True)
+
+    def _transaction_mutation_events(
+        self,
+        workspace_id: str,
+        arguments: dict[str, Any] | None,
+    ) -> tuple[MutationEvent, ...] | None:
+        """Project a successful edit transaction into exact observer events.
+
+        The transaction service is the mutation authority; this helper only
+        describes an already-successful effect to the derived repository
+        index.  Invalid or unsafe observer input deliberately falls back to a
+        bounded full refresh instead of inventing a partial event set.
+        """
+        if not isinstance(arguments, dict):
+            return None
+        operations = arguments.get("operations")
+        if not isinstance(operations, list) or not operations or len(operations) > 64:
+            return None
+        operation_types = {
+            "create": MutationType.CREATE,
+            "update": MutationType.UPDATE,
+            "delete": MutationType.DELETE,
+            "rename": MutationType.RENAME,
+        }
+        raw_events: list[tuple[MutationType, tuple[object, ...]]] = []
+        for operation in operations:
+            if not isinstance(operation, dict):
+                return None
+            kind = operation.get("operation")
+            mutation_type = operation_types.get(kind.casefold() if isinstance(kind, str) else "")
+            path = operation.get("path")
+            if mutation_type is None or not isinstance(path, str) or not path:
+                return None
+            if mutation_type is MutationType.RENAME:
+                destination = operation.get("destination_path")
+                if not isinstance(destination, str) or not destination:
+                    return None
+                raw_events.append((mutation_type, (path, destination)))
+            else:
+                raw_events.append((mutation_type, (path,)))
+
+        workspace = self._workspace_manager.get(workspace_id)
+        if workspace is None:
+            return None
+        try:
+            from khaos.coding.workspace.boundary import SafeWorkspaceFS
+
+            with SafeWorkspaceFS(workspace.worktree_path) as filesystem:
+                events: list[MutationEvent] = []
+                for mutation_type, raw_paths in raw_events:
+                    paths: list[str] = []
+                    for raw_path in raw_paths:
+                        relative = filesystem.relative(raw_path)
+                        info = filesystem.lstat(relative)
+                        if info is not None and not stat.S_ISREG(info.st_mode):
+                            return None
+                        paths.append(relative)
+                    events.append(MutationEvent(workspace_id, mutation_type, tuple(paths)))
+                return tuple(events)
+        except (OSError, PermissionError, ValueError):
+            return None
 
     async def close(self) -> None:
         if self._owns_repo_intelligence:

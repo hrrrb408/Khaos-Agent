@@ -20,6 +20,7 @@ from khaos.audit import (
     resolve_safe_audit_anchor_path,
     resolve_safe_audit_log_path,
 )
+from khaos.coding.edit_transaction import EditTransactionService
 from khaos.coding.execution import BackendSelector, ExecutionService
 from khaos.coding.intelligence.query_service import ContextIntelligenceService
 from khaos.coding.planning.coordinator import PlanningControlCoordinator
@@ -1784,6 +1785,7 @@ async def build_runtime(
             # when it is absent; legacy adapters remain explicit at their
             # compatibility boundaries.
             context_intelligence = cfg.context_intelligence
+        edit_transaction_service = EditTransactionService()
         # B1: the OfficeMutationAuthority is a server/project-lifecycle object.
         # When ``cfg.office_authority`` is injected (AgentService / SubAgentService
         # share one across every turn), reuse it so the aggregate storage baseline
@@ -2108,6 +2110,7 @@ async def build_runtime(
                 if context_intelligence is not None
                 else None
             ),
+            edit_transaction_service=edit_transaction_service,
             workspace_manager=workspace_manager,
             execution_service=execution_service,
             approval_broker=cfg.approval_broker,

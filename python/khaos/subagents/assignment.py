@@ -540,13 +540,13 @@ def derive_allowed_tools(step: PlanningStep, registry: Any, policy: SubAgentPoli
     for definition in definitions:
         role = getattr(getattr(definition, "plan_tool_role", None), "value", None)
         compatible = {
-            PlanOperation.MODIFY.value: {"file_mutation"},
-            PlanOperation.CREATE.value: {"file_create"},
-            PlanOperation.DELETE.value: {"file_delete"},
-            PlanOperation.RENAME.value: {"file_rename"},
-            PlanOperation.CONFIGURE.value: {"file_mutation"},
+            PlanOperation.MODIFY.value: {"file_mutation", "file_transaction"},
+            PlanOperation.CREATE.value: {"file_create", "file_transaction"},
+            PlanOperation.DELETE.value: {"file_delete", "file_transaction"},
+            PlanOperation.RENAME.value: {"file_rename", "file_transaction"},
+            PlanOperation.CONFIGURE.value: {"file_mutation", "file_transaction"},
             PlanOperation.TEST.value: {"verification_command"},
-            PlanOperation.DOCUMENT.value: {"file_mutation"},
+            PlanOperation.DOCUMENT.value: {"file_mutation", "file_transaction"},
         }.get(step.operation.value, set())
         if role in compatible or policy.allow_supporting_reads and role == "supporting_read":
             names.append(str(definition.name))

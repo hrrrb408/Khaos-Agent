@@ -22,6 +22,18 @@ _LAZY_EXPORTS = {
     "TaskManager": ("khaos.coding.task_manager", "TaskManager"),
     "TaskStatus": ("khaos.coding.task_manager", "TaskStatus"),
     "VerifyFixLoop": ("khaos.coding.verify_fix", "VerifyFixLoop"),
+    "EditOperation": ("khaos.coding.edit_transaction", "EditOperation"),
+    "EditOperationKind": ("khaos.coding.edit_transaction", "EditOperationKind"),
+    "EditTransaction": ("khaos.coding.edit_transaction", "EditTransaction"),
+    "EditTransactionEngine": (
+        "khaos.coding.edit_transaction",
+        "EditTransactionEngine",
+    ),
+    "EditTransactionService": (
+        "khaos.coding.edit_transaction",
+        "EditTransactionService",
+    ),
+    "TextEdit": ("khaos.coding.edit_transaction", "TextEdit"),
 }
 
 
@@ -45,11 +57,17 @@ __all__ = [
     "CodingContextBuilder",
     "CodingTask",
     "CostTracker",
+    "EditOperation",
+    "EditOperationKind",
+    "EditTransaction",
+    "EditTransactionEngine",
+    "EditTransactionService",
     "FileFingerprintCache",
     "RepoIndexer",
     "SessionCostReport",
     "TaskManager",
     "TaskStatus",
+    "TextEdit",
     "TurnCost",
     "VerifyFixLoop",
     "build_call_graph",

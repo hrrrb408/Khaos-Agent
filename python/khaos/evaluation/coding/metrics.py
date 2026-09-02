@@ -10,7 +10,6 @@ from dataclasses import dataclass, field
 from khaos.evaluation.coding.contracts import CodingVerdict
 from khaos.security.protocol_boundary import canonical_digest
 
-
 TOOL_CATEGORIES = frozenset({"editing", "verification", "context", "recovery", "other"})
 _DETAILED_TOOL_NAMES = frozenset(
     {
@@ -21,6 +20,8 @@ _DETAILED_TOOL_NAMES = frozenset(
         "write_file",
         "patch",
         "multi_edit",
+        "preview_edit_transaction",
+        "apply_edit_transaction",
         "terminal_argv",
         "terminal_shell",
         "process",
@@ -38,6 +39,8 @@ def classify_tool(name: str) -> str:
     """Map a tool name to a stable, non-content effort category."""
 
     lowered = name.casefold()
+    if lowered == "preview_edit_transaction":
+        return "context"
     if any(token in lowered for token in ("write", "patch", "edit", "delete", "move", "copy")):
         return "editing"
     if any(token in lowered for token in ("test", "verify", "lint", "format", "build", "check")):
@@ -205,7 +208,7 @@ class CodingMetrics:
 
     def __post_init__(self) -> None:
         if not isinstance(self.verdict, CodingVerdict):
-            raise ValueError("coding metric verdict is invalid")
+            raise TypeError("coding metric verdict is invalid")
         if not isinstance(self.agent_status, str) or not self.agent_status.strip():
             raise ValueError("coding metric agent status is invalid")
         if self.completion_status is not None and not isinstance(self.completion_status, str):
@@ -268,9 +271,9 @@ class CodingMetrics:
         ):
             raise ValueError("coding metrics contain a negative or malformed count")
         if not isinstance(self.tool_calls_by_category, Mapping):
-            raise ValueError("coding tool category metrics are invalid")
+            raise TypeError("coding tool category metrics are invalid")
         if not isinstance(self.tool_calls_by_name, Mapping):
-            raise ValueError("coding tool name metrics are invalid")
+            raise TypeError("coding tool name metrics are invalid")
         unknown = set(self.tool_calls_by_category) - TOOL_CATEGORIES
         if unknown or any(type(value) is not int or value < 0 for value in self.tool_calls_by_category.values()):
             raise ValueError("coding tool category metrics are invalid")
@@ -649,7 +652,11 @@ class CodingTraceCollector:
             "code_search_calls": tool_names.get("code_search", 0),
             "symbol_calls": tool_names.get("code_symbols", 0),
             "write_calls": tool_names.get("write_file", 0),
-            "patch_calls": tool_names.get("patch", 0) + tool_names.get("multi_edit", 0),
+            "patch_calls": (
+                tool_names.get("patch", 0)
+                + tool_names.get("multi_edit", 0)
+                + tool_names.get("apply_edit_transaction", 0)
+            ),
             "terminal_calls": sum(
                 tool_names.get(name, 0)
                 for name in (
@@ -788,9 +795,9 @@ class CodingTraceCollector:
 
 
 __all__ = [
+    "TOOL_CATEGORIES",
     "CodingMetrics",
     "CodingTraceCollector",
     "CodingTraceEvent",
-    "TOOL_CATEGORIES",
     "classify_tool",
 ]

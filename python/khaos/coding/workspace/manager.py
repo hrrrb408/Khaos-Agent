@@ -9,7 +9,7 @@ import os
 import stat
 import tempfile
 import uuid
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -1416,8 +1416,16 @@ class WorkspaceManager:
         workspace_id: str,
         task_id: str,
         operation: Callable[[], WorkspaceMutation[T]],
+        *,
+        advance_generation: bool = True,
     ) -> T:
-        """Serialize, account, and if necessary roll back one file-tool write."""
+        """Serialize, account, and if necessary roll back one file-tool write.
+
+        A successful mutation advances the server-owned TaskWorkspace
+        generation while the per-workspace storage lock is still held.  This
+        is the CAS authority consumed by edit transactions and repository
+        freshness checks; callers cannot supply or advance it themselves.
+        """
         async with self._lock:
             workspace = self._workspaces.get(workspace_id)
             if workspace is None or workspace.task_id != task_id:
@@ -1444,13 +1452,21 @@ class WorkspaceManager:
                         WorkspaceState.CLEANED,
                     }:
                         raise PermissionError("workspace is not writable")
+                mutation_advances_generation = True
+
+                def governed_operation() -> WorkspaceMutation[T]:
+                    nonlocal mutation_advances_generation
+                    mutation = operation()
+                    mutation_advances_generation = mutation.advances_generation
+                    return mutation
+
                 worker = asyncio.create_task(asyncio.to_thread(
                     self.storage_authority.mutate,
                     workspace_id,
                     workspace.worktree_path,
                     workspace.storage_baseline,
                     workspace.storage_limits,
-                    operation,
+                    governed_operation,
                 ))
                 cancelled = False
                 while not worker.done():
@@ -1463,6 +1479,21 @@ class WorkspaceManager:
                         # propagate cancellation to the caller.
                         cancelled = True
                 result = worker.result()
+                if advance_generation and mutation_advances_generation:
+                    async with self._lock:
+                        current = self._workspaces.get(workspace_id)
+                        if current is None or current is not workspace:
+                            raise WorkspaceError(
+                                "TaskWorkspace identity changed after mutation"
+                            )
+                        if (
+                            type(current.generation) is not int
+                            or current.generation <= 0
+                        ):
+                            raise WorkspaceError(
+                                "TaskWorkspace generation is invalid"
+                            )
+                        current.generation += 1
                 if cancelled:
                     raise asyncio.CancelledError
                 return result
@@ -1470,6 +1501,46 @@ class WorkspaceManager:
             if exc.quarantine_required:
                 await self.quarantine(workspace_id)
             raise
+
+    @asynccontextmanager
+    async def workspace_storage_scope(
+        self,
+        workspace_id: str,
+        task_id: str,
+    ) -> AsyncIterator[TaskWorkspace]:
+        """Serialize a bounded workspace read with storage mutations.
+
+        Preview and other read-only projections use this scope so they cannot
+        observe a multi-file mutation between individual publishes while the
+        server-owned workspace generation still has its old value.
+        """
+        async with self._lock:
+            workspace = self._workspaces.get(workspace_id)
+            if workspace is None or workspace.task_id != task_id:
+                raise PermissionError("task/workspace binding is invalid")
+            if workspace.state in {
+                WorkspaceState.FAILED,
+                WorkspaceState.CANCELLED,
+                WorkspaceState.CLEANING,
+                WorkspaceState.CLEANED,
+            }:
+                raise PermissionError("workspace is not readable")
+            storage_lock = self._storage_mutation_locks.setdefault(
+                workspace_id, asyncio.Lock()
+            )
+        async with storage_lock:
+            async with self._lock:
+                current = self._workspaces.get(workspace_id)
+                if current is None or current is not workspace:
+                    raise PermissionError("workspace identity changed")
+                if current.state in {
+                    WorkspaceState.FAILED,
+                    WorkspaceState.CANCELLED,
+                    WorkspaceState.CLEANING,
+                    WorkspaceState.CLEANED,
+                }:
+                    raise PermissionError("workspace is not readable")
+            yield workspace
 
     async def quarantine(self, workspace_id: str) -> WorkspaceTransition:
         """Fail closed and attempt forced cleanup without losing quarantine."""

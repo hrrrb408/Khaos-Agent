@@ -232,16 +232,15 @@ class ToolScheduler:
             return prepared
         if self._declared_effect_status(tool) != EFFECT_NOT_APPLIED:
             context = dict(tool_context or {})
-            prepared["_idempotency_key"] = server_operation_key(
+            prepared["_idempotency_key"] = _operation_key_for_call(
+                call=prepared,
+                tool_name=name,
                 principal_id=str(context.get("principal_id") or ""),
                 project_id=str(context.get("project_id") or ""),
                 session_id=str(session_id or context.get("session_id") or ""),
                 turn_id=str(turn_id or ""),
                 attempt_id=str(attempt_id or ""),
-                tool_call_id=str(
-                    prepared.get("id") or prepared.get("tool_call_id") or ""
-                ),
-                tool_name=name,
+                task_id=str(context.get("task_id") or ""),
                 workspace_id=str(context.get("workspace_id") or ""),
             )
             prepared["_server_operation_key"] = True
@@ -383,7 +382,9 @@ class ToolScheduler:
                 self._declared_effect_status(tool) != EFFECT_NOT_APPLIED
                 and not self._idempotency_key(normalized)
             ):
-                normalized["_idempotency_key"] = server_operation_key(
+                normalized["_idempotency_key"] = _operation_key_for_call(
+                    call=normalized,
+                    tool_name=tool.name,
                     principal_id=str(tool_context.get("principal_id") or ""),
                     project_id=str(tool_context.get("project_id") or ""),
                     session_id=str(session_id or tool_context.get("session_id") or ""),
@@ -391,8 +392,7 @@ class ToolScheduler:
                         tool_context.get("turn_id") or f"session:{session_id or ''}"
                     ),
                     attempt_id=str(tool_context.get("attempt_id") or "legacy"),
-                    tool_call_id=normalized["id"],
-                    tool_name=tool.name,
+                    task_id=str(tool_context.get("task_id") or ""),
                     workspace_id=str(tool_context.get("workspace_id") or ""),
                 )
             if not self.registry.validate_call(tool.name, normalized["arguments"]):
@@ -2580,4 +2580,59 @@ def server_operation_key(
             "tool_name": tool_name,
             "workspace_id": workspace_id,
         }
+    )
+
+
+def _operation_key_for_call(
+    *,
+    call: dict[str, Any],
+    tool_name: str,
+    principal_id: str,
+    project_id: str,
+    session_id: str,
+    turn_id: str,
+    attempt_id: str,
+    task_id: str,
+    workspace_id: str,
+) -> str:
+    """Return the durable identity seed for one effectful tool call.
+
+    Edit transactions are already content-addressed by ``transaction_id``;
+    their durable operation identity must survive a new model tool-call id or
+    retry attempt.  The operation repository still binds the complete
+    arguments digest and therefore rejects reuse of the same transaction id
+    with different content.  Other tools retain the turn/attempt identity
+    required for their normal replay semantics.
+    """
+    if tool_name == "apply_edit_transaction":
+        arguments = call.get("arguments")
+        transaction_id = (
+            arguments.get("transaction_id")
+            if isinstance(arguments, dict)
+            else None
+        )
+        if (
+            isinstance(transaction_id, str)
+            and 0 < len(transaction_id) <= 128
+            and "\x00" not in transaction_id
+        ):
+            return "srv-edit-transaction-" + _canonical_digest(
+                {
+                    "principal_id": principal_id,
+                    "project_id": project_id,
+                    "session_id": session_id,
+                    "task_id": task_id,
+                    "workspace_id": workspace_id,
+                    "transaction_id": transaction_id,
+                }
+            )
+    return server_operation_key(
+        principal_id=principal_id,
+        project_id=project_id,
+        session_id=session_id,
+        turn_id=turn_id,
+        attempt_id=attempt_id,
+        tool_call_id=str(call.get("id") or call.get("tool_call_id") or ""),
+        tool_name=tool_name,
+        workspace_id=workspace_id,
     )

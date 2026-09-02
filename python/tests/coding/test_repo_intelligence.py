@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-
+from khaos.coding.intelligence.query_service import ContextIntelligenceService
 from khaos.coding.intelligence.repository import (
     FreshnessPolicy,
     IntelligenceFreshness,
@@ -22,9 +22,7 @@ from khaos.coding.intelligence.repository import (
     RepoResourceLimits,
     repository_id_for_workspace,
 )
-from khaos.coding.intelligence.query_service import ContextIntelligenceService
 from khaos.coding.planning.approval.mutation_fence import WorkspaceMutationFence
-
 
 pytestmark = pytest.mark.posix_host
 
@@ -903,6 +901,37 @@ def test_successful_file_tool_mutation_marks_only_affected_paths_dirty(
     assert updated.generation.generation > first.generation.generation
     assert context.repo_intelligence.metrics_snapshot().full_index_count == 1
     assert context.repo_intelligence.metrics_snapshot().incremental_refresh_count == 1
+
+
+def test_edit_transaction_emits_exact_typed_mutation_events(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "updated.py").write_text("value = 1\n", encoding="utf-8")
+    (tmp_path / "deleted.py").write_text("value = 2\n", encoding="utf-8")
+    (tmp_path / "old.py").write_text("value = 3\n", encoding="utf-8")
+    (tmp_path / "new.py").write_text("value = 4\n", encoding="utf-8")
+    workspace = _workspace(tmp_path, "ws-1")
+    context = ContextIntelligenceService(_WorkspaceManager(workspace))
+    observed: list[MutationEvent] = []
+    monkeypatch.setattr(context.repo_intelligence, "mark_dirty", observed.append)
+
+    context.invalidate_from_tool_result(
+        workspace_id=workspace.id,
+        tool_name="apply_edit_transaction",
+        arguments={
+            "operations": [
+                {"operation": "update", "path": "updated.py"},
+                {"operation": "delete", "path": "deleted.py"},
+                {"operation": "rename", "path": "old.py", "destination_path": "new.py"},
+                {"operation": "create", "path": "created.py"},
+            ]
+        },
+    )
+
+    assert [(event.mutation_type, event.paths) for event in observed] == [
+        (MutationType.UPDATE, ("updated.py",)),
+        (MutationType.DELETE, ("deleted.py",)),
+        (MutationType.RENAME, ("new.py", "old.py")),
+        (MutationType.CREATE, ("created.py",)),
+    ]
 
 
 def test_move_mutation_removes_old_symbols_and_indexes_new_path(tmp_path: Path) -> None:
