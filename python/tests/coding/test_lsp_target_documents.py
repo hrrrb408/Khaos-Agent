@@ -237,6 +237,7 @@ def _make_doc(path: str, text: str, *, generation: int = 1, indexed: bool = True
     )
 
 
+@pytest.mark.posix_host
 class TestDiskWorkspaceDocumentProviderBoundary:
     """The disk provider must use the bounded workspace read capability."""
 

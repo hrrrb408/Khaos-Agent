@@ -26,6 +26,9 @@ from khaos.coding.intelligence.query_service import ContextIntelligenceService
 from khaos.coding.planning.approval.mutation_fence import WorkspaceMutationFence
 
 
+pytestmark = pytest.mark.posix_host
+
+
 class _WorkspaceManager:
     def __init__(self, *workspaces: SimpleNamespace) -> None:
         self.workspaces = {workspace.id: workspace for workspace in workspaces}

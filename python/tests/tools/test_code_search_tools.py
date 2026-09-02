@@ -21,6 +21,7 @@ async def test_code_symbols_requires_active_task_workspace(tmp_path):
         await code_symbols(str(tmp_path / "app.py"))
 
 
+@pytest.mark.posix_host
 async def test_repo_code_symbols_normalizes_absolute_workspace_path(tmp_path):
     source = tmp_path / "app.py"
     source.write_text("def run(): pass\n", encoding="utf-8")
@@ -61,6 +62,7 @@ async def test_repo_code_symbols_normalizes_absolute_workspace_path(tmp_path):
         ("main.ts", "export function run(): void {}\n", "typescript"),
     ),
 )
+@pytest.mark.posix_host
 async def test_repo_code_symbols_uses_semantic_path_for_supported_languages(
     tmp_path, filename, content, language
 ):
@@ -96,6 +98,7 @@ async def test_repo_code_symbols_uses_semantic_path_for_supported_languages(
     await intelligence.close()
 
 
+@pytest.mark.posix_host
 async def test_repo_code_search_honors_root_glob_and_language_scope(tmp_path):
     source_root = tmp_path / "src"
     other_root = tmp_path / "other"
@@ -169,6 +172,7 @@ async def test_coding_search_requires_the_runtime_shared_repository_service(tmp_
         )
 
 
+@pytest.mark.posix_host
 async def test_code_search_exposes_bounded_fallback_when_semantic_index_is_unavailable(
     tmp_path,
 ):
@@ -202,6 +206,7 @@ async def test_code_search_exposes_bounded_fallback_when_semantic_index_is_unava
     assert intelligence.metrics_snapshot().lexical_fallback_count == 1
 
 
+@pytest.mark.posix_host
 async def test_code_search_fails_closed_on_generation_contract_failure(
     tmp_path, monkeypatch
 ):
@@ -233,6 +238,7 @@ async def test_code_search_fails_closed_on_generation_contract_failure(
     await intelligence.close()
 
 
+@pytest.mark.posix_host
 async def test_code_search_fallback_reports_depth_bound(tmp_path):
     nested = tmp_path
     for index in range(33):

@@ -264,6 +264,7 @@ class TestFeatureFlagAndDegradation:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.posix_host
 class TestFusionRules:
     """Scenarios 6–10: the six definition fusion rules."""
 

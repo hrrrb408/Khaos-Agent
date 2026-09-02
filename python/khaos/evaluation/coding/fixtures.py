@@ -332,7 +332,24 @@ def _remove_private_tree(root: Path) -> None:
         return
     if not candidate.is_dir():
         raise FixtureError("private evaluation root is not a directory")
-    shutil.rmtree(candidate)
+    # Git object files are read-only on Windows.  Cleanup is restricted to the
+    # exact private run root above, so clearing that file attribute and retrying
+    # the same removal operation is safe and keeps fixture cleanup reliable
+    # across platforms.  The callback re-raises any failure it cannot repair.
+    shutil.rmtree(candidate, onerror=_retry_readonly_removal)
+
+
+def _retry_readonly_removal(function, path: str, _exc_info) -> None:
+    """Clear a Windows read-only bit and retry one rmtree operation."""
+
+    candidate = Path(path)
+    try:
+        info = candidate.lstat()
+    except FileNotFoundError:
+        return
+    if not stat.S_ISLNK(info.st_mode):
+        os.chmod(candidate, info.st_mode | stat.S_IWRITE)
+    function(path)
 
 
 __all__ = [

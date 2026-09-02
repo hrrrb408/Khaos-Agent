@@ -39,6 +39,7 @@ from khaos.coding.intelligence.query import CodeQueryService
 from khaos.coding.intelligence.registry import LanguageRegistry
 from khaos.coding.intelligence.resolution.ids import stable_symbol_id, symbol_id
 from khaos.coding.intelligence.resolution.service import ResolutionService
+from khaos.coding.planning.safe_workspace_path import SafePathError
 from khaos.security.protocol_boundary import canonical_digest
 
 
@@ -1001,7 +1002,7 @@ class RepoIntelligenceService:
                                     handle, path, max_structure_entries
                                 )
                             )
-                except (OSError, WorkspaceBoundaryError) as exc:
+                except (OSError, WorkspaceBoundaryError, SafePathError) as exc:
                     if request.freshness_policy is FreshnessPolicy.REQUIRE_CURRENT:
                         raise RepoIntelligenceUnavailableError("safe context source is unavailable") from exc
                     reasons.append("safe_source_unavailable")
@@ -1347,6 +1348,8 @@ class RepoIntelligenceService:
                             handle.deleted_paths.discard(relative)
         except RepoIntelligenceUnavailableError:
             raise
+        except (OSError, WorkspaceBoundaryError, SafePathError) as exc:
+            raise RepoIntelligenceUnavailableError("safe workspace probe failed") from exc
         if dirty_observed:
             if handle.freshness is IntelligenceFreshness.CURRENT:
                 handle.freshness = IntelligenceFreshness.STALE
