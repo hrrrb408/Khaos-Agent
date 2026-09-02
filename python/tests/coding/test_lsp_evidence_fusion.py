@@ -830,6 +830,7 @@ class TestQueryInterfaceAndGuarantees:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.posix_host
 class TestReferencesFusion:
     """Tests for LSP references fusion (spec §7)."""
 
