@@ -565,6 +565,13 @@ MIGRATIONS: tuple[MigrationSpec, ...] = (
         sql_files=("0027_coding_evaluation_runs.sql",),
         migrator_symbols=("_apply_v27_upgrades",),
     ),
+    MigrationSpec(
+        version=28,
+        name="m8_3_autonomous_verification_runs",
+        sha256="5f5ec6b8cfba8fb3753009e1d3ccbd138ec6fc907190ab2e7856679c1d0db637",
+        sql_files=("0028_autonomous_verification_runs.sql",),
+        migrator_symbols=("_apply_v28_upgrades",),
+    ),
 )
 
 

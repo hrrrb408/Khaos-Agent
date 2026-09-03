@@ -31,6 +31,7 @@ from khaos.coding.planning.tool_route_repository import PlanToolRouteRepository
 from khaos.coding.planning.verification_assessment_repository import (
     VerificationAssessmentRepository,
 )
+from khaos.coding.verification.evidence import VerificationObservationStore
 from khaos.db.connection import (
     READER_DRAIN_TIMEOUT,
     DatabaseClosingError,  # noqa: F401 - compatibility export
@@ -278,6 +279,7 @@ class Database:
         self._plan_step_execution_repository = PlanStepExecutionRepository(self)
         self._subagent_assignment_repository = SubAgentAssignmentRepository(self)
         self._verification_assessment_repository = VerificationAssessmentRepository(self)
+        self._autonomous_verification_repository = VerificationObservationStore(self)
         self._capability_evaluation_repository = CapabilityEvaluationRepository(self)
         # F-01: Per-domain locks remain for logical serialization (e.g. two
         # concurrent permission grants must not race on epoch computation).
@@ -361,6 +363,11 @@ class Database:
     def verification_assessment_repository(self) -> VerificationAssessmentRepository:
         """Return the owner-scoped trusted-verification assessment ledger."""
         return self._verification_assessment_repository
+
+    @property
+    def autonomous_verification_repository(self) -> VerificationObservationStore:
+        """Return the append-only M8.3 verification observation ledger."""
+        return self._autonomous_verification_repository
 
     @property
     def capability_evaluation_repository(self) -> CapabilityEvaluationRepository:
@@ -1004,6 +1011,15 @@ class Database:
             self._conn = _MigrationConnection(conn)
             try:
                 await self._apply_v27_upgrades()
+            finally:
+                self._conn = original_conn
+            # M8.3: persist bounded autonomous-verification plan/result
+            # observations.  This ledger is descriptive only and is not a
+            # completion, permission, approval, or execution authority.
+            original_conn = self._conn
+            self._conn = _MigrationConnection(conn)
+            try:
+                await self._apply_v28_upgrades()
             finally:
                 self._conn = original_conn
             # Batch 6.4 §10.4: backfill the historical ledger rows (v1–v5)
@@ -1772,6 +1788,15 @@ class Database:
         """Add the isolated M8.0 Coding evaluation run ledger."""
         conn = await self._require_conn()
         migration_path = _MIGRATIONS_DIR / "0027_coding_evaluation_runs.sql"
+        await self._execute_schema_statements(
+            conn,
+            migration_path.read_text(encoding="utf-8"),
+        )
+
+    async def _apply_v28_upgrades(self) -> None:
+        """Add the append-only M8.3 verification observation ledger."""
+        conn = await self._require_conn()
+        migration_path = _MIGRATIONS_DIR / "0028_autonomous_verification_runs.sql"
         await self._execute_schema_statements(
             conn,
             migration_path.read_text(encoding="utf-8"),

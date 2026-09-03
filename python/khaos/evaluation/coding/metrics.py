@@ -205,6 +205,46 @@ class CodingMetrics:
     diff_changed_files: int = 0
     diff_insertions: int = 0
     diff_deletions: int = 0
+    # M8.3 planner/executor observations.  These counters describe selection
+    # effort and bounded outcomes; they never authorize completion.
+    autonomous_verification_plan_count: int = 0
+    autonomous_verification_check_count: int = 0
+    autonomous_verification_executed_check_count: int = 0
+    autonomous_verification_structural_count: int = 0
+    autonomous_verification_static_count: int = 0
+    autonomous_verification_typecheck_count: int = 0
+    autonomous_verification_targeted_count: int = 0
+    autonomous_verification_module_count: int = 0
+    autonomous_verification_integration_count: int = 0
+    autonomous_verification_regression_count: int = 0
+    autonomous_verification_pass_count: int = 0
+    autonomous_verification_failure_count: int = 0
+    autonomous_verification_timeout_count: int = 0
+    autonomous_verification_stale_count: int = 0
+    autonomous_verification_infrastructure_error_count: int = 0
+    autonomous_verification_unknown_count: int = 0
+    autonomous_verification_diagnostic_count: int = 0
+    autonomous_verification_repair_count: int = 0
+    autonomous_verification_time_to_final_green_ms: int | None = None
+    # Stable M8.3/M8.0 vocabulary.  The autonomous-prefixed fields above keep
+    # the source explicit while these names are the public evaluation schema.
+    verification_plans: int = 0
+    verification_checks_planned: int = 0
+    verification_checks_executed: int = 0
+    targeted_test_runs: int = 0
+    package_test_runs: int = 0
+    integration_test_runs: int = 0
+    build_runs: int = 0
+    lint_runs: int = 0
+    typecheck_runs: int = 0
+    verification_passes: int = 0
+    verification_failures: int = 0
+    verification_timeouts: int = 0
+    verification_infra_errors: int = 0
+    verification_plan_rebuilds: int = 0
+    diagnostics_count: int = 0
+    time_to_final_green_ms: int | None = None
+    verification_required_checks: int = 0
 
     def __post_init__(self) -> None:
         if not isinstance(self.verdict, CodingVerdict):
@@ -264,6 +304,40 @@ class CodingMetrics:
             "diff_changed_files",
             "diff_insertions",
             "diff_deletions",
+            "autonomous_verification_plan_count",
+            "autonomous_verification_check_count",
+            "autonomous_verification_executed_check_count",
+            "autonomous_verification_structural_count",
+            "autonomous_verification_static_count",
+            "autonomous_verification_typecheck_count",
+            "autonomous_verification_targeted_count",
+            "autonomous_verification_module_count",
+            "autonomous_verification_integration_count",
+            "autonomous_verification_regression_count",
+            "autonomous_verification_pass_count",
+            "autonomous_verification_failure_count",
+            "autonomous_verification_timeout_count",
+            "autonomous_verification_stale_count",
+            "autonomous_verification_infrastructure_error_count",
+            "autonomous_verification_unknown_count",
+            "autonomous_verification_diagnostic_count",
+            "autonomous_verification_repair_count",
+            "verification_plans",
+            "verification_checks_planned",
+            "verification_checks_executed",
+            "targeted_test_runs",
+            "package_test_runs",
+            "integration_test_runs",
+            "build_runs",
+            "lint_runs",
+            "typecheck_runs",
+            "verification_passes",
+            "verification_failures",
+            "verification_timeouts",
+            "verification_infra_errors",
+            "verification_plan_rebuilds",
+            "diagnostics_count",
+            "verification_required_checks",
         )
         if any(
             type(getattr(self, name)) is not int or getattr(self, name) < 0
@@ -327,6 +401,8 @@ class CodingMetrics:
             "context_candidate_count",
             "context_selected_file_count",
             "context_selected_symbol_count",
+            "autonomous_verification_time_to_final_green_ms",
+            "time_to_final_green_ms",
         ):
             value = getattr(self, name)
             if value is not None and (type(value) is not int or value < 0):
@@ -432,6 +508,42 @@ class CodingMetrics:
             "diff_changed_files": self.diff_changed_files,
             "diff_insertions": self.diff_insertions,
             "diff_deletions": self.diff_deletions,
+            "autonomous_verification_plan_count": self.autonomous_verification_plan_count,
+            "autonomous_verification_check_count": self.autonomous_verification_check_count,
+            "autonomous_verification_executed_check_count": self.autonomous_verification_executed_check_count,
+            "autonomous_verification_structural_count": self.autonomous_verification_structural_count,
+            "autonomous_verification_static_count": self.autonomous_verification_static_count,
+            "autonomous_verification_typecheck_count": self.autonomous_verification_typecheck_count,
+            "autonomous_verification_targeted_count": self.autonomous_verification_targeted_count,
+            "autonomous_verification_module_count": self.autonomous_verification_module_count,
+            "autonomous_verification_integration_count": self.autonomous_verification_integration_count,
+            "autonomous_verification_regression_count": self.autonomous_verification_regression_count,
+            "autonomous_verification_pass_count": self.autonomous_verification_pass_count,
+            "autonomous_verification_failure_count": self.autonomous_verification_failure_count,
+            "autonomous_verification_timeout_count": self.autonomous_verification_timeout_count,
+            "autonomous_verification_stale_count": self.autonomous_verification_stale_count,
+            "autonomous_verification_infrastructure_error_count": self.autonomous_verification_infrastructure_error_count,
+            "autonomous_verification_unknown_count": self.autonomous_verification_unknown_count,
+            "autonomous_verification_diagnostic_count": self.autonomous_verification_diagnostic_count,
+            "autonomous_verification_repair_count": self.autonomous_verification_repair_count,
+            "autonomous_verification_time_to_final_green_ms": self.autonomous_verification_time_to_final_green_ms,
+            "verification_plans": self.verification_plans,
+            "verification_checks_planned": self.verification_checks_planned,
+            "verification_checks_executed": self.verification_checks_executed,
+            "targeted_test_runs": self.targeted_test_runs,
+            "package_test_runs": self.package_test_runs,
+            "integration_test_runs": self.integration_test_runs,
+            "build_runs": self.build_runs,
+            "lint_runs": self.lint_runs,
+            "typecheck_runs": self.typecheck_runs,
+            "verification_passes": self.verification_passes,
+            "verification_failures": self.verification_failures,
+            "verification_timeouts": self.verification_timeouts,
+            "verification_infra_errors": self.verification_infra_errors,
+            "verification_plan_rebuilds": self.verification_plan_rebuilds,
+            "diagnostics_count": self.diagnostics_count,
+            "time_to_final_green_ms": self.time_to_final_green_ms,
+            "verification_required_checks": self.verification_required_checks,
         }
 
 
@@ -484,6 +596,21 @@ class CodingTraceCollector:
         self._completion_rejections = 0
         self._completion_acceptances = 0
         self._permission_denials = 0
+        self._autonomous_verification_plan_count = 0
+        self._autonomous_verification_check_count = 0
+        self._autonomous_verification_executed_check_count = 0
+        self._autonomous_verification_stage_counts: Counter[str] = Counter()
+        self._autonomous_verification_kind_counts: Counter[str] = Counter()
+        self._autonomous_verification_required_checks = 0
+        self._autonomous_verification_pass_count = 0
+        self._autonomous_verification_failure_count = 0
+        self._autonomous_verification_timeout_count = 0
+        self._autonomous_verification_stale_count = 0
+        self._autonomous_verification_infrastructure_error_count = 0
+        self._autonomous_verification_unknown_count = 0
+        self._autonomous_verification_diagnostic_count = 0
+        self._autonomous_verification_repair_count = 0
+        self._autonomous_verification_time_to_final_green_ms: int | None = None
         self._repo_metrics: dict[str, int] | None = None
         self._started = time.monotonic()
 
@@ -583,7 +710,10 @@ class CodingTraceCollector:
                         self._failed_test_runs += 1
             self._tool_categories[category] += 0
         elif event:
+            raw_metadata = getattr(message, "metadata", {}) or {}
+            metadata = raw_metadata if isinstance(raw_metadata, Mapping) else {}
             self._record_agent_event(event)
+            self._record_autonomous_verification_event(event, metadata)
             self._record("agent_event", event)
 
     def record_repository_metrics(self, metrics: object) -> None:
@@ -743,6 +873,42 @@ class CodingTraceCollector:
             diff_changed_files=diff_changed_files,
             diff_insertions=diff_insertions,
             diff_deletions=diff_deletions,
+            autonomous_verification_plan_count=self._autonomous_verification_plan_count,
+            autonomous_verification_check_count=self._autonomous_verification_check_count,
+            autonomous_verification_executed_check_count=self._autonomous_verification_executed_check_count,
+            autonomous_verification_structural_count=self._autonomous_verification_stage_counts.get("structural", 0),
+            autonomous_verification_static_count=self._autonomous_verification_stage_counts.get("static", 0),
+            autonomous_verification_typecheck_count=self._autonomous_verification_stage_counts.get("typecheck", 0),
+            autonomous_verification_targeted_count=self._autonomous_verification_stage_counts.get("targeted", 0),
+            autonomous_verification_module_count=self._autonomous_verification_stage_counts.get("module", 0),
+            autonomous_verification_integration_count=self._autonomous_verification_stage_counts.get("integration", 0),
+            autonomous_verification_regression_count=self._autonomous_verification_stage_counts.get("regression", 0),
+            autonomous_verification_pass_count=self._autonomous_verification_pass_count,
+            autonomous_verification_failure_count=self._autonomous_verification_failure_count,
+            autonomous_verification_timeout_count=self._autonomous_verification_timeout_count,
+            autonomous_verification_stale_count=self._autonomous_verification_stale_count,
+            autonomous_verification_infrastructure_error_count=self._autonomous_verification_infrastructure_error_count,
+            autonomous_verification_unknown_count=self._autonomous_verification_unknown_count,
+            autonomous_verification_diagnostic_count=self._autonomous_verification_diagnostic_count,
+            autonomous_verification_repair_count=self._autonomous_verification_repair_count,
+            autonomous_verification_time_to_final_green_ms=self._autonomous_verification_time_to_final_green_ms,
+            verification_plans=self._autonomous_verification_plan_count,
+            verification_checks_planned=self._autonomous_verification_check_count,
+            verification_checks_executed=self._autonomous_verification_executed_check_count,
+            targeted_test_runs=self._autonomous_verification_kind_counts.get("targeted_test", 0),
+            package_test_runs=self._autonomous_verification_kind_counts.get("package_test", 0),
+            integration_test_runs=self._autonomous_verification_kind_counts.get("integration_test", 0),
+            build_runs=self._autonomous_verification_kind_counts.get("build", 0),
+            lint_runs=self._autonomous_verification_kind_counts.get("lint", 0),
+            typecheck_runs=self._autonomous_verification_kind_counts.get("typecheck", 0),
+            verification_passes=self._autonomous_verification_pass_count,
+            verification_failures=self._autonomous_verification_failure_count,
+            verification_timeouts=self._autonomous_verification_timeout_count,
+            verification_infra_errors=self._autonomous_verification_infrastructure_error_count,
+            verification_plan_rebuilds=max(0, self._autonomous_verification_plan_count - 1),
+            diagnostics_count=self._autonomous_verification_diagnostic_count,
+            time_to_final_green_ms=self._autonomous_verification_time_to_final_green_ms,
+            verification_required_checks=self._autonomous_verification_required_checks,
         )
 
     def _record_agent_event(self, event: str) -> None:
@@ -759,6 +925,71 @@ class CodingTraceCollector:
             self._replan_count += 1
         if "recover" in normalized or normalized.startswith("recovery"):
             self._recovery_count += 1
+
+    def _record_autonomous_verification_event(
+        self,
+        event: str,
+        metadata: Mapping[str, object],
+    ) -> None:
+        """Collect only bounded M8.3 status/count metadata from AgentLoop."""
+        normalized = event.casefold().replace(".", "_")
+        if normalized == "verification_result":
+            self._autonomous_verification_plan_count += 1
+            self._autonomous_verification_check_count += _nonnegative_int(
+                metadata.get("check_count")
+            )
+            self._autonomous_verification_executed_check_count += _nonnegative_int(
+                metadata.get("executed_check_count")
+            )
+            self._autonomous_verification_required_checks += _nonnegative_int(
+                metadata.get("required_check_count")
+            )
+            stage_counts = metadata.get("stage_counts")
+            if isinstance(stage_counts, Mapping):
+                for stage, count in stage_counts.items():
+                    if isinstance(stage, str) and stage in {
+                        "structural",
+                        "static",
+                        "typecheck",
+                        "targeted",
+                        "module",
+                        "integration",
+                        "regression",
+                    }:
+                        self._autonomous_verification_stage_counts[stage] += _nonnegative_int(count)
+            kind_counts = metadata.get("kind_counts")
+            if isinstance(kind_counts, Mapping):
+                for kind, count in kind_counts.items():
+                    if isinstance(kind, str) and kind in {
+                        "targeted_test",
+                        "package_test",
+                        "integration_test",
+                        "build",
+                        "lint",
+                        "typecheck",
+                    }:
+                        self._autonomous_verification_kind_counts[kind] += _nonnegative_int(count)
+            status = metadata.get("status")
+            if status == "passed":
+                self._autonomous_verification_pass_count += 1
+                self._autonomous_verification_time_to_final_green_ms = self._elapsed_ms()
+            elif status == "failed":
+                self._autonomous_verification_failure_count += 1
+            elif status == "timed_out":
+                self._autonomous_verification_timeout_count += 1
+            elif status == "stale":
+                self._autonomous_verification_stale_count += 1
+            elif status == "infrastructure_error":
+                self._autonomous_verification_infrastructure_error_count += 1
+            elif status == "unknown":
+                self._autonomous_verification_unknown_count += 1
+            self._autonomous_verification_diagnostic_count += _nonnegative_int(
+                metadata.get("diagnostic_count")
+            )
+            if _nonnegative_int(metadata.get("repair_attempt")) > 0:
+                self._autonomous_verification_repair_count += 1
+        elif normalized == "verification_unavailable":
+            self._autonomous_verification_infrastructure_error_count += 1
 
     def _mark_first(self, kind: str) -> None:
         elapsed = self._elapsed_ms()
@@ -792,6 +1023,11 @@ class CodingTraceCollector:
                 operation_digest=operation_digest,
             )
         )
+
+
+def _nonnegative_int(value: object) -> int:
+    """Project one untrusted event field into a bounded metric counter."""
+    return value if type(value) is int and value >= 0 else 0
 
 
 __all__ = [

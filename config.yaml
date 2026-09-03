@@ -62,6 +62,17 @@ coding:
   verification:
     enabled: true
     max_fix_attempts: 3
+    # M8.3 bounded planner/executor limits.  Verification never receives
+    # writable roots or network authority from this section.
+    max_checks: 16
+    # Short spellings are accepted by the typed limits reader; values are
+    # clamped to the immutable runtime ceiling and cannot widen authority.
+    max_total_seconds: 600
+    max_check_output_bytes: 65536
+    max_total_verification_seconds: 600
+    max_check_timeout: 120
+    max_output_bytes: 65536
+    max_repair_cycles: 3
     run_affected_first: true
     run_full_before_delivery: true
 

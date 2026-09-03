@@ -331,6 +331,7 @@ class AgentLoop:
         delegated_execution_context: Any = None,
         repo_intelligence=None,
         edit_transaction_service=None,
+        verification_coordinator=None,
     ):
         self.config = config
         self.mode_manager = mode_manager
@@ -361,6 +362,10 @@ class AgentLoop:
             context_intelligence, "repo_intelligence", None
         )
         self.edit_transaction_service = edit_transaction_service
+        # M8.3: post-edit verification is an observation coordinator only.
+        # Execution remains owned by ExecutionService and completion remains
+        # owned by the existing trusted provider plus CompletionGate.
+        self.verification_coordinator = verification_coordinator
         # Phase 6: 项目约定文件加载器（KHAOS.md / AGENTS.md）。注入优先级
         # 高于 memory / skill，因为它们是项目级硬规则。
         self.project_context_loader = project_context_loader
@@ -507,6 +512,94 @@ class AgentLoop:
     ) -> TurnPhaseSnapshot:
         """Close a turn through the explicit finalization boundary."""
         return TurnFinalizer.finalize(phase, terminal_status=terminal_status)
+
+    def _autonomous_verification_message(
+        self,
+        *,
+        run: Any,
+        impact: Any,
+        task_id: str,
+        turn_id: str,
+        attempt_id: str,
+        repair_attempt: int | None = None,
+    ) -> Message:
+        """Build a bounded model observation for one M8.3 run."""
+        from khaos.coding.verification.contracts import VerificationRunStatus
+        from khaos.coding.verification.service import AutonomousVerificationCoordinator
+
+        status = getattr(getattr(run, "status", None), "value", "unknown")
+        if status == VerificationRunStatus.PASSED.value:
+            content = (
+                "# Autonomous verification result (UNTRUSTED OBSERVATION)\n"
+                "Verification checks passed. This is advisory evidence only; "
+                "completion still requires the trusted verification authority."
+            )
+        else:
+            if impact is None:
+                raise TypeError("autonomous verification impact is invalid")
+            context = AutonomousVerificationCoordinator.repair_context(run, impact)
+            content = context.render()
+            if repair_attempt is not None:
+                content += (
+                    f"\n\nRepair attempt admitted by the existing verify-fix "
+                    f"controller: {repair_attempt}. Use a new EditTransaction "
+                    "to produce a new workspace generation and verification plan."
+                )
+            else:
+                content += (
+                    "\n\nNo automatic repair attempt was admitted. The failure "
+                    "remains a negative observation and may require user action."
+                )
+        plan = getattr(run, "plan", None)
+        checks = tuple(getattr(plan, "checks", ()) or ())
+        stage_counts: dict[str, int] = {}
+        kind_counts: dict[str, int] = {}
+        for check in checks:
+            stage = getattr(getattr(check, "stage", None), "name", "")
+            if stage:
+                stage_counts[stage.casefold()] = stage_counts.get(stage.casefold(), 0) + 1
+            kind = getattr(getattr(check, "kind", None), "value", "")
+            if kind:
+                kind_counts[kind] = kind_counts.get(kind, 0) + 1
+        checks_by_id = {
+            getattr(check, "check_id", ""): check
+            for check in checks
+            if getattr(check, "check_id", "")
+        }
+        executed_kind_counts: dict[str, int] = {}
+        for evidence in tuple(getattr(run, "evidence", ()) or ()):
+            check = checks_by_id.get(getattr(evidence, "check_id", ""))
+            kind = getattr(getattr(check, "kind", None), "value", "")
+            if kind:
+                executed_kind_counts[kind] = executed_kind_counts.get(kind, 0) + 1
+        metadata = {
+            "task_id": task_id,
+            "turn_id": turn_id,
+            "attempt_id": attempt_id,
+            "run_id": getattr(run, "run_id", ""),
+            "plan_id": getattr(plan, "plan_id", ""),
+            "plan_digest": getattr(plan, "plan_digest", ""),
+            "status": status,
+            "workspace_generation": getattr(plan, "workspace_generation", None),
+            "repository_generation": getattr(plan, "repository_generation", None),
+            "required_check_count": int(getattr(run, "required_count", 0)),
+            "passed_check_count": int(getattr(run, "passed_count", 0)),
+            "check_count": len(checks),
+            "executed_check_count": len(tuple(getattr(run, "evidence", ()) or ())),
+            "stage_counts": stage_counts,
+            "kind_counts": executed_kind_counts,
+            "planned_kind_counts": kind_counts,
+            "diagnostic_count": len(tuple(getattr(run, "diagnostics", ()) or ())),
+            "repair_attempt": repair_attempt,
+        }
+        return Message(
+            role="system",
+            content=content,
+            token_count=self.token_engine.count_tokens(content),
+            event="verification_result",
+            metadata=metadata,
+            created_at=time.time(),
+        )
 
     async def run(
         self,
@@ -1203,6 +1296,209 @@ class AgentLoop:
                                 tool_name=result.name,
                                 arguments=result.arguments or {},
                             )
+                        # M8.3: every successful canonical coding edit enters
+                        # the autonomous planner through the existing
+                        # coordinator.  Read-only tools, failed mutations, and
+                        # legacy text-edit tools do not enter this path.
+                        if (
+                            is_coding
+                            and result.success
+                            and result.name == "apply_edit_transaction"
+                            and self.verification_coordinator is not None
+                            and active_task_id is not None
+                            and self.active_workspace is not None
+                        ):
+                            try:
+                                from khaos.coding.verification.impact import (
+                                    EditImpact,
+                                    edit_transaction_result_from_tool_output,
+                                )
+
+                                # A successful tool envelope is still an
+                                # observation boundary.  Clear the previous
+                                # run before decoding it so malformed output
+                                # cannot leave stale positive evidence visible
+                                # to completion or repair logic.
+                                self.verification_coordinator.invalidate(active_task_id)
+                                edit_result = edit_transaction_result_from_tool_output(
+                                    result.output
+                                )
+                                autonomous_run = (
+                                    await self.verification_coordinator.verify_after_edit(
+                                        edit_result,
+                                        task_id=active_task_id,
+                                        workspace=self.active_workspace,
+                                        event_sink=turn,
+                                        principal_id=self.principal_id,
+                                        project_id=self.project_id,
+                                    )
+                                )
+                                impact = self.verification_coordinator.impact_for_task(
+                                    active_task_id
+                                ) or EditImpact.from_result(edit_result)
+                                repair_attempt = None
+                                autonomous_observation = None
+                                suppress_autonomous_repair = False
+                                if self.verify_fix_loop is not None:
+                                    autonomous_observation = (
+                                        self.verify_fix_loop.observe_autonomous_run(
+                                            autonomous_run
+                                        )
+                                    )
+                                    autonomous_status = autonomous_run.status.value
+                                    no_progress = self.verify_fix_loop.no_progress_signal()
+                                    if (
+                                        no_progress.detected
+                                        and autonomous_status in {"failed", "timed_out"}
+                                        and autonomous_observation is not None
+                                        and active_task_id is not None
+                                    ):
+                                        normalized_failure = (
+                                            self._normalize_verify_fix_failure(
+                                                autonomous_observation
+                                            )
+                                        )
+                                        await turn.emit(
+                                            "recovery.no_progress",
+                                            {
+                                                "task_id": active_task_id,
+                                                "observation_indices": list(
+                                                    no_progress.observation_indices
+                                                ),
+                                                "failure_signature_digest": (
+                                                    normalized_failure.failure_signature_digest
+                                                ),
+                                                "reason": "identical_failure_signature",
+                                            },
+                                        )
+                                        recovery_for_observation = (
+                                            await self._recover_after_no_progress(
+                                                turn=turn,
+                                                task_id=active_task_id,
+                                                failure_signature=normalized_failure,
+                                                query=user_input,
+                                            )
+                                        )
+                                        recovery_status = getattr(
+                                            getattr(
+                                                recovery_for_observation,
+                                                "status",
+                                                None,
+                                            ),
+                                            "value",
+                                            None,
+                                        )
+                                        recovery_action = getattr(
+                                            getattr(
+                                                recovery_for_observation,
+                                                "action",
+                                                None,
+                                            ),
+                                            "value",
+                                            None,
+                                        )
+                                        suppress_autonomous_repair = (
+                                            recovery_status in {"applied", "blocked"}
+                                            and recovery_action in {"replan", "block"}
+                                        )
+                                    if (
+                                        autonomous_status in {"failed", "timed_out"}
+                                        and autonomous_observation is not None
+                                        and not suppress_autonomous_repair
+                                    ):
+                                        repair_attempt = self.verify_fix_loop.admit_repair(
+                                            autonomous_observation
+                                        )
+                                verification_msg = self._autonomous_verification_message(
+                                    run=autonomous_run,
+                                    impact=impact,
+                                    task_id=active_task_id,
+                                    turn_id=turn.turn_id,
+                                    attempt_id=turn.attempt_id,
+                                    repair_attempt=repair_attempt,
+                                )
+                                messages.append(verification_msg)
+                                await self._persist_message(
+                                    session_id,
+                                    verification_msg,
+                                    task_id=active_task_id,
+                                    workspace_id=getattr(
+                                        self.active_workspace, "id", None
+                                    ),
+                                    commit_sha=getattr(
+                                        self.active_workspace, "base_sha", None
+                                    ),
+                                )
+                                if self.task_manager is not None and active_task_id:
+                                    if autonomous_run.status.value == "passed":
+                                        await self.task_manager.update_status(
+                                            active_task_id,
+                                            "waiting_test",
+                                        )
+                                    elif repair_attempt is not None:
+                                        await self.task_manager.update_status(
+                                            active_task_id,
+                                            "fixing",
+                                            fix_attempts=self.verify_fix_loop.attempt_count,
+                                        )
+                                if (
+                                    self.verify_fix_loop is not None
+                                    and self.verify_fix_loop.is_loop_exhausted()
+                                    and not self.verify_fix_loop.report_emitted
+                                ):
+                                    report = self.verify_fix_loop.get_final_report()
+                                    self.verify_fix_loop.mark_report_emitted()
+                                    yield Message(
+                                        role="system",
+                                        content=report,
+                                        event="verify_fix_report",
+                                        created_at=time.time(),
+                                    )
+                            except Exception as exc:  # noqa: BLE001 - verification failure is observed fail-closed
+                                # A malformed edit projection or unavailable
+                                # verification coordinator is an explicit
+                                # infrastructure observation.  It must not
+                                # turn a successful edit into positive proof,
+                                # and raw exception text never enters model
+                                # context or telemetry.
+                                logger.warning(
+                                    "autonomous verification could not start: %s",
+                                    type(exc).__name__,
+                                )
+                                await turn.emit(
+                                    "verification.infrastructure_error",
+                                    {
+                                        "task_id": active_task_id,
+                                        "workspace_id": self.active_workspace.id,
+                                        "tool_name": result.name,
+                                        "error_type": type(exc).__name__,
+                                    },
+                                )
+                                unavailable_msg = Message(
+                                    role="system",
+                                    content=(
+                                        "# Autonomous verification result "
+                                        "(UNTRUSTED OBSERVATION)\n"
+                                        "Verification infrastructure was unavailable; "
+                                        "no verification pass or completion authority was granted."
+                                    ),
+                                    event="verification_unavailable",
+                                    metadata={
+                                        "task_id": active_task_id,
+                                        "workspace_id": self.active_workspace.id,
+                                        "error_type": type(exc).__name__,
+                                    },
+                                    created_at=time.time(),
+                                )
+                                messages.append(unavailable_msg)
+                                await self._persist_message(
+                                    session_id,
+                                    unavailable_msg,
+                                    task_id=active_task_id,
+                                    workspace_id=getattr(
+                                        self.active_workspace, "id", None
+                                    ),
+                                )
                         if result.name == "test_run" and self.task_manager is not None and active_task_id:
                             await self.task_manager.update_status(active_task_id, "waiting_test")
                         if self.task_manager is not None and active_task_id:

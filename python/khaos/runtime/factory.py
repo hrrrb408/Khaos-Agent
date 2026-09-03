@@ -34,6 +34,15 @@ from khaos.coding.planning.trusted_verification_service import (
     TrustedVerificationService,
 )
 from khaos.coding.task_manager import TaskManager
+from khaos.coding.verification.evidence import VerificationObservationStore
+from khaos.coding.verification.planner import (
+    AutonomousPlannerLimits,
+    AutonomousVerificationPlanner,
+)
+from khaos.coding.verification.service import (
+    AutonomousVerificationCoordinator,
+    AutonomousVerificationFactProvider,
+)
 from khaos.coding.verify_fix import VerifyFixLoop
 from khaos.coding.workspace.manager import WorkspaceManager
 from khaos.coding.workspace.office_authority import OfficeMutationAuthority
@@ -496,6 +505,10 @@ class RuntimeResult:
     owns_context_intelligence: bool = field(
         init=False, default=False, repr=False
     )
+    # M8.3: the post-edit planner/executor observation coordinator is attached
+    # by the factory.  It has no independent execution or completion
+    # authority and therefore needs no separate lifecycle shutdown.
+    verification_coordinator: Any = field(init=False, default=None, repr=False)
     # M7.3: production-composed planning control coordinator.  It is an
     # orchestration owner only; plan revisions remain passive and TaskStatus
     # lifecycle writes remain owned by their existing control boundaries.
@@ -1935,7 +1948,31 @@ async def build_runtime(
         # overwrote each other's holder — see ``permission_tools.py``
         # docstring for the race description.
         compressor = ContextCompressor(router, memory_manager=memory_manager)
-        verify_factory = VerifyFixLoop
+        from khaos.config import ConfigError, load_config
+
+        verification_limits = AutonomousPlannerLimits()
+        try:
+            verification_config = load_config(
+                cfg.config_path or root / "config.yaml",
+                strict_env=False,
+            )
+            verification_limits = AutonomousPlannerLimits.from_config(
+                verification_config
+            )
+        except (ConfigError, OSError, TypeError, ValueError) as exc:
+            # Verification bounds are not authority inputs.  A malformed or
+            # unavailable optional config must retain the immutable safe
+            # defaults rather than widening or disabling autonomous checks.
+            logger.warning(
+                "autonomous verification config unavailable; using safe defaults: %s",
+                type(exc).__name__,
+            )
+
+        def verify_factory() -> VerifyFixLoop:
+            return VerifyFixLoop(
+                max_fix_attempts=verification_limits.max_repair_cycles
+            )
+
         skill_generator = SkillGenerator()
         cleanup_authority = cfg.cleanup_authority or RuntimeCleanupAuthority()
         from khaos.agent.control.completion_flow import (
@@ -1969,6 +2006,26 @@ async def build_runtime(
             authority=trusted_verification_authority,
             repository=verification_assessment_repository,
         )
+        autonomous_observation_store = getattr(
+            cfg.db, "autonomous_verification_repository", None
+        )
+        if not callable(getattr(autonomous_observation_store, "append", None)) or not callable(
+            getattr(autonomous_observation_store, "latest_for_task", None)
+        ):
+            autonomous_observation_store = VerificationObservationStore()
+        autonomous_verification = AutonomousVerificationCoordinator(
+            execution_service=execution_service,
+            repo_intelligence=(
+                getattr(context_intelligence, "repo_intelligence", None)
+                if context_intelligence is not None
+                else None
+            ),
+            evidence_store=autonomous_observation_store,
+            planner=AutonomousVerificationPlanner(limits=verification_limits),
+            principal_id=cfg.principal_id,
+            project_id=project_id,
+            repository_id=cfg.repo_id,
+        )
         fact_provider = cfg.completion_fact_provider
         if fact_provider is None:
             fact_provider = TrustedVerificationFactProvider(
@@ -1976,6 +2033,10 @@ async def build_runtime(
                 principal_id=cfg.principal_id,
                 project_id=project_id,
             )
+        fact_provider = AutonomousVerificationFactProvider(
+            fact_provider,
+            autonomous_verification,
+        )
         completion_controller = CompletionProposalController(
             goal_spec_repository=goal_spec_repository,
             decision_repository=decision_repository,
@@ -2139,6 +2200,7 @@ async def build_runtime(
             subagent_control_coordinator=subagent_control_coordinator,
             credential_broker=credential_broker,
             completion_controller=completion_controller,
+            completion_fact_provider=fact_provider,
             completion_gate=(
                 None if cfg.delegated_execution_context is not None else completion_gate
             ),
@@ -2158,6 +2220,7 @@ async def build_runtime(
             delegated_execution_context=cfg.delegated_execution_context,
             trusted_verification_authority=trusted_verification_authority,
             trusted_verification_service=trusted_verification_service,
+            verification_coordinator=autonomous_verification,
             # M4 batch 3.1.16A-5-1b (CRITICAL): carry the RPC-verified
             # project identity into the AgentLoop so every message / turn
             # write is stamped with it.  ``self._bound_project_id`` (set
@@ -2229,6 +2292,7 @@ async def build_runtime(
         runtime.owns_memory_host = owns_memory_host
         runtime.context_intelligence = context_intelligence
         runtime.owns_context_intelligence = context_intelligence is not None
+        runtime.verification_coordinator = autonomous_verification
         runtime.recovery_control = recovery_control
         runtime.composition_manifest = composition_manifest
         return runtime
