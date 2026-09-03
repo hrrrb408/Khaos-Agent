@@ -17,8 +17,8 @@
 
 ## Import reachability result
 
-- Reachable repository modules: `302`.
-- Resolved import edges: `2379`.
+- Reachable repository modules: `311`.
+- Resolved import edges: `2472`.
 - Forbidden production edges: `0`.
 - Unresolved internal edges: `0`.
 
@@ -155,6 +155,15 @@
 - `khaos.coding.planning.verification_store`
 - `khaos.coding.planning.workspace_mutation`
 - `khaos.coding.task_manager`
+- `khaos.coding.verification.contracts`
+- `khaos.coding.verification.diagnostics`
+- `khaos.coding.verification.evidence`
+- `khaos.coding.verification.executor`
+- `khaos.coding.verification.impact`
+- `khaos.coding.verification.models`
+- `khaos.coding.verification.planner`
+- `khaos.coding.verification.profile`
+- `khaos.coding.verification.service`
 - `khaos.coding.verify_fix`
 - `khaos.coding.workspace.artifacts`
 - `khaos.coding.workspace.boundary`

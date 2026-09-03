@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import pytest
-
 from khaos.db import Database
 from khaos.db.migrations._registry import (
     MIGRATIONS,
@@ -39,7 +38,9 @@ async def test_m8_coding_ledger_migration_is_idempotent_and_append_only() -> Non
                 )
             ).fetchall()
 
-        assert schema_version[0] == 27
+        # v27 is the Coding evaluation ledger migration; v28 is the current
+        # M8.3 autonomous-verification observation ledger.
+        assert schema_version[0] == 28
         assert ledger is not None
         assert [row[0] for row in triggers] == [
             "trg_coding_evaluation_runs_immutable_delete",

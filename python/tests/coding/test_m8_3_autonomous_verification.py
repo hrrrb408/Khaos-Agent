@@ -136,6 +136,7 @@ def test_applied_result_parser_rejects_coercion_and_requires_exact_identity() ->
         edit_transaction_result_from_tool_output(malformed)
 
 
+@pytest.mark.posix_host
 def test_profile_uses_known_script_names_not_readme_or_script_contents(tmp_path: Path) -> None:
     _profile_root(tmp_path)
     (tmp_path / "package.json").write_text(
@@ -150,6 +151,7 @@ def test_profile_uses_known_script_names_not_readme_or_script_contents(tmp_path:
     assert any(command.argv == ("npm", "run", "lint") for command in profile.commands)
 
 
+@pytest.mark.posix_host
 def test_profile_accepts_only_typed_custom_project_rules(tmp_path: Path) -> None:
     _profile_root(tmp_path)
     profile = VerificationProfileDetector().detect(
@@ -173,6 +175,7 @@ def test_profile_accepts_only_typed_custom_project_rules(tmp_path: Path) -> None
     assert custom[0].argv == ("python", "-m", "pytest")
 
 
+@pytest.mark.posix_host
 def test_planner_orders_checks_and_broadens_unknown_impact(tmp_path: Path) -> None:
     _profile_root(tmp_path)
     profile = VerificationProfileDetector().detect(tmp_path)
@@ -191,6 +194,7 @@ def test_planner_orders_checks_and_broadens_unknown_impact(tmp_path: Path) -> No
     assert plan.is_valid()
 
 
+@pytest.mark.posix_host
 def test_planner_does_not_target_config_files_as_source_code(tmp_path: Path) -> None:
     _profile_root(tmp_path)
     profile = VerificationProfileDetector().detect(tmp_path)
@@ -231,6 +235,7 @@ def _plan_for_executor(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.posix_host
 async def test_executor_is_read_only_network_denied_and_persists_digest_only(tmp_path: Path) -> None:
     plan = _plan_for_executor(tmp_path)
     fake = _FakeExecutionService(
@@ -270,6 +275,7 @@ async def test_executor_is_read_only_network_denied_and_persists_digest_only(tmp
 
 
 @pytest.mark.asyncio
+@pytest.mark.posix_host
 async def test_executor_marks_stale_before_running_any_check(tmp_path: Path) -> None:
     plan = _plan_for_executor(tmp_path)
     fake = _FakeExecutionService(
@@ -286,6 +292,7 @@ async def test_executor_marks_stale_before_running_any_check(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
+@pytest.mark.posix_host
 async def test_executor_distinguishes_timeout_and_infrastructure_error(tmp_path: Path) -> None:
     plan = _plan_for_executor(tmp_path)
     timeout_fake = _FakeExecutionService(TimeoutError("deadline"))
@@ -309,6 +316,7 @@ async def test_executor_distinguishes_timeout_and_infrastructure_error(tmp_path:
 
 
 @pytest.mark.asyncio
+@pytest.mark.posix_host
 async def test_executor_keeps_unknown_status_distinct_from_code_failure(tmp_path: Path) -> None:
     plan = _plan_for_executor(tmp_path)
     run = await VerificationExecutor(
@@ -323,6 +331,7 @@ async def test_executor_keeps_unknown_status_distinct_from_code_failure(tmp_path
 
 
 @pytest.mark.asyncio
+@pytest.mark.posix_host
 async def test_passed_count_only_counts_required_nontruncated_checks(tmp_path: Path) -> None:
     plan = _plan_for_executor(tmp_path)
     optional = replace(plan.checks[-1], required=False)
@@ -340,6 +349,7 @@ async def test_passed_count_only_counts_required_nontruncated_checks(tmp_path: P
 
 
 @pytest.mark.asyncio
+@pytest.mark.posix_host
 async def test_optional_failure_does_not_hide_required_success(tmp_path: Path) -> None:
     plan = _plan_for_executor(tmp_path)
     optional = replace(plan.checks[-1], required=False)
@@ -376,6 +386,7 @@ async def test_optional_failure_does_not_hide_required_success(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
+@pytest.mark.posix_host
 async def test_empty_plan_never_reports_required_success(tmp_path: Path) -> None:
     plan = _plan_for_executor(tmp_path)
     empty_plan = replace(plan, checks=(), plan_digest="")
@@ -393,6 +404,7 @@ async def test_empty_plan_never_reports_required_success(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
+@pytest.mark.posix_host
 async def test_coordinator_replans_from_applied_edit_and_records_events(tmp_path: Path) -> None:
     _profile_root(tmp_path)
     fake = _FakeExecutionService(
@@ -482,6 +494,7 @@ def test_metrics_record_m8_3_events_without_storing_diagnostic_text() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.posix_host
 async def test_observation_store_is_owner_scoped_and_append_only(tmp_path: Path) -> None:
     store = VerificationObservationStore()
     plan = _plan_for_executor(tmp_path)
@@ -499,6 +512,7 @@ async def test_observation_store_is_owner_scoped_and_append_only(tmp_path: Path)
 
 
 @pytest.mark.asyncio
+@pytest.mark.posix_host
 async def test_observation_store_uses_v28_database_ledger(tmp_path: Path) -> None:
     database = Database(tmp_path / "m83.sqlite3")
     try:
@@ -531,6 +545,7 @@ async def test_observation_store_uses_v28_database_ledger(tmp_path: Path) -> Non
         await database.close()
 
 
+@pytest.mark.posix_host
 def test_profile_detects_mixed_language_repository_metadata(tmp_path: Path) -> None:
     _profile_root(tmp_path)
     (tmp_path / "package.json").write_text(
@@ -548,6 +563,7 @@ def test_profile_detects_mixed_language_repository_metadata(tmp_path: Path) -> N
     )
 
 
+@pytest.mark.posix_host
 def test_planner_is_deterministic_and_deduplicates_same_command(tmp_path: Path) -> None:
     _profile_root(tmp_path)
     profile = VerificationProfileDetector().detect(tmp_path)
@@ -562,6 +578,7 @@ def test_planner_is_deterministic_and_deduplicates_same_command(tmp_path: Path) 
     assert len(identities) == len(first.checks)
 
 
+@pytest.mark.posix_host
 def test_planner_respects_subsecond_total_budget(tmp_path: Path) -> None:
     _profile_root(tmp_path)
     limits = AutonomousPlannerLimits(
@@ -579,6 +596,7 @@ def test_planner_respects_subsecond_total_budget(tmp_path: Path) -> None:
     assert sum(check.timeout_seconds for check in plan.checks) <= 0.1
 
 
+@pytest.mark.posix_host
 def test_security_sensitive_impact_broadens_verification(tmp_path: Path) -> None:
     _profile_root(tmp_path)
     profile = VerificationProfileDetector().detect(tmp_path)
@@ -655,6 +673,7 @@ async def test_impact_analyzer_uses_bounded_m8_1_relation_queries(tmp_path: Path
 
 
 @pytest.mark.asyncio
+@pytest.mark.posix_host
 async def test_executor_rejects_active_workspace_identity_mismatch(tmp_path: Path) -> None:
     plan = _plan_for_executor(tmp_path)
     with pytest.raises(PermissionError):
@@ -705,6 +724,7 @@ def test_limits_reader_accepts_both_config_spellings_and_only_narrows() -> None:
     assert widened == AutonomousPlannerLimits()
 
 
+@pytest.mark.posix_host
 def test_diagnostic_parser_handles_common_shapes_and_bounded_fallback(tmp_path: Path) -> None:
     _profile_root(tmp_path)
     profile = VerificationProfileDetector().detect(tmp_path)
@@ -750,6 +770,7 @@ def test_diagnostic_parser_handles_common_shapes_and_bounded_fallback(tmp_path: 
 
 
 @pytest.mark.asyncio
+@pytest.mark.posix_host
 async def test_executor_handles_cancel_and_enforces_plan_output_bound(tmp_path: Path) -> None:
     plan = _plan_for_executor(tmp_path)
     cancelled_fake = _FakeExecutionService(asyncio.CancelledError())
@@ -783,6 +804,7 @@ async def test_executor_handles_cancel_and_enforces_plan_output_bound(tmp_path: 
 
 
 @pytest.mark.asyncio
+@pytest.mark.posix_host
 async def test_failed_targeted_observation_repairs_with_new_generation_and_plan(
     tmp_path: Path,
 ) -> None:
@@ -869,6 +891,7 @@ async def test_failed_targeted_observation_repairs_with_new_generation_and_plan(
 
 
 @pytest.mark.asyncio
+@pytest.mark.posix_host
 async def test_m83_pass_does_not_override_trusted_completion_failure(tmp_path: Path) -> None:
     plan = _plan_for_executor(tmp_path)
     run = await VerificationExecutor(

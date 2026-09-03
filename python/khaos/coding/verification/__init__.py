@@ -1,5 +1,8 @@
 """Project-aware verification pipeline."""
 
+from importlib import import_module
+from typing import Any
+
 from khaos.coding.verification.contracts import (
     DiagnosticCategory,
     DiagnosticSeverity,
@@ -43,10 +46,6 @@ from khaos.coding.verification.impact import (
     edit_transaction_result_from_tool_output,
 )
 from khaos.coding.verification.models import VerificationPlan, VerificationStepResult
-from khaos.coding.verification.pipeline import (
-    VerificationMemoryOutcome,
-    VerificationPipeline,
-)
 from khaos.coding.verification.planner import (
     AutonomousPlannerLimits,
     AutonomousVerificationPlanner,
@@ -64,6 +63,31 @@ from khaos.coding.verification.service import (
     AutonomousVerificationCoordinator,
     AutonomousVerificationFactProvider,
 )
+
+# Keep the legacy pipeline outside the production import graph.  Production
+# roots use the autonomous verification contracts/evidence path directly;
+# loading this package must not import the forbidden host execution backend.
+_LEGACY_PIPELINE_EXPORTS: dict[str, tuple[str, str]] = {
+    "VerificationMemoryOutcome": (
+        "khaos.coding.verification.pipeline",
+        "VerificationMemoryOutcome",
+    ),
+    "VerificationPipeline": (
+        "khaos.coding.verification.pipeline",
+        "VerificationPipeline",
+    ),
+}
+
+
+def __getattr__(name: str) -> Any:
+    """Load legacy pipeline exports only when a legacy caller requests them."""
+    target = _LEGACY_PIPELINE_EXPORTS.get(name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module = import_module(target[0])
+    value = getattr(module, target[1])
+    globals()[name] = value
+    return value
 
 __all__ = [
     "AutonomousPlannerLimits",
