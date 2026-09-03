@@ -8,6 +8,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -228,6 +229,27 @@ class AgentConfig:
     context_max_symbols: int = 128
     context_max_bytes: int = 256 * 1024
     context_max_file_bytes: int = 64 * 1024
+    # M8.4: one bounded context engine owns final selection/eviction.  These
+    # values are disclosure budgets only; they do not alter workspace or tool
+    # authority.
+    context_output_reserve_tokens: int = 2_048
+    context_output_reserve_bytes: int = 32 * 1024
+    context_layer_token_budgets: tuple[int, int, int, int] = (
+        2_048,
+        3_072,
+        5_120,
+        1_760,
+    )
+    context_layer_byte_budgets: tuple[int, int, int, int] = (
+        48 * 1024,
+        64 * 1024,
+        112 * 1024,
+        32 * 1024,
+    )
+    context_recent_message_count: int = 12
+    tool_output_max_bytes: int = 64 * 1024
+    tool_output_max_tokens: int = 4_096
+    tool_output_max_lines: int = 512
 
 
 @dataclass
@@ -332,6 +354,7 @@ class AgentLoop:
         repo_intelligence=None,
         edit_transaction_service=None,
         verification_coordinator=None,
+        context_engine=None,
     ):
         self.config = config
         self.mode_manager = mode_manager
@@ -366,6 +389,15 @@ class AgentLoop:
         # Execution remains owned by ExecutionService and completion remains
         # owned by the existing trusted provider plus CompletionGate.
         self.verification_coordinator = verification_coordinator
+        # M8.4: final context selection/serialization owner.  This service is
+        # optional for direct legacy/test constructions; the runtime factory
+        # wires it for the normal path so the old builder is not a second
+        # production context manager.
+        self.context_engine = context_engine
+        # M8.4 keeps the typed M8.1 result separate from its legacy rendered
+        # projection.  The bundle is turn-local and never becomes authority;
+        # ContextEngineService consumes its bounded candidate records.
+        self._active_context_bundle = None
         # Phase 6: 项目约定文件加载器（KHAOS.md / AGENTS.md）。注入优先级
         # 高于 memory / skill，因为它们是项目级硬规则。
         self.project_context_loader = project_context_loader
@@ -411,6 +443,7 @@ class AgentLoop:
         self._active_session_id = ""
         self._active_task_id: str | None = None
         self._recovery_cycles_this_turn = 0
+        self._context_needs_rebuild = False
         self.execution_service = execution_service
         if approval_broker is None:
             from khaos.agent.approval import ApprovalBroker
@@ -630,6 +663,7 @@ class AgentLoop:
             if self.active_workspace is None:
                 raise PermissionError("delegated execution cannot attach the parent workspace")
         self._recovery_cycles_this_turn = 0
+        self._context_needs_rebuild = False
         is_coding = self.mode_manager.current_mode.value == "coding"
         if is_coding and self._verify_fix_factory is not None:
             self.verify_fix_loop = self._verify_fix_factory()
@@ -727,6 +761,18 @@ class AgentLoop:
                 runtime_id=self.runtime_id,
                 event_sink=turn,
             )
+            await self._observe_context_event(
+                "PlanRevision",
+                {
+                    "plan_revision": (
+                        getattr(self._active_planning_result, "revision_digest", None)
+                        or getattr(self._active_planning_result, "plan_digest", None)
+                        or ""
+                    ),
+                    "summary": "planning revision created",
+                },
+                task_id=active_task_id,
+            )
             # The coordinator owns the physical cognitive CAS.  Refresh only
             # the in-memory projection so the task facts below do not expose a
             # stale pre-CAS state; this is not restart ``load()`` semantics.
@@ -774,7 +820,19 @@ class AgentLoop:
                     stop_reason = StopReason.MAX_BUDGET.value
                     break
                 empty_response_retries = 0
-                if await self._check_compression(messages) and self.compressor is not None:
+                if self.context_engine is not None:
+                    if self._context_needs_rebuild:
+                        messages = await self._build_context(session_id, user_input)
+                        self._context_needs_rebuild = False
+                    else:
+                        messages = cast(
+                            list[Message],
+                            await self.context_engine.rebalance_messages(
+                                messages,
+                                requirements=self._context_requirements(user_input),
+                            ),
+                        )
+                elif await self._check_compression(messages) and self.compressor is not None:
                     result = await self.compressor.compress(
                         messages,
                         self.config.compression_threshold,
@@ -803,7 +861,7 @@ class AgentLoop:
                     assistant_content = ""
                     tool_calls: list[dict] = []
                     stop_reason = StopReason.END_TURN.value
-                    tools_schema = self._build_tools_schema()
+                    tools_schema = self._build_tools_schema(user_input)
                     call_kwargs = {"tools": tools_schema} if tools_schema is not None else {}
 
                     async for chunk in self.router.call(
@@ -1208,21 +1266,46 @@ class AgentLoop:
                         )
                     if event.result is not None:
                         result = event.result
-                        content = json.dumps(
-                            {
-                                "success": result.success,
-                                "output": result.output,
-                                "error": result.error,
-                                "error_code": result.error_code,
-                                "effect_status": result.effect_status,
-                                "delivery_status": result.delivery_status,
-                                "warning": result.warning,
-                                "effect_id": result.effect_id,
-                                "phase_digest": result.phase_digest,
-                                "retry_safe": result.retry_safe,
-                            },
-                            ensure_ascii=False,
-                        )
+                        bounded_envelope = None
+                        if self.context_engine is not None:
+                            bounded_envelope = self.context_engine.bound_tool_result(result)
+                            wrapper_prefix = '<untrusted_tool_output source="tool">\n'
+                            wrapper_suffix = "</untrusted_tool_output>"
+                            output_budget = max(
+                                1,
+                                int(
+                                    getattr(
+                                        self.config,
+                                        "tool_output_max_bytes",
+                                        64 * 1024,
+                                    )
+                                )
+                                - len(
+                                    (wrapper_prefix + wrapper_suffix).encode("utf-8")
+                                ),
+                            )
+                            bounded_content = bounded_envelope.to_json(
+                                max_bytes=output_budget
+                            )
+                            content = (
+                                f"{wrapper_prefix}{bounded_content}\n{wrapper_suffix}"
+                            )
+                        else:
+                            content = json.dumps(
+                                {
+                                    "success": result.success,
+                                    "output": result.output,
+                                    "error": result.error,
+                                    "error_code": result.error_code,
+                                    "effect_status": result.effect_status,
+                                    "delivery_status": result.delivery_status,
+                                    "warning": result.warning,
+                                    "effect_id": result.effect_id,
+                                    "phase_digest": result.phase_digest,
+                                    "retry_safe": result.retry_safe,
+                                },
+                                ensure_ascii=False,
+                            )
                         tool_msg = Message(
                             role="tool",
                             content=content,
@@ -1233,7 +1316,21 @@ class AgentLoop:
                                 "id": result.tool_call_id,
                                 "name": result.name,
                                 "success": result.success,
-                                "output": result.output,
+                                "output": (
+                                    result.output
+                                    if bounded_envelope is None
+                                    else ""
+                                ),
+                                "output_digest": (
+                                    bounded_envelope.full_result_digest
+                                    if bounded_envelope is not None
+                                    else None
+                                ),
+                                "output_truncated": (
+                                    bounded_envelope.truncated
+                                    if bounded_envelope is not None
+                                    else False
+                                ),
                                 "error": result.error,
                                 "error_code": result.error_code,
                                 "duration_ms": result.duration_ms,
@@ -1287,6 +1384,43 @@ class AgentLoop:
                         await self._record_task_activity(result, active_task_id)
                         if (
                             result.success
+                            and result.name == "apply_edit_transaction"
+                        ):
+                            self._context_needs_rebuild = True
+                            await self._observe_context_event(
+                                "EditTransactionApplied",
+                                {
+                                    "summary": "edit transaction applied",
+                                    "operation_digest": result.phase_digest or result.effect_id or "",
+                                    "changed_files": [
+                                        str(operation.get("path"))
+                                        for operation in (result.arguments or {}).get("operations", [])
+                                        if isinstance(operation, dict) and operation.get("path")
+                                    ],
+                                },
+                                task_id=active_task_id,
+                            )
+                        await self._observe_context_event(
+                            "ToolResult",
+                            {
+                                "tool_name": result.name,
+                                "success": result.success,
+                                "summary": (
+                                    _sanitize_tool_activity_output(
+                                        result.name,
+                                        result.output,
+                                        result.error,
+                                        max_chars=512,
+                                    )
+                                ),
+                                "workspace_id": getattr(
+                                    self.active_workspace, "id", ""
+                                ),
+                            },
+                            task_id=active_task_id,
+                        )
+                        if (
+                            result.success
                             and self.context_intelligence is not None
                             and active_task_id
                             and self.active_workspace is not None
@@ -1322,6 +1456,16 @@ class AgentLoop:
                                 self.verification_coordinator.invalidate(active_task_id)
                                 edit_result = edit_transaction_result_from_tool_output(
                                     result.output
+                                )
+                                await self._observe_context_event(
+                                    "VerificationPlanCreated",
+                                    {
+                                        "summary": "post-edit verification plan created",
+                                        "changed_files": list(
+                                            getattr(edit_result, "changed_files", ()) or ()
+                                        )[:32],
+                                    },
+                                    task_id=active_task_id,
                                 )
                                 autonomous_run = (
                                     await self.verification_coordinator.verify_after_edit(
@@ -1418,6 +1562,46 @@ class AgentLoop:
                                     repair_attempt=repair_attempt,
                                 )
                                 messages.append(verification_msg)
+                                await self._observe_context_event(
+                                    "VerificationResult",
+                                    {
+                                        "status": getattr(
+                                            getattr(autonomous_run, "status", None),
+                                            "value",
+                                            "unknown",
+                                        ),
+                                        "summary": "autonomous verification observed",
+                                    },
+                                    task_id=active_task_id,
+                                )
+                                verification_status = getattr(
+                                    getattr(autonomous_run, "status", None),
+                                    "value",
+                                    "unknown",
+                                )
+                                if verification_status in {"failed", "timed_out"}:
+                                    diagnostics = tuple(
+                                        getattr(autonomous_run, "diagnostics", ()) or ()
+                                    )
+                                    diagnostic_text = str(
+                                        getattr(diagnostics[0], "message", diagnostics[0])
+                                        if diagnostics
+                                        else "autonomous verification failed"
+                                    )[:2048]
+                                    await self._observe_context_event(
+                                        "VerificationDiagnostic",
+                                        {
+                                            "summary": diagnostic_text,
+                                            "diagnostic_count": len(diagnostics),
+                                        },
+                                        task_id=active_task_id,
+                                    )
+                                elif verification_status == "passed":
+                                    await self._observe_context_event(
+                                        "VerificationGreen",
+                                        {"summary": "autonomous verification is green"},
+                                        task_id=active_task_id,
+                                    )
                                 await self._persist_message(
                                     session_id,
                                     verification_msg,
@@ -1501,6 +1685,23 @@ class AgentLoop:
                                 )
                         if result.name == "test_run" and self.task_manager is not None and active_task_id:
                             await self.task_manager.update_status(active_task_id, "waiting_test")
+                        if result.name == "test_run":
+                            if result.success:
+                                await self._observe_context_event(
+                                    "VerificationGreen",
+                                    {"summary": "test_run passed"},
+                                    task_id=active_task_id,
+                                )
+                            else:
+                                await self._observe_context_event(
+                                    "VerificationDiagnostic",
+                                    {
+                                        "summary": str(
+                                            result.error or result.output or "test_run failed"
+                                        )[:2048],
+                                    },
+                                    task_id=active_task_id,
+                                )
                         if self.task_manager is not None and active_task_id:
                             await self.task_manager.record_trace(
                                 active_task_id,
@@ -2688,19 +2889,53 @@ class AgentLoop:
             source_type="TASK",
         )
     async def _build_context(self, session_id: str, user_input: str = "") -> list[Message]:
-        """Build the P0-A context from mode prompt and persisted messages.
+        """Dispatch model-context construction to the single active owner.
 
-        In coding mode (when ``project_root`` is set) this also injects:
-
-        1. The project structure tree into the *system* prompt (see
-           :meth:`_build_system_prompt`) — kept small (≤ token budget).
-        2. The contents of files relevant to ``user_input`` as a lower-trust
-           user observation appended *after* the persisted history, so the
-           authenticated current user request remains the final turn input.
-
-        Neither injection happens in office mode or when ``project_root`` is
-        unset, so non-coding behaviour is unchanged.
+        The runtime factory supplies Context Engine 2.0.  The explicitly
+        named legacy adapter below exists only for direct compatibility/test
+        constructions that do not provide that service.
         """
+        if self.context_engine is not None:
+            history = await self.db.list_messages(
+                session_id,
+                principal_id=self.principal_id,
+                project_id=self.project_id,
+            )
+            memory_message = await self._build_memory_message(session_id)
+            self._active_context_bundle = None
+            repo_message = None
+            if self.context_intelligence is not None and self._is_coding_mode():
+                repo_message = await self._build_context_intelligence_message(user_input)
+            context = await self.context_engine.build_for_agent(
+                system_prompt=await self._build_system_prompt_for_context_engine(
+                    session_id, user_input
+                ),
+                history=history,
+                active_facts=self._active_context_facts,
+                memory_message=memory_message,
+                repo_message=(
+                    None if self._active_context_bundle is not None else repo_message
+                ),
+                repo_bundle=self._active_context_bundle,
+                task_id=self._active_task_id or "",
+                workspace_id=getattr(self.active_workspace, "id", "") or "",
+                generation=self._context_generation(),
+                plan_revision=(
+                    getattr(self._active_planning_result, "revision_digest", None)
+                    or getattr(self._active_planning_result, "plan_digest", None)
+                ),
+                goal=user_input,
+                operation=self._context_operation(user_input),
+                target_path=self._context_target_path(user_input),
+            )
+            return [self._context_message_to_message(message) for message in context.messages]
+        return await self._build_legacy_context(session_id, user_input)
+
+    async def _build_legacy_context(
+        self, session_id: str, user_input: str = ""
+    ) -> list[Message]:
+        """Compatibility adapter for direct loops without Context Engine."""
+
         messages = [
             Message(
                 role="system",
@@ -2734,6 +2969,120 @@ class AgentLoop:
 
         return messages
 
+    async def _build_system_prompt_for_context_engine(
+        self, session_id: str, user_input: str = ""
+    ) -> str:
+        """Build only the application prompt and deferred skill projection."""
+
+        del session_id
+        prompt = await self.mode_manager.load_system_prompt()
+        skill_prompt = getattr(self.context_engine, "skill_prompt", None)
+        if callable(skill_prompt):
+            rendered = skill_prompt(self.mode_manager.current_mode.value, user_input)
+            if rendered:
+                prompt = f"{prompt}\n\n{rendered}"
+        return prompt
+
+    def _context_target_path(self, user_input: str) -> Path | None:
+        """Choose one safe target for scoped project-instruction resolution."""
+
+        if self.project_root is None:
+            return None
+        root = Path(self.project_root).expanduser().resolve()
+        candidates: list[str] = []
+        plan = self._active_planning_result
+        for container in (
+            getattr(plan, "target_files", ()),
+            getattr(plan, "affected_files", ()),
+        ):
+            for value in tuple(container or ())[:16]:
+                if isinstance(value, str):
+                    candidates.append(value)
+                else:
+                    for field_name in ("path", "relative_path", "file_path"):
+                        field_value = getattr(value, field_name, None)
+                        if isinstance(field_value, str) and field_value:
+                            candidates.append(field_value)
+                            break
+        # This is only an explicit-path hint; it never scans the repository or
+        # treats arbitrary user text as a filesystem authority.
+        candidates.extend(
+            re.findall(
+                r"(?<![A-Za-z0-9_])(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.(?:py|go|rs|js|jsx|ts|tsx|md|yaml|yml|toml|json)(?::\d+(?:-\d+)?)?",
+                user_input or "",
+            )
+        )
+        for raw in candidates:
+            clean = raw.split(":", 1)[0].strip("`'\".,;()[]{}")
+            if not clean:
+                continue
+            candidate = Path(clean).expanduser()
+            if not candidate.is_absolute():
+                candidate = root / candidate
+            try:
+                resolved = candidate.resolve(strict=False)
+                if os.path.commonpath((str(root), str(resolved))) == str(root):
+                    return resolved
+            except (OSError, ValueError):
+                continue
+        return root
+
+    def _context_operation(self, user_input: str):
+        """Map the current orchestration phase to operation-aware budgets."""
+
+        from khaos.coding.context_engine import ContextOperation
+
+        text = (user_input or "").casefold()
+        if any(token in text for token in ("verify", "test", "失败", "修复")):
+            return ContextOperation.VERIFICATION_REPAIR
+        if self._active_planning_result is None:
+            return ContextOperation.PLANNING
+        return ContextOperation.EDITING
+
+    def _context_generation(self) -> str | None:
+        """Return the repository-generation identity for context freshness."""
+
+        bundle = self._active_context_bundle
+        bundle_generation = getattr(bundle, "repository_generation", None)
+        if bundle_generation:
+            return str(bundle_generation)
+        workspace = self.active_workspace
+        value = getattr(workspace, "generation", None) or getattr(
+            workspace, "base_sha", None
+        )
+        return str(value) if value is not None else None
+
+    def _context_requirements(self, user_input: str):
+        """Build the same bounded requirements used by AgentLoop rebalances."""
+
+        from khaos.coding.context_engine import ContextBudget, ContextRequirements
+
+        engine_budget = getattr(self.context_engine, "default_budget", None)
+        if not isinstance(engine_budget, ContextBudget):
+            engine_budget = ContextBudget()
+        return ContextRequirements(
+            operation=self._context_operation(user_input),
+            task_id=self._active_task_id or "",
+            workspace_id=getattr(self.active_workspace, "id", "") or "",
+            generation=self._context_generation(),
+            plan_revision=(
+                getattr(self._active_planning_result, "revision_digest", None)
+                or getattr(self._active_planning_result, "plan_digest", None)
+            ),
+            query=user_input or "",
+            recent_message_count=max(
+                0,
+                int(
+                    getattr(
+                        self.config,
+                        "context_recent_message_count",
+                        getattr(self.context_engine, "recent_message_count", 12),
+                    )
+                ),
+            ),
+            budget=engine_budget,
+        )
+
     async def _build_memory_message(self, session_id: str) -> Message | None:
         """Project retrieved memory as bounded, low-trust data context.
 
@@ -2755,12 +3104,12 @@ class AgentLoop:
                 for name, parameter in parameters.items()
             )
             if supports_task:
-                memory_text = await inject(
+                memory_text = await cast(Any, inject)(
                     session_id,
                     task_id=self._active_task_id,
                 )
             else:
-                memory_text = await inject(session_id)
+                memory_text = await cast(Any, inject)(session_id)
         except Exception:
             logger.warning(
                 "memory prompt projection unavailable; continuing without memory",
@@ -2863,6 +3212,28 @@ class AgentLoop:
                 task_id,
                 bundle.freshness.value,
             )
+            return None
+        self._active_context_bundle = bundle
+        await self._observe_context_event(
+            "RepoQueryResult",
+            {
+                "workspace_id": bundle.workspace_id,
+                "generation": bundle.repository_generation,
+                "query_digest": hashlib.sha256(
+                    (user_input or goal_spec.normalized_goal).encode("utf-8")
+                ).hexdigest(),
+                "summary": (
+                    f"repository candidates={len(bundle.documents)} files, "
+                    f"{len(bundle.symbols)} symbols, {len(bundle.evidence)} relations"
+                ),
+            },
+            task_id=task_id,
+        )
+        if self.context_engine is not None:
+            # The engine consumes the typed M8.1 bundle directly.  Avoid
+            # constructing a second monolithic rendered projection on the
+            # normal runtime path; the legacy message remains below for
+            # explicitly constructed loops without Context Engine 2.0.
             return None
         blocks = [
             "# Context Bundle",
@@ -3192,7 +3563,7 @@ class AgentLoop:
             },
         )]
 
-    def _build_tools_schema(self) -> list[dict] | None:
+    def _build_tools_schema(self, intent: str = "") -> list[dict] | None:
         """Return provider-neutral function tool schemas for the current mode."""
         if self.tool_scheduler is None:
             return None
@@ -3200,6 +3571,8 @@ class AgentLoop:
         if registry is None:
             return None
         mode = self.mode_manager.current_mode.value
+        if self.context_engine is not None:
+            return self.context_engine.tool_schemas(mode=mode, intent=intent)
         tool_defs = registry.list_by_mode(mode)
         if not tool_defs:
             return None
@@ -3214,6 +3587,72 @@ class AgentLoop:
             }
             for tool_def in tool_defs
         ]
+
+    @staticmethod
+    def _context_message_to_message(message: object) -> Message:
+        """Convert a provider-neutral M8.4 message into AgentLoop data."""
+
+        result = Message(
+            role=str(getattr(message, "role", "user")),
+            content=str(getattr(message, "content", "")),
+            tool_calls=[
+                dict(call)
+                for call in (getattr(message, "tool_calls", ()) or ())
+                if isinstance(call, dict)
+            ],
+            tool_call_id=getattr(message, "tool_call_id", None),
+            token_count=0,
+            event=getattr(message, "event", None),
+            metadata=dict(getattr(message, "metadata", {}) or {}),
+        )
+        # The marker is process-local and never enters the serialized
+        # metadata.  Rebalance can therefore preserve engine-owned typed
+        # provenance without trusting a model/provider-supplied key.
+        setattr(result, "_context_engine_message", True)  # noqa: B010 - private provenance marker
+        return result
+
+    async def _observe_context_event(
+        self,
+        event: str,
+        payload: dict[str, object],
+        *,
+        task_id: str | None,
+    ) -> None:
+        """Project observability into the working set without failing a turn."""
+
+        if self.context_engine is None or not task_id:
+            return
+        try:
+            observe = getattr(self.context_engine, "observe_event", None)
+            if callable(observe):
+                workspace = getattr(self.active_workspace, "id", "") or ""
+                if event in {
+                    "EditTransactionApplied",
+                    "VerificationPlanCreated",
+                } or self._context_needs_rebuild:
+                    generation_value = getattr(
+                        self.active_workspace, "generation", None
+                    ) or getattr(self.active_workspace, "base_sha", None)
+                    event_generation = (
+                        str(generation_value) if generation_value is not None else None
+                    )
+                else:
+                    event_generation = self._context_generation()
+                observed_payload = dict(payload)
+                if workspace:
+                    observed_payload.setdefault("workspace_id", workspace)
+                if event_generation is not None:
+                    observed_payload.setdefault("generation", event_generation)
+                await cast(Any, observe)(
+                    task_id,
+                    event,
+                    observed_payload,
+                    workspace_id=workspace,
+                    goal="",
+                    generation=event_generation,
+                )
+        except Exception:
+            logger.debug("context working-set update unavailable", exc_info=True)
 
     async def _build_system_prompt(self, session_id: str, user_input: str = "") -> str:
         # 注入顺序：项目约定文件 > memory > skill > 项目结构（见 AGENTS.md Phase 6）

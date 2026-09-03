@@ -20,6 +20,11 @@ from khaos.audit import (
     resolve_safe_audit_anchor_path,
     resolve_safe_audit_log_path,
 )
+from khaos.coding.context_engine import (
+    ContextBudget,
+    ContextEngineService,
+    ToolOutputLimits,
+)
 from khaos.coding.edit_transaction import EditTransactionService
 from khaos.coding.execution import BackendSelector, ExecutionService
 from khaos.coding.intelligence.query_service import ContextIntelligenceService
@@ -76,6 +81,7 @@ from khaos.memory.providers import (
 from khaos.memory.transfer import MemoryTransferService
 from khaos.modes import ModeManager
 from khaos.permissions import PermissionEngine
+from khaos.project_context import InstructionResolver
 from khaos.routing.router import create_default_router
 from khaos.runtime.authority import RuntimeAuthoritySeal
 from khaos.runtime.lifecycle import CloseState
@@ -270,6 +276,9 @@ class RuntimeConfig:
     # ProductionRuntimeConfig deliberately omits this field, so the
     # production factory remains the sole owner of the canonical facade.
     context_intelligence: Any = None
+    # M8.4: trusted development/evaluation composition seam.  Production
+    # callers use the factory-created ContextEngineService below.
+    context_engine: Any = None
 
 
 @dataclass(frozen=True)
@@ -505,6 +514,9 @@ class RuntimeResult:
     owns_context_intelligence: bool = field(
         init=False, default=False, repr=False
     )
+    # M8.4: final context selection owner.  It has no external authority or
+    # closeable resource; this field is an observability/composition handle.
+    context_engine: Any = field(init=False, default=None, repr=False)
     # M8.3: the post-edit planner/executor observation coordinator is attached
     # by the factory.  It has no independent execution or completion
     # authority and therefore needs no separate lifecycle shutdown.
@@ -1360,6 +1372,10 @@ async def build_runtime(
     # it.  The borrowed AuditLogger digest match runs later, after the
     # effective policy is loaded.
     if runtime_profile.is_production:
+        if cfg.context_engine is not None:
+            raise ValueError(
+                "production runtime cannot inject a ContextEngineService"
+            )
         _enforce_no_testing_composition(cfg)
         _enforce_no_security_injection(cfg)
     root = cfg.project_root.expanduser().resolve()
@@ -1798,6 +1814,76 @@ async def build_runtime(
             # when it is absent; legacy adapters remain explicit at their
             # compatibility boundaries.
             context_intelligence = cfg.context_intelligence
+        agent_config = cfg.agent_config or AgentConfig()
+        raw_layer_token_budgets = tuple(
+            int(value)
+            for value in getattr(
+                agent_config,
+                "context_layer_token_budgets",
+                (2_048, 3_072, 5_120, 1_760),
+            )
+        )
+        raw_layer_byte_budgets = tuple(
+            int(value)
+            for value in getattr(
+                agent_config,
+                "context_layer_byte_budgets",
+                (48 * 1024, 64 * 1024, 112 * 1024, 32 * 1024),
+            )
+        )
+        if len(raw_layer_token_budgets) != 4 or len(raw_layer_byte_budgets) != 4:
+            raise ValueError("context layer budget must contain four layers")
+        context_budget = ContextBudget(
+            total_tokens=max(
+                int(getattr(agent_config, "context_token_budget", 12_000)),
+                int(getattr(agent_config, "context_output_reserve_tokens", 2_048)) + 1,
+            ),
+            total_bytes=max(
+                int(getattr(agent_config, "context_max_bytes", 256 * 1024)),
+                int(getattr(agent_config, "context_output_reserve_bytes", 32 * 1024)) + 1,
+            ),
+            output_reserve_tokens=max(
+                1, int(getattr(agent_config, "context_output_reserve_tokens", 2_048))
+            ),
+            output_reserve_bytes=max(
+                1, int(getattr(agent_config, "context_output_reserve_bytes", 32 * 1024))
+            ),
+            layer_token_budgets=(
+                raw_layer_token_budgets[0],
+                raw_layer_token_budgets[1],
+                raw_layer_token_budgets[2],
+                raw_layer_token_budgets[3],
+            ),
+            layer_byte_budgets=(
+                raw_layer_byte_budgets[0],
+                raw_layer_byte_budgets[1],
+                raw_layer_byte_budgets[2],
+                raw_layer_byte_budgets[3],
+            ),
+        )
+        if cfg.context_engine is not None and not production_mode:
+            context_engine = cfg.context_engine
+        else:
+            context_engine = ContextEngineService(
+                repo_intelligence=context_intelligence,
+                project_root=root,
+                instruction_resolver=InstructionResolver(root),
+                task_manager=task_manager,
+                tool_registry=runtime_registry,
+                skill_manager=skill_manager,
+                default_budget=context_budget,
+                tool_output_limits=ToolOutputLimits(
+                    max_bytes=max(1, int(getattr(agent_config, "tool_output_max_bytes", 64 * 1024))),
+                    max_tokens=max(1, int(getattr(agent_config, "tool_output_max_tokens", 4_096))),
+                    max_lines=max(1, int(getattr(agent_config, "tool_output_max_lines", 512))),
+                ),
+                principal_id=cfg.principal_id,
+                project_id=project_id,
+                recent_message_count=max(
+                    0,
+                    int(getattr(agent_config, "context_recent_message_count", 12)),
+                ),
+            )
         edit_transaction_service = EditTransactionService()
         # B1: the OfficeMutationAuthority is a server/project-lifecycle object.
         # When ``cfg.office_authority`` is injected (AgentService / SubAgentService
@@ -2221,6 +2307,7 @@ async def build_runtime(
             trusted_verification_authority=trusted_verification_authority,
             trusted_verification_service=trusted_verification_service,
             verification_coordinator=autonomous_verification,
+            context_engine=context_engine,
             # M4 batch 3.1.16A-5-1b (CRITICAL): carry the RPC-verified
             # project identity into the AgentLoop so every message / turn
             # write is stamped with it.  ``self._bound_project_id`` (set
@@ -2292,6 +2379,7 @@ async def build_runtime(
         runtime.owns_memory_host = owns_memory_host
         runtime.context_intelligence = context_intelligence
         runtime.owns_context_intelligence = context_intelligence is not None
+        runtime.context_engine = context_engine
         runtime.verification_coordinator = autonomous_verification
         runtime.recovery_control = recovery_control
         runtime.composition_manifest = composition_manifest

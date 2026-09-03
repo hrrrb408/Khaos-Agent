@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 from khaos.agent.control.completion_flow import CompletionProposalController
 from khaos.agent.control.completion_recovery import CompletionRecoveryService
+from khaos.coding.context_engine import ContextEngineService
 from khaos.db import Database
 from khaos.runtime import RuntimeConfig, build_runtime
 from khaos.security.effective_policy import load_effective_policy
@@ -27,6 +28,8 @@ async def test_factory_wires_office_and_coding_runtime(tmp_path):
     coding = await build_runtime(RuntimeConfig(db=db, project_root=tmp_path, mode_override="coding", principal_id="local-uid:test"))
     assert office.loop and office.tool_scheduler and office.task_manager is not None
     assert coding.task_manager and coding.skill_generator and coding.new_verify_fix_loop
+    assert isinstance(coding.context_engine, ContextEngineService)
+    assert coding.loop.context_engine is coding.context_engine
     assert isinstance(coding.loop.completion_controller, CompletionProposalController)
     assert isinstance(coding.loop.completion_recovery, CompletionRecoveryService)
     assert coding.new_verify_fix_loop() is not coding.new_verify_fix_loop()

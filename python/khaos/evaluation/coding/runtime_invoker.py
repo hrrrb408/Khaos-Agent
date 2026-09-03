@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-import uuid
 import json
 import re
+import uuid
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -17,11 +17,15 @@ from khaos.coding.workspace import WorkspaceManager
 from khaos.evaluation.coding.contracts import CodingScenario
 from khaos.evaluation.coding.fixtures import MaterializedFixture
 from khaos.evaluation.coding.metrics import CodingTraceCollector
+from khaos.evaluation.coding.oracle import OracleError, ReviewFinding
 from khaos.evaluation.coding.results import AgentExecution
-from khaos.evaluation.coding.oracle import ReviewFinding, OracleError
 from khaos.modes import ModeManager
-from khaos.runtime import RuntimeConfig, RuntimeProfile, build_runtime, close_runtime_or_register
-
+from khaos.runtime import (
+    RuntimeConfig,
+    RuntimeProfile,
+    build_runtime,
+    close_runtime_or_register,
+)
 
 _REVIEW_TOOL_ALLOWLIST = (
     "read_file",
@@ -198,13 +202,17 @@ class RuntimeCodingAgentInvoker:
             finally:
                 await close_runtime_or_register(runtime)
             raise
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - adapter boundary converts runtime failures to evidence
             status = "ERROR"
             error = _safe_error(exc)
         repository_metrics = getattr(runtime.loop, "repo_intelligence", None)
         snapshot = getattr(repository_metrics, "metrics_snapshot", None)
         if callable(snapshot):
             trace.record_repository_metrics(snapshot())
+        context_engine = getattr(runtime.loop, "context_engine", None)
+        context_snapshot = getattr(context_engine, "metrics_snapshot", None)
+        if callable(context_snapshot):
+            trace.record_context_metrics(context_snapshot())
         active_workspace = runtime.loop.active_workspace
         final_root = (
             active_workspace.worktree_path

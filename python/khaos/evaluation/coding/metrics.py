@@ -194,6 +194,43 @@ class CodingMetrics:
     context_candidate_count: int | None = None
     context_selected_file_count: int | None = None
     context_selected_symbol_count: int | None = None
+    # M8.4 bounded context-engine observations.  ``None`` means the adapter
+    # did not expose that measurement; it is never interpreted as zero by an
+    # evaluation oracle.
+    context_builds: int | None = None
+    context_input_tokens: int | None = None
+    context_input_bytes: int | None = None
+    context_l0_tokens: int | None = None
+    context_l1_tokens: int | None = None
+    context_l2_tokens: int | None = None
+    context_l3_tokens: int | None = None
+    context_items_selected: int | None = None
+    context_items_evicted: int | None = None
+    context_items_compressed: int | None = None
+    context_stale_retries: int | None = None
+    context_partial_builds: int | None = None
+    context_compactions: int | None = None
+    context_stable_prefix_tokens: int | None = None
+    context_stable_prefix_bytes: int | None = None
+    context_memory_items_selected: int | None = None
+    context_repo_items_selected: int | None = None
+    context_diagnostics_selected: int | None = None
+    tool_schema_tokens: int | None = None
+    tool_schema_bytes: int | None = None
+    deferred_tool_discoveries: int | None = None
+    deferred_skill_discoveries: int | None = None
+    deferred_skill_loads: int | None = None
+    skill_tokens: int | None = None
+    tool_output_tokens: int | None = None
+    tool_output_bytes: int | None = None
+    tool_output_truncated_count: int | None = None
+    # M8.0 keeps these aggregate names as part of the stable evaluation
+    # vocabulary; the context-engine-prefixed fields above remain the
+    # collision-free internal projection.
+    memory_items_selected: int | None = None
+    repo_items_selected: int | None = None
+    diagnostics_selected: int | None = None
+    compaction_count: int | None = None
     replan_count: int = 0
     recovery_count: int = 0
     no_progress_count: int = 0
@@ -401,6 +438,37 @@ class CodingMetrics:
             "context_candidate_count",
             "context_selected_file_count",
             "context_selected_symbol_count",
+            "context_builds",
+            "context_input_tokens",
+            "context_input_bytes",
+            "context_l0_tokens",
+            "context_l1_tokens",
+            "context_l2_tokens",
+            "context_l3_tokens",
+            "context_items_selected",
+            "context_items_evicted",
+            "context_items_compressed",
+            "context_stale_retries",
+            "context_partial_builds",
+            "context_compactions",
+            "context_stable_prefix_tokens",
+            "context_stable_prefix_bytes",
+            "context_memory_items_selected",
+            "context_repo_items_selected",
+            "context_diagnostics_selected",
+            "tool_schema_tokens",
+            "tool_schema_bytes",
+            "deferred_tool_discoveries",
+            "deferred_skill_discoveries",
+            "deferred_skill_loads",
+            "skill_tokens",
+            "tool_output_tokens",
+            "tool_output_bytes",
+            "tool_output_truncated_count",
+            "memory_items_selected",
+            "repo_items_selected",
+            "diagnostics_selected",
+            "compaction_count",
             "autonomous_verification_time_to_final_green_ms",
             "time_to_final_green_ms",
         ):
@@ -497,6 +565,37 @@ class CodingMetrics:
             "context_candidate_count": self.context_candidate_count,
             "context_selected_file_count": self.context_selected_file_count,
             "context_selected_symbol_count": self.context_selected_symbol_count,
+            "context_builds": self.context_builds,
+            "context_input_tokens": self.context_input_tokens,
+            "context_input_bytes": self.context_input_bytes,
+            "context_l0_tokens": self.context_l0_tokens,
+            "context_l1_tokens": self.context_l1_tokens,
+            "context_l2_tokens": self.context_l2_tokens,
+            "context_l3_tokens": self.context_l3_tokens,
+            "context_items_selected": self.context_items_selected,
+            "context_items_evicted": self.context_items_evicted,
+            "context_items_compressed": self.context_items_compressed,
+            "context_stale_retries": self.context_stale_retries,
+            "context_partial_builds": self.context_partial_builds,
+            "context_compactions": self.context_compactions,
+            "context_stable_prefix_tokens": self.context_stable_prefix_tokens,
+            "context_stable_prefix_bytes": self.context_stable_prefix_bytes,
+            "context_memory_items_selected": self.context_memory_items_selected,
+            "context_repo_items_selected": self.context_repo_items_selected,
+            "context_diagnostics_selected": self.context_diagnostics_selected,
+            "tool_schema_tokens": self.tool_schema_tokens,
+            "tool_schema_bytes": self.tool_schema_bytes,
+            "deferred_tool_discoveries": self.deferred_tool_discoveries,
+            "deferred_skill_discoveries": self.deferred_skill_discoveries,
+            "deferred_skill_loads": self.deferred_skill_loads,
+            "skill_tokens": self.skill_tokens,
+            "tool_output_tokens": self.tool_output_tokens,
+            "tool_output_bytes": self.tool_output_bytes,
+            "tool_output_truncated_count": self.tool_output_truncated_count,
+            "memory_items_selected": self.memory_items_selected,
+            "repo_items_selected": self.repo_items_selected,
+            "diagnostics_selected": self.diagnostics_selected,
+            "compaction_count": self.compaction_count,
             "replan_count": self.replan_count,
             "recovery_count": self.recovery_count,
             "no_progress_count": self.no_progress_count,
@@ -612,6 +711,7 @@ class CodingTraceCollector:
         self._autonomous_verification_repair_count = 0
         self._autonomous_verification_time_to_final_green_ms: int | None = None
         self._repo_metrics: dict[str, int] | None = None
+        self._context_metrics: dict[str, int | None] = {}
         self._started = time.monotonic()
 
     @property
@@ -745,6 +845,63 @@ class CodingTraceCollector:
             observed[destination] = value
         self._repo_metrics = observed
 
+    def record_context_metrics(self, metrics: object) -> None:
+        """Attach bounded M8.4 context-engine metrics.
+
+        The collector accepts either the typed snapshot or a mapping so test
+        adapters can remain small.  Only the closed public metric vocabulary
+        is copied; content, paths, and prompt text never enter the trace.
+        """
+
+        names = (
+            "context_builds",
+            "context_input_tokens",
+            "context_input_bytes",
+            "context_l0_tokens",
+            "context_l1_tokens",
+            "context_l2_tokens",
+            "context_l3_tokens",
+            "context_items_selected",
+            "context_items_evicted",
+            "context_items_compressed",
+            "context_truncated_count",
+            "context_stale_retries",
+            "context_partial_builds",
+            "context_compactions",
+            "context_cache_hits",
+            "context_cache_misses",
+            "context_stable_prefix_tokens",
+            "context_stable_prefix_bytes",
+            "context_selected_file_count",
+            "context_selected_symbol_count",
+            "context_memory_items_selected",
+            "context_repo_items_selected",
+            "context_diagnostics_selected",
+            "tool_schema_tokens",
+            "tool_schema_bytes",
+            "deferred_tool_discoveries",
+            "deferred_skill_discoveries",
+            "deferred_skill_loads",
+            "skill_tokens",
+            "tool_output_tokens",
+            "tool_output_bytes",
+            "tool_output_truncated_count",
+            "memory_items_selected",
+            "repo_items_selected",
+            "diagnostics_selected",
+            "compaction_count",
+        )
+        observed: dict[str, int | None] = {}
+        for name in names:
+            value = metrics.get(name) if isinstance(metrics, Mapping) else getattr(metrics, name, None)
+            if value is None:
+                observed[name] = None
+            elif type(value) is int and value >= 0:
+                observed[name] = value
+            else:
+                return
+        self._context_metrics = observed
+
     def record(
         self,
         kind: str,
@@ -776,6 +933,7 @@ class CodingTraceCollector:
         tool_names = dict(self._tool_names)
         category = dict(self._tool_categories)
         repo_metrics = self._repo_metrics or {}
+        context_metrics = self._context_metrics
         detailed = {
             "read_file_calls": tool_names.get("read_file", 0),
             "search_calls": tool_names.get("search_files", 0),
@@ -862,8 +1020,77 @@ class CodingTraceCollector:
             lexical_fallback_queries=repo_metrics.get("lexical_fallback_queries"),
             stale_query_count=repo_metrics.get("stale_query_count"),
             context_candidate_count=repo_metrics.get("context_candidate_count"),
-            context_selected_file_count=repo_metrics.get("context_selected_file_count"),
-            context_selected_symbol_count=repo_metrics.get("context_selected_symbol_count"),
+            context_selected_file_count=(
+                context_metrics.get("context_selected_file_count")
+                if context_metrics.get("context_selected_file_count") is not None
+                else repo_metrics.get("context_selected_file_count")
+            ),
+            context_selected_symbol_count=(
+                context_metrics.get("context_selected_symbol_count")
+                if context_metrics.get("context_selected_symbol_count") is not None
+                else repo_metrics.get("context_selected_symbol_count")
+            ),
+            context_build_count=context_metrics.get("context_builds"),
+            context_bundle_count=context_metrics.get("context_builds"),
+            context_tokens=context_metrics.get("context_input_tokens"),
+            context_bytes=context_metrics.get("context_input_bytes"),
+            context_files=context_metrics.get("context_selected_file_count"),
+            context_symbols=context_metrics.get("context_selected_symbol_count"),
+            context_truncated_count=context_metrics.get("context_truncated_count"),
+            context_stale_count=(
+                context_metrics.get("context_stale_retries")
+                if context_metrics.get("context_stale_retries") is not None
+                else repo_metrics.get("stale_query_count")
+            ),
+            context_cache_hits=context_metrics.get("context_cache_hits"),
+            context_cache_misses=context_metrics.get("context_cache_misses"),
+            context_builds=context_metrics.get("context_builds"),
+            context_input_tokens=context_metrics.get("context_input_tokens"),
+            context_input_bytes=context_metrics.get("context_input_bytes"),
+            context_l0_tokens=context_metrics.get("context_l0_tokens"),
+            context_l1_tokens=context_metrics.get("context_l1_tokens"),
+            context_l2_tokens=context_metrics.get("context_l2_tokens"),
+            context_l3_tokens=context_metrics.get("context_l3_tokens"),
+            context_items_selected=context_metrics.get("context_items_selected"),
+            context_items_evicted=context_metrics.get("context_items_evicted"),
+            context_items_compressed=context_metrics.get("context_items_compressed"),
+            context_stale_retries=context_metrics.get("context_stale_retries"),
+            context_partial_builds=context_metrics.get("context_partial_builds"),
+            context_compactions=context_metrics.get("context_compactions"),
+            context_stable_prefix_tokens=context_metrics.get("context_stable_prefix_tokens"),
+            context_stable_prefix_bytes=context_metrics.get("context_stable_prefix_bytes"),
+            context_memory_items_selected=context_metrics.get("context_memory_items_selected"),
+            context_repo_items_selected=context_metrics.get("context_repo_items_selected"),
+            context_diagnostics_selected=context_metrics.get("context_diagnostics_selected"),
+            tool_schema_tokens=context_metrics.get("tool_schema_tokens"),
+            tool_schema_bytes=context_metrics.get("tool_schema_bytes"),
+            deferred_tool_discoveries=context_metrics.get("deferred_tool_discoveries"),
+            deferred_skill_discoveries=context_metrics.get("deferred_skill_discoveries"),
+            deferred_skill_loads=context_metrics.get("deferred_skill_loads"),
+            skill_tokens=context_metrics.get("skill_tokens"),
+            tool_output_tokens=context_metrics.get("tool_output_tokens"),
+            tool_output_bytes=context_metrics.get("tool_output_bytes"),
+            tool_output_truncated_count=context_metrics.get("tool_output_truncated_count"),
+            memory_items_selected=(
+                context_metrics.get("memory_items_selected")
+                if context_metrics.get("memory_items_selected") is not None
+                else context_metrics.get("context_memory_items_selected")
+            ),
+            repo_items_selected=(
+                context_metrics.get("repo_items_selected")
+                if context_metrics.get("repo_items_selected") is not None
+                else context_metrics.get("context_repo_items_selected")
+            ),
+            diagnostics_selected=(
+                context_metrics.get("diagnostics_selected")
+                if context_metrics.get("diagnostics_selected") is not None
+                else context_metrics.get("context_diagnostics_selected")
+            ),
+            compaction_count=(
+                context_metrics.get("compaction_count")
+                if context_metrics.get("compaction_count") is not None
+                else context_metrics.get("context_compactions")
+            ),
             replan_count=self._replan_count,
             recovery_count=self._recovery_count,
             no_progress_count=self._no_progress_count,
