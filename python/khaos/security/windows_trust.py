@@ -373,6 +373,17 @@ def _validate_acl_components(
             _release(kernel32, security_descriptor)
 
 
+def _windows_acl_components(path: Path, root: Path) -> tuple[Path, ...]:
+    """Build the cumulative root-to-leaf path used for ACL validation."""
+    relative = path.relative_to(root)
+    components = [root]
+    current = root
+    for part in relative.parts:
+        current /= part
+        components.append(current)
+    return tuple(components)
+
+
 def validate_windows_acl_path(
     path: Path,
     *,
@@ -404,9 +415,8 @@ def validate_windows_acl_path(
     if any(part in {"", ".", ".."} for part in relative.parts):
         raise WindowsTrustError("Windows platform executable path is not canonical")
     reject_windows_reparse_points(candidate)
-    components = (trusted_root, *(trusted_root / part for part in relative.parts))
     _validate_acl_components(
-        components,
+        _windows_acl_components(candidate, trusted_root),
         owner_sids=set(owner_sids),
         allowed_write_sids=set(allowed_write_sids),
     )
@@ -445,11 +455,8 @@ def validate_windows_trusted_path(path: Path, *, kind: str) -> None:
     root, owner_sids, allowed_write_sids = _trusted_configuration(path)
     reject_windows_reparse_points(path)
     candidate = Path(path).expanduser()
-    relative = candidate.relative_to(root)
-    current = root
-    components = (root, *(current / part for part in relative.parts))
     _validate_acl_components(
-        components,
+        _windows_acl_components(candidate, root),
         owner_sids=owner_sids,
         allowed_write_sids=allowed_write_sids,
     )
