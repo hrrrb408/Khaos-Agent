@@ -28,6 +28,7 @@ _SECURITY_INFORMATION = _OWNER_SECURITY_INFORMATION | _DACL_SECURITY_INFORMATION
 _ACL_SIZE_INFORMATION = 2
 _ACCESS_ALLOWED_ACE_TYPE = 0
 _ACCESS_DENIED_ACE_TYPE = 1
+_INHERIT_ONLY_ACE = 0x08
 _FILE_WRITE_DATA = 0x0002
 _FILE_APPEND_DATA = 0x0004
 _FILE_WRITE_EA = 0x0010
@@ -265,6 +266,12 @@ def _check_descriptor(
         header = _AceHeader.from_address(ace.value)
         if header.ace_size < 8 or header.ace_size > acl_info.acl_bytes_in_use:
             raise WindowsTrustError("Windows trust ACL contains a malformed ACE")
+        # An inherit-only ACE does not grant access to the object being
+        # inspected.  Its descendants are checked separately as we walk the
+        # selected path, and a caller that cannot write this directory cannot
+        # turn the inherited entry into a new executable boundary.
+        if header.ace_flags & _INHERIT_ONLY_ACE:
+            continue
         if header.ace_type == _ACCESS_DENIED_ACE_TYPE:
             continue
         # Only the fixed ACCESS_ALLOWED_ACE shape is accepted.  Object ACEs
@@ -343,19 +350,14 @@ def _release(kernel32: Any, security_descriptor: ctypes.c_void_p) -> None:
         raise WindowsTrustError("LocalFree failed for Windows trust descriptor")
 
 
-def validate_windows_trusted_path(path: Path, *, kind: str) -> None:
-    """Validate the configured Windows trust root and every path component."""
-    if os.name != "nt":
-        return
-    if kind not in {"catalog", "key", "public-key"}:
-        raise WindowsTrustError("Windows trust material kind is invalid")
-    root, owner_sids, allowed_write_sids = _trusted_configuration(path)
-    reject_windows_reparse_points(path)
+def _validate_acl_components(
+    components: tuple[Path, ...],
+    *,
+    owner_sids: set[str],
+    allowed_write_sids: set[str],
+) -> None:
+    """Validate a bounded set of already-selected Windows path components."""
     advapi32, kernel32 = _bindings()
-    candidate = Path(path).expanduser()
-    relative = candidate.relative_to(root)
-    current = root
-    components = (root, *(current / part for part in relative.parts))
     for item in components:
         security_descriptor, owner, dacl = _query_named(item, advapi32=advapi32)
         try:
@@ -371,19 +373,62 @@ def validate_windows_trusted_path(path: Path, *, kind: str) -> None:
             _release(kernel32, security_descriptor)
 
 
-def validate_windows_trusted_descriptor(fd: int, *, path: Path, kind: str) -> None:
-    """Recheck the final opened object's ACL through its kernel handle."""
+def validate_windows_acl_path(
+    path: Path,
+    *,
+    root: Path,
+    owner_sids: set[str],
+    allowed_write_sids: set[str],
+) -> None:
+    """Validate ACLs from a fixed trusted root through one Windows path.
+
+    Unlike :func:`validate_windows_trusted_path`, this helper takes a
+    compiled-in caller allowlist instead of deployment environment variables.
+    It is used for platform-owned executables whose root and trusted SIDs are
+    part of the application policy, not model- or project-controlled input.
+    """
     if os.name != "nt":
         return
-    _root, owner_sids, allowed_write_sids = _trusted_configuration(path)
+    trusted_root = Path(root).expanduser()
+    candidate = Path(path).expanduser()
+    if not trusted_root.is_absolute() or not candidate.is_absolute():
+        raise WindowsTrustError("Windows ACL paths and root must be absolute")
+    if any(part in {"", ".", ".."} for part in trusted_root.parts):
+        raise WindowsTrustError("Windows ACL root is not canonical")
+    try:
+        relative = candidate.relative_to(trusted_root)
+    except ValueError as exc:
+        raise WindowsTrustError(
+            "Windows platform executable must stay under its trusted root"
+        ) from exc
+    if any(part in {"", ".", ".."} for part in relative.parts):
+        raise WindowsTrustError("Windows platform executable path is not canonical")
+    reject_windows_reparse_points(candidate)
+    components = (trusted_root, *(trusted_root / part for part in relative.parts))
+    _validate_acl_components(
+        components,
+        owner_sids=set(owner_sids),
+        allowed_write_sids=set(allowed_write_sids),
+    )
+
+
+def validate_windows_acl_descriptor(
+    fd: int,
+    *,
+    owner_sids: set[str],
+    allowed_write_sids: set[str],
+) -> None:
+    """Validate the ACL of an already-open Windows descriptor."""
+    if os.name != "nt":
+        return
     advapi32, kernel32 = _bindings()
     security_descriptor, owner, dacl = _query_handle(fd, advapi32=advapi32)
     try:
         _check_descriptor(
             owner,
             dacl,
-            owner_sids=owner_sids,
-            allowed_write_sids=allowed_write_sids,
+            owner_sids=set(owner_sids),
+            allowed_write_sids=set(allowed_write_sids),
             advapi32=advapi32,
             kernel32=kernel32,
         )
@@ -391,9 +436,42 @@ def validate_windows_trusted_descriptor(fd: int, *, path: Path, kind: str) -> No
         _release(kernel32, security_descriptor)
 
 
+def validate_windows_trusted_path(path: Path, *, kind: str) -> None:
+    """Validate the configured Windows trust root and every path component."""
+    if os.name != "nt":
+        return
+    if kind not in {"catalog", "key", "public-key"}:
+        raise WindowsTrustError("Windows trust material kind is invalid")
+    root, owner_sids, allowed_write_sids = _trusted_configuration(path)
+    reject_windows_reparse_points(path)
+    candidate = Path(path).expanduser()
+    relative = candidate.relative_to(root)
+    current = root
+    components = (root, *(current / part for part in relative.parts))
+    _validate_acl_components(
+        components,
+        owner_sids=owner_sids,
+        allowed_write_sids=allowed_write_sids,
+    )
+
+
+def validate_windows_trusted_descriptor(fd: int, *, path: Path, kind: str) -> None:
+    """Recheck the final opened object's ACL through its kernel handle."""
+    if os.name != "nt":
+        return
+    _root, owner_sids, allowed_write_sids = _trusted_configuration(path)
+    validate_windows_acl_descriptor(
+        fd,
+        owner_sids=owner_sids,
+        allowed_write_sids=allowed_write_sids,
+    )
+
+
 __all__ = [
     "WindowsTrustError",
     "reject_windows_reparse_points",
+    "validate_windows_acl_descriptor",
+    "validate_windows_acl_path",
     "validate_windows_trusted_descriptor",
     "validate_windows_trusted_path",
 ]

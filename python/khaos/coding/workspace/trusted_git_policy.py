@@ -8,7 +8,24 @@ import stat
 from dataclasses import dataclass
 from pathlib import Path
 
+from khaos.security.windows_trust import (
+    WindowsTrustError,
+    reject_windows_reparse_points,
+    validate_windows_acl_descriptor,
+    validate_windows_acl_path,
+)
+
 FileIdentity = tuple[int, int, int, int]
+
+_WINDOWS_TRUSTED_GIT_ROOT = Path("C:/Program Files/Git")
+_WINDOWS_TRUSTED_GIT_OWNER_SIDS = frozenset(
+    {
+        "S-1-5-18",  # NT AUTHORITY\SYSTEM
+        "S-1-5-32-544",  # BUILTIN\Administrators
+        # NT SERVICE\TrustedInstaller
+        "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464",
+    }
+)
 
 
 class TrustedGitExecutablePolicyError(RuntimeError):
@@ -99,13 +116,29 @@ class TrustedGitExecutablePolicy:
     root-owned ancestors of a temporary path, including a root-owned sticky
     system temporary directory such as ``/tmp``.  The production factory
     always uses the default ``0`` and never exposes this as a runtime/developer
-    override.
+    override.  ``test_fixture_root`` is an explicit test-only boundary for
+    Windows temporary fixtures; it never changes the production policy.
     """
 
-    def __init__(self, *, trusted_owner_uid: int = 0) -> None:
+    def __init__(
+        self,
+        *,
+        trusted_owner_uid: int = 0,
+        test_fixture_root: Path | None = None,
+    ) -> None:
         if type(trusted_owner_uid) is not int or trusted_owner_uid < 0:
             raise ValueError("trusted Git owner UID must be a non-negative integer")
         self.trusted_owner_uid = trusted_owner_uid
+        if test_fixture_root is None:
+            self._test_fixture_root: Path | None = None
+        else:
+            try:
+                fixture_root = Path(test_fixture_root).resolve(strict=True)
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                raise ValueError("Trusted Git test fixture root is invalid") from exc
+            if not fixture_root.is_dir():
+                raise ValueError("Trusted Git test fixture root must be a directory")
+            self._test_fixture_root = fixture_root
 
     def validate(self, candidate: Path) -> TrustedGitExecutableIdentity:
         """Resolve and validate one platform candidate, then fingerprint it."""
@@ -135,6 +168,7 @@ class TrustedGitExecutablePolicy:
             )
 
         self._validate_parent_chain(executable)
+        self._validate_platform_trust(executable)
         try:
             descriptor = os.open(executable, _binary_open_flags())
         except OSError as exc:
@@ -145,6 +179,7 @@ class TrustedGitExecutablePolicy:
         try:
             info = os.fstat(descriptor)
             self._validate_file_info(executable, info)
+            self._validate_platform_descriptor(descriptor)
             digest = _digest_descriptor(descriptor)
             after = os.fstat(descriptor)
         except TrustedGitExecutablePolicyError:
@@ -177,6 +212,7 @@ class TrustedGitExecutablePolicy:
                 category="candidate_not_found",
             )
         self._validate_parent_chain(path, label=label)
+        self._validate_platform_trust(path)
         try:
             descriptor = os.open(path, _binary_open_flags())
         except OSError as exc:
@@ -186,6 +222,7 @@ class TrustedGitExecutablePolicy:
         try:
             current = os.fstat(descriptor)
             self._validate_file_info(path, current, label=label)
+            self._validate_platform_descriptor(descriptor, label=label)
             if _identity(current) != identity.file_identity:
                 raise TrustedGitExecutablePolicyError(
                     f"{label} identity drifted: {path}", category="identity_drift"
@@ -257,6 +294,12 @@ class TrustedGitExecutablePolicy:
     def _validate_file_info(
         self, path: Path, info: os.stat_result, *, label: str = "Git executable"
     ) -> None:
+        if os.name == "nt" and self._test_fixture_root is None:
+            if not stat.S_ISREG(info.st_mode):
+                raise TrustedGitExecutablePolicyError(
+                    f"{label} must be an absolute regular file: {path}"
+                )
+            return
         if (
             not stat.S_ISREG(info.st_mode)
             or info.st_uid != self.trusted_owner_uid
@@ -269,6 +312,9 @@ class TrustedGitExecutablePolicy:
     def _validate_parent_chain(
         self, executable: Path, *, label: str = "Git executable"
     ) -> None:
+        if os.name == "nt":
+            self._validate_windows_parent_chain(executable, label=label)
+            return
         for parent in executable.parents:
             try:
                 info = parent.lstat()
@@ -285,6 +331,80 @@ class TrustedGitExecutablePolicy:
                 raise TrustedGitExecutablePolicyError(
                     f"{label} parent chain is not trusted: {parent}"
                 )
+
+    def _validate_windows_parent_chain(
+        self, executable: Path, *, label: str
+    ) -> None:
+        """Reject Windows reparse points and leave ACL ownership to Win32."""
+        try:
+            reject_windows_reparse_points(executable)
+        except WindowsTrustError as exc:
+            raise TrustedGitExecutablePolicyError(
+                f"{label} parent chain is not trusted: {executable}"
+            ) from exc
+        for parent in executable.parents:
+            try:
+                info = parent.lstat()
+            except OSError as exc:
+                raise TrustedGitExecutablePolicyError(
+                    f"{label} parent chain is unavailable: {parent}",
+                    category="candidate_not_found",
+                ) from exc
+            if not stat.S_ISDIR(info.st_mode):
+                raise TrustedGitExecutablePolicyError(
+                    f"{label} parent chain is not trusted: {parent}"
+                )
+            if self._test_fixture_root is None:
+                continue
+            if self._is_test_fixture_ancestor(parent):
+                continue
+            if not self._is_trusted_parent(info):
+                raise TrustedGitExecutablePolicyError(
+                    f"{label} parent chain is not trusted: {parent}"
+                )
+
+    def _is_test_fixture_ancestor(self, parent: Path) -> bool:
+        """Identify the explicit test root and its host-side ancestors."""
+        if self._test_fixture_root is None:
+            return False
+        try:
+            self._test_fixture_root.relative_to(parent)
+        except ValueError:
+            return False
+        return True
+
+    def _validate_platform_trust(self, path: Path) -> None:
+        """Apply the platform-native trust contract for production Windows."""
+        if os.name != "nt" or self._test_fixture_root is not None:
+            return
+        try:
+            validate_windows_acl_path(
+                path,
+                root=_WINDOWS_TRUSTED_GIT_ROOT,
+                owner_sids=set(_WINDOWS_TRUSTED_GIT_OWNER_SIDS),
+                allowed_write_sids=set(_WINDOWS_TRUSTED_GIT_OWNER_SIDS),
+            )
+        except WindowsTrustError as exc:
+            raise TrustedGitExecutablePolicyError(
+                f"Git executable Windows ACL policy rejected: {path}"
+            ) from exc
+
+    def _validate_platform_descriptor(
+        self, descriptor: int, *, label: str = "Git executable"
+    ) -> None:
+        """Recheck the opened Windows descriptor against the ACL allowlist."""
+        if os.name != "nt" or self._test_fixture_root is not None:
+            return
+        try:
+            validate_windows_acl_descriptor(
+                descriptor,
+                owner_sids=set(_WINDOWS_TRUSTED_GIT_OWNER_SIDS),
+                allowed_write_sids=set(_WINDOWS_TRUSTED_GIT_OWNER_SIDS),
+            )
+        except WindowsTrustError as exc:
+            raise TrustedGitExecutablePolicyError(
+                f"{label} Windows ACL policy changed or is unavailable"
+            ) from exc
 
     def _is_trusted_parent(self, info: os.stat_result) -> bool:
         """Accept only private parents, with a test-only ``/tmp`` carve-out."""

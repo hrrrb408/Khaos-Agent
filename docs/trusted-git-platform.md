@@ -20,6 +20,11 @@ Git effect authority 是四个相互独立的责任。
 descriptor 固定 device/inode/mode/owner 和 SHA-256。执行前会再次检查父链、身份和
 摘要；身份或内容漂移一律 fail closed。
 
+Windows 不把 POSIX `st_uid`/mode 当作 ACL 证据：仍只接受上表中的 Git 安装路径，
+拒绝重解析点，并在固定的 `C:\Program Files\Git` 根及已打开的 Git descriptor 上
+检查 Win32 owner/DACL。写权限 allowlist 仅包含 SYSTEM、BUILTIN Administrators
+和 TrustedInstaller；ACL 缺失、解析失败或出现其他写入主体时同样 fail closed。
+
 macOS 的 `/usr/bin/git` 可能只是依赖 Xcode 许可状态的系统入口。选中的候选必须
 先通过由 `TrustedGitProcessOwner` 管理的、带 stdout/stderr/时间上限的绝对路径
 `git --version` preflight。系统入口因 Xcode/Apple SDK 环境阻断时，诊断分类为

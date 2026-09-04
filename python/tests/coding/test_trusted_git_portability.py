@@ -42,9 +42,12 @@ def _validated_candidate() -> Path:
     pytest.fail("the platform did not expose a policy-valid Trusted Git candidate")
 
 
-def _local_policy() -> TrustedGitExecutablePolicy:
+def _local_policy(tmp_path: Path) -> TrustedGitExecutablePolicy:
     owner_uid = getattr(os, "getuid", lambda: 0)()
-    return TrustedGitExecutablePolicy(trusted_owner_uid=owner_uid)
+    return TrustedGitExecutablePolicy(
+        trusted_owner_uid=owner_uid,
+        test_fixture_root=tmp_path,
+    )
 
 
 def _local_executable(tmp_path: Path, name: str = "git") -> Path:
@@ -85,7 +88,7 @@ def test_untrusted_candidate_is_rejected_by_policy(tmp_path: Path) -> None:
 
 
 def test_policy_requires_absolute_regular_private_owned_file(tmp_path: Path) -> None:
-    policy = _local_policy()
+    policy = _local_policy(tmp_path)
     candidate = _local_executable(tmp_path)
 
     with pytest.raises(TrustedGitExecutablePolicyError) as relative_error:
@@ -112,7 +115,7 @@ def test_policy_requires_absolute_regular_private_owned_file(tmp_path: Path) -> 
 
 
 def test_policy_rejects_writable_parent_and_symlinked_parent(tmp_path: Path) -> None:
-    policy = _local_policy()
+    policy = _local_policy(tmp_path)
     parent = tmp_path / "parent"
     parent.mkdir()
     candidate = _local_executable(parent)
@@ -134,7 +137,7 @@ def test_policy_rejects_writable_parent_and_symlinked_parent(tmp_path: Path) -> 
 
 
 def test_policy_pins_identity_and_digest_and_rejects_drift(tmp_path: Path) -> None:
-    policy = _local_policy()
+    policy = _local_policy(tmp_path)
     candidate = _local_executable(tmp_path)
     identity = policy.validate(candidate)
 
@@ -265,7 +268,7 @@ async def test_generic_preflight_failure_does_not_try_next_static_candidate(
     info = root.stat()
     first = _local_executable(tmp_path, "first-git")
     second = _local_executable(tmp_path, "second-git")
-    policy = _local_policy()
+    policy = _local_policy(tmp_path)
     broker = AuthorityBroker()
     runner = TrustedGitRunner.for_authority_root(
         root,
@@ -306,7 +309,7 @@ async def test_injected_trusted_preflight_can_run_without_host_git(tmp_path: Pat
     candidate = tmp_path / "trusted-git"
     candidate.write_text("#!/bin/sh\nprintf 'git version fixture\\n'\n", encoding="utf-8")
     candidate.chmod(0o755)
-    policy = _local_policy()
+    policy = _local_policy(tmp_path)
     broker = AuthorityBroker()
     runner = TrustedGitRunner.for_authority_root(
         root,
