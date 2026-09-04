@@ -314,6 +314,7 @@ def test_m85_context_transfer_is_bounded_and_has_no_transcript() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.posix_host
 @pytest.mark.requires_trusted_git
 async def test_m85_dirty_parent_rejects_child_without_losing_user_edit(tmp_path: Path) -> None:
     repository = _repo(tmp_path / "repo")
@@ -352,6 +353,7 @@ async def test_m85_dirty_parent_rejects_child_without_losing_user_edit(tmp_path:
 
 
 @pytest.mark.asyncio
+@pytest.mark.posix_host
 @pytest.mark.requires_trusted_git
 async def test_m85_cancelled_child_is_drained_and_cleaned(tmp_path: Path) -> None:
     repository = _repo(tmp_path / "repo")
@@ -504,6 +506,7 @@ async def test_m85_restart_recovery_marks_unfinished_child_unknown(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+@pytest.mark.posix_host
 @pytest.mark.requires_trusted_git
 async def test_m85_parallel_children_use_isolated_worktrees_and_republish_after_verification(
     tmp_path: Path,
@@ -615,6 +618,7 @@ async def test_m85_parallel_children_use_isolated_worktrees_and_republish_after_
 
 
 @pytest.mark.asyncio
+@pytest.mark.posix_host
 @pytest.mark.requires_trusted_git
 async def test_m85_merge_reuses_shared_m83_verification_for_both_worktrees(
     tmp_path: Path,
@@ -734,6 +738,7 @@ async def test_m85_merge_reuses_shared_m83_verification_for_both_worktrees(
 
 
 @pytest.mark.asyncio
+@pytest.mark.posix_host
 @pytest.mark.requires_trusted_git
 async def test_m85_stale_parent_rejects_merge_without_parent_mutation(tmp_path: Path) -> None:
     repository = _repo(tmp_path / "repo")
@@ -797,6 +802,7 @@ async def test_m85_stale_parent_rejects_merge_without_parent_mutation(tmp_path: 
 
 
 @pytest.mark.asyncio
+@pytest.mark.posix_host
 @pytest.mark.requires_trusted_git
 async def test_m85_merge_rejects_artifact_paths_outside_assignment_claim(
     tmp_path: Path,
