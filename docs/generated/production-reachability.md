@@ -17,8 +17,8 @@
 
 ## Import reachability result
 
-- Reachable repository modules: `321`.
-- Resolved import edges: `2585`.
+- Reachable repository modules: `324`.
+- Resolved import edges: `2607`.
 - Forbidden production edges: `0`.
 - Unresolved internal edges: `0`.
 
@@ -186,6 +186,9 @@
 - `khaos.coding.workspace.policy`
 - `khaos.coding.workspace.storage`
 - `khaos.coding.workspace.trusted_git`
+- `khaos.coding.workspace.trusted_git_locator`
+- `khaos.coding.workspace.trusted_git_policy`
+- `khaos.coding.workspace.trusted_git_preflight`
 - `khaos.config`
 - `khaos.db`
 - `khaos.db.connection`

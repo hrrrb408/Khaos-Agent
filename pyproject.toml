@@ -80,6 +80,7 @@ markers = [
     "lsp_real: requires a trusted pre-installed Language Server (never downloaded at test time)",
     "production_sandbox_real: requires a supported production sandbox daemon and pinned image",
     "posix_host: requires POSIX dirfd, process-group, or host-managed-launch semantics; Windows must use native-or-fail-closed coverage",
+    "requires_trusted_git: requires the platform Trusted Git candidate to pass policy and operational preflight",
     # M2: real Playwright + Chromium binaries.  Tests marked with this
     # exercise the live ``context.route`` route guard, BrowserContext
     # lifecycle / refcount, scheme allowlist and concurrent-session

@@ -315,9 +315,7 @@ class WorkspaceManager:
             )
         except TrustedGitError as exc:
             raise WorkspaceError(str(exc)) from exc
-        self._git_executable = self._git_runner.executable
-        self._git_identity = self._git_runner.git_identity
-        self._git_digest = self._git_runner.git_digest
+        self._sync_git_runner_state()
         self.policy_digest = policy_digest
         if (
             resource_order is not None
@@ -356,6 +354,12 @@ class WorkspaceManager:
     def authority_broker(self) -> AuthorityBroker:
         """Return the one runtime authority used by every workspace effect."""
         return self._authority_broker
+
+    def _sync_git_runner_state(self) -> None:
+        """Persist a runner's selected, revalidated executable identity."""
+        self._git_executable = self._git_runner.executable
+        self._git_identity = self._git_runner.git_identity
+        self._git_digest = self._git_runner.git_digest
 
     def set_lease_invalidation_hook(self, hook: Any) -> None:
         """Register a callable invoked during cleanup to release execution leases."""
@@ -597,6 +601,8 @@ class WorkspaceManager:
             )
         except TrustedGitError as exc:
             raise WorkspaceError(str(exc)) from exc
+        finally:
+            self._sync_git_runner_state()
 
     async def _materialize_git_tree(
         self,
@@ -620,6 +626,8 @@ class WorkspaceManager:
             )
         except TrustedGitError as exc:
             raise WorkspaceError(str(exc)) from exc
+        finally:
+            self._sync_git_runner_state()
 
     async def _workspace_git(
         self,
@@ -673,6 +681,8 @@ class WorkspaceManager:
             )
         except TrustedGitError as exc:
             raise WorkspaceError(str(exc)) from exc
+        finally:
+            self._sync_git_runner_state()
 
     async def _workspace_git_input(
         self,
@@ -726,6 +736,8 @@ class WorkspaceManager:
             )
         except (GitIdentityError, TrustedGitError) as exc:
             raise WorkspaceError(str(exc)) from exc
+        finally:
+            self._sync_git_runner_state()
 
     async def _workspace_git_hash_fd(
         self,
@@ -751,6 +763,8 @@ class WorkspaceManager:
             )
         except (GitIdentityError, TrustedGitError) as exc:
             raise WorkspaceError(str(exc)) from exc
+        finally:
+            self._sync_git_runner_state()
 
     async def _workspace_git_bytes_limited(
         self,
@@ -777,6 +791,8 @@ class WorkspaceManager:
             )
         except (GitIdentityError, TrustedGitError) as exc:
             raise WorkspaceError(str(exc)) from exc
+        finally:
+            self._sync_git_runner_state()
 
     async def _workspace_git_stream(
         self,
@@ -806,6 +822,8 @@ class WorkspaceManager:
             )
         except (GitIdentityError, TrustedGitError) as exc:
             raise WorkspaceError(str(exc)) from exc
+        finally:
+            self._sync_git_runner_state()
 
     async def _workspace_diff_digest(self, workspace: TaskWorkspace) -> str:
         """Hash the current raw diff without materializing it in Python memory."""

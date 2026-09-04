@@ -1,16 +1,12 @@
 from __future__ import annotations
 
-import hashlib
 import sys
 from dataclasses import replace
-from pathlib import Path
 
 import pytest
-
 from khaos.agent import Message
 from khaos.db import Database
 from khaos.evaluation.coding import (
-    AgentExecution,
     CodingEvaluationRunner,
     CodingOracle,
     CompositeOracleSpec,
@@ -22,34 +18,33 @@ from khaos.evaluation.coding import (
     builtin_manifest_path,
     load_builtin_manifest,
 )
-from khaos.runtime import RuntimeProfile
 
 
 def _patch_local_trusted_git(monkeypatch) -> None:
     """Use an installed Command Line Tools Git only for this test harness.
 
-    Production TrustedGitRunner remains pinned to ``/usr/bin/git``.  This
-    machine has not accepted the Xcode license, while the separately installed
-    Command Line Tools Git is the same root-owned Apple Git build and passes
-    the runner's identity/digest checks.  The override keeps the real
+    This machine has not accepted the Xcode license, while the separately
+    installed platform candidate is the same root-owned Apple Git build and
+    passes the runner's identity/digest checks.  The override keeps the real
     AgentLoop/workspace path under test without adding a production fallback.
     """
 
     if sys.platform != "darwin":
         return
-    candidate = Path("/Library/Developer/CommandLineTools/usr/bin/git")
-    if not candidate.is_file():
+    from khaos.coding.workspace.trusted_git_locator import PlatformTrustedGitLocator
+    from khaos.coding.workspace.trusted_git_policy import TrustedGitExecutablePolicy
+
+    candidates = PlatformTrustedGitLocator().candidates()
+    candidate = next((path for path in candidates[1:] if path.is_file()), None)
+    if candidate is None:
         return
-    executable = candidate.resolve(strict=True)
-    info = executable.stat()
-    digest = hashlib.sha256(executable.read_bytes()).hexdigest()
-    identity = (int(info.st_dev), int(info.st_ino), int(info.st_uid), int(info.st_mode))
-    import khaos.coding.workspace.trusted_git as trusted_git
+    identity = TrustedGitExecutablePolicy().validate(candidate)
+    from khaos.coding.workspace import trusted_git
 
     monkeypatch.setattr(
         trusted_git,
         "resolve_trusted_git",
-        lambda: (executable, identity, digest),
+        lambda: (identity.path, identity.file_identity, identity.sha256),
     )
 
 

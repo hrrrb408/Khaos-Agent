@@ -48,6 +48,14 @@ def test_test_help():
     assert "Run tests" in result.stdout
 
 
+def test_trusted_git_doctor_parser_exposes_json_mode():
+    args = build_command_parser().parse_args(["doctor", "trusted-git", "--json"])
+
+    assert args.command == "doctor"
+    assert args.doctor_command == "trusted-git"
+    assert args.as_json is True
+
+
 def test_chat_parser_exposes_interactive_options():
     parser = build_command_parser()
     args = parser.parse_args(["chat", "--mode", "coding", "--no-tui", "--yes"])

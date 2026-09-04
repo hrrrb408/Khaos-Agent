@@ -26,6 +26,17 @@ Git submodules are an explicit current limitation: tree entries with mode
 `git submodule update` during bootstrap and therefore does not claim submodule
 materialization support.
 
+The executable pin is platform-portable but never `PATH`-portable: the static
+candidate locator and root-owned executable policy are documented in
+[`docs/trusted-git-platform.md`](trusted-git-platform.md). macOS probes the
+system Git entry point first and may select the separately policy-validated
+Command Line Tools binary when the host's Xcode/Apple SDK environment blocks
+the first invocation. That condition is reported as `ENVIRONMENT_BLOCKED`, not
+as a generic Git failure. Every selected candidate must pass a bounded
+`git --version` preflight through the existing `TrustedGitProcessOwner`; CI
+required integration tests fail on an unavailable preflight, while local
+environment-blocked tests may report an explicit fixture skip.
+
 ChangeSet artifacts are also bounded resources: each workspace may register at
 most 64 artifacts and 256 MiB total. Each artifact is exclusive-created,
 length/digest checked, owned by the workspace registry, exportable only below

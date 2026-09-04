@@ -59,6 +59,10 @@ jobs:
         # Round-24: Community Local Trust Root and explicit authority-profile
         # construction are now part of the same hard gate; profile boundary
         # code must not drift into dynamically typed fail-open paths.
+        # Trusted Git portability keeps location, executable policy, and
+        # operational preflight independently typed; these modules stay in
+        # the direct basic-mode list until their broader import graph is
+        # promoted into pyright-security.json.
         # additional direct file coverage remains basic-mode until
         # each file is promoted into pyright-security.json.
         run: |
@@ -70,6 +74,9 @@ jobs:
             python/khaos/coding/execution/authority.py \
             python/khaos/coding/execution/docker.py \
             python/khaos/coding/execution/identity.py \
+            python/khaos/coding/workspace/trusted_git_locator.py \
+            python/khaos/coding/workspace/trusted_git_policy.py \
+            python/khaos/coding/workspace/trusted_git_preflight.py \
             python/khaos/coding/execution/managed.py \
             python/khaos/coding/execution/platform.py \
             python/khaos/coding/execution/service.py \

@@ -230,6 +230,22 @@ def build_command_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("version", help="Show version")
 
+    doctor_parser = subparsers.add_parser(
+        "doctor",
+        help="Inspect host dependencies and security boundaries",
+    )
+    doctor_sub = doctor_parser.add_subparsers(dest="doctor_command")
+    trusted_git_parser = doctor_sub.add_parser(
+        "trusted-git",
+        help="Inspect Trusted Git candidates, policy, and preflight",
+    )
+    trusted_git_parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="Emit bounded machine-readable diagnostics",
+    )
+
     migrate_parser = subparsers.add_parser(
         "migrate",
         help="Trusted state migration tools (A-5-2)",
@@ -551,6 +567,55 @@ def cmd_version() -> None:
     """Show the product version."""
     print("Khaos Agent Platform v0.1.0")
     print("Python + Go + Rust")
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Inspect one supported host dependency without changing system state."""
+    if getattr(args, "doctor_command", None) != "trusted-git":
+        print(
+            "usage: khaos doctor trusted-git [--json]",
+            file=sys.stderr,
+        )
+        return 2
+
+    from khaos.coding.workspace.trusted_git_preflight import (
+        TrustedGitAvailability,
+        diagnose_trusted_git,
+    )
+
+    report = asyncio.run(diagnose_trusted_git())
+    if getattr(args, "as_json", False):
+        print(json.dumps(report.as_dict(), ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        print("Trusted Git")
+        print(f"status: {report.status.value}")
+        print(f"classification: {report.classification}")
+        for candidate in report.candidates:
+            policy = candidate.policy
+            print(f"candidate: {candidate.candidate}")
+            print(f"  canonical: {policy.get('canonical_path') or 'unavailable'}")
+            print(f"  owner_uid: {policy.get('owner_uid') if policy.get('owner_uid') is not None else 'unknown'}")
+            print(f"  mode: {policy.get('mode') if policy.get('mode') is not None else 'unknown'}")
+            print(f"  parent_chain: {policy.get('parent_chain') if policy.get('parent_chain') is not None else 'unknown'}")
+            print(f"  identity: {policy.get('identity') if policy.get('identity') is not None else 'unknown'}")
+            print(f"  digest: {policy.get('digest') if policy.get('digest') is not None else 'unknown'}")
+            print(f"  policy: {policy.get('status') or 'unknown'}")
+            if policy.get("diagnostic"):
+                print(f"  policy_diagnostic: {policy['diagnostic']}")
+            preflight = candidate.preflight
+            if preflight is None:
+                print("  preflight: not_run")
+                continue
+            print(f"  preflight: {preflight.status.value}")
+            print(f"  preflight_classification: {preflight.classification}")
+            print(f"  exit_code: {preflight.returncode if preflight.returncode is not None else 'unknown'}")
+            if preflight.diagnostic:
+                print(f"  diagnostic: {preflight.diagnostic}")
+        if report.selected is not None:
+            print(f"selected: {report.selected.identity.path if report.selected.identity else report.selected.candidate}")
+        else:
+            print("selected: none")
+    return 0 if report.status is TrustedGitAvailability.AVAILABLE else 1
 
 
 def cmd_migrate(args: argparse.Namespace) -> int:
@@ -1083,11 +1148,11 @@ def main() -> None:
     """CLI process entrypoint.
 
     Resolution order:
-      1. Product subcommands: start/chat/test/config/version.
+      1. Product subcommands: start/chat/test/config/version/doctor.
       2. Legacy flags such as ``--message`` for scriptable SSE output.
     """
     argv = sys.argv[1:]
-    command_names = {"start", "chat", "test", "config", "version", "migrate", "memory", "eval"}
+    command_names = {"start", "chat", "test", "config", "version", "doctor", "migrate", "memory", "eval"}
     if not argv:
         parser = build_command_parser()
         parser.print_help()
@@ -1107,6 +1172,8 @@ def main() -> None:
             cmd_config(args)
         elif args.command == "version":
             cmd_version()
+        elif args.command == "doctor":
+            raise SystemExit(cmd_doctor(args))
         elif args.command == "migrate":
             raise SystemExit(cmd_migrate(args))
         elif args.command == "memory":
