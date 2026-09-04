@@ -96,8 +96,9 @@ class TrustedGitExecutablePolicy:
 
     ``trusted_owner_uid`` exists to make pure policy tests deterministic with
     temporary fixtures.  A non-root test owner still accepts the unavoidable
-    root-owned ancestors of a temporary path.  The production factory always
-    uses the default ``0`` and never exposes this as a runtime/developer
+    root-owned ancestors of a temporary path, including a root-owned sticky
+    system temporary directory such as ``/tmp``.  The production factory
+    always uses the default ``0`` and never exposes this as a runtime/developer
     override.
     """
 
@@ -279,12 +280,23 @@ class TrustedGitExecutablePolicy:
             if (
                 stat.S_ISLNK(info.st_mode)
                 or not stat.S_ISDIR(info.st_mode)
-                or not self._is_trusted_parent_owner(info.st_uid)
-                or info.st_mode & 0o022
+                or not self._is_trusted_parent(info)
             ):
                 raise TrustedGitExecutablePolicyError(
                     f"{label} parent chain is not trusted: {parent}"
                 )
+
+    def _is_trusted_parent(self, info: os.stat_result) -> bool:
+        """Accept only private parents, with a test-only ``/tmp`` carve-out."""
+        if not self._is_trusted_parent_owner(info.st_uid):
+            return False
+        if not info.st_mode & 0o022:
+            return True
+        return (
+            self.trusted_owner_uid != 0
+            and info.st_uid == 0
+            and bool(info.st_mode & stat.S_ISVTX)
+        )
 
     def _is_trusted_parent_owner(self, owner_uid: int) -> bool:
         """Accept root ancestors when pure tests use a non-root fixture owner."""
