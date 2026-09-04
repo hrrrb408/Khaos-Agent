@@ -2248,12 +2248,19 @@ async def build_runtime(
                 workspace = kwargs.get("workspace")
                 if workspace is None:
                     raise RuntimeError("merge refresh is missing its parent workspace")
+                raw_changed_paths = kwargs.get("changed_paths", ())
+                if not isinstance(raw_changed_paths, (tuple, list)) or not all(
+                    isinstance(path, str) for path in raw_changed_paths
+                ):
+                    raise RuntimeError(
+                        "merge refresh changed_paths must be a sequence of strings"
+                    )
                 refreshed = refresh(
                     str(getattr(workspace, "id", "")),
                     task_id=str(kwargs.get("task_id", "")),
                     principal_id=cfg.principal_id,
                     project_id=project_id,
-                    paths=tuple(kwargs.get("changed_paths", ())),
+                    paths=tuple(cast(Iterable[str], raw_changed_paths)),
                     source_revision=str(kwargs.get("commit", "")),
                 )
                 if inspect.isawaitable(refreshed):
