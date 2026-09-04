@@ -294,10 +294,17 @@ class TrustedGitExecutablePolicy:
     def _validate_file_info(
         self, path: Path, info: os.stat_result, *, label: str = "Git executable"
     ) -> None:
-        if os.name == "nt" and self._test_fixture_root is None:
+        if os.name == "nt":
             if not stat.S_ISREG(info.st_mode):
                 raise TrustedGitExecutablePolicyError(
                     f"{label} must be an absolute regular file: {path}"
+                )
+            if (
+                self._test_fixture_root is not None
+                and not self._is_test_fixture_path(path)
+            ):
+                raise TrustedGitExecutablePolicyError(
+                    f"{label} test fixture escaped its explicit root: {path}"
                 )
             return
         if (
@@ -354,14 +361,27 @@ class TrustedGitExecutablePolicy:
                 raise TrustedGitExecutablePolicyError(
                     f"{label} parent chain is not trusted: {parent}"
                 )
-            if self._test_fixture_root is None:
+            if self._test_fixture_root is not None and (
+                self._is_test_fixture_path(parent)
+                or self._is_test_fixture_ancestor(parent)
+            ):
                 continue
-            if self._is_test_fixture_ancestor(parent):
+            if self._test_fixture_root is None:
                 continue
             if not self._is_trusted_parent(info):
                 raise TrustedGitExecutablePolicyError(
                     f"{label} parent chain is not trusted: {parent}"
                 )
+
+    def _is_test_fixture_path(self, path: Path) -> bool:
+        """Return whether a canonical test path stays inside its fixture root."""
+        if self._test_fixture_root is None:
+            return False
+        try:
+            path.relative_to(self._test_fixture_root)
+        except ValueError:
+            return False
+        return True
 
     def _is_test_fixture_ancestor(self, parent: Path) -> bool:
         """Identify the explicit test root and its host-side ancestors."""
@@ -386,7 +406,7 @@ class TrustedGitExecutablePolicy:
             )
         except WindowsTrustError as exc:
             raise TrustedGitExecutablePolicyError(
-                f"Git executable Windows ACL policy rejected: {path}"
+                f"Git executable Windows ACL policy rejected: {path}: {exc}"
             ) from exc
 
     def _validate_platform_descriptor(
@@ -403,7 +423,7 @@ class TrustedGitExecutablePolicy:
             )
         except WindowsTrustError as exc:
             raise TrustedGitExecutablePolicyError(
-                f"{label} Windows ACL policy changed or is unavailable"
+                f"{label} Windows ACL policy changed or is unavailable: {exc}"
             ) from exc
 
     def _is_trusted_parent(self, info: os.stat_result) -> bool:

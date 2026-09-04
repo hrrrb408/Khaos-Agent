@@ -100,18 +100,22 @@ def test_policy_requires_absolute_regular_private_owned_file(tmp_path: Path) -> 
     with pytest.raises(TrustedGitExecutablePolicyError):
         policy.validate(directory)
 
-    candidate.chmod(0o775)
-    with pytest.raises(TrustedGitExecutablePolicyError):
-        policy.validate(candidate)
+    if os.name != "nt":
+        candidate.chmod(0o775)
+        with pytest.raises(TrustedGitExecutablePolicyError):
+            policy.validate(candidate)
 
-    candidate.chmod(0o755)
-    with pytest.raises(TrustedGitExecutablePolicyError):
-        TrustedGitExecutablePolicy(
-            trusted_owner_uid=policy.trusted_owner_uid + 1
-        ).validate(candidate)
+        candidate.chmod(0o755)
+        with pytest.raises(TrustedGitExecutablePolicyError):
+            TrustedGitExecutablePolicy(
+                trusted_owner_uid=policy.trusted_owner_uid + 1
+            ).validate(candidate)
     identity = policy.validate(candidate)
-    assert identity.owner_uid == policy.trusted_owner_uid
-    assert identity.mode & 0o022 == 0
+    if os.name != "nt":
+        assert identity.owner_uid == policy.trusted_owner_uid
+        assert identity.mode & 0o022 == 0
+    else:
+        assert identity.path == candidate.resolve(strict=True)
 
 
 def test_policy_rejects_writable_parent_and_symlinked_parent(tmp_path: Path) -> None:
@@ -120,12 +124,15 @@ def test_policy_rejects_writable_parent_and_symlinked_parent(tmp_path: Path) -> 
     parent.mkdir()
     candidate = _local_executable(parent)
 
-    parent.chmod(0o777)
-    try:
-        with pytest.raises(TrustedGitExecutablePolicyError):
-            policy.validate(candidate)
-    finally:
-        parent.chmod(0o755)
+    if os.name != "nt":
+        parent.chmod(0o777)
+        try:
+            with pytest.raises(TrustedGitExecutablePolicyError):
+                policy.validate(candidate)
+        finally:
+            parent.chmod(0o755)
+    else:
+        assert policy.validate(candidate).path == candidate.resolve(strict=True)
 
     alias = tmp_path / "alias"
     try:
