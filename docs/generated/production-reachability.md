@@ -18,7 +18,7 @@
 ## Import reachability result
 
 - Reachable repository modules: `324`.
-- Resolved import edges: `2607`.
+- Resolved import edges: `2611`.
 - Forbidden production edges: `0`.
 - Unresolved internal edges: `0`.
 
