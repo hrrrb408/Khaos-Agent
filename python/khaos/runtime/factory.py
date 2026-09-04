@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 import uuid
@@ -279,6 +280,10 @@ class RuntimeConfig:
     # M8.4: trusted development/evaluation composition seam.  Production
     # callers use the factory-created ContextEngineService below.
     context_engine: Any = None
+    # M8.5: trusted development/evaluation seam for the parent-only parallel
+    # subagent coordinator.  Production composition creates this owner below
+    # from the canonical workspace, repository, and verification services.
+    parallel_subagent_coordinator: Any = None
 
 
 @dataclass(frozen=True)
@@ -521,6 +526,12 @@ class RuntimeResult:
     # by the factory.  It has no independent execution or completion
     # authority and therefore needs no separate lifecycle shutdown.
     verification_coordinator: Any = field(init=False, default=None, repr=False)
+    # M8.5: parent-only orchestration handle.  Child worktree lifecycle,
+    # Trusted Git, verification, and completion authority remain owned by the
+    # composed services referenced by this coordinator.
+    parallel_subagent_coordinator: Any = field(
+        init=False, default=None, repr=False
+    )
     # M7.3: production-composed planning control coordinator.  It is an
     # orchestration owner only; plan revisions remain passive and TaskStatus
     # lifecycle writes remain owned by their existing control boundaries.
@@ -2203,6 +2214,68 @@ async def build_runtime(
                 registry=scheduler.registry,
                 spawner=cfg.subagent_spawner,
             )
+        # M8.5: compose one parent-only orchestration service from the
+        # existing WorkspaceManager, repository, and M8.3 verification
+        # owners.  The coordinator owns no second AgentLoop, authority, or
+        # completion path.  Delegated M7.8 runtimes deliberately receive no
+        # parallel coordinator, preserving the single delegation depth.
+        parallel_subagent_coordinator = cfg.parallel_subagent_coordinator
+        if production_mode and parallel_subagent_coordinator is not None:
+            raise PermissionError(
+                "production runtime cannot accept an injected parallel subagent coordinator"
+            )
+        if cfg.delegated_execution_context is not None:
+            if parallel_subagent_coordinator is not None:
+                raise PermissionError(
+                    "delegated runtime cannot accept a parallel subagent coordinator"
+                )
+            parallel_subagent_coordinator = None
+        elif parallel_subagent_coordinator is None and workspace_manager is not None:
+            from khaos.subagents.coordinator import SubagentCoordinator
+            from khaos.subagents.merge import MergeCoordinator
+            from khaos.subagents.workspace import ChildWorkspaceService
+
+            parallel_repository = getattr(
+                cfg.db, "parallel_subagent_repository", None
+            )
+
+            async def refresh_after_merge(**kwargs: object) -> None:
+                """Refresh the canonical parent intelligence after publish."""
+                intelligence = getattr(context_intelligence, "repo_intelligence", None)
+                refresh = getattr(intelligence, "refresh", None)
+                if not callable(refresh):
+                    return
+                workspace = kwargs.get("workspace")
+                if workspace is None:
+                    raise RuntimeError("merge refresh is missing its parent workspace")
+                refreshed = refresh(
+                    str(getattr(workspace, "id", "")),
+                    task_id=str(kwargs.get("task_id", "")),
+                    principal_id=cfg.principal_id,
+                    project_id=project_id,
+                    paths=tuple(kwargs.get("changed_paths", ())),
+                    source_revision=str(kwargs.get("commit", "")),
+                )
+                if inspect.isawaitable(refreshed):
+                    await refreshed
+
+            parallel_subagent_coordinator = SubagentCoordinator(
+                ChildWorkspaceService(
+                    workspace_manager,
+                    repository=parallel_repository,
+                ),
+                merge_coordinator=MergeCoordinator(
+                    workspace_manager,
+                    repository=parallel_repository,
+                    post_merge_verifier=autonomous_verification.verify_after_merge,
+                    repo_intelligence_refresh=(
+                        refresh_after_merge
+                        if context_intelligence is not None
+                        else None
+                    ),
+                ),
+                repository=parallel_repository,
+            )
         recovery_decision_repository = getattr(
             cfg.db, "recovery_decision_repository", None
         )
@@ -2308,6 +2381,7 @@ async def build_runtime(
             trusted_verification_service=trusted_verification_service,
             verification_coordinator=autonomous_verification,
             context_engine=context_engine,
+            parallel_subagent_coordinator=parallel_subagent_coordinator,
             # M4 batch 3.1.16A-5-1b (CRITICAL): carry the RPC-verified
             # project identity into the AgentLoop so every message / turn
             # write is stamped with it.  ``self._bound_project_id`` (set
@@ -2381,6 +2455,7 @@ async def build_runtime(
         runtime.owns_context_intelligence = context_intelligence is not None
         runtime.context_engine = context_engine
         runtime.verification_coordinator = autonomous_verification
+        runtime.parallel_subagent_coordinator = parallel_subagent_coordinator
         runtime.recovery_control = recovery_control
         runtime.composition_manifest = composition_manifest
         return runtime

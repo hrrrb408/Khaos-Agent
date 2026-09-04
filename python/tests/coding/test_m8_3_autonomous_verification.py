@@ -444,6 +444,49 @@ async def test_coordinator_replans_from_applied_edit_and_records_events(tmp_path
     assert fake.requests
 
 
+@pytest.mark.asyncio
+@pytest.mark.posix_host
+async def test_coordinator_verifies_merge_against_resulting_parent_generation(
+    tmp_path: Path,
+) -> None:
+    _profile_root(tmp_path)
+    fake = _FakeExecutionService(
+        ExecutionResult("exec-merge", "completed", 0, "", "", 1, {})
+    )
+    coordinator = AutonomousVerificationCoordinator(
+        execution_service=fake,
+        evidence_store=VerificationObservationStore(),
+        principal_id="principal-1",
+        project_id="project-1",
+    )
+    workspace = SimpleNamespace(
+        id="ws-merge",
+        task_id="task-merge",
+        worktree_path=tmp_path,
+        generation=4,
+        head_sha="b" * 40,
+        principal_id="principal-1",
+        project_id="project-1",
+    )
+    run = await coordinator.verify_after_merge(
+        merge_id="merge-1",
+        task_id="task-merge",
+        workspace=workspace,
+        base_generation=3,
+        resulting_generation=4,
+        base_commit="a" * 40,
+        resulting_commit="b" * 40,
+        changed_paths=("src/app.py",),
+    )
+    assert run.status is VerificationRunStatus.PASSED
+    impact = coordinator.impact_for_task("task-merge")
+    assert impact is not None
+    assert impact.transaction_id == "merge:merge-1"
+    assert impact.changed_paths == ("src/app.py",)
+    assert impact.operations == ("merge",)
+    assert fake.requests
+
+
 def test_verify_fix_loop_is_the_single_m8_3_repair_budget_owner() -> None:
     loop = VerifyFixLoop(max_fix_attempts=1)
     failure = SimpleNamespace(

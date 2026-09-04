@@ -34,6 +34,7 @@ from khaos.coding.verification.impact import (
 )
 from khaos.coding.verification.planner import AutonomousVerificationPlanner
 from khaos.coding.verification.profile import VerificationProfileDetector
+from khaos.security.protocol_boundary import canonical_digest
 
 
 class AutonomousVerificationCoordinator:
@@ -107,12 +108,6 @@ class AutonomousVerificationCoordinator:
         ):
             raise PermissionError("edit result generation does not match active workspace")
         self._invalidated.add(task_id)
-        overview = await self._overview(
-            workspace_id=workspace_id,
-            task_id=task_id,
-            principal_id=owner_principal,
-            project_id=owner_project,
-        )
         impact = await self.impact_analyzer.analyze(
             result,
             repo_intelligence=self.repo_intelligence,
@@ -121,7 +116,137 @@ class AutonomousVerificationCoordinator:
             project_id=owner_project,
             transaction=transaction,
         )
+        return await self._verify_impact(
+            impact,
+            task_id=task_id,
+            workspace=workspace,
+            root=root,
+            principal_id=owner_principal,
+            project_id=owner_project,
+            event_sink=event_sink,
+        )
+
+    async def verify_after_merge(
+        self,
+        *,
+        merge_id: str,
+        task_id: str,
+        workspace: Any,
+        base_generation: int,
+        resulting_generation: int,
+        base_commit: str,
+        resulting_commit: str,
+        changed_paths: tuple[str, ...],
+        phase: str = "parent",
+        principal_id: str | None = None,
+        project_id: str | None = None,
+        event_sink: Any | None = None,
+    ) -> VerificationRun:
+        """Verify a committed integration or parent merge through M8.3.
+
+        The merge coordinator supplies the actual commit and generation
+        transition.  This method only derives bounded impact facts and
+        delegates planning/execution to the existing verification owners; it
+        never turns a child result into completion evidence.
+        """
+        if type(merge_id) is not str or not merge_id:
+            raise ValueError("merge_id must be non-empty")
+        if phase not in {"integration", "parent"}:
+            raise ValueError("merge verification phase is invalid")
+        if type(task_id) is not str or not task_id:
+            raise ValueError("task_id must be non-empty")
+        if type(base_generation) is not int or base_generation < 0:
+            raise ValueError("base_generation must be non-negative")
+        if type(resulting_generation) is not int or resulting_generation < 0:
+            raise ValueError("resulting_generation must be non-negative")
+        if resulting_generation < base_generation:
+            raise ValueError("resulting_generation cannot go backwards")
+        _validate_commit(base_commit, "base_commit")
+        _validate_commit(resulting_commit, "resulting_commit")
+        if type(changed_paths) is not tuple:
+            raise TypeError("changed_paths must be an immutable tuple")
+        workspace_id = str(getattr(workspace, "id", ""))
+        if not workspace_id:
+            raise PermissionError("merge workspace identity is missing")
+        if getattr(workspace, "task_id", task_id) != task_id:
+            raise PermissionError("merge workspace belongs to another task")
+        workspace_generation = getattr(workspace, "generation", None)
+        if type(workspace_generation) is not int or workspace_generation != resulting_generation:
+            raise PermissionError("merge result generation does not match active workspace")
+        workspace_head = getattr(workspace, "head_sha", None)
+        if workspace_head is not None and workspace_head != resulting_commit:
+            raise PermissionError("merge result commit does not match active workspace")
+        root = Path(workspace.worktree_path).expanduser().resolve(strict=True)
+        owner_principal = self.principal_id if principal_id is None else principal_id
+        owner_project = self.project_id if project_id is None else project_id
+        if not owner_principal:
+            owner_principal = str(getattr(workspace, "principal_id", ""))
+        if not owner_project:
+            owner_project = str(getattr(workspace, "project_id", ""))
+        workspace_principal = getattr(workspace, "principal_id", None)
+        if workspace_principal not in (None, "", owner_principal):
+            raise PermissionError("merge workspace belongs to another principal")
+        workspace_project = getattr(workspace, "project_id", None)
+        if workspace_project not in (None, "", owner_project):
+            raise PermissionError("merge workspace belongs to another project")
+        impact = EditImpact(
+            workspace_id=workspace_id,
+            transaction_id=f"merge:{merge_id}",
+            transaction_digest=canonical_digest(
+                {
+                    "merge_id": merge_id,
+                    "base_commit": base_commit,
+                    "resulting_commit": resulting_commit,
+                    "base_generation": base_generation,
+                    "resulting_generation": resulting_generation,
+                    "changed_paths": changed_paths,
+                }
+            ),
+            base_generation=base_generation,
+            resulting_generation=resulting_generation,
+            repository_generation=0,
+            changed_paths=changed_paths,
+            operations=("merge",),
+            uncertainty=("child-verification-is-not-parent-proof",),
+        )
+        self._invalidated.add(task_id)
+        impact = await self.impact_analyzer.analyze_impact(
+            impact,
+            repo_intelligence=self.repo_intelligence,
+            task_id=task_id,
+            principal_id=owner_principal,
+            project_id=owner_project,
+        )
+        return await self._verify_impact(
+            impact,
+            task_id=task_id,
+            workspace=workspace,
+            root=root,
+            principal_id=owner_principal,
+            project_id=owner_project,
+            event_sink=event_sink,
+        )
+
+    async def _verify_impact(
+        self,
+        impact: EditImpact,
+        *,
+        task_id: str,
+        workspace: Any,
+        root: Path,
+        principal_id: str,
+        project_id: str,
+        event_sink: Any | None,
+    ) -> VerificationRun:
+        """Run the shared M8.3 plan/execution/evidence pipeline."""
+        workspace_id = impact.workspace_id
         self._latest_impacts[task_id] = impact
+        overview = await self._overview(
+            workspace_id=workspace_id,
+            task_id=task_id,
+            principal_id=principal_id,
+            project_id=project_id,
+        )
         overview_freshness = getattr(overview, "freshness", None)
         overview_is_current = (
             overview_freshness is None
@@ -138,7 +263,9 @@ class AutonomousVerificationCoordinator:
         plan = self.planner.plan(
             impact,
             profile,
-            workspace_generation=int(getattr(workspace, "generation", result.resulting_generation)),
+            workspace_generation=int(
+                getattr(workspace, "generation", impact.resulting_generation)
+            ),
         )
         await _emit(
             event_sink,
@@ -159,8 +286,8 @@ class AutonomousVerificationCoordinator:
             current = await self._overview(
                 workspace_id=workspace_id,
                 task_id=task_id,
-                principal_id=owner_principal,
-                project_id=owner_project,
+                principal_id=principal_id,
+                project_id=project_id,
             )
             if current is None:
                 return plan.repository_generation + 1
@@ -179,14 +306,14 @@ class AutonomousVerificationCoordinator:
                 if self.repo_intelligence is not None and overview is not None
                 else None
             ),
-            principal_id=owner_principal,
-            project_id=owner_project,
+            principal_id=principal_id,
+            project_id=project_id,
             event_sink=event_sink,
         )
         await self.evidence_store.append(
             run,
-            principal_id=owner_principal,
-            project_id=owner_project,
+            principal_id=principal_id,
+            project_id=project_id,
             task_id=task_id,
         )
         self._latest[task_id] = run
@@ -376,6 +503,16 @@ async def _emit(sink: Any | None, event: str, payload: dict[str, object]) -> Non
     except Exception:  # noqa: BLE001 - observability cannot affect authority
         # Observability must not grant an availability or authority bypass.
         return
+
+
+def _validate_commit(value: str, label: str) -> None:
+    """Validate a Git object id without resolving model-controlled input."""
+    if (
+        type(value) is not str
+        or len(value) not in {40, 64}
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{label} must be a lowercase Git object id")
 
 
 __all__ = [

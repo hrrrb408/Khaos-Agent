@@ -66,7 +66,7 @@
 - `python/khaos/coding/execution/service.py`: `eb1c000ef30f3bf42dd2af245a6d7edf9b3abe8b89cbccb164748b62911f24a3`
 - `python/khaos/coding/execution/binding.py`: `99f3d8eb14d80a837ecf0f0d076d556ccdb366b8798c9e0fde6c69d0bb1a5501`
 - `python/khaos/coding/execution/supervisor.py`: `e6d88b6de0370b10b877f7228a37d2d910ce9a08ea3d8625b33c529d091098ff`
-- `python/khaos/coding/workspace/manager.py`: `26a8a98dcda900ff052c97a5bfdc986b186d0eefb1bbd5bf51b7d42eb3bfaf24`
+- `python/khaos/coding/workspace/manager.py`: `5caf0c501690b36ec21aedb88b9a119d4a455e535800ef690331c9794f14ea3a`
 - `python/khaos/coding/workspace/artifacts.py`: `f670450ac283ac822fec16edb445ca2f70b5afab3be6aeb1cea747843758d3de`
 - `python/khaos/coding/workspace/trusted_git.py`: `142805bbb4c0c60646f55a0790edb186b320f5c6ff03898a4d8a0f92f8ef5e40`
 - `python/khaos/coding/workspace/git_process.py`: `fb110ff687020411f1a57034e257fd86a591bbf72c9338c18c694f1dd7d014ee`

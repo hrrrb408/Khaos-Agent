@@ -42,6 +42,7 @@ from khaos.db.connection import (
 )
 from khaos.evaluation.repository import CapabilityEvaluationRepository
 from khaos.subagents.assignment import SubAgentAssignmentRepository
+from khaos.subagents.repository import ParallelSubagentRepository
 
 # Compatibility name for released tests and integrations.  The lifecycle
 # owner is ``db.connection.READER_DRAIN_TIMEOUT``; this alias must not become
@@ -281,6 +282,7 @@ class Database:
         self._verification_assessment_repository = VerificationAssessmentRepository(self)
         self._autonomous_verification_repository = VerificationObservationStore(self)
         self._capability_evaluation_repository = CapabilityEvaluationRepository(self)
+        self._parallel_subagent_repository = ParallelSubagentRepository(self)
         # F-01: Per-domain locks remain for logical serialization (e.g. two
         # concurrent permission grants must not race on epoch computation).
         self._operation_approval_lock = asyncio.Lock()
@@ -368,6 +370,11 @@ class Database:
     def autonomous_verification_repository(self) -> VerificationObservationStore:
         """Return the append-only M8.3 verification observation ledger."""
         return self._autonomous_verification_repository
+
+    @property
+    def parallel_subagent_repository(self) -> ParallelSubagentRepository:
+        """Return the durable M8.5 child/merge projection owner."""
+        return self._parallel_subagent_repository
 
     @property
     def capability_evaluation_repository(self) -> CapabilityEvaluationRepository:
@@ -1020,6 +1027,15 @@ class Database:
             self._conn = _MigrationConnection(conn)
             try:
                 await self._apply_v28_upgrades()
+            finally:
+                self._conn = original_conn
+            # M8.5: persist immutable parallel assignments, isolated child
+            # Worktree bindings, structured results, deterministic merge
+            # records, and append-only lifecycle events.
+            original_conn = self._conn
+            self._conn = _MigrationConnection(conn)
+            try:
+                await self._apply_v29_upgrades()
             finally:
                 self._conn = original_conn
             # Batch 6.4 §10.4: backfill the historical ledger rows (v1–v5)
@@ -1797,6 +1813,15 @@ class Database:
         """Add the append-only M8.3 verification observation ledger."""
         conn = await self._require_conn()
         migration_path = _MIGRATIONS_DIR / "0028_autonomous_verification_runs.sql"
+        await self._execute_schema_statements(
+            conn,
+            migration_path.read_text(encoding="utf-8"),
+        )
+
+    async def _apply_v29_upgrades(self) -> None:
+        """Add the durable M8.5 parallel-subagent control projections."""
+        conn = await self._require_conn()
+        migration_path = _MIGRATIONS_DIR / "0029_parallel_subagent_worktrees.sql"
         await self._execute_schema_statements(
             conn,
             migration_path.read_text(encoding="utf-8"),

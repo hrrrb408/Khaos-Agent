@@ -435,13 +435,33 @@ class VerificationImpactAnalyzer:
         project_id: str,
         transaction: EditTransaction | None = None,
     ) -> EditImpact:
-        """Return bounded impact facts; uncertainty widens downstream checks."""
+        """Analyze one applied edit through the shared impact path."""
         impact = EditImpact.from_result(result, transaction=transaction)
+        return await self.analyze_impact(
+            impact,
+            repo_intelligence=repo_intelligence,
+            task_id=task_id,
+            principal_id=principal_id,
+            project_id=project_id,
+        )
+
+    async def analyze_impact(
+        self,
+        impact: EditImpact,
+        *,
+        repo_intelligence: Any | None,
+        task_id: str,
+        principal_id: str,
+        project_id: str,
+    ) -> EditImpact:
+        """Enrich an existing impact, including a union merge impact."""
+        if type(impact) is not EditImpact:
+            raise TypeError("impact must be an EditImpact")
         if repo_intelligence is None:
             return replace(impact, uncertainty=tuple(sorted(set(impact.uncertainty) | {"repository-intelligence-unavailable"})))
         overview = await self._query(
             repo_intelligence,
-            workspace_id=result.workspace_id,
+            workspace_id=impact.workspace_id,
             task_id=task_id,
             principal_id=principal_id,
             project_id=project_id,
@@ -477,7 +497,7 @@ class VerificationImpactAnalyzer:
         for path in analysis_paths:
             related = await self._query(
                 repo_intelligence,
-                workspace_id=result.workspace_id,
+                workspace_id=impact.workspace_id,
                 task_id=task_id,
                 principal_id=principal_id,
                 project_id=project_id,
@@ -502,7 +522,7 @@ class VerificationImpactAnalyzer:
                             related_files.add(candidate_path)
             related_file_result = await self._query(
                 repo_intelligence,
-                workspace_id=result.workspace_id,
+                workspace_id=impact.workspace_id,
                 task_id=task_id,
                 principal_id=principal_id,
                 project_id=project_id,
@@ -530,7 +550,7 @@ class VerificationImpactAnalyzer:
                                 continue
             symbols = await self._query(
                 repo_intelligence,
-                workspace_id=result.workspace_id,
+                workspace_id=impact.workspace_id,
                 task_id=task_id,
                 principal_id=principal_id,
                 project_id=project_id,
@@ -545,7 +565,7 @@ class VerificationImpactAnalyzer:
                 # SYMBOLS projection as proof that the file has no symbols.
                 definitions = await self._query(
                     repo_intelligence,
-                    workspace_id=result.workspace_id,
+                    workspace_id=impact.workspace_id,
                     task_id=task_id,
                     principal_id=principal_id,
                     project_id=project_id,
@@ -578,7 +598,7 @@ class VerificationImpactAnalyzer:
                         public_api_changed = True
             importers = await self._query(
                 repo_intelligence,
-                workspace_id=result.workspace_id,
+                workspace_id=impact.workspace_id,
                 task_id=task_id,
                 principal_id=principal_id,
                 project_id=project_id,
@@ -620,7 +640,7 @@ class VerificationImpactAnalyzer:
             ):
                 relations = await self._query(
                     repo_intelligence,
-                    workspace_id=result.workspace_id,
+                    workspace_id=impact.workspace_id,
                     task_id=task_id,
                     principal_id=principal_id,
                     project_id=project_id,

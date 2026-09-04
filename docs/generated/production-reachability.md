@@ -17,8 +17,8 @@
 
 ## Import reachability result
 
-- Reachable repository modules: `324`.
-- Resolved import edges: `2611`.
+- Reachable repository modules: `330`.
+- Resolved import edges: `2672`.
 - Forbidden production edges: `0`.
 - Unresolved internal edges: `0`.
 
@@ -335,7 +335,13 @@
 - `khaos.skills.skill`
 - `khaos.subagents`
 - `khaos.subagents.assignment`
+- `khaos.subagents.contracts`
+- `khaos.subagents.coordinator`
+- `khaos.subagents.merge`
+- `khaos.subagents.repository`
+- `khaos.subagents.scheduler`
 - `khaos.subagents.spawner`
+- `khaos.subagents.workspace`
 - `khaos.time_utils`
 - `khaos.tools`
 - `khaos.tools.admission`

@@ -458,6 +458,7 @@ class WorkspaceManager:
         if artifact_path is not None and artifact_registered:
             async with self._lock:
                 workspace.change_artifacts.discard(artifact_path)
+                workspace.change_artifact_files.pop(artifact_path, None)
                 workspace.change_artifact_bytes = max(
                     0, workspace.change_artifact_bytes - artifact_length
                 )
@@ -825,12 +826,17 @@ class WorkspaceManager:
         finally:
             self._sync_git_runner_state()
 
-    async def _workspace_diff_digest(self, workspace: TaskWorkspace) -> str:
+    async def _workspace_diff_digest(
+        self, workspace: TaskWorkspace, *, base_sha: str | None = None
+    ) -> str:
         """Hash the current raw diff without materializing it in Python memory."""
+        diff_base = base_sha or workspace.base_sha
         index_file = workspace.worktree_path.parent / f".binding-index-{uuid.uuid4().hex}"
         temporary = workspace.worktree_path.parent / f".binding-{uuid.uuid4().hex}.patch"
         try:
-            await self._prepare_raw_changeset_index(workspace, index_file)
+            await self._prepare_raw_changeset_index(
+                workspace, index_file, base_sha=diff_base
+            )
             result = await self._workspace_git_stream(
                 workspace,
                 "diff",
@@ -838,7 +844,7 @@ class WorkspaceManager:
                 "--no-ext-diff",
                 "--no-textconv",
                 "--binary",
-                workspace.base_sha,
+                diff_base,
                 destination=temporary,
                 max_bytes=MAX_CHANGESET_BYTES,
                 index_file=index_file,
@@ -918,14 +924,19 @@ class WorkspaceManager:
         raise WorkspaceError(f"workspace change has an unsupported file type: {safe_relative}")
 
     async def _prepare_raw_changeset_index(
-        self, workspace: TaskWorkspace, index_file: Path
+        self,
+        workspace: TaskWorkspace,
+        index_file: Path,
+        *,
+        base_sha: str | None = None,
     ) -> None:
         """Build a temporary raw-byte index, bypassing all clean filters."""
+        index_base = base_sha or workspace.base_sha
         tracked_listing = await self._workspace_git_bytes_limited(
             workspace, "ls-files", "--stage", "-z", max_bytes=MAX_CHANGESET_NAMES_BYTES
         )
         tracked = _parse_index_listing(
-            tracked_listing, object_id_length=len(workspace.base_sha)
+            tracked_listing, object_id_length=len(index_base)
         )
         untracked_listing = await self._workspace_git_bytes_limited(
             workspace,
@@ -944,11 +955,11 @@ class WorkspaceManager:
         await self._workspace_git(
             workspace,
             "read-tree",
-            workspace.base_sha,
+            index_base,
             index_file=index_file,
             effect=GitEffect.read_tree(
                 repository_id=str(workspace.repository_root.resolve()),
-                treeish=workspace.base_sha,
+                treeish=index_base,
                 required_operation="index",
             ),
         )
@@ -997,7 +1008,7 @@ class WorkspaceManager:
             object_id, mode = await self._hash_workspace_entry(
                 workspace, safe_relative, info
             )
-            if len(object_id) != len(workspace.base_sha) or any(
+            if len(object_id) != len(index_base) or any(
                 character not in "0123456789abcdef" for character in object_id
             ):
                 raise WorkspaceError("Git returned an object id for the wrong repository format")
@@ -1429,6 +1440,116 @@ class WorkspaceManager:
             except GitIdentityError as exc:
                 raise WorkspaceError(str(exc)) from exc
 
+    async def current_head(self, workspace_id: str) -> str:
+        """Read the server-owned HEAD of one registered TaskWorkspace."""
+        workspace = self._workspaces.get(workspace_id)
+        if workspace is None:
+            raise WorkspaceError("workspace not found")
+        return await self._workspace_git(workspace, "rev-parse", "HEAD")
+
+    async def require_stable(
+        self,
+        workspace_id: str,
+        *,
+        task_id: str,
+        expected_generation: int | None = None,
+    ) -> tuple[str, int]:
+        """Return ``(HEAD, generation)`` only for a clean stable workspace."""
+        async with self.stable_workspace_scope(
+            workspace_id,
+            task_id=task_id,
+            expected_generation=expected_generation,
+        ) as snapshot:
+            return snapshot[0], snapshot[1]
+
+    @asynccontextmanager
+    async def stable_workspace_scope(
+        self,
+        workspace_id: str,
+        *,
+        task_id: str,
+        expected_generation: int | None = None,
+    ) -> AsyncIterator[tuple[str, int, TaskWorkspace]]:
+        """Hold the storage fence while validating and exposing a clean snapshot.
+
+        Child bootstrap callers use this scope to close the gap between a
+        stable-parent check and creation of the child Worktree.  The yielded
+        ``(HEAD, generation, workspace)`` remains bound to the same manager
+        object while the per-workspace storage fence is held.
+        """
+        async with self.workspace_storage_scope(workspace_id, task_id) as workspace:
+            if workspace.state not in {WorkspaceState.READY, WorkspaceState.RUNNING}:
+                raise WorkspaceError("workspace is not in a stable coding state")
+            if workspace.change_artifact_reservations:
+                raise WorkspaceError("workspace has an in-flight ChangeSet capture")
+            if expected_generation is not None and workspace.generation != expected_generation:
+                raise WorkspaceError("workspace generation is stale")
+            await self.verify_execution_root(workspace_id)
+            head = await self._workspace_git(workspace, "rev-parse", "HEAD")
+            if await self._workspace_diff_digest(workspace, base_sha=head) != hashlib.sha256(b"").hexdigest():
+                raise WorkspaceError("workspace has uncommitted changes")
+            yield head, workspace.generation, workspace
+
+    async def apply_verified_patch(
+        self,
+        workspace_id: str,
+        patch_path: Path,
+        patch_sha256: str,
+        patch_length: int,
+        *,
+        expected_head: str | None = None,
+        require_clean: bool = True,
+    ) -> None:
+        """Apply one authority-owned artifact through the Trusted Git gate."""
+        workspace = self._workspaces.get(workspace_id)
+        if workspace is None:
+            raise WorkspaceError("workspace not found")
+        if workspace.state in {
+            WorkspaceState.FAILED,
+            WorkspaceState.CANCELLED,
+            WorkspaceState.CLEANING,
+            WorkspaceState.CLEANED,
+        }:
+            raise WorkspaceError("workspace is not writable")
+        candidate = patch_path.absolute()
+        try:
+            if candidate.resolve(strict=True) != candidate:
+                raise WorkspaceError("patch artifact path is not canonical")
+            candidate.parent.resolve(strict=True).relative_to(self.root)
+            info = candidate.stat()
+        except WorkspaceError:
+            raise
+        except (OSError, ValueError) as exc:
+            raise WorkspaceError(
+                "patch artifact is outside the private authority root"
+            ) from exc
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise WorkspaceError("patch artifact is not a private regular file")
+        current_head = await self._workspace_git(workspace, "rev-parse", "HEAD")
+        if expected_head is not None and current_head != expected_head:
+            raise WorkspaceError("workspace HEAD changed before patch application")
+        if require_clean and await self._workspace_diff_digest(
+            workspace, base_sha=current_head
+        ) != hashlib.sha256(b"").hexdigest():
+            raise WorkspaceError("workspace is dirty before patch application")
+        try:
+            effect = GitEffect.apply_index_file(
+                repository_id=str(workspace.repository_root.resolve()),
+                patch_path=str(candidate),
+                patch_sha256=patch_sha256,
+                patch_length=patch_length,
+                required_operation="merge-apply",
+            )
+        except ValueError as exc:
+            raise WorkspaceError(str(exc)) from exc
+        await self._workspace_git(
+            workspace,
+            "apply",
+            "--index",
+            str(candidate),
+            effect=effect,
+        )
+
     async def mutate_with_storage_authority(
         self,
         workspace_id: str,
@@ -1577,8 +1698,15 @@ class WorkspaceManager:
                     workspace.state = WorkspaceState.FAILED
         return transition
 
-    async def build_changeset(self, workspace_id: str) -> ChangeSet:
-        """Capture a stable ChangeSet while holding the shared mutation fence."""
+    async def build_changeset(
+        self, workspace_id: str, *, base_sha: str | None = None
+    ) -> ChangeSet:
+        """Capture a stable ChangeSet while holding the shared mutation fence.
+
+        ``base_sha`` is a controlled publication seam.  It is accepted only
+        when it names the workspace's current HEAD; callers cannot use it to
+        reinterpret a stale worktree as a fresh ChangeSet.
+        """
         async with self._lock:
             workspace = self._workspaces.get(workspace_id)
             if workspace is None:
@@ -1586,9 +1714,13 @@ class WorkspaceManager:
         async with self._changeset_mutation_scope(
             workspace_id, f"changeset:{uuid.uuid4().hex}"
         ):
-            return await self._build_changeset_unfenced(workspace_id)
+            return await self._build_changeset_unfenced(
+                workspace_id, base_sha=base_sha
+            )
 
-    async def _build_changeset_unfenced(self, workspace_id: str) -> ChangeSet:
+    async def _build_changeset_unfenced(
+        self, workspace_id: str, *, base_sha: str | None = None
+    ) -> ChangeSet:
         async with self._lock:
             workspace = self._workspaces.get(workspace_id)
             if workspace is None:
@@ -1611,6 +1743,7 @@ class WorkspaceManager:
             ):
                 raise WorkspaceError("workspace ChangeSet artifact quota is exhausted")
             workspace.change_artifact_reservations += 1
+        changeset_base = base_sha or workspace.base_sha
         index_file = workspace.worktree_path.parent / f".changeset-index-{uuid.uuid4().hex}"
         artifact_path: Path | None = None
         artifact_registered = False
@@ -1618,12 +1751,17 @@ class WorkspaceManager:
         authority_generation = workspace.authority_generation
         git_identity = workspace.git_identity
         try:
+            current_head = await self._workspace_git(workspace, "rev-parse", "HEAD")
+            if current_head != changeset_base:
+                raise WorkspaceError("ChangeSet base SHA is stale")
             if git_identity is None:
                 raise WorkspaceError("TaskWorkspace Git identity is missing")
             await self._assert_changeset_snapshot(
                 workspace, authority_generation, git_identity
             )
-            await self._prepare_raw_changeset_index(workspace, index_file)
+            await self._prepare_raw_changeset_index(
+                workspace, index_file, base_sha=changeset_base
+            )
             names_raw = await self._workspace_git_bytes_limited(
                 workspace,
                 "diff",
@@ -1632,7 +1770,7 @@ class WorkspaceManager:
                 "--no-textconv",
                 "--name-only",
                 "-z",
-                workspace.base_sha,
+                changeset_base,
                 max_bytes=MAX_CHANGESET_NAMES_BYTES,
                 index_file=index_file,
             )
@@ -1655,7 +1793,7 @@ class WorkspaceManager:
                 "--no-ext-diff",
                 "--no-textconv",
                 "--stat",
-                workspace.base_sha,
+                changeset_base,
                 max_bytes=MAX_CHANGESET_STAT_BYTES,
                 index_file=index_file,
             )
@@ -1667,7 +1805,7 @@ class WorkspaceManager:
                 "--no-ext-diff",
                 "--no-textconv",
                 "--binary",
-                workspace.base_sha,
+                changeset_base,
                 destination=artifact_path,
                 max_bytes=MAX_CHANGESET_BYTES,
                 index_file=index_file,
@@ -1682,6 +1820,7 @@ class WorkspaceManager:
                         "workspace ChangeSet artifact byte quota is exhausted"
                     )
                 workspace.change_artifacts.add(artifact_path)
+                workspace.change_artifact_files[artifact_path] = changed_files
                 workspace.change_artifact_bytes += stream.byte_length
                 artifact_registered = True
             await self._assert_changeset_snapshot(
@@ -1707,7 +1846,7 @@ class WorkspaceManager:
             changeset = ChangeSet.create(
                 id=artifact_path.stem,
                 workspace_id=workspace_id,
-                base_sha=workspace.base_sha,
+                base_sha=changeset_base,
                 head_sha=None,
                 patch=patch,
                 diff_stat=stat_raw.decode("utf-8", errors="replace"),
@@ -1753,6 +1892,25 @@ class WorkspaceManager:
         )
         return data.decode("utf-8", errors="replace")
 
+    def changeset_artifact_files(
+        self, workspace_id: str, artifact_path: Path
+    ) -> tuple[str, ...]:
+        """Return the manager-captured paths for one live artifact.
+
+        The mapping is intentionally owned by ``WorkspaceManager`` and is
+        available only while the producing workspace is live.  Callers cannot
+        register arbitrary paths; ``build_changeset`` records the Git-derived
+        list at the same time it registers the bounded artifact.
+        """
+        workspace = self._workspaces.get(workspace_id)
+        if workspace is None:
+            raise WorkspaceError("workspace not found")
+        candidate = artifact_path.absolute()
+        try:
+            return workspace.change_artifact_files[candidate]
+        except KeyError as exc:
+            raise WorkspaceError("changeset artifact is not owned by workspace") from exc
+
     async def export_changeset_artifact(
         self, workspace_id: str, changeset: ChangeSet, destination: Path
     ) -> None:
@@ -1791,14 +1949,55 @@ class WorkspaceManager:
                 workspace_id, changeset, message
             )
 
+    async def commit_current_changeset(
+        self,
+        workspace_id: str,
+        changeset: ChangeSet,
+        message: str,
+        *,
+        expected_head: str,
+        expected_generation: int,
+    ) -> str:
+        """Commit a ChangeSet against a parent HEAD with a generation CAS.
+
+        Normal child commits retain the historical ``commit_in_worktree``
+        behavior.  Parent publication uses this explicit seam so a merge
+        cannot silently commit on a newer parent branch or generation.
+        """
+        async with self._changeset_mutation_scope(
+            workspace_id, f"publish:{uuid.uuid4().hex}"
+        ):
+            workspace = self._workspaces.get(workspace_id)
+            if workspace is None or changeset.workspace_id != workspace_id:
+                raise WorkspaceError("workspace or changeset not found")
+            if workspace.generation != expected_generation:
+                raise WorkspaceError("parent workspace generation changed")
+            return await self._commit_in_worktree_unfenced(
+                workspace_id,
+                changeset,
+                message,
+                expected_head=expected_head,
+                advance_generation=True,
+            )
+
     async def _commit_in_worktree_unfenced(
-        self, workspace_id: str, changeset: ChangeSet, message: str
+        self,
+        workspace_id: str,
+        changeset: ChangeSet,
+        message: str,
+        *,
+        expected_head: str | None = None,
+        advance_generation: bool = False,
     ) -> str:
         workspace = self._workspaces.get(workspace_id)
         if workspace is None or changeset.workspace_id != workspace_id:
             raise WorkspaceError("workspace or changeset not found")
         current_head = await self._workspace_git(workspace, "rev-parse", "HEAD")
-        current_digest = await self._workspace_diff_digest(workspace)
+        if expected_head is not None and current_head != expected_head:
+            raise WorkspaceError("workspace HEAD changed; approval is stale")
+        current_digest = await self._workspace_diff_digest(
+            workspace, base_sha=changeset.base_sha
+        )
         if current_head != changeset.base_sha or current_digest != changeset.content_hash:
             raise WorkspaceError("changeset content changed; approval is stale")
 
@@ -1806,10 +2005,10 @@ class WorkspaceManager:
         await self._workspace_git(
             workspace,
             "read-tree",
-            workspace.base_sha,
+            changeset.base_sha,
             effect=GitEffect.read_tree(
                 repository_id=repository_id,
-                treeish=workspace.base_sha,
+                treeish=changeset.base_sha,
                 required_operation="index",
             ),
         )
@@ -1854,7 +2053,7 @@ class WorkspaceManager:
             object_id, mode = await self._hash_workspace_entry(
                 workspace, safe_relative, info
             )
-            if len(object_id) != len(workspace.base_sha) or any(
+            if len(object_id) != len(changeset.base_sha) or any(
                 character not in "0123456789abcdef" for character in object_id
             ):
                 raise WorkspaceError("Git returned an object id for the wrong repository format")
@@ -1914,7 +2113,15 @@ class WorkspaceManager:
                 required_operation="workspace",
             ),
         )
-        return await self._workspace_git(workspace, "rev-parse", "HEAD")
+        committed_head = await self._workspace_git(workspace, "rev-parse", "HEAD")
+        workspace.head_sha = committed_head
+        if advance_generation:
+            async with self._lock:
+                current = self._workspaces.get(workspace_id)
+                if current is not workspace:
+                    raise WorkspaceError("TaskWorkspace identity changed after commit")
+                current.generation += 1
+        return committed_head
 
     async def cleanup(self, workspace_id: str, *, force: bool = False) -> WorkspaceTransition:
         """Clean up a workspace worktree.
@@ -2027,18 +2234,19 @@ class WorkspaceManager:
                     # task ref.  Delete it with the last known commit as a CAS so
                     # cleanup cannot erase a ref that advanced outside this
                     # workspace owner.
+                    cleanup_head = workspace.head_sha or workspace.base_sha
                     await self._git(
                         workspace.repository_root,
                         "update-ref",
                         "-d",
                         _safe_branch_ref(workspace.branch_name),
-                        workspace.base_sha,
+                        cleanup_head,
                         authority_grant=self._workspace_authority(workspace, "git.cleanup-ref"),
                         effect=GitEffect.update_ref(
                             repository_id=str(workspace.repository_root.resolve()),
                             ref_name=_safe_branch_ref(workspace.branch_name),
                             new_oid=None,
-                            expected_old_oid=workspace.base_sha,
+                            expected_old_oid=cleanup_head,
                             delete=True,
                             required_operation="cleanup-ref",
                         ),
@@ -2053,6 +2261,7 @@ class WorkspaceManager:
                         raise WorkspaceError("changeset artifact escaped its authority root")
                     artifact.unlink(missing_ok=True)
                 workspace.change_artifacts.clear()
+                workspace.change_artifact_files.clear()
                 workspace.change_artifact_bytes = 0
             except (OSError, WorkspaceError):
                 workspace.state = WorkspaceState.FAILED

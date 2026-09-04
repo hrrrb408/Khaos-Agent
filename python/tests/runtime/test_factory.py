@@ -32,6 +32,8 @@ async def test_factory_wires_office_and_coding_runtime(tmp_path):
     assert coding.loop.context_engine is coding.context_engine
     assert isinstance(coding.loop.completion_controller, CompletionProposalController)
     assert isinstance(coding.loop.completion_recovery, CompletionRecoveryService)
+    assert coding.loop.parallel_subagent_coordinator is coding.parallel_subagent_coordinator
+    assert coding.parallel_subagent_coordinator is not None
     assert coding.new_verify_fix_loop() is not coding.new_verify_fix_loop()
     await db.close()
 

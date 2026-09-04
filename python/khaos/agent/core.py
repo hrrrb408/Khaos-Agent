@@ -355,6 +355,7 @@ class AgentLoop:
         edit_transaction_service=None,
         verification_coordinator=None,
         context_engine=None,
+        parallel_subagent_coordinator=None,
     ):
         self.config = config
         self.mode_manager = mode_manager
@@ -389,6 +390,10 @@ class AgentLoop:
         # Execution remains owned by ExecutionService and completion remains
         # owned by the existing trusted provider plus CompletionGate.
         self.verification_coordinator = verification_coordinator
+        # M8.5: parent-only thin orchestration seam.  Child workspaces,
+        # budgets, merge CAS, verification, and completion remain owned by
+        # their existing services; the loop only exposes the composed port.
+        self.parallel_subagent_coordinator = parallel_subagent_coordinator
         # M8.4: final context selection/serialization owner.  This service is
         # optional for direct legacy/test constructions; the runtime factory
         # wires it for the normal path so the old builder is not a second
@@ -507,6 +512,38 @@ class AgentLoop:
             self.execution_service = ExecutionService(
                 UnsupportedBackend(), runtime_profile=self.runtime_profile
             )
+
+    def _require_parallel_parent(self) -> tuple[Any, Any]:
+        """Return the parent workspace and M8.5 coordinator, fail-closed."""
+        if self.delegated_execution_context is not None:
+            raise PermissionError("delegated children cannot create parallel children")
+        coordinator = self.parallel_subagent_coordinator
+        if coordinator is None:
+            raise RuntimeError("parallel subagent coordinator is not configured")
+        workspace = self.active_workspace
+        if workspace is None:
+            raise PermissionError("parallel subagents require an active parent workspace")
+        active_task_id = self._active_task_id or self.task_id
+        if active_task_id is not None and workspace.task_id != active_task_id:
+            raise PermissionError("active workspace is not bound to the parent task")
+        return coordinator, workspace
+
+    async def run_parallel_subagents(
+        self,
+        assignments: tuple[Any, ...],
+        worker: Any,
+    ) -> tuple[Any, ...]:
+        """Run bounded child assignments from the active parent workspace."""
+        coordinator, workspace = self._require_parallel_parent()
+        return await coordinator.run_parallel(workspace, assignments, worker)
+
+    async def merge_parallel_subagents(
+        self,
+        assignments: tuple[Any, ...],
+    ) -> tuple[Any, Any]:
+        """Trigger deterministic child merge through the composed coordinator."""
+        coordinator, workspace = self._require_parallel_parent()
+        return await coordinator.merge(workspace, assignments)
 
     @staticmethod
     def _turn_context_digest(messages: list[Message]) -> str:
@@ -1190,6 +1227,9 @@ class AgentLoop:
                         ),
                         "subagent_control_coordinator": getattr(
                             self, "subagent_control_coordinator", None
+                        ),
+                        "parallel_subagent_coordinator": getattr(
+                            self, "parallel_subagent_coordinator", None
                         ),
                     },
                 }
