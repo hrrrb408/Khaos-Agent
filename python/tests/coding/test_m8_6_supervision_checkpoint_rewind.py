@@ -237,8 +237,9 @@ async def test_pause_resume_cancel_are_durable_idempotent_and_cooperative(tmp_pa
             principal_id=owner["principal_id"], project_id=owner["project_id"],
         ))
         paused = None
-        for _ in range(20):
-            await asyncio.sleep(0)
+        for _ in range(100):
+            # Give the cooperative runtime enough scheduler time on slower hosts.
+            await asyncio.sleep(0.01)
             paused = await service.control.repository.get_control(
                 owner["task_id"], principal_id=owner["principal_id"],
                 project_id=owner["project_id"],
@@ -507,6 +508,11 @@ def _model_result(
     )
 
 
+# These fixture tests exercise SafeWorkspaceFS-backed M8.2 filesystem effects.
+# Windows intentionally fails closed when POSIX dirfd/no-follow support is
+# unavailable; the Windows applicability contract is covered by
+# test_windows_fail_closed.py.
+@pytest.mark.posix_host
 @pytest.mark.asyncio
 async def test_checkpoint_rewind_uses_edit_transaction_and_preserves_unowned_files(tmp_path: Path):
     worktree = tmp_path / "worktree"
@@ -591,6 +597,7 @@ async def test_checkpoint_rewind_uses_edit_transaction_and_preserves_unowned_fil
         await db.close()
 
 
+@pytest.mark.posix_host
 @pytest.mark.asyncio
 async def test_rewind_rejects_uncommitted_drift_before_edit_effect(tmp_path: Path):
     worktree = tmp_path / "worktree"
