@@ -1,7 +1,6 @@
 """M4 Batch 3.0.1 durability, no-replace and recovery closure matrix."""
 from __future__ import annotations
 
-import asyncio
 import os
 import sqlite3
 import threading
@@ -14,18 +13,25 @@ import pytest
 
 pytestmark = pytest.mark.posix_host
 
-from test_m4_batch2_8_boot_scope_closure import _real_runtime
-from test_m4_batch3_0_workspace_mutation import (
-    _apply, _authorize, _bundle, _hash, _plan, _setup, _workspace,
-)
 from khaos.coding.planning.execution_models import (
-    ExecutionRunStatus, PlanExecutionRun, PlannedEditOperation, PlannedFileEdit,
+    ExecutionRunStatus,
+    PlanExecutionRun,
+    PlannedEditOperation,
+    PlannedFileEdit,
 )
-from khaos.coding.planning.git_state import GitStateSnapshot
 from khaos.coding.planning.safe_workspace_path import (
-    SafeParentDirectory, WorkspacePathHandle,
+    SafeParentDirectory,
+    WorkspacePathHandle,
 )
 from khaos.coding.planning.workspace_mutation import WorkspaceMutationError
+from test_m4_batch2_8_boot_scope_closure import _real_runtime
+from test_m4_batch3_0_workspace_mutation import (
+    _apply,
+    _bundle,
+    _hash,
+    _setup,
+    _workspace,
+)
 
 
 def _operation_edit(tmp_path, operation):
@@ -182,14 +188,18 @@ def test_rename_destination_race_is_true_no_replace(tmp_path, monkeypatch):
     edit = _operation_edit(tmp_path, PlannedEditOperation.RENAME)
     runtime, workspace, plan, authorization = _setup(tmp_path, (edit,))
     ready = threading.Event(); done = threading.Event()
-    original = os.link
+    original = WorkspacePathHandle._rename_no_replace
 
-    def racing_link(src, dst, **kwargs):
+    def racing_rename(source_parent_fd, src, destination_parent_fd, dst):
         if dst == "b.txt":
             ready.set(); assert done.wait(2)
-        return original(src, dst, **kwargs)
+        return original(source_parent_fd, src, destination_parent_fd, dst)
 
-    monkeypatch.setattr("khaos.coding.planning.safe_workspace_path.os.link", racing_link)
+    monkeypatch.setattr(
+        WorkspacePathHandle,
+        "_rename_no_replace",
+        staticmethod(racing_rename),
+    )
     competitor = threading.Thread(target=lambda: (
         ready.wait(2), (workspace.worktree_path / "b.txt").write_text("competitor"), done.set()
     ))
@@ -210,7 +220,7 @@ def test_dirfd_rejects_parent_or_target_symlink_swap(tmp_path, monkeypatch, swap
         "e1", "s1", PlannedEditOperation.UPDATE, "dir/a.txt",
         expected_content_hash=_hash("old"), new_content="new",
     )
-    runtime, workspace, plan, authorization = _setup(tmp_path, (edit,))
+    runtime, _, plan, authorization = _setup(tmp_path, (edit,))
     if swap == "parent":
         original = SafeParentDirectory.revalidate; fired = False
         def revalidate(parent):
@@ -317,7 +327,7 @@ def test_rollback_does_not_destroy_third_party_content(tmp_path, monkeypatch, op
 
 def test_scoped_recovery_does_not_clear_unrelated_poison(tmp_path):
     runtime, _, manager, _ = _real_runtime(tmp_path)
-    workspace = _workspace(tmp_path, manager)
+    _workspace(tmp_path, manager)
     runtime.mutation_fence.poison("ws1", "lease-release", owner="lease:l1")
     runtime._store.add_workspace_poison_scope("ws1", owner="lease:l1", reason="lease-release")
     run_id = f"per_{uuid.uuid4().hex}"; now = time.time()

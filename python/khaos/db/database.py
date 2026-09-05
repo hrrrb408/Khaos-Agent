@@ -25,12 +25,14 @@ from khaos.agent.control.recovery_gate_repository import RecoveryGateRepository
 from khaos.agent.control.recovery_repository import RecoveryDecisionRepository
 from khaos.agent.control.state_repository import AgentControlStateRepository
 from khaos.agent.core import Message
+from khaos.coding.checkpoints.repository import CheckpointRepository
 from khaos.coding.planning.repository import PlanRevisionRepository
 from khaos.coding.planning.step_execution_repository import PlanStepExecutionRepository
 from khaos.coding.planning.tool_route_repository import PlanToolRouteRepository
 from khaos.coding.planning.verification_assessment_repository import (
     VerificationAssessmentRepository,
 )
+from khaos.coding.verification.evidence import VerificationObservationStore
 from khaos.db.connection import (
     READER_DRAIN_TIMEOUT,
     DatabaseClosingError,  # noqa: F401 - compatibility export
@@ -41,6 +43,8 @@ from khaos.db.connection import (
 )
 from khaos.evaluation.repository import CapabilityEvaluationRepository
 from khaos.subagents.assignment import SubAgentAssignmentRepository
+from khaos.subagents.repository import ParallelSubagentRepository
+from khaos.supervision.repository import TaskSupervisionRepository
 
 # Compatibility name for released tests and integrations.  The lifecycle
 # owner is ``db.connection.READER_DRAIN_TIMEOUT``; this alias must not become
@@ -278,7 +282,11 @@ class Database:
         self._plan_step_execution_repository = PlanStepExecutionRepository(self)
         self._subagent_assignment_repository = SubAgentAssignmentRepository(self)
         self._verification_assessment_repository = VerificationAssessmentRepository(self)
+        self._autonomous_verification_repository = VerificationObservationStore(self)
         self._capability_evaluation_repository = CapabilityEvaluationRepository(self)
+        self._parallel_subagent_repository = ParallelSubagentRepository(self)
+        self._supervision_repository = TaskSupervisionRepository(self)
+        self._checkpoint_repository = CheckpointRepository(self)
         # F-01: Per-domain locks remain for logical serialization (e.g. two
         # concurrent permission grants must not race on epoch computation).
         self._operation_approval_lock = asyncio.Lock()
@@ -361,6 +369,26 @@ class Database:
     def verification_assessment_repository(self) -> VerificationAssessmentRepository:
         """Return the owner-scoped trusted-verification assessment ledger."""
         return self._verification_assessment_repository
+
+    @property
+    def autonomous_verification_repository(self) -> VerificationObservationStore:
+        """Return the append-only M8.3 verification observation ledger."""
+        return self._autonomous_verification_repository
+
+    @property
+    def parallel_subagent_repository(self) -> ParallelSubagentRepository:
+        """Return the durable M8.5 child/merge projection owner."""
+        return self._parallel_subagent_repository
+
+    @property
+    def supervision_repository(self) -> TaskSupervisionRepository:
+        """Return the durable M8.6 supervision event/projection owner."""
+        return self._supervision_repository
+
+    @property
+    def checkpoint_repository(self) -> CheckpointRepository:
+        """Return the durable M8.6 checkpoint/rewind persistence owner."""
+        return self._checkpoint_repository
 
     @property
     def capability_evaluation_repository(self) -> CapabilityEvaluationRepository:
@@ -995,6 +1023,41 @@ class Database:
             self._conn = _MigrationConnection(conn)
             try:
                 await self._apply_v26_upgrades()
+            finally:
+                self._conn = original_conn
+            # M8.0: Coding capability evaluation is a separate append-only
+            # experiment ledger.  It is descriptive evidence only and is not
+            # consumed by any control-plane authority.
+            original_conn = self._conn
+            self._conn = _MigrationConnection(conn)
+            try:
+                await self._apply_v27_upgrades()
+            finally:
+                self._conn = original_conn
+            # M8.3: persist bounded autonomous-verification plan/result
+            # observations.  This ledger is descriptive only and is not a
+            # completion, permission, approval, or execution authority.
+            original_conn = self._conn
+            self._conn = _MigrationConnection(conn)
+            try:
+                await self._apply_v28_upgrades()
+            finally:
+                self._conn = original_conn
+            # M8.5: persist immutable parallel assignments, isolated child
+            # Worktree bindings, structured results, deterministic merge
+            # records, and append-only lifecycle events.
+            original_conn = self._conn
+            self._conn = _MigrationConnection(conn)
+            try:
+                await self._apply_v29_upgrades()
+            finally:
+                self._conn = original_conn
+            # M8.6: persist canonical supervision events, cooperative control
+            # state, immutable checkpoints, and rewind records.
+            original_conn = self._conn
+            self._conn = _MigrationConnection(conn)
+            try:
+                await self._apply_v30_upgrades()
             finally:
                 self._conn = original_conn
             # Batch 6.4 §10.4: backfill the historical ledger rows (v1–v5)
@@ -1754,6 +1817,42 @@ class Database:
         """Add the immutable M7.9 capability-evaluation observation ledger."""
         conn = await self._require_conn()
         migration_path = _MIGRATIONS_DIR / "0026_capability_evaluations.sql"
+        await self._execute_schema_statements(
+            conn,
+            migration_path.read_text(encoding="utf-8"),
+        )
+
+    async def _apply_v27_upgrades(self) -> None:
+        """Add the isolated M8.0 Coding evaluation run ledger."""
+        conn = await self._require_conn()
+        migration_path = _MIGRATIONS_DIR / "0027_coding_evaluation_runs.sql"
+        await self._execute_schema_statements(
+            conn,
+            migration_path.read_text(encoding="utf-8"),
+        )
+
+    async def _apply_v28_upgrades(self) -> None:
+        """Add the append-only M8.3 verification observation ledger."""
+        conn = await self._require_conn()
+        migration_path = _MIGRATIONS_DIR / "0028_autonomous_verification_runs.sql"
+        await self._execute_schema_statements(
+            conn,
+            migration_path.read_text(encoding="utf-8"),
+        )
+
+    async def _apply_v29_upgrades(self) -> None:
+        """Add the durable M8.5 parallel-subagent control projections."""
+        conn = await self._require_conn()
+        migration_path = _MIGRATIONS_DIR / "0029_parallel_subagent_worktrees.sql"
+        await self._execute_schema_statements(
+            conn,
+            migration_path.read_text(encoding="utf-8"),
+        )
+
+    async def _apply_v30_upgrades(self) -> None:
+        """Add the durable M8.6 supervision/checkpoint control plane."""
+        conn = await self._require_conn()
+        migration_path = _MIGRATIONS_DIR / "0030_coding_supervision_checkpoint_rewind.sql"
         await self._execute_schema_statements(
             conn,
             migration_path.read_text(encoding="utf-8"),

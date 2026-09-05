@@ -1,7 +1,10 @@
 import subprocess
 from pathlib import Path
 
+import pytest
 from khaos.coding.workspace.recovery import discover_orphans
+
+pytestmark = pytest.mark.requires_trusted_git
 
 
 def test_dirty_orphan_requires_recovery(tmp_path: Path):

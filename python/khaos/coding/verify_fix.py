@@ -140,8 +140,98 @@ class VerifyFixLoop:
         if parsed is None:
             return None
 
+        return self._record_observation(
+            passed=parsed["passed"],
+            failed=parsed["failed"],
+            errors=parsed["errors"],
+            failed_cases=tuple(parsed["failed_cases"]),
+        )
+
+    def observe_autonomous_run(self, run: Any) -> VerificationObservation | None:
+        """Record an M8.3 run in this same repair strategy layer.
+
+        The autonomous planner has richer typed statuses than the legacy
+        ``test_run`` tool.  This adapter reduces them to the existing bounded
+        observation shape so repair budgets, no-progress detection, and
+        recovery remain owned by one loop rather than creating a second
+        controller in ``AgentLoop``.
+        """
+        status = getattr(getattr(run, "status", None), "value", getattr(run, "status", None))
+        if not isinstance(status, str) or status not in {
+            "passed",
+            "failed",
+            "timed_out",
+            "cancelled",
+            "stale",
+            "infrastructure_error",
+            "unknown",
+        }:
+            return None
+        required = getattr(run, "required_count", 0)
+        passed = getattr(run, "passed_count", 0)
+        if type(required) is not int or required < 0:
+            required = 0
+        if type(passed) is not int or passed < 0:
+            passed = 0
+        passed = min(passed, required)
+        failed = 0 if status == "passed" else max(1, required - passed)
+        errors = 0 if status in {"passed", "failed"} else 1
+        failed_cases: list[dict[str, Any]] = []
+        for diagnostic in tuple(getattr(run, "diagnostics", ()) or ())[:64]:
+            category = getattr(getattr(diagnostic, "category", None), "value", "verification")
+            path = getattr(diagnostic, "path", None)
+            line = getattr(diagnostic, "line", None)
+            message = getattr(diagnostic, "message", "")
+            name = f"{category}:{path or 'verification'}"
+            failed_cases.append(
+                {
+                    "name": str(name)[:512],
+                    "file": path if isinstance(path, str) else None,
+                    "line": line if type(line) is int and line > 0 else None,
+                    "error": str(message)[:1024],
+                }
+            )
+        for evidence in tuple(getattr(run, "evidence", ()) or ())[:64]:
+            evidence_status = getattr(
+                getattr(evidence, "status", None), "value", getattr(evidence, "status", None)
+            )
+            if evidence_status == "passed":
+                continue
+            check_id = getattr(evidence, "check_id", "verification-check")
+            failed_cases.append(
+                {
+                    "name": str(check_id)[:512],
+                    "file": None,
+                    "line": None,
+                    "error": str(evidence_status or status)[:1024],
+                }
+            )
+        if status != "passed" and not failed_cases:
+            failed_cases.append(
+                {
+                    "name": "autonomous-verification",
+                    "file": None,
+                    "line": None,
+                    "error": status,
+                }
+            )
+        return self._record_observation(
+            passed=passed,
+            failed=failed,
+            errors=errors,
+            failed_cases=tuple(failed_cases[:64]),
+        )
+
+    def _record_observation(
+        self,
+        *,
+        passed: int,
+        failed: int,
+        errors: int,
+        failed_cases: tuple[dict[str, Any], ...],
+    ) -> VerificationObservation:
         observation_number = len(self._verification_history) + 1
-        if not parsed["failed"] and not parsed["errors"]:
+        if not failed and not errors:
             state = VerificationState.PASSED
         elif self._attempt_count >= self.max_fix_attempts:
             state = VerificationState.EXHAUSTED_FAILURE
@@ -149,10 +239,10 @@ class VerifyFixLoop:
             state = VerificationState.FAILING
         observation = VerificationObservation(
             observation=observation_number,
-            passed=parsed["passed"],
-            failed=parsed["failed"],
-            errors=parsed["errors"],
-            failed_cases=tuple(parsed["failed_cases"]),
+            passed=passed,
+            failed=failed,
+            errors=errors,
+            failed_cases=failed_cases,
             state=state,
         )
         self._verification_history.append(observation)
@@ -222,16 +312,12 @@ class VerifyFixLoop:
         if self._attempt_count >= self.max_fix_attempts:
             return ""
 
-        self._attempt_count += 1
-        repair = RepairAttempt(
-            attempt=self._attempt_count,
-            observation=observation.observation,
-            failure_signature=observation.failure_signature,
-        )
-        self._repair_history.append(repair)
+        attempt = self.admit_repair(observation)
+        if attempt is None:
+            return ""
 
         lines: list[str] = [
-            f"## 测试失败（第 {self._attempt_count}/{self.max_fix_attempts} 次修复尝试）",
+            f"## 测试失败（第 {attempt}/{self.max_fix_attempts} 次修复尝试）",
             "",
             "以下测试失败：",
         ]
@@ -262,6 +348,35 @@ class VerifyFixLoop:
             observation.observation,
         )
         return message
+
+    def admit_repair(self, observation: VerificationObservation) -> int | None:
+        """Consume one repair attempt for any verification observation.
+
+        M8.3 uses this exact budget boundary while supplying its own typed,
+        bounded diagnostic context.  Returning ``None`` means the failure is
+        observed but no further automatic mutation may be requested.
+        """
+        if not isinstance(observation, VerificationObservation):
+            return None
+        if not observation.failed and not observation.errors:
+            return None
+        if self._attempt_count >= self.max_fix_attempts:
+            return None
+        self._attempt_count += 1
+        self._repair_history.append(
+            RepairAttempt(
+                attempt=self._attempt_count,
+                observation=observation.observation,
+                failure_signature=observation.failure_signature,
+            )
+        )
+        logger.info(
+            "verify-fix repair attempt %d/%d issued for observation %d",
+            self._attempt_count,
+            self.max_fix_attempts,
+            observation.observation,
+        )
+        return self._attempt_count
 
     @property
     def verification_state(self) -> VerificationState:

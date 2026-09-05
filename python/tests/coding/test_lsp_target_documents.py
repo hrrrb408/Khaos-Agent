@@ -16,6 +16,7 @@ Also verifies:
 from __future__ import annotations
 
 import asyncio
+import os
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -234,6 +235,63 @@ def _make_doc(path: str, text: str, *, generation: int = 1, indexed: bool = True
         generation=generation,
         indexed=indexed,
     )
+
+
+@pytest.mark.posix_host
+class TestDiskWorkspaceDocumentProviderBoundary:
+    """The disk provider must use the bounded workspace read capability."""
+
+    async def test_internal_document_is_bounded_and_generation_bound(
+        self, tmp_path: Path
+    ) -> None:
+        root = tmp_path / "workspace"
+        root.mkdir()
+        source = root / "app.py"
+        content = "def run(): pass\n"
+        source.write_text(content, encoding="utf-8")
+        conn = _make_db()
+        _insert_code_file(conn, "r", "app.py", generation=3)
+
+        document = await DiskWorkspaceDocumentProvider(conn).load_document(
+            "r", root, "app.py"
+        )
+
+        assert document is not None
+        assert document.path == "app.py"
+        assert document.text == content
+        assert document.generation == 3
+        assert document.indexed is True
+
+    @pytest.mark.skipif(os.name != "posix", reason="symlink semantics are POSIX-only")
+    async def test_symlink_target_is_not_read_as_a_workspace_document(
+        self, tmp_path: Path
+    ) -> None:
+        root = tmp_path / "workspace"
+        root.mkdir()
+        outside = tmp_path / "outside.py"
+        outside.write_text("SECRET = True\n", encoding="utf-8")
+        (root / "link.py").symlink_to(outside)
+        conn = _make_db()
+
+        document = await DiskWorkspaceDocumentProvider(conn).load_document(
+            "r", root, "link.py"
+        )
+
+        assert document is None
+
+    async def test_oversized_document_is_rejected_before_unbounded_read(
+        self, tmp_path: Path
+    ) -> None:
+        root = tmp_path / "workspace"
+        root.mkdir()
+        (root / "large.py").write_bytes(b"x" * (2 * 1024 * 1024 + 1))
+        conn = _make_db()
+
+        document = await DiskWorkspaceDocumentProvider(conn).load_document(
+            "r", root, "large.py"
+        )
+
+        assert document is None
 
 
 # ---------------------------------------------------------------------------

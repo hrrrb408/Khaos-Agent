@@ -6,12 +6,14 @@ import hashlib
 import os
 import stat
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Self
 
 from khaos.coding.planning.safe_workspace_path import (
+    MutationObjectIdentity,
     SafePathError,
     WorkspacePathHandle,
 )
@@ -187,7 +189,9 @@ class SafeWorkspaceFS:
                 )
             descriptor = os.open(
                 parent.leaf,
-                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_BINARY", 0),
                 dir_fd=parent.parent_fd,
             )
             try:
@@ -263,7 +267,9 @@ class SafeWorkspaceFS:
                 )
             descriptor = os.open(
                 parent.leaf,
-                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_BINARY", 0),
                 dir_fd=parent.parent_fd,
             )
             recovery_path: Path | None = None
@@ -331,10 +337,14 @@ class SafeWorkspaceFS:
         if not snapshot.exists or snapshot.recovery_path is None:
             raise WorkspaceBoundaryError("rollback recovery file is unavailable")
         current = self.snapshot_file(target)
-        if current != expected or expected.identity is None:
+        if current != expected:
             raise WorkspaceBoundaryError("rollback target changed concurrently")
         recovery = snapshot.recovery_path
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_BINARY", 0)
+        )
         descriptor = os.open(recovery, flags)
         parent = self._parent(self.relative(target))
         temporary = ""
@@ -367,21 +377,42 @@ class SafeWorkspaceFS:
                 raise WorkspaceBoundaryError("rollback recovery digest mismatch")
             parent.revalidate()
             live = parent.lstat()
-            if live is None or (live.st_dev, live.st_ino) != expected.identity:
-                raise WorkspaceBoundaryError("rollback target identity changed")
-            self._handle._exchange(
-                parent.parent_fd, temporary, parent.leaf
-            )
-            replaced = os.stat(
-                temporary, dir_fd=parent.parent_fd, follow_symlinks=False
-            )
-            if (replaced.st_dev, replaced.st_ino) != expected.identity:
+            if expected.identity is None:
+                # A deleted file rolls back into a currently missing leaf.
+                # The exchange primitive deliberately requires an existing
+                # target, so publish the verified recovery temp with the same
+                # no-replace link primitive used by create.  The parent dirfd
+                # remains fixed for the entire check/publish sequence.
+                if live is not None:
+                    raise WorkspaceBoundaryError("rollback target reappeared")
+                os.link(
+                    temporary,
+                    parent.leaf,
+                    src_dir_fd=parent.parent_fd,
+                    dst_dir_fd=parent.parent_fd,
+                    follow_symlinks=False,
+                )
+                installed = parent.lstat()
+                if installed is None or not stat.S_ISREG(installed.st_mode):
+                    raise WorkspaceBoundaryError("rollback target identity missing")
+                os.unlink(temporary, dir_fd=parent.parent_fd)
+                temporary = ""
+            else:
+                if live is None or (live.st_dev, live.st_ino) != expected.identity:
+                    raise WorkspaceBoundaryError("rollback target identity changed")
                 self._handle._exchange(
                     parent.parent_fd, temporary, parent.leaf
                 )
-                raise WorkspaceBoundaryError("rollback exchange identity mismatch")
-            os.unlink(temporary, dir_fd=parent.parent_fd)
-            temporary = ""
+                replaced = os.stat(
+                    temporary, dir_fd=parent.parent_fd, follow_symlinks=False
+                )
+                if (replaced.st_dev, replaced.st_ino) != expected.identity:
+                    self._handle._exchange(
+                        parent.parent_fd, temporary, parent.leaf
+                    )
+                    raise WorkspaceBoundaryError("rollback exchange identity mismatch")
+                os.unlink(temporary, dir_fd=parent.parent_fd)
+                temporary = ""
             parent.fsync()
         finally:
             if temporary:
@@ -408,7 +439,8 @@ class SafeWorkspaceFS:
                 descriptor = os.open(
                     path,
                     os.O_WRONLY | os.O_CREAT | os.O_EXCL
-                    | getattr(os, "O_NOFOLLOW", 0),
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_BINARY", 0),
                     0o600,
                 )
                 return path, descriptor
@@ -487,8 +519,25 @@ class SafeWorkspaceFS:
         *,
         max_entries: int = DEFAULT_TREE_ENTRIES,
         max_depth: int = DEFAULT_TREE_DEPTH,
+        ignored_dirs: set[str] | None = None,
+        max_duration_seconds: float | None = None,
     ) -> list[tuple[str, bool]]:
         """Return safe regular files and directories below ``target``."""
+        if type(max_entries) is not int or max_entries <= 0:
+            raise ValueError("max_entries must be positive")
+        if type(max_depth) is not int or max_depth < 0:
+            raise ValueError("max_depth must be non-negative")
+        if max_duration_seconds is not None and (
+            type(max_duration_seconds) not in (int, float)
+            or max_duration_seconds <= 0
+        ):
+            raise ValueError("max_duration_seconds must be positive")
+        ignored = {str(name).casefold() for name in (ignored_dirs or set())}
+        deadline = (
+            time.monotonic() + float(max_duration_seconds)
+            if max_duration_seconds is not None
+            else None
+        )
         directory = self._open_directory(target)
         base = self._directory_relative(target)
         root_parts = tuple(base.split("/")) if base else ()
@@ -499,12 +548,22 @@ class SafeWorkspaceFS:
         observed = 0
         try:
             while stack:
+                if deadline is not None and time.monotonic() > deadline:
+                    raise WorkspaceBoundaryError(
+                        "directory traversal exceeds the duration limit"
+                    )
                 descriptor, prefix, depth = stack.pop()
                 try:
                     names = sorted(os.listdir(descriptor), key=str.casefold)
                     children: list[tuple[int, tuple[str, ...], int]] = []
                     for name in names:
+                        if deadline is not None and time.monotonic() > deadline:
+                            raise WorkspaceBoundaryError(
+                                "directory traversal exceeds the duration limit"
+                            )
                         if name.casefold() in PROTECTED_WORKSPACE_NAMES_CASEFOLD:
+                            continue
+                        if name.casefold() in ignored:
                             continue
                         observed += 1
                         if observed > max_entries:
@@ -754,6 +813,7 @@ class SafeWorkspaceFS:
         *,
         cancel_event: threading.Event | None = None,
         identity_out: list | None = None,
+        expected_identity: tuple[int, int, int] | None = None,
     ) -> None:
         """Move one validated file/tree atomically within the fixed root.
 
@@ -764,6 +824,12 @@ class SafeWorkspaceFS:
         H4: if ``identity_out`` is provided, the published destination's
         ``(st_dev, st_ino, st_mode)`` is appended inside the same dirfd
         critical section as the atomic rename.
+
+        ``expected_identity`` is used by recovery callers to bind the source
+        leaf to the object they previously published.  A mismatch fails
+        closed before the native no-replace rename; callers also verify the
+        resulting source identity after the move because no filesystem API
+        can compare an inode as part of the rename itself.
         """
         source_relative = self.relative(source)
         destination_relative = self.relative(destination)
@@ -773,6 +839,13 @@ class SafeWorkspaceFS:
             source_info = source_parent.lstat()
             if source_info is None:
                 raise FileNotFoundError(source_relative)
+            if expected_identity is not None and (
+                source_info.st_dev,
+                source_info.st_ino,
+            ) != expected_identity[:2]:
+                raise WorkspaceBoundaryError(
+                    "move source identity does not match expected published object"
+                )
             if destination_parent.lstat() is not None:
                 raise FileExistsError(destination_relative)
             if stat.S_ISREG(source_info.st_mode):
@@ -810,6 +883,13 @@ class SafeWorkspaceFS:
                 source_info.st_ino,
             ):
                 raise WorkspaceBoundaryError("move source identity changed")
+            if expected_identity is not None and (
+                current.st_dev,
+                current.st_ino,
+            ) != expected_identity[:2]:
+                raise WorkspaceBoundaryError(
+                    "move source identity changed before publish"
+                )
             # H1: the source identity is already validated above; ``rename``
             # preserves the inode, so ``current`` IS the published destina-
             # tion's identity.  Capture it now — no post-publish ``os.stat``
@@ -917,12 +997,16 @@ class SafeWorkspaceFS:
                 raise WorkspaceBoundaryError("copy source exceeds the byte limit")
             source_file = os.open(
                 name,
-                os.O_RDONLY | os.O_NOFOLLOW,
+                os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_BINARY", 0),
                 dir_fd=source_fd,
             )
             destination_file = os.open(
                 name,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | os.O_NOFOLLOW
+                | getattr(os, "O_BINARY", 0),
                 stat.S_IMODE(before.st_mode) & 0o666,
                 dir_fd=destination_fd,
             )
@@ -1070,6 +1154,7 @@ class SafeWorkspaceFS:
         *,
         mode: int = 0o600,
         cancel_event: threading.Event | None = None,
+        effect_callback: Callable[..., None] | None = None,
     ) -> None:
         relative = self.relative(target)
         parent = self._parent(relative)
@@ -1087,8 +1172,13 @@ class SafeWorkspaceFS:
                 selected_mode = mode & 0o666
         finally:
             parent.close()
-        def phase(*_args, **_kwargs) -> None:
-            return None
+        def phase(status: str, identity: object | None = None) -> None:
+            if (
+                status == "filesystem-applied"
+                and effect_callback is not None
+                and identity is not None
+            ):
+                effect_callback(identity)
 
         def before_publish() -> None:
             if cancel_event is not None and cancel_event.is_set():
@@ -1097,20 +1187,12 @@ class SafeWorkspaceFS:
         try:
             if expected_inode is None:
                 self._handle.create(
-                    relative,
-                    content,
-                    selected_mode,
-                    phase,
-                    before_publish,
+                    relative, content, selected_mode, phase, before_publish
                 )
             else:
                 self._handle.update(
-                    relative,
-                    content,
-                    selected_mode,
-                    expected_inode,
-                    phase,
-                    before_publish,
+                    relative, content, selected_mode, expected_inode,
+                    phase, before_publish,
                 )
         except (OSError, SafePathError) as exc:
             raise WorkspaceBoundaryError(str(exc)) from exc
@@ -1121,11 +1203,15 @@ class SafeWorkspaceFS:
         transform: Callable[[str], str],
         *,
         cancel_event: threading.Event | None = None,
+        effect_callback: Callable[..., None] | None = None,
     ) -> str:
         original = self.read_bytes(target).decode("utf-8")
         updated = transform(original)
         self.write_bytes(
-            target, updated.encode("utf-8"), cancel_event=cancel_event
+            target,
+            updated.encode("utf-8"),
+            cancel_event=cancel_event,
+            effect_callback=effect_callback,
         )
         return updated
 
@@ -1136,6 +1222,7 @@ class SafeWorkspaceFS:
         *,
         cancel_event: threading.Event | None = None,
         identity_out: list | None = None,
+        effect_callback: Callable[..., None] | None = None,
     ) -> int:
         source_relative = self.relative(source)
         relative = self.relative(destination)
@@ -1159,7 +1246,9 @@ class SafeWorkspaceFS:
                 )
             source_descriptor = os.open(
                 source_parent.leaf,
-                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_BINARY", 0),
                 dir_fd=source_parent.parent_fd,
             )
             temporary_descriptor, temporary = parent.temporary(mode=0o600)
@@ -1192,7 +1281,7 @@ class SafeWorkspaceFS:
                 # ``os.stat`` that could fail (and leave the published file
                 # with an empty identity_out and a no-op rollback) or race
                 # with a concurrent replacement of the destination path.
-                if identity_out is not None:
+                if identity_out is not None or effect_callback is not None:
                     temp_stat = os.fstat(temporary_descriptor)
                     pre_publish_identity = (
                         temp_stat.st_dev,
@@ -1231,6 +1320,16 @@ class SafeWorkspaceFS:
                 dst_dir_fd=parent.parent_fd,
                 follow_symlinks=False,
             )
+            published_identity = MutationObjectIdentity(
+                True,
+                pre_publish_identity[0],
+                pre_publish_identity[1],
+                "regular",
+                parent.identity[0],
+                parent.identity[1],
+            ) if pre_publish_identity is not None else None
+            if effect_callback is not None and published_identity is not None:
+                effect_callback(published_identity)
             os.unlink(temporary, dir_fd=parent.parent_fd)
             temporary = ""
             # H1: the published destination's identity was captured via
@@ -1254,7 +1353,13 @@ class SafeWorkspaceFS:
             source_parent.close()
             parent.close()
 
-    def move_file(self, source: str | Path, destination: str | Path) -> None:
+    def move_file(
+        self,
+        source: str | Path,
+        destination: str | Path,
+        *,
+        effect_callback: Callable[..., None] | None = None,
+    ) -> None:
         source_relative = self.relative(source)
         destination_relative = self.relative(destination)
         parent = self._parent(source_relative)
@@ -1270,7 +1375,15 @@ class SafeWorkspaceFS:
         try:
             self._handle.rename_no_replace(
                 source_relative, destination_relative, inode,
-                lambda *_args, **_kwargs: None,
+                lambda status, identity=None: (
+                    effect_callback(identity)
+                    if (
+                        status == "filesystem-applied"
+                        and effect_callback is not None
+                        and identity is not None
+                    )
+                    else None
+                ),
             )
         except (OSError, SafePathError) as exc:
             raise WorkspaceBoundaryError(str(exc)) from exc
@@ -1280,6 +1393,7 @@ class SafeWorkspaceFS:
         target: str | Path,
         *,
         expected: WorkspaceFileSnapshot,
+        effect_callback: Callable[..., None] | None = None,
     ) -> None:
         """Delete only the exact file state installed by this mutation."""
         if not expected.exists or expected.identity is None:
@@ -1306,7 +1420,15 @@ class SafeWorkspaceFS:
             self._handle.delete(
                 relative,
                 expected.identity[1],
-                lambda *_args, **_kwargs: None,
+                lambda status, identity=None: (
+                    effect_callback(identity)
+                    if (
+                        status == "filesystem-applied"
+                        and effect_callback is not None
+                        and identity is not None
+                    )
+                    else None
+                ),
             )
         except (OSError, SafePathError) as exc:
             raise WorkspaceBoundaryError(str(exc)) from exc
@@ -1461,7 +1583,11 @@ class SafeWorkspaceFS:
         # uses ``_rename_no_replace`` so the destination (the original
         # source) must not exist — which it cannot, since the original move
         # removed it.
-        self.move_path(target_relative, source_relative)
+        self.move_path(
+            target_relative,
+            source_relative,
+            expected_identity=expected_identity,
+        )
         return True
 
 

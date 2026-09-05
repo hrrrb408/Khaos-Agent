@@ -46,6 +46,7 @@ async def _eventually_dead(pid: int) -> bool:
 
 
 @pytest.mark.asyncio
+@pytest.mark.requires_trusted_git
 @pytest.mark.skipif(os.name != "posix", reason="process-group semantics are POSIX-only")
 async def test_execution_service_shutdown_terminates_parent_child_and_grandchild(tmp_path: Path):
     repository = _repo(tmp_path / "repo")

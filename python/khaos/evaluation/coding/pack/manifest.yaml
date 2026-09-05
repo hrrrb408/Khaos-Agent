@@ -1,0 +1,290 @@
+schema_version: 1
+manifest_id: m8-coding-capability-baseline
+version: 1
+scenarios:
+  - scenario_id: bugfix-go-counter
+    version: 1
+    kind: BUG_FIX
+    difficulty: medium
+    repository_fixture: bugfix-go-counter
+    user_prompt: Fix the counter so a failed decrement cannot make the balance negative, while preserving the public Go API and adding focused coverage.
+    languages: [go]
+    expected_files: [counter.go, counter_test.go]
+    forbidden_files: [.env, .khaos]
+    tags: [smoke, bug-fix, go]
+    oracle:
+      kind: COMPOSITE
+      children:
+        - kind: COMMAND
+          argv: [python3, .oracle-hidden/verify.py]
+          hidden_files: [verify.py]
+          network: none
+        - kind: DIFF
+          required_changed_files: [counter.go]
+          forbidden_changed_files: [.env]
+          min_changed_files: 1
+          max_changed_files: 3
+          max_insertions: 80
+          max_deletions: 40
+  - scenario_id: bugfix-python-cache
+    version: 1
+    kind: BUG_FIX
+    difficulty: easy
+    repository_fixture: bugfix-python-cache
+    user_prompt: Fix the cache lookup so stored falsey values such as 0, false, and an empty string are returned instead of being replaced by the default.
+    languages: [python]
+    expected_files: [src/cache.py]
+    forbidden_files: [.env, .khaos]
+    tags: [smoke, bug-fix, python]
+    oracle:
+      kind: COMPOSITE
+      children:
+        - kind: COMMAND
+          argv: [python3, .oracle-hidden/verify.py]
+          hidden_files: [verify.py]
+          network: none
+        - kind: DIFF
+          required_changed_files: [src/cache.py]
+          forbidden_changed_files: [.env]
+          min_changed_files: 1
+          max_changed_files: 3
+          max_insertions: 80
+          max_deletions: 40
+  - scenario_id: bugfix-typescript-config
+    version: 1
+    kind: BUG_FIX
+    difficulty: medium
+    repository_fixture: bugfix-typescript-config
+    user_prompt: Correct the TypeScript configuration reader so an explicit false value is not treated as missing, and preserve the exported API.
+    languages: [typescript]
+    expected_files: [src/config.ts]
+    forbidden_files: [.env, .khaos]
+    tags: [bug-fix, typescript]
+    oracle:
+      kind: COMPOSITE
+      children:
+        - kind: COMMAND
+          argv: [python3, .oracle-hidden/verify.py]
+          hidden_files: [verify.py]
+          network: none
+        - kind: DIFF
+          required_changed_files: [src/config.ts]
+          forbidden_changed_files: [.env]
+          min_changed_files: 1
+          max_changed_files: 3
+          max_insertions: 80
+          max_deletions: 40
+  - scenario_id: cross-language-python-go-contract
+    version: 1
+    kind: CROSS_LANGUAGE
+    difficulty: hard
+    repository_fixture: cross-language-python-go-contract
+    user_prompt: Align the Python client and Go server around the checked-in response contract, including the error field and stable integer status.
+    languages: [python, go]
+    expected_files: [contract.json, python/client.py, go/server.go]
+    forbidden_files: [.env, .khaos]
+    tags: [cross-language, python, go]
+    oracle:
+      kind: COMPOSITE
+      children:
+        - kind: COMMAND
+          argv: [python3, .oracle-hidden/verify.py]
+          hidden_files: [verify.py]
+          network: none
+        - kind: DIFF
+          required_changed_files: [python/client.py, go/server.go]
+          forbidden_changed_files: [.env]
+          min_changed_files: 2
+          max_changed_files: 4
+          max_insertions: 120
+          max_deletions: 80
+  - scenario_id: cross-language-typescript-go-config
+    version: 1
+    kind: CROSS_LANGUAGE
+    difficulty: hard
+    repository_fixture: cross-language-typescript-go-config
+    user_prompt: Make the TypeScript configuration client and Go configuration service agree on the versioned timeout and retry fields without changing the wire key names.
+    languages: [typescript, go]
+    expected_files: [contract.json, ts/client.ts, go/config.go]
+    forbidden_files: [.env, .khaos]
+    tags: [cross-language, typescript, go]
+    oracle:
+      kind: COMPOSITE
+      children:
+        - kind: COMMAND
+          argv: [python3, .oracle-hidden/verify.py]
+          hidden_files: [verify.py]
+          network: none
+        - kind: DIFF
+          required_changed_files: [ts/client.ts, go/config.go]
+          forbidden_changed_files: [.env]
+          min_changed_files: 2
+          max_changed_files: 4
+          max_insertions: 120
+          max_deletions: 80
+  - scenario_id: feature-python-index
+    version: 1
+    kind: FEATURE
+    difficulty: medium
+    repository_fixture: feature-python-index
+    user_prompt: Add a deterministic prefix index that supports insert and lookup, keeps insertion order for duplicate keys, and is exposed by the existing service.
+    languages: [python]
+    expected_files: [src/index.py, src/service.py]
+    forbidden_files: [.env, .khaos]
+    tags: [smoke, feature, python]
+    oracle:
+      kind: COMPOSITE
+      children:
+        - kind: COMMAND
+          argv: [python3, .oracle-hidden/verify.py]
+          hidden_files: [verify.py]
+          network: none
+        - kind: DIFF
+          required_changed_files: [src/index.py, src/service.py]
+          forbidden_changed_files: [.env]
+          min_changed_files: 2
+          max_changed_files: 4
+          max_insertions: 160
+          max_deletions: 80
+  - scenario_id: feature-rust-parser
+    version: 1
+    kind: FEATURE
+    difficulty: hard
+    repository_fixture: feature-rust-parser
+    user_prompt: Add a small Rust parser for key=value records with typed errors, preserving the existing record representation and public module layout.
+    languages: [rust]
+    expected_files: [src/lib.rs, src/parser.rs]
+    forbidden_files: [.env, .khaos]
+    tags: [feature, rust]
+    oracle:
+      kind: COMPOSITE
+      children:
+        - kind: COMMAND
+          argv: [python3, .oracle-hidden/verify.py]
+          hidden_files: [verify.py]
+          network: none
+        - kind: DIFF
+          required_changed_files: [src/parser.rs, src/lib.rs]
+          forbidden_changed_files: [.env]
+          min_changed_files: 2
+          max_changed_files: 4
+          max_insertions: 180
+          max_deletions: 100
+  - scenario_id: multifile-go-pipeline
+    version: 1
+    kind: MULTI_FILE
+    difficulty: hard
+    repository_fixture: multifile-go-pipeline
+    user_prompt: Extend the Go pipeline with validation and a result accumulator, updating the service and tests while leaving the public entry point compatible.
+    languages: [go]
+    expected_files: [pipeline.go, validate.go, service.go]
+    forbidden_files: [.env, .khaos]
+    tags: [multi-file, go]
+    oracle:
+      kind: COMPOSITE
+      children:
+        - kind: COMMAND
+          argv: [python3, .oracle-hidden/verify.py]
+          hidden_files: [verify.py]
+          network: none
+        - kind: DIFF
+          required_changed_files: [pipeline.go, validate.go, service.go]
+          forbidden_changed_files: [.env]
+          min_changed_files: 3
+          max_changed_files: 5
+          max_insertions: 220
+          max_deletions: 120
+  - scenario_id: multifile-python-settings
+    version: 1
+    kind: MULTI_FILE
+    difficulty: hard
+    repository_fixture: multifile-python-settings
+    user_prompt: Add layered settings loading with environment overrides, validation, and a stable service facade; update the model and tests together.
+    languages: [python]
+    expected_files: [settings.py, service.py, tests/test_settings.py]
+    forbidden_files: [.env, .khaos]
+    tags: [multi-file, python]
+    oracle:
+      kind: COMPOSITE
+      children:
+        - kind: COMMAND
+          argv: [python3, .oracle-hidden/verify.py]
+          hidden_files: [verify.py]
+          network: none
+        - kind: DIFF
+          required_changed_files: [settings.py, service.py, tests/test_settings.py]
+          forbidden_changed_files: [.env]
+          min_changed_files: 3
+          max_changed_files: 5
+          max_insertions: 220
+          max_deletions: 120
+  - scenario_id: refactor-python-repository
+    version: 1
+    kind: REFACTOR
+    difficulty: medium
+    repository_fixture: refactor-python-repository
+    user_prompt: Refactor the repository adapter behind a narrow protocol without changing observable behavior or introducing a second persistence path.
+    languages: [python]
+    expected_files: [src/repository.py, src/service.py]
+    forbidden_files: [.env, .khaos]
+    tags: [refactor, python]
+    oracle:
+      kind: COMPOSITE
+      children:
+        - kind: COMMAND
+          argv: [python3, .oracle-hidden/verify.py]
+          hidden_files: [verify.py]
+          network: none
+        - kind: DIFF
+          required_changed_files: [src/repository.py, src/service.py]
+          forbidden_changed_files: [.env]
+          min_changed_files: 2
+          max_changed_files: 4
+          max_insertions: 140
+          max_deletions: 100
+  - scenario_id: refactor-typescript-client
+    version: 1
+    kind: REFACTOR
+    difficulty: medium
+    repository_fixture: refactor-typescript-client
+    user_prompt: Refactor the TypeScript client transport behind a typed adapter while preserving request serialization and the public Client API.
+    languages: [typescript]
+    expected_files: [src/client.ts, src/transport.ts]
+    forbidden_files: [.env, .khaos]
+    tags: [refactor, typescript]
+    oracle:
+      kind: COMPOSITE
+      children:
+        - kind: COMMAND
+          argv: [python3, .oracle-hidden/verify.py]
+          hidden_files: [verify.py]
+          network: none
+        - kind: DIFF
+          required_changed_files: [src/client.ts, src/transport.ts]
+          forbidden_changed_files: [.env]
+          min_changed_files: 2
+          max_changed_files: 4
+          max_insertions: 140
+          max_deletions: 100
+  - scenario_id: review-python-cache-race
+    version: 1
+    kind: CODE_REVIEW
+    difficulty: medium
+    repository_fixture: review-python-cache-race
+    user_prompt: Review the cache implementation for correctness under concurrent get-or-compute calls. Return structured findings with file, line, category, and the concepts that justify each finding. Do not modify files.
+    languages: [python]
+    expected_files: []
+    forbidden_files: [.env, .khaos]
+    tags: [smoke, review, python]
+    oracle:
+      kind: REVIEW_FINDING
+      allow_extra_findings: true
+      match_mode: ALL
+      required_findings:
+        - finding_id: cache-lock
+          category: concurrency
+          file: src/cache.py
+          line: 12
+          line_tolerance: 4
+          concepts: [lock, compute, duplicate]
+          severity: high

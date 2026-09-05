@@ -557,6 +557,37 @@ MIGRATIONS: tuple[MigrationSpec, ...] = (
         sql_files=("0026_capability_evaluations.sql",),
         migrator_symbols=("_apply_v26_upgrades",),
     ),
+    MigrationSpec(
+        version=27,
+        name="m8_0_coding_evaluation_runs",
+        # Release-time manifest over the isolated Coding evaluation ledger.
+        sha256="aa21fcdef825a59738147ad310bd947754bad89a7a9781f3d475f9186d49303c",
+        sql_files=("0027_coding_evaluation_runs.sql",),
+        migrator_symbols=("_apply_v27_upgrades",),
+    ),
+    MigrationSpec(
+        version=28,
+        name="m8_3_autonomous_verification_runs",
+        sha256="5f5ec6b8cfba8fb3753009e1d3ccbd138ec6fc907190ab2e7856679c1d0db637",
+        sql_files=("0028_autonomous_verification_runs.sql",),
+        migrator_symbols=("_apply_v28_upgrades",),
+    ),
+    MigrationSpec(
+        version=29,
+        name="m8_5_parallel_subagent_worktrees",
+        sha256="b6d79b9236514923d79bea8c538c5f7bc2ad8ba3bd3ca58f65db7b3a1eaf0bd9",
+        sql_files=("0029_parallel_subagent_worktrees.sql",),
+        migrator_symbols=("_apply_v29_upgrades",),
+    ),
+    MigrationSpec(
+        version=30,
+        name="m8_6_coding_supervision_checkpoint_rewind",
+        # Release-time manifest over the additive M8.6 supervision/checkpoint
+        # schema and its migration owner.
+        sha256="95c5cde7ef6905077b0e555b16e086776add54bddc19d84c6234d00b60ec7c56",
+        sql_files=("0030_coding_supervision_checkpoint_rewind.sql",),
+        migrator_symbols=("_apply_v30_upgrades",),
+    ),
 )
 
 

@@ -48,6 +48,14 @@ def test_test_help():
     assert "Run tests" in result.stdout
 
 
+def test_trusted_git_doctor_parser_exposes_json_mode():
+    args = build_command_parser().parse_args(["doctor", "trusted-git", "--json"])
+
+    assert args.command == "doctor"
+    assert args.doctor_command == "trusted-git"
+    assert args.as_json is True
+
+
 def test_chat_parser_exposes_interactive_options():
     parser = build_command_parser()
     args = parser.parse_args(["chat", "--mode", "coding", "--no-tui", "--yes"])
@@ -56,6 +64,39 @@ def test_chat_parser_exposes_interactive_options():
     assert args.mode == "coding"
     assert args.no_tui is True
     assert args.yes is True
+
+
+def test_m8_6_task_control_parser_is_typed_and_owner_scoped():
+    parser = build_command_parser()
+    args = parser.parse_args([
+        "task", "--json", "pause", "task-1",
+        "--command-id", "cmd-1", "--expected-revision", "4",
+    ])
+
+    assert args.command == "task"
+    assert args.task_command == "pause"
+    assert args.task_id == "task-1"
+    assert args.command_id == "cmd-1"
+    assert args.expected_revision == 4
+    assert args.as_json is True
+
+
+def test_m8_6_checkpoint_and_rewind_parsers_expose_digest_bindings():
+    parser = build_command_parser()
+    checkpoint = parser.parse_args([
+        "checkpoint", "create", "task-1", "before", "merge",
+        "--idempotency-key", "cp-1",
+    ])
+    rewind = parser.parse_args([
+        "rewind", "execute", "rw-1", "--task-id", "task-1",
+        "--plan-digest", "a" * 64,
+    ])
+
+    assert checkpoint.checkpoint_command == "create"
+    assert checkpoint.label == ["before", "merge"]
+    assert checkpoint.idempotency_key == "cp-1"
+    assert rewind.rewind_command == "execute"
+    assert rewind.plan_digest == "a" * 64
 
 
 @pytest.mark.posix_host

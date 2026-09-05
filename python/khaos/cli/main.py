@@ -216,6 +216,66 @@ def build_command_parser() -> argparse.ArgumentParser:
     chat_parser.add_argument("--yes", action="store_true", help="Approve permission prompts")
     chat_parser.add_argument("--remember", action="store_true", help="Remember approved permissions")
 
+    task_parser = subparsers.add_parser(
+        "task", help="Inspect or control one owner-scoped Coding task"
+    )
+    task_parser.add_argument("--project-root", type=Path, default=None)
+    task_parser.add_argument("--db", default=None)
+    task_parser.add_argument("--json", action="store_true", dest="as_json")
+    task_sub = task_parser.add_subparsers(dest="task_command", required=True)
+    for task_command, help_text in (
+        ("status", "Show durable supervision state"),
+        ("events", "Replay durable supervision events"),
+        ("pause", "Request a cooperative pause"),
+        ("resume", "Resume a paused task"),
+        ("cancel", "Cancel and drain a task"),
+    ):
+        command_parser = task_sub.add_parser(task_command, help=help_text)
+        command_parser.add_argument("task_id")
+        if task_command == "events":
+            command_parser.add_argument("--after", type=int, default=0)
+            command_parser.add_argument("--limit", type=int, default=1024)
+        elif task_command in {"pause", "resume", "cancel"}:
+            command_parser.add_argument("--command-id", default=None)
+            command_parser.add_argument("--expected-revision", type=int, default=None)
+
+    checkpoint_parser = subparsers.add_parser(
+        "checkpoint", help="Inspect or request Coding checkpoints"
+    )
+    checkpoint_parser.add_argument("--project-root", type=Path, default=None)
+    checkpoint_parser.add_argument("--db", default=None)
+    checkpoint_parser.add_argument("--json", action="store_true", dest="as_json")
+    checkpoint_sub = checkpoint_parser.add_subparsers(
+        dest="checkpoint_command", required=True
+    )
+    checkpoint_list = checkpoint_sub.add_parser("list", help="List checkpoint metadata")
+    checkpoint_list.add_argument("task_id")
+    checkpoint_show = checkpoint_sub.add_parser("show", help="Show checkpoint metadata")
+    checkpoint_show.add_argument("checkpoint_id")
+    checkpoint_create = checkpoint_sub.add_parser("create", help="Request a user checkpoint")
+    checkpoint_create.add_argument("task_id")
+    checkpoint_create.add_argument("label", nargs="*")
+    checkpoint_create.add_argument("--kind", default="USER_CREATED")
+    checkpoint_create.add_argument("--expected-generation", type=int, default=None)
+    checkpoint_create.add_argument("--idempotency-key", default=None)
+
+    rewind_parser = subparsers.add_parser(
+        "rewind", help="Build or execute a digest-bound Coding rewind"
+    )
+    rewind_parser.add_argument("--project-root", type=Path, default=None)
+    rewind_parser.add_argument("--db", default=None)
+    rewind_parser.add_argument("--json", action="store_true", dest="as_json")
+    rewind_sub = rewind_parser.add_subparsers(dest="rewind_command", required=True)
+    rewind_plan = rewind_sub.add_parser("plan", help="Build a rewind plan")
+    rewind_plan.add_argument("checkpoint_id")
+    rewind_plan.add_argument("--task-id", default=None)
+    rewind_plan.add_argument("--workspace-id", default=None)
+    rewind_plan.add_argument("--idempotency-key", default=None)
+    rewind_execute = rewind_sub.add_parser("execute", help="Execute a stored rewind plan")
+    rewind_execute.add_argument("rewind_id")
+    rewind_execute.add_argument("--task-id", required=True)
+    rewind_execute.add_argument("--plan-digest", default=None)
+
     test_parser = subparsers.add_parser("test", help="Run tests", description="Run tests")
     test_parser.add_argument("--all", action="store_true", help="Run all tests (Python + Go)")
     test_parser.add_argument("--go", action="store_true", help="Run Go tests only")
@@ -229,6 +289,22 @@ def build_command_parser() -> argparse.ArgumentParser:
     config_group.add_argument("--set", type=str, help="Set a config value (KEY=VALUE)")
 
     subparsers.add_parser("version", help="Show version")
+
+    doctor_parser = subparsers.add_parser(
+        "doctor",
+        help="Inspect host dependencies and security boundaries",
+    )
+    doctor_sub = doctor_parser.add_subparsers(dest="doctor_command")
+    trusted_git_parser = doctor_sub.add_parser(
+        "trusted-git",
+        help="Inspect Trusted Git candidates, policy, and preflight",
+    )
+    trusted_git_parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="Emit bounded machine-readable diagnostics",
+    )
 
     migrate_parser = subparsers.add_parser(
         "migrate",
@@ -328,6 +404,59 @@ def build_command_parser() -> argparse.ArgumentParser:
     import_parser = memory_sub.add_parser("import", help="Import a scope-bound memory package")
     import_parser.add_argument("path", type=Path)
     import_parser.add_argument("--no-rebuild", action="store_true")
+
+    eval_parser = subparsers.add_parser(
+        "eval",
+        help="Run observation-only capability evaluations",
+    )
+    eval_sub = eval_parser.add_subparsers(dest="eval_command")
+    coding_eval_parser = eval_sub.add_parser(
+        "coding",
+        help="M8.0 Coding capability evaluation",
+    )
+    coding_sub = coding_eval_parser.add_subparsers(dest="coding_command")
+
+    coding_list = coding_sub.add_parser("list", help="List immutable Coding scenarios")
+    coding_list.add_argument("--manifest", type=Path)
+    coding_list.add_argument("--tag")
+    coding_list.add_argument("--json", action="store_true", dest="as_json")
+
+    coding_run = coding_sub.add_parser("run", help="Run one or more Coding scenarios")
+    coding_run.add_argument("scenario_id", nargs="?")
+    coding_run_group = coding_run.add_mutually_exclusive_group(required=False)
+    coding_run_group.add_argument("--tag")
+    coding_run_group.add_argument("--all", action="store_true", dest="all_scenarios")
+    coding_run_group.add_argument("--scenario", dest="scenario_option")
+    coding_run.add_argument("--manifest", type=Path)
+    coding_run.add_argument("--project-root", type=Path)
+    coding_run.add_argument("--db")
+    coding_run.add_argument("--config", type=Path)
+    coding_run.add_argument("--principal-id")
+    coding_run.add_argument("--project-id")
+    coding_run.add_argument("--model")
+    coding_run.add_argument("--provider")
+    coding_run.add_argument("--khaos-source-sha")
+    coding_run.add_argument("--json", action="store_true", dest="as_json")
+
+    coding_report = coding_sub.add_parser("report", help="Report persisted Coding runs")
+    coding_report.add_argument("run_id_positional", nargs="?", help="Run id to report")
+    coding_report.add_argument("--run-id")
+    coding_report.add_argument("--scenario-id")
+    coding_report.add_argument("--manifest", type=Path)
+    coding_report.add_argument("--project-root", type=Path)
+    coding_report.add_argument("--db")
+    coding_report.add_argument("--principal-id")
+    coding_report.add_argument("--project-id")
+    coding_report.add_argument("--limit", type=int, default=100)
+    coding_report.add_argument("--format", choices=["markdown", "json"], default="markdown")
+
+    coding_compare = coding_sub.add_parser("compare", help="Compare two runs of one scenario version")
+    coding_compare.add_argument("baseline_run_id")
+    coding_compare.add_argument("candidate_run_id")
+    coding_compare.add_argument("--project-root", type=Path)
+    coding_compare.add_argument("--db")
+    coding_compare.add_argument("--principal-id")
+    coding_compare.add_argument("--project-id")
 
     return parser
 
@@ -498,6 +627,55 @@ def cmd_version() -> None:
     """Show the product version."""
     print("Khaos Agent Platform v0.1.0")
     print("Python + Go + Rust")
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Inspect one supported host dependency without changing system state."""
+    if getattr(args, "doctor_command", None) != "trusted-git":
+        print(
+            "usage: khaos doctor trusted-git [--json]",
+            file=sys.stderr,
+        )
+        return 2
+
+    from khaos.coding.workspace.trusted_git_preflight import (
+        TrustedGitAvailability,
+        diagnose_trusted_git,
+    )
+
+    report = asyncio.run(diagnose_trusted_git())
+    if getattr(args, "as_json", False):
+        print(json.dumps(report.as_dict(), ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        print("Trusted Git")
+        print(f"status: {report.status.value}")
+        print(f"classification: {report.classification}")
+        for candidate in report.candidates:
+            policy = candidate.policy
+            print(f"candidate: {candidate.candidate}")
+            print(f"  canonical: {policy.get('canonical_path') or 'unavailable'}")
+            print(f"  owner_uid: {policy.get('owner_uid') if policy.get('owner_uid') is not None else 'unknown'}")
+            print(f"  mode: {policy.get('mode') if policy.get('mode') is not None else 'unknown'}")
+            print(f"  parent_chain: {policy.get('parent_chain') if policy.get('parent_chain') is not None else 'unknown'}")
+            print(f"  identity: {policy.get('identity') if policy.get('identity') is not None else 'unknown'}")
+            print(f"  digest: {policy.get('digest') if policy.get('digest') is not None else 'unknown'}")
+            print(f"  policy: {policy.get('status') or 'unknown'}")
+            if policy.get("diagnostic"):
+                print(f"  policy_diagnostic: {policy['diagnostic']}")
+            preflight = candidate.preflight
+            if preflight is None:
+                print("  preflight: not_run")
+                continue
+            print(f"  preflight: {preflight.status.value}")
+            print(f"  preflight_classification: {preflight.classification}")
+            print(f"  exit_code: {preflight.returncode if preflight.returncode is not None else 'unknown'}")
+            if preflight.diagnostic:
+                print(f"  diagnostic: {preflight.diagnostic}")
+        if report.selected is not None:
+            print(f"selected: {report.selected.identity.path if report.selected.identity else report.selected.candidate}")
+        else:
+            print("selected: none")
+    return 0 if report.status is TrustedGitAvailability.AVAILABLE else 1
 
 
 def cmd_migrate(args: argparse.Namespace) -> int:
@@ -1030,11 +1208,14 @@ def main() -> None:
     """CLI process entrypoint.
 
     Resolution order:
-      1. Product subcommands: start/chat/test/config/version.
+      1. Product subcommands: start/chat/test/config/version/doctor.
       2. Legacy flags such as ``--message`` for scriptable SSE output.
     """
     argv = sys.argv[1:]
-    command_names = {"start", "chat", "test", "config", "version", "migrate", "memory"}
+    command_names = {
+        "start", "chat", "task", "checkpoint", "rewind", "test", "config",
+        "version", "doctor", "migrate", "memory", "eval",
+    }
     if not argv:
         parser = build_command_parser()
         parser.print_help()
@@ -1048,16 +1229,34 @@ def main() -> None:
             cmd_start(args)
         elif args.command == "chat":
             cmd_chat(args)
+        elif args.command == "task":
+            from khaos.cli.supervision_commands import cmd_task
+
+            raise SystemExit(cmd_task(args))
+        elif args.command == "checkpoint":
+            from khaos.cli.supervision_commands import cmd_checkpoint
+
+            raise SystemExit(cmd_checkpoint(args))
+        elif args.command == "rewind":
+            from khaos.cli.supervision_commands import cmd_rewind
+
+            raise SystemExit(cmd_rewind(args))
         elif args.command == "test":
             cmd_test(args)
         elif args.command == "config":
             cmd_config(args)
         elif args.command == "version":
             cmd_version()
+        elif args.command == "doctor":
+            raise SystemExit(cmd_doctor(args))
         elif args.command == "migrate":
             raise SystemExit(cmd_migrate(args))
         elif args.command == "memory":
             raise SystemExit(cmd_memory(args))
+        elif args.command == "eval":
+            from khaos.cli.eval_commands import cmd_eval
+
+            raise SystemExit(cmd_eval(args))
         return
 
     parser = build_parser()

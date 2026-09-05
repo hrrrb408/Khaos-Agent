@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 import uuid
@@ -20,6 +21,13 @@ from khaos.audit import (
     resolve_safe_audit_anchor_path,
     resolve_safe_audit_log_path,
 )
+from khaos.coding.checkpoints.service import CheckpointService
+from khaos.coding.context_engine import (
+    ContextBudget,
+    ContextEngineService,
+    ToolOutputLimits,
+)
+from khaos.coding.edit_transaction import EditTransactionService
 from khaos.coding.execution import BackendSelector, ExecutionService
 from khaos.coding.intelligence.query_service import ContextIntelligenceService
 from khaos.coding.planning.coordinator import PlanningControlCoordinator
@@ -33,6 +41,15 @@ from khaos.coding.planning.trusted_verification_service import (
     TrustedVerificationService,
 )
 from khaos.coding.task_manager import TaskManager
+from khaos.coding.verification.evidence import VerificationObservationStore
+from khaos.coding.verification.planner import (
+    AutonomousPlannerLimits,
+    AutonomousVerificationPlanner,
+)
+from khaos.coding.verification.service import (
+    AutonomousVerificationCoordinator,
+    AutonomousVerificationFactProvider,
+)
 from khaos.coding.verify_fix import VerifyFixLoop
 from khaos.coding.workspace.manager import WorkspaceManager
 from khaos.coding.workspace.office_authority import OfficeMutationAuthority
@@ -66,6 +83,7 @@ from khaos.memory.providers import (
 from khaos.memory.transfer import MemoryTransferService
 from khaos.modes import ModeManager
 from khaos.permissions import PermissionEngine
+from khaos.project_context import InstructionResolver
 from khaos.routing.router import create_default_router
 from khaos.runtime.authority import RuntimeAuthoritySeal
 from khaos.runtime.lifecycle import CloseState
@@ -80,6 +98,7 @@ from khaos.security.network_guard import NetworkGuard
 from khaos.security.resource_scope import ResourceScopeError, TypedResourcePartialOrder
 from khaos.security.sandbox import Sandbox
 from khaos.skills import SkillGenerator, SkillManager
+from khaos.supervision.service import TaskSupervisionService
 from khaos.tools import create_runtime_registry
 from khaos.tools.scheduler import ToolScheduler
 
@@ -255,6 +274,21 @@ class RuntimeConfig:
     # ProductionRuntimeConfig deliberately does not expose this hook; its
     # default is the conservative empty provider.
     completion_fact_provider: Any = None
+    # M8.1: a trusted development/evaluation composition may inject the
+    # workspace-bound repository-intelligence facade.  The structural
+    # ProductionRuntimeConfig deliberately omits this field, so the
+    # production factory remains the sole owner of the canonical facade.
+    context_intelligence: Any = None
+    # M8.4: trusted development/evaluation composition seam.  Production
+    # callers use the factory-created ContextEngineService below.
+    context_engine: Any = None
+    # M8.5: trusted development/evaluation seam for the parent-only parallel
+    # subagent coordinator.  Production composition creates this owner below
+    # from the canonical workspace, repository, and verification services.
+    parallel_subagent_coordinator: Any = None
+    # M8.6: application-scoped typed supervision owner.  Production callers
+    # may share this server-lifecycle service; it carries no effect authority.
+    supervision_service: Any = None
 
 
 @dataclass(frozen=True)
@@ -316,6 +350,7 @@ class ProductionRuntimeConfig:
     cron_engine: Any = None
     subagent_spawner: Any = None
     project_id: str = ""
+    supervision_service: Any = None
 
     def as_runtime_config(self) -> RuntimeConfig:
         """Materialize the internal config after the structural boundary."""
@@ -361,6 +396,7 @@ class ProductionRuntimeConfig:
             cron_engine=self.cron_engine,
             subagent_spawner=self.subagent_spawner,
             project_id=self.project_id,
+            supervision_service=self.supervision_service,
         )
 
 
@@ -482,6 +518,31 @@ class RuntimeResult:
     composition_manifest: dict[str, object] | None = field(
         init=False, default=None
     )
+    # M8.1: repository intelligence is attached by the composition root so
+    # lifecycle cleanup does not infer ownership from the AgentLoop object.
+    # ``init=False`` preserves the established positional construction
+    # contract used by direct tests and compatibility adapters.
+    context_intelligence: Any = field(init=False, default=None, repr=False)
+    owns_context_intelligence: bool = field(
+        init=False, default=False, repr=False
+    )
+    # M8.4: final context selection owner.  It has no external authority or
+    # closeable resource; this field is an observability/composition handle.
+    context_engine: Any = field(init=False, default=None, repr=False)
+    # M8.3: the post-edit planner/executor observation coordinator is attached
+    # by the factory.  It has no independent execution or completion
+    # authority and therefore needs no separate lifecycle shutdown.
+    verification_coordinator: Any = field(init=False, default=None, repr=False)
+    # M8.5: parent-only orchestration handle.  Child worktree lifecycle,
+    # Trusted Git, verification, and completion authority remain owned by the
+    # composed services referenced by this coordinator.
+    parallel_subagent_coordinator: Any = field(
+        init=False, default=None, repr=False
+    )
+    # M8.6: canonical typed supervision and checkpoint owners attached by the
+    # factory without changing the long-standing positional constructor.
+    supervision_service: Any = field(init=False, default=None, repr=False)
+    checkpoint_service: Any = field(init=False, default=None, repr=False)
     # M7.3: production-composed planning control coordinator.  It is an
     # orchestration owner only; plan revisions remain passive and TaskStatus
     # lifecycle writes remain owned by their existing control boundaries.
@@ -868,6 +929,27 @@ class RuntimeResult:
                 except Exception:
                     failed = True
                     logger.debug("memory host close failed", exc_info=True)
+            # M8.1 repository intelligence owns only derived index resources;
+            # close its persistent connection after memory and before the
+            # execution authority.  The factory records the explicit owner on
+            # RuntimeResult; direct compatibility constructions leave it
+            # unset, so arbitrary loop attributes cannot affect shutdown.
+            if (
+                self.context_intelligence is not None
+                and self.owns_context_intelligence
+            ):
+                context_close = getattr(self.context_intelligence, "close", None)
+                if callable(context_close):
+                    try:
+                        close_context = cast(
+                            Callable[[], Awaitable[object]], context_close
+                        )
+                        await close_context()
+                    except Exception:
+                        failed = True
+                        logger.debug(
+                            "context intelligence close failed", exc_info=True
+                        )
             if self.execution_service is not None:
                 try:
                     await self.tool_scheduler.aclose()
@@ -1312,6 +1394,10 @@ async def build_runtime(
     # it.  The borrowed AuditLogger digest match runs later, after the
     # effective policy is loaded.
     if runtime_profile.is_production:
+        if cfg.context_engine is not None:
+            raise ValueError(
+                "production runtime cannot inject a ContextEngineService"
+            )
         _enforce_no_testing_composition(cfg)
         _enforce_no_security_injection(cfg)
     root = cfg.project_root.expanduser().resolve()
@@ -1733,11 +1819,94 @@ async def build_runtime(
         # authority.  ProductionRuntimeConfig intentionally has no reader/index
         # injection seam, so model-controlled or host-path readers cannot replace
         # SafeWorkspaceFS here.
-        context_intelligence = (
-            ContextIntelligenceService(workspace_manager)
-            if production_mode
-            else None
+        context_index_database = None
+        if production_mode and getattr(cfg.db, "path", ":memory:") != ":memory:":
+            # Repository intelligence is derived state, but it must survive a
+            # runtime restart. Keep it in the trusted state directory beside
+            # the lifecycle DB, never under the model-writable worktree.
+            context_index_database = Path(cfg.db.path).with_name("repo-intelligence.db")
+        if production_mode:
+            context_intelligence = ContextIntelligenceService(
+                workspace_manager,
+                index_database=context_index_database,
+            )
+        else:
+            # Test/development composition may provide the same facade used
+            # by the M8 evaluator.  No fallback intelligence path is created
+            # when it is absent; legacy adapters remain explicit at their
+            # compatibility boundaries.
+            context_intelligence = cfg.context_intelligence
+        agent_config = cfg.agent_config or AgentConfig()
+        raw_layer_token_budgets = tuple(
+            int(value)
+            for value in getattr(
+                agent_config,
+                "context_layer_token_budgets",
+                (2_048, 3_072, 5_120, 1_760),
+            )
         )
+        raw_layer_byte_budgets = tuple(
+            int(value)
+            for value in getattr(
+                agent_config,
+                "context_layer_byte_budgets",
+                (48 * 1024, 64 * 1024, 112 * 1024, 32 * 1024),
+            )
+        )
+        if len(raw_layer_token_budgets) != 4 or len(raw_layer_byte_budgets) != 4:
+            raise ValueError("context layer budget must contain four layers")
+        context_budget = ContextBudget(
+            total_tokens=max(
+                int(getattr(agent_config, "context_token_budget", 12_000)),
+                int(getattr(agent_config, "context_output_reserve_tokens", 2_048)) + 1,
+            ),
+            total_bytes=max(
+                int(getattr(agent_config, "context_max_bytes", 256 * 1024)),
+                int(getattr(agent_config, "context_output_reserve_bytes", 32 * 1024)) + 1,
+            ),
+            output_reserve_tokens=max(
+                1, int(getattr(agent_config, "context_output_reserve_tokens", 2_048))
+            ),
+            output_reserve_bytes=max(
+                1, int(getattr(agent_config, "context_output_reserve_bytes", 32 * 1024))
+            ),
+            layer_token_budgets=(
+                raw_layer_token_budgets[0],
+                raw_layer_token_budgets[1],
+                raw_layer_token_budgets[2],
+                raw_layer_token_budgets[3],
+            ),
+            layer_byte_budgets=(
+                raw_layer_byte_budgets[0],
+                raw_layer_byte_budgets[1],
+                raw_layer_byte_budgets[2],
+                raw_layer_byte_budgets[3],
+            ),
+        )
+        if cfg.context_engine is not None and not production_mode:
+            context_engine = cfg.context_engine
+        else:
+            context_engine = ContextEngineService(
+                repo_intelligence=context_intelligence,
+                project_root=root,
+                instruction_resolver=InstructionResolver(root),
+                task_manager=task_manager,
+                tool_registry=runtime_registry,
+                skill_manager=skill_manager,
+                default_budget=context_budget,
+                tool_output_limits=ToolOutputLimits(
+                    max_bytes=max(1, int(getattr(agent_config, "tool_output_max_bytes", 64 * 1024))),
+                    max_tokens=max(1, int(getattr(agent_config, "tool_output_max_tokens", 4_096))),
+                    max_lines=max(1, int(getattr(agent_config, "tool_output_max_lines", 512))),
+                ),
+                principal_id=cfg.principal_id,
+                project_id=project_id,
+                recent_message_count=max(
+                    0,
+                    int(getattr(agent_config, "context_recent_message_count", 12)),
+                ),
+            )
+        edit_transaction_service = EditTransactionService()
         # B1: the OfficeMutationAuthority is a server/project-lifecycle object.
         # When ``cfg.office_authority`` is injected (AgentService / SubAgentService
         # share one across every turn), reuse it so the aggregate storage baseline
@@ -1887,7 +2056,31 @@ async def build_runtime(
         # overwrote each other's holder — see ``permission_tools.py``
         # docstring for the race description.
         compressor = ContextCompressor(router, memory_manager=memory_manager)
-        verify_factory = VerifyFixLoop
+        from khaos.config import ConfigError, load_config
+
+        verification_limits = AutonomousPlannerLimits()
+        try:
+            verification_config = load_config(
+                cfg.config_path or root / "config.yaml",
+                strict_env=False,
+            )
+            verification_limits = AutonomousPlannerLimits.from_config(
+                verification_config
+            )
+        except (ConfigError, OSError, TypeError, ValueError) as exc:
+            # Verification bounds are not authority inputs.  A malformed or
+            # unavailable optional config must retain the immutable safe
+            # defaults rather than widening or disabling autonomous checks.
+            logger.warning(
+                "autonomous verification config unavailable; using safe defaults: %s",
+                type(exc).__name__,
+            )
+
+        def verify_factory() -> VerifyFixLoop:
+            return VerifyFixLoop(
+                max_fix_attempts=verification_limits.max_repair_cycles
+            )
+
         skill_generator = SkillGenerator()
         cleanup_authority = cfg.cleanup_authority or RuntimeCleanupAuthority()
         from khaos.agent.control.completion_flow import (
@@ -1921,6 +2114,26 @@ async def build_runtime(
             authority=trusted_verification_authority,
             repository=verification_assessment_repository,
         )
+        autonomous_observation_store = getattr(
+            cfg.db, "autonomous_verification_repository", None
+        )
+        if not callable(getattr(autonomous_observation_store, "append", None)) or not callable(
+            getattr(autonomous_observation_store, "latest_for_task", None)
+        ):
+            autonomous_observation_store = VerificationObservationStore()
+        autonomous_verification = AutonomousVerificationCoordinator(
+            execution_service=execution_service,
+            repo_intelligence=(
+                getattr(context_intelligence, "repo_intelligence", None)
+                if context_intelligence is not None
+                else None
+            ),
+            evidence_store=autonomous_observation_store,
+            planner=AutonomousVerificationPlanner(limits=verification_limits),
+            principal_id=cfg.principal_id,
+            project_id=project_id,
+            repository_id=cfg.repo_id,
+        )
         fact_provider = cfg.completion_fact_provider
         if fact_provider is None:
             fact_provider = TrustedVerificationFactProvider(
@@ -1928,6 +2141,10 @@ async def build_runtime(
                 principal_id=cfg.principal_id,
                 project_id=project_id,
             )
+        fact_provider = AutonomousVerificationFactProvider(
+            fact_provider,
+            autonomous_verification,
+        )
         completion_controller = CompletionProposalController(
             goal_spec_repository=goal_spec_repository,
             decision_repository=decision_repository,
@@ -2008,6 +2225,114 @@ async def build_runtime(
                 registry=scheduler.registry,
                 spawner=cfg.subagent_spawner,
             )
+        # M8.5: compose one parent-only orchestration service from the
+        # existing WorkspaceManager, repository, and M8.3 verification
+        # owners.  The coordinator owns no second AgentLoop, authority, or
+        # completion path.  Delegated M7.8 runtimes deliberately receive no
+        # parallel coordinator, preserving the single delegation depth.
+        parallel_repository = getattr(cfg.db, "parallel_subagent_repository", None)
+        parallel_subagent_coordinator = cfg.parallel_subagent_coordinator
+        merge_coordinator = None
+        if production_mode and parallel_subagent_coordinator is not None:
+            raise PermissionError(
+                "production runtime cannot accept an injected parallel subagent coordinator"
+            )
+        if cfg.delegated_execution_context is not None:
+            if parallel_subagent_coordinator is not None:
+                raise PermissionError(
+                    "delegated runtime cannot accept a parallel subagent coordinator"
+                )
+            parallel_subagent_coordinator = None
+        elif parallel_subagent_coordinator is None and workspace_manager is not None:
+            from khaos.subagents.coordinator import SubagentCoordinator
+            from khaos.subagents.merge import MergeCoordinator
+            from khaos.subagents.workspace import ChildWorkspaceService
+
+            async def refresh_after_merge(**kwargs: object) -> None:
+                """Refresh the canonical parent intelligence after publish."""
+                intelligence = getattr(context_intelligence, "repo_intelligence", None)
+                refresh = getattr(intelligence, "refresh", None)
+                if not callable(refresh):
+                    return
+                workspace = kwargs.get("workspace")
+                if workspace is None:
+                    raise RuntimeError("merge refresh is missing its parent workspace")
+                raw_changed_paths = kwargs.get("changed_paths", ())
+                if not isinstance(raw_changed_paths, (tuple, list)) or not all(
+                    isinstance(path, str) for path in raw_changed_paths
+                ):
+                    raise RuntimeError(
+                        "merge refresh changed_paths must be a sequence of strings"
+                    )
+                refreshed = refresh(
+                    str(getattr(workspace, "id", "")),
+                    task_id=str(kwargs.get("task_id", "")),
+                    principal_id=cfg.principal_id,
+                    project_id=project_id,
+                    paths=tuple(cast(Iterable[str], raw_changed_paths)),
+                    source_revision=str(kwargs.get("commit", "")),
+                )
+                if inspect.isawaitable(refreshed):
+                    await refreshed
+
+            merge_coordinator = MergeCoordinator(
+                workspace_manager,
+                repository=parallel_repository,
+                post_merge_verifier=autonomous_verification.verify_after_merge,
+                repo_intelligence_refresh=(
+                    refresh_after_merge if context_intelligence is not None else None
+                ),
+            )
+            parallel_subagent_coordinator = SubagentCoordinator(
+                ChildWorkspaceService(
+                    workspace_manager,
+                    repository=parallel_repository,
+                ),
+                merge_coordinator=merge_coordinator,
+                repository=parallel_repository,
+            )
+        # M8.6: one typed supervision owner and one checkpoint service are
+        # composed from the existing task/workspace/edit/verification owners.
+        # Neither object is a second permission, mutation, merge, or
+        # completion authority.  Delegated child runtimes observe the parent
+        # execution context but do not receive a user-facing rewind owner.
+        supervision_service = cfg.supervision_service
+        if supervision_service is None:
+            supervision_service = TaskSupervisionService(
+                cfg.db,
+                audit_logger=audit_logger,
+            )
+        checkpoint_service = None
+        if cfg.delegated_execution_context is None:
+            checkpoint_service = CheckpointService(
+                workspace_manager,
+                edit_transaction_service,
+                checkpoint_repository=getattr(cfg.db, "checkpoint_repository", None),
+                supervision_service=supervision_service,
+                verification_coordinator=autonomous_verification,
+                repo_intelligence=(
+                    getattr(context_intelligence, "repo_intelligence", None)
+                    if context_intelligence is not None
+                    else None
+                ),
+                parallel_subagent_repository=parallel_repository,
+                principal_id=cfg.principal_id,
+                project_id=project_id,
+                runtime_id=cfg.runtime_id,
+                audit_logger=audit_logger,
+                database=cfg.db,
+            )
+            if merge_coordinator is not None:
+                merge_coordinator.set_supervision_hooks(
+                    checkpoint_service=checkpoint_service,
+                    supervision_service=supervision_service,
+                )
+        if parallel_subagent_coordinator is not None:
+            set_supervision_service = getattr(
+                parallel_subagent_coordinator, "set_supervision_service", None
+            )
+            if callable(set_supervision_service):
+                set_supervision_service(supervision_service)
         recovery_decision_repository = getattr(
             cfg.db, "recovery_decision_repository", None
         )
@@ -2057,6 +2382,12 @@ async def build_runtime(
                 cfg.coding_context_builder if not production_mode else None
             ),
             context_intelligence=context_intelligence,
+            repo_intelligence=(
+                getattr(context_intelligence, "repo_intelligence", None)
+                if context_intelligence is not None
+                else None
+            ),
+            edit_transaction_service=edit_transaction_service,
             workspace_manager=workspace_manager,
             execution_service=execution_service,
             approval_broker=cfg.approval_broker,
@@ -2085,6 +2416,7 @@ async def build_runtime(
             subagent_control_coordinator=subagent_control_coordinator,
             credential_broker=credential_broker,
             completion_controller=completion_controller,
+            completion_fact_provider=fact_provider,
             completion_gate=(
                 None if cfg.delegated_execution_context is not None else completion_gate
             ),
@@ -2104,6 +2436,11 @@ async def build_runtime(
             delegated_execution_context=cfg.delegated_execution_context,
             trusted_verification_authority=trusted_verification_authority,
             trusted_verification_service=trusted_verification_service,
+            verification_coordinator=autonomous_verification,
+            context_engine=context_engine,
+            parallel_subagent_coordinator=parallel_subagent_coordinator,
+            supervision_service=supervision_service,
+            checkpoint_service=checkpoint_service,
             # M4 batch 3.1.16A-5-1b (CRITICAL): carry the RPC-verified
             # project identity into the AgentLoop so every message / turn
             # write is stamped with it.  ``self._bound_project_id`` (set
@@ -2173,6 +2510,13 @@ async def build_runtime(
         runtime.owns_authority_broker = owns_authority_broker
         runtime.memory_host = memory_host
         runtime.owns_memory_host = owns_memory_host
+        runtime.context_intelligence = context_intelligence
+        runtime.owns_context_intelligence = context_intelligence is not None
+        runtime.context_engine = context_engine
+        runtime.verification_coordinator = autonomous_verification
+        runtime.parallel_subagent_coordinator = parallel_subagent_coordinator
+        runtime.supervision_service = supervision_service
+        runtime.checkpoint_service = checkpoint_service
         runtime.recovery_control = recovery_control
         runtime.composition_manifest = composition_manifest
         return runtime

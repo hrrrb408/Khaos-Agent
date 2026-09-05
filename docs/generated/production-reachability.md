@@ -17,8 +17,8 @@
 
 ## Import reachability result
 
-- Reachable repository modules: `286`.
-- Resolved import edges: `2248`.
+- Reachable repository modules: `337`.
+- Resolved import edges: `2753`.
 - Forbidden production edges: `0`.
 - Unresolved internal edges: `0`.
 
@@ -65,7 +65,21 @@
 - `khaos.channels.models`
 - `khaos.channels.registry`
 - `khaos.channels.webhook`
+- `khaos.coding.checkpoints.contracts`
+- `khaos.coding.checkpoints.repository`
+- `khaos.coding.checkpoints.service`
+- `khaos.coding.context_engine`
+- `khaos.coding.context_engine.cache`
+- `khaos.coding.context_engine.compression`
+- `khaos.coding.context_engine.contracts`
+- `khaos.coding.context_engine.discovery`
+- `khaos.coding.context_engine.selector`
+- `khaos.coding.context_engine.serializer`
+- `khaos.coding.context_engine.service`
+- `khaos.coding.context_engine.tools`
+- `khaos.coding.context_engine.working_set`
 - `khaos.coding.cost_tracker`
+- `khaos.coding.edit_transaction`
 - `khaos.coding.execution`
 - `khaos.coding.execution.authority`
 - `khaos.coding.execution.binding`
@@ -82,11 +96,26 @@
 - `khaos.coding.execution.service`
 - `khaos.coding.execution.supervisor`
 - `khaos.coding.fingerprint`
+- `khaos.coding.indexer`
 - `khaos.coding.intelligence.adapters`
 - `khaos.coding.intelligence.context`
+- `khaos.coding.intelligence.index`
+- `khaos.coding.intelligence.index.repository`
+- `khaos.coding.intelligence.index.store`
 - `khaos.coding.intelligence.models`
+- `khaos.coding.intelligence.query`
 - `khaos.coding.intelligence.query_service`
 - `khaos.coding.intelligence.registry`
+- `khaos.coding.intelligence.repository`
+- `khaos.coding.intelligence.resolution.go_resolver`
+- `khaos.coding.intelligence.resolution.ids`
+- `khaos.coding.intelligence.resolution.javascript_resolver`
+- `khaos.coding.intelligence.resolution.models`
+- `khaos.coding.intelligence.resolution.persistence`
+- `khaos.coding.intelligence.resolution.python_resolver`
+- `khaos.coding.intelligence.resolution.rust_resolver`
+- `khaos.coding.intelligence.resolution.service`
+- `khaos.coding.intelligence.resolution.symbol_table`
 - `khaos.coding.parser`
 - `khaos.coding.planning.approval.execution_contract`
 - `khaos.coding.planning.approval.execution_journal_writer`
@@ -139,6 +168,15 @@
 - `khaos.coding.planning.verification_store`
 - `khaos.coding.planning.workspace_mutation`
 - `khaos.coding.task_manager`
+- `khaos.coding.verification.contracts`
+- `khaos.coding.verification.diagnostics`
+- `khaos.coding.verification.evidence`
+- `khaos.coding.verification.executor`
+- `khaos.coding.verification.impact`
+- `khaos.coding.verification.models`
+- `khaos.coding.verification.planner`
+- `khaos.coding.verification.profile`
+- `khaos.coding.verification.service`
 - `khaos.coding.verify_fix`
 - `khaos.coding.workspace.artifacts`
 - `khaos.coding.workspace.boundary`
@@ -151,6 +189,9 @@
 - `khaos.coding.workspace.policy`
 - `khaos.coding.workspace.storage`
 - `khaos.coding.workspace.trusted_git`
+- `khaos.coding.workspace.trusted_git_locator`
+- `khaos.coding.workspace.trusted_git_policy`
+- `khaos.coding.workspace.trusted_git_preflight`
 - `khaos.config`
 - `khaos.db`
 - `khaos.db.connection`
@@ -297,7 +338,17 @@
 - `khaos.skills.skill`
 - `khaos.subagents`
 - `khaos.subagents.assignment`
+- `khaos.subagents.contracts`
+- `khaos.subagents.coordinator`
+- `khaos.subagents.merge`
+- `khaos.subagents.repository`
+- `khaos.subagents.scheduler`
 - `khaos.subagents.spawner`
+- `khaos.subagents.workspace`
+- `khaos.supervision.contracts`
+- `khaos.supervision.control`
+- `khaos.supervision.repository`
+- `khaos.supervision.service`
 - `khaos.time_utils`
 - `khaos.tools`
 - `khaos.tools.admission`

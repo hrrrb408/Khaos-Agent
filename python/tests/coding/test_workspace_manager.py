@@ -12,6 +12,7 @@ from khaos.coding.workspace.git_identity import GitIdentityError
 from khaos.coding.workspace.manager import WorkspaceError, WorkspaceManager
 from khaos.coding.workspace.models import WorkspaceState, WorkspaceTransition
 from khaos.coding.workspace.trusted_git import WorkspaceBootstrapLimits
+from khaos.coding.workspace.trusted_git_locator import PlatformTrustedGitLocator
 from khaos.security.authority_broker import AuthorityBrokerError
 from khaos.security.resource_scope import (
     GIT_SCOPE_OPERATIONS,
@@ -54,6 +55,7 @@ def test_typed_catalog_replaces_repository_path_hash(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.requires_trusted_git
 async def test_worktree_lifecycle_and_changeset_binding(tmp_path: Path):
     repository = _repo(tmp_path / "repo")
     manager = WorkspaceManager(tmp_path / "worktrees")
@@ -76,6 +78,7 @@ async def test_worktree_lifecycle_and_changeset_binding(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.requires_trusted_git
 async def test_cleanup_retries_grant_revocation_after_git_resources_are_gone(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -103,6 +106,7 @@ async def test_cleanup_retries_grant_revocation_after_git_resources_are_gone(
 
 
 @pytest.mark.asyncio
+@pytest.mark.requires_trusted_git
 async def test_changeset_commit_rejects_diff_drift(tmp_path: Path):
     repository = _repo(tmp_path / "repo")
     manager = WorkspaceManager(tmp_path / "worktrees")
@@ -115,6 +119,7 @@ async def test_changeset_commit_rejects_diff_drift(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.requires_trusted_git
 async def test_dirty_main_worktree_is_rejected(tmp_path: Path):
     repository = _repo(tmp_path / "repo")
     (repository / "README.md").write_text("dirty\n")
@@ -123,6 +128,7 @@ async def test_dirty_main_worktree_is_rejected(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.requires_trusted_git
 async def test_git_pointer_redirection_is_rejected_before_host_git(tmp_path: Path):
     repository = _repo(tmp_path / "repo")
     manager = WorkspaceManager(tmp_path / "worktrees")
@@ -146,6 +152,7 @@ async def test_git_pointer_redirection_is_rejected_before_host_git(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+@pytest.mark.requires_trusted_git
 async def test_git_pointer_inode_replacement_is_rejected(tmp_path: Path):
     repository = _repo(tmp_path / "repo")
     manager = WorkspaceManager(tmp_path / "worktrees")
@@ -161,6 +168,7 @@ async def test_git_pointer_inode_replacement_is_rejected(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.requires_trusted_git
 async def test_verify_execution_root_detects_worktree_swap(tmp_path: Path):
     """Round-14 §1: ``verify_execution_root`` re-checks the worktree root
     ``(dev, ino)`` immediately before subprocess launch, closing the TOCTOU
@@ -192,6 +200,7 @@ async def test_verify_execution_root_detects_worktree_swap(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.requires_trusted_git
 async def test_verify_execution_root_passes_for_stable_worktree(tmp_path: Path):
     """Round-14 §1: positive case — an unchanged worktree passes the
     pre-exec root-inode revalidation."""
@@ -203,6 +212,7 @@ async def test_verify_execution_root_passes_for_stable_worktree(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.requires_trusted_git
 async def test_workspace_commit_disables_repository_hooks(tmp_path: Path):
     repository = _repo(tmp_path / "repo")
     marker = tmp_path / "hook-ran"
@@ -220,6 +230,7 @@ async def test_workspace_commit_disables_repository_hooks(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.requires_trusted_git
 async def test_workspace_bootstrap_never_executes_repository_git_extensions(
     tmp_path: Path,
 ):
@@ -271,6 +282,7 @@ async def test_workspace_bootstrap_never_executes_repository_git_extensions(
 
 
 @pytest.mark.asyncio
+@pytest.mark.requires_trusted_git
 async def test_workspace_bootstrap_enforces_independent_blob_quota_and_cleans_pending(
     tmp_path: Path,
 ):
@@ -305,6 +317,7 @@ async def test_workspace_bootstrap_enforces_independent_blob_quota_and_cleans_pe
 
 
 @pytest.mark.asyncio
+@pytest.mark.requires_trusted_git
 async def test_workspace_bootstrap_publish_failure_cleans_final_worktree(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -342,6 +355,7 @@ async def test_workspace_bootstrap_publish_failure_cleans_final_worktree(
 
 
 @pytest.mark.asyncio
+@pytest.mark.requires_trusted_git
 async def test_workspace_bootstrap_cancellation_rolls_back_transaction(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -377,6 +391,7 @@ async def test_workspace_bootstrap_cancellation_rolls_back_transaction(
 
 
 @pytest.mark.asyncio
+@pytest.mark.requires_trusted_git
 async def test_workspace_bootstrap_rejects_gitlinks_without_submodule_update(
     tmp_path: Path,
 ):
@@ -404,6 +419,7 @@ async def test_workspace_bootstrap_rejects_gitlinks_without_submodule_update(
 
 
 @pytest.mark.asyncio
+@pytest.mark.requires_trusted_git
 async def test_trusted_diff_and_plumbing_commit_disable_textconv_filters_and_signing(
     tmp_path: Path,
 ):
@@ -454,6 +470,7 @@ async def test_trusted_diff_and_plumbing_commit_disable_textconv_filters_and_sig
 
 
 @pytest.mark.asyncio
+@pytest.mark.requires_trusted_git
 async def test_large_changeset_is_streamed_and_inline_read_is_bounded(tmp_path: Path):
     repository = _repo(tmp_path / "repo")
     manager = WorkspaceManager(tmp_path / "worktrees")
@@ -469,6 +486,7 @@ async def test_large_changeset_is_streamed_and_inline_read_is_bounded(tmp_path: 
 
 
 @pytest.mark.asyncio
+@pytest.mark.requires_trusted_git
 async def test_changeset_artifact_workspace_quota_is_enforced(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -483,6 +501,7 @@ async def test_changeset_artifact_workspace_quota_is_enforced(
 
 
 @pytest.mark.asyncio
+@pytest.mark.requires_trusted_git
 async def test_plumbing_changeset_covers_untracked_and_deleted_files(tmp_path: Path):
     repository = _repo(tmp_path / "repo")
     manager = WorkspaceManager(tmp_path / "worktrees")
@@ -498,6 +517,7 @@ async def test_plumbing_changeset_covers_untracked_and_deleted_files(tmp_path: P
 
 
 @pytest.mark.asyncio
+@pytest.mark.requires_trusted_git
 async def test_sha256_repository_uses_64_character_object_ids(tmp_path: Path):
     repository = tmp_path / "sha256-repo"
     repository.mkdir()
@@ -518,6 +538,7 @@ async def test_sha256_repository_uses_64_character_object_ids(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.requires_trusted_git
 async def test_host_git_does_not_inherit_git_configuration_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -575,7 +596,13 @@ def test_host_git_authority_ignores_caller_path(
 
     manager = WorkspaceManager(tmp_path / "worktrees")
 
-    assert manager._git_executable == Path("/usr/bin/git").resolve(strict=True)
+    selected = manager._git_executable.resolve(strict=True)
+    candidates = {
+        candidate.resolve(strict=True)
+        for candidate in PlatformTrustedGitLocator().candidates()
+    }
+    assert selected in candidates
+    assert selected != attacker.resolve(strict=True)
 
 
 @pytest.mark.asyncio

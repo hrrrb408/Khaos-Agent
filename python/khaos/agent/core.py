@@ -8,6 +8,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -60,6 +61,146 @@ def _default_runtime_environment(key: str) -> str:
     return ""
 
 
+def _observable_text_digest(value: object) -> dict[str, object] | None:
+    """Return bounded metadata for text that must not enter task telemetry."""
+    if not isinstance(value, str):
+        return None
+    encoded = value.encode("utf-8")
+    return {"bytes": len(encoded), "sha256": hashlib.sha256(encoded).hexdigest()}
+
+
+def _sanitize_tool_activity_arguments(
+    tool_name: str,
+    arguments: object,
+) -> object:
+    """Remove edit source/replacement text from persisted observability data.
+
+    The model-facing approval/tool contract retains its original arguments,
+    but task traces, runtime memory events, and tool-result metadata only need
+    path and digest evidence.  Keeping hashes and bounded offsets preserves
+    replay/audit usefulness without duplicating source material or secrets in
+    long-lived telemetry.
+    """
+    if tool_name not in {"apply_edit_transaction", "preview_edit_transaction"}:
+        return arguments
+    if not isinstance(arguments, dict):
+        return {}
+    sanitized: dict[str, object] = {}
+    for field_name in (
+        "transaction_id",
+        "base_generation",
+        "expected_workspace_digest",
+    ):
+        value = arguments.get(field_name)
+        if value is not None:
+            sanitized[field_name] = value
+    intent_digest = _observable_text_digest(arguments.get("intent"))
+    if intent_digest is not None:
+        sanitized["intent"] = intent_digest
+
+    operations = arguments.get("operations")
+    if not isinstance(operations, list):
+        sanitized["operation_count"] = 0
+        return sanitized
+    sanitized_operations: list[dict[str, object]] = []
+    for operation in operations[:64]:
+        if not isinstance(operation, dict):
+            continue
+        projection: dict[str, object] = {}
+        for field_name in (
+            "operation",
+            "path",
+            "destination_path",
+            "expected_exists",
+            "expected_digest",
+        ):
+            value = operation.get(field_name)
+            if value is not None:
+                projection[field_name] = value
+        content_digest = _observable_text_digest(operation.get("content"))
+        if content_digest is not None:
+            projection["content"] = content_digest
+        edits = operation.get("text_edits")
+        if isinstance(edits, list):
+            projection["text_edits"] = [
+                {
+                    "start": edit.get("start"),
+                    "end": edit.get("end"),
+                    "replacement": _observable_text_digest(edit.get("replacement")),
+                }
+                for edit in edits[:256]
+                if isinstance(edit, dict)
+            ]
+        sanitized_operations.append(projection)
+    sanitized["operations"] = sanitized_operations
+    sanitized["operation_count"] = len(operations)
+    if len(operations) > 64:
+        sanitized["operations_truncated"] = True
+    return sanitized
+
+
+def _sanitize_tool_activity_output(
+    tool_name: str,
+    output: object,
+    error: object = "",
+    *,
+    max_chars: int = 2048,
+) -> str:
+    """Return a bounded task-telemetry summary without preview source text."""
+    if tool_name not in {"apply_edit_transaction", "preview_edit_transaction"}:
+        return str(output or error)[:max_chars]
+    if isinstance(output, dict):
+        safe: dict[str, object] = {}
+        for field_name in (
+            "status",
+            "transaction_id",
+            "workspace_id",
+            "base_generation",
+            "resulting_generation",
+            "transaction_digest",
+            "before_workspace_digest",
+            "after_workspace_digest",
+            "predicted_workspace_digest",
+        ):
+            value = output.get(field_name)
+            if value is not None:
+                safe[field_name] = value
+        operations = output.get("operations")
+        if isinstance(operations, list):
+            safe_operations: list[dict[str, object]] = []
+            for operation in operations[:64]:
+                if not isinstance(operation, dict):
+                    continue
+                safe_operation: dict[str, object] = {}
+                for field_name in (
+                    "index",
+                    "operation",
+                    "path",
+                    "destination_path",
+                    "before_exists",
+                    "after_exists",
+                    "before_digest",
+                    "after_digest",
+                ):
+                    value = operation.get(field_name)
+                    if value is not None:
+                        safe_operation[field_name] = value
+                safe_operations.append(safe_operation)
+            safe["operations"] = safe_operations
+            safe["operation_count"] = len(operations)
+            if len(operations) > 64:
+                safe["operations_truncated"] = True
+        summary = safe
+    else:
+        summary = {
+            "output_type": type(output).__name__,
+            "output_digest": _observable_text_digest(output),
+        }
+    if error:
+        summary["error"] = str(error)[:512]
+    return json.dumps(summary, ensure_ascii=False, sort_keys=True)[:max_chars]
+
+
 class StopReason(Enum):
     """Reasons an agent turn can stop."""
 
@@ -88,6 +229,27 @@ class AgentConfig:
     context_max_symbols: int = 128
     context_max_bytes: int = 256 * 1024
     context_max_file_bytes: int = 64 * 1024
+    # M8.4: one bounded context engine owns final selection/eviction.  These
+    # values are disclosure budgets only; they do not alter workspace or tool
+    # authority.
+    context_output_reserve_tokens: int = 2_048
+    context_output_reserve_bytes: int = 32 * 1024
+    context_layer_token_budgets: tuple[int, int, int, int] = (
+        2_048,
+        3_072,
+        5_120,
+        1_760,
+    )
+    context_layer_byte_budgets: tuple[int, int, int, int] = (
+        48 * 1024,
+        64 * 1024,
+        112 * 1024,
+        32 * 1024,
+    )
+    context_recent_message_count: int = 12
+    tool_output_max_bytes: int = 64 * 1024
+    tool_output_max_tokens: int = 4_096
+    tool_output_max_lines: int = 512
 
 
 @dataclass
@@ -189,6 +351,13 @@ class AgentLoop:
         trusted_verification_service: Any = None,
         recovery_control: RecoveryControlCoordinator | None = None,
         delegated_execution_context: Any = None,
+        repo_intelligence=None,
+        edit_transaction_service=None,
+        verification_coordinator=None,
+        context_engine=None,
+        parallel_subagent_coordinator=None,
+        supervision_service=None,
+        checkpoint_service=None,
     ):
         self.config = config
         self.mode_manager = mode_manager
@@ -215,6 +384,33 @@ class AgentLoop:
         # owner-scoped, SafeWorkspaceFS-backed service.  The legacy builder
         # remains available for explicitly injected development/test loops.
         self.context_intelligence = context_intelligence
+        self.repo_intelligence = repo_intelligence or getattr(
+            context_intelligence, "repo_intelligence", None
+        )
+        self.edit_transaction_service = edit_transaction_service
+        # M8.3: post-edit verification is an observation coordinator only.
+        # Execution remains owned by ExecutionService and completion remains
+        # owned by the existing trusted provider plus CompletionGate.
+        self.verification_coordinator = verification_coordinator
+        # M8.5: parent-only thin orchestration seam.  Child workspaces,
+        # budgets, merge CAS, verification, and completion remain owned by
+        # their existing services; the loop only exposes the composed port.
+        self.parallel_subagent_coordinator = parallel_subagent_coordinator
+        # M8.6: the loop emits semantic lifecycle facts through this thin
+        # service.  It never calls a UI adapter and never treats the
+        # supervision projection as permission, mutation, or completion
+        # authority.
+        self.supervision_service = supervision_service
+        self.checkpoint_service = checkpoint_service
+        # M8.4: final context selection/serialization owner.  This service is
+        # optional for direct legacy/test constructions; the runtime factory
+        # wires it for the normal path so the old builder is not a second
+        # production context manager.
+        self.context_engine = context_engine
+        # M8.4 keeps the typed M8.1 result separate from its legacy rendered
+        # projection.  The bundle is turn-local and never becomes authority;
+        # ContextEngineService consumes its bounded candidate records.
+        self._active_context_bundle = None
         # Phase 6: 项目约定文件加载器（KHAOS.md / AGENTS.md）。注入优先级
         # 高于 memory / skill，因为它们是项目级硬规则。
         self.project_context_loader = project_context_loader
@@ -259,7 +455,9 @@ class AgentLoop:
         self.active_workspace = None
         self._active_session_id = ""
         self._active_task_id: str | None = None
+        self._supervision_runtime_registered = False
         self._recovery_cycles_this_turn = 0
+        self._context_needs_rebuild = False
         self.execution_service = execution_service
         if approval_broker is None:
             from khaos.agent.approval import ApprovalBroker
@@ -324,6 +522,38 @@ class AgentLoop:
                 UnsupportedBackend(), runtime_profile=self.runtime_profile
             )
 
+    def _require_parallel_parent(self) -> tuple[Any, Any]:
+        """Return the parent workspace and M8.5 coordinator, fail-closed."""
+        if self.delegated_execution_context is not None:
+            raise PermissionError("delegated children cannot create parallel children")
+        coordinator = self.parallel_subagent_coordinator
+        if coordinator is None:
+            raise RuntimeError("parallel subagent coordinator is not configured")
+        workspace = self.active_workspace
+        if workspace is None:
+            raise PermissionError("parallel subagents require an active parent workspace")
+        active_task_id = self._active_task_id or self.task_id
+        if active_task_id is not None and workspace.task_id != active_task_id:
+            raise PermissionError("active workspace is not bound to the parent task")
+        return coordinator, workspace
+
+    async def run_parallel_subagents(
+        self,
+        assignments: tuple[Any, ...],
+        worker: Any,
+    ) -> tuple[Any, ...]:
+        """Run bounded child assignments from the active parent workspace."""
+        coordinator, workspace = self._require_parallel_parent()
+        return await coordinator.run_parallel(workspace, assignments, worker)
+
+    async def merge_parallel_subagents(
+        self,
+        assignments: tuple[Any, ...],
+    ) -> tuple[Any, Any]:
+        """Trigger deterministic child merge through the composed coordinator."""
+        coordinator, workspace = self._require_parallel_parent()
+        return await coordinator.merge(workspace, assignments)
+
     @staticmethod
     def _turn_context_digest(messages: list[Message]) -> str:
         """Digest the immutable message facts crossing the context boundary."""
@@ -362,6 +592,94 @@ class AgentLoop:
         """Close a turn through the explicit finalization boundary."""
         return TurnFinalizer.finalize(phase, terminal_status=terminal_status)
 
+    def _autonomous_verification_message(
+        self,
+        *,
+        run: Any,
+        impact: Any,
+        task_id: str,
+        turn_id: str,
+        attempt_id: str,
+        repair_attempt: int | None = None,
+    ) -> Message:
+        """Build a bounded model observation for one M8.3 run."""
+        from khaos.coding.verification.contracts import VerificationRunStatus
+        from khaos.coding.verification.service import AutonomousVerificationCoordinator
+
+        status = getattr(getattr(run, "status", None), "value", "unknown")
+        if status == VerificationRunStatus.PASSED.value:
+            content = (
+                "# Autonomous verification result (UNTRUSTED OBSERVATION)\n"
+                "Verification checks passed. This is advisory evidence only; "
+                "completion still requires the trusted verification authority."
+            )
+        else:
+            if impact is None:
+                raise TypeError("autonomous verification impact is invalid")
+            context = AutonomousVerificationCoordinator.repair_context(run, impact)
+            content = context.render()
+            if repair_attempt is not None:
+                content += (
+                    f"\n\nRepair attempt admitted by the existing verify-fix "
+                    f"controller: {repair_attempt}. Use a new EditTransaction "
+                    "to produce a new workspace generation and verification plan."
+                )
+            else:
+                content += (
+                    "\n\nNo automatic repair attempt was admitted. The failure "
+                    "remains a negative observation and may require user action."
+                )
+        plan = getattr(run, "plan", None)
+        checks = tuple(getattr(plan, "checks", ()) or ())
+        stage_counts: dict[str, int] = {}
+        kind_counts: dict[str, int] = {}
+        for check in checks:
+            stage = getattr(getattr(check, "stage", None), "name", "")
+            if stage:
+                stage_counts[stage.casefold()] = stage_counts.get(stage.casefold(), 0) + 1
+            kind = getattr(getattr(check, "kind", None), "value", "")
+            if kind:
+                kind_counts[kind] = kind_counts.get(kind, 0) + 1
+        checks_by_id = {
+            getattr(check, "check_id", ""): check
+            for check in checks
+            if getattr(check, "check_id", "")
+        }
+        executed_kind_counts: dict[str, int] = {}
+        for evidence in tuple(getattr(run, "evidence", ()) or ()):
+            check = checks_by_id.get(getattr(evidence, "check_id", ""))
+            kind = getattr(getattr(check, "kind", None), "value", "")
+            if kind:
+                executed_kind_counts[kind] = executed_kind_counts.get(kind, 0) + 1
+        metadata = {
+            "task_id": task_id,
+            "turn_id": turn_id,
+            "attempt_id": attempt_id,
+            "run_id": getattr(run, "run_id", ""),
+            "plan_id": getattr(plan, "plan_id", ""),
+            "plan_digest": getattr(plan, "plan_digest", ""),
+            "status": status,
+            "workspace_generation": getattr(plan, "workspace_generation", None),
+            "repository_generation": getattr(plan, "repository_generation", None),
+            "required_check_count": int(getattr(run, "required_count", 0)),
+            "passed_check_count": int(getattr(run, "passed_count", 0)),
+            "check_count": len(checks),
+            "executed_check_count": len(tuple(getattr(run, "evidence", ()) or ())),
+            "stage_counts": stage_counts,
+            "kind_counts": executed_kind_counts,
+            "planned_kind_counts": kind_counts,
+            "diagnostic_count": len(tuple(getattr(run, "diagnostics", ()) or ())),
+            "repair_attempt": repair_attempt,
+        }
+        return Message(
+            role="system",
+            content=content,
+            token_count=self.token_engine.count_tokens(content),
+            event="verification_result",
+            metadata=metadata,
+            created_at=time.time(),
+        )
+
     async def run(
         self,
         user_input: str,
@@ -391,6 +709,7 @@ class AgentLoop:
             if self.active_workspace is None:
                 raise PermissionError("delegated execution cannot attach the parent workspace")
         self._recovery_cycles_this_turn = 0
+        self._context_needs_rebuild = False
         is_coding = self.mode_manager.current_mode.value == "coding"
         if is_coding and self._verify_fix_factory is not None:
             self.verify_fix_loop = self._verify_fix_factory()
@@ -488,6 +807,44 @@ class AgentLoop:
                 runtime_id=self.runtime_id,
                 event_sink=turn,
             )
+            if self.supervision_service is not None:
+                await self.supervision_service.emit(
+                    task_id=active_task_id,
+                    workspace_id=self.active_workspace.id,
+                    principal_id=self.principal_id,
+                    project_id=self.project_id,
+                    event_type="plan.created",
+                    payload={
+                        "plan": {
+                            "revision_id": str(
+                                getattr(self._active_planning_result, "revision_id", "")
+                                or getattr(self._active_planning_result, "plan_id", "planning")
+                            ),
+                            "digest": str(
+                                getattr(self._active_planning_result, "revision_digest", "")
+                                or getattr(self._active_planning_result, "plan_digest", "unknown")
+                            ),
+                            "current_step": 0,
+                            "total_steps": int(
+                                getattr(self._active_planning_result, "step_count", 0) or 0
+                            ),
+                            "summary": "durable Coding plan created",
+                        },
+                        "status": "PLANNING",
+                    },
+                )
+            await self._observe_context_event(
+                "PlanRevision",
+                {
+                    "plan_revision": (
+                        getattr(self._active_planning_result, "revision_digest", None)
+                        or getattr(self._active_planning_result, "plan_digest", None)
+                        or ""
+                    ),
+                    "summary": "planning revision created",
+                },
+                task_id=active_task_id,
+            )
             # The coordinator owns the physical cognitive CAS.  Refresh only
             # the in-memory projection so the task facts below do not expose a
             # stale pre-CAS state; this is not restart ``load()`` semantics.
@@ -503,6 +860,49 @@ class AgentLoop:
             attempt_id=turn.attempt_id,
             task_id=active_task_id or "",
         )
+        # M8.6: register the live runtime only after the TaskWorkspace is
+        # bound and before model/tool effects can start.  A durable PAUSED or
+        # CANCELLING state is recovered by the control owner at this point.
+        self._supervision_runtime_registered = False
+        if (
+            is_coding
+            and active_task_id
+            and self.active_workspace is not None
+            and self.supervision_service is not None
+            and self.delegated_execution_context is None
+        ):
+            supervision_state = await self.supervision_service.state(
+                active_task_id,
+                principal_id=self.principal_id,
+                project_id=self.project_id,
+            )
+            if supervision_state is None:
+                task_goal = str(getattr(locals().get("task", None), "goal", user_input))
+                await self.supervision_service.start_task(
+                    task_id=active_task_id,
+                    workspace_id=self.active_workspace.id,
+                    principal_id=self.principal_id,
+                    project_id=self.project_id,
+                    goal=task_goal,
+                )
+            await self.supervision_service.register_runtime(
+                task_id=active_task_id,
+                workspace_id=self.active_workspace.id,
+                principal_id=self.principal_id,
+                project_id=self.project_id,
+                runtime_id=self.runtime_id,
+                runtime_task=asyncio.current_task(),
+                checkpoint_service=self.checkpoint_service,
+            )
+            self._supervision_runtime_registered = True
+            await self.supervision_service.emit(
+                task_id=active_task_id,
+                workspace_id=self.active_workspace.id,
+                principal_id=self.principal_id,
+                project_id=self.project_id,
+                event_type="context.prepared",
+                payload={"status": "INVESTIGATING"},
+            )
         total_tokens = 0
         budget_exhausted = False
         stop_reason: str | None = None
@@ -534,8 +934,32 @@ class AgentLoop:
                     budget_exhausted = True
                     stop_reason = StopReason.MAX_BUDGET.value
                     break
+                if (
+                    active_task_id
+                    and self.supervision_service is not None
+                    and self._supervision_runtime_registered
+                ):
+                    resumed = await self.supervision_service.wait_if_paused(
+                        active_task_id,
+                        principal_id=self.principal_id,
+                        project_id=self.project_id,
+                    )
+                    if resumed:
+                        self._context_needs_rebuild = True
                 empty_response_retries = 0
-                if await self._check_compression(messages) and self.compressor is not None:
+                if self.context_engine is not None:
+                    if self._context_needs_rebuild:
+                        messages = await self._build_context(session_id, user_input)
+                        self._context_needs_rebuild = False
+                    else:
+                        messages = cast(
+                            list[Message],
+                            await self.context_engine.rebalance_messages(
+                                messages,
+                                requirements=self._context_requirements(user_input),
+                            ),
+                        )
+                elif await self._check_compression(messages) and self.compressor is not None:
                     result = await self.compressor.compress(
                         messages,
                         self.config.compression_threshold,
@@ -564,7 +988,7 @@ class AgentLoop:
                     assistant_content = ""
                     tool_calls: list[dict] = []
                     stop_reason = StopReason.END_TURN.value
-                    tools_schema = self._build_tools_schema()
+                    tools_schema = self._build_tools_schema(user_input)
                     call_kwargs = {"tools": tools_schema} if tools_schema is not None else {}
 
                     async for chunk in self.router.call(
@@ -660,6 +1084,22 @@ class AgentLoop:
 
                     if budget_exhausted:
                         break
+                    # A pause may arrive while the model stream is in
+                    # flight.  Do not admit the returned tool calls into the
+                    # scheduler until the durable control owner has reached
+                    # a safe point and the user resumes the task.
+                    if (
+                        active_task_id
+                        and self.supervision_service is not None
+                        and self._supervision_runtime_registered
+                    ):
+                        resumed = await self.supervision_service.wait_if_paused(
+                            active_task_id,
+                            principal_id=self.principal_id,
+                            project_id=self.project_id,
+                        )
+                        if resumed:
+                            self._context_needs_rebuild = True
                     if assistant_content.strip() or tool_calls or stop_reason == StopReason.TOOL_USE.value:
                         break
                     if empty_response_retries >= 1:
@@ -791,6 +1231,8 @@ class AgentLoop:
                         },
                         "sandbox_backend": execution_backend_identity,
                         "workspace_manager": self.workspace_manager,
+                        "repo_intelligence": self.repo_intelligence,
+                        "edit_transaction_service": self.edit_transaction_service,
                         "coding_workspace_enforced": self.active_workspace is not None,
                         "production_runtime": self.runtime_profile.is_production,
                         "approval_broker": self.approval_broker,
@@ -892,8 +1334,80 @@ class AgentLoop:
                         "subagent_control_coordinator": getattr(
                             self, "subagent_control_coordinator", None
                         ),
+                        "parallel_subagent_coordinator": getattr(
+                            self, "parallel_subagent_coordinator", None
+                        ),
                     },
                 }
+                if (
+                    active_task_id
+                    and self.supervision_service is not None
+                    and self._supervision_runtime_registered
+                ):
+                    await self.supervision_service.wait_if_paused(
+                        active_task_id,
+                        principal_id=self.principal_id,
+                        project_id=self.project_id,
+                    )
+                    if any(
+                        str(call.get("name", "")) == "apply_edit_transaction"
+                        for call in tool_calls
+                    ):
+                        if self.checkpoint_service is None or self.active_workspace is None:
+                            raise PermissionError(
+                                "mutating Coding work requires a checkpoint owner"
+                            )
+                        try:
+                            await self.checkpoint_service.create_checkpoint(
+                                task_id=active_task_id,
+                                workspace_id=self.active_workspace.id,
+                                kind="PRE_EDIT",
+                                label="before coding edit",
+                                expected_generation=self.active_workspace.generation,
+                                principal_id=self.principal_id,
+                                project_id=self.project_id,
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "pre-edit checkpoint refused: %s",
+                                type(exc).__name__,
+                            )
+                            await self.supervision_service.emit(
+                                task_id=active_task_id,
+                                workspace_id=self.active_workspace.id,
+                                principal_id=self.principal_id,
+                                project_id=self.project_id,
+                                event_type="task.failed",
+                                payload={
+                                    "reason": "pre-edit checkpoint unavailable",
+                                    "error_type": type(exc).__name__,
+                                },
+                                severity="error",
+                            )
+                            raise PermissionError(
+                                "pre-edit checkpoint is required before mutation"
+                            ) from exc
+                    await self.supervision_service.emit(
+                        task_id=active_task_id,
+                        workspace_id=getattr(self.active_workspace, "id", ""),
+                        principal_id=self.principal_id,
+                        project_id=self.project_id,
+                        event_type="step.started",
+                        payload={
+                            "current_step": "tool execution",
+                            "activity": {
+                                "operation": "coding",
+                                "kind": "tool_batch",
+                                "stage": "executing",
+                                "description": "Executing approved Coding tools",
+                                "scope": [
+                                    str(call.get("name", ""))[:128]
+                                    for call in tool_calls[:64]
+                                ],
+                                "status": "active",
+                            },
+                        },
+                    )
                 orchestration_phase = orchestration_phase.transition(
                     TurnPhase.TOOL_EXECUTING,
                     tool_batch_digest=self._tool_batch_phase_digest(tool_calls),
@@ -913,6 +1427,25 @@ class AgentLoop:
                                 "expires_at": request.expires_at,
                             },
                         )
+                        if (
+                            active_task_id
+                            and self.supervision_service is not None
+                            and self._supervision_runtime_registered
+                        ):
+                            await self.supervision_service.emit(
+                                task_id=active_task_id,
+                                workspace_id=request.workspace_id or getattr(self.active_workspace, "id", ""),
+                                principal_id=self.principal_id,
+                                project_id=self.project_id,
+                                event_type="approval.requested",
+                                payload={
+                                    "approval_id": request.tool_call_id,
+                                    "operation": request.name,
+                                    "binding_digest": request.binding_digest,
+                                    "expires_at": request.expires_at,
+                                    "approval_state": "pending",
+                                },
+                            )
                         await self._record_memory_runtime_event(
                             "APPROVAL_REQUESTED",
                             session_id=session_id,
@@ -938,6 +1471,8 @@ class AgentLoop:
                                     "expires_at": request.expires_at,
                                     "principal_id": self.principal_id,
                                     "session_id": session_id,
+                                    "workspace_id": request.workspace_id
+                                    or getattr(self.active_workspace, "id", ""),
                                 },
                             )
                         yield Message(
@@ -967,21 +1502,46 @@ class AgentLoop:
                         )
                     if event.result is not None:
                         result = event.result
-                        content = json.dumps(
-                            {
-                                "success": result.success,
-                                "output": result.output,
-                                "error": result.error,
-                                "error_code": result.error_code,
-                                "effect_status": result.effect_status,
-                                "delivery_status": result.delivery_status,
-                                "warning": result.warning,
-                                "effect_id": result.effect_id,
-                                "phase_digest": result.phase_digest,
-                                "retry_safe": result.retry_safe,
-                            },
-                            ensure_ascii=False,
-                        )
+                        bounded_envelope = None
+                        if self.context_engine is not None:
+                            bounded_envelope = self.context_engine.bound_tool_result(result)
+                            wrapper_prefix = '<untrusted_tool_output source="tool">\n'
+                            wrapper_suffix = "</untrusted_tool_output>"
+                            output_budget = max(
+                                1,
+                                int(
+                                    getattr(
+                                        self.config,
+                                        "tool_output_max_bytes",
+                                        64 * 1024,
+                                    )
+                                )
+                                - len(
+                                    (wrapper_prefix + wrapper_suffix).encode("utf-8")
+                                ),
+                            )
+                            bounded_content = bounded_envelope.to_json(
+                                max_bytes=output_budget
+                            )
+                            content = (
+                                f"{wrapper_prefix}{bounded_content}\n{wrapper_suffix}"
+                            )
+                        else:
+                            content = json.dumps(
+                                {
+                                    "success": result.success,
+                                    "output": result.output,
+                                    "error": result.error,
+                                    "error_code": result.error_code,
+                                    "effect_status": result.effect_status,
+                                    "delivery_status": result.delivery_status,
+                                    "warning": result.warning,
+                                    "effect_id": result.effect_id,
+                                    "phase_digest": result.phase_digest,
+                                    "retry_safe": result.retry_safe,
+                                },
+                                ensure_ascii=False,
+                            )
                         tool_msg = Message(
                             role="tool",
                             content=content,
@@ -992,11 +1552,27 @@ class AgentLoop:
                                 "id": result.tool_call_id,
                                 "name": result.name,
                                 "success": result.success,
-                                "output": result.output,
+                                "output": (
+                                    result.output
+                                    if bounded_envelope is None
+                                    else ""
+                                ),
+                                "output_digest": (
+                                    bounded_envelope.full_result_digest
+                                    if bounded_envelope is not None
+                                    else None
+                                ),
+                                "output_truncated": (
+                                    bounded_envelope.truncated
+                                    if bounded_envelope is not None
+                                    else False
+                                ),
                                 "error": result.error,
                                 "error_code": result.error_code,
                                 "duration_ms": result.duration_ms,
-                                "arguments": result.arguments or {},
+                                "arguments": _sanitize_tool_activity_arguments(
+                                    result.name, result.arguments or {}
+                                ),
                                 "effect_status": result.effect_status,
                                 "delivery_status": result.delivery_status,
                                 "warning": result.warning,
@@ -1044,6 +1620,43 @@ class AgentLoop:
                         await self._record_task_activity(result, active_task_id)
                         if (
                             result.success
+                            and result.name == "apply_edit_transaction"
+                        ):
+                            self._context_needs_rebuild = True
+                            await self._observe_context_event(
+                                "EditTransactionApplied",
+                                {
+                                    "summary": "edit transaction applied",
+                                    "operation_digest": result.phase_digest or result.effect_id or "",
+                                    "changed_files": [
+                                        str(operation.get("path"))
+                                        for operation in (result.arguments or {}).get("operations", [])
+                                        if isinstance(operation, dict) and operation.get("path")
+                                    ],
+                                },
+                                task_id=active_task_id,
+                            )
+                        await self._observe_context_event(
+                            "ToolResult",
+                            {
+                                "tool_name": result.name,
+                                "success": result.success,
+                                "summary": (
+                                    _sanitize_tool_activity_output(
+                                        result.name,
+                                        result.output,
+                                        result.error,
+                                        max_chars=512,
+                                    )
+                                ),
+                                "workspace_id": getattr(
+                                    self.active_workspace, "id", ""
+                                ),
+                            },
+                            task_id=active_task_id,
+                        )
+                        if (
+                            result.success
                             and self.context_intelligence is not None
                             and active_task_id
                             and self.active_workspace is not None
@@ -1053,12 +1666,387 @@ class AgentLoop:
                                 tool_name=result.name,
                                 arguments=result.arguments or {},
                             )
+                        # M8.3: every successful canonical coding edit enters
+                        # the autonomous planner through the existing
+                        # coordinator.  Read-only tools, failed mutations, and
+                        # legacy text-edit tools do not enter this path.
+                        if (
+                            is_coding
+                            and result.success
+                            and result.name == "apply_edit_transaction"
+                            and self.verification_coordinator is not None
+                            and active_task_id is not None
+                            and self.active_workspace is not None
+                        ):
+                            try:
+                                from khaos.coding.verification.impact import (
+                                    EditImpact,
+                                    edit_transaction_result_from_tool_output,
+                                )
+
+                                # A successful tool envelope is still an
+                                # observation boundary.  Clear the previous
+                                # run before decoding it so malformed output
+                                # cannot leave stale positive evidence visible
+                                # to completion or repair logic.
+                                self.verification_coordinator.invalidate(active_task_id)
+                                edit_result = edit_transaction_result_from_tool_output(
+                                    result.output
+                                )
+                                if self.checkpoint_service is not None:
+                                    await self.checkpoint_service.record_transaction(
+                                        active_task_id,
+                                        edit_result,
+                                        principal_id=self.principal_id,
+                                        project_id=self.project_id,
+                                    )
+                                if self.supervision_service is not None:
+                                    await self.supervision_service.emit(
+                                        task_id=active_task_id,
+                                        workspace_id=self.active_workspace.id,
+                                        principal_id=self.principal_id,
+                                        project_id=self.project_id,
+                                        event_type="verification.started",
+                                        repository_generation=edit_result.resulting_generation,
+                                        payload={
+                                            "transaction_id": edit_result.transaction_id,
+                                            "transaction_digest": edit_result.transaction_digest,
+                                            "changed_paths": [
+                                                operation.path
+                                                for operation in edit_result.operations
+                                            ],
+                                            "verification_state": "running",
+                                        },
+                                    )
+                                await self._observe_context_event(
+                                    "VerificationPlanCreated",
+                                    {
+                                        "summary": "post-edit verification plan created",
+                                        "changed_files": list(
+                                            getattr(edit_result, "changed_files", ()) or ()
+                                        )[:32],
+                                    },
+                                    task_id=active_task_id,
+                                )
+                                autonomous_run = (
+                                    await self.verification_coordinator.verify_after_edit(
+                                        edit_result,
+                                        task_id=active_task_id,
+                                        workspace=self.active_workspace,
+                                        event_sink=turn,
+                                        principal_id=self.principal_id,
+                                        project_id=self.project_id,
+                                    )
+                                )
+                                impact = self.verification_coordinator.impact_for_task(
+                                    active_task_id
+                                ) or EditImpact.from_result(edit_result)
+                                repair_attempt = None
+                                autonomous_observation = None
+                                suppress_autonomous_repair = False
+                                if self.verify_fix_loop is not None:
+                                    autonomous_observation = (
+                                        self.verify_fix_loop.observe_autonomous_run(
+                                            autonomous_run
+                                        )
+                                    )
+                                    autonomous_status = autonomous_run.status.value
+                                    no_progress = self.verify_fix_loop.no_progress_signal()
+                                    if (
+                                        no_progress.detected
+                                        and autonomous_status in {"failed", "timed_out"}
+                                        and autonomous_observation is not None
+                                        and active_task_id is not None
+                                    ):
+                                        normalized_failure = (
+                                            self._normalize_verify_fix_failure(
+                                                autonomous_observation
+                                            )
+                                        )
+                                        await turn.emit(
+                                            "recovery.no_progress",
+                                            {
+                                                "task_id": active_task_id,
+                                                "observation_indices": list(
+                                                    no_progress.observation_indices
+                                                ),
+                                                "failure_signature_digest": (
+                                                    normalized_failure.failure_signature_digest
+                                                ),
+                                                "reason": "identical_failure_signature",
+                                            },
+                                        )
+                                        recovery_for_observation = (
+                                            await self._recover_after_no_progress(
+                                                turn=turn,
+                                                task_id=active_task_id,
+                                                failure_signature=normalized_failure,
+                                                query=user_input,
+                                            )
+                                        )
+                                        recovery_status = getattr(
+                                            getattr(
+                                                recovery_for_observation,
+                                                "status",
+                                                None,
+                                            ),
+                                            "value",
+                                            None,
+                                        )
+                                        recovery_action = getattr(
+                                            getattr(
+                                                recovery_for_observation,
+                                                "action",
+                                                None,
+                                            ),
+                                            "value",
+                                            None,
+                                        )
+                                        suppress_autonomous_repair = (
+                                            recovery_status in {"applied", "blocked"}
+                                            and recovery_action in {"replan", "block"}
+                                        )
+                                    if (
+                                        autonomous_status in {"failed", "timed_out"}
+                                        and autonomous_observation is not None
+                                        and not suppress_autonomous_repair
+                                    ):
+                                        repair_attempt = self.verify_fix_loop.admit_repair(
+                                            autonomous_observation
+                                        )
+                                verification_msg = self._autonomous_verification_message(
+                                    run=autonomous_run,
+                                    impact=impact,
+                                    task_id=active_task_id,
+                                    turn_id=turn.turn_id,
+                                    attempt_id=turn.attempt_id,
+                                    repair_attempt=repair_attempt,
+                                )
+                                messages.append(verification_msg)
+                                await self._observe_context_event(
+                                    "VerificationResult",
+                                    {
+                                        "status": getattr(
+                                            getattr(autonomous_run, "status", None),
+                                            "value",
+                                            "unknown",
+                                        ),
+                                        "summary": "autonomous verification observed",
+                                    },
+                                    task_id=active_task_id,
+                                )
+                                verification_status = getattr(
+                                    getattr(autonomous_run, "status", None),
+                                    "value",
+                                    "unknown",
+                                )
+                                if (
+                                    repair_attempt is not None
+                                    and self.supervision_service is not None
+                                    and active_task_id is not None
+                                ):
+                                    await self.supervision_service.emit(
+                                        task_id=active_task_id,
+                                        workspace_id=self.active_workspace.id,
+                                        principal_id=self.principal_id,
+                                        project_id=self.project_id,
+                                        event_type="repair.started",
+                                        repository_generation=edit_result.resulting_generation,
+                                        payload={
+                                            "attempt": repair_attempt,
+                                            "verification_state": verification_status,
+                                            "status": "REPAIRING",
+                                        },
+                                    )
+                                if self.supervision_service is not None:
+                                    await self.supervision_service.emit(
+                                        task_id=active_task_id,
+                                        workspace_id=self.active_workspace.id,
+                                        principal_id=self.principal_id,
+                                        project_id=self.project_id,
+                                        event_type=(
+                                            "verification.passed"
+                                            if verification_status == "passed"
+                                            else "verification.failed"
+                                        ),
+                                        repository_generation=edit_result.resulting_generation,
+                                        payload={
+                                            "verification_state": verification_status,
+                                            "changed_paths": [
+                                                operation.path
+                                                for operation in edit_result.operations
+                                            ],
+                                        },
+                                    )
+                                if (
+                                    verification_status == "passed"
+                                    and self.checkpoint_service is not None
+                                ):
+                                    try:
+                                        await self.checkpoint_service.create_checkpoint(
+                                            task_id=active_task_id,
+                                            workspace_id=self.active_workspace.id,
+                                            kind="POST_VERIFICATION",
+                                            label="after verified coding edit",
+                                            expected_generation=edit_result.resulting_generation,
+                                            verification_evidence_digest=(
+                                                getattr(autonomous_run, "run_digest", None)
+                                                if isinstance(
+                                                    getattr(autonomous_run, "run_digest", None),
+                                                    str,
+                                                )
+                                                and len(getattr(autonomous_run, "run_digest", "")) == 64
+                                                else None
+                                            ),
+                                            known_state=True,
+                                            principal_id=self.principal_id,
+                                            project_id=self.project_id,
+                                        )
+                                    except Exception:
+                                        logger.warning(
+                                            "post-verification checkpoint unavailable",
+                                            exc_info=True,
+                                        )
+                                if verification_status in {"failed", "timed_out"}:
+                                    diagnostics = tuple(
+                                        getattr(autonomous_run, "diagnostics", ()) or ()
+                                    )
+                                    diagnostic_text = str(
+                                        getattr(diagnostics[0], "message", diagnostics[0])
+                                        if diagnostics
+                                        else "autonomous verification failed"
+                                    )[:2048]
+                                    await self._observe_context_event(
+                                        "VerificationDiagnostic",
+                                        {
+                                            "summary": diagnostic_text,
+                                            "diagnostic_count": len(diagnostics),
+                                        },
+                                        task_id=active_task_id,
+                                    )
+                                elif verification_status == "passed":
+                                    await self._observe_context_event(
+                                        "VerificationGreen",
+                                        {"summary": "autonomous verification is green"},
+                                        task_id=active_task_id,
+                                    )
+                                await self._persist_message(
+                                    session_id,
+                                    verification_msg,
+                                    task_id=active_task_id,
+                                    workspace_id=getattr(
+                                        self.active_workspace, "id", None
+                                    ),
+                                    commit_sha=getattr(
+                                        self.active_workspace, "base_sha", None
+                                    ),
+                                )
+                                if self.task_manager is not None and active_task_id:
+                                    if autonomous_run.status.value == "passed":
+                                        await self.task_manager.update_status(
+                                            active_task_id,
+                                            "waiting_test",
+                                        )
+                                    elif repair_attempt is not None:
+                                        await self.task_manager.update_status(
+                                            active_task_id,
+                                            "fixing",
+                                            fix_attempts=self.verify_fix_loop.attempt_count,
+                                        )
+                                if (
+                                    self.verify_fix_loop is not None
+                                    and self.verify_fix_loop.is_loop_exhausted()
+                                    and not self.verify_fix_loop.report_emitted
+                                ):
+                                    report = self.verify_fix_loop.get_final_report()
+                                    self.verify_fix_loop.mark_report_emitted()
+                                    yield Message(
+                                        role="system",
+                                        content=report,
+                                        event="verify_fix_report",
+                                        created_at=time.time(),
+                                    )
+                            except Exception as exc:  # noqa: BLE001 - verification failure is observed fail-closed
+                                # A malformed edit projection or unavailable
+                                # verification coordinator is an explicit
+                                # infrastructure observation.  It must not
+                                # turn a successful edit into positive proof,
+                                # and raw exception text never enters model
+                                # context or telemetry.
+                                logger.warning(
+                                    "autonomous verification could not start: %s",
+                                    type(exc).__name__,
+                                )
+                                await turn.emit(
+                                    "verification.infrastructure_error",
+                                    {
+                                        "task_id": active_task_id,
+                                        "workspace_id": self.active_workspace.id,
+                                        "tool_name": result.name,
+                                        "error_type": type(exc).__name__,
+                                    },
+                                )
+                                unavailable_msg = Message(
+                                    role="system",
+                                    content=(
+                                        "# Autonomous verification result "
+                                        "(UNTRUSTED OBSERVATION)\n"
+                                        "Verification infrastructure was unavailable; "
+                                        "no verification pass or completion authority was granted."
+                                    ),
+                                    event="verification_unavailable",
+                                    metadata={
+                                        "task_id": active_task_id,
+                                        "workspace_id": self.active_workspace.id,
+                                        "error_type": type(exc).__name__,
+                                    },
+                                    created_at=time.time(),
+                                )
+                                messages.append(unavailable_msg)
+                                await self._persist_message(
+                                    session_id,
+                                    unavailable_msg,
+                                    task_id=active_task_id,
+                                    workspace_id=getattr(
+                                        self.active_workspace, "id", None
+                                    ),
+                                )
                         if result.name == "test_run" and self.task_manager is not None and active_task_id:
                             await self.task_manager.update_status(active_task_id, "waiting_test")
+                        if result.name == "test_run":
+                            if result.success:
+                                await self._observe_context_event(
+                                    "VerificationGreen",
+                                    {"summary": "test_run passed"},
+                                    task_id=active_task_id,
+                                )
+                            else:
+                                await self._observe_context_event(
+                                    "VerificationDiagnostic",
+                                    {
+                                        "summary": str(
+                                            result.error or result.output or "test_run failed"
+                                        )[:2048],
+                                    },
+                                    task_id=active_task_id,
+                                )
                         if self.task_manager is not None and active_task_id:
                             await self.task_manager.record_trace(
                                 active_task_id,
-                                {"tool_name": result.name, "arguments": result.arguments or {}, "success": result.success, "result_summary": str(result.output or result.error)[:500], "timestamp": time.time()},
+                                {
+                                    "tool_name": result.name,
+                                    "arguments": _sanitize_tool_activity_arguments(
+                                        result.name, result.arguments or {}
+                                    ),
+                                    "success": result.success,
+                                    "result_summary": _sanitize_tool_activity_output(
+                                        result.name,
+                                        result.output,
+                                        result.error,
+                                        max_chars=500,
+                                    ),
+                                    "timestamp": time.time(),
+                                },
                             )
                         # Verify-fix loop: when a test_run result contains
                         # failures, inject a guidance message so the model
@@ -1273,6 +2261,37 @@ class AgentLoop:
                     stop_reason,
                     recovery_result=recovery_result,
                 )
+            if (
+                self.supervision_service is not None
+                and self._supervision_runtime_registered
+                and active_task_id
+                and self.active_workspace is not None
+            ):
+                task_projection = (
+                    await self.task_manager.get(active_task_id)
+                    if self.task_manager is not None
+                    else None
+                )
+                task_status = getattr(
+                    getattr(task_projection, "status", None), "value", "ready"
+                )
+                await self.supervision_service.emit(
+                    task_id=active_task_id,
+                    workspace_id=self.active_workspace.id,
+                    principal_id=self.principal_id,
+                    project_id=self.project_id,
+                    event_type=(
+                        "task.completed"
+                        if task_status == "completed"
+                        else "completion.rejected"
+                    ),
+                    payload={
+                        "status": "COMPLETED" if task_status == "completed" else "BLOCKED",
+                        "completion_eligibility": (
+                            "completed" if task_status == "completed" else "not_current"
+                        ),
+                    },
+                )
 
             # Non-terminal accounting events must precede the durable terminal.
             if self.cost_tracker is not None:
@@ -1345,6 +2364,18 @@ class AgentLoop:
         except asyncio.CancelledError:
             if self.task_manager is not None and active_task_id:
                 await self.task_manager.update_status(active_task_id, "cancelled", error="task cancelled")
+            if (
+                self.supervision_service is not None
+                and self._supervision_runtime_registered
+                and active_task_id
+                and self.active_workspace is not None
+            ):
+                await self.supervision_service.settle_cancel(
+                    task_id=active_task_id,
+                    workspace_id=self.active_workspace.id,
+                    principal_id=self.principal_id,
+                    project_id=self.project_id,
+                )
             try:
                 orchestration_phase = self._finish_turn_phase(
                     orchestration_phase,
@@ -1361,6 +2392,21 @@ class AgentLoop:
             logger.exception("Agent loop error")
             if self.task_manager is not None and active_task_id:
                 await self.task_manager.update_status(active_task_id, "failed", error=str(exc))
+            if (
+                self.supervision_service is not None
+                and self._supervision_runtime_registered
+                and active_task_id
+                and self.active_workspace is not None
+            ):
+                await self.supervision_service.emit(
+                    task_id=active_task_id,
+                    workspace_id=self.active_workspace.id,
+                    principal_id=self.principal_id,
+                    project_id=self.project_id,
+                    event_type="task.failed",
+                    payload={"error_type": type(exc).__name__, "status": "FAILED"},
+                    severity="error",
+                )
             try:
                 orchestration_phase = self._finish_turn_phase(
                     orchestration_phase,
@@ -1427,6 +2473,17 @@ class AgentLoop:
                         "failed to persist interrupted turn: %s", turn.turn_id
                     )
             self._active_task_id = None
+            if (
+                self.supervision_service is not None
+                and self._supervision_runtime_registered
+                and active_task_id
+            ):
+                await self.supervision_service.unregister_runtime(
+                    active_task_id,
+                    principal_id=self.principal_id,
+                    project_id=self.project_id,
+                )
+                self._supervision_runtime_registered = False
 
     async def _persist_message(
         self,
@@ -2229,19 +3286,53 @@ class AgentLoop:
             source_type="TASK",
         )
     async def _build_context(self, session_id: str, user_input: str = "") -> list[Message]:
-        """Build the P0-A context from mode prompt and persisted messages.
+        """Dispatch model-context construction to the single active owner.
 
-        In coding mode (when ``project_root`` is set) this also injects:
-
-        1. The project structure tree into the *system* prompt (see
-           :meth:`_build_system_prompt`) — kept small (≤ token budget).
-        2. The contents of files relevant to ``user_input`` as a lower-trust
-           user observation appended *after* the persisted history, so the
-           authenticated current user request remains the final turn input.
-
-        Neither injection happens in office mode or when ``project_root`` is
-        unset, so non-coding behaviour is unchanged.
+        The runtime factory supplies Context Engine 2.0.  The explicitly
+        named legacy adapter below exists only for direct compatibility/test
+        constructions that do not provide that service.
         """
+        if self.context_engine is not None:
+            history = await self.db.list_messages(
+                session_id,
+                principal_id=self.principal_id,
+                project_id=self.project_id,
+            )
+            memory_message = await self._build_memory_message(session_id)
+            self._active_context_bundle = None
+            repo_message = None
+            if self.context_intelligence is not None and self._is_coding_mode():
+                repo_message = await self._build_context_intelligence_message(user_input)
+            context = await self.context_engine.build_for_agent(
+                system_prompt=await self._build_system_prompt_for_context_engine(
+                    session_id, user_input
+                ),
+                history=history,
+                active_facts=self._active_context_facts,
+                memory_message=memory_message,
+                repo_message=(
+                    None if self._active_context_bundle is not None else repo_message
+                ),
+                repo_bundle=self._active_context_bundle,
+                task_id=self._active_task_id or "",
+                workspace_id=getattr(self.active_workspace, "id", "") or "",
+                generation=self._context_generation(),
+                plan_revision=(
+                    getattr(self._active_planning_result, "revision_digest", None)
+                    or getattr(self._active_planning_result, "plan_digest", None)
+                ),
+                goal=user_input,
+                operation=self._context_operation(user_input),
+                target_path=self._context_target_path(user_input),
+            )
+            return [self._context_message_to_message(message) for message in context.messages]
+        return await self._build_legacy_context(session_id, user_input)
+
+    async def _build_legacy_context(
+        self, session_id: str, user_input: str = ""
+    ) -> list[Message]:
+        """Compatibility adapter for direct loops without Context Engine."""
+
         messages = [
             Message(
                 role="system",
@@ -2275,6 +3366,120 @@ class AgentLoop:
 
         return messages
 
+    async def _build_system_prompt_for_context_engine(
+        self, session_id: str, user_input: str = ""
+    ) -> str:
+        """Build only the application prompt and deferred skill projection."""
+
+        del session_id
+        prompt = await self.mode_manager.load_system_prompt()
+        skill_prompt = getattr(self.context_engine, "skill_prompt", None)
+        if callable(skill_prompt):
+            rendered = skill_prompt(self.mode_manager.current_mode.value, user_input)
+            if rendered:
+                prompt = f"{prompt}\n\n{rendered}"
+        return prompt
+
+    def _context_target_path(self, user_input: str) -> Path | None:
+        """Choose one safe target for scoped project-instruction resolution."""
+
+        if self.project_root is None:
+            return None
+        root = Path(self.project_root).expanduser().resolve()
+        candidates: list[str] = []
+        plan = self._active_planning_result
+        for container in (
+            getattr(plan, "target_files", ()),
+            getattr(plan, "affected_files", ()),
+        ):
+            for value in tuple(container or ())[:16]:
+                if isinstance(value, str):
+                    candidates.append(value)
+                else:
+                    for field_name in ("path", "relative_path", "file_path"):
+                        field_value = getattr(value, field_name, None)
+                        if isinstance(field_value, str) and field_value:
+                            candidates.append(field_value)
+                            break
+        # This is only an explicit-path hint; it never scans the repository or
+        # treats arbitrary user text as a filesystem authority.
+        candidates.extend(
+            re.findall(
+                r"(?<![A-Za-z0-9_])(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.(?:py|go|rs|js|jsx|ts|tsx|md|yaml|yml|toml|json)(?::\d+(?:-\d+)?)?",
+                user_input or "",
+            )
+        )
+        for raw in candidates:
+            clean = raw.split(":", 1)[0].strip("`'\".,;()[]{}")
+            if not clean:
+                continue
+            candidate = Path(clean).expanduser()
+            if not candidate.is_absolute():
+                candidate = root / candidate
+            try:
+                resolved = candidate.resolve(strict=False)
+                if os.path.commonpath((str(root), str(resolved))) == str(root):
+                    return resolved
+            except (OSError, ValueError):
+                continue
+        return root
+
+    def _context_operation(self, user_input: str):
+        """Map the current orchestration phase to operation-aware budgets."""
+
+        from khaos.coding.context_engine import ContextOperation
+
+        text = (user_input or "").casefold()
+        if any(token in text for token in ("verify", "test", "失败", "修复")):
+            return ContextOperation.VERIFICATION_REPAIR
+        if self._active_planning_result is None:
+            return ContextOperation.PLANNING
+        return ContextOperation.EDITING
+
+    def _context_generation(self) -> str | None:
+        """Return the repository-generation identity for context freshness."""
+
+        bundle = self._active_context_bundle
+        bundle_generation = getattr(bundle, "repository_generation", None)
+        if bundle_generation:
+            return str(bundle_generation)
+        workspace = self.active_workspace
+        value = getattr(workspace, "generation", None) or getattr(
+            workspace, "base_sha", None
+        )
+        return str(value) if value is not None else None
+
+    def _context_requirements(self, user_input: str):
+        """Build the same bounded requirements used by AgentLoop rebalances."""
+
+        from khaos.coding.context_engine import ContextBudget, ContextRequirements
+
+        engine_budget = getattr(self.context_engine, "default_budget", None)
+        if not isinstance(engine_budget, ContextBudget):
+            engine_budget = ContextBudget()
+        return ContextRequirements(
+            operation=self._context_operation(user_input),
+            task_id=self._active_task_id or "",
+            workspace_id=getattr(self.active_workspace, "id", "") or "",
+            generation=self._context_generation(),
+            plan_revision=(
+                getattr(self._active_planning_result, "revision_digest", None)
+                or getattr(self._active_planning_result, "plan_digest", None)
+            ),
+            query=user_input or "",
+            recent_message_count=max(
+                0,
+                int(
+                    getattr(
+                        self.config,
+                        "context_recent_message_count",
+                        getattr(self.context_engine, "recent_message_count", 12),
+                    )
+                ),
+            ),
+            budget=engine_budget,
+        )
+
     async def _build_memory_message(self, session_id: str) -> Message | None:
         """Project retrieved memory as bounded, low-trust data context.
 
@@ -2296,12 +3501,12 @@ class AgentLoop:
                 for name, parameter in parameters.items()
             )
             if supports_task:
-                memory_text = await inject(
+                memory_text = await cast(Any, inject)(
                     session_id,
                     task_id=self._active_task_id,
                 )
             else:
-                memory_text = await inject(session_id)
+                memory_text = await cast(Any, inject)(session_id)
         except Exception:
             logger.warning(
                 "memory prompt projection unavailable; continuing without memory",
@@ -2404,6 +3609,28 @@ class AgentLoop:
                 task_id,
                 bundle.freshness.value,
             )
+            return None
+        self._active_context_bundle = bundle
+        await self._observe_context_event(
+            "RepoQueryResult",
+            {
+                "workspace_id": bundle.workspace_id,
+                "generation": bundle.repository_generation,
+                "query_digest": hashlib.sha256(
+                    (user_input or goal_spec.normalized_goal).encode("utf-8")
+                ).hexdigest(),
+                "summary": (
+                    f"repository candidates={len(bundle.documents)} files, "
+                    f"{len(bundle.symbols)} symbols, {len(bundle.evidence)} relations"
+                ),
+            },
+            task_id=task_id,
+        )
+        if self.context_engine is not None:
+            # The engine consumes the typed M8.1 bundle directly.  Avoid
+            # constructing a second monolithic rendered projection on the
+            # normal runtime path; the legacy message remains below for
+            # explicitly constructed loops without Context Engine 2.0.
             return None
         blocks = [
             "# Context Bundle",
@@ -2733,7 +3960,7 @@ class AgentLoop:
             },
         )]
 
-    def _build_tools_schema(self) -> list[dict] | None:
+    def _build_tools_schema(self, intent: str = "") -> list[dict] | None:
         """Return provider-neutral function tool schemas for the current mode."""
         if self.tool_scheduler is None:
             return None
@@ -2741,6 +3968,8 @@ class AgentLoop:
         if registry is None:
             return None
         mode = self.mode_manager.current_mode.value
+        if self.context_engine is not None:
+            return self.context_engine.tool_schemas(mode=mode, intent=intent)
         tool_defs = registry.list_by_mode(mode)
         if not tool_defs:
             return None
@@ -2755,6 +3984,72 @@ class AgentLoop:
             }
             for tool_def in tool_defs
         ]
+
+    @staticmethod
+    def _context_message_to_message(message: object) -> Message:
+        """Convert a provider-neutral M8.4 message into AgentLoop data."""
+
+        result = Message(
+            role=str(getattr(message, "role", "user")),
+            content=str(getattr(message, "content", "")),
+            tool_calls=[
+                dict(call)
+                for call in (getattr(message, "tool_calls", ()) or ())
+                if isinstance(call, dict)
+            ],
+            tool_call_id=getattr(message, "tool_call_id", None),
+            token_count=0,
+            event=getattr(message, "event", None),
+            metadata=dict(getattr(message, "metadata", {}) or {}),
+        )
+        # The marker is process-local and never enters the serialized
+        # metadata.  Rebalance can therefore preserve engine-owned typed
+        # provenance without trusting a model/provider-supplied key.
+        setattr(result, "_context_engine_message", True)  # noqa: B010 - private provenance marker
+        return result
+
+    async def _observe_context_event(
+        self,
+        event: str,
+        payload: dict[str, object],
+        *,
+        task_id: str | None,
+    ) -> None:
+        """Project observability into the working set without failing a turn."""
+
+        if self.context_engine is None or not task_id:
+            return
+        try:
+            observe = getattr(self.context_engine, "observe_event", None)
+            if callable(observe):
+                workspace = getattr(self.active_workspace, "id", "") or ""
+                if event in {
+                    "EditTransactionApplied",
+                    "VerificationPlanCreated",
+                } or self._context_needs_rebuild:
+                    generation_value = getattr(
+                        self.active_workspace, "generation", None
+                    ) or getattr(self.active_workspace, "base_sha", None)
+                    event_generation = (
+                        str(generation_value) if generation_value is not None else None
+                    )
+                else:
+                    event_generation = self._context_generation()
+                observed_payload = dict(payload)
+                if workspace:
+                    observed_payload.setdefault("workspace_id", workspace)
+                if event_generation is not None:
+                    observed_payload.setdefault("generation", event_generation)
+                await cast(Any, observe)(
+                    task_id,
+                    event,
+                    observed_payload,
+                    workspace_id=workspace,
+                    goal="",
+                    generation=event_generation,
+                )
+        except Exception:
+            logger.debug("context working-set update unavailable", exc_info=True)
 
     async def _build_system_prompt(self, session_id: str, user_input: str = "") -> str:
         # 注入顺序：项目约定文件 > memory > skill > 项目结构（见 AGENTS.md Phase 6）
@@ -2967,6 +4262,7 @@ class AgentLoop:
         try:
             name = result.name
             args = result.arguments or {}
+            activity_args = _sanitize_tool_activity_arguments(name, args)
             output = result.output
             if name in {"read_file", "list_directory"}:
                 path = args.get("path") or args.get("cwd")
@@ -2976,6 +4272,18 @@ class AgentLoop:
                 path = args.get("path")
                 if path:
                     await self.task_manager.track_file_modified(task_id, str(path))
+            elif name == "apply_edit_transaction":
+                for operation in args.get("operations", []):
+                    if not isinstance(operation, dict):
+                        continue
+                    for path in (
+                        operation.get("path"),
+                        operation.get("destination_path"),
+                    ):
+                        if path:
+                            await self.task_manager.track_file_modified(
+                                task_id, str(path)
+                            )
             elif name == "test_run":
                 await self.task_manager.add_test_result(
                     task_id, {"success": result.success, "output": output}
@@ -2986,6 +4294,7 @@ class AgentLoop:
                 "write_file": "PATCH_APPLIED",
                 "patch": "PATCH_APPLIED",
                 "multi_edit": "PATCH_APPLIED",
+                "apply_edit_transaction": "PATCH_APPLIED",
                 "test_run": "VERIFICATION_RESULT",
                 "git_commit": "COMMIT_OBSERVED",
                 "commit": "COMMIT_OBSERVED",
@@ -2995,8 +4304,10 @@ class AgentLoop:
                 event_payload = {
                     "tool_name": name,
                     "success": bool(result.success),
-                    "arguments": args,
-                    "output_summary": str(output or result.error)[:2048],
+                    "arguments": activity_args,
+                    "output_summary": _sanitize_tool_activity_output(
+                        name, output, result.error
+                    ),
                 }
                 if event_type == "PLAN_CREATED":
                     event_payload["plan"] = args.get(

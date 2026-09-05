@@ -15,12 +15,12 @@ from dataclasses import replace
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
-from khaos.coding.planning.approval.models import compute_plan_binding_digest
 from khaos.coding.planning.approval.execution_journal_writer import (
     PlanExecutionJournalWriter,
 )
 from khaos.coding.planning.approval.execution_read_model import PlanExecutionReadModel
 from khaos.coding.planning.approval.execution_writer import PlanExecutionWriter
+from khaos.coding.planning.approval.models import compute_plan_binding_digest
 from khaos.coding.planning.approval.read_model import PlanApprovalReadModel
 from khaos.coding.planning.contracts import PlanOperation, PlanStatus
 from khaos.coding.planning.execution_models import (
@@ -338,12 +338,22 @@ class WorkspaceMutationEngine:
                 recovery, run, "mutation", attestation.attestation_digest,
                 journal_digest,
             )
+            if type(workspace.generation) is not int or workspace.generation <= 0:
+                raise WorkspaceMutationError(
+                    "workspace-generation-invalid",
+                    "TaskWorkspace generation is invalid",
+                )
             self._execution_writer.commit_terminal_seal(
                 run.execution_run_id, expected_status="sealing",
                 terminal_status="mutated",
                 seal_digest=self._recovery_seal_digest(run.execution_run_id),
                 tombstone_digest=tombstone.tombstone_digest, rollback=False,
             )
+            # TaskWorkspace.generation is the server-owned write CAS consumed
+            # by M8.2 transactions. The terminal seal is committed first, so
+            # a successful planned mutation cannot leave an older edit
+            # transaction looking current.
+            workspace.generation += 1
             try:
                 recovery.delete_tombstone(tombstone_name)
             except OSError:
