@@ -18,13 +18,14 @@ import (
 
 // Compile-time assertions that PythonClient satisfies the gateway interfaces.
 var (
-	_ api.AgentClient    = PythonClient{}
-	_ api.HealthProbe    = PythonClient{}
-	_ api.AuditClient    = PythonClient{}
-	_ api.SubagentClient = PythonClient{}
-	_ api.ChannelClient  = PythonClient{}
-	_ api.TaskClient     = PythonClient{}
-	_ api.MemoryClient   = PythonClient{} // C-2-2 (HIGH 6): Gateway now proxies Python MemoryService.
+	_ api.AgentClient       = PythonClient{}
+	_ api.HealthProbe       = PythonClient{}
+	_ api.AuditClient       = PythonClient{}
+	_ api.SubagentClient    = PythonClient{}
+	_ api.ChannelClient     = PythonClient{}
+	_ api.TaskClient        = PythonClient{}
+	_ api.TaskControlClient = PythonClient{}
+	_ api.MemoryClient      = PythonClient{} // C-2-2 (HIGH 6): Gateway now proxies Python MemoryService.
 )
 
 // F-06 (third-round review): bufio.Scanner defaults to a 64 KiB max
@@ -78,6 +79,118 @@ func (c PythonClient) taskApprovalAction(ctx context.Context, method, id, princi
 func (c PythonClient) TaskArtifacts(ctx context.Context, principalID string, id string) ([]map[string]any, error) {
 	return c.callList(ctx, "TaskService.Artifacts", map[string]any{"task_id": id}, principalID)
 }
+
+// TaskSupervision returns the durable M8.6 projection for one task.
+func (c PythonClient) TaskSupervision(ctx context.Context, principalID string, id string) (map[string]any, error) {
+	return c.callMap(ctx, "TaskService.Supervision", map[string]any{"task_id": id}, principalID)
+}
+
+// TaskSupervisionEvents replays the bounded canonical M8.6 event stream.
+func (c PythonClient) TaskSupervisionEvents(ctx context.Context, principalID string, id string, afterSequence uint64) (<-chan map[string]any, error) {
+	conn, err := c.dial(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.writeRPC(conn, "TaskService.SupervisionEvents", map[string]any{
+		"task_id": id, "after_sequence": afterSequence,
+	}, principalID); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	ch := make(chan map[string]any)
+	go func() {
+		defer close(ch)
+		defer conn.Close()
+		scanner := bufio.NewScanner(conn)
+		scanner.Buffer(make([]byte, 64*1024), maxStreamFrameSize)
+		for scanner.Scan() {
+			var event map[string]any
+			if err := json.Unmarshal(scanner.Bytes(), &event); err != nil {
+				select {
+				case ch <- map[string]any{
+					"event": "stream_error",
+					"data":  map[string]any{"message": "json decode: " + err.Error()},
+				}:
+				case <-ctx.Done():
+				}
+				return
+			}
+			select {
+			case ch <- event:
+			case <-ctx.Done():
+				return
+			}
+		}
+		if err := scanner.Err(); err != nil && ctx.Err() == nil {
+			select {
+			case ch <- map[string]any{
+				"event": "stream_error",
+				"data":  map[string]any{"message": "scanner: " + err.Error()},
+			}:
+			case <-ctx.Done():
+			}
+		}
+	}()
+	return ch, nil
+}
+
+// TaskCommand forwards a typed pause/resume/cancel request and its optional
+// command-id/revision binding to Python's owner-scoped service.
+func (c PythonClient) TaskCommand(ctx context.Context, principalID string, action string, id string, options map[string]any) (map[string]any, error) {
+	methods := map[string]string{
+		"pause":  "TaskService.Pause",
+		"resume": "TaskService.Resume",
+		"cancel": "TaskService.Cancel",
+	}
+	method, ok := methods[action]
+	if !ok {
+		return nil, fmt.Errorf("unsupported task control action %q", action)
+	}
+	payload := make(map[string]any, len(options)+1)
+	for key, value := range options {
+		payload[key] = value
+	}
+	payload["task_id"] = id
+	return c.callMap(ctx, method, payload, principalID)
+}
+
+// TaskCheckpoints lists owner-scoped immutable checkpoint metadata.
+func (c PythonClient) TaskCheckpoints(ctx context.Context, principalID string, id string) ([]map[string]any, error) {
+	return c.callList(ctx, "TaskService.CheckpointList", map[string]any{"task_id": id}, principalID)
+}
+
+// TaskCheckpoint returns one owner-scoped checkpoint, including its bounded snapshot.
+func (c PythonClient) TaskCheckpoint(ctx context.Context, principalID string, id string) (map[string]any, error) {
+	return c.callMap(ctx, "TaskService.Checkpoint", map[string]any{"checkpoint_id": id}, principalID)
+}
+
+// CreateTaskCheckpoint requests a checkpoint from the active workspace owner.
+func (c PythonClient) CreateTaskCheckpoint(ctx context.Context, principalID string, id string, options map[string]any) (map[string]any, error) {
+	payload := make(map[string]any, len(options)+1)
+	for key, value := range options {
+		payload[key] = value
+	}
+	payload["task_id"] = id
+	return c.callMap(ctx, "TaskService.CheckpointCreate", payload, principalID)
+}
+
+// PlanTaskRewind creates a fresh, generation-bound rewind plan.
+func (c PythonClient) PlanTaskRewind(ctx context.Context, principalID string, checkpointID string, options map[string]any) (map[string]any, error) {
+	payload := make(map[string]any, len(options)+1)
+	for key, value := range options {
+		payload[key] = value
+	}
+	payload["checkpoint_id"] = checkpointID
+	return c.callMap(ctx, "TaskService.RewindPlan", payload, principalID)
+}
+
+// ExecuteTaskRewind executes only a stored digest-bound rewind plan.
+func (c PythonClient) ExecuteTaskRewind(ctx context.Context, principalID string, taskID string, rewindID string, planDigest string) (map[string]any, error) {
+	return c.callMap(ctx, "TaskService.Rewind", map[string]any{
+		"task_id": taskID, "rewind_id": rewindID, "plan_digest": planDigest,
+	}, principalID)
+}
+
 func (c PythonClient) taskAction(ctx context.Context, method, principalID, id string) (api.TransitionResult, error) {
 	response, err := c.callMap(ctx, method, map[string]any{"task_id": id}, principalID)
 	if err != nil {

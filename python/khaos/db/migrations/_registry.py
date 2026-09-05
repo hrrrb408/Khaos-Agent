@@ -579,6 +579,15 @@ MIGRATIONS: tuple[MigrationSpec, ...] = (
         sql_files=("0029_parallel_subagent_worktrees.sql",),
         migrator_symbols=("_apply_v29_upgrades",),
     ),
+    MigrationSpec(
+        version=30,
+        name="m8_6_coding_supervision_checkpoint_rewind",
+        # Release-time manifest over the additive M8.6 supervision/checkpoint
+        # schema and its migration owner.
+        sha256="95c5cde7ef6905077b0e555b16e086776add54bddc19d84c6234d00b60ec7c56",
+        sql_files=("0030_coding_supervision_checkpoint_rewind.sql",),
+        migrator_symbols=("_apply_v30_upgrades",),
+    ),
 )
 
 

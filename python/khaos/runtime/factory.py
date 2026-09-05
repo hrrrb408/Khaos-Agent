@@ -21,6 +21,7 @@ from khaos.audit import (
     resolve_safe_audit_anchor_path,
     resolve_safe_audit_log_path,
 )
+from khaos.coding.checkpoints.service import CheckpointService
 from khaos.coding.context_engine import (
     ContextBudget,
     ContextEngineService,
@@ -97,6 +98,7 @@ from khaos.security.network_guard import NetworkGuard
 from khaos.security.resource_scope import ResourceScopeError, TypedResourcePartialOrder
 from khaos.security.sandbox import Sandbox
 from khaos.skills import SkillGenerator, SkillManager
+from khaos.supervision.service import TaskSupervisionService
 from khaos.tools import create_runtime_registry
 from khaos.tools.scheduler import ToolScheduler
 
@@ -284,6 +286,9 @@ class RuntimeConfig:
     # subagent coordinator.  Production composition creates this owner below
     # from the canonical workspace, repository, and verification services.
     parallel_subagent_coordinator: Any = None
+    # M8.6: application-scoped typed supervision owner.  Production callers
+    # may share this server-lifecycle service; it carries no effect authority.
+    supervision_service: Any = None
 
 
 @dataclass(frozen=True)
@@ -345,6 +350,7 @@ class ProductionRuntimeConfig:
     cron_engine: Any = None
     subagent_spawner: Any = None
     project_id: str = ""
+    supervision_service: Any = None
 
     def as_runtime_config(self) -> RuntimeConfig:
         """Materialize the internal config after the structural boundary."""
@@ -390,6 +396,7 @@ class ProductionRuntimeConfig:
             cron_engine=self.cron_engine,
             subagent_spawner=self.subagent_spawner,
             project_id=self.project_id,
+            supervision_service=self.supervision_service,
         )
 
 
@@ -532,6 +539,10 @@ class RuntimeResult:
     parallel_subagent_coordinator: Any = field(
         init=False, default=None, repr=False
     )
+    # M8.6: canonical typed supervision and checkpoint owners attached by the
+    # factory without changing the long-standing positional constructor.
+    supervision_service: Any = field(init=False, default=None, repr=False)
+    checkpoint_service: Any = field(init=False, default=None, repr=False)
     # M7.3: production-composed planning control coordinator.  It is an
     # orchestration owner only; plan revisions remain passive and TaskStatus
     # lifecycle writes remain owned by their existing control boundaries.
@@ -2219,7 +2230,9 @@ async def build_runtime(
         # owners.  The coordinator owns no second AgentLoop, authority, or
         # completion path.  Delegated M7.8 runtimes deliberately receive no
         # parallel coordinator, preserving the single delegation depth.
+        parallel_repository = getattr(cfg.db, "parallel_subagent_repository", None)
         parallel_subagent_coordinator = cfg.parallel_subagent_coordinator
+        merge_coordinator = None
         if production_mode and parallel_subagent_coordinator is not None:
             raise PermissionError(
                 "production runtime cannot accept an injected parallel subagent coordinator"
@@ -2234,10 +2247,6 @@ async def build_runtime(
             from khaos.subagents.coordinator import SubagentCoordinator
             from khaos.subagents.merge import MergeCoordinator
             from khaos.subagents.workspace import ChildWorkspaceService
-
-            parallel_repository = getattr(
-                cfg.db, "parallel_subagent_repository", None
-            )
 
             async def refresh_after_merge(**kwargs: object) -> None:
                 """Refresh the canonical parent intelligence after publish."""
@@ -2266,23 +2275,64 @@ async def build_runtime(
                 if inspect.isawaitable(refreshed):
                     await refreshed
 
+            merge_coordinator = MergeCoordinator(
+                workspace_manager,
+                repository=parallel_repository,
+                post_merge_verifier=autonomous_verification.verify_after_merge,
+                repo_intelligence_refresh=(
+                    refresh_after_merge if context_intelligence is not None else None
+                ),
+            )
             parallel_subagent_coordinator = SubagentCoordinator(
                 ChildWorkspaceService(
                     workspace_manager,
                     repository=parallel_repository,
                 ),
-                merge_coordinator=MergeCoordinator(
-                    workspace_manager,
-                    repository=parallel_repository,
-                    post_merge_verifier=autonomous_verification.verify_after_merge,
-                    repo_intelligence_refresh=(
-                        refresh_after_merge
-                        if context_intelligence is not None
-                        else None
-                    ),
-                ),
+                merge_coordinator=merge_coordinator,
                 repository=parallel_repository,
             )
+        # M8.6: one typed supervision owner and one checkpoint service are
+        # composed from the existing task/workspace/edit/verification owners.
+        # Neither object is a second permission, mutation, merge, or
+        # completion authority.  Delegated child runtimes observe the parent
+        # execution context but do not receive a user-facing rewind owner.
+        supervision_service = cfg.supervision_service
+        if supervision_service is None:
+            supervision_service = TaskSupervisionService(
+                cfg.db,
+                audit_logger=audit_logger,
+            )
+        checkpoint_service = None
+        if cfg.delegated_execution_context is None:
+            checkpoint_service = CheckpointService(
+                workspace_manager,
+                edit_transaction_service,
+                checkpoint_repository=getattr(cfg.db, "checkpoint_repository", None),
+                supervision_service=supervision_service,
+                verification_coordinator=autonomous_verification,
+                repo_intelligence=(
+                    getattr(context_intelligence, "repo_intelligence", None)
+                    if context_intelligence is not None
+                    else None
+                ),
+                parallel_subagent_repository=parallel_repository,
+                principal_id=cfg.principal_id,
+                project_id=project_id,
+                runtime_id=cfg.runtime_id,
+                audit_logger=audit_logger,
+                database=cfg.db,
+            )
+            if merge_coordinator is not None:
+                merge_coordinator.set_supervision_hooks(
+                    checkpoint_service=checkpoint_service,
+                    supervision_service=supervision_service,
+                )
+        if parallel_subagent_coordinator is not None:
+            set_supervision_service = getattr(
+                parallel_subagent_coordinator, "set_supervision_service", None
+            )
+            if callable(set_supervision_service):
+                set_supervision_service(supervision_service)
         recovery_decision_repository = getattr(
             cfg.db, "recovery_decision_repository", None
         )
@@ -2389,6 +2439,8 @@ async def build_runtime(
             verification_coordinator=autonomous_verification,
             context_engine=context_engine,
             parallel_subagent_coordinator=parallel_subagent_coordinator,
+            supervision_service=supervision_service,
+            checkpoint_service=checkpoint_service,
             # M4 batch 3.1.16A-5-1b (CRITICAL): carry the RPC-verified
             # project identity into the AgentLoop so every message / turn
             # write is stamped with it.  ``self._bound_project_id`` (set
@@ -2463,6 +2515,8 @@ async def build_runtime(
         runtime.context_engine = context_engine
         runtime.verification_coordinator = autonomous_verification
         runtime.parallel_subagent_coordinator = parallel_subagent_coordinator
+        runtime.supervision_service = supervision_service
+        runtime.checkpoint_service = checkpoint_service
         runtime.recovery_control = recovery_control
         runtime.composition_manifest = composition_manifest
         return runtime

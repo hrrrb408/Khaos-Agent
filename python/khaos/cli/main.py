@@ -216,6 +216,66 @@ def build_command_parser() -> argparse.ArgumentParser:
     chat_parser.add_argument("--yes", action="store_true", help="Approve permission prompts")
     chat_parser.add_argument("--remember", action="store_true", help="Remember approved permissions")
 
+    task_parser = subparsers.add_parser(
+        "task", help="Inspect or control one owner-scoped Coding task"
+    )
+    task_parser.add_argument("--project-root", type=Path, default=None)
+    task_parser.add_argument("--db", default=None)
+    task_parser.add_argument("--json", action="store_true", dest="as_json")
+    task_sub = task_parser.add_subparsers(dest="task_command", required=True)
+    for task_command, help_text in (
+        ("status", "Show durable supervision state"),
+        ("events", "Replay durable supervision events"),
+        ("pause", "Request a cooperative pause"),
+        ("resume", "Resume a paused task"),
+        ("cancel", "Cancel and drain a task"),
+    ):
+        command_parser = task_sub.add_parser(task_command, help=help_text)
+        command_parser.add_argument("task_id")
+        if task_command == "events":
+            command_parser.add_argument("--after", type=int, default=0)
+            command_parser.add_argument("--limit", type=int, default=1024)
+        elif task_command in {"pause", "resume", "cancel"}:
+            command_parser.add_argument("--command-id", default=None)
+            command_parser.add_argument("--expected-revision", type=int, default=None)
+
+    checkpoint_parser = subparsers.add_parser(
+        "checkpoint", help="Inspect or request Coding checkpoints"
+    )
+    checkpoint_parser.add_argument("--project-root", type=Path, default=None)
+    checkpoint_parser.add_argument("--db", default=None)
+    checkpoint_parser.add_argument("--json", action="store_true", dest="as_json")
+    checkpoint_sub = checkpoint_parser.add_subparsers(
+        dest="checkpoint_command", required=True
+    )
+    checkpoint_list = checkpoint_sub.add_parser("list", help="List checkpoint metadata")
+    checkpoint_list.add_argument("task_id")
+    checkpoint_show = checkpoint_sub.add_parser("show", help="Show checkpoint metadata")
+    checkpoint_show.add_argument("checkpoint_id")
+    checkpoint_create = checkpoint_sub.add_parser("create", help="Request a user checkpoint")
+    checkpoint_create.add_argument("task_id")
+    checkpoint_create.add_argument("label", nargs="*")
+    checkpoint_create.add_argument("--kind", default="USER_CREATED")
+    checkpoint_create.add_argument("--expected-generation", type=int, default=None)
+    checkpoint_create.add_argument("--idempotency-key", default=None)
+
+    rewind_parser = subparsers.add_parser(
+        "rewind", help="Build or execute a digest-bound Coding rewind"
+    )
+    rewind_parser.add_argument("--project-root", type=Path, default=None)
+    rewind_parser.add_argument("--db", default=None)
+    rewind_parser.add_argument("--json", action="store_true", dest="as_json")
+    rewind_sub = rewind_parser.add_subparsers(dest="rewind_command", required=True)
+    rewind_plan = rewind_sub.add_parser("plan", help="Build a rewind plan")
+    rewind_plan.add_argument("checkpoint_id")
+    rewind_plan.add_argument("--task-id", default=None)
+    rewind_plan.add_argument("--workspace-id", default=None)
+    rewind_plan.add_argument("--idempotency-key", default=None)
+    rewind_execute = rewind_sub.add_parser("execute", help="Execute a stored rewind plan")
+    rewind_execute.add_argument("rewind_id")
+    rewind_execute.add_argument("--task-id", required=True)
+    rewind_execute.add_argument("--plan-digest", default=None)
+
     test_parser = subparsers.add_parser("test", help="Run tests", description="Run tests")
     test_parser.add_argument("--all", action="store_true", help="Run all tests (Python + Go)")
     test_parser.add_argument("--go", action="store_true", help="Run Go tests only")
@@ -1152,7 +1212,10 @@ def main() -> None:
       2. Legacy flags such as ``--message`` for scriptable SSE output.
     """
     argv = sys.argv[1:]
-    command_names = {"start", "chat", "test", "config", "version", "doctor", "migrate", "memory", "eval"}
+    command_names = {
+        "start", "chat", "task", "checkpoint", "rewind", "test", "config",
+        "version", "doctor", "migrate", "memory", "eval",
+    }
     if not argv:
         parser = build_command_parser()
         parser.print_help()
@@ -1166,6 +1229,18 @@ def main() -> None:
             cmd_start(args)
         elif args.command == "chat":
             cmd_chat(args)
+        elif args.command == "task":
+            from khaos.cli.supervision_commands import cmd_task
+
+            raise SystemExit(cmd_task(args))
+        elif args.command == "checkpoint":
+            from khaos.cli.supervision_commands import cmd_checkpoint
+
+            raise SystemExit(cmd_checkpoint(args))
+        elif args.command == "rewind":
+            from khaos.cli.supervision_commands import cmd_rewind
+
+            raise SystemExit(cmd_rewind(args))
         elif args.command == "test":
             cmd_test(args)
         elif args.command == "config":

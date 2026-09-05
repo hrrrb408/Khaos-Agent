@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from typing import Any
@@ -31,11 +32,14 @@ from khaos.subagents.scheduler import (
     SubagentSchedulerError,
 )
 from khaos.subagents.workspace import ChildWorkspaceService
+from khaos.supervision.contracts import SupervisionEventType
 
 ChildWorker = Callable[
     [SubagentAssignment, ChildWorkspaceBinding, TaskWorkspace, ChildBudget],
     Awaitable[SubagentResult],
 ]
+
+logger = logging.getLogger(__name__)
 
 
 class SubagentCoordinator:
@@ -55,10 +59,66 @@ class SubagentCoordinator:
         self.repository = repository
         self._results: dict[str, SubagentResult] = {}
         self._contexts: dict[str, ContextTransferPackage] = {}
+        self._supervision_service: Any | None = None
+        self._active_assignments: set[str] = set()
         if self.merge_coordinator is not None:
             # MergeCoordinator owns the pre-publication resource barrier.  The
             # child service remains the sole lifecycle writer for child state.
             self.merge_coordinator.set_child_cleanup(workspace_service.cleanup)
+
+    def set_supervision_service(self, service: Any | None) -> None:
+        """Bind the parent-owned supervision projection to this coordinator."""
+        if service is not None and not callable(getattr(service, "emit", None)):
+            raise TypeError("supervision service must expose emit")
+        self._supervision_service = service
+
+    async def _supervision_event(
+        self,
+        event_type: SupervisionEventType,
+        *,
+        parent_workspace: TaskWorkspace,
+        assignment: SubagentAssignment,
+        payload: dict[str, object],
+    ) -> None:
+        """Project child lifecycle facts without owning child authority."""
+        if self._supervision_service is None:
+            return
+        try:
+            await self._supervision_service.emit(
+                task_id=parent_workspace.task_id,
+                workspace_id=parent_workspace.id,
+                principal_id=parent_workspace.principal_id,
+                project_id=parent_workspace.project_id,
+                event_type=event_type,
+                repository_generation=parent_workspace.generation,
+                payload=payload,
+            )
+        except Exception:
+            # Presentation projection failure must not change the existing
+            # child lifecycle or merge authority outcome.
+            logger.exception(
+                "subagent supervision projection failed for assignment=%s",
+                assignment.assignment_id,
+            )
+
+    def _active_subagent_payload(self) -> dict[str, object]:
+        active = sorted(self._active_assignments)
+        payload: dict[str, object] = {
+            "active_subagents": active,
+            "status": "RUNNING_SUBAGENTS" if active else "READY",
+        }
+        if active:
+            payload["activity"] = {
+                "operation": "parallel_subagent",
+                "kind": "subagent",
+                "stage": "running",
+                "description": "Running bounded Coding subagents",
+                "scope": active,
+                "status": "active",
+            }
+        else:
+            payload["activity_cleared"] = True
+        return payload
 
     async def run_parallel(
         self,
@@ -146,7 +206,7 @@ class SubagentCoordinator:
                     error_code="dependency_not_satisfied",
                     summary=f"dependency {dependency} did not complete successfully",
                 )
-                await self._record_result(result)
+                await self._record_result(result, parent_workspace=parent_workspace, assignment=assignment)
                 return result
         return await self._run_one(parent_workspace, assignment, worker)
 
@@ -159,6 +219,21 @@ class SubagentCoordinator:
         binding: ChildWorkspaceBinding | None = None
         child: TaskWorkspace | None = None
         result: SubagentResult | None = None
+        self._active_assignments.add(assignment.assignment_id)
+        start_payload = self._active_subagent_payload()
+        start_payload.update(
+            {
+                "assignment_id": assignment.assignment_id,
+                "assignment_digest": assignment.assignment_digest,
+                "plan_step_id": getattr(assignment, "plan_step_id", ""),
+            }
+        )
+        await self._supervision_event(
+            SupervisionEventType.SUBAGENT_STARTED,
+            parent_workspace=parent_workspace,
+            assignment=assignment,
+            payload=start_payload,
+        )
         try:
             binding, child = await self.workspace_service.create(assignment, parent_workspace)
             if self.repository is not None:
@@ -269,9 +344,39 @@ class SubagentCoordinator:
                     assignment_id=assignment.assignment_id,
                 )
             self._results[assignment.assignment_id] = result
+            self._active_assignments.discard(assignment.assignment_id)
+            finish_payload = self._active_subagent_payload()
+            finish_payload.update(
+                {
+                    "assignment_id": assignment.assignment_id,
+                    "assignment_digest": assignment.assignment_digest,
+                    "child_workspace_id": result.child_workspace_id,
+                    "status": (
+                        "RUNNING_SUBAGENTS"
+                        if self._active_assignments
+                        else "READY"
+                    ),
+                    "result_status": result.status.value,
+                    "result_digest": result.result_digest,
+                    "verification_status": result.verification_status,
+                    "changed_paths": list(result.changed_paths),
+                }
+            )
+            await self._supervision_event(
+                SupervisionEventType.SUBAGENT_FINISHED,
+                parent_workspace=parent_workspace,
+                assignment=assignment,
+                payload=finish_payload,
+            )
         return result
 
-    async def _record_result(self, result: SubagentResult) -> None:
+    async def _record_result(
+        self,
+        result: SubagentResult,
+        *,
+        parent_workspace: TaskWorkspace | None = None,
+        assignment: SubagentAssignment | None = None,
+    ) -> None:
         """Persist a dependency-skipped result through the same result port."""
         if self.repository is None:
             self._results[result.assignment_id] = result
@@ -288,6 +393,25 @@ class SubagentCoordinator:
             assignment_id=result.assignment_id,
         )
         self._results[result.assignment_id] = result
+        if parent_workspace is not None and assignment is not None:
+            payload = self._active_subagent_payload()
+            payload.update(
+                {
+                    "assignment_id": assignment.assignment_id,
+                    "assignment_digest": assignment.assignment_digest,
+                    "child_workspace_id": result.child_workspace_id,
+                    "result_status": result.status.value,
+                    "result_digest": result.result_digest,
+                    "verification_status": result.verification_status,
+                    "changed_paths": list(result.changed_paths),
+                }
+            )
+            await self._supervision_event(
+                SupervisionEventType.SUBAGENT_FINISHED,
+                parent_workspace=parent_workspace,
+                assignment=assignment,
+                payload=payload,
+            )
 
     @staticmethod
     def _failure_result(

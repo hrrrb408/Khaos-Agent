@@ -820,12 +820,12 @@ async def test_fresh_v18_and_v17_to_v18_upgrade_do_not_backfill_decisions(
         # M7.8 adds v25 plan-bound sub-agent assignment/run ledgers, M7.9
         # adds the observation-only capability evaluation ledger, M8.0 adds
         # v27 coding evaluation runs, M8.3 adds v28 autonomous-verification
-        # observations, and M8.5 adds v29 parallel-subagent worktree
-        # records.
+        # observations, M8.5 adds v29 parallel-subagent worktree records, and
+        # M8.6 adds v30 coding supervision/checkpoint/rewind records.
         # after the immutable completion-decision ledger. The
         # v18 no-backfill assertion remains valid while the schema advances
         # monotonically.
-        assert SCHEMA_MIGRATION_VERSION == 29
+        assert SCHEMA_MIGRATION_VERSION == 30
     finally:
         await fresh.close()
 

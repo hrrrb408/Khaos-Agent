@@ -454,6 +454,43 @@ class ParallelSubagentRepository:
             rows = await cursor.fetchall()
         return tuple(dict(row) for row in rows)
 
+    async def has_active_for_parent(
+        self,
+        task_id: str,
+        *,
+        workspace_id: str,
+        project_id: str = "",
+        principal_id: str = "",
+    ) -> bool:
+        """Return whether a child or merge still owns a parent mutation barrier.
+
+        M8.5 merge rows are already bound to the globally unique parent task
+        and workspace ids.  Child assignments additionally carry principal
+        and project ownership, so those filters are applied whenever supplied.
+        This is an observation-only query; it never changes child/merge state.
+        """
+        del project_id
+        async with self._database.read_connection() as conn:
+            query = (
+                "SELECT 1 FROM agent_parallel_assignments "
+                "WHERE parent_task_id = ? AND parent_workspace_id = ? "
+                "AND state IN ('starting', 'ready', 'running', 'verifying')"
+            )
+            params: list[object] = [task_id, workspace_id]
+            if principal_id:
+                query += " AND parent_principal_id = ?"
+                params.append(principal_id)
+            cursor = await conn.execute(query + " LIMIT 1", tuple(params))
+            if await cursor.fetchone() is not None:
+                return True
+            cursor = await conn.execute(
+                "SELECT 1 FROM agent_parallel_merge_records "
+                "WHERE parent_task_id = ? AND parent_workspace_id = ? "
+                "AND state IN ('planned', 'running', 'merging', 'unknown', 'published-quarantined') LIMIT 1",
+                (task_id, workspace_id),
+            )
+            return await cursor.fetchone() is not None
+
     async def _assignment_row(self, conn: Any, assignment_id: str) -> Any:
         cursor = await conn.execute(
             "SELECT assignment_id, assignment_digest FROM agent_parallel_assignments WHERE assignment_id = ?",

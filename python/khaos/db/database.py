@@ -25,6 +25,7 @@ from khaos.agent.control.recovery_gate_repository import RecoveryGateRepository
 from khaos.agent.control.recovery_repository import RecoveryDecisionRepository
 from khaos.agent.control.state_repository import AgentControlStateRepository
 from khaos.agent.core import Message
+from khaos.coding.checkpoints.repository import CheckpointRepository
 from khaos.coding.planning.repository import PlanRevisionRepository
 from khaos.coding.planning.step_execution_repository import PlanStepExecutionRepository
 from khaos.coding.planning.tool_route_repository import PlanToolRouteRepository
@@ -43,6 +44,7 @@ from khaos.db.connection import (
 from khaos.evaluation.repository import CapabilityEvaluationRepository
 from khaos.subagents.assignment import SubAgentAssignmentRepository
 from khaos.subagents.repository import ParallelSubagentRepository
+from khaos.supervision.repository import TaskSupervisionRepository
 
 # Compatibility name for released tests and integrations.  The lifecycle
 # owner is ``db.connection.READER_DRAIN_TIMEOUT``; this alias must not become
@@ -283,6 +285,8 @@ class Database:
         self._autonomous_verification_repository = VerificationObservationStore(self)
         self._capability_evaluation_repository = CapabilityEvaluationRepository(self)
         self._parallel_subagent_repository = ParallelSubagentRepository(self)
+        self._supervision_repository = TaskSupervisionRepository(self)
+        self._checkpoint_repository = CheckpointRepository(self)
         # F-01: Per-domain locks remain for logical serialization (e.g. two
         # concurrent permission grants must not race on epoch computation).
         self._operation_approval_lock = asyncio.Lock()
@@ -375,6 +379,16 @@ class Database:
     def parallel_subagent_repository(self) -> ParallelSubagentRepository:
         """Return the durable M8.5 child/merge projection owner."""
         return self._parallel_subagent_repository
+
+    @property
+    def supervision_repository(self) -> TaskSupervisionRepository:
+        """Return the durable M8.6 supervision event/projection owner."""
+        return self._supervision_repository
+
+    @property
+    def checkpoint_repository(self) -> CheckpointRepository:
+        """Return the durable M8.6 checkpoint/rewind persistence owner."""
+        return self._checkpoint_repository
 
     @property
     def capability_evaluation_repository(self) -> CapabilityEvaluationRepository:
@@ -1036,6 +1050,14 @@ class Database:
             self._conn = _MigrationConnection(conn)
             try:
                 await self._apply_v29_upgrades()
+            finally:
+                self._conn = original_conn
+            # M8.6: persist canonical supervision events, cooperative control
+            # state, immutable checkpoints, and rewind records.
+            original_conn = self._conn
+            self._conn = _MigrationConnection(conn)
+            try:
+                await self._apply_v30_upgrades()
             finally:
                 self._conn = original_conn
             # Batch 6.4 §10.4: backfill the historical ledger rows (v1–v5)
@@ -1822,6 +1844,15 @@ class Database:
         """Add the durable M8.5 parallel-subagent control projections."""
         conn = await self._require_conn()
         migration_path = _MIGRATIONS_DIR / "0029_parallel_subagent_worktrees.sql"
+        await self._execute_schema_statements(
+            conn,
+            migration_path.read_text(encoding="utf-8"),
+        )
+
+    async def _apply_v30_upgrades(self) -> None:
+        """Add the durable M8.6 supervision/checkpoint control plane."""
+        conn = await self._require_conn()
+        migration_path = _MIGRATIONS_DIR / "0030_coding_supervision_checkpoint_rewind.sql"
         await self._execute_schema_statements(
             conn,
             migration_path.read_text(encoding="utf-8"),

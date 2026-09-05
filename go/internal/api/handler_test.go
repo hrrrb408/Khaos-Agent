@@ -126,6 +126,46 @@ func (m *mockTaskClient) TaskArtifacts(_ context.Context, principalID string, id
 	return []map[string]any{{"type": "file"}}, nil
 }
 
+type mockTaskControlClient struct{ mockTaskClient }
+
+func (m *mockTaskControlClient) TaskSupervision(_ context.Context, _ string, id string) (map[string]any, error) {
+	return map[string]any{"task_id": id, "status": "READY", "revision": 2}, nil
+}
+
+func (m *mockTaskControlClient) TaskSupervisionEvents(_ context.Context, _ string, id string, _ uint64) (<-chan map[string]any, error) {
+	ch := make(chan map[string]any, 1)
+	ch <- map[string]any{"task_id": id, "sequence": 2, "event_type": "task.started"}
+	close(ch)
+	return ch, nil
+}
+
+func (m *mockTaskControlClient) TaskCommand(_ context.Context, _ string, action string, id string, _ map[string]any) (map[string]any, error) {
+	return map[string]any{
+		"ok": true, "task_id": id, "status": "APPLIED",
+		"control_state": map[string]string{"pause": "PAUSING", "resume": "RUNNING", "cancel": "CANCELLING"}[action],
+	}, nil
+}
+
+func (m *mockTaskControlClient) TaskCheckpoints(_ context.Context, _ string, id string) ([]map[string]any, error) {
+	return []map[string]any{{"task_id": id, "checkpoint_id": "cp-1"}}, nil
+}
+
+func (m *mockTaskControlClient) TaskCheckpoint(_ context.Context, _ string, id string) (map[string]any, error) {
+	return map[string]any{"checkpoint_id": id, "status": "READY"}, nil
+}
+
+func (m *mockTaskControlClient) CreateTaskCheckpoint(_ context.Context, _ string, id string, _ map[string]any) (map[string]any, error) {
+	return map[string]any{"ok": true, "task_id": id, "checkpoint_id": "cp-new"}, nil
+}
+
+func (m *mockTaskControlClient) PlanTaskRewind(_ context.Context, _ string, checkpointID string, _ map[string]any) (map[string]any, error) {
+	return map[string]any{"ok": true, "status": "planned", "target_checkpoint_id": checkpointID}, nil
+}
+
+func (m *mockTaskControlClient) ExecuteTaskRewind(_ context.Context, _ string, taskID string, rewindID string, _ string) (map[string]any, error) {
+	return map[string]any{"ok": true, "task_id": taskID, "rewind_id": rewindID, "status": "APPLIED"}, nil
+}
+
 func (m *mockChannelAgent) HandleWebhook(_ context.Context, principalID string, request WebhookRequest) (WebhookResponse, error) {
 	m.webhook = request
 	return WebhookResponse{Status: "ok", MessageID: "m1"}, nil
@@ -812,6 +852,38 @@ func TestTaskRESTAndEvents(t *testing.T) {
 	rec := serve(handler, http.MethodGet, "/v1/tasks/t1/events", "", "")
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"event_id":"e1"`) {
 		t.Fatalf("events=%d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestM86TypedTaskControlRESTSurface(t *testing.T) {
+	tasks := &mockTaskControlClient{}
+	handler := NewHandler(&mockAgent{}, NewMemoryMap(), NewMapConfig(nil), testAPIKey, rate.NewTokenBucket(100, 10)).WithTasks(tasks).Routes()
+	if rec := serve(handler, http.MethodGet, "/v1/tasks/t1/supervision", "", testAPIKey); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"status":"READY"`) {
+		t.Fatalf("supervision=%d %s", rec.Code, rec.Body.String())
+	}
+	if rec := serve(handler, http.MethodGet, "/v1/tasks/t1/supervision/events", "", testAPIKey); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"event_type":"task.started"`) {
+		t.Fatalf("supervision events=%d %s", rec.Code, rec.Body.String())
+	}
+	if rec := serve(handler, http.MethodPost, "/v1/tasks/t1/pause", `{"command_id":"p1","expected_revision":2}`, testAPIKey); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"control_state":"PAUSING"`) {
+		t.Fatalf("pause=%d %s", rec.Code, rec.Body.String())
+	}
+	if rec := serve(handler, http.MethodPost, "/v1/tasks/t1/cancel", "", testAPIKey); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"status":"APPLIED"`) {
+		t.Fatalf("typed cancel=%d %s", rec.Code, rec.Body.String())
+	}
+	if rec := serve(handler, http.MethodGet, "/v1/tasks/t1/checkpoints", "", testAPIKey); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"checkpoint_id":"cp-1"`) {
+		t.Fatalf("checkpoint list=%d %s", rec.Code, rec.Body.String())
+	}
+	if rec := serve(handler, http.MethodPost, "/v1/tasks/t1/checkpoints", `{"label":"manual"}`, testAPIKey); rec.Code != http.StatusOK {
+		t.Fatalf("checkpoint create=%d %s", rec.Code, rec.Body.String())
+	}
+	if rec := serve(handler, http.MethodGet, "/v1/checkpoints/cp-1", "", testAPIKey); rec.Code != http.StatusOK {
+		t.Fatalf("checkpoint show=%d %s", rec.Code, rec.Body.String())
+	}
+	if rec := serve(handler, http.MethodPost, "/v1/checkpoints/cp-1/rewind", `{"task_id":"t1"}`, testAPIKey); rec.Code != http.StatusOK {
+		t.Fatalf("rewind plan=%d %s", rec.Code, rec.Body.String())
+	}
+	if rec := serve(handler, http.MethodPost, "/v1/tasks/t1/rewind", `{"rewind_id":"rw-1","plan_digest":"`+strings.Repeat("a", 64)+`"}`, testAPIKey); rec.Code != http.StatusOK {
+		t.Fatalf("rewind execute=%d %s", rec.Code, rec.Body.String())
 	}
 }
 

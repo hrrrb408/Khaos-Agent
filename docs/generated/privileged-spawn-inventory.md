@@ -4,10 +4,10 @@
 > Every host-spawn primitive detected by this enforced static verifier must have an owner, threat model, and enforcement boundary. Indirect or dynamic dispatch is not proven by this inventory.
 
 - `python/khaos/cli/eval_commands.py:259` `subprocess.run` in `<module>._git_sha` owner=`CodingEvaluationCLI` threat-model=`trusted-source-git-provenance` boundary=`coding-evaluation-cli`
-- `python/khaos/cli/main.py:421` `subprocess.run` in `<module>.cmd_start` owner=`CliGatewayProcess` threat-model=`user-authorized-local-gateway` boundary=`cli-runtime`
-- `python/khaos/cli/main.py:435` `subprocess.Popen` in `<module>.cmd_start` owner=`CliGatewayProcess` threat-model=`user-authorized-local-gateway` boundary=`cli-runtime`
-- `python/khaos/cli/main.py:496` `subprocess.run` in `<module>.cmd_test` owner=`CliGatewayProcess` threat-model=`user-authorized-local-gateway` boundary=`cli-runtime`
-- `python/khaos/cli/main.py:506` `subprocess.run` in `<module>.cmd_test` owner=`CliGatewayProcess` threat-model=`user-authorized-local-gateway` boundary=`cli-runtime`
+- `python/khaos/cli/main.py:481` `subprocess.run` in `<module>.cmd_start` owner=`CliGatewayProcess` threat-model=`user-authorized-local-gateway` boundary=`cli-runtime`
+- `python/khaos/cli/main.py:495` `subprocess.Popen` in `<module>.cmd_start` owner=`CliGatewayProcess` threat-model=`user-authorized-local-gateway` boundary=`cli-runtime`
+- `python/khaos/cli/main.py:556` `subprocess.run` in `<module>.cmd_test` owner=`CliGatewayProcess` threat-model=`user-authorized-local-gateway` boundary=`cli-runtime`
+- `python/khaos/cli/main.py:566` `subprocess.run` in `<module>.cmd_test` owner=`CliGatewayProcess` threat-model=`user-authorized-local-gateway` boundary=`cli-runtime`
 - `python/khaos/coding/execution/capability.py:263` `subprocess.run` in `<module>._capability_evidence` owner=`SandboxCapabilityProbe` threat-model=`trusted-tcb-probe` boundary=`execution-capability`
 - `python/khaos/coding/execution/native_launcher.py:368` `subprocess.run` in `<module>._darwin_signature_mode` owner=`NativeLauncherBoundary` threat-model=`fd-bound-exec-and-host-signature-probe` boundary=`native-launcher`
 - `python/khaos/coding/execution/native_launcher.py:378` `subprocess.run` in `<module>._darwin_signature_mode` owner=`NativeLauncherBoundary` threat-model=`fd-bound-exec-and-host-signature-probe` boundary=`native-launcher`

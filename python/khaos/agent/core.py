@@ -356,6 +356,8 @@ class AgentLoop:
         verification_coordinator=None,
         context_engine=None,
         parallel_subagent_coordinator=None,
+        supervision_service=None,
+        checkpoint_service=None,
     ):
         self.config = config
         self.mode_manager = mode_manager
@@ -394,6 +396,12 @@ class AgentLoop:
         # budgets, merge CAS, verification, and completion remain owned by
         # their existing services; the loop only exposes the composed port.
         self.parallel_subagent_coordinator = parallel_subagent_coordinator
+        # M8.6: the loop emits semantic lifecycle facts through this thin
+        # service.  It never calls a UI adapter and never treats the
+        # supervision projection as permission, mutation, or completion
+        # authority.
+        self.supervision_service = supervision_service
+        self.checkpoint_service = checkpoint_service
         # M8.4: final context selection/serialization owner.  This service is
         # optional for direct legacy/test constructions; the runtime factory
         # wires it for the normal path so the old builder is not a second
@@ -447,6 +455,7 @@ class AgentLoop:
         self.active_workspace = None
         self._active_session_id = ""
         self._active_task_id: str | None = None
+        self._supervision_runtime_registered = False
         self._recovery_cycles_this_turn = 0
         self._context_needs_rebuild = False
         self.execution_service = execution_service
@@ -798,6 +807,32 @@ class AgentLoop:
                 runtime_id=self.runtime_id,
                 event_sink=turn,
             )
+            if self.supervision_service is not None:
+                await self.supervision_service.emit(
+                    task_id=active_task_id,
+                    workspace_id=self.active_workspace.id,
+                    principal_id=self.principal_id,
+                    project_id=self.project_id,
+                    event_type="plan.created",
+                    payload={
+                        "plan": {
+                            "revision_id": str(
+                                getattr(self._active_planning_result, "revision_id", "")
+                                or getattr(self._active_planning_result, "plan_id", "planning")
+                            ),
+                            "digest": str(
+                                getattr(self._active_planning_result, "revision_digest", "")
+                                or getattr(self._active_planning_result, "plan_digest", "unknown")
+                            ),
+                            "current_step": 0,
+                            "total_steps": int(
+                                getattr(self._active_planning_result, "step_count", 0) or 0
+                            ),
+                            "summary": "durable Coding plan created",
+                        },
+                        "status": "PLANNING",
+                    },
+                )
             await self._observe_context_event(
                 "PlanRevision",
                 {
@@ -825,6 +860,49 @@ class AgentLoop:
             attempt_id=turn.attempt_id,
             task_id=active_task_id or "",
         )
+        # M8.6: register the live runtime only after the TaskWorkspace is
+        # bound and before model/tool effects can start.  A durable PAUSED or
+        # CANCELLING state is recovered by the control owner at this point.
+        self._supervision_runtime_registered = False
+        if (
+            is_coding
+            and active_task_id
+            and self.active_workspace is not None
+            and self.supervision_service is not None
+            and self.delegated_execution_context is None
+        ):
+            supervision_state = await self.supervision_service.state(
+                active_task_id,
+                principal_id=self.principal_id,
+                project_id=self.project_id,
+            )
+            if supervision_state is None:
+                task_goal = str(getattr(locals().get("task", None), "goal", user_input))
+                await self.supervision_service.start_task(
+                    task_id=active_task_id,
+                    workspace_id=self.active_workspace.id,
+                    principal_id=self.principal_id,
+                    project_id=self.project_id,
+                    goal=task_goal,
+                )
+            await self.supervision_service.register_runtime(
+                task_id=active_task_id,
+                workspace_id=self.active_workspace.id,
+                principal_id=self.principal_id,
+                project_id=self.project_id,
+                runtime_id=self.runtime_id,
+                runtime_task=asyncio.current_task(),
+                checkpoint_service=self.checkpoint_service,
+            )
+            self._supervision_runtime_registered = True
+            await self.supervision_service.emit(
+                task_id=active_task_id,
+                workspace_id=self.active_workspace.id,
+                principal_id=self.principal_id,
+                project_id=self.project_id,
+                event_type="context.prepared",
+                payload={"status": "INVESTIGATING"},
+            )
         total_tokens = 0
         budget_exhausted = False
         stop_reason: str | None = None
@@ -856,6 +934,18 @@ class AgentLoop:
                     budget_exhausted = True
                     stop_reason = StopReason.MAX_BUDGET.value
                     break
+                if (
+                    active_task_id
+                    and self.supervision_service is not None
+                    and self._supervision_runtime_registered
+                ):
+                    resumed = await self.supervision_service.wait_if_paused(
+                        active_task_id,
+                        principal_id=self.principal_id,
+                        project_id=self.project_id,
+                    )
+                    if resumed:
+                        self._context_needs_rebuild = True
                 empty_response_retries = 0
                 if self.context_engine is not None:
                     if self._context_needs_rebuild:
@@ -994,6 +1084,22 @@ class AgentLoop:
 
                     if budget_exhausted:
                         break
+                    # A pause may arrive while the model stream is in
+                    # flight.  Do not admit the returned tool calls into the
+                    # scheduler until the durable control owner has reached
+                    # a safe point and the user resumes the task.
+                    if (
+                        active_task_id
+                        and self.supervision_service is not None
+                        and self._supervision_runtime_registered
+                    ):
+                        resumed = await self.supervision_service.wait_if_paused(
+                            active_task_id,
+                            principal_id=self.principal_id,
+                            project_id=self.project_id,
+                        )
+                        if resumed:
+                            self._context_needs_rebuild = True
                     if assistant_content.strip() or tool_calls or stop_reason == StopReason.TOOL_USE.value:
                         break
                     if empty_response_retries >= 1:
@@ -1233,6 +1339,75 @@ class AgentLoop:
                         ),
                     },
                 }
+                if (
+                    active_task_id
+                    and self.supervision_service is not None
+                    and self._supervision_runtime_registered
+                ):
+                    await self.supervision_service.wait_if_paused(
+                        active_task_id,
+                        principal_id=self.principal_id,
+                        project_id=self.project_id,
+                    )
+                    if any(
+                        str(call.get("name", "")) == "apply_edit_transaction"
+                        for call in tool_calls
+                    ):
+                        if self.checkpoint_service is None or self.active_workspace is None:
+                            raise PermissionError(
+                                "mutating Coding work requires a checkpoint owner"
+                            )
+                        try:
+                            await self.checkpoint_service.create_checkpoint(
+                                task_id=active_task_id,
+                                workspace_id=self.active_workspace.id,
+                                kind="PRE_EDIT",
+                                label="before coding edit",
+                                expected_generation=self.active_workspace.generation,
+                                principal_id=self.principal_id,
+                                project_id=self.project_id,
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "pre-edit checkpoint refused: %s",
+                                type(exc).__name__,
+                            )
+                            await self.supervision_service.emit(
+                                task_id=active_task_id,
+                                workspace_id=self.active_workspace.id,
+                                principal_id=self.principal_id,
+                                project_id=self.project_id,
+                                event_type="task.failed",
+                                payload={
+                                    "reason": "pre-edit checkpoint unavailable",
+                                    "error_type": type(exc).__name__,
+                                },
+                                severity="error",
+                            )
+                            raise PermissionError(
+                                "pre-edit checkpoint is required before mutation"
+                            ) from exc
+                    await self.supervision_service.emit(
+                        task_id=active_task_id,
+                        workspace_id=getattr(self.active_workspace, "id", ""),
+                        principal_id=self.principal_id,
+                        project_id=self.project_id,
+                        event_type="step.started",
+                        payload={
+                            "current_step": "tool execution",
+                            "activity": {
+                                "operation": "coding",
+                                "kind": "tool_batch",
+                                "stage": "executing",
+                                "description": "Executing approved Coding tools",
+                                "scope": [
+                                    str(call.get("name", ""))[:128]
+                                    for call in tool_calls[:64]
+                                ],
+                                "status": "active",
+                            },
+                        },
+                    )
                 orchestration_phase = orchestration_phase.transition(
                     TurnPhase.TOOL_EXECUTING,
                     tool_batch_digest=self._tool_batch_phase_digest(tool_calls),
@@ -1252,6 +1427,25 @@ class AgentLoop:
                                 "expires_at": request.expires_at,
                             },
                         )
+                        if (
+                            active_task_id
+                            and self.supervision_service is not None
+                            and self._supervision_runtime_registered
+                        ):
+                            await self.supervision_service.emit(
+                                task_id=active_task_id,
+                                workspace_id=request.workspace_id or getattr(self.active_workspace, "id", ""),
+                                principal_id=self.principal_id,
+                                project_id=self.project_id,
+                                event_type="approval.requested",
+                                payload={
+                                    "approval_id": request.tool_call_id,
+                                    "operation": request.name,
+                                    "binding_digest": request.binding_digest,
+                                    "expires_at": request.expires_at,
+                                    "approval_state": "pending",
+                                },
+                            )
                         await self._record_memory_runtime_event(
                             "APPROVAL_REQUESTED",
                             session_id=session_id,
@@ -1277,6 +1471,8 @@ class AgentLoop:
                                     "expires_at": request.expires_at,
                                     "principal_id": self.principal_id,
                                     "session_id": session_id,
+                                    "workspace_id": request.workspace_id
+                                    or getattr(self.active_workspace, "id", ""),
                                 },
                             )
                         yield Message(
@@ -1497,6 +1693,31 @@ class AgentLoop:
                                 edit_result = edit_transaction_result_from_tool_output(
                                     result.output
                                 )
+                                if self.checkpoint_service is not None:
+                                    await self.checkpoint_service.record_transaction(
+                                        active_task_id,
+                                        edit_result,
+                                        principal_id=self.principal_id,
+                                        project_id=self.project_id,
+                                    )
+                                if self.supervision_service is not None:
+                                    await self.supervision_service.emit(
+                                        task_id=active_task_id,
+                                        workspace_id=self.active_workspace.id,
+                                        principal_id=self.principal_id,
+                                        project_id=self.project_id,
+                                        event_type="verification.started",
+                                        repository_generation=edit_result.resulting_generation,
+                                        payload={
+                                            "transaction_id": edit_result.transaction_id,
+                                            "transaction_digest": edit_result.transaction_digest,
+                                            "changed_paths": [
+                                                operation.path
+                                                for operation in edit_result.operations
+                                            ],
+                                            "verification_state": "running",
+                                        },
+                                    )
                                 await self._observe_context_event(
                                     "VerificationPlanCreated",
                                     {
@@ -1619,6 +1840,73 @@ class AgentLoop:
                                     "value",
                                     "unknown",
                                 )
+                                if (
+                                    repair_attempt is not None
+                                    and self.supervision_service is not None
+                                    and active_task_id is not None
+                                ):
+                                    await self.supervision_service.emit(
+                                        task_id=active_task_id,
+                                        workspace_id=self.active_workspace.id,
+                                        principal_id=self.principal_id,
+                                        project_id=self.project_id,
+                                        event_type="repair.started",
+                                        repository_generation=edit_result.resulting_generation,
+                                        payload={
+                                            "attempt": repair_attempt,
+                                            "verification_state": verification_status,
+                                            "status": "REPAIRING",
+                                        },
+                                    )
+                                if self.supervision_service is not None:
+                                    await self.supervision_service.emit(
+                                        task_id=active_task_id,
+                                        workspace_id=self.active_workspace.id,
+                                        principal_id=self.principal_id,
+                                        project_id=self.project_id,
+                                        event_type=(
+                                            "verification.passed"
+                                            if verification_status == "passed"
+                                            else "verification.failed"
+                                        ),
+                                        repository_generation=edit_result.resulting_generation,
+                                        payload={
+                                            "verification_state": verification_status,
+                                            "changed_paths": [
+                                                operation.path
+                                                for operation in edit_result.operations
+                                            ],
+                                        },
+                                    )
+                                if (
+                                    verification_status == "passed"
+                                    and self.checkpoint_service is not None
+                                ):
+                                    try:
+                                        await self.checkpoint_service.create_checkpoint(
+                                            task_id=active_task_id,
+                                            workspace_id=self.active_workspace.id,
+                                            kind="POST_VERIFICATION",
+                                            label="after verified coding edit",
+                                            expected_generation=edit_result.resulting_generation,
+                                            verification_evidence_digest=(
+                                                getattr(autonomous_run, "run_digest", None)
+                                                if isinstance(
+                                                    getattr(autonomous_run, "run_digest", None),
+                                                    str,
+                                                )
+                                                and len(getattr(autonomous_run, "run_digest", "")) == 64
+                                                else None
+                                            ),
+                                            known_state=True,
+                                            principal_id=self.principal_id,
+                                            project_id=self.project_id,
+                                        )
+                                    except Exception:
+                                        logger.warning(
+                                            "post-verification checkpoint unavailable",
+                                            exc_info=True,
+                                        )
                                 if verification_status in {"failed", "timed_out"}:
                                     diagnostics = tuple(
                                         getattr(autonomous_run, "diagnostics", ()) or ()
@@ -1973,6 +2261,37 @@ class AgentLoop:
                     stop_reason,
                     recovery_result=recovery_result,
                 )
+            if (
+                self.supervision_service is not None
+                and self._supervision_runtime_registered
+                and active_task_id
+                and self.active_workspace is not None
+            ):
+                task_projection = (
+                    await self.task_manager.get(active_task_id)
+                    if self.task_manager is not None
+                    else None
+                )
+                task_status = getattr(
+                    getattr(task_projection, "status", None), "value", "ready"
+                )
+                await self.supervision_service.emit(
+                    task_id=active_task_id,
+                    workspace_id=self.active_workspace.id,
+                    principal_id=self.principal_id,
+                    project_id=self.project_id,
+                    event_type=(
+                        "task.completed"
+                        if task_status == "completed"
+                        else "completion.rejected"
+                    ),
+                    payload={
+                        "status": "COMPLETED" if task_status == "completed" else "BLOCKED",
+                        "completion_eligibility": (
+                            "completed" if task_status == "completed" else "not_current"
+                        ),
+                    },
+                )
 
             # Non-terminal accounting events must precede the durable terminal.
             if self.cost_tracker is not None:
@@ -2045,6 +2364,18 @@ class AgentLoop:
         except asyncio.CancelledError:
             if self.task_manager is not None and active_task_id:
                 await self.task_manager.update_status(active_task_id, "cancelled", error="task cancelled")
+            if (
+                self.supervision_service is not None
+                and self._supervision_runtime_registered
+                and active_task_id
+                and self.active_workspace is not None
+            ):
+                await self.supervision_service.settle_cancel(
+                    task_id=active_task_id,
+                    workspace_id=self.active_workspace.id,
+                    principal_id=self.principal_id,
+                    project_id=self.project_id,
+                )
             try:
                 orchestration_phase = self._finish_turn_phase(
                     orchestration_phase,
@@ -2061,6 +2392,21 @@ class AgentLoop:
             logger.exception("Agent loop error")
             if self.task_manager is not None and active_task_id:
                 await self.task_manager.update_status(active_task_id, "failed", error=str(exc))
+            if (
+                self.supervision_service is not None
+                and self._supervision_runtime_registered
+                and active_task_id
+                and self.active_workspace is not None
+            ):
+                await self.supervision_service.emit(
+                    task_id=active_task_id,
+                    workspace_id=self.active_workspace.id,
+                    principal_id=self.principal_id,
+                    project_id=self.project_id,
+                    event_type="task.failed",
+                    payload={"error_type": type(exc).__name__, "status": "FAILED"},
+                    severity="error",
+                )
             try:
                 orchestration_phase = self._finish_turn_phase(
                     orchestration_phase,
@@ -2127,6 +2473,17 @@ class AgentLoop:
                         "failed to persist interrupted turn: %s", turn.turn_id
                     )
             self._active_task_id = None
+            if (
+                self.supervision_service is not None
+                and self._supervision_runtime_registered
+                and active_task_id
+            ):
+                await self.supervision_service.unregister_runtime(
+                    active_task_id,
+                    principal_id=self.principal_id,
+                    project_id=self.project_id,
+                )
+                self._supervision_runtime_registered = False
 
     async def _persist_message(
         self,

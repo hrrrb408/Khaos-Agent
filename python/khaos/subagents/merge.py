@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from khaos.coding.checkpoints.contracts import CheckpointKind
 from khaos.coding.verification.contracts import VerificationRunStatus
 from khaos.coding.verification.evidence import VerificationRun
 from khaos.coding.workspace.errors import WorkspaceError
@@ -29,6 +31,10 @@ from khaos.subagents.contracts import (
     PublicationAttestation,
     SubagentResultStatus,
     VerifiedIntegrationArtifact,
+)
+from khaos.supervision.contracts import (
+    SupervisionActor,
+    SupervisionEventType,
 )
 
 VerificationCallback = Callable[..., Awaitable[object] | object]
@@ -107,12 +113,37 @@ class MergeCoordinator:
         self.child_cleanup = child_cleanup
         self.allow_test_verifier = allow_test_verifier
         self._parent_locks: dict[str, asyncio.Lock] = {}
+        self._checkpoint_service: Any | None = None
+        self._supervision_service: Any | None = None
 
     def set_child_cleanup(self, callback: VerificationCallback) -> None:
         """Bind the existing ChildWorkspaceService as the lifecycle owner."""
         if not callable(callback):
             raise TypeError("child cleanup callback must be callable")
         self.child_cleanup = callback
+
+    def set_supervision_hooks(
+        self,
+        *,
+        checkpoint_service: Any | None = None,
+        supervision_service: Any | None = None,
+    ) -> None:
+        """Bind the existing M8.6 observers to the canonical merge owner.
+
+        The coordinator remains the sole owner of the M8.5 publication fence.
+        These hooks only record typed supervision/checkpoint facts and never
+        perform an independent Git or workspace mutation.
+        """
+        if checkpoint_service is not None and not callable(
+            getattr(checkpoint_service, "create_checkpoint", None)
+        ):
+            raise TypeError("checkpoint service must expose create_checkpoint")
+        if supervision_service is not None and not callable(
+            getattr(supervision_service, "emit", None)
+        ):
+            raise TypeError("supervision service must expose emit")
+        self._checkpoint_service = checkpoint_service
+        self._supervision_service = supervision_service
 
     async def plan(
         self,
@@ -256,6 +287,26 @@ class MergeCoordinator:
                 },
                 merge_id=plan.merge_id,
             )
+        await self._supervision_event(
+            SupervisionEventType.MERGE_PLANNED,
+            {
+                "merge_id": plan.merge_id,
+                "plan_digest": plan.plan_digest,
+                "candidate_ids": list(plan.ordered_candidate_ids),
+                "conflict_count": len(plan.conflicts),
+                "merge_state": "planned",
+                "activity": {
+                    "operation": "parallel_merge",
+                    "kind": "merge",
+                    "stage": "planning",
+                    "description": "Planning verified child integration",
+                    "scope": list(plan.ordered_candidate_ids),
+                    "status": "active",
+                },
+            },
+            parent_workspace=parent_workspace,
+            actor=SupervisionActor.RUNTIME,
+        )
         return plan
 
     async def create_plan(
@@ -350,6 +401,55 @@ class MergeCoordinator:
                     reason="parent generation or HEAD changed after planning",
                     candidates=candidates,
                 )
+
+            if self._checkpoint_service is not None:
+                try:
+                    await self._checkpoint_service.create_checkpoint(
+                        task_id=parent_workspace.task_id,
+                        workspace_id=parent_workspace.id,
+                        kind=CheckpointKind.PRE_PARALLEL_MERGE,
+                        label="before parallel merge publication",
+                        expected_generation=plan.parent_generation,
+                        principal_id=parent_workspace.principal_id,
+                        project_id=parent_workspace.project_id,
+                    )
+                except Exception as exc:  # noqa: BLE001 - merge barrier is fail-closed
+                    return await self._terminal_result(
+                        plan,
+                        MergeResultStatus.QUARANTINED,
+                        reason=(
+                            "pre-merge checkpoint could not be established: "
+                            f"{type(exc).__name__}"
+                        ),
+                        candidates=candidates,
+                    )
+            await self._supervision_event(
+                SupervisionEventType.MERGE_PLANNED,
+                {
+                    "merge_id": plan.merge_id,
+                    "plan_digest": plan.plan_digest,
+                    "merge_state": "integrating",
+                    "candidate_ids": list(plan.ordered_candidate_ids),
+                    "changed_paths": sorted({
+                        path
+                        for candidate in candidates
+                        for path in candidate.result.changed_paths
+                    }),
+                    "activity": {
+                        "operation": "parallel_merge",
+                        "kind": "merge",
+                        "stage": "integrating",
+                        "description": "Integrating verified child artifacts",
+                        "scope": sorted({
+                            path
+                            for candidate in candidates
+                            for path in candidate.result.changed_paths
+                        }),
+                        "status": "active",
+                    },
+                },
+                parent_workspace=parent_workspace,
+            )
             child_conflicts = await self._validate_child_candidates(
                 parent_workspace,
                 plan,
@@ -740,6 +840,29 @@ class MergeCoordinator:
                                                 "published after the pre-publication integration "
                                                 "verification and exact-tree attestation"
                                             )
+                                            if self._checkpoint_service is not None:
+                                                try:
+                                                    await self._checkpoint_service.create_checkpoint(
+                                                        task_id=parent_workspace.task_id,
+                                                        workspace_id=parent_workspace.id,
+                                                        kind=CheckpointKind.POST_MERGE,
+                                                        label="after verified parallel merge",
+                                                        expected_generation=published_generation,
+                                                        verification_evidence_digest=(
+                                                            parent_verification_digest
+                                                            if len(parent_verification_digest) == 64
+                                                            else None
+                                                        ),
+                                                        known_state=True,
+                                                        principal_id=parent_workspace.principal_id,
+                                                        project_id=parent_workspace.project_id,
+                                                    )
+                                                except Exception as exc:  # noqa: BLE001 - preserve publication truth
+                                                    status = MergeResultStatus.PUBLISHED_UNVERIFIED
+                                                    reason = (
+                                                        "published but post-merge checkpoint "
+                                                        f"failed: {type(exc).__name__}"
+                                                    )
             except (WorkspaceError, PermissionError, OSError) as exc:
                 reason = str(exc)
                 if published_head is not None:
@@ -1283,6 +1406,33 @@ class MergeCoordinator:
             },
             merge_id=result.merge_id,
         )
+        if result.published_head is not None:
+            parent_workspace = self.workspace_manager.get(result.parent_workspace_id)
+            if parent_workspace is not None:
+                await self._supervision_event(
+                    SupervisionEventType.MERGE_PUBLISHED,
+                    {
+                        "merge_id": result.merge_id,
+                        "plan_digest": result.plan_digest,
+                        "result_digest": result.result_digest,
+                        "published_head": result.published_head,
+                        "published_generation": result.published_generation,
+                        "merge_state": result.status.value,
+                        "verification_state": result.verification_status,
+                        "changed_paths": list(result.changed_paths),
+                        "activity_cleared": True,
+                    },
+                    parent_workspace=parent_workspace,
+                    severity=(
+                        "warning"
+                        if result.status
+                        in {
+                            MergeResultStatus.PUBLISHED_UNVERIFIED,
+                            MergeResultStatus.PUBLISHED_QUARANTINED,
+                        }
+                        else "info"
+                    ),
+                )
         if result.status is MergeResultStatus.PUBLISHED:
             event_type = "merge_published"
         elif result.status in {
@@ -1335,6 +1485,37 @@ class MergeCoordinator:
             payload=payload,
             merge_id=merge_id,
         )
+
+    async def _supervision_event(
+        self,
+        event_type: SupervisionEventType,
+        payload: Mapping[str, object],
+        *,
+        parent_workspace: TaskWorkspace,
+        actor: SupervisionActor = SupervisionActor.RUNTIME,
+        severity: str = "info",
+    ) -> None:
+        """Publish a best-effort UI projection without weakening merge truth."""
+        if self._supervision_service is None:
+            return
+        try:
+            await self._supervision_service.emit(
+                task_id=parent_workspace.task_id,
+                workspace_id=parent_workspace.id,
+                principal_id=parent_workspace.principal_id,
+                project_id=parent_workspace.project_id,
+                event_type=event_type,
+                repository_generation=parent_workspace.generation,
+                payload=payload,
+                actor=actor,
+                severity=severity,
+            )
+        except Exception:
+            logger = logging.getLogger(__name__)
+            logger.exception(
+                "supervision merge projection failed for merge=%s",
+                payload.get("merge_id", "unknown"),
+            )
 
 
 __all__ = ["MergeCoordinator"]
