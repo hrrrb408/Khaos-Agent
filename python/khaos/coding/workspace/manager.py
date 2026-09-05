@@ -182,6 +182,18 @@ def _safe_branch_ref(branch_name: str) -> str:
     return f"refs/heads/{branch_name}"
 
 
+def _safe_verified_artifact_id(storage_id: str) -> str:
+    """Validate the opaque name used for manager-owned verified artifacts."""
+    if (
+        type(storage_id) is not str
+        or not storage_id
+        or len(storage_id) > 256
+        or any(character not in "0123456789abcdef-" for character in storage_id)
+    ):
+        raise WorkspaceError("verified artifact storage id is invalid")
+    return storage_id
+
+
 def _open_private_authority_root(configured: Path) -> tuple[Path, FileIdentity]:
     """Create a private root without following attacker-controlled components."""
     if (
@@ -336,6 +348,11 @@ class WorkspaceManager:
         self._task_ids: set[str] = set()
         self._bootstrap_transactions: dict[str, WorkspaceBootstrapTransaction] = {}
         self._quarantined_bootstraps: dict[str, WorkspaceBootstrapTransaction] = {}
+        # Verified publication artifacts are independent of disposable
+        # worktrees.  Their registry is the sole in-process owner; merge
+        # orchestration must release each entry before reporting terminal
+        # success.
+        self._verified_artifacts: dict[str, ChangeSetArtifact] = {}
         self._lock = asyncio.Lock()
         self._storage_mutation_locks: dict[str, asyncio.Lock] = {}
 
@@ -379,6 +396,10 @@ class WorkspaceManager:
                 *self._quarantined_bootstraps,
             }
         )
+        resources.extend(
+            f"verified-artifact:{storage_id}"
+            for storage_id in self._verified_artifacts
+        )
         runner_resources = getattr(self._git_runner, "owned_resources", None)
         if callable(runner_resources):
             resources.extend(f"git:{item}" for item in runner_resources())
@@ -390,6 +411,7 @@ class WorkspaceManager:
         return (
             not self._bootstrap_transactions
             and not self._quarantined_bootstraps
+            and not self._verified_artifacts
             and (not callable(runner_terminal) or bool(runner_terminal()))
         )
 
@@ -1447,6 +1469,26 @@ class WorkspaceManager:
             raise WorkspaceError("workspace not found")
         return await self._workspace_git(workspace, "rev-parse", "HEAD")
 
+    async def current_tree(self, workspace_id: str, *, commit: str | None = None) -> str:
+        """Return the trusted Git tree object for a registered workspace commit."""
+        workspace = self._workspaces.get(workspace_id)
+        if workspace is None:
+            raise WorkspaceError("workspace not found")
+        target = commit or await self.current_head(workspace_id)
+        if (
+            type(target) is not str
+            or len(target) not in {40, 64}
+            or any(character not in "0123456789abcdef" for character in target)
+        ):
+            raise WorkspaceError("workspace commit is not a valid Git object id")
+        tree = await self._workspace_git(workspace, "rev-parse", f"{target}^{{tree}}")
+        if (
+            len(tree) not in {40, 64}
+            or any(character not in "0123456789abcdef" for character in tree)
+        ):
+            raise WorkspaceError("Git returned an invalid tree object id")
+        return tree
+
     async def require_stable(
         self,
         workspace_id: str,
@@ -1525,6 +1567,16 @@ class WorkspaceManager:
             ) from exc
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
             raise WorkspaceError("patch artifact is not a private regular file")
+        try:
+            await asyncio.to_thread(
+                _read_verified_artifact,
+                candidate,
+                patch_length,
+                patch_sha256,
+                MAX_CHANGESET_BYTES,
+            )
+        except (OSError, WorkspaceError) as exc:
+            raise WorkspaceError("patch artifact digest or length drifted") from exc
         current_head = await self._workspace_git(workspace, "rev-parse", "HEAD")
         if expected_head is not None and current_head != expected_head:
             raise WorkspaceError("workspace HEAD changed before patch application")
@@ -1937,6 +1989,154 @@ class WorkspaceManager:
             changeset.artifact.byte_length,
             changeset.artifact.sha256,
         )
+
+    def _verified_artifact_path(self, storage_id: str) -> Path:
+        """Derive one canonical path below the private authority root."""
+        safe_id = _safe_verified_artifact_id(storage_id)
+        return self.root / f".khaos-verified-{safe_id}.patch"
+
+    async def freeze_verified_changeset_artifact(
+        self,
+        workspace_id: str,
+        changeset: ChangeSet,
+        *,
+        storage_id: str,
+    ) -> ChangeSetArtifact:
+        """Promote a ChangeSet artifact to an independent merge-owned file.
+
+        The source remains owned by the producing workspace while it is
+        copied.  The destination is created exclusively below the manager's
+        private root, verified by digest/length, and then registered under a
+        separate lifecycle owner so worktree cleanup cannot delete the
+        publication input.
+        """
+        workspace = self._workspaces.get(workspace_id)
+        if workspace is None or changeset.workspace_id != workspace_id:
+            raise WorkspaceError("workspace or changeset not found")
+        if changeset.artifact is None:
+            raise WorkspaceError("verified publication requires a ChangeSet artifact")
+        safe_id = _safe_verified_artifact_id(storage_id)
+        destination = self._verified_artifact_path(safe_id)
+        async with self._lock:
+            existing = self._verified_artifacts.get(safe_id)
+            if existing is not None:
+                if (
+                    existing.sha256 != changeset.artifact.sha256
+                    or existing.byte_length != changeset.artifact.byte_length
+                ):
+                    raise WorkspaceError("verified artifact storage identity is already bound")
+                return existing
+            if destination.exists() or destination.is_symlink():
+                raise WorkspaceError("verified artifact destination already exists")
+        await self.export_changeset_artifact(workspace_id, changeset, destination)
+        try:
+            await asyncio.to_thread(
+                _read_verified_artifact,
+                destination,
+                changeset.artifact.byte_length,
+                changeset.artifact.sha256,
+                MAX_CHANGESET_BYTES,
+            )
+        except BaseException:
+            destination.unlink(missing_ok=True)
+            raise
+        artifact = ChangeSetArtifact(
+            path=destination,
+            byte_length=changeset.artifact.byte_length,
+            sha256=changeset.artifact.sha256,
+            preview=changeset.artifact.preview,
+        )
+        async with self._lock:
+            existing = self._verified_artifacts.get(safe_id)
+            if existing is not None:
+                destination.unlink(missing_ok=True)
+                if (
+                    existing.sha256 != artifact.sha256
+                    or existing.byte_length != artifact.byte_length
+                ):
+                    raise WorkspaceError("verified artifact storage identity is already bound")
+                return existing
+            self._verified_artifacts[safe_id] = artifact
+        return artifact
+
+    async def load_verified_artifact(
+        self,
+        *,
+        storage_id: str,
+        sha256: str,
+        byte_length: int,
+    ) -> ChangeSetArtifact:
+        """Re-admit a durable verified artifact after restart by exact identity."""
+        safe_id = _safe_verified_artifact_id(storage_id)
+        if type(sha256) is not str or len(sha256) != 64:
+            raise WorkspaceError("verified artifact digest is invalid")
+        if type(byte_length) is not int or byte_length <= 0:
+            raise WorkspaceError("verified artifact length is invalid")
+        path = self._verified_artifact_path(safe_id)
+        await asyncio.to_thread(
+            _read_verified_artifact,
+            path,
+            byte_length,
+            sha256,
+            MAX_CHANGESET_BYTES,
+        )
+        artifact = ChangeSetArtifact(
+            path=path,
+            byte_length=byte_length,
+            sha256=sha256,
+            preview="",
+        )
+        async with self._lock:
+            existing = self._verified_artifacts.get(safe_id)
+            if existing is not None and (
+                existing.sha256 != sha256 or existing.byte_length != byte_length
+            ):
+                raise WorkspaceError("verified artifact identity changed during recovery")
+            self._verified_artifacts[safe_id] = existing or artifact
+            return self._verified_artifacts[safe_id]
+
+    async def get_verified_artifact(self, storage_id: str) -> ChangeSetArtifact:
+        """Return a manager-owned verified artifact, rechecking its bytes."""
+        safe_id = _safe_verified_artifact_id(storage_id)
+        async with self._lock:
+            artifact = self._verified_artifacts.get(safe_id)
+        if artifact is None:
+            raise WorkspaceError("verified artifact is not owned by the manager")
+        await asyncio.to_thread(
+            _read_verified_artifact,
+            artifact.path,
+            artifact.byte_length,
+            artifact.sha256,
+            MAX_CHANGESET_BYTES,
+        )
+        return artifact
+
+    async def release_verified_artifact(self, storage_id: str) -> WorkspaceTransition:
+        """Release one merge-owned artifact only after its lifecycle settles."""
+        safe_id = _safe_verified_artifact_id(storage_id)
+        async with self._lock:
+            artifact = self._verified_artifacts.get(safe_id)
+            if artifact is None:
+                return WorkspaceTransition.NOT_FOUND
+            try:
+                await asyncio.to_thread(
+                    _read_verified_artifact,
+                    artifact.path,
+                    artifact.byte_length,
+                    artifact.sha256,
+                    MAX_CHANGESET_BYTES,
+                )
+            except (OSError, WorkspaceError):
+                # A tampered publication input is retained as an owned
+                # resource.  Do not turn a failed integrity check into a
+                # successful release/quiescent manager state.
+                return WorkspaceTransition.FAILED
+            try:
+                artifact.path.unlink(missing_ok=True)
+            except OSError:
+                return WorkspaceTransition.FAILED
+            self._verified_artifacts.pop(safe_id, None)
+            return WorkspaceTransition.UPDATED
 
     async def commit_in_worktree(
         self, workspace_id: str, changeset: ChangeSet, message: str

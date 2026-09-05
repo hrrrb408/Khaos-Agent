@@ -32,10 +32,12 @@ _EXPORT_MODULES = {
     "ContextTransferItem": "khaos.subagents.contracts",
     "ContextTransferPackage": "khaos.subagents.contracts",
     "MergeCandidate": "khaos.subagents.contracts",
+    "MergeCandidateBinding": "khaos.subagents.contracts",
     "MergeConflictKind": "khaos.subagents.contracts",
     "MergePlan": "khaos.subagents.contracts",
     "MergeResult": "khaos.subagents.contracts",
     "MergeResultStatus": "khaos.subagents.contracts",
+    "PublicationAttestation": "khaos.subagents.contracts",
     "ParallelMetrics": "khaos.subagents.contracts",
     "ParallelSubagentContractError": "khaos.subagents.contracts",
     "MergeCoordinator": "khaos.subagents.merge",
@@ -53,6 +55,7 @@ _EXPORT_MODULES = {
     "SubagentResult": "khaos.subagents.contracts",
     "SubagentResultStatus": "khaos.subagents.contracts",
     "SubagentRole": "khaos.subagents.contracts",
+    "VerifiedIntegrationArtifact": "khaos.subagents.contracts",
 }
 
 
@@ -79,6 +82,7 @@ __all__ = [
     "ContextTransferPackage",
     "DelegatedExecutionContext",
     "MergeCandidate",
+    "MergeCandidateBinding",
     "MergeConflictKind",
     "MergeCoordinator",
     "MergePlan",
@@ -88,6 +92,7 @@ __all__ = [
     "ParallelSubagentContractError",
     "ParallelSubagentRecovery",
     "ParallelSubagentRepository",
+    "PublicationAttestation",
     "SubAgentAssignment",
     "SubAgentAssignmentRepository",
     "SubAgentConfig",
@@ -109,4 +114,5 @@ __all__ = [
     "SubagentRole",
     "SubagentSchedulerError",
     "TaskPlanner",
+    "VerifiedIntegrationArtifact",
 ]

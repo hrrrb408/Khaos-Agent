@@ -78,6 +78,8 @@ class MergeResultStatus(str, Enum):
     """Deterministic merge outcome."""
 
     PUBLISHED = "published"
+    PUBLISHED_UNVERIFIED = "published-unverified"
+    PUBLISHED_QUARANTINED = "published-quarantined"
     REJECTED_STALE = "rejected-stale"
     CONFLICT = "conflict"
     VERIFICATION_FAILED = "verification-failed"
@@ -94,6 +96,7 @@ class MergeConflictKind(str, Enum):
     BASE_MISMATCH = "base-mismatch"
     ARTIFACT_MISSING = "artifact-missing"
     ASSIGNMENT_MISMATCH = "assignment-mismatch"
+    CANDIDATE_DRIFT = "candidate-drift"
 
 
 def _text(value: object, label: str, *, allow_empty: bool = False, limit: int = 1024) -> str:
@@ -637,6 +640,113 @@ class SubagentResult:
 
 
 @dataclass(frozen=True, slots=True)
+class MergeCandidateBinding:
+    """Immutable identity of the exact child result admitted to a merge.
+
+    The binding is constructed from a validated assignment/result pair by the
+    trusted merge planner.  An assignment id is only a readable lookup key;
+    this complete binding is the merge authority identity.
+    """
+
+    assignment_id: str
+    assignment_digest: str
+    result_digest: str
+    child_workspace_id: str
+    child_final_commit: str
+    change_digest: str
+    changeset_artifact_sha256: str
+    changeset_artifact_length: int
+    changed_paths: tuple[str, ...]
+    verification_evidence_digest: str
+    changeset_artifact_path: str
+    binding_digest: str = ""
+
+    @classmethod
+    def from_candidate(
+        cls,
+        assignment: SubagentAssignment,
+        result: SubagentResult,
+    ) -> MergeCandidateBinding:
+        """Build a binding only from server-validated assignment/result state."""
+        if type(assignment) is not SubagentAssignment or type(result) is not SubagentResult:
+            raise ParallelSubagentContractError("candidate binding input is malformed")
+        result.validate_against(assignment)
+        if result.status is not SubagentResultStatus.SUCCESS:
+            raise ParallelSubagentContractError("only successful results can be bound")
+        if result.child_final_commit is None:
+            raise ParallelSubagentContractError("candidate result has no final commit")
+        if not result.change_digest:
+            raise ParallelSubagentContractError("candidate result has no change digest")
+        if not result.changeset_artifact_sha256:
+            raise ParallelSubagentContractError("candidate result has no artifact digest")
+        if not result.verification_evidence_digest:
+            raise ParallelSubagentContractError(
+                "candidate result has no verification evidence digest"
+            )
+        return cls(
+            assignment_id=assignment.assignment_id,
+            assignment_digest=assignment.assignment_digest,
+            result_digest=result.result_digest,
+            child_workspace_id=result.child_workspace_id,
+            child_final_commit=result.child_final_commit,
+            change_digest=result.change_digest,
+            changeset_artifact_sha256=result.changeset_artifact_sha256,
+            changeset_artifact_length=result.changeset_artifact_length,
+            changed_paths=result.changed_paths,
+            verification_evidence_digest=result.verification_evidence_digest,
+            changeset_artifact_path=result.changeset_artifact_path,
+        )
+
+    def __post_init__(self) -> None:
+        _text(self.assignment_id, "candidate assignment_id", limit=128)
+        _digest(self.assignment_digest, "candidate assignment_digest")
+        _digest(self.result_digest, "candidate result_digest")
+        _text(self.child_workspace_id, "candidate child_workspace_id", limit=4096)
+        _object_id(self.child_final_commit, "candidate child_final_commit")
+        _digest(self.change_digest, "candidate change_digest")
+        _digest(self.changeset_artifact_sha256, "candidate artifact digest")
+        if type(self.changeset_artifact_length) is not int or self.changeset_artifact_length <= 0:
+            raise ParallelSubagentContractError("candidate artifact length is invalid")
+        object.__setattr__(
+            self,
+            "changed_paths",
+            _paths(self.changed_paths, "candidate changed_paths", limit=MAX_RESULT_PATHS),
+        )
+        _digest(self.verification_evidence_digest, "candidate verification evidence digest")
+        _text(
+            self.changeset_artifact_path,
+            "candidate changeset artifact path",
+            limit=4096,
+        )
+        expected = canonical_digest(self._payload(include_digest=False))
+        if self.binding_digest and self.binding_digest != expected:
+            raise ParallelSubagentContractError("binding_digest does not match candidate binding")
+        object.__setattr__(self, "binding_digest", expected)
+
+    def _payload(self, *, include_digest: bool) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "assignment_id": self.assignment_id,
+            "assignment_digest": self.assignment_digest,
+            "result_digest": self.result_digest,
+            "child_workspace_id": self.child_workspace_id,
+            "child_final_commit": self.child_final_commit,
+            "change_digest": self.change_digest,
+            "changeset_artifact_sha256": self.changeset_artifact_sha256,
+            "changeset_artifact_length": self.changeset_artifact_length,
+            "changed_paths": self.changed_paths,
+            "verification_evidence_digest": self.verification_evidence_digest,
+            "changeset_artifact_path": self.changeset_artifact_path,
+        }
+        if include_digest:
+            payload["binding_digest"] = self.binding_digest
+        return payload
+
+    def to_payload(self) -> dict[str, object]:
+        """Return the complete digest-bound candidate identity."""
+        return self._payload(include_digest=True)
+
+
+@dataclass(frozen=True, slots=True)
 class MergeCandidate:
     """A result admitted to deterministic merge planning."""
 
@@ -656,6 +766,11 @@ class MergeCandidate:
     def assignment_id(self) -> str:
         return self.assignment.assignment_id
 
+    @property
+    def binding(self) -> MergeCandidateBinding:
+        """Return the trusted immutable binding for this candidate."""
+        return MergeCandidateBinding.from_candidate(self.assignment, self.result)
+
 
 @dataclass(frozen=True, slots=True)
 class MergePlan:
@@ -668,6 +783,9 @@ class MergePlan:
     parent_base_commit: str
     candidate_ids: tuple[str, ...]
     ordered_candidate_ids: tuple[str, ...]
+    parent_principal_id: str = ""
+    parent_project_id: str = ""
+    candidate_bindings: tuple[MergeCandidateBinding, ...] = ()
     conflicts: tuple[tuple[str, str, str], ...] = ()
     expected_result: str = "publish-parent"
     plan_digest: str = ""
@@ -681,8 +799,19 @@ class MergePlan:
         _object_id(self.parent_base_commit, "parent_base_commit")
         object.__setattr__(self, "candidate_ids", _strings(self.candidate_ids, "candidate_ids", limit=64, item_limit=128))
         object.__setattr__(self, "ordered_candidate_ids", _strings(self.ordered_candidate_ids, "ordered_candidate_ids", limit=64, item_limit=128))
+        _text(self.parent_principal_id, "parent_principal_id", allow_empty=True, limit=4096)
+        _text(self.parent_project_id, "parent_project_id", allow_empty=True, limit=4096)
         if set(self.candidate_ids) != set(self.ordered_candidate_ids):
             raise ParallelSubagentContractError("merge candidate order is not a permutation")
+        if type(self.candidate_bindings) is not tuple or len(self.candidate_bindings) > 64:
+            raise ParallelSubagentContractError("merge candidate bindings exceed their bound")
+        if any(type(binding) is not MergeCandidateBinding for binding in self.candidate_bindings):
+            raise ParallelSubagentContractError("merge candidate binding is malformed")
+        binding_ids = tuple(binding.assignment_id for binding in self.candidate_bindings)
+        if binding_ids != self.ordered_candidate_ids:
+            raise ParallelSubagentContractError(
+                "merge candidate bindings do not match the deterministic order"
+            )
         if type(self.conflicts) is not tuple or len(self.conflicts) > 256:
             raise ParallelSubagentContractError("merge conflict set exceeds its bound")
         for item in self.conflicts:
@@ -706,12 +835,21 @@ class MergePlan:
             "parent_base_commit": self.parent_base_commit,
             "candidate_ids": self.candidate_ids,
             "ordered_candidate_ids": self.ordered_candidate_ids,
+            "parent_principal_id": self.parent_principal_id,
+            "parent_project_id": self.parent_project_id,
+            "candidate_bindings": tuple(
+                binding.to_payload() for binding in self.candidate_bindings
+            ),
             "conflicts": self.conflicts,
             "expected_result": self.expected_result,
         }
         if include_digest:
             payload["plan_digest"] = self.plan_digest
         return payload
+
+    def to_payload(self) -> dict[str, object]:
+        """Return the complete immutable plan identity for durable storage."""
+        return self._payload(include_digest=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -730,6 +868,11 @@ class MergeResult:
     verification_status: str = "unknown"
     verification_evidence_digest: str = ""
     changed_paths: tuple[str, ...] = ()
+    plan_digest: str = ""
+    candidate_binding_digests: tuple[str, ...] = ()
+    verified_integration_artifact_digest: str = ""
+    publication_attestation_digest: str = ""
+    parent_verification_evidence_digest: str = ""
     reason: str = ""
     result_digest: str = ""
 
@@ -753,6 +896,29 @@ class MergeResult:
         if self.verification_evidence_digest:
             _digest(self.verification_evidence_digest, "verification_evidence_digest")
         object.__setattr__(self, "changed_paths", _paths(self.changed_paths, "merge changed_paths", limit=MAX_RESULT_PATHS))
+        if self.plan_digest:
+            _digest(self.plan_digest, "merge plan_digest")
+        if type(self.candidate_binding_digests) is not tuple or len(
+            self.candidate_binding_digests
+        ) > 64:
+            raise ParallelSubagentContractError(
+                "candidate binding digests exceed their bound"
+            )
+        object.__setattr__(
+            self,
+            "candidate_binding_digests",
+            tuple(
+                _digest(value, "candidate binding digest")
+                for value in self.candidate_binding_digests
+            ),
+        )
+        for label, value in (
+            ("verified_integration_artifact_digest", self.verified_integration_artifact_digest),
+            ("publication_attestation_digest", self.publication_attestation_digest),
+            ("parent_verification_evidence_digest", self.parent_verification_evidence_digest),
+        ):
+            if value:
+                _digest(value, label)
         _text(self.reason, "reason", allow_empty=True, limit=4096)
         expected = canonical_digest(self._payload(include_digest=False))
         if self.result_digest and self.result_digest != expected:
@@ -773,11 +939,170 @@ class MergeResult:
             "verification_status": self.verification_status,
             "verification_evidence_digest": self.verification_evidence_digest,
             "changed_paths": self.changed_paths,
+            "plan_digest": self.plan_digest,
+            "candidate_binding_digests": self.candidate_binding_digests,
+            "verified_integration_artifact_digest": self.verified_integration_artifact_digest,
+            "publication_attestation_digest": self.publication_attestation_digest,
+            "parent_verification_evidence_digest": self.parent_verification_evidence_digest,
             "reason": self.reason,
         }
         if include_digest:
             payload["result_digest"] = self.result_digest
         return payload
+
+    def to_payload(self) -> dict[str, object]:
+        """Return the complete digest-bound merge result."""
+        return self._payload(include_digest=True)
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedIntegrationArtifact:
+    """Frozen, manager-owned publication input produced after verification."""
+
+    merge_id: str
+    merge_plan_digest: str
+    base_commit: str
+    resulting_tree: str
+    changeset_sha256: str
+    changeset_length: int
+    changed_paths: tuple[str, ...]
+    verification_evidence_digest: str
+    verification_plan_digest: str = ""
+    artifact_storage_id: str = ""
+    artifact_digest: str = ""
+
+    def __post_init__(self) -> None:
+        _text(self.merge_id, "verified artifact merge_id", limit=128)
+        _digest(self.merge_plan_digest, "verified artifact merge_plan_digest")
+        _object_id(self.base_commit, "verified artifact base_commit")
+        _object_id(self.resulting_tree, "verified artifact resulting_tree")
+        _digest(self.changeset_sha256, "verified artifact changeset_sha256")
+        if type(self.changeset_length) is not int or self.changeset_length <= 0:
+            raise ParallelSubagentContractError("verified artifact changeset_length is invalid")
+        object.__setattr__(
+            self,
+            "changed_paths",
+            _paths(self.changed_paths, "verified artifact changed_paths", limit=MAX_RESULT_PATHS),
+        )
+        _digest(
+            self.verification_evidence_digest,
+            "verified artifact verification_evidence_digest",
+        )
+        if self.verification_plan_digest:
+            _digest(self.verification_plan_digest, "verified artifact verification_plan_digest")
+        if self.artifact_storage_id:
+            _text(self.artifact_storage_id, "verified artifact storage id", limit=256)
+        expected = canonical_digest(self._payload(include_digest=False))
+        if self.artifact_digest and self.artifact_digest != expected:
+            raise ParallelSubagentContractError("artifact_digest does not match verified artifact")
+        object.__setattr__(self, "artifact_digest", expected)
+
+    def _payload(self, *, include_digest: bool) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "merge_id": self.merge_id,
+            "merge_plan_digest": self.merge_plan_digest,
+            "base_commit": self.base_commit,
+            "resulting_tree": self.resulting_tree,
+            "changeset_sha256": self.changeset_sha256,
+            "changeset_length": self.changeset_length,
+            "changed_paths": self.changed_paths,
+            "verification_evidence_digest": self.verification_evidence_digest,
+            "verification_plan_digest": self.verification_plan_digest,
+            "artifact_storage_id": self.artifact_storage_id,
+        }
+        if include_digest:
+            payload["artifact_digest"] = self.artifact_digest
+        return payload
+
+    def to_payload(self) -> dict[str, object]:
+        return self._payload(include_digest=True)
+
+
+@dataclass(frozen=True, slots=True)
+class PublicationAttestation:
+    """Proof that the current Parent tree equals the verified integration tree."""
+
+    merge_id: str
+    integration_workspace_id: str
+    integration_generation: int
+    integration_commit: str
+    integration_tree_digest: str
+    parent_workspace_id: str
+    parent_generation: int
+    parent_commit: str
+    parent_tree_digest: str
+    source_verification_evidence_digest: str
+    merge_plan_digest: str = ""
+    verification_plan_digest: str = ""
+    changed_paths: tuple[str, ...] = ()
+    parent_task_id: str = ""
+    project_id: str = ""
+    attestation_digest: str = ""
+
+    def __post_init__(self) -> None:
+        _text(self.merge_id, "publication merge_id", limit=128)
+        _text(self.integration_workspace_id, "integration_workspace_id", limit=4096)
+        _text(self.parent_workspace_id, "parent_workspace_id", limit=4096)
+        for label, value in (
+            ("integration_generation", self.integration_generation),
+            ("parent_generation", self.parent_generation),
+        ):
+            if type(value) is not int or value <= 0:
+                raise ParallelSubagentContractError(f"publication {label} is invalid")
+        _object_id(self.integration_commit, "integration_commit")
+        _object_id(self.integration_tree_digest, "integration_tree_digest")
+        _object_id(self.parent_commit, "parent_commit")
+        _object_id(self.parent_tree_digest, "parent_tree_digest")
+        if self.integration_tree_digest != self.parent_tree_digest:
+            raise ParallelSubagentContractError(
+                "publication attestation requires exact integration/Parent tree equality"
+            )
+        _digest(
+            self.source_verification_evidence_digest,
+            "source_verification_evidence_digest",
+        )
+        if self.merge_plan_digest:
+            _digest(self.merge_plan_digest, "publication merge_plan_digest")
+        if self.verification_plan_digest:
+            _digest(self.verification_plan_digest, "publication verification_plan_digest")
+        object.__setattr__(
+            self,
+            "changed_paths",
+            _paths(self.changed_paths, "publication changed_paths", limit=MAX_RESULT_PATHS),
+        )
+        _text(self.parent_task_id, "publication parent_task_id", allow_empty=True, limit=4096)
+        _text(self.project_id, "publication project_id", allow_empty=True, limit=4096)
+        expected = canonical_digest(self._payload(include_digest=False))
+        if self.attestation_digest and self.attestation_digest != expected:
+            raise ParallelSubagentContractError(
+                "attestation_digest does not match publication attestation"
+            )
+        object.__setattr__(self, "attestation_digest", expected)
+
+    def _payload(self, *, include_digest: bool) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "merge_id": self.merge_id,
+            "integration_workspace_id": self.integration_workspace_id,
+            "integration_generation": self.integration_generation,
+            "integration_commit": self.integration_commit,
+            "integration_tree_digest": self.integration_tree_digest,
+            "parent_workspace_id": self.parent_workspace_id,
+            "parent_generation": self.parent_generation,
+            "parent_commit": self.parent_commit,
+            "parent_tree_digest": self.parent_tree_digest,
+            "source_verification_evidence_digest": self.source_verification_evidence_digest,
+            "merge_plan_digest": self.merge_plan_digest,
+            "verification_plan_digest": self.verification_plan_digest,
+            "changed_paths": self.changed_paths,
+            "parent_task_id": self.parent_task_id,
+            "project_id": self.project_id,
+        }
+        if include_digest:
+            payload["attestation_digest"] = self.attestation_digest
+        return payload
+
+    def to_payload(self) -> dict[str, object]:
+        return self._payload(include_digest=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -888,17 +1213,20 @@ __all__ = [
     "ContextTransferItem",
     "ContextTransferPackage",
     "MergeCandidate",
+    "MergeCandidateBinding",
     "MergeConflictKind",
     "MergePlan",
     "MergeResult",
     "MergeResultStatus",
     "ParallelMetrics",
     "ParallelSubagentContractError",
+    "PublicationAttestation",
     "SubagentAccessMode",
     "SubagentAssignment",
     "SubagentParallelismPolicy",
     "SubagentResult",
     "SubagentResultStatus",
     "SubagentRole",
+    "VerifiedIntegrationArtifact",
     "validate_assignment_plan",
 ]

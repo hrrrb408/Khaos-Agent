@@ -55,6 +55,10 @@ class SubagentCoordinator:
         self.repository = repository
         self._results: dict[str, SubagentResult] = {}
         self._contexts: dict[str, ContextTransferPackage] = {}
+        if self.merge_coordinator is not None:
+            # MergeCoordinator owns the pre-publication resource barrier.  The
+            # child service remains the sole lifecycle writer for child state.
+            self.merge_coordinator.set_child_cleanup(workspace_service.cleanup)
 
     async def run_parallel(
         self,
@@ -359,15 +363,7 @@ class SubagentCoordinator:
             and self._results[assignment.assignment_id].status is SubagentResultStatus.SUCCESS
         )
         plan = await self.merge_coordinator.plan(parent_workspace, candidates)
-        try:
-            result = await self.merge_coordinator.merge(parent_workspace, plan, candidates)
-        finally:
-            for assignment in assignments:
-                if assignment.mutating and assignment.assignment_id in self._results:
-                    await self.workspace_service.cleanup(
-                        assignment,
-                        result_status=self._results[assignment.assignment_id].status,
-                    )
+        result = await self.merge_coordinator.merge(parent_workspace, plan, candidates)
         return plan, result
 
     async def cleanup(self, assignments: tuple[SubagentAssignment, ...]) -> None:

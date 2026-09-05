@@ -33,13 +33,22 @@ class ParallelSubagentRecovery:
         for record in records:
             identifier = str(record.get("assignment_id", ""))
             kind = str(record.get("kind", ""))
+            state = str(record.get("state", ""))
             reason = "restart interrupted an unfinished M8.5 operation"
+            if state in {"quarantined", "published-quarantined"}:
+                # Quarantine is already the durable fail-closed projection.
+                # Do not downgrade it to UNKNOWN or attempt an invalid
+                # QUARANTINED -> UNKNOWN child transition on restart.
+                quarantined += 1
+                reasons.append(f"{kind}:{identifier}:quarantined")
+                continue
             if kind == "child":
-                await self.repository.update_child_state(
-                    identifier,
-                    ChildWorkspaceState.UNKNOWN,
-                    reason=reason,
-                )
+                if state != ChildWorkspaceState.UNKNOWN.value:
+                    await self.repository.update_child_state(
+                        identifier,
+                        ChildWorkspaceState.UNKNOWN,
+                        reason=reason,
+                    )
             elif kind == "merge":
                 await self.repository.mark_merge_recovery(identifier, reason)
             else:

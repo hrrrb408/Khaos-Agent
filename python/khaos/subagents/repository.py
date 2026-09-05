@@ -316,7 +316,7 @@ class ParallelSubagentRepository:
 
     async def record_merge_plan(self, plan: MergePlan) -> None:
         """Persist a plan before integration-worktree mutation."""
-        plan_json = canonical_json_bytes(plan._payload(include_digest=True)).decode("utf-8")
+        plan_json = canonical_json_bytes(plan.to_payload()).decode("utf-8")
         candidate_json = canonical_json_bytes(plan.candidate_ids).decode("utf-8")
         async with self._database.transaction() as conn:
             await conn.execute(
@@ -362,7 +362,13 @@ class ParallelSubagentRepository:
             if row is None:
                 raise RuntimeError("merge result has no durable plan")
             if row["result_digest"] not in (None, result.result_digest):
-                raise RuntimeError("parallel merge result digest collision")
+                # A terminal plan may be replayed after its first result was
+                # recorded.  Keep the original durable terminal projection;
+                # the replay observation is captured by the append-only event
+                # emitted by MergeCoordinator.  Never let a replay overwrite
+                # the first result or turn a safe stale rejection into a
+                # persistence error.
+                return
             await conn.execute(
                 """
                 UPDATE agent_parallel_merge_records
@@ -431,13 +437,17 @@ class ParallelSubagentRepository:
                 FROM agent_parallel_child_workspaces
                 WHERE state IN (
                     'starting', 'ready', 'running', 'verifying', 'success',
-                    'failed', 'cancelled', 'stale', 'conflict', 'unknown'
+                    'failed', 'cancelled', 'stale', 'conflict', 'unknown',
+                    'quarantined'
                 )
                 UNION ALL
                 SELECT 'merge' AS kind, merge_id AS assignment_id, state, 0,
                        '' AS quarantine_reason
                 FROM agent_parallel_merge_records
-                WHERE state IN ('planned', 'running', 'merging', 'unknown')
+                WHERE state IN (
+                    'planned', 'running', 'merging', 'unknown', 'quarantined',
+                    'published-quarantined'
+                )
                 ORDER BY kind, assignment_id
                 """
             )
