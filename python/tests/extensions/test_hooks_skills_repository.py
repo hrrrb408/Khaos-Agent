@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from pathlib import Path
 
@@ -247,6 +248,13 @@ def test_skill_loader_rejects_symlink_and_path_escape(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     loader = SkillPackageLoader([root])
+    if os.name == "nt" and not hasattr(os, "O_NOFOLLOW"):
+        with pytest.raises(SkillPackageError, match="no-follow"):
+            loader.load_file(skill_path)
+        pytest.skip(
+            "Windows native no-follow handle support is unavailable; "
+            "symlink-specific coverage is exercised on POSIX"
+        )
     assert loader.load_file(skill_path).manifest.skill_id == "local"
     link = root / "link.md"
     link.symlink_to(skill_path)
