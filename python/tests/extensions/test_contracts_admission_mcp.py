@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -326,19 +327,20 @@ def test_endpoint_and_stdio_guards_reject_ssrf_shell_and_fake_path() -> None:
         "https://EXAMPLE.COM./mcp", "https://example.com/mcp"
     ) == "https://example.com/mcp"
 
+    executable = Path(sys.executable).resolve()
     stdio = _descriptor(
         "ext:stdio",
         transport=McpTransportKind.STDIO,
-        config={"argv": ["/bin/echo", "hello"]},
-        artifact_digest=hashlib.sha256(Path("/bin/echo").resolve().read_bytes()).hexdigest(),
+        config={"argv": [str(executable), "hello"]},
+        artifact_digest=hashlib.sha256(executable.read_bytes()).hexdigest(),
     )
     argv, environment = validate_stdio_configuration(stdio)
-    assert argv[0] == str(Path("/bin/echo").resolve())
+    assert argv[0] == str(executable)
     assert "PYTHONPATH" not in environment
     drifted = _descriptor(
         "ext:stdio-drift",
         transport=McpTransportKind.STDIO,
-        config={"argv": ["/bin/echo"]},
+        config={"argv": [str(executable)]},
         artifact_digest="0" * 64,
     )
     with pytest.raises(McpError):
@@ -349,7 +351,7 @@ def test_endpoint_and_stdio_guards_reject_ssrf_shell_and_fake_path() -> None:
             _descriptor(
                 "ext:stdio-env",
                 transport=McpTransportKind.STDIO,
-                config={"argv": ["/bin/echo"], "env": {"PATH": "/tmp"}},
+                config={"argv": [str(executable)], "env": {"PATH": "/tmp"}},
             )
         )
     with pytest.raises(McpError):
