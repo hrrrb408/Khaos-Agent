@@ -81,6 +81,21 @@ class SupervisionEventType(StrEnum):
     TASK_CANCELLED = "task.cancelled"
     CONTROL_REQUESTED = "control.requested"
     WORKSPACE_OBSERVED = "workspace.observed"
+    EXTENSION_DISCOVERED = "extension.discovered"
+    EXTENSION_VALIDATED = "extension.validated"
+    EXTENSION_STARTED = "extension.started"
+    EXTENSION_STOPPED = "extension.stopped"
+    EXTENSION_QUARANTINED = "extension.quarantined"
+    CAPABILITY_ADMITTED = "capability.admitted"
+    CAPABILITY_DENIED = "capability.denied"
+    MCP_CONNECTED = "mcp.connected"
+    MCP_DISCONNECTED = "mcp.disconnected"
+    MCP_DEGRADED = "mcp.degraded"
+    HOOK_INVOKED = "hook.invoked"
+    HOOK_COMPLETED = "hook.completed"
+    HOOK_FAILED = "hook.failed"
+    SKILL_ACTIVATED = "skill.activated"
+    SKILL_DEACTIVATED = "skill.deactivated"
 
 
 class SupervisionActor(StrEnum):
@@ -448,6 +463,15 @@ class TaskSupervisionState:
     sequence: int = 0
     updated_at: str = field(default_factory=lambda: utc_now_naive().isoformat())
     state_digest: str = ""
+    # M8.7 is a bounded supervision projection.  These fields summarize
+    # extension health and activity; they are not tool/approval/completion
+    # authority and never contain raw provider output.
+    active_extensions: tuple[str, ...] = ()
+    extension_health: Mapping[str, str] = field(default_factory=dict)
+    active_mcp_calls: tuple[str, ...] = ()
+    hook_activity: tuple[str, ...] = ()
+    active_skills: tuple[str, ...] = ()
+    extension_blockers: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _bounded_text(self.task_id, "state.task_id", 128)
@@ -490,6 +514,18 @@ class TaskSupervisionState:
             ):
                 raise SupervisionContractError("state.known_file_digests has invalid digest")
         object.__setattr__(self, "known_file_digests", known)
+        for label in (
+            "active_extensions", "active_mcp_calls", "hook_activity",
+            "active_skills", "extension_blockers",
+        ):
+            object.__setattr__(self, label, _paths(getattr(self, label), f"state.{label}"))
+        health = dict(self.extension_health)
+        if len(health) > MAX_SUBAGENTS:
+            raise SupervisionContractError("state.extension_health exceeds its bound")
+        for key, value in health.items():
+            _bounded_text(key, "state.extension_health.key", 256)
+            _bounded_text(value, "state.extension_health.value", 128)
+        object.__setattr__(self, "extension_health", health)
         expected = canonical_digest(self._digest_payload())
         if self.state_digest and self.state_digest != expected:
             raise SupervisionContractError("state digest does not match projection")
@@ -523,6 +559,12 @@ class TaskSupervisionState:
             "blockers": list(self.blockers),
             "completion_eligibility": self.completion_eligibility,
             "known_file_digests": dict(self.known_file_digests),
+            "active_extensions": list(self.active_extensions),
+            "extension_health": dict(self.extension_health),
+            "active_mcp_calls": list(self.active_mcp_calls),
+            "hook_activity": list(self.hook_activity),
+            "active_skills": list(self.active_skills),
+            "extension_blockers": list(self.extension_blockers),
             "revision": self.revision,
             "sequence": self.sequence,
             "updated_at": self.updated_at,
@@ -551,6 +593,12 @@ class TaskSupervisionState:
             blockers=tuple(value.get("blockers", ())),
             completion_eligibility=value.get("completion_eligibility", "unknown"),
             known_file_digests=value.get("known_file_digests", {}),
+            active_extensions=tuple(value.get("active_extensions", ())),
+            extension_health=value.get("extension_health", {}),
+            active_mcp_calls=tuple(value.get("active_mcp_calls", ())),
+            hook_activity=tuple(value.get("hook_activity", ())),
+            active_skills=tuple(value.get("active_skills", ())),
+            extension_blockers=tuple(value.get("extension_blockers", ())),
             revision=value.get("revision", 0),
             sequence=value.get("sequence", 0),
             updated_at=value.get("updated_at") or utc_now_naive().isoformat(),

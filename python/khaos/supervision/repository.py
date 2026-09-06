@@ -193,6 +193,23 @@ def _apply_event(
         if active_subagents_value is not None
         else state.active_subagents
     )
+    extension_fields: dict[str, object] = {}
+    for key in (
+        "active_extensions", "active_mcp_calls", "hook_activity",
+        "active_skills", "extension_blockers",
+    ):
+        value = _tuple_payload(payload, key)
+        if value is not None:
+            extension_fields[key] = value
+    extension_health = state.extension_health
+    health_value = payload.get("extension_health")
+    if health_value is not None:
+        if not isinstance(health_value, dict) or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in health_value.items()
+        ):
+            raise SupervisionIntegrityError("extension_health must be a text mapping")
+        extension_health = dict(health_value)
     checkpoints = list(state.checkpoint_ids)
     checkpoint_id = payload.get("checkpoint_id")
     if isinstance(checkpoint_id, str) and checkpoint_id and checkpoint_id not in checkpoints:
@@ -246,6 +263,12 @@ def _apply_event(
         blockers=blockers,
         completion_eligibility=completion_eligibility,
         known_file_digests=known,
+        active_extensions=extension_fields.get("active_extensions", state.active_extensions),
+        extension_health=extension_health,
+        active_mcp_calls=extension_fields.get("active_mcp_calls", state.active_mcp_calls),
+        hook_activity=extension_fields.get("hook_activity", state.hook_activity),
+        active_skills=extension_fields.get("active_skills", state.active_skills),
+        extension_blockers=extension_fields.get("extension_blockers", state.extension_blockers),
         revision=state.revision + 1,
         sequence=event.sequence,
         updated_at=event.created_at,

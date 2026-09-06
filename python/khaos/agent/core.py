@@ -358,6 +358,7 @@ class AgentLoop:
         parallel_subagent_coordinator=None,
         supervision_service=None,
         checkpoint_service=None,
+        extension_service=None,
     ):
         self.config = config
         self.mode_manager = mode_manager
@@ -402,6 +403,10 @@ class AgentLoop:
         # authority.
         self.supervision_service = supervision_service
         self.checkpoint_service = checkpoint_service
+        # M8.7: extension discovery/admission is a composed handle only; MCP,
+        # Hook, and Skill adapters remain subordinate to their existing
+        # execution, approval, context, verification, and completion owners.
+        self.extension_service = extension_service
         # M8.4: final context selection/serialization owner.  This service is
         # optional for direct legacy/test constructions; the runtime factory
         # wires it for the normal path so the old builder is not a second
@@ -3303,6 +3308,15 @@ class AgentLoop:
             repo_message = None
             if self.context_intelligence is not None and self._is_coding_mode():
                 repo_message = await self._build_context_intelligence_message(user_input)
+            extension_items: list[object] = []
+            skill_context_items = getattr(self.context_engine, "skill_context_items", None)
+            if callable(skill_context_items):
+                extension_items = skill_context_items(
+                    self.mode_manager.current_mode.value,
+                    user_input,
+                    workspace_id=getattr(self.active_workspace, "id", "") or "",
+                    generation=self._context_generation(),
+                )
             context = await self.context_engine.build_for_agent(
                 system_prompt=await self._build_system_prompt_for_context_engine(
                     session_id, user_input
@@ -3314,6 +3328,7 @@ class AgentLoop:
                     None if self._active_context_bundle is not None else repo_message
                 ),
                 repo_bundle=self._active_context_bundle,
+                extension_items=extension_items,
                 task_id=self._active_task_id or "",
                 workspace_id=getattr(self.active_workspace, "id", "") or "",
                 generation=self._context_generation(),
@@ -3369,16 +3384,14 @@ class AgentLoop:
     async def _build_system_prompt_for_context_engine(
         self, session_id: str, user_input: str = ""
     ) -> str:
-        """Build only the application prompt and deferred skill projection."""
+        """Build only the trusted application prompt.
 
-        del session_id
-        prompt = await self.mode_manager.load_system_prompt()
-        skill_prompt = getattr(self.context_engine, "skill_prompt", None)
-        if callable(skill_prompt):
-            rendered = skill_prompt(self.mode_manager.current_mode.value, user_input)
-            if rendered:
-                prompt = f"{prompt}\n\n{rendered}"
-        return prompt
+        Skills are supplied separately as Context Engine extension items so
+        their untrusted instructions cannot become an L0 system message.
+        """
+
+        del session_id, user_input
+        return await self.mode_manager.load_system_prompt()
 
     def _context_target_path(self, user_input: str) -> Path | None:
         """Choose one safe target for scoped project-instruction resolution."""

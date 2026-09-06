@@ -65,6 +65,10 @@ jobs:
         # promoted into pyright-security.json.
         # additional direct file coverage remains basic-mode until
         # each file is promoted into pyright-security.json.
+        # M8.7: the extension contracts, admission fence, registry, managed
+        # MCP client, Hook dispatcher, Skill package adapter, and durable
+        # projection façade are checked directly while their broader import
+        # graph remains outside the strict project set.
         run: |
           python scripts/validate_type_check_contract.py
           uv run pyright --project pyright-security.json
@@ -97,4 +101,15 @@ jobs:
             python/khaos/tools/execution_coordinator.py \
             python/khaos/tools/registry.py \
             python/khaos/tools/scheduler.py \
-            python/khaos/agent/approval.py
+            python/khaos/agent/approval.py \
+            python/khaos/coding/context_engine/service.py \
+            python/khaos/extensions/__init__.py \
+            python/khaos/extensions/admission.py \
+            python/khaos/extensions/contracts.py \
+            python/khaos/extensions/hooks.py \
+            python/khaos/extensions/mcp.py \
+            python/khaos/extensions/registry.py \
+            python/khaos/extensions/repository.py \
+            python/khaos/extensions/schema.py \
+            python/khaos/extensions/service.py \
+            python/khaos/extensions/skills.py

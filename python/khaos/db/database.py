@@ -42,6 +42,7 @@ from khaos.db.connection import (
     aiosqlite,  # noqa: F401 - tests patch the shared driver module
 )
 from khaos.evaluation.repository import CapabilityEvaluationRepository
+from khaos.extensions.repository import ExtensionRepository
 from khaos.subagents.assignment import SubAgentAssignmentRepository
 from khaos.subagents.repository import ParallelSubagentRepository
 from khaos.supervision.repository import TaskSupervisionRepository
@@ -287,6 +288,7 @@ class Database:
         self._parallel_subagent_repository = ParallelSubagentRepository(self)
         self._supervision_repository = TaskSupervisionRepository(self)
         self._checkpoint_repository = CheckpointRepository(self)
+        self._extension_repository = ExtensionRepository(self)
         # F-01: Per-domain locks remain for logical serialization (e.g. two
         # concurrent permission grants must not race on epoch computation).
         self._operation_approval_lock = asyncio.Lock()
@@ -389,6 +391,11 @@ class Database:
     def checkpoint_repository(self) -> CheckpointRepository:
         """Return the durable M8.6 checkpoint/rewind persistence owner."""
         return self._checkpoint_repository
+
+    @property
+    def extension_repository(self) -> ExtensionRepository:
+        """Return the owner-scoped M8.7 extension projection repository."""
+        return self._extension_repository
 
     @property
     def capability_evaluation_repository(self) -> CapabilityEvaluationRepository:
@@ -1058,6 +1065,16 @@ class Database:
             self._conn = _MigrationConnection(conn)
             try:
                 await self._apply_v30_upgrades()
+            finally:
+                self._conn = original_conn
+            # M8.7: persist owner-scoped extension descriptors, capability
+            # metadata, lifecycle/invocation projections, Hook registrations,
+            # and Skill activation facts.  These tables remain descriptive
+            # and do not replace existing authority owners.
+            original_conn = self._conn
+            self._conn = _MigrationConnection(conn)
+            try:
+                await self._apply_v31_upgrades()
             finally:
                 self._conn = original_conn
             # Batch 6.4 §10.4: backfill the historical ledger rows (v1–v5)
@@ -1853,6 +1870,15 @@ class Database:
         """Add the durable M8.6 supervision/checkpoint control plane."""
         conn = await self._require_conn()
         migration_path = _MIGRATIONS_DIR / "0030_coding_supervision_checkpoint_rewind.sql"
+        await self._execute_schema_statements(
+            conn,
+            migration_path.read_text(encoding="utf-8"),
+        )
+
+    async def _apply_v31_upgrades(self) -> None:
+        """Add the durable M8.7 extension metadata/lifecycle projections."""
+        conn = await self._require_conn()
+        migration_path = _MIGRATIONS_DIR / "0031_mcp_hooks_skills_extensibility.sql"
         await self._execute_schema_statements(
             conn,
             migration_path.read_text(encoding="utf-8"),

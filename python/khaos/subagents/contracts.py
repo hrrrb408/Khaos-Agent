@@ -345,6 +345,9 @@ class SubagentAssignment:
     priority: int = 0
     base_repository_generation: int | None = None
     context: AssignmentContext | None = None
+    # M8.7: explicit intersection of the parent's extension capability
+    # scope.  An empty tuple means no extension capability is delegated.
+    allowed_extension_capabilities: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _text(self.parent_task_id, "parent_task_id")
@@ -409,6 +412,12 @@ class SubagentAssignment:
                 raise ParallelSubagentContractError("assignment context digest is mismatched")
         object.__setattr__(self, "dependencies", _strings(self.dependencies, "dependencies", limit=32, item_limit=128))
         object.__setattr__(self, "allowed_tools", _strings(self.allowed_tools, "allowed_tools", limit=128, item_limit=256))
+        object.__setattr__(self, "allowed_extension_capabilities", _strings(
+            self.allowed_extension_capabilities,
+            "allowed_extension_capabilities",
+            limit=128,
+            item_limit=256,
+        ))
         if self.policy_digest:
             _digest(self.policy_digest, "policy_digest")
         if type(self.required) is not bool or type(self.priority) is not int:
@@ -458,6 +467,7 @@ class SubagentAssignment:
             "assignment_id": self.assignment_id,
             "dependencies": self.dependencies,
             "allowed_tools": self.allowed_tools,
+            "allowed_extension_capabilities": self.allowed_extension_capabilities,
             "policy_digest": self.policy_digest,
             "depth": self.depth,
             "required": self.required,

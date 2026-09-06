@@ -18,6 +18,7 @@ from pathlib import Path
 
 import yaml
 
+from khaos.cli.extensions_commands import cmd_extensions
 from khaos.cli.skills_commands import handle_skills_command
 from khaos.cli.sse import encode_sse
 from khaos.config import (
@@ -289,6 +290,22 @@ def build_command_parser() -> argparse.ArgumentParser:
     config_group.add_argument("--set", type=str, help="Set a config value (KEY=VALUE)")
 
     subparsers.add_parser("version", help="Show version")
+
+    extensions_parser = subparsers.add_parser(
+        "extensions",
+        help="Inspect and explicitly manage MCP, Hook, and Skill extensions",
+    )
+    extensions_parser.add_argument("--config", default="config.yaml")
+    extensions_parser.add_argument("--json", action="store_true", dest="as_json")
+    extensions_sub = extensions_parser.add_subparsers(dest="extensions_command")
+    extensions_sub.add_parser("list", help="List configured extension metadata")
+    extensions_show = extensions_sub.add_parser("show", help="Show one extension metadata")
+    extensions_show.add_argument("extension_id")
+    extensions_sub.add_parser("doctor", help="Show extension lifecycle blockers")
+    extensions_enable = extensions_sub.add_parser("enable", help="Enable one validated extension")
+    extensions_enable.add_argument("extension_id")
+    extensions_disable = extensions_sub.add_parser("disable", help="Disable one extension")
+    extensions_disable.add_argument("extension_id")
 
     doctor_parser = subparsers.add_parser(
         "doctor",
@@ -1215,6 +1232,7 @@ def main() -> None:
     command_names = {
         "start", "chat", "task", "checkpoint", "rewind", "test", "config",
         "version", "doctor", "migrate", "memory", "eval",
+        "extensions",
     }
     if not argv:
         parser = build_command_parser()
@@ -1247,6 +1265,8 @@ def main() -> None:
             cmd_config(args)
         elif args.command == "version":
             cmd_version()
+        elif args.command == "extensions":
+            raise SystemExit(cmd_extensions(args))
         elif args.command == "doctor":
             raise SystemExit(cmd_doctor(args))
         elif args.command == "migrate":

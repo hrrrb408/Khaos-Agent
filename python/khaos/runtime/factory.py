@@ -55,6 +55,12 @@ from khaos.coding.workspace.manager import WorkspaceManager
 from khaos.coding.workspace.office_authority import OfficeMutationAuthority
 from khaos.db.state_root import project_id as compute_project_id
 from khaos.exceptions import RuntimeCloseError
+from khaos.extensions import (
+    EffectKind,
+    ExtensionPolicy,
+    ExtensionRegistry,
+    ExtensionService,
+)
 from khaos.memory import (
     MemoryBroker,
     MemoryBudget,
@@ -289,6 +295,10 @@ class RuntimeConfig:
     # M8.6: application-scoped typed supervision owner.  Production callers
     # may share this server-lifecycle service; it carries no effect authority.
     supervision_service: Any = None
+    # M8.7: trusted development seam only.  ProductionRuntimeConfig omits this
+    # field so the factory constructs the sole extension registry/admission
+    # plane from the effective policy.
+    extension_service: Any = None
 
 
 @dataclass(frozen=True)
@@ -543,6 +553,9 @@ class RuntimeResult:
     # factory without changing the long-standing positional constructor.
     supervision_service: Any = field(init=False, default=None, repr=False)
     checkpoint_service: Any = field(init=False, default=None, repr=False)
+    # M8.7: composed ExtensionService handle; it owns registry/admission
+    # metadata, not execution, approval, verification, or completion authority.
+    extension_service: Any = field(init=False, default=None, repr=False)
     # M7.3: production-composed planning control coordinator.  It is an
     # orchestration owner only; plan revisions remain passive and TaskStatus
     # lifecycle writes remain owned by their existing control boundaries.
@@ -1577,6 +1590,36 @@ async def build_runtime(
         else:
             runtime_registry = create_runtime_registry()
         exec_tool_names = runtime_registry.exec_tool_names()
+        extension_service = cfg.extension_service
+        if extension_service is None:
+            denied_extension_effects = set()
+            if not effective_policy.network_enabled:
+                denied_extension_effects.add(EffectKind.NETWORK)
+            if effective_policy.mode.value == "read-only":
+                denied_extension_effects.update(
+                    {
+                        EffectKind.WRITE_WORKSPACE,
+                        EffectKind.EXECUTE_PROCESS,
+                        EffectKind.EXTERNAL_WRITE,
+                        EffectKind.EXTERNAL_DELETE,
+                    }
+                )
+            extension_service = ExtensionService(
+                registry=ExtensionRegistry(
+                    tool_registry=runtime_registry,
+                    principal_id=cfg.principal_id,
+                    project_id=project_id,
+                ),
+                policy=ExtensionPolicy(
+                    allowed_network_hosts=frozenset(
+                        effective_policy.network_allowed_domains or ()
+                    ),
+                    denied_effects=frozenset(denied_extension_effects),
+                ),
+                repository=getattr(cfg.db, "extension_repository", None),
+            )
+        elif not isinstance(extension_service, ExtensionService):
+            raise TypeError("RuntimeConfig.extension_service must be an ExtensionService")
         # Construct the shared audit repository before any component that can
         # emit audit events.  Permission and error paths must use this same
         # anchored writer; constructing it later allowed direct DB writers to
@@ -1892,6 +1935,7 @@ async def build_runtime(
                 instruction_resolver=InstructionResolver(root),
                 task_manager=task_manager,
                 tool_registry=runtime_registry,
+                extension_registry=extension_service.registry,
                 skill_manager=skill_manager,
                 default_budget=context_budget,
                 tool_output_limits=ToolOutputLimits(
@@ -2441,6 +2485,7 @@ async def build_runtime(
             parallel_subagent_coordinator=parallel_subagent_coordinator,
             supervision_service=supervision_service,
             checkpoint_service=checkpoint_service,
+            extension_service=extension_service,
             # M4 batch 3.1.16A-5-1b (CRITICAL): carry the RPC-verified
             # project identity into the AgentLoop so every message / turn
             # write is stamped with it.  ``self._bound_project_id`` (set
@@ -2517,6 +2562,7 @@ async def build_runtime(
         runtime.parallel_subagent_coordinator = parallel_subagent_coordinator
         runtime.supervision_service = supervision_service
         runtime.checkpoint_service = checkpoint_service
+        runtime.extension_service = extension_service
         runtime.recovery_control = recovery_control
         runtime.composition_manifest = composition_manifest
         return runtime

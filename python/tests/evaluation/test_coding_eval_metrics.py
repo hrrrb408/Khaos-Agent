@@ -128,6 +128,41 @@ def test_trace_metrics_capture_repository_intelligence_counters() -> None:
     assert metrics.context_selected_symbol_count == 9
 
 
+def test_trace_metrics_capture_m8_7_extension_counters_and_context_bounds() -> None:
+    collector = CodingTraceCollector()
+    collector.record_context_metrics(
+        SimpleNamespace(
+            active_skills=2,
+            extension_context_bytes=321,
+            extension_tool_schema_bytes=123,
+        )
+    )
+    collector.record_extension_metrics(
+        {
+            "extension_calls": 4,
+            "mcp_calls": 3,
+            "mcp_failures": 1,
+            "hook_invocations": 2,
+            "hook_failures": 1,
+        }
+    )
+    metrics = collector.finish(
+        verdict=CodingVerdict.PASS,
+        agent_status="COMPLETED",
+        completion_status="completed",
+    )
+
+    assert metrics.extension_calls == 4
+    assert metrics.mcp_calls == 3
+    assert metrics.mcp_failures == 1
+    assert metrics.hook_invocations == 2
+    assert metrics.hook_failures == 1
+    assert metrics.active_skills == 2
+    assert metrics.extension_context_bytes == 321
+    assert metrics.extension_tool_schema_bytes == 123
+    assert metrics.to_payload()["mcp_failures"] == 1
+
+
 def test_trace_limits_fail_closed() -> None:
     collector = CodingTraceCollector(max_events=8, max_model_turns=1, max_tool_calls=1)
     collector.record_message(Message(role="assistant", content="first"))

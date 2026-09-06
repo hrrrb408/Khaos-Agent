@@ -52,7 +52,9 @@ from khaos.coding.context_engine.working_set import (
     TaskWorkingSet,
     WorkingSetEvent,
 )
+from khaos.extensions.contracts import CapabilityDescriptor, CapabilityKind
 from khaos.security.protocol_boundary import canonical_digest
+from khaos.skills.skill import Skill
 
 _ContextEnum = TypeVar("_ContextEnum", bound=Enum)
 
@@ -68,6 +70,7 @@ class ContextEngineService:
         instruction_resolver: object | None = None,
         task_manager: object | None = None,
         tool_registry: object | None = None,
+        extension_registry: object | None = None,
         skill_manager: object | None = None,
         working_set_store: InMemoryWorkingSetStore | None = None,
         cache: ContextCache | None = None,
@@ -82,6 +85,7 @@ class ContextEngineService:
         self.instruction_resolver = instruction_resolver
         self.task_manager = task_manager
         self.tool_registry = tool_registry
+        self.extension_registry = extension_registry
         self.skill_manager = skill_manager
         self.working_set_store = working_set_store or InMemoryWorkingSetStore()
         self.cache = cache or ContextCache()
@@ -131,6 +135,9 @@ class ContextEngineService:
             "tool_output_tokens": 0,
             "tool_output_bytes": 0,
             "tool_output_truncated_count": 0,
+            "extension_context_bytes": 0,
+            "extension_tool_schema_bytes": 0,
+            "active_skills": 0,
         }
 
     async def build(
@@ -139,6 +146,7 @@ class ContextEngineService:
         candidates: Iterable[ContextItem] = (),
         *,
         repo_bundle: object | None = None,
+        extension_items: Iterable[object] = (),
         scope_id: str = "parent",
         partial: bool = False,
     ) -> ModelContext:
@@ -149,6 +157,13 @@ class ContextEngineService:
         values = [item for item in candidates if type(item) is ContextItem]
         if repo_bundle is not None:
             values.extend(self.items_from_repo_bundle(repo_bundle, requirements=requirements))
+        values.extend(
+            self.extension_context_items(
+                extension_items,
+                workspace_id=requirements.workspace_id,
+                generation=requirements.generation,
+            )
+        )
         values, stale = self._filter_generation(values, requirements.generation)
         values, scope_mismatch = self._filter_workspace(values, requirements.workspace_id)
         if scope_mismatch:
@@ -218,6 +233,7 @@ class ContextEngineService:
         memory_message: object | None = None,
         repo_message: object | None = None,
         repo_bundle: object | None = None,
+        extension_items: Iterable[object] = (),
         requirements: ContextRequirements | None = None,
         task_id: str = "",
         workspace_id: str = "",
@@ -471,6 +487,7 @@ class ContextEngineService:
             requirements,
             candidates,
             repo_bundle=repo_bundle,
+            extension_items=extension_items,
             scope_id=scope_id,
         )
 
@@ -875,7 +892,11 @@ class ContextEngineService:
                 generation=generation,
             )) is not None
         ]
-        return await self.build(requirements, candidates, scope_id=scope_id)
+        return await self.build(
+            requirements,
+            candidates,
+            scope_id=scope_id,
+        )
 
     def tool_schemas(
         self,
@@ -886,22 +907,44 @@ class ContextEngineService:
     ) -> list[dict[str, object]] | None:
         """Return visibility-filtered schemas; authority stays in the registry."""
 
-        if self.tool_registry is None:
-            return None
-        discovery = DeferredToolDiscovery(self.tool_registry, mode=mode)
-        result = discovery.discover(intent=intent, allowlist=allowlist)
-        self._inc("deferred_tool_discoveries", result.deferred_count)
         schemas: list[dict[str, object]] = []
-        for definition in result.definitions:
-            schema = {
-                "type": "function",
-                "function": {
-                    "name": getattr(definition, "name", ""),
-                    "description": getattr(definition, "description", ""),
-                    "parameters": getattr(definition, "parameters", {}),
-                },
-            }
-            schemas.append(schema)
+        if self.tool_registry is not None:
+            discovery = DeferredToolDiscovery(self.tool_registry, mode=mode)
+            result = discovery.discover(intent=intent, allowlist=allowlist)
+            self._inc("deferred_tool_discoveries", result.deferred_count)
+            for definition in result.definitions:
+                schemas.append(
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": getattr(definition, "name", ""),
+                            "description": getattr(definition, "description", ""),
+                            "parameters": getattr(definition, "parameters", {}),
+                        },
+                    }
+                )
+        if self.extension_registry is not None and len(schemas) < 256:
+            self._set("extension_tool_schema_bytes", 0)
+            extension_schemas = self.extension_tool_schemas(
+                self.extension_registry,
+                allowlist=allowlist,
+                max_tools=max(1, 256 - len(schemas)),
+            )
+            if extension_schemas:
+                schemas.extend(extension_schemas)
+                try:
+                    extension_encoded = json.dumps(
+                        extension_schemas,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    self._set(
+                        "extension_tool_schema_bytes",
+                        len(extension_encoded.encode("utf-8")),
+                    )
+                except (TypeError, ValueError):
+                    self._set("extension_tool_schema_bytes", None)
         try:
             encoded = json.dumps(schemas, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
             self._set("tool_schema_bytes", len(encoded.encode("utf-8")))
@@ -911,6 +954,113 @@ class ContextEngineService:
             self._set("tool_schema_tokens", None)
         return schemas or None
 
+    def extension_context_items(
+        self,
+        values: Iterable[object],
+        *,
+        workspace_id: str = "",
+        generation: str | None = None,
+    ) -> list[ContextItem]:
+        """Convert extension data into explicit lower-precedence context.
+
+        Extension adapters may expose a ``to_context_item`` method, but the
+        resulting item is accepted only after this service rechecks its type,
+        source, trust, and non-system layer.  This prevents a provider from
+        smuggling an extension prompt into the trusted project/system tier.
+        """
+        items: list[ContextItem] = []
+        total_bytes = 0
+        max_items = 64
+        max_bytes = 512 * 1024
+        for value in values:
+            item = value if isinstance(value, ContextItem) else None
+            if item is None:
+                converter = getattr(value, "to_context_item", None)
+                if callable(converter):
+                    try:
+                        item = converter(workspace_id=workspace_id, generation=generation)
+                    except (TypeError, ValueError):
+                        item = None
+                    except Exception:  # noqa: BLE001 - extension converters are untrusted
+                        item = None
+            if not isinstance(item, ContextItem):
+                continue
+            if item.source is not ContextSource.EXTENSION:
+                continue
+            if item.layer is ContextLayer.L0 or item.required or item.pinned or item.priority > 100:
+                item = replace(
+                    item,
+                    layer=ContextLayer.L3,
+                    required=False,
+                    pinned=False,
+                    priority=min(item.priority, 100),
+                )
+            if item.trust not in {
+                ContextTrust.UNTRUSTED_EXTENSION_RESOURCE,
+                ContextTrust.UNTRUSTED_EXTENSION_INSTRUCTION,
+                ContextTrust.UNTRUSTED_EXTENSION_DIAGNOSTIC,
+            }:
+                item = replace(item, trust=ContextTrust.UNTRUSTED_EXTENSION_DIAGNOSTIC)
+            item_bytes = max(item.estimated_bytes, len(item.payload.encode("utf-8")))
+            if item_bytes > max_bytes - total_bytes:
+                remaining = max_bytes - total_bytes
+                if remaining <= 0:
+                    break
+                item = item.truncated_to(max_bytes=remaining)
+                item_bytes = max(item.estimated_bytes, len(item.payload.encode("utf-8")))
+            if item_bytes > max_bytes - total_bytes:
+                break
+            items.append(item)
+            total_bytes += item_bytes
+            self._inc("extension_context_bytes", item_bytes)
+            if len(items) >= max_items:
+                break
+        return items
+
+    def extension_tool_schemas(
+        self,
+        registry: object,
+        *,
+        allowlist: Iterable[str] | None = None,
+        max_tools: int = 256,
+    ) -> list[dict[str, object]] | None:
+        """Expose validated external tool metadata without executable handlers."""
+        if max_tools <= 0:
+            raise ValueError("max_tools must be positive")
+        allowed = None if allowlist is None else {str(value) for value in allowlist}
+        values = []
+        capabilities = getattr(registry, "capabilities", None)
+        if not callable(capabilities):
+            return None
+        discovered = capabilities(include_unavailable=False)
+        if not isinstance(discovered, Iterable):
+            return None
+        for capability in cast(Iterable[object], discovered):
+            if type(capability) is not CapabilityDescriptor:
+                continue
+            if capability.kind is not CapabilityKind.TOOL:
+                continue
+            capability_id = capability.capability_id
+            if allowed is not None and capability_id not in allowed:
+                continue
+            values.append(
+                {
+                    "type": "function",
+                    "function": {
+                        # The capability id is the visible name so it cannot
+                        # collide with a built-in ToolRegistry name.
+                        "name": capability_id,
+                        "description": capability.description,
+                        "parameters": dict(capability.input_schema),
+                    },
+                    "extension_capability": True,
+                    "capability_digest": capability.capability_digest,
+                }
+            )
+            if len(values) >= max_tools:
+                break
+        return values or None
+
     def discover_skill_metadata(self, mode: str, user_text: str) -> tuple[object, ...]:
         discovery = LazySkillDiscovery(self.skill_manager)
         result = discovery.discover(mode, user_text)
@@ -918,7 +1068,7 @@ class ContextEngineService:
         return result
 
     def skill_prompt(self, mode: str, user_text: str) -> str:
-        """Load selected skill bodies only after bounded metadata matching."""
+        """Render the legacy skill projection for direct compatibility callers."""
 
         metadata = self.discover_skill_metadata(mode, user_text)
         manager = self.skill_manager
@@ -933,6 +1083,55 @@ class ContextEngineService:
         if not callable(formatter):
             return ""
         return str(formatter(skills) or "")
+
+    def skill_context_items(
+        self,
+        mode: str,
+        user_text: str,
+        *,
+        workspace_id: str = "",
+        generation: str | None = None,
+    ) -> list[ContextItem]:
+        """Load matched skills as explicit lower-precedence extension items.
+
+        The Context Engine path must never append a Skill body to the trusted
+        system prompt.  Metadata matching stays deferred and the package
+        adapter stamps every selected body as ``EXTENSION_INSTRUCTION`` in
+        ``L1`` with an untrusted trust label; the extension boundary then
+        strips required/pinned precedence and keeps the item below trusted
+        system/project and task constraints.
+        """
+
+        metadata = self.discover_skill_metadata(mode, user_text)
+        self._set("active_skills", 0)
+        if not metadata:
+            return []
+        try:
+            from khaos.extensions.skills import SkillPackageLoader
+
+            items: list[ContextItem] = []
+            for entry in metadata:
+                skill = self.load_skill(str(getattr(entry, "name", "")))
+                if not isinstance(skill, Skill):
+                    continue
+                try:
+                    package = SkillPackageLoader.from_skill(skill)
+                    items.extend(
+                        self.extension_context_items(
+                            (package.to_context_item(
+                                workspace_id=workspace_id,
+                                generation=generation,
+                            ),),
+                            workspace_id=workspace_id,
+                            generation=generation,
+                        )
+                    )
+                except (TypeError, ValueError):
+                    continue
+            self._set("active_skills", len(items))
+            return items
+        except (ImportError, TypeError, ValueError):
+            return []
 
     def load_skill(self, name: str) -> object | None:
         skill = LazySkillDiscovery(self.skill_manager).load_full(name)

@@ -119,6 +119,9 @@ class ContextSerializer:
             ContextTrust.UNTRUSTED_TOOL: ("untrusted_tool_output", "tool"),
             ContextTrust.UNTRUSTED_MEMORY: ("untrusted_memory", "memory"),
             ContextTrust.UNTRUSTED_MODEL: ("untrusted_model_observation", "model"),
+            ContextTrust.UNTRUSTED_EXTENSION_RESOURCE: ("untrusted_extension_resource", "extension"),
+            ContextTrust.UNTRUSTED_EXTENSION_INSTRUCTION: ("untrusted_extension_instruction", "extension"),
+            ContextTrust.UNTRUSTED_EXTENSION_DIAGNOSTIC: ("untrusted_extension_diagnostic", "extension"),
         }.get(item.trust)
         if marker is None:
             if item.source is ContextSource.PROJECT and item.layer is ContextLayer.L0:

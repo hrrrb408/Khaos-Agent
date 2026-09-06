@@ -86,6 +86,9 @@ class SubAgentTask:
     # Internal-only reference installed by the trusted coordinator. It is
     # never read from RPC/model payloads or persisted as authority data.
     parent_workspace_manager: object | None = None
+    # M8.7: explicit parent-issued extension subset.  Empty means no
+    # extension capability is inherited by this child.
+    allowed_extension_capabilities: tuple[str, ...] = ()
 
 
 Runner = Callable[[SubAgentTask], Awaitable[str]]

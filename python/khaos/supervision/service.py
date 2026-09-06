@@ -23,6 +23,26 @@ from khaos.supervision.control import (
 )
 from khaos.supervision.repository import TaskSupervisionRepository
 
+_EXTENSION_EVENT_TYPES = frozenset(
+    {
+        SupervisionEventType.EXTENSION_DISCOVERED,
+        SupervisionEventType.EXTENSION_VALIDATED,
+        SupervisionEventType.EXTENSION_STARTED,
+        SupervisionEventType.EXTENSION_STOPPED,
+        SupervisionEventType.EXTENSION_QUARANTINED,
+        SupervisionEventType.CAPABILITY_ADMITTED,
+        SupervisionEventType.CAPABILITY_DENIED,
+        SupervisionEventType.MCP_CONNECTED,
+        SupervisionEventType.MCP_DISCONNECTED,
+        SupervisionEventType.MCP_DEGRADED,
+        SupervisionEventType.HOOK_INVOKED,
+        SupervisionEventType.HOOK_COMPLETED,
+        SupervisionEventType.HOOK_FAILED,
+        SupervisionEventType.SKILL_ACTIVATED,
+        SupervisionEventType.SKILL_DEACTIVATED,
+    }
+)
+
 
 class TaskSupervisionService:
     """Typed owner used by AgentLoop and all presentation adapters."""
@@ -69,6 +89,66 @@ class TaskSupervisionService:
         )
         return await self.repository.append(
             event, principal_id=principal_id, project_id=project_id
+        )
+
+    async def emit_extension_event(
+        self,
+        *,
+        task_id: str,
+        workspace_id: str,
+        principal_id: str,
+        project_id: str,
+        event_type: SupervisionEventType | str,
+        extension_id: str,
+        status: str = "",
+        capability_id: str = "",
+        reason_code: str = "",
+        digest: str = "",
+        payload: Mapping[str, object] | None = None,
+    ) -> SupervisionEvent:
+        """Emit a bounded extension projection through canonical supervision.
+
+        Extension events are a separate projection namespace.  The helper
+        rejects canonical task events and never forwards generic ``status``
+        or authority-shaped payload keys to the state reducer, so an
+        extension cannot mark a task completed, verified, approved, or
+        otherwise alter the canonical control state.
+        """
+        try:
+            normalized_event_type = SupervisionEventType(str(event_type))
+        except ValueError as exc:
+            raise ValueError("extension supervision event type is invalid") from exc
+        if normalized_event_type not in _EXTENSION_EVENT_TYPES:
+            raise ValueError("extension supervision cannot emit canonical task events")
+        if type(extension_id) is not str or not extension_id or "\x00" in extension_id:
+            raise ValueError("extension_id is required")
+        values: dict[str, object] = {
+            "extension_id": extension_id,
+        }
+        for key, value in (
+            ("extension_status", status),
+            ("extension_capability_id", capability_id),
+            ("extension_reason_code", reason_code),
+            ("extension_digest", digest),
+        ):
+            if value:
+                values[key] = value
+        if payload:
+            for key, value in payload.items():
+                if (
+                    type(key) is not str
+                    or not key.startswith("extension_")
+                    or key in {"extension_id", "extension_status", "extension_capability_id", "extension_reason_code", "extension_digest"}
+                ):
+                    raise ValueError("extension payload keys must use a non-authoritative extension namespace")
+                values[key] = value
+        return await self.emit(
+            task_id=task_id,
+            workspace_id=workspace_id,
+            principal_id=principal_id,
+            project_id=project_id,
+            event_type=normalized_event_type,
+            payload=values,
         )
 
     async def start_task(

@@ -70,6 +70,11 @@ class ContextItemKind(str, Enum):
     BLOCKER = "blocker"
     CONVERSATION = "conversation"
     TASK_STATE = "task_state"
+    # M8.7 extension inputs are explicit low-trust context kinds.  They are
+    # intentionally not aliases of PROJECT_INSTRUCTION or TOOL_RESULT.
+    EXTENSION_RESOURCE = "extension_resource"
+    EXTENSION_INSTRUCTION = "extension_instruction"
+    EXTENSION_DIAGNOSTIC = "extension_diagnostic"
 
 
 class ContextSource(str, Enum):
@@ -85,6 +90,7 @@ class ContextSource(str, Enum):
     TOOL = "tool"
     MEMORY = "memory"
     MODEL = "model"
+    EXTENSION = "extension"
 
 
 # These sources describe code-state observations.  A workspace identifier
@@ -114,6 +120,9 @@ class ContextTrust(str, Enum):
     UNTRUSTED_MODEL = "untrusted_model"
     UNTRUSTED_MODEL_SUMMARY = "untrusted_model"  # noqa: PIE796 - contract alias
     UNKNOWN = "unknown"
+    UNTRUSTED_EXTENSION_RESOURCE = "untrusted_extension_resource"
+    UNTRUSTED_EXTENSION_INSTRUCTION = "untrusted_extension_instruction"
+    UNTRUSTED_EXTENSION_DIAGNOSTIC = "untrusted_extension_diagnostic"
 
 
 class ContextOperation(str, Enum):
@@ -902,6 +911,9 @@ class ContextMetricsSnapshot:
     tool_output_tokens: int = 0
     tool_output_bytes: int = 0
     tool_output_truncated_count: int = 0
+    extension_context_bytes: int = 0
+    extension_tool_schema_bytes: int = 0
+    active_skills: int = 0
 
     @property
     def memory_items_selected(self) -> int | None:

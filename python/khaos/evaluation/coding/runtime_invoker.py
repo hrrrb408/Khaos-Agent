@@ -213,6 +213,10 @@ class RuntimeCodingAgentInvoker:
         context_snapshot = getattr(context_engine, "metrics_snapshot", None)
         if callable(context_snapshot):
             trace.record_context_metrics(context_snapshot())
+        extension_service = getattr(runtime.loop, "extension_service", None)
+        extension_snapshot = getattr(extension_service, "metrics_snapshot", None)
+        if callable(extension_snapshot):
+            trace.record_extension_metrics(extension_snapshot())
         active_workspace = runtime.loop.active_workspace
         final_root = (
             active_workspace.worktree_path

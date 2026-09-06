@@ -588,6 +588,15 @@ MIGRATIONS: tuple[MigrationSpec, ...] = (
         sql_files=("0030_coding_supervision_checkpoint_rewind.sql",),
         migrator_symbols=("_apply_v30_upgrades",),
     ),
+    MigrationSpec(
+        version=31,
+        name="m8_7_mcp_hooks_skills_extensibility",
+        # Release-time manifest over the additive M8.7 extension metadata
+        # schema and its migration owner.
+        sha256="fa717cea289019756e922e7832bf0879926537882843d2338bacbe1dd1cddad1",
+        sql_files=("0031_mcp_hooks_skills_extensibility.sql",),
+        migrator_symbols=("_apply_v31_upgrades",),
+    ),
 )
 
 

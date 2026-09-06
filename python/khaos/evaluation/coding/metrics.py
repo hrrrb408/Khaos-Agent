@@ -143,6 +143,11 @@ class CodingMetrics:
     cached_tokens: int | None = None
     total_tokens: int | None = None
     tool_calls_by_name: Mapping[str, int] = field(default_factory=dict)
+    extension_calls: int = 0
+    mcp_calls: int = 0
+    mcp_failures: int = 0
+    hook_invocations: int = 0
+    hook_failures: int = 0
     read_file_calls: int = 0
     search_calls: int = 0
     code_search_calls: int = 0
@@ -224,6 +229,9 @@ class CodingMetrics:
     tool_output_tokens: int | None = None
     tool_output_bytes: int | None = None
     tool_output_truncated_count: int | None = None
+    active_skills: int | None = None
+    extension_context_bytes: int | None = None
+    extension_tool_schema_bytes: int | None = None
     # M8.0 keeps these aggregate names as part of the stable evaluation
     # vocabulary; the context-engine-prefixed fields above remain the
     # collision-free internal projection.
@@ -320,6 +328,11 @@ class CodingMetrics:
             "git_calls",
             "browser_calls",
             "subagent_calls",
+            "extension_calls",
+            "mcp_calls",
+            "mcp_failures",
+            "hook_invocations",
+            "hook_failures",
             "editing_calls",
             "verification_calls",
             "recovery_calls",
@@ -465,6 +478,9 @@ class CodingMetrics:
             "tool_output_tokens",
             "tool_output_bytes",
             "tool_output_truncated_count",
+            "active_skills",
+            "extension_context_bytes",
+            "extension_tool_schema_bytes",
             "memory_items_selected",
             "repo_items_selected",
             "diagnostics_selected",
@@ -514,6 +530,11 @@ class CodingMetrics:
             "cached_tokens": self.cached_tokens,
             "total_tokens": self.total_tokens,
             "tool_calls_by_name": dict(sorted(self.tool_calls_by_name.items())),
+            "extension_calls": self.extension_calls,
+            "mcp_calls": self.mcp_calls,
+            "mcp_failures": self.mcp_failures,
+            "hook_invocations": self.hook_invocations,
+            "hook_failures": self.hook_failures,
             "read_file_calls": self.read_file_calls,
             "search_calls": self.search_calls,
             "code_search_calls": self.code_search_calls,
@@ -592,6 +613,9 @@ class CodingMetrics:
             "tool_output_tokens": self.tool_output_tokens,
             "tool_output_bytes": self.tool_output_bytes,
             "tool_output_truncated_count": self.tool_output_truncated_count,
+            "active_skills": self.active_skills,
+            "extension_context_bytes": self.extension_context_bytes,
+            "extension_tool_schema_bytes": self.extension_tool_schema_bytes,
             "memory_items_selected": self.memory_items_selected,
             "repo_items_selected": self.repo_items_selected,
             "diagnostics_selected": self.diagnostics_selected,
@@ -712,6 +736,7 @@ class CodingTraceCollector:
         self._autonomous_verification_time_to_final_green_ms: int | None = None
         self._repo_metrics: dict[str, int] | None = None
         self._context_metrics: dict[str, int | None] = {}
+        self._extension_metrics: dict[str, int] = {}
         self._started = time.monotonic()
 
     @property
@@ -886,6 +911,9 @@ class CodingTraceCollector:
             "tool_output_tokens",
             "tool_output_bytes",
             "tool_output_truncated_count",
+            "active_skills",
+            "extension_context_bytes",
+            "extension_tool_schema_bytes",
             "memory_items_selected",
             "repo_items_selected",
             "diagnostics_selected",
@@ -901,6 +929,26 @@ class CodingTraceCollector:
             else:
                 return
         self._context_metrics = observed
+
+    def record_extension_metrics(self, metrics: object) -> None:
+        """Attach only the bounded MCP/Hook counters to the coding ledger."""
+
+        names = (
+            "extension_calls",
+            "mcp_calls",
+            "mcp_failures",
+            "hook_invocations",
+            "hook_failures",
+        )
+        observed: dict[str, int] = {}
+        for name in names:
+            value = metrics.get(name) if isinstance(metrics, Mapping) else getattr(metrics, name, None)
+            if value is None:
+                continue
+            if type(value) is not int or value < 0:
+                return
+            observed[name] = value
+        self._extension_metrics = observed
 
     def record(
         self,
@@ -934,6 +982,7 @@ class CodingTraceCollector:
         category = dict(self._tool_categories)
         repo_metrics = self._repo_metrics or {}
         context_metrics = self._context_metrics
+        extension_metrics = self._extension_metrics
         detailed = {
             "read_file_calls": tool_names.get("read_file", 0),
             "search_calls": tool_names.get("search_files", 0),
@@ -992,6 +1041,11 @@ class CodingTraceCollector:
                 else None
             ),
             tool_calls_by_name=tool_names,
+            extension_calls=extension_metrics.get("extension_calls", 0),
+            mcp_calls=extension_metrics.get("mcp_calls", 0),
+            mcp_failures=extension_metrics.get("mcp_failures", 0),
+            hook_invocations=extension_metrics.get("hook_invocations", 0),
+            hook_failures=extension_metrics.get("hook_failures", 0),
             **detailed,
             editing_calls=category.get("editing", 0),
             verification_calls=category.get("verification", 0),
@@ -1071,6 +1125,9 @@ class CodingTraceCollector:
             tool_output_tokens=context_metrics.get("tool_output_tokens"),
             tool_output_bytes=context_metrics.get("tool_output_bytes"),
             tool_output_truncated_count=context_metrics.get("tool_output_truncated_count"),
+            active_skills=context_metrics.get("active_skills"),
+            extension_context_bytes=context_metrics.get("extension_context_bytes"),
+            extension_tool_schema_bytes=context_metrics.get("extension_tool_schema_bytes"),
             memory_items_selected=(
                 context_metrics.get("memory_items_selected")
                 if context_metrics.get("memory_items_selected") is not None
