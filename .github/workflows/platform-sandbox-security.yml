@@ -30,6 +30,16 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.11"
+      - name: Disable stale Google Chrome apt source
+        run: |
+          # The hosted image's unrelated Google Chrome source can serve a
+          # transiently inconsistent Packages index and abort apt entirely.
+          for source in /etc/apt/sources.list /etc/apt/sources.list.d/*; do
+            if [ -f "$source" ] && sudo grep -q "dl.google.com/linux/chrome" "$source"; then
+              sudo mv "$source" "$source.disabled"
+            fi
+          done
+          sudo rm -f /var/lib/apt/lists/*dl.google.com*
       - name: Install bubblewrap
         run: |
           sudo apt-get update
@@ -188,6 +198,16 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.11"
+      - name: Disable stale Google Chrome apt source
+        run: |
+          # The hosted image's unrelated Google Chrome source can serve a
+          # transiently inconsistent Packages index and abort apt entirely.
+          for source in /etc/apt/sources.list /etc/apt/sources.list.d/*; do
+            if [ -f "$source" ] && sudo grep -q "dl.google.com/linux/chrome" "$source"; then
+              sudo mv "$source" "$source.disabled"
+            fi
+          done
+          sudo rm -f /var/lib/apt/lists/*dl.google.com*
       - name: Install nftables + iproute2 + nsenter
         run: |
           sudo apt-get update
@@ -293,6 +313,16 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.11"
+      - name: Disable stale Google Chrome apt source
+        run: |
+          # The hosted image's unrelated Google Chrome source can serve a
+          # transiently inconsistent Packages index and abort apt entirely.
+          for source in /etc/apt/sources.list /etc/apt/sources.list.d/*; do
+            if [ -f "$source" ] && sudo grep -q "dl.google.com/linux/chrome" "$source"; then
+              sudo mv "$source" "$source.disabled"
+            fi
+          done
+          sudo rm -f /var/lib/apt/lists/*dl.google.com*
       - name: Install nftables + iproute2 + bubblewrap
         run: |
           sudo apt-get update
@@ -374,17 +404,6 @@ jobs:
           python -m pip install --require-hashes -r python/bootstrap-requirements.txt
           uv sync --frozen --extra test --extra browser
           echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
-      - name: Disable stale Google Chrome apt source
-        run: |
-          # Playwright installs Chromium and its Ubuntu dependencies.  The
-          # hosted image's unrelated Google Chrome source can serve a
-          # transiently inconsistent Packages index and abort apt entirely.
-          for source in /etc/apt/sources.list /etc/apt/sources.list.d/*; do
-            if [ -f "$source" ] && sudo grep -q "dl.google.com/linux/chrome" "$source"; then
-              sudo mv "$source" "$source.disabled"
-            fi
-          done
-          sudo rm -f /var/lib/apt/lists/*dl.google.com*
       - name: Download Chromium binary
         env:
           PLAYWRIGHT_BROWSERS_PATH: /opt/khaos-playwright
