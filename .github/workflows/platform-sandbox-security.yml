@@ -473,6 +473,16 @@ jobs:
           python -m pip install --require-hashes -r python/bootstrap-requirements.txt
           uv sync --frozen --extra test
           echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+      - name: Repair pinned Rust toolchain on macOS
+        if: runner.os == 'macOS'
+        run: |
+          # macOS hosted runners can expose a partially cached pinned
+          # toolchain whose cargo-clippy binary conflicts during rustup's
+          # component install. Recreate only the pinned toolchain before the
+          # locked build; keep the repository's rust-toolchain contract.
+          rustup toolchain uninstall 1.97.1 || true
+          rustup toolchain install 1.97.1 --profile minimal \
+            --component rustfmt --component clippy --no-self-update
       - name: Build native execution launcher
         run: |
           cargo build --locked --release --no-default-features \
