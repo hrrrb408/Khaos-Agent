@@ -69,7 +69,7 @@ KHAOS.md / AGENTS.md
 | Plan/change approval | `coding/planning/approval/` | `approval/schema.py`（schema/migration）+ approval runtime/store + signed receipt | plan UI、verification | 不能与普通 tool approval 静默合并；schema owner 不执行业务状态转换 |
 | Process effect | `coding/execution/service.py`、`supervisor.py` | `ExecutionService` + platform backend | terminal/test/LSP/browser | restricted backend 不可用时 fail closed，不回退 host |
 | Workspace file effect | `coding/workspace/`、file tools | `SafeWorkspaceFS` / mutation authority | patch/ChangeSet/UI | 新代码不能直接用 `Path.write_*` 替代安全 API |
-| Git effect | `coding/workspace/trusted_git.py`、`tools/git_tools.py` | `TrustedGitRunner` + authority receipt | diff/status renderers | read-only Git 也要经过受控执行上下文 |
+| Git effect | `coding/workspace/trusted_git.py`、`coding/workspace/trusted_git_locator.py`、`coding/workspace/trusted_git_policy.py`、`coding/workspace/trusted_git_preflight.py`、`tools/git_tools.py` | `TrustedGitRunner` + authority receipt；locator/policy/preflight 只负责候选、身份和运行可用性 | diff/status renderers、doctor | read-only Git 也要经过受控执行上下文；进程生命周期仍唯一归 `TrustedGitProcessOwner` |
 | Verification proof | `coding/planning/verification_*` | trusted verification authority/ledger | plan gate、audit/export | 被测代码不能写 canonical input/result |
 | Capability evaluation/metrics | `python/khaos/evaluation/` | `CapabilityEvidenceService`（coherent read snapshot）+ `CapabilityEvaluator`（纯计算）+ `CapabilityEvaluationRepository`（append-only ledger） | report/benchmark/export | 只读观察；不能写 TaskStatus、Gate、approval、verification、recovery、routing 或 prompt authority |
 | Task/workspace identity | `coding/task_manager.py`、`coding/workspace/` | Task/Workspace stores | AgentLoop、TUI、RPC | 客户端只提交引用，不能自报 owner 或 generation |

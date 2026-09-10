@@ -156,6 +156,9 @@ class SubAgentAssignment:
     created_at: str
     expires_at: str | None = None
     assignment_digest: str = ""
+    # M8.7: child extension visibility is an explicit parent-selected
+    # intersection; credentials and parent-only hooks are never inherited.
+    allowed_extension_capabilities: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.schema_version != ASSIGNMENT_SCHEMA_VERSION:
@@ -184,6 +187,10 @@ class SubAgentAssignment:
         if any(type(tool) is not str or not tool for tool in tools):
             raise ValueError("allowed_tools contains an invalid tool")
         object.__setattr__(self, "allowed_tools", tools)
+        extension_capabilities = tuple(sorted(set(self.allowed_extension_capabilities)))
+        if any(type(capability) is not str or not capability or len(capability) > 256 for capability in extension_capabilities):
+            raise ValueError("allowed_extension_capabilities contains an invalid capability")
+        object.__setattr__(self, "allowed_extension_capabilities", extension_capabilities)
         expected = canonical_digest(self._payload(include_digest=False))
         if self.assignment_digest and self.assignment_digest != expected:
             raise ValueError("assignment_digest does not match assignment")
@@ -213,6 +220,7 @@ class SubAgentAssignment:
             "plan_step_digest": self.plan_step_digest,
             "plan_operation": self.plan_operation,
             "allowed_tools": list(self.allowed_tools),
+            "allowed_extension_capabilities": list(self.allowed_extension_capabilities),
             "child_execution_principal_id": self.child_execution_principal_id,
             "child_session_id": self.child_session_id,
             "child_runtime_id": self.child_runtime_id,
@@ -232,6 +240,10 @@ class SubAgentAssignment:
     def canonical_json(self) -> str:
         return canonical_json_bytes(self.to_payload()).decode("utf-8")
 
+    def extension_capability_allowed(self, capability_id: str) -> bool:
+        """Return whether this plan-bound child may request one extension cap."""
+        return capability_id in self.allowed_extension_capabilities
+
 
 @dataclass(frozen=True, slots=True)
 class DelegatedExecutionContext:
@@ -247,6 +259,10 @@ class DelegatedExecutionContext:
     published_plan_revision_id: str
     plan_step_id: str
     execution_epoch_digest: str
+    # M8.7: extension capabilities are an explicit, parent-issued subset.
+    # The default is empty so legacy/delegated children never inherit parent
+    # MCP credentials or hooks by accident.
+    allowed_extension_capabilities: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         for name in (
@@ -260,6 +276,20 @@ class DelegatedExecutionContext:
             f"subagent:{self.task_owner_principal_id}:"
         ):
             raise ValueError("delegated child principal is not owner-bound")
+        capabilities = tuple(sorted(set(self.allowed_extension_capabilities)))
+        if len(capabilities) > 128 or any(
+            type(capability) is not str
+            or not capability
+            or "\x00" in capability
+            or len(capability) > 256
+            for capability in capabilities
+        ):
+            raise ValueError("delegated extension capability scope is invalid")
+        object.__setattr__(self, "allowed_extension_capabilities", capabilities)
+
+    def extension_capability_allowed(self, capability_id: str) -> bool:
+        """Check the explicit child extension-capability intersection."""
+        return capability_id in self.allowed_extension_capabilities
 
 
 @dataclass(frozen=True, slots=True)
@@ -483,6 +513,12 @@ def _decode_assignment(row: Any) -> SubAgentAssignment:
         raw_tools = json.loads(str(row["allowed_tools"]))
         if not isinstance(raw_tools, list):
             raise TypeError("allowed_tools is malformed")
+        raw_assignment = json.loads(str(row["assignment_json"]))
+        if not isinstance(raw_assignment, dict):
+            raise TypeError("assignment_json is malformed")
+        raw_extension_capabilities = raw_assignment.get("allowed_extension_capabilities", [])
+        if not isinstance(raw_extension_capabilities, list):
+            raise TypeError("allowed_extension_capabilities is malformed")
         assignment = SubAgentAssignment(
             schema_version=ASSIGNMENT_SCHEMA_VERSION,
             assignment_id=str(row["assignment_id"]),
@@ -514,9 +550,19 @@ def _decode_assignment(row: Any) -> SubAgentAssignment:
             created_at=str(row["created_at"]),
             expires_at=row["expires_at"],
             assignment_digest=str(row["assignment_digest"]),
+            allowed_extension_capabilities=tuple(str(item) for item in raw_extension_capabilities),
         )
-        if row["assignment_json"] != assignment.canonical_json():
-            raise ValueError("assignment canonical payload disagrees with columns")
+        stored_assignment_json = str(row["assignment_json"])
+        if stored_assignment_json != assignment.canonical_json():
+            # M8.7 adds the explicit child extension-capability intersection to
+            # the payload.  Rows written by M7.8 are still valid when that
+            # field was absent and therefore semantically means an empty set;
+            # retain the existing column/payload consistency check for every
+            # other field without rewriting legacy rows during a read.
+            legacy_payload = assignment.to_payload()
+            legacy_payload.pop("allowed_extension_capabilities", None)
+            if stored_assignment_json != canonical_json_bytes(legacy_payload).decode("utf-8"):
+                raise ValueError("assignment canonical payload disagrees with columns")
         return assignment
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise RuntimeError("malformed durable sub-agent assignment") from exc
@@ -540,13 +586,13 @@ def derive_allowed_tools(step: PlanningStep, registry: Any, policy: SubAgentPoli
     for definition in definitions:
         role = getattr(getattr(definition, "plan_tool_role", None), "value", None)
         compatible = {
-            PlanOperation.MODIFY.value: {"file_mutation"},
-            PlanOperation.CREATE.value: {"file_create"},
-            PlanOperation.DELETE.value: {"file_delete"},
-            PlanOperation.RENAME.value: {"file_rename"},
-            PlanOperation.CONFIGURE.value: {"file_mutation"},
+            PlanOperation.MODIFY.value: {"file_mutation", "file_transaction"},
+            PlanOperation.CREATE.value: {"file_create", "file_transaction"},
+            PlanOperation.DELETE.value: {"file_delete", "file_transaction"},
+            PlanOperation.RENAME.value: {"file_rename", "file_transaction"},
+            PlanOperation.CONFIGURE.value: {"file_mutation", "file_transaction"},
             PlanOperation.TEST.value: {"verification_command"},
-            PlanOperation.DOCUMENT.value: {"file_mutation"},
+            PlanOperation.DOCUMENT.value: {"file_mutation", "file_transaction"},
         }.get(step.operation.value, set())
         if role in compatible or policy.allow_supporting_reads and role == "supporting_read":
             names.append(str(definition.name))
@@ -782,6 +828,7 @@ class SubAgentControlCoordinator:
                 published_plan_revision_id=assignment.published_plan_revision_id,
                 plan_step_id=assignment.plan_step_id,
                 execution_epoch_digest=assignment.execution_epoch_digest,
+                allowed_extension_capabilities=assignment.allowed_extension_capabilities,
                 parent_workspace_manager=self.workspace_manager,
             )
             await self.spawner.spawn(task)

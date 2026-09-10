@@ -16,6 +16,7 @@ from khaos.exceptions import ToolNotFoundError
 from khaos.permissions.resource import (
     ResourceResolver,
     resolve_copy_or_move,
+    resolve_edit_transaction,
     resolve_network_origin,
     resolve_process_control,
     resolve_single_workspace_path,
@@ -29,7 +30,8 @@ from khaos.tools import schema as tool_schema
 _WORKSPACE_FILE_TOOLS = frozenset({
     "read_file", "search_files", "list_directory", "file_info", "tree_view",
     "file_search_content", "write_file", "delete_file", "patch", "multi_edit", "copy_file",
-    "move_file", "code_search", "code_symbols",
+    "move_file", "preview_edit_transaction", "apply_edit_transaction",
+    "code_search", "code_symbols",
 })
 _OFFICE_WORKSPACE_FILE_TOOLS = frozenset({
     "read_file", "search_files", "list_directory", "file_info", "tree_view",
@@ -47,6 +49,7 @@ _INJECTED_CAPABILITY_FIELDS = frozenset({
     "network_lease",
     "credential_context", "credential_lease", "credential_broker", "process_supervisor", "process_authority",
     "browser_manager", "cron_engine", "subagent_control_coordinator",
+    "edit_transaction_service", "browser_coding_service", "browser_approval",
 })
 
 
@@ -86,6 +89,7 @@ _BUILTIN_EFFECT_STATUS: dict[str, str] = {
             "git_status", "git_pr_body", "todo_read", "history_browse",
             "history_read", "cron_list", "collect_results", "subagent_status",
             "list_permission_rules", "query_audit_logs", "security_status",
+            "browser_observe",
         )
     },
     **{
@@ -93,7 +97,8 @@ _BUILTIN_EFFECT_STATUS: dict[str, str] = {
         for name in (
             "channel_enable", "channel_disable", "github_create_pr",
             "github_comment_issue", "github_request_review", "write_file", "delete_file",
-            "multi_edit", "patch", "copy_file", "move_file", "quick_note",
+            "multi_edit", "patch", "copy_file", "move_file",
+            "apply_edit_transaction", "quick_note",
             "delete_note", "clipboard_write", "sandbox_build", "git_commit",
             "git_branch", "git_status_write", "git_smart_commit", "git_undo",
             "git_create_branch", "git_push", "todo_write", "todo_update",
@@ -101,6 +106,7 @@ _BUILTIN_EFFECT_STATUS: dict[str, str] = {
             "spawn_subagent", "delegate_plan_step", "execute_plan", "grant_permission",
             "revoke_permission",
             "browser_launch", "browser_close",
+            "browser_app_open", "browser_session_close",
         )
     },
     **{
@@ -108,6 +114,7 @@ _BUILTIN_EFFECT_STATUS: dict[str, str] = {
         for name in (
             "browser_navigate", "browser_click", "browser_type",
             "browser_scroll", "browser_evaluate", "browser_file_upload",
+            "browser_action",
         )
     },
 }
@@ -118,6 +125,10 @@ class CapabilityName(str, Enum):
     FILESYSTEM_WRITE = "filesystem.write"
     PROCESS_EXECUTE = "process.execute"
     NETWORK_ACCESS = "network.access"
+    BROWSER_READ = "browser.read"
+    BROWSER_INTERACT = "browser.interact"
+    BROWSER_EFFECT = "browser.effect"
+    APP_LAUNCH = "app.launch"
     CREDENTIAL_ACCESS = "credential.access"
     VCS_READ = "vcs.read"
     VCS_WRITE = "vcs.write"
@@ -147,6 +158,7 @@ class PlanToolRole(str, Enum):
 
     SUPPORTING_READ = "supporting_read"
     FILE_MUTATION = "file_mutation"
+    FILE_TRANSACTION = "file_transaction"
     FILE_CREATE = "file_create"
     FILE_RENAME = "file_rename"
     FILE_DELETE = "file_delete"
@@ -221,6 +233,8 @@ _BUILTIN_CAPABILITY_MANIFEST: dict[str, tuple[ToolCapability, ...]] = {
     "todo_read": _capability("task.state.read", {"coding"}, {"runtime"}),
     "todo_update": _capability("task.state.write", {"coding"}, {"runtime"}),
     "delete_file": _capability("filesystem.write", {"coding"}, {"task-workspace"}),
+    "preview_edit_transaction": _capability("filesystem.read", {"coding"}, {"task-workspace"}),
+    "apply_edit_transaction": _capability("filesystem.write", {"coding"}, {"task-workspace"}),
 }
 
 # Closed reviewed compatibility table.  Names absent from this table remain
@@ -238,6 +252,8 @@ _BUILTIN_PLAN_TOOL_ROLES: dict[str, PlanToolRole] = {
     "copy_file": PlanToolRole.FILE_CREATE,
     "delete_file": PlanToolRole.FILE_DELETE,
     "move_file": PlanToolRole.FILE_RENAME,
+    "preview_edit_transaction": PlanToolRole.SUPPORTING_READ,
+    "apply_edit_transaction": PlanToolRole.FILE_TRANSACTION,
     "terminal_argv": PlanToolRole.VERIFICATION_COMMAND,
     "test_run": PlanToolRole.VERIFICATION_COMMAND,
 }
@@ -255,6 +271,8 @@ _BUILTIN_RESOURCE_RESOLVERS: dict[str, ResourceResolver] = {
     "copy_file": resolve_copy_or_move,
     "move_file": resolve_copy_or_move,
     "delete_file": resolve_single_workspace_path,
+    "preview_edit_transaction": resolve_edit_transaction,
+    "apply_edit_transaction": resolve_edit_transaction,
     "terminal_argv": resolve_terminal_argv,
     "terminal_shell": resolve_terminal_shell,
     "terminal": resolve_terminal_shell,
@@ -275,6 +293,9 @@ _BUILTIN_RESOURCE_RESOLVERS: dict[str, ResourceResolver] = {
         "browser_type", "browser_evaluate",
     )},
     "browser_file_upload": resolve_single_workspace_path,
+    **{name: resolve_workspace_root for name in (
+        "browser_app_open", "browser_observe", "browser_action", "browser_session_close",
+    )},
 }
 
 
@@ -834,6 +855,27 @@ class ToolInvocationBroker:
                 service = context.get("execution_service")
                 if service is None:
                     raise PermissionError("process.execute requires ExecutionService")
+            if capability.name.startswith("browser.") or capability.name == "app.launch":
+                service = context.get("browser_coding_service")
+                if service is None:
+                    raise PermissionError(
+                        f"{capability.name} requires BrowserCodingService"
+                    )
+                if mode != "coding":
+                    raise PermissionError("Coding browser authority is unavailable outside coding mode")
+            if (
+                name == "browser_action"
+                and params.get("credential_name")
+                and (
+                    context.get("credential_broker") is None
+                    or context.get(
+                        "credential_lease", context.get("credential_context")
+                    ) is None
+                )
+            ):
+                raise PermissionError(
+                    "credential browser action requires an injected credential lease"
+                )
             if (
                 capability.name == "filesystem.write"
                 and mode == "coding"
@@ -945,6 +987,28 @@ class ToolInvocationBroker:
             )
         if name == "browser_close":
             handler_params["browser_manager"] = context.get("browser_manager")
+        if any(
+            capability.name.startswith("browser.") or capability.name == "app.launch"
+            for capability in capabilities
+        ):
+            handler_params["browser_coding_service"] = context.get(
+                "browser_coding_service"
+            )
+            handler_params["principal_id"] = context.get("principal_id", "")
+            handler_params["project_id"] = context.get("project_id", "")
+            handler_params["runtime_id"] = context.get("runtime_id", "")
+            handler_params["task_id"] = context.get("task_id", "")
+            handler_params["workspace_id"] = context.get("workspace_id", "")
+            handler_params["workspace_generation"] = context.get(
+                "workspace_generation", 0
+            )
+            handler_params["workspace_manager"] = context.get("workspace_manager")
+            if name == "browser_action":
+                handler_params["browser_approval"] = context.get("browser_approval")
+                handler_params["credential_lease"] = context.get(
+                    "credential_lease", context.get("credential_context")
+                )
+                handler_params["credential_broker"] = context.get("credential_broker")
         if any(capability.name in {"remote.write", "remote.destructive-write"} for capability in capabilities):
             handler_params["approval_context"] = context.get("approval_context")
             handler_params["principal_id"] = context.get("principal_id")
@@ -1065,6 +1129,17 @@ class ToolInvocationBroker:
             handler_params["workspace_manager"] = context.get("workspace_manager")
             handler_params["task_id"] = context.get("task_id")
             handler_params["workspace_id"] = context.get("workspace_id")
+            if name in {"code_search", "code_symbols"}:
+                handler_params["repo_intelligence"] = context.get("repo_intelligence")
+                handler_params["principal_id"] = context.get("principal_id", "")
+                handler_params["project_id"] = context.get("project_id", "")
+            if name in {"preview_edit_transaction", "apply_edit_transaction"}:
+                handler_params["edit_transaction_service"] = context.get(
+                    "edit_transaction_service"
+                )
+                handler_params["principal_id"] = context.get("principal_id", "")
+                handler_params["project_id"] = context.get("project_id", "")
+                handler_params["runtime_id"] = context.get("runtime_id", "")
         if mode == "office" and name in _OFFICE_WORKSPACE_FILE_TOOLS:
             workspace_root = context.get("office_workspace_root")
             if workspace_root is None:
@@ -1166,6 +1241,68 @@ HISTORY_TOOL_SPECS = [
         },
     },
 ]
+
+
+def _edit_transaction_parameters() -> dict[str, Any]:
+    """Return the closed model-visible schema for one edit transaction."""
+    text_edit = {
+        "type": "object",
+        "properties": {
+            "start": {"type": "integer", "minimum": 0},
+            "end": {"type": "integer", "minimum": 0},
+            "replacement": {
+                "type": "string",
+                "maxLength": 16 * 1024 * 1024,
+            },
+        },
+        "required": ["start", "end", "replacement"],
+        "additionalProperties": False,
+        "maxProperties": 3,
+    }
+    operation = {
+        "type": "object",
+        "properties": {
+            "operation": {
+                "type": "string",
+                "enum": ["create", "update", "delete", "rename"],
+            },
+            "path": {"type": "string", "maxLength": 4096},
+            "destination_path": {"type": "string", "maxLength": 4096},
+            "expected_exists": {"type": "boolean"},
+            "expected_digest": {"type": "string", "maxLength": 64},
+            "content": {
+                "type": "string",
+                "maxLength": 16 * 1024 * 1024,
+            },
+            "text_edits": {
+                "type": "array",
+                "items": text_edit,
+                "minItems": 0,
+                "maxItems": 256,
+            },
+        },
+        "required": ["operation", "path"],
+        "additionalProperties": False,
+        "maxProperties": 7,
+    }
+    return {
+        "type": "object",
+        "properties": {
+            "transaction_id": {"type": "string", "maxLength": 128},
+            "base_generation": {"type": "integer", "minimum": 1},
+            "operations": {
+                "type": "array",
+                "items": operation,
+                "minItems": 1,
+                "maxItems": 64,
+            },
+            "expected_workspace_digest": {"type": "string", "maxLength": 64},
+            "intent": {"type": "string", "maxLength": 512},
+        },
+        "required": ["transaction_id", "base_generation", "operations"],
+        "additionalProperties": False,
+        "maxProperties": 5,
+    }
 
 
 def register_builtin_tools(registry: ToolRegistry) -> None:
@@ -1331,6 +1468,48 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
             modes=["coding"],
             permission_level="write",
             parallel=False,
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="preview_edit_transaction",
+            description=(
+                "Preview a bounded multi-file edit against the active workspace "
+                "generation and return a deterministic diff."
+            ),
+            parameters=_edit_transaction_parameters(),
+            modes=["coding"],
+            permission_level="read",
+            parallel=False,
+            capabilities=_capability(
+                "filesystem.read",
+                {"coding"},
+                {"task-workspace"},
+            ),
+            resource_resolver=resolve_edit_transaction,
+            effect_status=_EFFECT_NOT_APPLIED,
+            plan_tool_role=PlanToolRole.SUPPORTING_READ,
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="apply_edit_transaction",
+            description=(
+                "Apply a generation-bound multi-file edit with precondition "
+                "validation, atomic publish, verification, and rollback."
+            ),
+            parameters=_edit_transaction_parameters(),
+            modes=["coding"],
+            permission_level="write",
+            parallel=False,
+            capabilities=_capability(
+                "filesystem.write",
+                {"coding"},
+                {"task-workspace"},
+            ),
+            resource_resolver=resolve_edit_transaction,
+            effect_status=_EFFECT_APPLIED,
+            plan_tool_role=PlanToolRole.FILE_TRANSACTION,
         )
     )
     registry.register(
@@ -2226,6 +2405,117 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
                 capabilities=capabilities,
             )
         )
+    # ── M8.8 Coding browser/app tools ──
+    # These are deliberately separate from the legacy Phase-6 browser tools.
+    # The model receives typed semantic actions and bounded observations, not
+    # a Page object, arbitrary JavaScript, or an app argv/cwd.
+    _CODING_BROWSER_MODES = frozenset({"coding"})
+    _BROWSER_ACTION_KINDS = [
+        "navigate", "click", "type", "select", "press_key", "scroll",
+        "wait_for", "read", "screenshot", "upload", "download", "close",
+        "open_new_page",
+    ]
+    _BROWSER_EFFECT_CLASSES = [
+        "read-only", "local-navigation", "ui-input", "form-submit", "upload",
+        "download", "external-write", "destructive-write", "unknown",
+    ]
+    _CODING_BROWSER_CAP = ToolCapability(
+        "browser.read", _CODING_BROWSER_MODES, frozenset({"task-workspace"})
+    )
+    _CODING_BROWSER_INTERACT_CAP = ToolCapability(
+        "browser.interact", _CODING_BROWSER_MODES, frozenset({"task-workspace"})
+    )
+    _CODING_BROWSER_EFFECT_CAP = ToolCapability(
+        "browser.effect", _CODING_BROWSER_MODES, frozenset({"task-workspace"})
+    )
+    _APP_LAUNCH_CAP = ToolCapability(
+        "app.launch", _CODING_BROWSER_MODES, frozenset({"task-workspace"})
+    )
+    registry.register(
+        ToolDefinition(
+            name="browser_app_open",
+            description="Open a trusted task-owned development app profile and bind a real browser session.",
+            parameters={
+                "type": "object",
+                "properties": {"profile_id": {"type": "string", "maxLength": 256}},
+                "required": ["profile_id"],
+                "additionalProperties": False,
+                "maxProperties": 1,
+            },
+            modes=["coding"],
+            permission_level="write",
+            parallel=False,
+            capabilities=(
+                ToolCapability("process.execute", _CODING_BROWSER_MODES, frozenset({"task-workspace"})),
+                _APP_LAUNCH_CAP,
+            ),
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="browser_observe",
+            description="Read a bounded semantic observation from a bound Coding browser session.",
+            parameters={
+                "type": "object",
+                "properties": {"session_id": {"type": "string", "maxLength": 256}},
+                "required": ["session_id"],
+                "additionalProperties": False,
+                "maxProperties": 1,
+            },
+            modes=["coding"],
+            permission_level="read",
+            parallel=False,
+            capabilities=(_CODING_BROWSER_CAP,),
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="browser_action",
+            description="Perform one typed semantic browser action; arbitrary JavaScript and coordinates are unavailable.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "action_id": {"type": "string", "maxLength": 256},
+                    "session_id": {"type": "string", "maxLength": 256},
+                    "sequence": {"type": "integer", "minimum": 1, "maximum": 10000},
+                    "kind": {"type": "string", "enum": _BROWSER_ACTION_KINDS},
+                    "effect_class": {"type": "string", "enum": _BROWSER_EFFECT_CLASSES},
+                    "selector": {"type": "string", "maxLength": 1024},
+                    "value": {"type": "string", "maxLength": 4096},
+                    "target_url": {"type": "string", "maxLength": 2048},
+                    "key": {"type": "string", "maxLength": 128},
+                    "wait_for": {"type": "string", "maxLength": 1024},
+                    "file_path": {"type": "string", "maxLength": 2048},
+                    "precondition_digest": {"type": "string", "maxLength": 64},
+                    "credential_name": {"type": "string", "maxLength": 256},
+                },
+                "required": ["action_id", "session_id", "sequence", "kind", "effect_class"],
+                "additionalProperties": False,
+                "maxProperties": 14,
+            },
+            modes=["coding"],
+            permission_level="write",
+            parallel=False,
+            capabilities=(_CODING_BROWSER_INTERACT_CAP, _CODING_BROWSER_EFFECT_CAP),
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="browser_session_close",
+            description="Close a task-owned Coding browser session and release its page context.",
+            parameters={
+                "type": "object",
+                "properties": {"session_id": {"type": "string", "maxLength": 256}},
+                "required": ["session_id"],
+                "additionalProperties": False,
+                "maxProperties": 1,
+            },
+            modes=["coding"],
+            permission_level="write",
+            parallel=False,
+            capabilities=(_CODING_BROWSER_EFFECT_CAP,),
+        )
+    )
     # ── Phase 6 web content tools (HTML→Markdown, tables, metadata) ──
     _WEB_NETWORK_CAP = ToolCapability(
         "network.access",
@@ -2284,7 +2574,7 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
     registry.register(
         ToolDefinition(
             name="code_search",
-            description="Search code files for text.",
+            description="Search the workspace repository index semantically, with bounded lexical fallback.",
             parameters={
                 "type": "object",
                 "properties": {
@@ -2292,6 +2582,7 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
                     "query": {"type": "string"},
                     "glob": {"type": "string"},
                     "limit": {"type": "integer"},
+                    "language": {"type": "string"},
                 },
                 "required": ["query"],
             },
@@ -2303,7 +2594,7 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
     registry.register(
         ToolDefinition(
             name="code_symbols",
-            description="Extract symbols from a Python source file.",
+            description="Extract repository-indexed symbols from a supported source file.",
             parameters={
                 "type": "object",
                 "properties": {"path": {"type": "string"}},
@@ -2668,6 +2959,7 @@ def create_runtime_registry() -> ToolRegistry:
     binds approval contracts to the specific implementation that will
     execute the tool.
     """
+    from khaos.coding.browser import tools as coding_browser_tools
     from khaos.tools import (
         browser_tools,
         channel_tools,
@@ -2723,6 +3015,16 @@ def create_runtime_registry() -> ToolRegistry:
     _bind("delete_file", file_tools.delete_file, "khaos.tools.file_tools")
     _bind("patch", file_tools.patch, "khaos.tools.file_tools")
     _bind("multi_edit", file_tools.multi_edit, "khaos.tools.file_tools")
+    _bind(
+        "preview_edit_transaction",
+        file_tools.preview_edit_transaction,
+        "khaos.tools.file_tools",
+    )
+    _bind(
+        "apply_edit_transaction",
+        file_tools.apply_edit_transaction,
+        "khaos.tools.file_tools",
+    )
     _bind("search_files", file_tools.search_files, "khaos.tools.file_tools")
     _bind("list_directory", file_tools.list_directory, "khaos.tools.file_tools")
     _bind("file_info", file_tools.file_info, "khaos.tools.file_tools")
@@ -2768,6 +3070,26 @@ def create_runtime_registry() -> ToolRegistry:
     _bind("browser_vision", browser_tools.browser_vision, "khaos.tools.browser_tools")
     _bind("browser_evaluate", browser_tools.browser_evaluate, "khaos.tools.browser_tools")
     _bind("browser_file_upload", browser_tools.browser_file_upload, "khaos.tools.browser_tools")
+    _bind(
+        "browser_app_open",
+        coding_browser_tools.browser_app_open,
+        "khaos.coding.browser.tools",
+    )
+    _bind(
+        "browser_observe",
+        coding_browser_tools.browser_observe,
+        "khaos.coding.browser.tools",
+    )
+    _bind(
+        "browser_action",
+        coding_browser_tools.browser_action,
+        "khaos.coding.browser.tools",
+    )
+    _bind(
+        "browser_session_close",
+        coding_browser_tools.browser_session_close,
+        "khaos.coding.browser.tools",
+    )
     # Phase 6 web content tools
     _bind("web_fetch", web_tools.web_fetch, "khaos.tools.web_tools")
     _bind("web_extract_tables", web_tools.web_extract_tables, "khaos.tools.web_tools")

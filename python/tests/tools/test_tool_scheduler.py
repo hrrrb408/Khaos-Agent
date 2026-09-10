@@ -1155,6 +1155,59 @@ async def test_scheduler_replays_explicit_idempotency_key_without_reinvoking_han
     await db.close()
 
 
+async def test_edit_transaction_idempotency_survives_new_tool_call_and_retry(tmp_path):
+    db = Database(tmp_path / "edit-transaction-idempotency.db")
+    await db.connect()
+    await db.run_migrations()
+    scheduler = ToolScheduler(
+        _effect_registry(_ok, name="apply_edit_transaction"),
+        PermissionEngine(db, default_mode=ApprovalMode.AUTO_APPROVE),
+    )
+    context = {
+        "principal_id": "principal",
+        "project_id": "project",
+        "task_id": "task",
+        "workspace_id": "workspace",
+    }
+    first = scheduler.bind_server_operation_key(
+        {
+            "id": "call-1",
+            "name": "apply_edit_transaction",
+            "arguments": {"transaction_id": "tx-1", "content": "first"},
+        },
+        session_id="session",
+        turn_id="turn-1",
+        attempt_id="attempt-1",
+        tool_context=context,
+    )
+    retry = scheduler.bind_server_operation_key(
+        {
+            "id": "call-2",
+            "name": "apply_edit_transaction",
+            "arguments": {"transaction_id": "tx-1", "content": "first"},
+        },
+        session_id="session",
+        turn_id="turn-2",
+        attempt_id="attempt-2",
+        tool_context=context,
+    )
+    conflicting = scheduler.bind_server_operation_key(
+        {
+            "id": "call-3",
+            "name": "apply_edit_transaction",
+            "arguments": {"transaction_id": "tx-1", "content": "different"},
+        },
+        session_id="session",
+        turn_id="turn-3",
+        attempt_id="attempt-3",
+        tool_context=context,
+    )
+
+    assert first["_idempotency_key"] == retry["_idempotency_key"]
+    assert first["_idempotency_key"] == conflicting["_idempotency_key"]
+    await db.close()
+
+
 async def test_scheduler_serializes_concurrent_idempotent_dispatches(tmp_path):
     calls = 0
     started = asyncio.Event()

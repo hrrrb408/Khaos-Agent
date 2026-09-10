@@ -212,15 +212,27 @@ def resolve_go_references(
     return results
 
 
-def read_go_module_path(root: Path | None) -> str | None:
+def read_go_module_path(
+    root: Path | None,
+    *,
+    source_reader: Any | None = None,
+) -> str | None:
     """Read the module path from go.mod. Returns None if not found."""
     if root is None:
         return None
-    go_mod = root / "go.mod"
-    if not go_mod.is_file():
-        return None
     try:
-        for line in go_mod.read_text(encoding="utf-8").splitlines():
+        if source_reader is None:
+            go_mod = root / "go.mod"
+            if not go_mod.is_file():
+                return None
+            content = go_mod.read_text(encoding="utf-8")
+        else:
+            content = source_reader.read_bytes(
+                root,
+                "go.mod",
+                max_bytes=64 * 1024,
+            ).decode("utf-8")
+        for line in content.splitlines():
             if line.startswith("module "):
                 return line.split(None, 1)[1].strip()
     except (OSError, UnicodeDecodeError):

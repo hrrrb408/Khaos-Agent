@@ -143,7 +143,10 @@ class SkillLoader:
             raise SkillParseError(
                 f"{path}: secure open failed: Windows no-follow handle support is unavailable"
             )
-        flags = os.O_RDONLY
+        # Binary mode is required on Windows: CRT text mode would translate
+        # CRLF and treat 0x1A as EOF, corrupting the bytes used by the
+        # extension/package digest boundary.
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         try:
@@ -205,6 +208,21 @@ class SkillLoader:
         if not isinstance(raw_triggers, list):
             raise SkillParseError(f"{path}: 'triggers' must be a list")
 
+        version = str(data.get("version", "1")).strip() or "1"
+        skill_id = str(data.get("skill_id", name)).strip() or name
+        required_tools = data.get("required_tools", []) or []
+        optional_tools = data.get("optional_tools", []) or []
+        applicable_paths = data.get("applicable_paths", []) or []
+        applicable_languages = data.get("applicable_languages", []) or []
+        for label, values in (
+            ("required_tools", required_tools),
+            ("optional_tools", optional_tools),
+            ("applicable_paths", applicable_paths),
+            ("applicable_languages", applicable_languages),
+        ):
+            if not isinstance(values, list):
+                raise SkillParseError(f"{path}: '{label}' must be a list")
+
         body = body.strip()
         if len(body) > MAX_SKILL_BODY_CHARS:
             raise SkillParseError(f"{path}: skill body exceeds prompt budget")
@@ -216,6 +234,12 @@ class SkillLoader:
             body=body,
             path=Path(path),
             trust_tier=trust_tier,
+            version=version,
+            skill_id=skill_id,
+            required_tools=tuple(str(value) for value in required_tools),
+            optional_tools=tuple(str(value) for value in optional_tools),
+            applicable_paths=tuple(str(value) for value in applicable_paths),
+            applicable_languages=tuple(str(value) for value in applicable_languages),
         )
 
     @staticmethod

@@ -29,8 +29,11 @@ from khaos.coding.intelligence.lsp.uri import (
     WorkspaceEscapeError,
     map_lsp_uri_to_workspace_path,
 )
+from khaos.coding.workspace.boundary import SafeWorkspaceFS, WorkspaceBoundaryError
 
 logger = logging.getLogger(__name__)
+
+_MAX_DOCUMENT_BYTES = 2 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -111,10 +114,29 @@ class DiskWorkspaceDocumentProvider:
             )
             return None
 
-        # Read the file content from disk (async to avoid blocking).
+        # Read through the same dirfd/no-follow capability as the coding file
+        # tools.  The URI mapping above is a lexical/boundary check; it is not
+        # a safe authority for the subsequent read and must not be followed by
+        # ``Path.read_bytes`` across a symlink replacement race.
         try:
-            content = await asyncio.to_thread(absolute.read_bytes)
-        except (OSError, UnicodeError):
+            root = workspace_root.expanduser().resolve(strict=True)
+            with SafeWorkspaceFS(root) as filesystem:
+                relative = filesystem.relative(validated_path)
+                before = filesystem.stat(relative)
+                content = await asyncio.to_thread(
+                    filesystem.read_bytes,
+                    relative,
+                    max_bytes=_MAX_DOCUMENT_BYTES,
+                )
+                after = filesystem.stat(relative)
+            if (
+                len(content) != int(before.st_size)
+                or (before.st_dev, before.st_ino, before.st_mtime_ns, before.st_size)
+                != (after.st_dev, after.st_ino, after.st_mtime_ns, after.st_size)
+            ):
+                logger.debug("Document load rejected (source changed): %s", file_path)
+                return None
+        except (OSError, UnicodeError, WorkspaceBoundaryError):
             logger.debug("Document load failed (read error): %s", file_path)
             return None
 

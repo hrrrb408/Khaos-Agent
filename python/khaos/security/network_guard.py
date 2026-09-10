@@ -31,6 +31,7 @@ import logging
 import re
 import shlex
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 from khaos.security.host_network import (
     HostNetworkAuthority,
@@ -209,6 +210,12 @@ class NetworkGuard:
         # can use an isolated loopback HTTP server without weakening the
         # production authority's public-address-only policy.
         self._host_authority = host_authority or HostNetworkAuthority()
+        # Coding app listeners are not general network access.  They are
+        # exact task-owned loopback endpoints declared by BrowserCodingService
+        # before a BrowserContext is admitted.  Keep this separate from the
+        # public-domain allowlist so ``network_enabled=False`` remains the
+        # default for all other destinations.
+        self._local_service_endpoints: frozenset[tuple[str, int]] = frozenset()
 
     @property
     def allowed_domains(self) -> frozenset[str] | None:
@@ -221,6 +228,32 @@ class NetworkGuard:
     def blocked_domains(self) -> frozenset[str]:
         """Return the compiled blocklist without exposing mutable state."""
         return frozenset(self._blocked)
+
+    def bind_local_service_endpoint(self, host: str, port: int) -> None:
+        """Authorize one exact task-owned ``127.0.0.1:<port>`` endpoint.
+
+        This does not enable outbound network access and does not authorize a
+        hostname, wildcard, private address, or arbitrary localhost port.
+        """
+        if host != "127.0.0.1" or type(port) is not int or not 1 <= port <= 65535:
+            raise ValueError("local service endpoint must be 127.0.0.1:<port>")
+        self._local_service_endpoints = frozenset(
+            (*self._local_service_endpoints, (host, port))
+        )
+
+    def unbind_local_service_endpoint(self, host: str, port: int) -> None:
+        """Revoke one exact task-owned loopback endpoint."""
+        if host != "127.0.0.1" or type(port) is not int or not 1 <= port <= 65535:
+            raise ValueError("local service endpoint must be 127.0.0.1:<port>")
+        endpoint = (host, port)
+        self._local_service_endpoints = frozenset(
+            value for value in self._local_service_endpoints if value != endpoint
+        )
+
+    @property
+    def local_service_endpoints(self) -> frozenset[tuple[str, int]]:
+        """Return the exact loopback endpoints admitted for local apps."""
+        return self._local_service_endpoints
 
     async def check_resolved_url(self, url: str) -> NetworkCheckResult:
         """Apply domain policy and reject URLs resolving to special-use IPs."""
@@ -249,6 +282,18 @@ class NetworkGuard:
         Redirect transports must call this for every hop so the effective
         domain policy and DNS/IP policy cannot drift apart.
         """
+        local_target = self._local_target(url)
+        if local_target is not None:
+            # Blocked domains retain precedence even for a declared endpoint.
+            if any(
+                local_target.hostname == blocked
+                or local_target.hostname.endswith(f".{blocked}")
+                for blocked in self._blocked
+            ):
+                raise HostNetworkDeniedError("local service endpoint is blocked by policy")
+            if previous_scheme == "https" and local_target.parsed.scheme == "http":
+                raise HostNetworkDeniedError("HTTPS redirect downgrade is not allowed")
+            return local_target
         domain_result = self._check_url(url)
         if not domain_result.allowed:
             raise HostNetworkDeniedError(domain_result.reason)
@@ -256,6 +301,36 @@ class NetworkGuard:
             url,
             previous_scheme=previous_scheme,
             allowed_schemes=frozenset({"http", "https", "ws", "wss"}),
+        )
+
+    def _local_target(self, url: str) -> ValidatedTarget | None:
+        """Return a no-DNS target only for an exact bound loopback endpoint."""
+        try:
+            parsed = urlparse(url)
+            scheme = parsed.scheme.lower()
+            host = (parsed.hostname or "").strip().casefold()
+            parsed_port = parsed.port
+            port = (
+                parsed_port
+                if parsed_port is not None
+                else (443 if scheme in {"https", "wss"} else 80)
+            )
+        except ValueError:
+            return None
+        if (
+            scheme not in {"http", "https", "ws", "wss"}
+            or parsed.username is not None
+            or parsed.password is not None
+            or host != "127.0.0.1"
+            or not 1 <= port <= 65535
+            or (host, port) not in self._local_service_endpoints
+        ):
+            return None
+        return ValidatedTarget(
+            url=url,
+            parsed=parsed,
+            hostname=host,
+            addresses=(host,),
         )
 
     def check_tool(self, tool_name: str, arguments: dict) -> NetworkCheckResult:

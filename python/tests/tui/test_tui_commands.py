@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-import pytest
+from types import SimpleNamespace
 
+import pytest
 from khaos.db import Database
 from khaos.memory import Memory, MemoryScope, MemoryStore, SqliteMemoryRepository
 from khaos.modes import Mode, ModeManager
 from khaos.routing.router import create_default_router
 from khaos.skills import Skill, SkillManager, SkillRegistry
+from khaos.supervision.service import TaskSupervisionService
 from khaos.tui.commands import TuiContext, handle_command, is_command
 
 
@@ -137,3 +139,33 @@ async def test_non_command_not_handled(tmp_path):
     result = await handle_command("hello there", ctx)
 
     assert result.handled is False
+
+
+@pytest.mark.asyncio
+async def test_m8_6_status_and_control_commands_use_typed_owner(tmp_path):
+    supervision = TaskSupervisionService((ctx := await _ctx(tmp_path)).db)
+    await supervision.start_task(
+        task_id="task-ux", workspace_id="workspace-ux",
+        principal_id="principal-a", project_id="project-a", goal="ux",
+    )
+
+    class _TaskManager:
+        async def get(self, task_id):
+            if task_id != "task-ux":
+                return None
+            return SimpleNamespace(metadata={"workspace_id": "workspace-ux"})
+
+    ctx.supervision_service = supervision
+    ctx.task_manager = _TaskManager()
+    ctx.principal_id = "principal-a"
+    ctx.project_id = "project-a"
+
+    status = await handle_command("/status task-ux", ctx)
+    paused = await handle_command("/pause task-ux", ctx)
+    resumed = await handle_command("/resume task-ux", ctx)
+
+    assert status.payload["status"] == "PLANNING"
+    assert paused.payload["status"] == "APPLIED"
+    assert paused.payload["control_state"] == "PAUSED"
+    assert resumed.payload["control_state"] == "RUNNING"
+    assert "source" not in status.payload

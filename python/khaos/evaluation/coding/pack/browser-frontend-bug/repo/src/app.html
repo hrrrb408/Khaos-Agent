@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Task editor</title>
+  </head>
+  <body>
+    <main>
+      <h1>Task editor</h1>
+      <button id="save-button" type="button">Save</button>
+      <p id="status" role="status" aria-live="polite">Not saved</p>
+    </main>
+    <script>
+      const status = document.querySelector("#status");
+      document.querySelector("#save").addEventListener("click", () => {
+        status.textContent = "Saved";
+      });
+    </script>
+  </body>
+</html>

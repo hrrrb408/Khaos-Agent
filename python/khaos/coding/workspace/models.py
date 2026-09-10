@@ -75,6 +75,17 @@ class TaskWorkspace:
     change_artifact_bytes: int = field(default=0, repr=False)
     change_artifact_reservations: int = field(default=0, repr=False)
     git_cleanup_complete: bool = field(default=False, repr=False)
+    # ``base_sha`` remains the immutable logical base of the ChangeSet
+    # protocol.  ``head_sha`` tracks the branch head after a controlled
+    # commit so cleanup can delete the task ref with a correct CAS value.
+    head_sha: str | None = field(default=None, repr=False)
+    # WorkspaceManager-owned metadata binds each live artifact to the exact
+    # paths captured while the artifact was generated.  Merge coordination
+    # uses this to reject a result that names another child artifact or lies
+    # about the paths represented by the artifact.
+    change_artifact_files: dict[Path, tuple[str, ...]] = field(
+        default_factory=dict, repr=False
+    )
     _authority_sealed: bool = field(default=False, init=False, repr=False)
 
     _IMMUTABLE_AUTHORITY_FIELDS = frozenset(
@@ -95,6 +106,8 @@ class TaskWorkspace:
     def __post_init__(self) -> None:
         if self.authority_generation <= 0:
             raise ValueError("workspace authority generation must be positive")
+        if self.head_sha is None:
+            self.head_sha = self.base_sha
         object.__setattr__(self, "_authority_sealed", True)
 
     def __setattr__(self, name: str, value: object) -> None:

@@ -17,12 +17,17 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import os
+from collections import OrderedDict
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 VALID_NAMES = frozenset({"KHAOS.md", "AGENTS.md", "khaos.md", "agents.md"})
+VALID_NAME_ORDER = ("KHAOS.md", "AGENTS.md", "khaos.md", "agents.md")
+MAX_INSTRUCTION_BYTES = 128 * 1024
 
 # Directories that never carry meaningful project instructions and may be
 # large — skip them during subdirectory scans.
@@ -56,6 +61,7 @@ class ProjectContextLoader:
             Path(project_root).expanduser().resolve() if project_root else None
         )
         self._cache: dict[str, str] = {}
+        self._resolve_cache: OrderedDict[str, str] = OrderedDict()
         self._loaded = False
 
     def load(self) -> str:
@@ -93,6 +99,7 @@ class ProjectContextLoader:
     def reload(self) -> str:
         """清除缓存并重新加载。"""
         self._cache.clear()
+        self._resolve_cache.clear()
         self._loaded = False
         return self.load()
 
@@ -105,14 +112,10 @@ class ProjectContextLoader:
         home = Path.home()
         current = project_root
         while True:
-            for name in VALID_NAMES:
+            for name in VALID_NAME_ORDER:
                 candidate = current / name
-                if candidate.is_file():
-                    try:
-                        content = candidate.read_text(encoding="utf-8")
-                    except OSError as exc:
-                        logger.warning("Failed to read %s: %s", candidate, exc)
-                        continue
+                content = self._read_instruction(candidate)
+                if content is not None:
                     return content
 
             # Stop at home (do not read home-level files) or filesystem root.
@@ -143,14 +146,10 @@ class ProjectContextLoader:
             # 跳过版本控制、构建产物、隐藏目录等。
             if entry.name in SKIP_DIRS or entry.name.startswith("."):
                 continue
-            for name in VALID_NAMES:
+            for name in VALID_NAME_ORDER:
                 candidate = entry / name
-                if candidate.is_file():
-                    try:
-                        content = candidate.read_text(encoding="utf-8")
-                    except OSError as exc:
-                        logger.warning("Failed to read %s: %s", candidate, exc)
-                        break
+                content = self._read_instruction(candidate)
+                if content is not None:
                     rel = entry.relative_to(project_root)
                     results.append((str(rel), content))
                     break  # 每个目录只读一个文件
@@ -169,3 +168,145 @@ class ProjectContextLoader:
                 continue
             parts.append(content)
         return "\n\n".join(parts)
+
+    def resolve(self, path: str | Path | None = None) -> str:
+        """Resolve instructions from the project root to one scoped path.
+
+        ``load()`` intentionally keeps its historical shallow, whole-project
+        projection for compatibility.  New context-engine callers use this
+        method so only the root-to-target chain is included; sibling module
+        instructions never leak into the current step.
+        """
+
+        if self.project_root is None or not self.project_root.is_dir():
+            return ""
+        target = self._safe_target(path)
+        if target is None:
+            return ""
+        root_contexts = self._find_root_context_files(self.project_root)
+        root_paths = {candidate for candidate, _ in root_contexts}
+        instruction_records = list(root_contexts)
+        parts: list[str] = []
+        parts.extend(content for _, content in root_contexts)
+        try:
+            relative = target.relative_to(self.project_root)
+        except ValueError:
+            return ""
+        directories = [self.project_root]
+        current = self.project_root
+        for component in relative.parts:
+            current = current / component
+            if current.is_file():
+                current = current.parent
+                break
+            directories.append(current)
+        for directory in directories:
+            for name in VALID_NAME_ORDER:
+                candidate = directory / name
+                content = self._read_instruction(candidate)
+                if content is None or candidate in root_paths:
+                    continue
+                instruction_records.append((candidate, content))
+                if content in parts:
+                    continue
+                parts.append(content)
+        resolved = "\n\n".join(parts)
+        cache_key = self._resolve_cache_key(target, instruction_records)
+        cached = self._resolve_cache.get(cache_key)
+        if cached is not None:
+            self._resolve_cache.move_to_end(cache_key)
+            return cached
+        self._resolve_cache[cache_key] = resolved
+        self._resolve_cache.move_to_end(cache_key)
+        while len(self._resolve_cache) > 128:
+            self._resolve_cache.popitem(last=False)
+        return resolved
+
+    def _resolve_cache_key(
+        self,
+        target: Path,
+        records: list[tuple[Path, str]],
+    ) -> str:
+        """Bind scoped instruction cache entries to project/path/content."""
+
+        return hashlib.sha256(
+            repr(
+                (
+                    str(self.project_root),
+                    str(target),
+                    tuple(
+                        (str(path), hashlib.sha256(content.encode("utf-8")).hexdigest())
+                        for path, content in records
+                    ),
+                )
+            ).encode("utf-8")
+        ).hexdigest()
+
+    def _find_root_context_files(self, project_root: Path) -> list[tuple[Path, str]]:
+        """Return all supported root instruction files from the nearest scope."""
+
+        home = Path.home()
+        current = project_root
+        while True:
+            matches: list[tuple[Path, str]] = []
+            for name in VALID_NAME_ORDER:
+                candidate = current / name
+                content = self._read_instruction(candidate)
+                if content is not None:
+                    matches.append((candidate, content))
+            if matches:
+                return matches
+            if current == home or current == current.parent:
+                break
+            current = current.parent
+        return []
+
+    def _safe_target(self, path: str | Path | None) -> Path | None:
+        """Resolve a target without allowing symlink/path escape."""
+
+        root_path = self.project_root
+        if root_path is None:
+            return None
+        if path is None:
+            return root_path
+        candidate = Path(path).expanduser()
+        if not candidate.is_absolute():
+            candidate = root_path / candidate
+        try:
+            target = candidate.resolve(strict=False)
+            root = root_path.resolve(strict=True)
+            if os.path.commonpath((str(root), str(target))) != str(root):
+                return None
+            return target
+        except (OSError, ValueError):
+            return None
+
+    @staticmethod
+    def _read_instruction(candidate: Path) -> str | None:
+        if candidate.name not in VALID_NAMES or candidate.is_symlink() or not candidate.is_file():
+            return None
+        try:
+            size = candidate.stat().st_size
+            if size > MAX_INSTRUCTION_BYTES:
+                logger.warning("Project instruction exceeds bound: %s", candidate)
+                return None
+            return candidate.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            logger.warning("Failed to read %s: %s", candidate, exc)
+            return None
+
+
+class InstructionResolver:
+    """Small adapter used by Context Engine and direct callers."""
+
+    def __init__(self, loader_or_root: ProjectContextLoader | str | Path | None = None):
+        self.loader = (
+            loader_or_root
+            if isinstance(loader_or_root, ProjectContextLoader)
+            else ProjectContextLoader(loader_or_root)
+        )
+
+    def resolve(self, path: str | Path | None = None) -> str:
+        """Return root-to-target scoped instructions."""
+
+        return self.loader.resolve(path)

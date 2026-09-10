@@ -66,6 +66,7 @@ class ResolutionService:
         changed_paths: set[str] | None = None,
         deleted_paths: set[str] | None = None,
         full_rebuild: bool = False,
+        source_reader: Any | None = None,
     ) -> RepositoryResolutionReport:
         """Resolve semantic edges for the repository.
 
@@ -89,7 +90,7 @@ class ResolutionService:
             from khaos.coding.intelligence.resolution.go_resolver import (
                 read_go_module_path,
             )
-            go_module_path = read_go_module_path(root)
+            go_module_path = read_go_module_path(root, source_reader=source_reader)
 
         # Determine which files to resolve
         if full_rebuild:

@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = pytest.mark.posix_host
+pytestmark = [pytest.mark.posix_host, pytest.mark.requires_trusted_git]
 
 from khaos.agent import AgentConfig, AgentLoop, Message
 from khaos.agent.approval import ApprovalBroker

@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>Task status</title></head>
+  <body>
+    <main>
+      <h1>Task status</h1>
+      <p id="status" role="status">Loading</p>
+    </main>
+    <script>
+      fetch("/task")
+        .then((response) => response.json())
+        .then((task) => {
+          document.querySelector("#status").textContent = task.state;
+        });
+    </script>
+  </body>
+</html>

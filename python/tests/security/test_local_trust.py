@@ -176,9 +176,23 @@ def test_community_local_profile_round_trip_uses_real_authorityd(
         thread.start()
         try:
             deadline = time.monotonic() + 5
-            while not socket_path.exists() and time.monotonic() < deadline:
-                time.sleep(0.02)
-            assert socket_path.exists(), errors
+            socket_ready = False
+            while time.monotonic() < deadline:
+                if errors:
+                    break
+                if not socket_path.exists():
+                    time.sleep(0.02)
+                    continue
+                try:
+                    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+                        probe.settimeout(0.2)
+                        probe.connect(str(socket_path))
+                except (ConnectionRefusedError, FileNotFoundError):
+                    time.sleep(0.02)
+                else:
+                    socket_ready = True
+                    break
+            assert socket_ready, errors
             client = AuthorityDaemonClient(
                 socket_path,
                 expected_authority_uid=os.geteuid(),

@@ -20,6 +20,7 @@ from khaos.security.orchestration_phases import (
     ToolPhase,
     ToolPhaseSnapshot,
 )
+from khaos.exceptions import ToolNotFoundError
 from khaos.tools.registry import ToolDefinition, ToolRegistry
 
 
@@ -79,10 +80,10 @@ class ToolAdmission:
     def admit(self, call: dict[str, Any]) -> ToolAdmissionResult:
         """Normalize and validate one call without executing it.
 
-        Unknown tool names intentionally propagate the registry's
-        ``ToolNotFoundError``.  That is a caller/configuration error, whereas
-        malformed phase evidence and invalid arguments are ordinary rejected
-        calls that the scheduler can report as a ``ToolResult``.
+        Unknown tool names are ordinary rejected calls at this boundary.  A
+        model can propose a tool that is outside a runtime's allowlist; that
+        must become a bounded denial result rather than escaping the
+        scheduler and terminating an otherwise recoverable turn.
         """
         normalized = self.normalize_call(call)
         try:
@@ -95,7 +96,13 @@ class ToolAdmission:
         normalized["_phase_snapshot"] = raw_phase
         normalized["_phase_digest"] = raw_phase.digest()
 
-        tool = self._registry.get(normalized["name"])
+        try:
+            tool = self._registry.get(normalized["name"])
+        except ToolNotFoundError:
+            return RejectedToolCall(
+                normalized,
+                f"Permission denied: tool {normalized['name']!r} is not available in this runtime",
+            )
         arguments = cast(dict[str, Any], normalized["arguments"])
         if not self._registry.validate_call(tool.name, arguments):
             return RejectedToolCall(normalized, "Invalid tool arguments")

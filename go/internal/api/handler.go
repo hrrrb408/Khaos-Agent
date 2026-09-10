@@ -212,9 +212,18 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("GET /v1/tasks", h.handleListTasks)
 	mux.HandleFunc("GET /v1/tasks/{id}", h.handleGetTask)
 	mux.HandleFunc("POST /v1/tasks/{id}/cancel", h.handleCancelTask)
+	mux.HandleFunc("POST /v1/tasks/{id}/pause", h.handlePauseTask)
+	mux.HandleFunc("POST /v1/tasks/{id}/resume", h.handleResumeTask)
 	mux.HandleFunc("POST /v1/tasks/{id}/approve", h.handleApproveTask)
 	mux.HandleFunc("POST /v1/tasks/{id}/reject", h.handleRejectTask)
 	mux.HandleFunc("GET /v1/tasks/{id}/events", h.handleTaskEvents)
+	mux.HandleFunc("GET /v1/tasks/{id}/supervision", h.handleTaskSupervision)
+	mux.HandleFunc("GET /v1/tasks/{id}/supervision/events", h.handleTaskSupervisionEvents)
+	mux.HandleFunc("GET /v1/tasks/{id}/checkpoints", h.handleTaskCheckpoints)
+	mux.HandleFunc("POST /v1/tasks/{id}/checkpoints", h.handleCreateTaskCheckpoint)
+	mux.HandleFunc("POST /v1/tasks/{id}/rewind", h.handleExecuteTaskRewind)
+	mux.HandleFunc("GET /v1/checkpoints/{id}", h.handleTaskCheckpoint)
+	mux.HandleFunc("POST /v1/checkpoints/{id}/rewind", h.handlePlanTaskRewind)
 	mux.HandleFunc("GET /v1/tasks/{id}/artifacts", h.handleTaskArtifacts)
 	common := h.requestLog(h.metricsMiddleware(mux))
 	health := h.rateLimit(h.healthLimiter, common)
@@ -337,6 +346,10 @@ func (h *Handler) handleCancelTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "task service not available")
 		return
 	}
+	if _, ok := h.tasks.(TaskControlClient); ok {
+		h.handleTaskCommand(w, r, "cancel")
+		return
+	}
 	if !h.authorizeTask(w, r) {
 		return
 	}
@@ -344,6 +357,279 @@ func (h *Handler) handleCancelTask(w http.ResponseWriter, r *http.Request) {
 	h.changeTask(w, r, "cancelled", func(ctx context.Context, id string) (TransitionResult, error) {
 		return h.tasks.CancelTask(ctx, principalID, id)
 	})
+}
+
+func (h *Handler) taskControlClient(w http.ResponseWriter) (TaskControlClient, bool) {
+	if h.tasks == nil {
+		writeError(w, http.StatusServiceUnavailable, "task service not available")
+		return nil, false
+	}
+	client, ok := h.tasks.(TaskControlClient)
+	if !ok {
+		writeError(w, http.StatusNotImplemented, "typed task control service not available")
+	}
+	return client, ok
+}
+
+func (h *Handler) handleTaskCommand(w http.ResponseWriter, r *http.Request, action string) {
+	client, ok := h.taskControlClient(w)
+	if !ok || !h.authorizeTask(w, r) {
+		return
+	}
+	principalID, _ := auth.PrincipalFromContext(r.Context())
+	options := map[string]any{}
+	if r.ContentLength != 0 {
+		var body struct {
+			CommandID        string `json:"command_id"`
+			ExpectedRevision *int64 `json:"expected_revision"`
+		}
+		if decodeJSON(r, &body) != nil {
+			writeError(w, http.StatusBadRequest, "invalid task control request")
+			return
+		}
+		if body.CommandID != "" {
+			options["command_id"] = body.CommandID
+		}
+		if body.ExpectedRevision != nil {
+			options["expected_revision"] = *body.ExpectedRevision
+		}
+	}
+	result, err := client.TaskCommand(r.Context(), principalID, action, r.PathValue("id"), options)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeTaskControlResult(w, result)
+}
+
+func (h *Handler) handlePauseTask(w http.ResponseWriter, r *http.Request) {
+	h.handleTaskCommand(w, r, "pause")
+}
+
+func (h *Handler) handleResumeTask(w http.ResponseWriter, r *http.Request) {
+	h.handleTaskCommand(w, r, "resume")
+}
+
+func writeTaskControlResult(w http.ResponseWriter, result map[string]any) {
+	if result == nil {
+		writeError(w, http.StatusBadGateway, "task service returned an empty result")
+		return
+	}
+	if message, _ := result["error"].(string); message != "" {
+		if message == "task not found" || message == "checkpoint not found" {
+			writeError(w, http.StatusNotFound, message)
+			return
+		}
+		writeJSON(w, http.StatusConflict, result)
+		return
+	}
+	status, _ := result["status"].(string)
+	if status == "REJECTED_STALE" || status == "BLOCKED" || status == "REQUIRES_APPROVAL" || status == "FAILED" {
+		writeJSON(w, http.StatusConflict, result)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (h *Handler) handleTaskSupervision(w http.ResponseWriter, r *http.Request) {
+	client, ok := h.taskControlClient(w)
+	if !ok || !h.authorizeTask(w, r) {
+		return
+	}
+	principalID, _ := auth.PrincipalFromContext(r.Context())
+	result, err := client.TaskSupervision(r.Context(), principalID, r.PathValue("id"))
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeTaskControlResult(w, result)
+}
+
+func (h *Handler) handleTaskSupervisionEvents(w http.ResponseWriter, r *http.Request) {
+	client, ok := h.taskControlClient(w)
+	if !ok || !h.authorizeTask(w, r) {
+		return
+	}
+	principalID, _ := auth.PrincipalFromContext(r.Context())
+	after, _ := strconv.ParseUint(r.Header.Get("Last-Event-ID"), 10, 64)
+	events, err := client.TaskSupervisionEvents(r.Context(), principalID, r.PathValue("id"), after)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	h.streamTypedTaskEvents(w, r, events)
+}
+
+func (h *Handler) streamTypedTaskEvents(w http.ResponseWriter, r *http.Request, events <-chan map[string]any) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "streaming not supported")
+		return
+	}
+	lastSequence, _ := strconv.ParseUint(r.Header.Get("Last-Event-ID"), 10, 64)
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case event, open := <-events:
+			if !open {
+				return
+			}
+			sequence := eventSequence(event["sequence"])
+			if sequence > 0 && sequence <= lastSequence {
+				continue
+			}
+			data, _ := json.Marshal(event)
+			if sequence > 0 {
+				fmt.Fprintf(w, "id: %d\n", sequence)
+			}
+			fmt.Fprintf(w, "data: %s\n\n", data)
+			flusher.Flush()
+			if sequence > lastSequence {
+				lastSequence = sequence
+			}
+		}
+	}
+}
+
+func (h *Handler) handleTaskCheckpoints(w http.ResponseWriter, r *http.Request) {
+	client, ok := h.taskControlClient(w)
+	if !ok || !h.authorizeTask(w, r) {
+		return
+	}
+	principalID, _ := auth.PrincipalFromContext(r.Context())
+	result, err := client.TaskCheckpoints(r.Context(), principalID, r.PathValue("id"))
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (h *Handler) handleTaskCheckpoint(w http.ResponseWriter, r *http.Request) {
+	client, ok := h.taskControlClient(w)
+	if !ok {
+		return
+	}
+	principalID, authenticated := auth.PrincipalFromContext(r.Context())
+	if !authenticated {
+		writeError(w, http.StatusUnauthorized, "authenticated principal required")
+		return
+	}
+	result, err := client.TaskCheckpoint(r.Context(), principalID, r.PathValue("id"))
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeTaskControlResult(w, result)
+}
+
+func (h *Handler) handleCreateTaskCheckpoint(w http.ResponseWriter, r *http.Request) {
+	client, ok := h.taskControlClient(w)
+	if !ok || !h.authorizeTask(w, r) {
+		return
+	}
+	principalID, _ := auth.PrincipalFromContext(r.Context())
+	var body struct {
+		Label                      string `json:"label"`
+		Kind                       string `json:"kind"`
+		ExpectedGeneration         *int64 `json:"expected_generation"`
+		PlanRevision               *int64 `json:"plan_revision"`
+		VerificationEvidenceDigest string `json:"verification_evidence_digest"`
+		IdempotencyKey             string `json:"idempotency_key"`
+	}
+	if r.ContentLength != 0 && decodeJSON(r, &body) != nil {
+		writeError(w, http.StatusBadRequest, "invalid checkpoint request")
+		return
+	}
+	options := map[string]any{}
+	if body.Label != "" {
+		options["label"] = body.Label
+	}
+	if body.Kind != "" {
+		options["kind"] = body.Kind
+	}
+	if body.ExpectedGeneration != nil {
+		options["expected_generation"] = *body.ExpectedGeneration
+	}
+	if body.PlanRevision != nil {
+		options["plan_revision"] = *body.PlanRevision
+	}
+	if body.VerificationEvidenceDigest != "" {
+		options["verification_evidence_digest"] = body.VerificationEvidenceDigest
+	}
+	if body.IdempotencyKey != "" {
+		options["idempotency_key"] = body.IdempotencyKey
+	}
+	result, err := client.CreateTaskCheckpoint(r.Context(), principalID, r.PathValue("id"), options)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeTaskControlResult(w, result)
+}
+
+func (h *Handler) handlePlanTaskRewind(w http.ResponseWriter, r *http.Request) {
+	client, ok := h.taskControlClient(w)
+	if !ok {
+		return
+	}
+	principalID, authenticated := auth.PrincipalFromContext(r.Context())
+	if !authenticated {
+		writeError(w, http.StatusUnauthorized, "authenticated principal required")
+		return
+	}
+	var body struct {
+		TaskID         string `json:"task_id"`
+		WorkspaceID    string `json:"workspace_id"`
+		IdempotencyKey string `json:"idempotency_key"`
+	}
+	if r.ContentLength != 0 && decodeJSON(r, &body) != nil {
+		writeError(w, http.StatusBadRequest, "invalid rewind plan request")
+		return
+	}
+	options := map[string]any{}
+	if body.TaskID != "" {
+		options["task_id"] = body.TaskID
+	}
+	if body.WorkspaceID != "" {
+		options["workspace_id"] = body.WorkspaceID
+	}
+	if body.IdempotencyKey != "" {
+		options["idempotency_key"] = body.IdempotencyKey
+	}
+	result, err := client.PlanTaskRewind(r.Context(), principalID, r.PathValue("id"), options)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeTaskControlResult(w, result)
+}
+
+func (h *Handler) handleExecuteTaskRewind(w http.ResponseWriter, r *http.Request) {
+	client, ok := h.taskControlClient(w)
+	if !ok || !h.authorizeTask(w, r) {
+		return
+	}
+	principalID, _ := auth.PrincipalFromContext(r.Context())
+	var body struct {
+		RewindID   string `json:"rewind_id"`
+		PlanDigest string `json:"plan_digest"`
+	}
+	if decodeJSON(r, &body) != nil || body.RewindID == "" || body.PlanDigest == "" {
+		writeError(w, http.StatusBadRequest, "rewind_id and plan_digest are required")
+		return
+	}
+	result, err := client.ExecuteTaskRewind(
+		r.Context(), principalID, r.PathValue("id"), body.RewindID, body.PlanDigest,
+	)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeTaskControlResult(w, result)
 }
 func (h *Handler) handleApproveTask(w http.ResponseWriter, r *http.Request) {
 	if h.tasks == nil {

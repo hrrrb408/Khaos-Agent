@@ -11,8 +11,8 @@ import math
 import os
 import re
 import secrets
-import signal
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -1291,6 +1291,7 @@ class MacOSSandboxBackend:
         synthetic_tmp: Path | None = None,
         preserve_workspace_path: bool = False,
         network_broker=None,
+        local_listen_ports: tuple[int, ...] = (),
     ) -> str:
         workspace = (
             worktree.expanduser().absolute()
@@ -1365,11 +1366,32 @@ class MacOSSandboxBackend:
         # deny-default plus the positive allowlist makes all non-runtime host
         # paths invisible, including credential roots not known in advance.
         _ = unreadable_roots
-        network_rules = "(deny network*)"
+        if type(local_listen_ports) is not tuple or any(
+            type(port) is not int or not 1 <= port <= 65535
+            for port in local_listen_ports
+        ):
+            raise PermissionError("macOS local listener ports are invalid")
+        network_rules = "".join(
+            '(allow network-inbound (local ip "127.0.0.1") '
+            f'(local tcp "{port}"))'
+            for port in sorted(set(local_listen_ports))
+        ) + "(deny network*)"
         if network_broker is not None:
+            if local_listen_ports:
+                # The app listener and broker are both explicit narrow
+                # exceptions; preserve the final deny-all rule.
+                local_rules = "".join(
+                    '(allow network-inbound (local ip "127.0.0.1") '
+                    f'(local tcp "{port}"))'
+                    for port in sorted(set(local_listen_ports))
+                )
+            else:
+                local_rules = ""
             if network_broker.host != "127.0.0.1":
                 raise PermissionError("macOS broker endpoint must be loopback")
             network_rules = (
+                local_rules
+                +
                 '(allow network-outbound (remote ip "127.0.0.1") '
                 f'(remote tcp "{network_broker.port}"))'
                 "(deny network*)"
@@ -1403,6 +1425,7 @@ class MacOSSandboxBackend:
         profile = _validated_profile(request)
         writable = profile.filesystem.value == "workspace-write"
         worktree = profile.workspace_roots[0]
+        cwd = _canonical_execution_cwd(worktree, request.cwd)
         with tempfile.TemporaryDirectory(prefix="khaos-home-") as home_value:
             # macOS exposes /var as a symlink to /private/var.  Bind the
             # environment and Seatbelt rules to the same canonical identity;
@@ -1420,6 +1443,7 @@ class MacOSSandboxBackend:
                 synthetic_tmp=sandbox_tmp,
                 preserve_workspace_path=request.workspace_root_identity is not None,
                 network_broker=profile.network_broker,
+                local_listen_ports=profile.local_listen_ports,
             )
             sandboxed_argv = (
                 "/usr/bin/sandbox-exec", "-p", sandbox_profile,
@@ -1441,7 +1465,7 @@ class MacOSSandboxBackend:
             try:
                 return await supervisor.run(
                     sandboxed,
-                    cwd=request.cwd.expanduser().absolute(),
+                    cwd=cwd,
                     execution_root=worktree,
                     env=environment,
                     tmp_root=home,
@@ -1720,7 +1744,13 @@ class LinuxBubblewrapBackend:
         network_broker=None,
         include_network_authority: bool = True,
         network_mode: Literal["isolated", "shared"] = "isolated",
+        local_listen_ports: tuple[int, ...] = (),
     ) -> tuple[str, ...]:
+        if local_listen_ports:
+            raise PermissionError(
+                "Linux bubblewrap cannot safely expose a task app listener "
+                "without widening the isolated network namespace"
+            )
         canonical_worktree = worktree.expanduser().absolute()
         canonical_cwd = (cwd or canonical_worktree).expanduser().absolute()
         if (
@@ -1879,6 +1909,7 @@ class LinuxBubblewrapBackend:
         profile = _validated_profile(request)
         writable = profile.filesystem.value == "workspace-write"
         worktree = profile.workspace_roots[0]
+        cwd = _canonical_execution_cwd(worktree, request.cwd)
         with tempfile.TemporaryDirectory(prefix="khaos-home-") as home_value:
             try:
                 cgroup = await asyncio.to_thread(
@@ -1928,7 +1959,7 @@ class LinuxBubblewrapBackend:
             try:
                 directory_binding = open_execution_directory_binding(
                     worktree,
-                    request.cwd,
+                    cwd,
                     expected_root_identity=request.workspace_root_identity,
                     expected_cwd_identity=request.workspace_cwd_identity,
                 )
@@ -1939,7 +1970,7 @@ class LinuxBubblewrapBackend:
                 )
                 prefix = self.argv_prefix(
                     worktree,
-                    cwd=request.cwd,
+                    cwd=cwd,
                     writable=writable,
                     unreadable_roots=profile.unreadable_roots,
                     synthetic_home=Path(home_value),
@@ -1947,6 +1978,7 @@ class LinuxBubblewrapBackend:
                     command=request.argv,
                     environment=request.environment,
                     network_broker=profile.network_broker,
+                    local_listen_ports=profile.local_listen_ports,
                     include_network_authority=False,
                     # bwrap resolves bind sources in the launching mount
                     # namespace.  An inherited proc-fd keeps that source tied
@@ -2032,14 +2064,14 @@ class LinuxBubblewrapBackend:
                                 asyncio.shield(wait_task),
                                 timeout=supervisor.termination_grace_seconds,
                             )
-                        except asyncio.TimeoutError as exc:
+                        except TimeoutError as exc:
                             raise TimeoutError(
                                 "production launcher did not reap its namespace init"
                             ) from exc
 
                 return await supervisor.run(
                     sandboxed,
-                    cwd=request.cwd.expanduser().absolute(),
+                    cwd=cwd,
                     execution_root=worktree,
                     sandbox_storage_paths=("/home/khaos", "/tmp"),
                     workspace_root=worktree if writable else None,
@@ -2621,6 +2653,24 @@ def _validated_profile(request):
             f"platform backend cannot enforce requested network policy: {profile.network.value}"
         )
     return profile
+
+
+def _canonical_execution_cwd(worktree: Path, requested_cwd: Path) -> Path:
+    """Canonicalize a validated cwd before binding it into a platform sandbox.
+
+    macOS exposes ``/var`` as a symlink to ``/private/var``.  Permission
+    profiles intentionally canonicalize workspace roots, while callers may
+    still carry the lexical spelling.  Resolve the cwd once, then let the
+    no-follow directory binding perform the final identity check; a symlink
+    that resolves outside the already-authorized workspace remains rejected.
+    """
+    root = worktree.expanduser().resolve(strict=True)
+    candidate = requested_cwd.expanduser().resolve(strict=True)
+    try:
+        candidate.relative_to(root)
+    except ValueError as exc:
+        raise PermissionError("execution cwd is outside the pinned workspace root") from exc
+    return candidate
 
 
 def _seatbelt_escape(path: Path) -> str:

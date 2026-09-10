@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import fnmatch
+import hashlib
 import json
 import mimetypes
 import os
@@ -168,6 +169,148 @@ async def multi_edit(path: str, edits: list[dict], workspace_manager=None, task_
             ),
         )
     raise PermissionError("multi_edit requires a Workspace root capability")
+
+
+def _parse_edit_transaction(
+    transaction_id: str,
+    base_generation: int,
+    operations: list[dict[str, Any]],
+    *,
+    workspace_id: str,
+    expected_workspace_digest: str | None = None,
+    intent: str = "",
+):
+    from khaos.coding.edit_transaction import (
+        EditOperation,
+        EditTransaction,
+        TextEdit,
+    )
+
+    if not isinstance(operations, list):
+        raise TypeError("operations must be a list")
+    typed_operations = []
+    for index, raw in enumerate(operations):
+        if not isinstance(raw, dict):
+            raise TypeError(f"operation at index {index} must be an object")
+        raw_text_edits = raw.get("text_edits", [])
+        if not isinstance(raw_text_edits, list):
+            raise TypeError(f"operation at index {index} text_edits must be a list")
+        text_edits = tuple(
+            TextEdit(
+                start=edit.get("start"),
+                end=edit.get("end"),
+                replacement=edit.get("replacement"),
+            )
+            for edit in raw_text_edits
+            if isinstance(edit, dict)
+        )
+        if len(text_edits) != len(raw_text_edits):
+            raise ValueError(
+                f"operation at index {index} text_edits must contain objects"
+            )
+        typed_operations.append(
+            EditOperation(
+                operation=raw.get("operation", raw.get("kind")),
+                path=raw.get("path"),
+                expected_exists=raw.get("expected_exists"),
+                expected_digest=raw.get("expected_digest"),
+                content=raw.get("content"),
+                text_edits=text_edits,
+                destination_path=raw.get("destination_path"),
+            )
+        )
+    return EditTransaction(
+        transaction_id=transaction_id,
+        workspace_id=workspace_id,
+        base_generation=base_generation,
+        operations=tuple(typed_operations),
+        expected_workspace_digest=expected_workspace_digest,
+        intent=intent,
+    )
+
+
+async def preview_edit_transaction(
+    transaction_id: str,
+    base_generation: int,
+    operations: list[dict[str, Any]],
+    expected_workspace_digest: str | None = None,
+    intent: str = "",
+    *,
+    workspace_manager=None,
+    task_id: str | None = None,
+    workspace_id: str | None = None,
+    principal_id: str | None = None,
+    project_id: str | None = None,
+    runtime_id: str | None = None,
+    edit_transaction_service=None,
+) -> dict[str, Any]:
+    """Preview a deterministic, generation-bound multi-file edit."""
+    if workspace_id is None:
+        raise PermissionError("edit transaction workspace scope is missing")
+    transaction = _parse_edit_transaction(
+        transaction_id,
+        base_generation,
+        operations,
+        workspace_id=workspace_id,
+        expected_workspace_digest=expected_workspace_digest,
+        intent=intent,
+    )
+    if edit_transaction_service is None:
+        from khaos.coding.edit_transaction import EditTransactionService
+
+        edit_transaction_service = EditTransactionService()
+    preview = await edit_transaction_service.preview(
+        transaction,
+        workspace_manager=workspace_manager,
+        task_id=task_id or "",
+        workspace_id=workspace_id,
+        principal_id=principal_id,
+        project_id=project_id,
+        runtime_id=runtime_id,
+    )
+    return preview.to_payload()
+
+
+async def apply_edit_transaction(
+    transaction_id: str,
+    base_generation: int,
+    operations: list[dict[str, Any]],
+    expected_workspace_digest: str | None = None,
+    intent: str = "",
+    *,
+    workspace_manager=None,
+    task_id: str | None = None,
+    workspace_id: str | None = None,
+    principal_id: str | None = None,
+    project_id: str | None = None,
+    runtime_id: str | None = None,
+    edit_transaction_service=None,
+) -> dict[str, Any]:
+    """Apply a generation-bound multi-file edit with all-or-rollback semantics."""
+    if workspace_id is None:
+        raise PermissionError("edit transaction workspace scope is missing")
+    transaction = _parse_edit_transaction(
+        transaction_id,
+        base_generation,
+        operations,
+        workspace_id=workspace_id,
+        expected_workspace_digest=expected_workspace_digest,
+        intent=intent,
+    )
+    if edit_transaction_service is None:
+        from khaos.coding.edit_transaction import EditTransactionService
+
+        edit_transaction_service = EditTransactionService()
+    result = await edit_transaction_service.apply(
+        transaction,
+        workspace_manager=workspace_manager,
+        task_id=task_id or "",
+        workspace_id=workspace_id,
+        principal_id=principal_id,
+        project_id=project_id,
+        runtime_id=runtime_id,
+    )
+    return result.to_payload()
 
 
 def _normalize_multi_edits(edits: list[dict]) -> list[dict[str, str]]:
@@ -367,6 +510,73 @@ async def _workspace_mutate(
     return await mutate(workspace.id, task_id, operation)
 
 
+def _published_identity_matches(snapshot, identity: object) -> None:
+    """Bind a post-failure snapshot to the exact effect callback identity."""
+    from khaos.coding.planning.safe_workspace_path import MutationObjectIdentity
+    from khaos.coding.workspace.boundary import WorkspaceBoundaryError
+
+    if not isinstance(identity, MutationObjectIdentity):
+        raise WorkspaceBoundaryError("published mutation identity is unavailable")
+    if not identity.exists:
+        if snapshot.exists:
+            raise WorkspaceBoundaryError("deleted target reappeared during recovery")
+        return
+    if (
+        not snapshot.exists
+        or snapshot.identity != (identity.object_dev, identity.object_ino)
+    ):
+        raise WorkspaceBoundaryError("published mutation identity changed")
+
+
+def _published_content_matches(
+    snapshot,
+    expected_digest: str | None,
+    path: str,
+) -> None:
+    """Reject a post-publish content race before recovery trusts the leaf."""
+    from khaos.coding.workspace.boundary import WorkspaceBoundaryError
+
+    if (
+        expected_digest is None
+        or not snapshot.exists
+        or snapshot.digest != expected_digest
+    ):
+        raise WorkspaceBoundaryError(f"published content changed: {path}")
+
+
+def _rollback_published_file(
+    filesystem,
+    path: str,
+    before,
+    published_identity: object,
+) -> None:
+    """Rollback one legacy file mutation without trusting a replaced leaf."""
+    current = filesystem.snapshot_file(path)
+    _published_identity_matches(current, published_identity)
+    if before.exists:
+        filesystem.restore_file(path, before, expected=current)
+    else:
+        filesystem.delete_file(path, expected=current)
+
+
+def _recovery_violation(path: str, error: BaseException):
+    """Build the shared fail-closed storage signal for legacy adapters."""
+    from khaos.coding.workspace.storage import WorkspaceStorageViolation
+
+    return WorkspaceStorageViolation(
+        {
+            "kind": "workspace-file-recovery",
+            "observed": "rollback-failed",
+            "limit": "rollback-complete",
+            "path": path,
+            "error": type(error).__name__,
+        },
+        rollback_attempted=True,
+        rollback_succeeded=False,
+        quarantine_required=True,
+    )
+
+
 def _workspace_write_sync(
     root: Path,
     recovery_root: Path,
@@ -381,11 +591,35 @@ def _workspace_write_sync(
     with SafeWorkspaceFS(root) as filesystem:
         relative = filesystem.relative(path)
         before = filesystem.snapshot_file(path, recovery_root=recovery_root)
+        published_identity: object | None = None
+
+        def on_publish(identity: object) -> None:
+            nonlocal published_identity
+            published_identity = identity
+
         try:
             encoded = content.encode("utf-8")
-            filesystem.write_bytes(path, encoded, cancel_event=cancel_event)
+            filesystem.write_bytes(
+                path,
+                encoded,
+                cancel_event=cancel_event,
+                effect_callback=on_publish,
+            )
             after = filesystem.snapshot_file(path)
-        except Exception:
+            _published_identity_matches(after, published_identity)
+            _published_content_matches(
+                after,
+                hashlib.sha256(encoded).hexdigest(),
+                path,
+            )
+        except Exception as exc:
+            if published_identity is not None:
+                try:
+                    _rollback_published_file(
+                        filesystem, path, before, published_identity
+                    )
+                except Exception as recovery_error:  # noqa: BLE001 - recovery must quarantine
+                    raise _recovery_violation(path, recovery_error) from exc
             before.cleanup()
             raise
         value = {
@@ -406,11 +640,30 @@ def _workspace_delete_sync(root: Path, recovery_root: Path, path: str) -> object
     with SafeWorkspaceFS(root) as filesystem:
         relative = filesystem.relative(path)
         before = filesystem.snapshot_file(path, recovery_root=recovery_root)
+        published_identity: object | None = None
+
+        def on_publish(identity: object) -> None:
+            nonlocal published_identity
+            published_identity = identity
+
         try:
             if not before.exists:
                 raise FileNotFoundError(path)
-            filesystem.delete_file(path, expected=before)
-        except Exception:
+            filesystem.delete_file(
+                path,
+                expected=before,
+                effect_callback=on_publish,
+            )
+            after = filesystem.snapshot_file(path)
+            _published_identity_matches(after, published_identity)
+        except Exception as exc:
+            if published_identity is not None:
+                try:
+                    _rollback_published_file(
+                        filesystem, path, before, published_identity
+                    )
+                except Exception as recovery_error:  # noqa: BLE001 - recovery must quarantine
+                    raise _recovery_violation(path, recovery_error) from exc
             before.cleanup()
             raise
         value = {"path": str(filesystem.root / relative), "deleted": True}
@@ -1116,6 +1369,11 @@ def _workspace_patch_sync(
         relative = filesystem.relative(path)
         before = filesystem.snapshot_file(path, recovery_root=recovery_root)
         result: dict[str, Any] = {}
+        published_identity: object | None = None
+
+        def on_publish(identity: object) -> None:
+            nonlocal published_identity
+            published_identity = identity
 
         def transform(original: str) -> str:
             if old in original:
@@ -1131,11 +1389,27 @@ def _workspace_patch_sync(
             return original[:start] + new + original[end:]
 
         try:
-            filesystem.transform_text(
-                path, transform, cancel_event=cancel_event
+            updated = filesystem.transform_text(
+                path,
+                transform,
+                cancel_event=cancel_event,
+                effect_callback=on_publish,
             )
             after = filesystem.snapshot_file(path)
-        except Exception:
+            _published_identity_matches(after, published_identity)
+            _published_content_matches(
+                after,
+                hashlib.sha256(updated.encode("utf-8")).hexdigest(),
+                path,
+            )
+        except Exception as exc:
+            if published_identity is not None:
+                try:
+                    _rollback_published_file(
+                        filesystem, path, before, published_identity
+                    )
+                except Exception as recovery_error:  # noqa: BLE001 - recovery must quarantine
+                    raise _recovery_violation(path, recovery_error) from exc
             before.cleanup()
             raise
         value = {"path": str(filesystem.root / relative), **result}
@@ -1166,6 +1440,12 @@ def _workspace_multi_edit_sync(
     with SafeWorkspaceFS(root) as filesystem:
         relative = filesystem.relative(path)
         before = filesystem.snapshot_file(path, recovery_root=recovery_root)
+        published_identity: object | None = None
+
+        def on_publish(identity: object) -> None:
+            nonlocal published_identity
+            published_identity = identity
+
         try:
             original = filesystem.read_bytes(path).decode("utf-8")
         except Exception:
@@ -1189,7 +1469,7 @@ def _workspace_multi_edit_sync(
                 "path": str(filesystem.root / relative),
                 "applied": 0,
                 "failed": sorted(failures, key=lambda item: int(item["index"])),
-            }, ensure_ascii=False), lambda: None, before.cleanup)
+            }, ensure_ascii=False), lambda: None, before.cleanup, False)
         updated = original
         applied: list[dict[str, Any]] = []
         for original_index, edit in sorted_edits:
@@ -1200,9 +1480,23 @@ def _workspace_multi_edit_sync(
                 path,
                 updated.encode("utf-8"),
                 cancel_event=cancel_event,
+                effect_callback=on_publish,
             )
             after = filesystem.snapshot_file(path)
-        except Exception:
+            _published_identity_matches(after, published_identity)
+            _published_content_matches(
+                after,
+                hashlib.sha256(updated.encode("utf-8")).hexdigest(),
+                path,
+            )
+        except Exception as exc:
+            if published_identity is not None:
+                try:
+                    _rollback_published_file(
+                        filesystem, path, before, published_identity
+                    )
+                except Exception as recovery_error:  # noqa: BLE001 - recovery must quarantine
+                    raise _recovery_violation(path, recovery_error) from exc
             before.cleanup()
             raise
         value = json.dumps({
@@ -1221,19 +1515,47 @@ def _workspace_multi_edit_sync(
 def _workspace_copy_sync(
     root: Path, recovery_root: Path, source: str, destination: str
 ) -> object:
-    from khaos.coding.workspace.boundary import SafeWorkspaceFS
+    from khaos.coding.workspace.boundary import (
+        SafeWorkspaceFS,
+        WorkspaceBoundaryError,
+    )
     from khaos.coding.workspace.storage import WorkspaceMutation
 
     with SafeWorkspaceFS(root) as filesystem:
         source_relative = filesystem.relative(source)
         destination_relative = filesystem.relative(destination)
+        source_before = filesystem.snapshot_file(source)
         before = filesystem.snapshot_file(
             destination, recovery_root=recovery_root
         )
+        published_identity: object | None = None
+
+        def on_publish(identity: object) -> None:
+            nonlocal published_identity
+            published_identity = identity
+
         try:
-            size = filesystem.copy_file(source, destination)
+            size = filesystem.copy_file(
+                source,
+                destination,
+                effect_callback=on_publish,
+            )
             after = filesystem.snapshot_file(destination)
-        except Exception:
+            _published_identity_matches(after, published_identity)
+            _published_content_matches(after, source_before.digest, destination)
+            source_after = filesystem.snapshot_file(source)
+            if source_after != source_before:
+                raise WorkspaceBoundaryError("copy source changed after publish")
+        except Exception as exc:
+            if published_identity is not None:
+                try:
+                    _rollback_published_file(
+                        filesystem, destination, before, published_identity
+                    )
+                except Exception as recovery_error:  # noqa: BLE001 - recovery must quarantine
+                    raise _recovery_violation(
+                        destination, recovery_error
+                    ) from exc
             before.cleanup()
             raise
         value = {
@@ -1260,8 +1582,43 @@ def _workspace_move_sync(
         destination_relative = filesystem.relative(destination)
         source_before = filesystem.snapshot_file(source)
         destination_before = filesystem.snapshot_file(destination)
-        filesystem.move_file(source, destination)
-        destination_after = filesystem.snapshot_file(destination)
+        published_identity: object | None = None
+
+        def on_publish(identity: object) -> None:
+            nonlocal published_identity
+            published_identity = identity
+
+        try:
+            filesystem.move_file(
+                source,
+                destination,
+                effect_callback=on_publish,
+            )
+            destination_after = filesystem.snapshot_file(destination)
+            _published_identity_matches(destination_after, published_identity)
+            _published_content_matches(
+                destination_after, source_before.digest, destination
+            )
+        except Exception as exc:
+            if published_identity is not None:
+                try:
+                    current_destination = filesystem.snapshot_file(destination)
+                    _published_identity_matches(
+                        current_destination, published_identity
+                    )
+                    _rollback_move(
+                        root,
+                        source,
+                        destination,
+                        source_before,
+                        destination_before,
+                        current_destination,
+                    )
+                except Exception as recovery_error:  # noqa: BLE001 - recovery must quarantine
+                    raise _recovery_violation(
+                        destination, recovery_error
+                    ) from exc
+            raise
         value = {
             "ok": True,
             "src": str(filesystem.root / source_relative),
@@ -1316,9 +1673,17 @@ def _rollback_move(
             raise WorkspaceBoundaryError("move rollback source reappeared")
         if filesystem.snapshot_file(destination) != destination_after:
             raise WorkspaceBoundaryError("move rollback target changed concurrently")
-        filesystem.move_file(destination, source)
+        expected_identity = (
+            (destination_after.identity[0], destination_after.identity[1], destination_after.mode)
+            if destination_after.identity is not None
+            else None
+        )
+        filesystem.move_published_back(destination, source, expected_identity)
         restored = filesystem.snapshot_file(source)
-        if restored.digest != source_before.digest:
+        if (
+            restored != source_before
+            or filesystem.snapshot_file(destination).exists
+        ):
             raise WorkspaceBoundaryError("move rollback content mismatch")
 
 

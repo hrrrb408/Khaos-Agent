@@ -87,6 +87,15 @@ def test_tool_admission_owns_normalization_and_validation() -> None:
     assert rejected.error == "Invalid tool arguments"
 
 
+def test_tool_admission_turns_unknown_model_tool_into_bounded_denial() -> None:
+    rejected = ToolAdmission(ToolRegistry()).admit(
+        {"id": "call-unknown", "name": "write_file", "arguments": {}}
+    )
+
+    assert isinstance(rejected, RejectedToolCall)
+    assert "not available in this runtime" in rejected.error
+
+
 def test_admitted_arguments_are_immutable_and_scheduler_drift_is_rejected() -> None:
     registry = ToolRegistry()
     registry.register(

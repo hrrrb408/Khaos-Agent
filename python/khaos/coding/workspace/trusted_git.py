@@ -32,6 +32,24 @@ from khaos.coding.workspace.git_process import (
     TrustedGitProcessOwner,
     TrustedGitProcessState,
 )
+from khaos.coding.workspace.trusted_git_locator import (
+    PlatformTrustedGitLocator,
+    TrustedGitLocator,
+)
+from khaos.coding.workspace.trusted_git_policy import (
+    FileIdentity,
+    TrustedGitExecutableIdentity,
+    TrustedGitExecutablePolicy,
+    TrustedGitExecutablePolicyError,
+    digest_file,
+)
+from khaos.coding.workspace.trusted_git_preflight import (
+    TrustedGitAvailability,
+    TrustedGitPreflightResult,
+    build_trusted_git_environment,
+    format_preflight_error,
+    run_trusted_git_preflight,
+)
 from khaos.runtime_profile import RuntimeProfile, resolve_runtime_profile
 from khaos.security.authority import AuthorityEnvelope
 from khaos.security.authority_broker import (
@@ -45,17 +63,11 @@ from khaos.security.resource_scope import (
     TypedResourcePartialOrder,
 )
 
-FileIdentity = tuple[int, int, int, int]
 _PROTECTED_GIT_NAME = ".git"
 _MAX_GIT_ERROR_BYTES = 64 * 1024
 _MAX_GIT_SYNC_SECONDS = 120.0
 _MAX_GIT_CHUNK_BYTES = 1024 * 1024
 _MAX_GIT_EFFECT_FILE_BYTES = 256 * 1024 * 1024
-_TRUSTED_GIT_PATH = (
-    r"C:\Windows\System32;C:\Program Files\Git\cmd"
-    if os.name == "nt"
-    else "/usr/bin:/bin"
-)
 _ALLOWED_COMMANDS = frozenset(
     {
         "apply",
@@ -527,48 +539,32 @@ def _verify_same_file_snapshot(
 
 
 def _file_digest(path: Path) -> str:
-    digest = hashlib.sha256()
     try:
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    except OSError as exc:
-        raise TrustedGitError(f"Git executable is unavailable: {path}") from exc
-    try:
-        while chunk := os.read(descriptor, 1024 * 1024):
-            digest.update(chunk)
-    finally:
-        os.close(descriptor)
-    return digest.hexdigest()
+        return digest_file(path)
+    except TrustedGitExecutablePolicyError as exc:
+        raise TrustedGitError(str(exc)) from exc
 
 
-def resolve_trusted_git() -> tuple[Path, FileIdentity, str]:
-    """Resolve and fingerprint the platform Git without consulting ``PATH``."""
-    system_git = (
-        Path("C:/Program Files/Git/cmd/git.exe")
-        if os.name == "nt"
-        else Path("/usr/bin/git")
-    )
-    try:
-        executable = system_git.resolve(strict=True)
-        info = executable.stat()
-    except OSError as exc:
-        raise TrustedGitError("trusted system Git executable is unavailable") from exc
-    if (
-        not executable.is_absolute()
-        or not stat.S_ISREG(info.st_mode)
-        or info.st_uid != 0
-        or info.st_mode & 0o022
-    ):
-        raise TrustedGitError(
-            "Git executable must be absolute, root-owned, regular, and immutable"
-        )
-    for parent in executable.parents:
+def resolve_trusted_git(
+    *,
+    locator: TrustedGitLocator | None = None,
+    policy: TrustedGitExecutablePolicy | None = None,
+) -> tuple[Path, FileIdentity, str]:
+    """Resolve and fingerprint a platform Git candidate without ``PATH``."""
+    selected_locator = locator or PlatformTrustedGitLocator()
+    selected_policy = policy or TrustedGitExecutablePolicy()
+    errors: list[str] = []
+    for candidate in selected_locator.candidates():
         try:
-            parent_info = parent.stat()
-        except OSError as exc:
-            raise TrustedGitError("Git executable parent chain is unavailable") from exc
-        if parent_info.st_uid != 0 or parent_info.st_mode & 0o022:
-            raise TrustedGitError("Git executable parent chain is not trusted")
-    return executable, _identity(info), _file_digest(executable)
+            identity = selected_policy.validate(candidate)
+        except TrustedGitExecutablePolicyError as exc:
+            errors.append(f"{candidate}: {exc}")
+            continue
+        return identity.path, identity.file_identity, identity.sha256
+    detail = "; ".join(errors) if errors else "no platform-approved candidates"
+    raise TrustedGitError(
+        "trusted Git executable is unavailable; no candidate passed policy: " + detail
+    )
 
 
 def _verify_identity(
@@ -580,7 +576,18 @@ def _verify_identity(
     expected_digest: str | None = None,
 ) -> None:
     """Open an authority object with no-follow and compare its live identity."""
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    if require_root_owner:
+        try:
+            TrustedGitExecutablePolicy().revalidate(
+                TrustedGitExecutableIdentity(path, expected, expected_digest or _file_digest(path)),
+                expected_digest=expected_digest,
+                label=label,
+            )
+        except TrustedGitExecutablePolicyError as exc:
+            raise TrustedGitError(str(exc)) from exc
+        return
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
     try:
         descriptor = os.open(path, flags)
         try:
@@ -776,11 +783,22 @@ class TrustedGitRunner:
     authority_root_identity: FileIdentity
     authority_broker: AuthorityBroker | None = None
     resource_order: TypedResourcePartialOrder | None = None
+    locator: TrustedGitLocator | None = field(default=None, repr=False)
+    executable_policy: TrustedGitExecutablePolicy = field(
+        default_factory=TrustedGitExecutablePolicy, repr=False
+    )
     _owners: dict[str, TrustedGitProcessOwner] = field(default_factory=dict, init=False, repr=False)
     _authority_pending_effects: dict[str, EffectCapability] = field(
         default_factory=dict, init=False, repr=False
     )
     _authority_quarantined: bool = field(default=False, init=False, repr=False)
+    _preflight_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
+    _preflight_cache_key: tuple[Path, FileIdentity, str] | None = field(
+        default=None, init=False, repr=False
+    )
+    _preflight_result: TrustedGitPreflightResult | None = field(
+        default=None, init=False, repr=False
+    )
 
     @classmethod
     def for_authority_root(
@@ -791,22 +809,42 @@ class TrustedGitRunner:
         authority_broker: AuthorityBroker | None = None,
         resource_order: TypedResourcePartialOrder | None = None,
         runtime_profile: RuntimeProfile | str | None = None,
+        locator: TrustedGitLocator | None = None,
+        executable_policy: TrustedGitExecutablePolicy | None = None,
     ) -> TrustedGitRunner:
         profile = resolve_runtime_profile(runtime_profile)
         if profile.is_production and authority_broker is None:
             raise TrustedGitError(
                 "production TrustedGitRunner requires the runtime authority broker"
             )
-        executable, identity, digest = resolve_trusted_git()
+        if profile.is_production and (locator is not None or executable_policy is not None):
+            raise TrustedGitError(
+                "production TrustedGitRunner uses only the platform Trusted Git policy"
+            )
+        selected_locator = locator or PlatformTrustedGitLocator()
+        selected_policy = executable_policy or TrustedGitExecutablePolicy()
+        # Keep the no-argument call as a compatibility seam for the existing
+        # test/evaluation harnesses that inject a validated identity by
+        # monkeypatching ``resolve_trusted_git``.  Real factory construction
+        # still records the platform locator for operational fallback.
+        if locator is None and executable_policy is None:
+            executable, identity, digest = resolve_trusted_git()
+        else:
+            executable, identity, digest = resolve_trusted_git(
+                locator=selected_locator,
+                policy=selected_policy,
+            )
         return cls(
-            executable,
-            identity,
-            digest,
-            root,
-            root_identity,
-            authority_broker
+            executable=executable,
+            git_identity=identity,
+            git_digest=digest,
+            authority_root=root,
+            authority_root_identity=root_identity,
+            authority_broker=authority_broker
             or AuthorityBroker.default(runtime_profile=profile),
-            resource_order,
+            resource_order=resource_order,
+            locator=selected_locator,
+            executable_policy=selected_policy,
         )
 
     def _new_owner(self, label: str) -> TrustedGitProcessOwner:
@@ -892,6 +930,156 @@ class TrustedGitRunner:
             label="workspace authority root",
         )
 
+    @property
+    def preflight_result(self) -> TrustedGitPreflightResult | None:
+        """Return the cached operational preflight result, if one exists."""
+        return self._preflight_result
+
+    def _candidate_paths(self) -> tuple[Path, ...]:
+        """Return the pinned candidate followed by static locator candidates."""
+        if self.locator is None:
+            return (self.executable,)
+        candidates: list[Path] = [self.executable]
+        for candidate in self.locator.candidates():
+            if candidate not in candidates:
+                candidates.append(candidate)
+        return tuple(candidates)
+
+    @staticmethod
+    def _preflight_key(identity: TrustedGitExecutableIdentity) -> tuple[Path, FileIdentity, str]:
+        return identity.path, identity.file_identity, identity.sha256
+
+    async def ensure_preflight(self) -> TrustedGitPreflightResult:
+        """Validate and operationally probe the pinned Git before each spawn.
+
+        A blocked first platform candidate may be replaced only by the next
+        static candidate that independently passes the same executable policy
+        and preflight.  PATH, repository configuration, and caller arguments
+        never participate in this selection.
+        """
+        current_key = (self.executable, self.git_identity, self.git_digest)
+        if self._preflight_cache_key == current_key and self._preflight_result is not None:
+            if self._preflight_result.status is TrustedGitAvailability.AVAILABLE:
+                return self._preflight_result
+            raise TrustedGitError(format_preflight_error(self._preflight_result))
+
+        async with self._preflight_lock:
+            current_key = (self.executable, self.git_identity, self.git_digest)
+            if (
+                self._preflight_cache_key == current_key
+                and self._preflight_result is not None
+            ):
+                if self._preflight_result.status is TrustedGitAvailability.AVAILABLE:
+                    return self._preflight_result
+                raise TrustedGitError(format_preflight_error(self._preflight_result))
+
+            pinned_identity = TrustedGitExecutableIdentity(
+                self.executable,
+                self.git_identity,
+                self.git_digest,
+            )
+            candidates = self._candidate_paths()
+            results: list[TrustedGitPreflightResult] = []
+            for index, candidate in enumerate(candidates):
+                try:
+                    identity = self.executable_policy.validate(candidate)
+                except TrustedGitExecutablePolicyError as exc:
+                    status = (
+                        TrustedGitAvailability.IDENTITY_DRIFT
+                        if index == 0 and candidate == self.executable
+                        else TrustedGitAvailability.TRUST_REJECTED
+                    )
+                    result = TrustedGitPreflightResult(
+                        status,
+                        candidate,
+                        pinned_identity if index == 0 else None,
+                        diagnostic=str(exc),
+                    )
+                    results.append(result)
+                    if index == 0:
+                        self._cache_preflight_failure(current_key, result)
+                        raise TrustedGitError(format_preflight_error(result)) from exc
+                    continue
+
+                if index == 0 and self._preflight_key(identity) != current_key:
+                    result = TrustedGitPreflightResult(
+                        TrustedGitAvailability.IDENTITY_DRIFT,
+                        candidate,
+                        pinned_identity,
+                        diagnostic="pinned Git executable identity or digest changed",
+                    )
+                    self._cache_preflight_failure(current_key, result)
+                    raise TrustedGitError(format_preflight_error(result))
+
+                owner = self._new_owner("git.preflight")
+                try:
+                    result = await run_trusted_git_preflight(
+                        identity,
+                        owner,
+                        cwd=self.authority_root,
+                        environment=self._environment(executable=identity.path),
+                    )
+                finally:
+                    self._release_owner(owner)
+                results.append(result)
+                if result.status is TrustedGitAvailability.AVAILABLE:
+                    self.executable = identity.path
+                    self.git_identity = identity.file_identity
+                    self.git_digest = identity.sha256
+                    selected_key = self._preflight_key(identity)
+                    self._preflight_cache_key = selected_key
+                    self._preflight_result = result
+                    return result
+                if index == 0 and result.status is not TrustedGitAvailability.INVOCATION_BLOCKED:
+                    self._cache_preflight_failure(current_key, result)
+                    raise TrustedGitError(format_preflight_error(result))
+
+            result = self._select_preflight_failure(results, pinned_identity)
+            self._cache_preflight_failure(current_key, result)
+            raise TrustedGitError(format_preflight_error(result))
+
+    def _cache_preflight_failure(
+        self,
+        key: tuple[Path, FileIdentity, str],
+        result: TrustedGitPreflightResult,
+    ) -> None:
+        self._preflight_cache_key = key
+        self._preflight_result = result
+
+    def _ensure_preflight_sync(self) -> TrustedGitPreflightResult:
+        """Run the async preflight for the startup/recovery-only sync path."""
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self.ensure_preflight())
+        raise TrustedGitError(
+            "synchronous Trusted Git recovery cannot run inside an active event loop"
+        )
+
+    @staticmethod
+    def _select_preflight_failure(
+        results: list[TrustedGitPreflightResult],
+        pinned_identity: TrustedGitExecutableIdentity,
+    ) -> TrustedGitPreflightResult:
+        if not results:
+            return TrustedGitPreflightResult(
+                TrustedGitAvailability.MISSING,
+                pinned_identity.path,
+                pinned_identity,
+                diagnostic="no platform-approved Git candidate was available",
+            )
+        for status in (
+            TrustedGitAvailability.INVOCATION_BLOCKED,
+            TrustedGitAvailability.TIMEOUT,
+            TrustedGitAvailability.INVOCATION_FAILED,
+            TrustedGitAvailability.TRUST_REJECTED,
+            TrustedGitAvailability.MISSING,
+        ):
+            for result in results:
+                if result.status is status:
+                    return result
+        return results[-1]
+
     @staticmethod
     def _validate_args(args: tuple[str, ...]) -> tuple[str, ...]:
         """Allow only audited plumbing operations and safe diff modes."""
@@ -950,27 +1138,20 @@ class TrustedGitRunner:
                     insertion += 1
         return tuple(values)
 
-    def _environment(self, *, index_file: Path | None = None) -> dict[str, str]:
+    def _environment(
+        self,
+        *,
+        index_file: Path | None = None,
+        executable: Path | None = None,
+    ) -> dict[str, str]:
         # These values are pinned and preserved explicitly.  The runner does
         # not inherit PATH, credentials, proxy variables, Git aliases, or
         # caller-provided GIT_CONFIG_* injection variables.
-        environment = {
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_CONFIG_SYSTEM": os.devnull,
-            "GIT_CONFIG_GLOBAL": os.devnull,
-            "GIT_TERMINAL_PROMPT": "0",
-            "GIT_ASKPASS": os.devnull,
-            "SSH_ASKPASS": os.devnull,
-            "GIT_PAGER": "cat",
-            "PAGER": "cat",
-            "GIT_EDITOR": ":",
-            "GIT_SEQUENCE_EDITOR": ":",
-            "GIT_OPTIONAL_LOCKS": "0",
-            "PATH": _TRUSTED_GIT_PATH,
-            "LANG": "C.UTF-8",
-            "LC_ALL": "C.UTF-8",
-            "HOME": str(self.authority_root),
-        }
+        selected_executable = executable or self.executable
+        environment = build_trusted_git_environment(
+            selected_executable,
+            home=self.authority_root,
+        )
         if index_file is not None:
             environment["GIT_INDEX_FILE"] = str(index_file)
         return scrub_spawn_environment(
@@ -988,6 +1169,7 @@ class TrustedGitRunner:
                 "GIT_INDEX_FILE",
                 "GIT_PAGER",
                 "PAGER",
+                "GIT_EXEC_PATH",
                 "GIT_OBJECT_DIRECTORY",
                 "GIT_ALTERNATE_OBJECT_DIRECTORIES",
             },
@@ -1278,6 +1460,7 @@ class TrustedGitRunner:
                 path,
                 os.O_RDONLY
                 | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_BINARY", 0)
                 | getattr(os, "O_CLOEXEC", 0),
             )
             info = os.fstat(descriptor)
@@ -1367,6 +1550,8 @@ class TrustedGitRunner:
             self._verify_patch_file(effect)
         elif effect is not None:
             raise TrustedGitError("a Git effect cannot authorize a read-only command")
+        await self.ensure_preflight()
+        self._verify()
         owner = self._new_owner("git.run")
         try:
             stdout, stderr, _ = await owner.communicate_bounded_after_spawn(
@@ -1404,6 +1589,8 @@ class TrustedGitRunner:
             raise TrustedGitError(
                 "state-changing Git commands require a structured exact effect"
             )
+        await self.ensure_preflight()
+        self._verify()
         owner = self._new_owner("git.run-bytes")
         try:
             stdout, stderr, _ = await owner.communicate_bounded_after_spawn(
@@ -1452,6 +1639,8 @@ class TrustedGitRunner:
                 raise TrustedGitError("Git effect stdin does not match its authorization")
         elif effect is not None:
             raise TrustedGitError("a Git effect cannot authorize a read-only command")
+        await self.ensure_preflight()
+        self._verify()
         owner = self._new_owner("git.run-with-input")
         try:
             stdout, stderr, _ = await owner.communicate_bounded_after_spawn(
@@ -1507,6 +1696,8 @@ class TrustedGitRunner:
         except OSError as exc:
             raise TrustedGitError("Git hash input descriptor is unavailable") from exc
 
+        await self.ensure_preflight()
+        self._verify()
         owner = self._new_owner("git.hash-fd")
         stderr_task: asyncio.Task[tuple[bytes, bool]] | None = None
         stdout_task: asyncio.Task[tuple[bytes, bool]] | None = None
@@ -1598,6 +1789,8 @@ class TrustedGitRunner:
         self._verify()
         self._authority_or_fail(authority)
         process: asyncio.subprocess.Process | None = None
+        await self.ensure_preflight()
+        self._verify()
         owner = self._new_owner("git.stream-to-file")
         stderr_task: asyncio.Task[bytes] | None = None
         descriptor: int | None = None
@@ -1609,7 +1802,8 @@ class TrustedGitRunner:
                 os.O_WRONLY
                 | os.O_CREAT
                 | os.O_EXCL
-                | getattr(os, "O_NOFOLLOW", 0),
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_BINARY", 0),
                 0o600,
             )
             process = await owner.spawn(
@@ -1701,6 +1895,8 @@ class TrustedGitRunner:
             raise TrustedGitError(
                 "state-changing Git commands require a structured exact effect"
             )
+        await self.ensure_preflight()
+        self._verify()
         process: asyncio.subprocess.Process | None = None
         owner = self._new_owner("git.run-bytes-limited")
         stderr_task: asyncio.Task[bytes] | None = None
@@ -1820,6 +2016,8 @@ class TrustedGitRunner:
     ) -> None:
         self._verify()
         self._authority_or_fail(authority)
+        await self.ensure_preflight()
+        self._verify()
         process: asyncio.subprocess.Process | None = None
         owner = self._new_owner("git.materialize-blobs")
         try:
@@ -1885,7 +2083,8 @@ class TrustedGitRunner:
                     os.O_WRONLY
                     | os.O_CREAT
                     | os.O_EXCL
-                    | getattr(os, "O_NOFOLLOW", 0),
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_BINARY", 0),
                     0o755 if mode == "100755" else 0o644,
                 )
                 try:
@@ -2007,6 +2206,8 @@ class TrustedGitRunner:
             raise TrustedGitError(
                 "state-changing Git commands require a structured exact effect"
             )
+        self._ensure_preflight_sync()
+        self._verify()
         try:
             stdout, stderr, returncode = _run_sync_bounded(
                 [str(self.executable), *self._argv(tuple(args))],
@@ -2083,6 +2284,8 @@ class TrustedGitRunner:
             raise TrustedGitError(
                 "state-changing Git commands require a structured exact effect"
             )
+        self._ensure_preflight_sync()
+        self._verify()
         try:
             stdout, stderr, returncode = _run_sync_bounded(
                 [str(self.executable), *self._argv(tuple(args))],
@@ -2375,7 +2578,9 @@ def _working_tree_matches_index(
             digest = _blob_hasher(object_id, int(info.st_size))
             descriptor = os.open(
                 target,
-                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_BINARY", 0),
             )
             try:
                 while chunk := os.read(descriptor, 1024 * 1024):
@@ -2452,7 +2657,14 @@ __all__ = [
     "FileIdentity",
     "GitEffect",
     "GitStreamResult",
+    "PlatformTrustedGitLocator",
+    "TrustedGitAvailability",
     "TrustedGitError",
+    "TrustedGitExecutableIdentity",
+    "TrustedGitExecutablePolicy",
+    "TrustedGitExecutablePolicyError",
+    "TrustedGitLocator",
+    "TrustedGitPreflightResult",
     "TrustedGitRunner",
     "WorkspaceBootstrapLimits",
     "resolve_trusted_git",

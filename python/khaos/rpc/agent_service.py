@@ -43,10 +43,11 @@ from khaos.memory import MemoryEventBridge, RuntimeMemoryContext
 from khaos.modes import ModeManager
 from khaos.rpc.models import ChatRequest, ConfirmRequest
 from khaos.runtime import RequestContext
-from khaos.runtime_profile import RuntimeProfile, resolve_runtime_profile
 from khaos.runtime.context import local_principal_id
+from khaos.runtime_profile import RuntimeProfile, resolve_runtime_profile
 from khaos.scheduler import CronEngine
 from khaos.security.middleware import SecurityMiddleware
+from khaos.supervision.service import TaskSupervisionService
 
 logger = logging.getLogger(__name__)
 
@@ -177,6 +178,13 @@ class AgentService:
             )
             if self._effective_policy.audit_enabled
             else None
+        )
+        # M8.6: one application-scoped canonical supervision writer is shared
+        # by AgentLoop and TaskService.  It owns only typed projections and
+        # control commands; mutation, approval, merge, and completion remain
+        # with their existing authorities.
+        self.supervision_service = TaskSupervisionService(
+            db, audit_logger=self._audit_logger
         )
         self.cron_engine = CronEngine(
             db=db,
@@ -1149,6 +1157,7 @@ class AgentService:
             cron_engine=self.cron_engine,
             subagent_spawner=self.subagent_spawner,
             cleanup_authority=self.runtime_cleanup_authority,
+            supervision_service=self.supervision_service,
         )
         if self.runtime_profile.is_production:
             return await build_production_runtime(runtime_config)

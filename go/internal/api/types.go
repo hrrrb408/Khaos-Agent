@@ -140,6 +140,24 @@ type TaskClient interface {
 	TaskArtifacts(ctx context.Context, principalID string, id string) ([]map[string]any, error)
 }
 
+// TaskControlClient is the optional typed M8.6 task-control surface.
+//
+// It is deliberately separate from TaskClient so existing adapters keep
+// their compatibility contract while production adapters can expose the
+// durable supervision projection, cooperative controls, checkpoints, and
+// digest-bound rewind records.  The Python service remains the authority;
+// the Gateway only authenticates, forwards, and maps the response.
+type TaskControlClient interface {
+	TaskSupervision(ctx context.Context, principalID string, id string) (map[string]any, error)
+	TaskSupervisionEvents(ctx context.Context, principalID string, id string, afterSequence uint64) (<-chan map[string]any, error)
+	TaskCommand(ctx context.Context, principalID string, action string, id string, options map[string]any) (map[string]any, error)
+	TaskCheckpoints(ctx context.Context, principalID string, id string) ([]map[string]any, error)
+	TaskCheckpoint(ctx context.Context, principalID string, id string) (map[string]any, error)
+	CreateTaskCheckpoint(ctx context.Context, principalID string, id string, options map[string]any) (map[string]any, error)
+	PlanTaskRewind(ctx context.Context, principalID string, checkpointID string, options map[string]any) (map[string]any, error)
+	ExecuteTaskRewind(ctx context.Context, principalID string, taskID string, rewindID string, planDigest string) (map[string]any, error)
+}
+
 // SubagentClient forwards subagent lifecycle calls to the Python service.
 type SubagentClient interface {
 	Spawn(ctx context.Context, principalID string, goal string, context string, tools []string, timeout int) (map[string]any, error)

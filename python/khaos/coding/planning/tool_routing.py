@@ -8,6 +8,7 @@ without turning a plan into a capability grant.
 from __future__ import annotations
 
 import json
+import os
 import shlex
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -197,8 +198,6 @@ def relative_resource_targets(resource: AuthorizationResource) -> tuple[str, ...
     def relative(value: Any) -> str:
         if type(value) is not str or not value:
             raise ValueError("authorization resource path is malformed")
-        import os
-
         rel = os.path.relpath(value, root)
         if rel == ".." or rel.startswith("../"):
             raise ValueError("authorization resource escapes workspace")
@@ -208,6 +207,19 @@ def relative_resource_targets(resource: AuthorizationResource) -> tuple[str, ...
         return (relative(payload.get("path")),)
     if resource.kind is AuthorizationResourceKind.WORKSPACE_COPY_MOVE:
         return (relative(payload.get("source")), relative(payload.get("destination")))
+    if resource.kind is AuthorizationResourceKind.WORKSPACE:
+        operations = payload.get("operations")
+        if type(operations) is not list or not operations:
+            raise ValueError("transaction resource operations are malformed")
+        targets: list[str] = []
+        for operation in operations:
+            if not isinstance(operation, Mapping):
+                raise TypeError("transaction resource operation is malformed")
+            targets.append(relative(operation.get("path")))
+            destination = operation.get("destination_path")
+            if destination is not None:
+                targets.append(relative(destination))
+        return tuple(targets)
     return ()
 
 

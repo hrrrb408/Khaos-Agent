@@ -85,6 +85,8 @@ class KhaosApp(App):
         self.router = None
         self.memory_manager: MemoryManager | None = None
         self.task_manager = None
+        self.supervision_service = None
+        self.checkpoint_service = None
         self._runtime = None
         self.skill_manager = SkillManager()
         self.agent_loop: AgentLoop | None = None
@@ -226,6 +228,8 @@ class KhaosApp(App):
         self.agent_loop = runtime.loop
         self.memory_manager = runtime.memory_manager
         self.task_manager = runtime.task_manager
+        self.supervision_service = getattr(runtime, "supervision_service", None)
+        self.checkpoint_service = getattr(runtime, "checkpoint_service", None)
         self._runtime = runtime
 
     async def on_unmount(self) -> None:  # type: ignore[override]
@@ -487,6 +491,9 @@ class KhaosApp(App):
             db=self.db,
             skill_manager=self.skill_manager,
             task_manager=self.task_manager,
+            supervision_service=self.supervision_service,
+            checkpoint_service=self.checkpoint_service,
+            principal_id=local_principal_id(),
             session_id=self.session_id,
             # M4 batch 3.1.16A-5-1b: pass the cached project identity so
             # slash commands (e.g. ``/mode``) stamp the SAME project_id

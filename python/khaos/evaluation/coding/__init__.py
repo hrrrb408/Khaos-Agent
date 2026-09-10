@@ -1,0 +1,138 @@
+"""M8.0 Coding capability evaluation, isolated from M7.9 control metrics."""
+
+from khaos.evaluation.coding.contracts import (
+    CodingContractError,
+    CodingFailureReason,
+    CodingResourceLimits,
+    CodingRunIdentity,
+    CodingScenario,
+    CodingScenarioKind,
+    CodingScenarioManifest,
+    CodingVerdict,
+    CommandOracleSpec,
+    CompositeOracleSpec,
+    DiffOracleSpec,
+    FileStateCheck,
+    FileStateOracleSpec,
+    FindingMatchMode,
+    OracleKind,
+    ReviewFindingExpectation,
+    ReviewOracleSpec,
+)
+from khaos.evaluation.coding.fixtures import (
+    FixtureError,
+    FixtureManager,
+    MaterializedFixture,
+    OracleWorkspace,
+)
+from khaos.evaluation.coding.manifest import (
+    builtin_manifest_path,
+    load_builtin_manifest,
+    load_manifest,
+    resolve_fixture_path,
+)
+from khaos.evaluation.coding.oracle import (
+    CodingOracle,
+    CommandExecution,
+    DiffSummary,
+    ExecutionServiceOracleExecutor,
+    OracleCheckResult,
+    OracleError,
+    OracleEvaluation,
+    ReviewFinding,
+    snapshot_tree,
+    summarize_diff,
+)
+from khaos.evaluation.coding.repository import (
+    CodingEvaluationConflictError,
+    CodingEvaluationIntegrityError,
+    CodingEvaluationRepository,
+    CodingEvaluationRepositoryError,
+)
+from khaos.evaluation.coding.metrics import CodingMetrics, CodingTraceCollector, CodingTraceEvent
+from khaos.evaluation.coding.report import (
+    CodingComparison,
+    compare_runs,
+    report_json,
+    report_markdown,
+    report_payload,
+)
+from khaos.evaluation.coding.results import (
+    AgentExecution,
+    CodingEvaluationRun,
+    new_run_id,
+    utc_timestamp,
+)
+from khaos.evaluation.coding.runner import (
+    AgentInvokerCallable,
+    CodingAgentInvoker,
+    CodingEvaluationRunner,
+)
+from khaos.evaluation.coding.runtime_invoker import RuntimeCodingAgentInvoker
+from khaos.evaluation.coding.sandbox import (
+    CodingSandboxUnavailableError,
+    build_oracle_execution_service,
+)
+from khaos.evaluation.coding.service import CodingEvaluationService, CodingScenarioSummary
+
+__all__ = [
+    "CodingContractError",
+    "CodingFailureReason",
+    "CodingComparison",
+    "CodingEvaluationConflictError",
+    "CodingEvaluationIntegrityError",
+    "CodingEvaluationRepository",
+    "CodingEvaluationRepositoryError",
+    "CodingEvaluationRun",
+    "CodingEvaluationRunner",
+    "CodingEvaluationService",
+    "CodingMetrics",
+    "CodingTraceCollector",
+    "CodingTraceEvent",
+    "RuntimeCodingAgentInvoker",
+    "CodingSandboxUnavailableError",
+    "build_oracle_execution_service",
+    "CodingOracle",
+    "CodingResourceLimits",
+    "CodingRunIdentity",
+    "CodingScenario",
+    "CodingScenarioKind",
+    "CodingScenarioManifest",
+    "CodingScenarioSummary",
+    "CodingVerdict",
+    "CommandExecution",
+    "CommandOracleSpec",
+    "CompositeOracleSpec",
+    "DiffOracleSpec",
+    "DiffSummary",
+    "ExecutionServiceOracleExecutor",
+    "FileStateCheck",
+    "FileStateOracleSpec",
+    "FindingMatchMode",
+    "FixtureError",
+    "FixtureManager",
+    "MaterializedFixture",
+    "AgentExecution",
+    "AgentInvokerCallable",
+    "CodingAgentInvoker",
+    "OracleCheckResult",
+    "OracleError",
+    "OracleEvaluation",
+    "OracleKind",
+    "OracleWorkspace",
+    "ReviewFinding",
+    "ReviewFindingExpectation",
+    "ReviewOracleSpec",
+    "builtin_manifest_path",
+    "compare_runs",
+    "load_builtin_manifest",
+    "load_manifest",
+    "resolve_fixture_path",
+    "new_run_id",
+    "report_json",
+    "report_markdown",
+    "report_payload",
+    "snapshot_tree",
+    "summarize_diff",
+    "utc_timestamp",
+]
