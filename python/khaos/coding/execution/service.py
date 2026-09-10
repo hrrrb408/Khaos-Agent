@@ -953,7 +953,10 @@ class ExecutionService:
             for key, value in request.environment.items()
         ):
             raise PermissionError("managed process environment is malformed")
-        allowed_environment_keys = request.permission_profile.environment_keys
+        permission_profile = request.permission_profile
+        if permission_profile is None:
+            raise PermissionError("managed process request has no permission profile")
+        allowed_environment_keys = permission_profile.environment_keys
         if any(key not in allowed_environment_keys for key in request.environment):
             raise PermissionError(
                 "managed process environment contains an unauthorized key"
@@ -980,9 +983,8 @@ class ExecutionService:
                 environment_keys=frozenset(environment),
                 resources=request.budget,
                 local_listen_ports=(
-                    request.permission_profile.local_listen_ports
-                    if request.permission_profile is not None
-                    else request.local_listen_ports
+                    permission_profile.local_listen_ports
+                    or request.local_listen_ports
                 ),
             ).bind_workspace(root),
             workspace_root_identity=root_identity,

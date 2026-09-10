@@ -988,11 +988,14 @@ class RuntimeResult:
             # effect can outlive the runtime owner.
             if self.browser_coding_service is not None:
                 try:
-                    close_browser_coding = getattr(
+                    close_browser_coding: object = getattr(
                         self.browser_coding_service, "aclose", None
                     ) or getattr(self.browser_coding_service, "close", None)
                     if callable(close_browser_coding):
-                        await close_browser_coding()
+                        close_method = cast(
+                            Callable[[], Awaitable[object]], close_browser_coding
+                        )
+                        await close_method()
                 except Exception:
                     failed = True
                     logger.debug(
