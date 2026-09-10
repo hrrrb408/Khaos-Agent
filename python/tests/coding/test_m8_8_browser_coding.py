@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -209,6 +210,15 @@ def app_profile() -> AppLaunchProfile:
         environment=(("APP_MODE", "fixture"),),
         provenance="trusted:test-fixture",
     )
+
+
+def test_app_profile_accepts_native_absolute_executable_path() -> None:
+    executable = r"C:\Python311\python.exe" if os.name == "nt" else "/usr/bin/python3"
+    profile = AppLaunchProfile(
+        profile_id="native-executable",
+        argv=(executable, "-m", "http.server", "{port}"),
+    )
+    assert profile.argv[0] == executable
 
 
 @pytest.fixture

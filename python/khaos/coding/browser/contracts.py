@@ -13,7 +13,7 @@ import math
 import re
 from dataclasses import dataclass
 from enum import Enum
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit, urlunsplit
 
 from khaos.security.protocol_boundary import canonical_digest
@@ -300,9 +300,10 @@ class AppLaunchProfile:
                 raise BrowserContractError("app argv contains shell control syntax")
             if item.casefold() in {"-c", "--command", "--eval", "-e", "--shell"}:
                 raise BrowserContractError("app profiles cannot use inline evaluation")
-            if index == 0 and PurePosixPath(item).name.casefold() in _SHELL_LAUNCHERS:
+            launcher_name = PurePosixPath(item.replace("\\", "/")).name.casefold()
+            if index == 0 and launcher_name in _SHELL_LAUNCHERS:
                 raise BrowserContractError("app profiles cannot launch a shell")
-        if not PurePosixPath(self.argv[0]).is_absolute():
+        if not Path(self.argv[0]).is_absolute():
             raise BrowserContractError("trusted app argv[0] must be an absolute executable path")
         if self.argv.count("{port}") != 1:
             raise BrowserContractError("app argv must contain exactly one {port} placeholder")
