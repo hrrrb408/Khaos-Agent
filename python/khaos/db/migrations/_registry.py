@@ -597,6 +597,15 @@ MIGRATIONS: tuple[MigrationSpec, ...] = (
         sql_files=("0031_mcp_hooks_skills_extensibility.sql",),
         migrator_symbols=("_apply_v31_upgrades",),
     ),
+    MigrationSpec(
+        version=32,
+        name="m8_8_browser_app_coding_recovery",
+        # Filled from the release-time manifest over the additive browser/app
+        # recovery schema and its migration owner.
+        sha256="adea72e55334b708b8b58ec70abbdf7891c431af4521a6248b3b8598fd37a742",
+        sql_files=("0032_browser_app_coding.sql",),
+        migrator_symbols=("_apply_v32_upgrades",),
+    ),
 )
 
 

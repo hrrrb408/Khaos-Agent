@@ -70,6 +70,7 @@ class ContextItemKind(str, Enum):
     BLOCKER = "blocker"
     CONVERSATION = "conversation"
     TASK_STATE = "task_state"
+    BROWSER_OBSERVATION = "browser_observation"
     # M8.7 extension inputs are explicit low-trust context kinds.  They are
     # intentionally not aliases of PROJECT_INSTRUCTION or TOOL_RESULT.
     EXTENSION_RESOURCE = "extension_resource"
@@ -91,6 +92,7 @@ class ContextSource(str, Enum):
     MEMORY = "memory"
     MODEL = "model"
     EXTENSION = "extension"
+    BROWSER = "browser"
 
 
 # These sources describe code-state observations.  A workspace identifier
@@ -101,6 +103,7 @@ GENERATION_BOUND_SOURCES = frozenset(
         ContextSource.REPO_INTELLIGENCE,
         ContextSource.EDIT_TRANSACTION,
         ContextSource.VERIFICATION,
+        ContextSource.BROWSER,
     }
 )
 
@@ -123,6 +126,7 @@ class ContextTrust(str, Enum):
     UNTRUSTED_EXTENSION_RESOURCE = "untrusted_extension_resource"
     UNTRUSTED_EXTENSION_INSTRUCTION = "untrusted_extension_instruction"
     UNTRUSTED_EXTENSION_DIAGNOSTIC = "untrusted_extension_diagnostic"
+    UNTRUSTED_BROWSER_CONTENT = "untrusted_browser"
 
 
 class ContextOperation(str, Enum):

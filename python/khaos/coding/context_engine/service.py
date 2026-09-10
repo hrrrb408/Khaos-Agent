@@ -361,7 +361,12 @@ class ContextEngineService:
             raw_metadata = getattr(raw, "metadata", {}) or {}
             raw_metadata = raw_metadata if isinstance(raw_metadata, Mapping) else {}
             raw_event = str(getattr(raw, "event", "") or "")
-            if role == "tool":
+            if raw_event in {"browser_observation", "browser_diagnostic"} or raw_metadata.get("context_source") == ContextSource.BROWSER.value:
+                layer = ContextLayer.L3
+                source = ContextSource.BROWSER
+                trust = ContextTrust.UNTRUSTED_BROWSER_CONTENT
+                kind = ContextItemKind.BROWSER_OBSERVATION
+            elif role == "tool":
                 layer = ContextLayer.L3
                 source = ContextSource.TOOL
                 trust = ContextTrust.UNTRUSTED_TOOL
@@ -758,7 +763,15 @@ class ContextEngineService:
                 if typed_metadata
                 else None
             )
-            if role == "tool":
+            raw_event = str(getattr(raw, "event", "") or "")
+            raw_metadata = getattr(raw, "metadata", {}) or {}
+            raw_metadata = raw_metadata if isinstance(raw_metadata, Mapping) else {}
+            if raw_event in {"browser_observation", "browser_diagnostic"} or raw_metadata.get("context_source") == ContextSource.BROWSER.value:
+                layer = layer or ContextLayer.L3
+                source = source or ContextSource.BROWSER
+                trust = trust or ContextTrust.UNTRUSTED_BROWSER_CONTENT
+                kind = kind or ContextItemKind.BROWSER_OBSERVATION
+            elif role == "tool":
                 layer = layer or ContextLayer.L3
                 source = source or ContextSource.TOOL
                 trust = trust or ContextTrust.UNTRUSTED_TOOL
@@ -876,22 +889,29 @@ class ContextEngineService:
                 layer_byte_budgets=(24 * 1024, 40 * 1024, 48 * 1024, 16 * 1024),
             ),
         )
-        candidates = [
-            item
-            for index, message in enumerate(parent_messages)
-            if (item := self._message_to_item(
+        candidates: list[ContextItem] = []
+        for index, message in enumerate(parent_messages):
+            metadata = getattr(message, "metadata", {}) or {}
+            metadata = metadata if isinstance(metadata, Mapping) else {}
+            event = str(getattr(message, "event", "") or "")
+            is_browser = (
+                event in {"browser_observation", "browser_diagnostic"}
+                or metadata.get("context_source") == ContextSource.BROWSER.value
+            )
+            item = self._message_to_item(
                 message,
-                layer=ContextLayer.L1 if index else ContextLayer.L0,
-                source=ContextSource.RUNTIME,
-                trust=ContextTrust.TRUSTED_RUNTIME,
-                kind=ContextItemKind.CONVERSATION,
-                priority=500 if index else 1000,
+                layer=ContextLayer.L3 if is_browser else (ContextLayer.L1 if index else ContextLayer.L0),
+                source=ContextSource.BROWSER if is_browser else ContextSource.RUNTIME,
+                trust=ContextTrust.UNTRUSTED_BROWSER_CONTENT if is_browser else ContextTrust.TRUSTED_RUNTIME,
+                kind=ContextItemKind.BROWSER_OBSERVATION if is_browser else ContextItemKind.CONVERSATION,
+                priority=100 if is_browser else (500 if index else 1000),
                 sequence=index,
-                required=index == 0,
+                required=False if is_browser else index == 0,
                 workspace_id=workspace_id,
                 generation=generation,
-            )) is not None
-        ]
+            )
+            if item is not None:
+                candidates.append(item)
         return await self.build(
             requirements,
             candidates,
@@ -1544,6 +1564,11 @@ class ContextEngineService:
                 "success",
                 "error_code",
                 "role",
+                "context_source",
+                "context_trust",
+                "context_kind",
+                "context_workspace_id",
+                "context_generation",
             ):
                 if key in metadata and isinstance(metadata[key], (str, bool, int, float)):
                     safe_metadata[key] = metadata[key]

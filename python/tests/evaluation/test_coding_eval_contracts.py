@@ -3,27 +3,42 @@ from __future__ import annotations
 from dataclasses import replace
 
 import pytest
-
 from khaos.evaluation.coding import (
     CodingContractError,
     CodingScenario,
     CodingScenarioKind,
-    CodingScenarioManifest,
     load_builtin_manifest,
 )
 
 
-def test_builtin_pack_has_twelve_typed_scenarios() -> None:
+def test_builtin_pack_has_fifteen_typed_scenarios() -> None:
     manifest = load_builtin_manifest()
 
-    assert len(manifest.scenarios) == 12
+    assert len(manifest.scenarios) == 15
     assert {scenario.kind for scenario in manifest.scenarios} == {
+        CodingScenarioKind.FRONTEND_BUG,
+        CodingScenarioKind.FULLSTACK_BUG,
+        CodingScenarioKind.BROWSER_VALIDATED_FEATURE,
         CodingScenarioKind.BUG_FIX,
         CodingScenarioKind.FEATURE,
         CodingScenarioKind.REFACTOR,
         CodingScenarioKind.MULTI_FILE,
         CodingScenarioKind.CROSS_LANGUAGE,
         CodingScenarioKind.CODE_REVIEW,
+    }
+    assert {
+        scenario.scenario_id
+        for scenario in manifest.scenarios
+        if scenario.kind
+        in {
+            CodingScenarioKind.FRONTEND_BUG,
+            CodingScenarioKind.FULLSTACK_BUG,
+            CodingScenarioKind.BROWSER_VALIDATED_FEATURE,
+        }
+    } == {
+        "browser-frontend-bug",
+        "browser-fullstack-bug",
+        "browser-validated-feature",
     }
     assert sum("smoke" in scenario.tags for scenario in manifest.scenarios) >= 4
     assert all(scenario.digest for scenario in manifest.scenarios)

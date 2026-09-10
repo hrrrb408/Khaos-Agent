@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from enum import Enum, IntEnum
 from pathlib import PurePosixPath
 
+from khaos.coding.browser.contracts import BrowserVerificationSpec
 from khaos.security.protocol_boundary import canonical_digest
 
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
@@ -73,8 +74,9 @@ class VerificationCheckKind(str, Enum):
     BUILD = "build"
     REGRESSION = "regression"
     CUSTOM_PROJECT_CHECK = "custom_project_check"
-    # Reserved extension points.  M8.3 never schedules these kinds; a later
-    # browser/UI harness must introduce its own explicit authority path.
+    # Browser/UI checks are still executed by the M8.3 planner/executor.  The
+    # browser service contributes only bounded evidence; it is not a second
+    # verification or completion authority.
     BROWSER = "browser"
     UI = "ui"
 
@@ -332,6 +334,7 @@ class VerificationCheck:
     target_symbols: tuple[str, ...] = ()
     reason_codes: tuple[str, ...] = ()
     cost: VerificationCost = VerificationCost.NORMAL
+    browser_spec: BrowserVerificationSpec | None = None
 
     def __post_init__(self) -> None:
         _text(self.check_id, label="check_id")
@@ -375,6 +378,15 @@ class VerificationCheck:
             object.__setattr__(self, "cost", cost)
         if type(cost) is not VerificationCost:
             raise VerificationContractError("verification cost is invalid")
+        if self.kind in {VerificationCheckKind.BROWSER, VerificationCheckKind.UI}:
+            if type(self.browser_spec) is not BrowserVerificationSpec:
+                raise VerificationContractError(
+                    "browser/UI checks require a typed BrowserVerificationSpec"
+                )
+        elif self.browser_spec is not None:
+            raise VerificationContractError(
+                "browser verification spec is only valid for browser/UI checks"
+            )
 
     @property
     def command_digest(self) -> str:
@@ -395,6 +407,11 @@ class VerificationCheck:
                 "required": self.required,
                 "target_paths": self.target_paths,
                 "target_symbols": self.target_symbols,
+                "browser_spec": (
+                    self.browser_spec.to_payload()
+                    if self.browser_spec is not None
+                    else None
+                ),
             }
         )
 
@@ -416,6 +433,11 @@ class VerificationCheck:
             "target_symbols": self.target_symbols,
             "reason_codes": self.reason_codes,
             "cost": self.cost.value,
+            "browser_spec": (
+                self.browser_spec.to_payload()
+                if self.browser_spec is not None
+                else None
+            ),
             "command_digest": self.command_digest,
         }
 

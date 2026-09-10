@@ -98,6 +98,9 @@ class PermissionProfile:
         {"PATH", "LANG", "LC_ALL", "TMPDIR"}
     )
     resources: ResourceBudget = field(default_factory=ResourceBudget)
+    # Exact task-owned loopback listeners for a local Coding app.  This is
+    # intentionally distinct from outbound ``NetworkPolicy`` authority.
+    local_listen_ports: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if self.schema_version != 1:
@@ -120,6 +123,15 @@ class PermissionProfile:
             raise ValueError("brokered network profile requires a NetworkLease")
         if network is not NetworkPolicy.BROKERED and self.network_broker is not None:
             raise ValueError("NetworkLease is only valid for a brokered profile")
+        if type(self.local_listen_ports) is not tuple or any(
+            type(port) is not int or not 1 <= port <= 65535
+            for port in self.local_listen_ports
+        ):
+            raise ValueError("local listener ports are invalid")
+        if len(set(self.local_listen_ports)) != len(self.local_listen_ports):
+            raise ValueError("local listener ports contain duplicates")
+        if network is not NetworkPolicy.NONE and self.local_listen_ports:
+            raise ValueError("local listener ports require outbound network policy none")
         if any(root not in workspace_roots for root in writable_roots):
             raise ValueError("writable roots must be contained in workspace roots")
         if any(not isinstance(key, str) or not key for key in self.environment_keys):
@@ -158,6 +170,7 @@ class PermissionProfile:
             unreadable_roots=_default_unreadable_roots(),
             environment_keys=environment_keys,
             resources=resources,
+            local_listen_ports=(),
         )
 
     def bind_workspace(self, root: Path) -> PermissionProfile:
@@ -177,6 +190,7 @@ class PermissionProfile:
             unreadable_roots=self.unreadable_roots,
             environment_keys=self.environment_keys,
             resources=self.resources,
+            local_listen_ports=self.local_listen_ports,
         )
 
     def validate_resolved(self) -> None:
@@ -212,6 +226,7 @@ class PermissionProfile:
             "writable_roots": [str(path) for path in self.writable_roots],
             "unreadable_roots": [str(path) for path in self.unreadable_roots],
             "environment_keys": sorted(self.environment_keys),
+            "local_listen_ports": self.local_listen_ports,
             "resources": {
                 "timeout_seconds": self.resources.timeout_seconds,
                 "output_bytes": self.resources.output_bytes,
@@ -412,6 +427,7 @@ class ExecutionRequest:
     sandbox_decision: SandboxDecision | None = None
     spawn_plan: ResolvedSpawnPlan | None = None
     execution_authority: ExecutionAuthority | None = None
+    local_listen_ports: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         profile = self.permission_profile or PermissionProfile.from_legacy(
@@ -422,6 +438,29 @@ class ExecutionRequest:
             environment_keys=self.allowed_environment_keys,
             resources=self.budget,
         )
+        if type(self.local_listen_ports) is not tuple or any(
+            type(port) is not int or not 1 <= port <= 65535
+            for port in self.local_listen_ports
+        ):
+            raise ValueError("execution local listener ports are invalid")
+        if self.local_listen_ports:
+            if profile.local_listen_ports and profile.local_listen_ports != self.local_listen_ports:
+                raise ValueError("execution and permission local listener ports disagree")
+            if not profile.local_listen_ports:
+                profile = PermissionProfile(
+                    schema_version=profile.schema_version,
+                    filesystem=profile.filesystem,
+                    network=profile.network,
+                    network_broker=profile.network_broker,
+                    workspace_roots=profile.workspace_roots,
+                    writable_roots=profile.writable_roots,
+                    unreadable_roots=profile.unreadable_roots,
+                    environment_keys=profile.environment_keys,
+                    resources=profile.resources,
+                    local_listen_ports=self.local_listen_ports,
+                )
+        else:
+            object.__setattr__(self, "local_listen_ports", profile.local_listen_ports)
         # Compatibility fields are a projection of the profile.  Explicit
         # profiles always win over conflicting legacy values.
         object.__setattr__(self, "permission_profile", profile)

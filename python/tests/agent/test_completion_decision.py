@@ -822,11 +822,12 @@ async def test_fresh_v18_and_v17_to_v18_upgrade_do_not_backfill_decisions(
         # v27 coding evaluation runs, M8.3 adds v28 autonomous-verification
         # observations, M8.5 adds v29 parallel-subagent worktree records,
         # M8.6 adds v30 coding supervision/checkpoint/rewind records, and
-        # M8.7 adds v31 extension metadata/lifecycle projections.
+        # M8.7 adds v31 extension metadata/lifecycle projections and M8.8 adds
+        # v32 browser/app recovery metadata.
         # after the immutable completion-decision ledger. The
         # v18 no-backfill assertion remains valid while the schema advances
         # monotonically.
-        assert SCHEMA_MIGRATION_VERSION == 31
+        assert SCHEMA_MIGRATION_VERSION == 32
     finally:
         await fresh.close()
 

@@ -12,11 +12,12 @@ import math
 import platform as platform_module
 import re
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Mapping, TypeAlias
+from typing import Any, TypeAlias
 
 from khaos.security.protocol_boundary import canonical_digest, canonical_json_bytes
 
@@ -28,6 +29,9 @@ class CodingContractError(ValueError):
 class CodingScenarioKind(StrEnum):
     """Supported coding capability task families."""
 
+    FRONTEND_BUG = "FRONTEND_BUG"
+    FULLSTACK_BUG = "FULLSTACK_BUG"
+    BROWSER_VALIDATED_FEATURE = "BROWSER_VALIDATED_FEATURE"
     BUG_FIX = "BUG_FIX"
     FEATURE = "FEATURE"
     REFACTOR = "REFACTOR"

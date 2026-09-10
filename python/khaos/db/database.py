@@ -1077,6 +1077,15 @@ class Database:
                 await self._apply_v31_upgrades()
             finally:
                 self._conn = original_conn
+            # M8.8: persist bounded browser/app identity, action/evidence
+            # metadata, and append-only lifecycle events.  Live Playwright
+            # objects and page contents never enter this projection.
+            original_conn = self._conn
+            self._conn = _MigrationConnection(conn)
+            try:
+                await self._apply_v32_upgrades()
+            finally:
+                self._conn = original_conn
             # Batch 6.4 §10.4: backfill the historical ledger rows (v1–v5)
             # so the chain is complete from this point on.  Idempotent —
             # uses INSERT OR IGNORE keyed on the version PK.
@@ -1879,6 +1888,15 @@ class Database:
         """Add the durable M8.7 extension metadata/lifecycle projections."""
         conn = await self._require_conn()
         migration_path = _MIGRATIONS_DIR / "0031_mcp_hooks_skills_extensibility.sql"
+        await self._execute_schema_statements(
+            conn,
+            migration_path.read_text(encoding="utf-8"),
+        )
+
+    async def _apply_v32_upgrades(self) -> None:
+        """Add the durable M8.8 browser/app recovery projection."""
+        conn = await self._require_conn()
+        migration_path = _MIGRATIONS_DIR / "0032_browser_app_coding.sql"
         await self._execute_schema_statements(
             conn,
             migration_path.read_text(encoding="utf-8"),

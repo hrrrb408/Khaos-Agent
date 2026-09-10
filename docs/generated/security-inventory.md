@@ -59,11 +59,11 @@
 - `python/khaos/permissions/rules.py`: `19d02b4ea1427b7c4b5075b5bbcd641cefc680ac984d27e6fdbf95a5415eae7c`
 - `python/khaos/coding/execution/authority.py`: `194fffcdceb04a008199cb3fabd98f03d57402363111855351cccf1503a073f2`
 - `python/khaos/coding/execution/identity.py`: `f5b21dd9098def1ea894b4830181fd9a6be1196b00235a404027794f8b4b0bef`
-- `python/khaos/coding/execution/models.py`: `bc6cee60bd4b1e73edaabc75e41b46810b5a5d571425ee587f188c64d85d71e0`
+- `python/khaos/coding/execution/models.py`: `877ea69199423224b02e7d11e697dfa671cf9beaa956be29a999d044c0e54c7b`
 - `python/khaos/coding/execution/native_launcher.py`: `f53d8b878c4d666100c60b71f4d96e979a511fb00e55ac95d77a0278c3074f77`
-- `python/khaos/coding/execution/platform.py`: `60aff7911caae2f2d9d1aa090b620f24f030fe175a57c7f3b85d8b5d6d4f3850`
+- `python/khaos/coding/execution/platform.py`: `537c48674e245bd18b843237e5dbea7c7b94d732c35c5c83689f499963e9469c`
 - `python/khaos/coding/execution/resource_owner.py`: `9304e64dda07b968159333fab1abae603ca19b43c972a2794c77b65dd06b52e8`
-- `python/khaos/coding/execution/service.py`: `eb1c000ef30f3bf42dd2af245a6d7edf9b3abe8b89cbccb164748b62911f24a3`
+- `python/khaos/coding/execution/service.py`: `90f1eaf09f252263011115048fa95697cdee1d070f99fc06bafc637e4302225a`
 - `python/khaos/coding/execution/binding.py`: `99f3d8eb14d80a837ecf0f0d076d556ccdb366b8798c9e0fde6c69d0bb1a5501`
 - `python/khaos/coding/execution/supervisor.py`: `e6d88b6de0370b10b877f7228a37d2d910ce9a08ea3d8625b33c529d091098ff`
 - `python/khaos/coding/workspace/manager.py`: `e8db05ddd03eced47d2966369f221f5203d9a2b34795006b8bcc413a6afe5aae`

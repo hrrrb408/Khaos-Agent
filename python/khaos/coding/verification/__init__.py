@@ -3,6 +3,11 @@
 from importlib import import_module
 from typing import Any
 
+from khaos.coding.browser.contracts import (
+    BrowserAssertion,
+    BrowserCheckAction,
+    BrowserVerificationSpec,
+)
 from khaos.coding.verification.contracts import (
     DiagnosticCategory,
     DiagnosticSeverity,
@@ -95,6 +100,9 @@ __all__ = [
     "AutonomousVerificationFactProvider",
     "AutonomousVerificationPlan",
     "AutonomousVerificationPlanner",
+    "BrowserAssertion",
+    "BrowserCheckAction",
+    "BrowserVerificationSpec",
     "ChangedRange",
     "DiagnosticCategory",
     "DiagnosticParser",

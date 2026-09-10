@@ -51,6 +51,10 @@ from khaos.security.orchestration_phases import (
 
 logger = logging.getLogger(__name__)
 
+_BROWSER_CODING_TOOL_NAMES = frozenset(
+    {"browser_app_open", "browser_observe", "browser_action", "browser_session_close"}
+)
+
 
 def _default_runtime_environment(key: str) -> str:
     """Return the deterministic value used in the spawn authority snapshot."""
@@ -359,6 +363,7 @@ class AgentLoop:
         supervision_service=None,
         checkpoint_service=None,
         extension_service=None,
+        browser_coding_service=None,
     ):
         self.config = config
         self.mode_manager = mode_manager
@@ -496,6 +501,10 @@ class AgentLoop:
         self.channel_registry = channel_registry
         self.cron_engine = cron_engine
         self.browser_manager = browser_manager
+        # M8.8: the Coding browser facade is a composition handle only.  It
+        # delegates process/network/page/approval authority to existing
+        # owners and is intentionally injected per runtime.
+        self.browser_coding_service = browser_coding_service
         self.subagent_spawner = subagent_spawner
         self.subagent_control_coordinator = subagent_control_coordinator
         self.credential_broker = credential_broker
@@ -1333,6 +1342,9 @@ class AgentLoop:
                         ),
                         "cron_engine": getattr(self, "cron_engine", None),
                         "browser_manager": getattr(self, "browser_manager", None),
+                        "browser_coding_service": getattr(
+                            self, "browser_coding_service", None
+                        ),
                         "subagent_spawner": getattr(
                             self, "subagent_spawner", None
                         ),
@@ -1547,12 +1559,13 @@ class AgentLoop:
                                 },
                                 ensure_ascii=False,
                             )
+                        browser_tool_result = result.name in _BROWSER_CODING_TOOL_NAMES
                         tool_msg = Message(
                             role="tool",
                             content=content,
                             tool_call_id=result.tool_call_id,
                             token_count=self.token_engine.count_tokens(content),
-                            event="tool_result",
+                            event=("browser_observation" if browser_tool_result else "tool_result"),
                             metadata={
                                 "id": result.tool_call_id,
                                 "name": result.name,
@@ -1585,6 +1598,11 @@ class AgentLoop:
                                 "phase_digest": result.phase_digest,
                                 "reconciliation_hint": result.reconciliation_hint,
                                 "retry_safe": result.retry_safe,
+                                "context_source": "browser" if browser_tool_result else "tool",
+                                "context_trust": "untrusted_browser" if browser_tool_result else "untrusted_tool",
+                                "context_kind": "browser_observation" if browser_tool_result else "tool_result",
+                                "context_workspace_id": getattr(self.active_workspace, "id", "") or "",
+                                "context_generation": getattr(self.active_workspace, "generation", 0) or 0,
                             },
                             created_at=time.time(),
                         )

@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from khaos.coding.browser.contracts import BrowserVerificationSpec
 from khaos.coding.planning.contracts import VerificationCatalogEntry
 from khaos.coding.planning.verification_catalog import (
     SafeConfigSnapshot,
@@ -179,6 +180,9 @@ class VerificationProfile:
     config_hashes: tuple[tuple[str, str], ...]
     diagnostics: tuple[str, ...] = ()
     profile_digest: str = ""
+    # Trusted browser checks are supplied by the composition root; they are
+    # never inferred from README prose or model/package-script text.
+    browser_checks: tuple[BrowserVerificationSpec, ...] = ()
 
     def __post_init__(self) -> None:
         for label, value in (("profile_id", self.profile_id),):
@@ -229,6 +233,12 @@ class VerificationProfile:
             not item or len(item) > 1024 or "\x00" in item for item in self.diagnostics
         ):
             raise VerificationContractError("profile diagnostics exceed their bound")
+        if type(self.browser_checks) is not tuple or len(self.browser_checks) > 64 or any(
+            type(item) is not BrowserVerificationSpec for item in self.browser_checks
+        ):
+            raise VerificationContractError("browser checks must contain typed specs")
+        if len({item.spec_id for item in self.browser_checks}) != len(self.browser_checks):
+            raise VerificationContractError("browser check IDs must be unique")
         computed = self._computed_digest()
         if self.profile_digest:
             if self.profile_digest != computed:
@@ -246,6 +256,7 @@ class VerificationProfile:
             "commands": tuple(item.to_payload() for item in self.commands),
             "config_hashes": self.config_hashes,
             "diagnostics": self.diagnostics,
+            "browser_checks": tuple(item.to_payload() for item in self.browser_checks),
         }
 
     def _computed_digest(self) -> str:
@@ -278,6 +289,7 @@ class VerificationProfileDetector:
         repository_id: str = "",
         overview: Any | None = None,
         server_rules: tuple[dict[str, Any], ...] = (),
+        browser_checks: tuple[BrowserVerificationSpec, ...] = (),
     ) -> VerificationProfile:
         """Detect a bounded profile without executing repository code."""
         canonical_root = Path(root).expanduser().resolve(strict=True)
@@ -362,6 +374,7 @@ class VerificationProfileDetector:
                 "commands": tuple(item.to_payload() for item in commands),
                 "config_hashes": config_hash_items,
                 "diagnostics": diagnostic_items,
+                "browser_checks": tuple(item.to_payload() for item in browser_checks),
             }
         )
         return VerificationProfile(
@@ -374,6 +387,7 @@ class VerificationProfileDetector:
             commands=tuple(commands),
             config_hashes=config_hash_items,
             diagnostics=diagnostic_items,
+            browser_checks=browser_checks,
             profile_digest=profile_digest,
         )
 

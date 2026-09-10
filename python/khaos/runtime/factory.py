@@ -299,6 +299,15 @@ class RuntimeConfig:
     # field so the factory constructs the sole extension registry/admission
     # plane from the effective policy.
     extension_service: Any = None
+    # M8.8: trusted Coding browser/app facade.  Production composition builds
+    # it from the already-owned browser, execution, network, workspace, and
+    # approval services; this hook is retained only for test/development
+    # adapters.
+    browser_coding_service: Any = None
+    # Trusted, immutable app launch profiles supplied by explicit operator
+    # configuration.  The model can select only a registered profile id; it
+    # cannot create or alter the argv/cwd contract at tool-call time.
+    app_profiles: tuple[Any, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -361,6 +370,10 @@ class ProductionRuntimeConfig:
     subagent_spawner: Any = None
     project_id: str = ""
     supervision_service: Any = None
+    # Explicit operator-owned app profiles are safe to carry through the
+    # structural production config because BrowserCodingService validates the
+    # typed profile before registration and ExecutionService owns the spawn.
+    app_profiles: tuple[Any, ...] = ()
 
     def as_runtime_config(self) -> RuntimeConfig:
         """Materialize the internal config after the structural boundary."""
@@ -407,6 +420,7 @@ class ProductionRuntimeConfig:
             subagent_spawner=self.subagent_spawner,
             project_id=self.project_id,
             supervision_service=self.supervision_service,
+            app_profiles=self.app_profiles,
         )
 
 
@@ -556,6 +570,9 @@ class RuntimeResult:
     # M8.7: composed ExtensionService handle; it owns registry/admission
     # metadata, not execution, approval, verification, or completion authority.
     extension_service: Any = field(init=False, default=None, repr=False)
+    # M8.8: attached by the factory; it has no independent security authority
+    # and is closed before its underlying ExecutionService/BrowserManager.
+    browser_coding_service: Any = field(init=False, default=None, repr=False)
     # M7.3: production-composed planning control coordinator.  It is an
     # orchestration owner only; plan revisions remain passive and TaskStatus
     # lifecycle writes remain owned by their existing control boundaries.
@@ -639,6 +656,7 @@ class RuntimeResult:
         )
         for name, component in (
             ("execution_service", self.execution_service),
+            ("browser_coding_service", self.browser_coding_service),
             ("browser_manager", self.browser_manager),
             (
                 "credential_broker",
@@ -687,6 +705,7 @@ class RuntimeResult:
         """Verify every runtime-owned child exposes an independent proof."""
         for name, component in (
             ("execution_service", self.execution_service),
+            ("browser_coding_service", self.browser_coding_service),
             ("browser_manager", self.browser_manager),
             (
                 "credential_broker",
@@ -963,6 +982,24 @@ class RuntimeResult:
                         logger.debug(
                             "context intelligence close failed", exc_info=True
                         )
+            # M8.8: browser sessions/apps are children of the composed
+            # facade.  Drain them before shutting down their underlying
+            # ExecutionService and BrowserManager so no page or dev-server
+            # effect can outlive the runtime owner.
+            if self.browser_coding_service is not None:
+                try:
+                    close_browser_coding = getattr(
+                        self.browser_coding_service, "aclose", None
+                    ) or getattr(self.browser_coding_service, "close", None)
+                    if callable(close_browser_coding):
+                        await close_browser_coding()
+                except Exception:
+                    failed = True
+                    logger.debug(
+                        "browser coding service close failed for runtime %s",
+                        self.runtime_id,
+                        exc_info=True,
+                    )
             if self.execution_service is not None:
                 try:
                     await self.tool_scheduler.aclose()
@@ -2084,6 +2121,30 @@ async def build_runtime(
             browser_manager = BrowserManager(runtime_profile=runtime_profile)
         else:
             browser_manager = cfg.browser_manager
+        if cfg.browser_coding_service is None:
+            from khaos.coding.browser import (
+                BrowserCodingService,
+                BrowserStateRepository,
+            )
+
+            browser_coding_service = BrowserCodingService(
+                browser_manager=browser_manager,
+                execution_service=execution_service,
+                network_guard=network_guard,
+                approval_broker=cfg.approval_broker,
+                workspace_manager=workspace_manager,
+                app_profiles=cfg.app_profiles,
+                policy_digest=getattr(
+                    getattr(scheduler, "security_middleware", None),
+                    "effective_policy_digest",
+                    "",
+                ),
+                runtime_id=cfg.runtime_id,
+                state_repository=BrowserStateRepository(cfg.db),
+                supervision_service=cfg.supervision_service,
+            )
+        else:
+            browser_coding_service = cfg.browser_coding_service
         # B1: register the authority on the scheduler only (instance attribute).
         # The previous module-global ``file_tools._office_authority`` was removed
         # — direct callers must pass ``office_authority`` explicitly or fall back
@@ -2167,6 +2228,7 @@ async def build_runtime(
             autonomous_observation_store = VerificationObservationStore()
         autonomous_verification = AutonomousVerificationCoordinator(
             execution_service=execution_service,
+            browser_service=browser_coding_service,
             repo_intelligence=(
                 getattr(context_intelligence, "repo_intelligence", None)
                 if context_intelligence is not None
@@ -2346,6 +2408,11 @@ async def build_runtime(
                 cfg.db,
                 audit_logger=audit_logger,
             )
+        set_browser_supervision = getattr(
+            browser_coding_service, "set_supervision_service", None
+        )
+        if callable(set_browser_supervision):
+            set_browser_supervision(supervision_service)
         checkpoint_service = None
         if cfg.delegated_execution_context is None:
             checkpoint_service = CheckpointService(
@@ -2456,6 +2523,7 @@ async def build_runtime(
             channel_admins=cfg.channel_admins,
             cron_engine=cfg.cron_engine,
             browser_manager=browser_manager,
+            browser_coding_service=browser_coding_service,
             subagent_spawner=cfg.subagent_spawner,
             subagent_control_coordinator=subagent_control_coordinator,
             credential_broker=credential_broker,
@@ -2559,6 +2627,7 @@ async def build_runtime(
         runtime.owns_context_intelligence = context_intelligence is not None
         runtime.context_engine = context_engine
         runtime.verification_coordinator = autonomous_verification
+        runtime.browser_coding_service = browser_coding_service
         runtime.parallel_subagent_coordinator = parallel_subagent_coordinator
         runtime.supervision_service = supervision_service
         runtime.checkpoint_service = checkpoint_service

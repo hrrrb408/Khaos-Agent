@@ -52,8 +52,13 @@ class AutonomousVerificationCoordinator:
         principal_id: str = "",
         project_id: str = "",
         repository_id: str = "",
+        browser_service: Any | None = None,
     ) -> None:
-        self.executor = VerificationExecutor(execution_service)
+        self.executor = VerificationExecutor(
+            execution_service,
+            browser_service=browser_service,
+        )
+        self.browser_service = browser_service
         self.repo_intelligence = repo_intelligence
         self.evidence_store = evidence_store or VerificationObservationStore()
         self.profile_detector = profile_detector or VerificationProfileDetector()

@@ -17,8 +17,8 @@
 
 ## Import reachability result
 
-- Reachable repository modules: `347`.
-- Resolved import edges: `2893`.
+- Reachable repository modules: `353`.
+- Resolved import edges: `2967`.
 - Forbidden production edges: `0`.
 - Unresolved internal edges: `0`.
 
@@ -65,6 +65,12 @@
 - `khaos.channels.models`
 - `khaos.channels.registry`
 - `khaos.channels.webhook`
+- `khaos.coding.browser`
+- `khaos.coding.browser.artifacts`
+- `khaos.coding.browser.contracts`
+- `khaos.coding.browser.metrics`
+- `khaos.coding.browser.service`
+- `khaos.coding.browser.state`
 - `khaos.coding.checkpoints.contracts`
 - `khaos.coding.checkpoints.repository`
 - `khaos.coding.checkpoints.service`

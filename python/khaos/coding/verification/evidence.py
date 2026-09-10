@@ -58,6 +58,11 @@ class VerificationEvidence:
     evidence_digest: str = ""
     started_at: float = 0.0
     finished_at: float = 0.0
+    # M8.8: browser evidence remains a bounded observation projection.  The
+    # existing trusted verification/completion authority still decides
+    # whether a run is sufficient.
+    browser_evidence_digest: str = ""
+    artifact_refs: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         for label, value in (
@@ -101,6 +106,22 @@ class VerificationEvidence:
             type(item) is not VerificationDiagnostic for item in self.diagnostics
         ):
             raise VerificationContractError("diagnostics are invalid")
+        object.__setattr__(
+            self,
+            "browser_evidence_digest",
+            _digest(
+                self.browser_evidence_digest,
+                label="browser_evidence_digest",
+                allow_empty=True,
+            ),
+        )
+        if type(self.artifact_refs) is not tuple or len(self.artifact_refs) > 32 or any(
+            type(item) is not str or not item or len(item) > 256 or "\x00" in item
+            for item in self.artifact_refs
+        ):
+            raise VerificationContractError("artifact_refs are invalid")
+        if len(set(self.artifact_refs)) != len(self.artifact_refs):
+            raise VerificationContractError("artifact_refs contain duplicates")
         computed = self._computed_digest()
         if self.evidence_digest:
             object.__setattr__(self, "evidence_digest", _digest(self.evidence_digest, label="evidence_digest"))
@@ -127,6 +148,8 @@ class VerificationEvidence:
             "diagnostics": tuple(item.to_payload() for item in self.diagnostics),
             "started_at": self.started_at,
             "finished_at": self.finished_at,
+            "browser_evidence_digest": self.browser_evidence_digest,
+            "artifact_refs": self.artifact_refs,
         }
 
     def _computed_digest(self) -> str:

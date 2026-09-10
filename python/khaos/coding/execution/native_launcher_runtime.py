@@ -17,15 +17,16 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - resource is POSIX-only
     resource = None  # type: ignore[assignment]
 
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-
-from khaos.coding.execution.receipt_binding import launcher_binding_digest
-from khaos.security.authorityd_protocol import SignedAuthorizationReceipt
-
 
 def main(argv: list[str]) -> int:
     options, command = _parse(argv)
     if options.get("require_authority_receipt"):
+        # Keep the development launcher importable for arbitrary read-only
+        # oracle payloads.  The receipt verifier pulls in the full Khaos
+        # package graph; production is the only path that needs it, and it
+        # still loads these trusted modules immediately before verification.
+        from khaos.coding.execution.receipt_binding import launcher_binding_digest
+
         receipt_fd = options.get("authority_receipt_fd")
         public_key_fd = options.get("authority_public_key_fd")
         if receipt_fd is None or public_key_fd is None:
@@ -307,6 +308,10 @@ def _verify_authority_receipt(
     expected_resource_digest: str,
 ) -> None:
     """Verify the same signed receipt contract as the Rust launcher."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+    from khaos.security.authorityd_protocol import SignedAuthorizationReceipt
+
     receipt_payload = _read_fd(receipt_fd, 64 * 1024)
     public_key_payload = _read_fd(public_key_fd, 4096)
     try:

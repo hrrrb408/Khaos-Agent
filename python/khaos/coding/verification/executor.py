@@ -10,6 +10,10 @@ from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from khaos.coding.browser.contracts import (
+    BrowserResultStatus,
+    BrowserRunResult,
+)
 from khaos.coding.execution import (
     ExecutionRequest,
     ExecutionResult,
@@ -39,11 +43,13 @@ class VerificationExecutor:
         execution_service: Any,
         *,
         diagnostic_parser: DiagnosticParser | None = None,
+        browser_service: Any | None = None,
     ) -> None:
         if execution_service is None or not callable(getattr(execution_service, "execute", None)):
             raise ValueError("VerificationExecutor requires the composed ExecutionService")
         self.execution_service = execution_service
         self.diagnostic_parser = diagnostic_parser or DiagnosticParser()
+        self.browser_service = browser_service
 
     async def execute(
         self,
@@ -127,21 +133,37 @@ class VerificationExecutor:
                 },
             )
             try:
-                result = await self._execute_check(
-                    check,
-                    root=root,
-                    task_id=task_id,
-                    workspace_id=plan.workspace_id,
-                    principal_id=principal_id,
-                    project_id=project_id,
-                    timeout_seconds=min(check.timeout_seconds, remaining),
-                    output_limit_bytes=min(
-                        check.output_limit_bytes,
-                        plan.max_output_bytes,
-                        65_536,
-                    ),
-                    run_id=effective_run_id,
-                )
+                browser_result: BrowserRunResult | None = None
+                if check.kind.value in {"browser", "ui"}:
+                    browser_result = await asyncio.wait_for(
+                        self._execute_browser_check(
+                            check,
+                            plan=plan,
+                            workspace=workspace,
+                            task_id=task_id,
+                            principal_id=principal_id,
+                            project_id=project_id,
+                            run_id=effective_run_id,
+                        ),
+                        timeout=min(check.timeout_seconds, remaining),
+                    )
+                    result = None
+                else:
+                    result = await self._execute_check(
+                        check,
+                        root=root,
+                        task_id=task_id,
+                        workspace_id=plan.workspace_id,
+                        principal_id=principal_id,
+                        project_id=project_id,
+                        timeout_seconds=min(check.timeout_seconds, remaining),
+                        output_limit_bytes=min(
+                            check.output_limit_bytes,
+                            plan.max_output_bytes,
+                            65_536,
+                        ),
+                        run_id=effective_run_id,
+                    )
             except asyncio.CancelledError:
                 await self._terminate(f"m83-{effective_run_id}-{check.check_id}")
                 evidence.append(
@@ -216,12 +238,22 @@ class VerificationExecutor:
                 )
                 aggregate_status = VerificationRunStatus.INFRASTRUCTURE_ERROR
                 break
-            evidence_item = self._evidence_from_result(
-                run_id=effective_run_id,
-                plan=plan,
-                check=check,
-                result=result,
-                workspace_root=root,
+            if browser_result is not None:
+                evidence_item = self._evidence_from_browser_result(
+                    run_id=effective_run_id,
+                    plan=plan,
+                    check=check,
+                    result=browser_result,
+                    started_at=check_started_at,
+                    finished_at=time.time(),
+                )
+            else:
+                evidence_item = self._evidence_from_result(
+                    run_id=effective_run_id,
+                    plan=plan,
+                    check=check,
+                    result=result,
+                    workspace_root=root,
                     output_limit_bytes=min(
                         check.output_limit_bytes,
                         plan.max_output_bytes,
@@ -278,6 +310,37 @@ class VerificationExecutor:
     async def run(self, plan: VerificationPlan, **kwargs: Any) -> VerificationRun:
         """Compatibility alias for callers that use the ``run`` vocabulary."""
         return await self.execute(plan, **kwargs)
+
+    async def _execute_browser_check(
+        self,
+        check: VerificationCheck,
+        *,
+        plan: VerificationPlan,
+        workspace: Any | None,
+        task_id: str,
+        principal_id: str,
+        project_id: str,
+        run_id: str,
+    ) -> BrowserRunResult:
+        if self.browser_service is None:
+            raise RuntimeError("browser verification owner is unavailable")
+        if check.browser_spec is None:
+            raise RuntimeError("browser verification check has no typed spec")
+        result = await self.browser_service.run_verification(
+            check.browser_spec,
+            plan_id=plan.plan_id,
+            check_id=check.check_id,
+            run_id=run_id,
+            workspace=workspace,
+            task_id=task_id,
+            principal_id=principal_id,
+            project_id=project_id,
+            workspace_generation=plan.workspace_generation,
+            repository_generation=plan.repository_generation,
+        )
+        if type(result) is not BrowserRunResult:
+            raise RuntimeError("browser verification owner returned an invalid result")
+        return result
 
     async def _execute_check(
         self,
@@ -378,6 +441,63 @@ class VerificationExecutor:
             diagnostics=diagnostics,
             started_at=started_at,
             finished_at=finished_at,
+        )
+
+    def _evidence_from_browser_result(
+        self,
+        *,
+        run_id: str,
+        plan: VerificationPlan,
+        check: VerificationCheck,
+        result: BrowserRunResult,
+        started_at: float,
+        finished_at: float,
+    ) -> VerificationEvidence:
+        status = {
+            BrowserResultStatus.PASS: VerificationCheckStatus.PASSED,
+            BrowserResultStatus.FAIL: VerificationCheckStatus.FAILED,
+            BrowserResultStatus.STALE: VerificationCheckStatus.STALE,
+            BrowserResultStatus.CANCELLED: VerificationCheckStatus.CANCELLED,
+            BrowserResultStatus.PAUSED: VerificationCheckStatus.CANCELLED,
+            BrowserResultStatus.ENVIRONMENT_BLOCKED: VerificationCheckStatus.INFRASTRUCTURE_ERROR,
+            BrowserResultStatus.INFRASTRUCTURE_ERROR: VerificationCheckStatus.INFRASTRUCTURE_ERROR,
+            BrowserResultStatus.UNKNOWN: VerificationCheckStatus.UNKNOWN,
+        }[result.status]
+        diagnostics: tuple[VerificationDiagnostic, ...] = ()
+        if status is not VerificationCheckStatus.PASSED:
+            category = (
+                DiagnosticCategory.TIMEOUT
+                if result.error_category == "timeout"
+                else DiagnosticCategory.INFRASTRUCTURE
+            )
+            diagnostics = (_run_diagnostic(category, result.error or result.status.value),)
+        browser_evidence_digest = ""
+        artifact_refs: tuple[str, ...] = ()
+        if result.evidence is not None:
+            browser_evidence_digest = result.evidence.evidence_digest
+            artifact_refs = result.evidence.artifact_refs
+        elif result.observation is not None:
+            browser_evidence_digest = result.observation.observation_digest
+            artifact_refs = tuple(item.artifact_id for item in result.observation.artifacts)
+        return VerificationEvidence(
+            run_id=run_id,
+            plan_id=plan.plan_id,
+            check_id=check.check_id,
+            workspace_id=plan.workspace_id,
+            workspace_generation=plan.workspace_generation,
+            repository_generation=plan.repository_generation,
+            command_digest=check.command_digest,
+            status=status,
+            exit_code=0 if status is VerificationCheckStatus.PASSED else None,
+            duration_ms=max(0, int((finished_at - started_at) * 1000)),
+            stdout_digest="",
+            stderr_digest="",
+            output_truncated=False,
+            diagnostics=diagnostics,
+            started_at=started_at,
+            finished_at=finished_at,
+            browser_evidence_digest=browser_evidence_digest,
+            artifact_refs=artifact_refs,
         )
 
 

@@ -62,6 +62,12 @@ _CONFIG_NAMES = frozenset(
         "tsconfig.json",
     }
 )
+_BROWSER_SUFFIXES = frozenset(
+    {".html", ".htm", ".css", ".scss", ".sass", ".less", ".vue", ".svelte"}
+)
+_BROWSER_PATH_PARTS = frozenset(
+    {"frontend", "web", "ui", "routes", "templates", "static", "public", "client", "browser"}
+)
 
 
 def _path(value: str) -> str:
@@ -385,6 +391,22 @@ class EditImpact:
         return bool(self.changed_paths) and all(_looks_like_test(path) for path in self.changed_paths)
 
     @property
+    def requires_browser(self) -> bool:
+        """Return whether the trusted edit scope requires a browser check."""
+        if not self.changed_paths:
+            return False
+        for path in self.changed_paths:
+            candidate = PurePosixPath(path)
+            name = candidate.name.casefold()
+            if candidate.suffix.casefold() in _BROWSER_SUFFIXES:
+                return True
+            if any(part.casefold() in _BROWSER_PATH_PARTS for part in candidate.parts):
+                return True
+            if name in {"package.json", "vite.config.js", "vite.config.ts", "webpack.config.js", "next.config.js"}:
+                return True
+        return False
+
+    @property
     def languages(self) -> tuple[str, ...]:
         """Return languages inferred from changed file suffixes."""
         mapping = {
@@ -419,6 +441,7 @@ class EditImpact:
             "public_api_changed": self.public_api_changed,
             "uncertainty": self.uncertainty,
             "after_workspace_digest": self.after_workspace_digest,
+            "requires_browser": self.requires_browser,
         }
 
 

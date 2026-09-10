@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Task filter</title>
+  </head>
+  <body>
+    <main>
+      <h1>Tasks</h1>
+      <label for="filter">Filter</label>
+      <input id="filter" type="search" placeholder="Search tasks">
+      <p id="result-count" role="status" aria-live="polite">2 tasks</p>
+      <ul id="tasks">
+        <li data-task="alpha">Alpha</li>
+        <li data-task="beta">Beta</li>
+      </ul>
+    </main>
+    <script>
+      const filter = document.querySelector("#filter");
+      const tasks = [...document.querySelectorAll("#tasks [data-task]")];
+      const resultCount = document.querySelector("#result-count");
+      filter.addEventListener("input", () => {
+        const query = filter.value.trim().toLowerCase();
+        const visible = tasks.filter((task) => task.textContent.toLowerCase().includes(query));
+        tasks.forEach((task) => { task.hidden = !visible.includes(task); });
+        resultCount.textContent = `${visible.length} tasks`;
+      });
+    </script>
+  </body>
+</html>

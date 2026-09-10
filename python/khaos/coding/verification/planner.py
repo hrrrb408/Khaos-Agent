@@ -233,6 +233,35 @@ class AutonomousVerificationPlanner:
         if not impact.is_docs_only:
             checks.extend(self._structural_checks(impact, profile))
 
+        if impact.requires_browser:
+            if not profile.browser_checks:
+                reasons = (
+                    *reasons,
+                    VerificationReason(
+                        "browser-verification-unavailable",
+                        "Browser-impacting changes require a trusted browser check, but no trusted app/check profile is available.",
+                    ),
+                )
+            else:
+                for browser_spec in profile.browser_checks:
+                    checks.append(
+                        self._make_check(
+                            command_id=browser_spec.spec_id,
+                            kind=VerificationCheckKind.BROWSER,
+                            stage=VerificationStage.INTEGRATION,
+                            argv=("khaos-browser-check", browser_spec.spec_id),
+                            cwd=".",
+                            profile_digest=profile.profile_digest,
+                            source="trusted-browser-profile",
+                            target_paths=impact.changed_paths,
+                            target_symbols=impact.changed_symbols,
+                            reason_codes=("browser-impact",),
+                            required=True,
+                            cost=VerificationCost.EXPENSIVE,
+                            browser_spec=browser_spec,
+                        )
+                    )
+
         selected_targeted = False
         selected_package = False
         for spec in profile.commands:
@@ -482,6 +511,7 @@ class AutonomousVerificationPlanner:
         reason_codes: tuple[str, ...],
         required: bool,
         cost: VerificationCost,
+        browser_spec=None,
     ) -> VerificationCheck:
         semantic = {
             "command_id": command_id,
@@ -493,6 +523,9 @@ class AutonomousVerificationPlanner:
             "target_paths": target_paths,
             "target_symbols": target_symbols,
             "reason_codes": reason_codes,
+            "browser_spec": (
+                browser_spec.to_payload() if browser_spec is not None else None
+            ),
         }
         check_id = f"m83-check-{canonical_digest(semantic)[:24]}"
         return VerificationCheck(
@@ -509,6 +542,7 @@ class AutonomousVerificationPlanner:
             reason_codes=reason_codes,
             required=required,
             cost=cost,
+            browser_spec=browser_spec,
         )
 
     @staticmethod

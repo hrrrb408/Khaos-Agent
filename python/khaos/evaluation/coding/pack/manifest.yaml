@@ -2,6 +2,78 @@ schema_version: 1
 manifest_id: m8-coding-capability-baseline
 version: 1
 scenarios:
+  - scenario_id: browser-frontend-bug
+    version: 1
+    kind: FRONTEND_BUG
+    difficulty: medium
+    repository_fixture: browser-frontend-bug
+    user_prompt: Fix the Save interaction so the task status is updated through the semantic button target and remains accessible to browser verification.
+    languages: [javascript]
+    expected_files: [src/app.html]
+    forbidden_files: [.env, .khaos]
+    tags: [browser, frontend, bug-fix]
+    oracle:
+      kind: COMPOSITE
+      children:
+        - kind: COMMAND
+          argv: [python3, .oracle-hidden/verify.py]
+          hidden_files: [verify.py]
+          network: none
+        - kind: DIFF
+          required_changed_files: [src/app.html]
+          forbidden_changed_files: [.env]
+          min_changed_files: 1
+          max_changed_files: 2
+          max_insertions: 100
+          max_deletions: 50
+  - scenario_id: browser-fullstack-bug
+    version: 1
+    kind: FULLSTACK_BUG
+    difficulty: hard
+    repository_fixture: browser-fullstack-bug
+    user_prompt: Fix the full-stack task update flow so the browser uses the task-owned API path, the server returns the documented JSON state, and the UI renders the returned status.
+    languages: [python, javascript]
+    expected_files: [server.py, frontend/index.html]
+    forbidden_files: [.env, .khaos]
+    tags: [browser, full-stack, bug-fix]
+    oracle:
+      kind: COMPOSITE
+      children:
+        - kind: COMMAND
+          argv: [python3, .oracle-hidden/verify.py]
+          hidden_files: [verify.py]
+          network: none
+        - kind: DIFF
+          required_changed_files: [server.py, frontend/index.html]
+          forbidden_changed_files: [.env]
+          min_changed_files: 2
+          max_changed_files: 3
+          max_insertions: 160
+          max_deletions: 100
+  - scenario_id: browser-validated-feature
+    version: 1
+    kind: BROWSER_VALIDATED_FEATURE
+    difficulty: medium
+    repository_fixture: browser-validated-feature
+    user_prompt: Add an accessible task filter that updates the visible result count and exposes a stable semantic status for deterministic browser verification.
+    languages: [javascript]
+    expected_files: [src/app.html]
+    forbidden_files: [.env, .khaos]
+    tags: [browser, frontend, feature]
+    oracle:
+      kind: COMPOSITE
+      children:
+        - kind: COMMAND
+          argv: [python3, .oracle-hidden/verify.py]
+          hidden_files: [verify.py]
+          network: none
+        - kind: DIFF
+          required_changed_files: [src/app.html]
+          forbidden_changed_files: [.env]
+          min_changed_files: 1
+          max_changed_files: 2
+          max_insertions: 140
+          max_deletions: 60
   - scenario_id: bugfix-go-counter
     version: 1
     kind: BUG_FIX
