@@ -548,6 +548,7 @@ def test_runtime_roots_include_lexical_virtualenv(tmp_path: Path):
     assert virtualenv.resolve() in roots
 
 
+@pytest.mark.posix_host
 def test_runtime_roots_follow_approved_path_for_shell_children(tmp_path: Path):
     base = tmp_path / "base" / "bin" / "python"
     base.parent.mkdir(parents=True)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 from khaos.cli.eval_commands import (
@@ -105,21 +106,21 @@ def test_coding_eval_cli_exposes_list_run_report_and_compare() -> None:
         "zhipu-coding",
         "zhipu-coding",
     )
-    assert str(artifact_run.results_jsonl) == "/tmp/m8-results.jsonl"
+    assert artifact_run.results_jsonl == Path("/tmp/m8-results.jsonl")
     assert artifact_run.task_seed == "seed-1"
     assert tagged.tag == "smoke"
     assert (
         qualification.model,
         qualification.provider,
         qualification.unlock_provider,
-        str(qualification.qualification_output),
-        str(qualification.results_jsonl),
+        qualification.qualification_output,
+        qualification.results_jsonl,
     ) == (
         "glm-5.3",
         "zhipu-coding",
         "zhipu-coding",
-        "/tmp/m8-qualification.json",
-        "/tmp/m8-qualification.jsonl",
+        Path("/tmp/m8-qualification.json"),
+        Path("/tmp/m8-qualification.jsonl"),
     )
     assert qualification_v3.p4_scenario == "p4-readonly-authority-v3"
     assert report.format == "json"

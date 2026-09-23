@@ -37,6 +37,9 @@ TEST_ROOT = "python/tests/"
 # collected set while giving their HostExecutionBackend children a clean
 # parent process.
 DEDICATED_FIRST_SHARD_PREFIXES = (
+    # Fresh-process import probes must run before the long shard can exhaust
+    # the hosted Windows runner's shared Winsock provider state.
+    "python/tests/integration/test_router_import_boundaries.py::",
     "python/tests/test_cli.py::",
     "python/tests/coding/test_runtime_approval_e2e.py::",
     "python/tests/tools/test_terminal_tools.py::",

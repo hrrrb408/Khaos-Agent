@@ -216,6 +216,7 @@ def test_unavailable_store_fails_closed_without_plaintext_fallback():
         broker.close()
 
 
+@pytest.mark.posix_host
 def test_secretless_writer_stores_only_opaque_ref(tmp_path):
     target = tmp_path / ".khaos" / "config.yaml"
     store = InMemoryCredentialStore()

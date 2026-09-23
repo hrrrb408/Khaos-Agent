@@ -156,6 +156,7 @@ async def test_local_runtime_builder_pins_local_profile(
 
 
 @pytest.mark.asyncio
+@pytest.mark.posix_host
 async def test_local_runtime_composes_typed_identity_without_browser_authority(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -76,6 +76,7 @@ def _assert_secretless(values: list[object], canary: str) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.posix_host
 async def test_synthetic_canary_crosses_all_runtime_output_boundaries(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
