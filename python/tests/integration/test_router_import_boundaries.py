@@ -81,12 +81,12 @@ def _clean_process_environment(
         # the audit module its explicit service-style trust root.  Probes
         # that provide a synthetic home also need USERPROFILE because
         # pathlib ignores HOME on Windows.
+        trusted_home = home if home is not None else python_root.parent
+        # pathlib uses USERPROFILE on Windows; keep it synthetic rather than
+        # inheriting the hosted runner's account metadata.
+        environment["USERPROFILE"] = str(trusted_home)
         if home is not None:
             environment["HOME"] = str(home)
-            environment["USERPROFILE"] = str(home)
-            trusted_home = home
-        else:
-            trusted_home = python_root.parent
         environment["KHAOS_AUDIT_TRUSTED_DIR"] = str(
             trusted_home / ".khaos" / "audit"
         )
