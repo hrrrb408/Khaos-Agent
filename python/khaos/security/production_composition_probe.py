@@ -527,6 +527,7 @@ async def _verified_production_runtime(
                     principal_kind=_COMPOSE_PRINCIPAL_KIND,
                     parent_principal_id=_COMPOSE_PARENT_PRINCIPAL_ID,
                     source_transport="cron",
+                    session_id=_COMPOSE_SESSION_ID,
                     project_id="compose",
                     runtime_id=_COMPOSE_RUNTIME_ID,
                 )
