@@ -948,12 +948,30 @@ class ExecutionService:
         temporary_home = Path(tempfile.mkdtemp(prefix="khaos-lsp-home-"))
         temporary_tmp = temporary_home / "tmp"
         temporary_tmp.mkdir(mode=0o700)
+        if type(request.environment) is not dict or any(
+            type(key) is not str or type(value) is not str
+            for key, value in request.environment.items()
+        ):
+            raise PermissionError("managed process environment is malformed")
+        permission_profile = request.permission_profile
+        if permission_profile is None:
+            raise PermissionError("managed process request has no permission profile")
+        allowed_environment_keys = permission_profile.environment_keys
+        if any(key not in allowed_environment_keys for key in request.environment):
+            raise PermissionError(
+                "managed process environment contains an unauthorized key"
+            )
         environment = {
-            "PATH": os.environ.get("PATH", ""),
-            "LANG": os.environ.get("LANG", "C.UTF-8"),
-            "HOME": str(temporary_home),
-            "TMPDIR": str(temporary_tmp),
+            key: value
+            for key, value in request.environment.items()
+            if key not in {"HOME", "TMPDIR"}
         }
+        environment.setdefault("PATH", os.environ.get("PATH", ""))
+        environment.setdefault("LANG", os.environ.get("LANG", "C.UTF-8"))
+        # The managed-process owner always controls HOME/TMPDIR so app
+        # profiles cannot escape the synthetic process storage boundary.
+        environment["HOME"] = str(temporary_home)
+        environment["TMPDIR"] = str(temporary_tmp)
         resolved = ResolvedExecutionContext(
             request.task_id, request.workspace_id, workspace.state.value,
             workspace.repository_root.expanduser().absolute(), root, cwd, (),
@@ -964,6 +982,10 @@ class ExecutionService:
                 network=NetworkPolicy.NONE,
                 environment_keys=frozenset(environment),
                 resources=request.budget,
+                local_listen_ports=(
+                    permission_profile.local_listen_ports
+                    or request.local_listen_ports
+                ),
             ).bind_workspace(root),
             workspace_root_identity=root_identity,
             workspace_cwd_identity=cwd_identity,
@@ -1143,6 +1165,7 @@ class ExecutionService:
                 synthetic_home=temporary_home,
                 synthetic_tmp=temporary_home / "tmp",
                 preserve_workspace_path=context.workspace_root_identity is not None,
+                local_listen_ports=context.permission_profile.local_listen_ports,
             )
             return (
                 "/usr/bin/sandbox-exec",
@@ -1160,6 +1183,7 @@ class ExecutionService:
                 resources=context.budget,
                 command=context.argv,
                 environment=context.environment,
+                local_listen_ports=context.permission_profile.local_listen_ports,
             )
             return (*prefix, "--", *context.argv)
         raise PermissionError("unsupported: managed process backend cannot enforce network isolation")

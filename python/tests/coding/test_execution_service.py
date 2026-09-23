@@ -418,6 +418,7 @@ async def test_shutdown_retry_succeeds_when_failed_step_recovers():
 
 @pytest.mark.asyncio
 @pytest.mark.posix_host
+@pytest.mark.requires_trusted_git
 async def test_shutdown_cancels_in_flight_managed_spawn(tmp_path: Path):
     """Batch 15.7: shutdown() must cancel a ``start_managed_process()``
     that is paused inside ``managed_process_factory`` (between admission
@@ -498,6 +499,7 @@ async def test_shutdown_cancels_in_flight_managed_spawn(tmp_path: Path):
 
 @pytest.mark.asyncio
 @pytest.mark.posix_host
+@pytest.mark.requires_trusted_git
 async def test_late_publish_after_closing_kills_handle(tmp_path: Path):
     """Batch 15.7: if ``_shutdown_state`` transitions away from OPEN
     between the final re-check and the ``_active`` publish (the

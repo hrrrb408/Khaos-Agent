@@ -26,6 +26,7 @@ from khaos.coding.workspace.manager import WorkspaceManager
 
 @pytest.mark.asyncio
 @pytest.mark.posix_host
+@pytest.mark.requires_trusted_git
 async def test_execution_service_rejects_cross_task_workspace(tmp_path: Path):
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -45,6 +46,7 @@ async def test_execution_service_rejects_cross_task_workspace(tmp_path: Path):
 
 @pytest.mark.asyncio
 @pytest.mark.posix_host
+@pytest.mark.requires_trusted_git
 async def test_execution_service_rejects_cross_principal_workspace(tmp_path: Path):
     repo = tmp_path / "repo-owner"
     repo.mkdir()
@@ -173,6 +175,7 @@ def test_directory_binding_rejects_symlinked_cwd_component(tmp_path: Path):
 
 @pytest.mark.asyncio
 @pytest.mark.posix_host
+@pytest.mark.requires_trusted_git
 async def test_execution_git_pointer_drift_is_quarantined_before_return(tmp_path: Path):
     repo = tmp_path / "repo"
     repo.mkdir()

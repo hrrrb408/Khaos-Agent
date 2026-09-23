@@ -1,7 +1,6 @@
 from pathlib import Path
 
 import pytest
-
 from khaos.coding.execution import (
     ExecutionRequest,
     FileSystemAccess,
@@ -20,6 +19,7 @@ def test_legacy_read_only_request_builds_immutable_profile(tmp_path: Path):
     assert request.permission_profile.writable_roots == ()
     assert request.permission_profile.network is NetworkPolicy.NONE
     assert "HOME" not in request.permission_profile.environment_keys
+    assert "PYTHONDONTWRITEBYTECODE" in request.permission_profile.environment_keys
     assert Path.home().resolve() / ".ssh" in request.permission_profile.unreadable_roots
 
 

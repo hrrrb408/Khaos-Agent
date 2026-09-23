@@ -158,10 +158,16 @@ async def test_lsp_timeout_eof_stderr_and_runtime_shutdown(tmp_path):
     service, workspace = _runtime(tmp_path)
     server = tmp_path / "server.py"
     server.write_text(FAKE_SERVER, encoding="utf-8")
-    client = _client(service, workspace, server, timeout=0.05)
+    # Keep process admission/initialize separate from the request-timeout
+    # assertion.  A 50ms process-start budget is scheduler-sensitive on
+    # hosted macOS runners, while the behavior under test is the bounded
+    # request itself.
+    client = _client(service, workspace, server, timeout=1)
     assert (await client.start(workspace.worktree_path.as_uri()))["ok"]
+    client.timeout = 0.05
     with pytest.raises(asyncio.TimeoutError):
         await client.request("sleep", {})
+    client.timeout = 1
     await client.close()
     client = _client(service, workspace, server, timeout=1)
     assert (await client.start(workspace.worktree_path.as_uri()))["ok"]

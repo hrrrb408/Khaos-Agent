@@ -7,6 +7,7 @@ unit-testable without a running Textual app. The TUI widgets call into
 
 from __future__ import annotations
 
+import asyncio
 import shlex
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -14,6 +15,8 @@ from pathlib import Path
 from typing import Any
 
 from khaos.runtime.context import local_principal_id
+from khaos.security.credential_broker import CredentialBrokerError
+from khaos.security.credentials import CredentialRef
 from khaos.skills import SkillManager
 
 
@@ -40,6 +43,16 @@ class TuiContext:
     skill_manager: SkillManager | None = None
     # Optional shared coding-task tracker for the /tasks and /task commands.
     task_manager: Any = None
+    # Canonical M8.6 supervision and checkpoint owners.  Presentation code
+    # must call these typed services instead of maintaining a second state
+    # machine or reading the worktree directly.
+    supervision_service: Any = None
+    checkpoint_service: Any = None
+    # The runtime-owned CredentialBroker is the only credential authority.
+    # Slash commands may request an explicit unlock/lock; Agent tools never
+    # receive this handle.
+    credential_broker: Any = None
+    principal_id: str = ""
     # Optional cron engine for the /cron command.
     cron_engine: Any = None
     # Optional session history search for the /history command.
@@ -101,8 +114,19 @@ Khaos TUI — slash commands:
   /memory import <path>     Import a scope-bound package
   /tools [mode]             List available tools (optionally per mode)
   /model <name>             Show or set the active model (set is advisory)
+  /credentials status       Show safe persistent/session credential state
+  /credentials unlock <p>  Explicitly unlock one configured provider
+  /credentials lock <p>    Lock one provider's in-memory lease
   /tasks                    List active coding tasks (all tasks with -a)
   /task <id>                Show details for one coding task
+  /status [task_id]         Show typed supervision state
+  /pause <task_id>          Request a safe cooperative pause
+  /resume <task_id>         Resume a paused task
+  /cancel <task_id>         Cancel and drain a task safely
+  /checkpoint list [id]     List checkpoint metadata
+  /checkpoint show <id>     Show one checkpoint metadata
+  /checkpoint create <id>   Create a user checkpoint
+  /rewind <checkpoint_id>   Build a safe rewind preview
   /cron list                List scheduled tasks
   /cron create <n> <sched> <prompt>  Create a scheduled task
   /cron pause <id>          Pause a scheduled task
@@ -167,10 +191,20 @@ async def handle_command(line: str, ctx: TuiContext) -> CommandResult:
         return _cmd_tools(args, ctx)
     if cmd == "/model":
         return _cmd_model(args, ctx)
+    if cmd == "/credentials":
+        return await _cmd_credentials(args, ctx)
     if cmd == "/tasks":
         return await _cmd_tasks(args, ctx)
     if cmd == "/task":
         return await _cmd_task(args, ctx)
+    if cmd == "/status":
+        return await _cmd_status(args, ctx)
+    if cmd in {"/pause", "/resume", "/cancel"}:
+        return await _cmd_control(cmd[1:], args, ctx)
+    if cmd == "/checkpoint":
+        return await _cmd_checkpoint(args, ctx)
+    if cmd == "/rewind":
+        return await _cmd_rewind(args, ctx)
     if cmd == "/cron":
         return await _cmd_cron(args, ctx)
     if cmd == "/history":
@@ -181,6 +215,95 @@ async def handle_command(line: str, ctx: TuiContext) -> CommandResult:
         return _cmd_session(args, ctx)
 
     return CommandResult(handled=True, message=f"unknown command: {cmd}\n\n{HELP_TEXT}")
+
+
+def _configured_credential_ref(ctx: TuiContext, provider: str) -> CredentialRef:
+    """Resolve a provider name through the already-composed router only."""
+    if ctx.router is None:
+        raise CredentialBrokerError("provider router is not configured")
+    manager = getattr(ctx.router, "provider_manager", None)
+    if manager is None:
+        raise CredentialBrokerError("provider manager is not configured")
+    try:
+        config = manager.get_provider(provider.casefold())
+    except (KeyError, AttributeError) as exc:
+        raise CredentialBrokerError("provider is not configured") from exc
+    ref = getattr(config, "credential_ref", None)
+    if not isinstance(ref, CredentialRef):
+        raise CredentialBrokerError("provider has no configured credential")
+    return ref
+
+
+def _credential_error_message(exc: CredentialBrokerError) -> str:
+    """Render only typed, secret-free session failure metadata."""
+    code = getattr(exc, "code", None)
+    if isinstance(code, str) and code:
+        return code
+    return type(exc).__name__
+
+
+async def _cmd_credentials(args: list[str], ctx: TuiContext) -> CommandResult:
+    """Handle explicit human credential-session operations in the TUI."""
+    broker = ctx.credential_broker
+    if broker is None:
+        return CommandResult(handled=True, message="credential broker not configured")
+    action = args[0].casefold() if args else "status"
+    targets = args[1:] if args else []
+    if action not in {"status", "unlock", "lock"}:
+        return CommandResult(
+            handled=True,
+            message="usage: /credentials status | unlock <provider|all> | lock <provider|all>",
+        )
+    manager = getattr(ctx.router, "provider_manager", None)
+    providers = getattr(manager, "providers", {}) if manager is not None else {}
+    if not isinstance(providers, dict):
+        return CommandResult(handled=True, message="provider manager not configured")
+    if action == "status":
+        selected = targets or sorted(str(name) for name in providers)
+        lines: list[str] = []
+        for provider in selected:
+            try:
+                ref = _configured_credential_ref(ctx, provider)
+                status = broker.credential_session.status(ref, provider=provider)
+                lines.append(
+                    f"{provider}: {status['session']} "
+                    f"({status['runtime_credential']})"
+                )
+            except CredentialBrokerError as exc:
+                lines.append(f"{provider}: {_credential_error_message(exc)}")
+        return CommandResult(
+            handled=True,
+            message="\n".join(lines) if lines else "no configured provider credentials",
+        )
+
+    if not targets or len(targets) != 1:
+        return CommandResult(
+            handled=True,
+            message=f"usage: /credentials {action} <provider|all>",
+        )
+    target = targets[0].casefold()
+    selected = (
+        sorted(str(name) for name in providers)
+        if target == "all"
+        else [target]
+    )
+    results: list[str] = []
+    for provider in selected:
+        try:
+            ref = _configured_credential_ref(ctx, provider)
+            if action == "unlock":
+                await asyncio.to_thread(
+                    broker.credential_session.unlock,
+                    ref,
+                    provider=provider,
+                )
+                results.append(f"{provider}: UNLOCKED")
+            else:
+                broker.credential_session.lock(ref, provider=provider)
+                results.append(f"{provider}: LOCKED")
+        except CredentialBrokerError as exc:
+            results.append(f"{provider}: {_credential_error_message(exc)}")
+    return CommandResult(handled=True, message="\n".join(results))
 
 
 def _cmd_channels(args: list[str], ctx: TuiContext) -> CommandResult:
@@ -711,6 +834,225 @@ async def _cmd_task(args: list[str], ctx: TuiContext) -> CommandResult:
             ok = result.get("success")
             lines.append(f"    - success={ok}")
     return CommandResult(handled=True, message="\n".join(lines))
+
+
+def _supervision_owner(ctx: TuiContext) -> tuple[str, str]:
+    return ctx.principal_id or local_principal_id(), ctx.project_id or "legacy"
+
+
+def _control_message(payload: dict[str, object]) -> str:
+    status = payload.get("status", "UNKNOWN")
+    task_id = payload.get("task_id", "")
+    control_state = payload.get("control_state", "unknown")
+    reason = payload.get("reason")
+    suffix = f"; {reason}" if reason else ""
+    return f"{task_id}: {status} ({control_state}){suffix}"
+
+
+async def _cmd_status(args: list[str], ctx: TuiContext) -> CommandResult:
+    """Render only the durable supervision projection, never raw model data."""
+    if ctx.supervision_service is None:
+        return CommandResult(handled=True, message="supervision service not configured")
+    if len(args) > 1:
+        return CommandResult(handled=True, message="usage: /status [task_id]")
+    principal_id, project_id = _supervision_owner(ctx)
+    if args:
+        task_id = args[0]
+        state = await ctx.supervision_service.state(
+            task_id, principal_id=principal_id, project_id=project_id
+        )
+        if state is None:
+            return CommandResult(handled=True, message=f"task {task_id!r} has no supervision state")
+        payload = state.to_payload()
+        activity = payload.get("activity") or {}
+        return CommandResult(
+            handled=True,
+            message=(
+                f"task {task_id}: {payload.get('status')} "
+                f"generation={payload.get('repository_generation')} "
+                f"revision={payload.get('revision')} "
+                f"activity={activity.get('kind', 'idle')}"
+            ),
+            payload=payload,
+        )
+    if ctx.task_manager is None:
+        return CommandResult(handled=True, message="usage: /status <task_id>")
+    tasks = await ctx.task_manager.list_active()
+    if not tasks:
+        return CommandResult(handled=True, message="no active coding tasks.")
+    rows: list[str] = []
+    for task in tasks:
+        task_id = task.get("id", "") if isinstance(task, dict) else getattr(task, "id", "")
+        state = await ctx.supervision_service.state(
+            task_id, principal_id=principal_id, project_id=project_id
+        )
+        status = state.status.value if state is not None else "UNINITIALIZED"
+        rows.append(f"  {task_id} [{status}]")
+    return CommandResult(handled=True, message="supervision:\n" + "\n".join(rows))
+
+
+async def _task_workspace(ctx: TuiContext, task_id: str) -> str | None:
+    if ctx.task_manager is not None:
+        task = await ctx.task_manager.get(task_id)
+        if task is not None:
+            metadata = getattr(task, "metadata", None)
+            if isinstance(metadata, dict) and isinstance(metadata.get("workspace_id"), str):
+                return metadata["workspace_id"]
+    if ctx.supervision_service is not None:
+        principal_id, project_id = _supervision_owner(ctx)
+        state = await ctx.supervision_service.state(
+            task_id, principal_id=principal_id, project_id=project_id
+        )
+        return state.workspace_id if state is not None else None
+    return None
+
+
+async def _cmd_control(command: str, args: list[str], ctx: TuiContext) -> CommandResult:
+    if ctx.supervision_service is None:
+        return CommandResult(handled=True, message="supervision service not configured")
+    if len(args) < 1 or len(args) > 2:
+        return CommandResult(handled=True, message=f"usage: /{command} <task_id> [expected_revision]")
+    task_id = args[0]
+    try:
+        expected_revision = int(args[1]) if len(args) == 2 else None
+    except ValueError:
+        return CommandResult(handled=True, message="expected_revision must be an integer")
+    workspace_id = await _task_workspace(ctx, task_id)
+    if not workspace_id:
+        return CommandResult(handled=True, message=f"task {task_id!r} has no bound workspace")
+    principal_id, project_id = _supervision_owner(ctx)
+    handler = getattr(ctx.supervision_service, command)
+    result = await handler(
+        task_id=task_id,
+        workspace_id=workspace_id,
+        principal_id=principal_id,
+        project_id=project_id,
+        expected_revision=expected_revision,
+    )
+    payload = result.to_payload() if hasattr(result, "to_payload") else dict(result)
+    return CommandResult(handled=True, message=_control_message(payload), payload=payload)
+
+
+def _checkpoint_line(checkpoint: Any, *, detailed: bool = False) -> str:
+    payload = checkpoint.to_payload(include_snapshot=False)
+    line = (
+        f"{payload['checkpoint_id']} [{payload['checkpoint_kind']}] "
+        f"generation={payload['repository_generation']} "
+        f"label={payload['label'] or '-'}"
+    )
+    if detailed:
+        line += (
+            f"\n  task={payload['task_id']} workspace={payload['workspace_id']} "
+            f"snapshot={payload['snapshot_digest']} files={len(checkpoint.snapshot)}"
+            f"\n  digest={payload['checkpoint_digest']}"
+        )
+    return line
+
+
+async def _cmd_checkpoint(args: list[str], ctx: TuiContext) -> CommandResult:
+    if not args or args[0] not in {"list", "show", "create"}:
+        return CommandResult(
+            handled=True,
+            message="usage: /checkpoint [list [task_id]|show <id>|create <task_id> [label]]",
+        )
+    if ctx.checkpoint_service is None and ctx.db is None:
+        return CommandResult(handled=True, message="checkpoint service not configured")
+    principal_id, project_id = _supervision_owner(ctx)
+    sub = args[0]
+    if sub == "list":
+        task_id = args[1] if len(args) > 1 else None
+        if task_id is None:
+            if ctx.task_manager is None:
+                return CommandResult(handled=True, message="usage: /checkpoint list <task_id>")
+            tasks = await ctx.task_manager.list_active()
+            task_id = tasks[0].get("id") if tasks and isinstance(tasks[0], dict) else None
+        if not task_id:
+            return CommandResult(handled=True, message="no task selected")
+        if ctx.checkpoint_service is not None:
+            checkpoints = await ctx.checkpoint_service.list_checkpoints(
+                task_id, principal_id=principal_id, project_id=project_id
+            )
+        else:
+            checkpoints = await ctx.db.checkpoint_repository.list(
+                task_id, principal_id=principal_id, project_id=project_id
+            )
+        if not checkpoints:
+            return CommandResult(handled=True, message=f"no checkpoints for {task_id}")
+        return CommandResult(
+            handled=True,
+            message="\n".join(_checkpoint_line(item) for item in checkpoints),
+            payload=[item.to_payload(include_snapshot=False) for item in checkpoints],
+        )
+    if sub == "show":
+        if len(args) != 2:
+            return CommandResult(handled=True, message="usage: /checkpoint show <checkpoint_id>")
+        checkpoint_id = args[1]
+        checkpoint = await (
+            ctx.checkpoint_service.checkpoint(
+                checkpoint_id, principal_id=principal_id, project_id=project_id
+            )
+            if ctx.checkpoint_service is not None
+            else ctx.db.checkpoint_repository.get(
+                checkpoint_id, principal_id=principal_id, project_id=project_id
+            )
+        )
+        if checkpoint is None:
+            return CommandResult(handled=True, message=f"checkpoint {checkpoint_id!r} not found")
+        return CommandResult(
+            handled=True,
+            message=_checkpoint_line(checkpoint, detailed=True),
+            payload=checkpoint.to_payload(include_snapshot=False),
+        )
+    if len(args) < 2:
+        return CommandResult(handled=True, message="usage: /checkpoint create <task_id> [label]")
+    task_id = args[1]
+    workspace_id = await _task_workspace(ctx, task_id)
+    if ctx.checkpoint_service is None or not workspace_id:
+        return CommandResult(
+            handled=True,
+            message="checkpoint capture requires the active workspace owner",
+        )
+    checkpoint = await ctx.checkpoint_service.create_checkpoint(
+        task_id=task_id,
+        workspace_id=workspace_id,
+        kind="USER_CREATED",
+        label=" ".join(args[2:]),
+        principal_id=principal_id,
+        project_id=project_id,
+    )
+    return CommandResult(
+        handled=True,
+        message=f"created {_checkpoint_line(checkpoint)}",
+        payload=checkpoint.to_payload(include_snapshot=False),
+    )
+
+
+async def _cmd_rewind(args: list[str], ctx: TuiContext) -> CommandResult:
+    """Only preview a rewind in the TUI; execution remains an explicit API action."""
+    if len(args) != 1:
+        return CommandResult(handled=True, message="usage: /rewind <checkpoint_id>")
+    if ctx.checkpoint_service is None:
+        return CommandResult(handled=True, message="checkpoint service not configured")
+    principal_id, project_id = _supervision_owner(ctx)
+    checkpoint = await ctx.checkpoint_service.checkpoint(
+        args[0], principal_id=principal_id, project_id=project_id
+    )
+    if checkpoint is None:
+        return CommandResult(handled=True, message=f"checkpoint {args[0]!r} not found")
+    plan = await ctx.checkpoint_service.build_rewind_plan(
+        args[0], principal_id=principal_id, project_id=project_id
+    )
+    payload = plan.to_payload(include_transaction_content=False)
+    status = "blocked" if plan.conflicts else plan.status
+    message = (
+        f"rewind preview {plan.rewind_id}: {status}; "
+        f"affected={len(plan.affected_paths)} preserved={len(plan.preserved_paths)}"
+    )
+    if plan.conflicts:
+        message += "\n  conflicts: " + "; ".join(plan.conflicts)
+    else:
+        message += "\n  execution is intentionally not performed by the TUI preview"
+    return CommandResult(handled=True, message=message, payload=payload)
 
 
 def _current_mode_value(ctx: TuiContext) -> str:

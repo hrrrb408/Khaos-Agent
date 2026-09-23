@@ -112,6 +112,33 @@ def test_context_request_is_deeply_typed_and_immutable() -> None:
             query="q",
             target_files=["foo.py"],  # type: ignore[arg-type]
         )
+    with pytest.raises(ContextContractError, match="item-count bound"):
+        ContextRequest(
+            task_id="t",
+            principal_id="p",
+            project_id="project",
+            goal_spec_id="g",
+            goal_spec_digest="0" * 64,
+            workspace_id="w",
+            repository_id="r",
+            query="q",
+            target_files=tuple(f"{index}.py" for index in range(257)),
+        )
+    with pytest.raises(ContextContractError, match="targets exceeds"):
+        ContextRequest(
+            task_id="t",
+            principal_id="p",
+            project_id="project",
+            goal_spec_id="g",
+            goal_spec_digest="0" * 64,
+            workspace_id="w",
+            repository_id="r",
+            query="q",
+            targets=tuple(
+                ContextTarget(relative_path=f"{index}.py")
+                for index in range(257)
+            ),
+        )
 
     semantic_fields = {
         field.name

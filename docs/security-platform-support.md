@@ -10,6 +10,14 @@ pass for the current commit.
 | macOS | Supported through the Seatbelt backend when its probe passes | No Linux namespace/browser-kernel claim |
 | Windows | Supported when the native helper probe passes | Native commands and trusted Python use an OS-issued no-network AppContainer; trusted Python stages the resolved base executable and grants temporary runtime RX ACLs only to the disposable tree, while brokered mode uses the restricted primary token plus exact loopback-only WFP rules; all paths use child-process policy, transactional workspace ACLs, a one-process Job Object, and fail closed |
 
+For native Linux systemd deployment, `khaos-agent.service` must own a
+systemd-delegated cgroup subtree and set `KHAOS_CGROUP_ROOT` to that exact
+service cgroup. Coding execution must run from inside that service boundary;
+an interactive shell-created sibling below `/sys/fs/cgroup` is not a valid
+delegated root because cgroup v2 rejects migration across an undelegated
+ancestor. The browser helper retains its separate root-owned delegated
+subtree.
+
 Host execution on supported POSIX systems requires a trusted
 `khaos-exec-launcher`. The loader accepts a root-owned or current-EUID-owned
 binary only when its binary and parent chain are not group/world-writable;

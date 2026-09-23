@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import os
 import stat
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -42,7 +41,6 @@ from khaos.db.state_root import (
     resolve_state_db_path,
     state_db_path,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -413,6 +411,8 @@ def test_acceptance_10_open_state_db_safely_creates_chain(
     assert db_path.parent.is_dir()
     mode = stat.S_IMODE(db_path.parent.lstat().st_mode)
     assert mode == 0o700
+    db_mode = stat.S_IMODE(db_path.lstat().st_mode)
+    assert db_mode == 0o600
 
 
 def test_acceptance_10b_open_state_db_safely_rejects_non_state_root(
@@ -449,10 +449,10 @@ async def test_acceptance_11_database_opens_after_state_root_resolution(
     assert db_path.exists()
     st = db_path.lstat()
     assert stat.S_ISREG(st.st_mode)
-    # SQLite creates with 0644 by default (subject to umask); the
-    # 0700 directory protects it.  We don't chmod the file here —
-    # that's a future hardening step.  The key property is that
-    # it's under a 0700 directory owned by the current UID.
+    # The state-root opener pre-creates the inode with owner-only
+    # permissions before SQLite connects, so the file contract remains
+    # 0600 after migrations as well as before them.
+    assert stat.S_IMODE(st.st_mode) == 0o600
     dir_st = db_path.parent.lstat()
     assert stat.S_IMODE(dir_st.st_mode) == 0o700
     assert dir_st.st_uid == os.getuid()

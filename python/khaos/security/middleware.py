@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any
 from khaos.security.command_guard import CommandGuard
 from khaos.security.path_guard import PathGuard
 from khaos.security.secret_scanner import ScanResult, SecretScanner
+from khaos.security.secret_redaction import SecretRedactor
 
 if TYPE_CHECKING:
     from khaos.audit.logger import AuditLogger
@@ -93,6 +94,7 @@ class SecurityMiddleware:
         audit_logger: AuditLogger | None = None,
         *,
         effective_policy: EffectiveSecurityPolicy | None = None,
+        secret_redactor: SecretRedactor | None = None,
     ):
         self.command_guard = command_guard or CommandGuard()
         self.path_guard = path_guard or PathGuard()
@@ -102,6 +104,7 @@ class SecurityMiddleware:
         self.sandbox = sandbox
         self.network_guard = network_guard
         self.audit_logger = audit_logger
+        self.secret_redactor = secret_redactor
         # B1: the effective policy is the compiled user ∩ project ∩ platform
         # intersection.  When present, it (not the raw project policy) drives
         # denied_paths / commands_blocked / secrets_scan_on_output, and its
@@ -394,8 +397,15 @@ class SecurityMiddleware:
 
     async def post_check(self, tool_name: str, output: Any) -> tuple[ScanResult, Any]:
         """Scan and redact tool output before it reaches model context."""
-        if not self.enabled or not self._scan_on_output or self.secret_scanner is None:
+        if not self.enabled:
             return ScanResult(has_secrets=False), output
+        redacted_output = (
+            self.secret_redactor.redact(output)
+            if self.secret_redactor is not None
+            else output
+        )
+        if not self._scan_on_output or self.secret_scanner is None:
+            return ScanResult(has_secrets=False), redacted_output
 
         text = ""
         if isinstance(output, str):
@@ -404,7 +414,7 @@ class SecurityMiddleware:
             text = str(output)
         result = self.secret_scanner.scan_text(text)
         if not result.has_secrets:
-            return result, output
+            return result, redacted_output
 
         def redact(value: Any) -> Any:
             if isinstance(value, str):
@@ -426,7 +436,11 @@ class SecurityMiddleware:
             return value
 
         logger.warning("secret detected and redacted in %s output", tool_name)
-        return result, redact(output)
+        return result, (
+            self.secret_redactor.redact(redact(output))
+            if self.secret_redactor is not None
+            else redact(output)
+        )
 
     def _scan_arguments_for_secrets(
         self, tool_name: str, arguments: dict

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import os
+import tempfile
 from pathlib import Path
 
+from khaos.coding.execution.environment import build_task_environment
 from khaos.coding.execution.models import (
     ExecutionRequest,
     ExecutionResult,
@@ -58,12 +60,12 @@ class HostExecutionBackend:
                 "host backend only permits network policy none; it cannot prove "
                 "network isolation; use an OS sandbox"
             )
-        env = {
+        requested_environment = {
             key: value
             for key, value in os.environ.items()
             if key in profile.environment_keys
         }
-        env.update(
+        requested_environment.update(
             {
                 key: value
                 for key, value in request.environment.items()
@@ -75,14 +77,29 @@ class HostExecutionBackend:
             if profile.filesystem.value == "workspace-write"
             else None
         )
-        return await self._get_supervisor().run(
-            request,
-            cwd=cwd,
-            execution_root=roots[0] if roots else None,
-            env=env,
-            workspace_root=workspace_root,
-            workspace_baseline=request.workspace_baseline,
-        )
+        # The host backend is retained for trusted local/test adapters, but
+        # even that path must not hand the caller's HOME to a model-reachable
+        # child.  Keep the synthetic home alive for the complete supervisor
+        # ownership interval; TemporaryDirectory cleanup happens only after
+        # the child has reached a terminal state.
+        with tempfile.TemporaryDirectory(prefix="khaos-task-home-") as home:
+            temporary_home = Path(home)
+            temporary_tmp = temporary_home / "tmp"
+            temporary_tmp.mkdir(mode=0o700)
+            environment = build_task_environment(
+                home=str(temporary_home),
+                tmpdir=str(temporary_tmp),
+                base_environment=requested_environment,
+                allowed_keys=profile.environment_keys,
+            )
+            return await self._get_supervisor().run(
+                request,
+                cwd=cwd,
+                execution_root=roots[0] if roots else None,
+                env=environment,
+                workspace_root=workspace_root,
+                workspace_baseline=request.workspace_baseline,
+            )
 
     async def terminate(self, execution_id: str) -> None:
         await self._get_supervisor().terminate(execution_id)

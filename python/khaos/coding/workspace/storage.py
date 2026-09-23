@@ -51,6 +51,7 @@ class WorkspaceMutation(Generic[T]):
     value: T
     rollback: Callable[[], None]
     finalize: Callable[[], None] = lambda: None
+    advances_generation: bool = True
 
 
 class WorkspaceStorageViolation(PermissionError):
@@ -133,9 +134,27 @@ class WorkspaceStorageAuthority:
             violation = self.assess(root, baseline, limits)
             if violation is None:
                 try:
-                    return mutation.value
-                finally:
                     mutation.finalize()
+                except Exception as finalize_error:
+                    try:
+                        mutation.rollback()
+                    except Exception as rollback_error:  # noqa: BLE001 - recovery failure requires quarantine
+                        raise WorkspaceStorageViolation(
+                            _finalization_diagnostic(
+                                finalize_error,
+                                rollback_error=rollback_error,
+                            ),
+                            rollback_attempted=True,
+                            rollback_succeeded=False,
+                            quarantine_required=True,
+                        ) from finalize_error
+                    raise WorkspaceStorageViolation(
+                        _finalization_diagnostic(finalize_error),
+                        rollback_attempted=True,
+                        rollback_succeeded=True,
+                        quarantine_required=True,
+                    ) from finalize_error
+                return mutation.value
 
             rollback_succeeded = False
             try:
@@ -143,12 +162,27 @@ class WorkspaceStorageAuthority:
                 rollback_succeeded = True
             except Exception:  # noqa: BLE001 - rollback failure requires quarantine
                 rollback_succeeded = False
-            finally:
+            finalize_error: BaseException | None = None
+            try:
                 mutation.finalize()
+            except Exception as error:  # noqa: BLE001 - cleanup uncertainty requires quarantine
+                finalize_error = error
             remaining = self.assess(root, baseline, limits)
-            quarantine_required = not rollback_succeeded or remaining is not None
+            quarantine_required = (
+                not rollback_succeeded
+                or remaining is not None
+                or finalize_error is not None
+            )
+            diagnostic = (
+                _finalization_diagnostic(
+                    finalize_error,
+                    original_violation=violation,
+                )
+                if finalize_error is not None
+                else violation
+            )
             raise WorkspaceStorageViolation(
-                violation,
+                diagnostic,
                 rollback_attempted=True,
                 rollback_succeeded=rollback_succeeded,
                 quarantine_required=quarantine_required,
@@ -164,6 +198,26 @@ class WorkspaceStorageAuthority:
             raise ValueError("workspace id is required for storage authority")
         with self._locks_guard:
             return self._locks.setdefault(workspace_id, threading.RLock())
+
+
+def _finalization_diagnostic(
+    error: BaseException,
+    *,
+    rollback_error: BaseException | None = None,
+    original_violation: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """Describe an effect whose post-publish cleanup could not be proven."""
+    diagnostic: dict[str, object] = {
+        "kind": "workspace-finalize",
+        "observed": type(error).__name__,
+        "limit": "cleanup-complete",
+        "error": type(error).__name__,
+    }
+    if rollback_error is not None:
+        diagnostic["rollback_error"] = type(rollback_error).__name__
+    if original_violation is not None:
+        diagnostic["original_violation"] = original_violation.get("kind", "unknown")
+    return diagnostic
 
 
 def capture_workspace_snapshot(root: Path) -> WorkspaceStorageSnapshot:

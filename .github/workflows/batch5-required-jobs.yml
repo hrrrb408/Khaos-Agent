@@ -105,6 +105,17 @@ jobs:
           python -m pip install --require-hashes -r python/bootstrap-requirements.txt
           uv sync --frozen --extra test --extra browser
           echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+      - name: Disable stale Google Chrome apt source
+        run: |
+          # Playwright installs Chromium and its Ubuntu dependencies.  The
+          # hosted image's unrelated Google Chrome source can serve a
+          # transiently inconsistent Packages index and abort apt entirely.
+          for source in /etc/apt/sources.list /etc/apt/sources.list.d/*; do
+            if [ -f "$source" ] && sudo grep -q "dl.google.com/linux/chrome" "$source"; then
+              sudo mv "$source" "$source.disabled"
+            fi
+          done
+          sudo rm -f /var/lib/apt/lists/*dl.google.com*
       - name: Download Chromium binary
         run: python -m playwright install --with-deps chromium
       - name: Run browser kernel egress + netns attack tests

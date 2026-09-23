@@ -5,7 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-
 from khaos.runtime_profile import RuntimeProfile, resolve_runtime_profile
 
 
@@ -133,6 +132,68 @@ def test_testing_runtime_can_explicitly_use_testing_profile(
     assert resolve_runtime_profile(RuntimeProfile.TESTING) is RuntimeProfile.TESTING
 
 
+@pytest.mark.asyncio
+async def test_local_runtime_builder_pins_local_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from khaos.runtime import factory
+
+    seen: list[object] = []
+
+    async def capture(config: object) -> object:
+        seen.append(config)
+        return object()
+
+    monkeypatch.setattr(factory, "build_runtime", capture)
+
+    await factory.build_local_runtime(factory.RuntimeConfig())
+
+    assert len(seen) == 1
+    assert isinstance(seen[0], factory.RuntimeConfig)
+    assert seen[0].profile is RuntimeProfile.LOCAL
+    assert RuntimeProfile.LOCAL.is_local is True
+    assert RuntimeProfile.LOCAL.is_production is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.posix_host
+async def test_local_runtime_composes_typed_identity_without_browser_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KHAOS_NO_CONFIG", "1")
+    from khaos.db import Database
+    from khaos.runtime import (
+        RuntimeConfig,
+        build_local_runtime,
+        close_runtime_or_register,
+    )
+
+    db = Database(tmp_path / "runtime.db")
+    await db.connect()
+    await db.run_migrations()
+    runtime = await build_local_runtime(
+        RuntimeConfig(
+            db=db,
+            project_root=tmp_path,
+            mode_override="coding",
+            principal_id="local-uid:local-test",
+            source_transport="cli",
+            session_id="local-session",
+        )
+    )
+    try:
+        assert runtime.profile is RuntimeProfile.LOCAL
+        assert runtime.browser_manager is None
+        assert runtime.browser_coding_service is None
+        assert runtime.loop.principal_kind == "human"
+        assert runtime.loop.parent_principal_id == "human:local-uid:local-test"
+        assert len(runtime.loop.delegation_digest) == 64
+    finally:
+        await close_runtime_or_register(runtime)
+        await db.close()
+
+
 def test_legacy_runtime_config_is_not_production_reachable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -143,3 +204,66 @@ def test_legacy_runtime_config_is_not_production_reachable(
 
     assert config.profile is None
     assert resolve_runtime_profile(config.profile) is RuntimeProfile.TESTING
+
+
+def test_production_transport_binding_is_derived_from_complete_runtime_identity() -> None:
+    from khaos.runtime.factory import _complete_production_principal_binding
+    from khaos.security.principals import transport_root_delegation_digest
+
+    kind, parent, digest = _complete_production_principal_binding(
+        principal_id="local-uid:501",
+        principal_kind="",
+        parent_principal_id="",
+        delegation_digest="",
+        source_transport="cli",
+        session_id="session-1",
+        project_id="project-1",
+        runtime_id="runtime-1",
+        policy_digest="a" * 64,
+    )
+
+    assert kind == "human"
+    assert parent == "human:local-uid:501"
+    assert digest == transport_root_delegation_digest(
+        principal_id="local-uid:501",
+        principal_kind="human",
+        parent_principal_id=parent,
+        project_id="project-1",
+        session_id="session-1",
+        runtime_id="runtime-1",
+        source_transport="cli",
+        policy_digest="a" * 64,
+    )
+
+
+def test_production_transport_binding_rejects_partial_identity() -> None:
+    from khaos.runtime.factory import _complete_production_principal_binding
+
+    with pytest.raises(ValueError, match="known.*session_id"):
+        _complete_production_principal_binding(
+            principal_id="local-uid:501",
+            principal_kind="human",
+            parent_principal_id="human:local-uid:501",
+            delegation_digest="",
+            source_transport="unknown",
+            session_id="",
+            project_id="project-1",
+            runtime_id="runtime-1",
+            policy_digest="a" * 64,
+        )
+
+
+def test_untyped_local_fixture_does_not_receive_partial_principal_binding() -> None:
+    from khaos.runtime.factory import _complete_production_principal_binding
+
+    assert _complete_production_principal_binding(
+        principal_id="local-uid:501",
+        principal_kind="",
+        parent_principal_id="",
+        delegation_digest="",
+        source_transport="unknown",
+        session_id="",
+        project_id="project-1",
+        runtime_id="runtime-1",
+        policy_digest="a" * 64,
+    ) == ("", "", "")

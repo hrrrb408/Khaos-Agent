@@ -264,6 +264,7 @@ class TestFeatureFlagAndDegradation:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.posix_host
 class TestFusionRules:
     """Scenarios 6–10: the six definition fusion rules."""
 
@@ -829,6 +830,7 @@ class TestQueryInterfaceAndGuarantees:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.posix_host
 class TestReferencesFusion:
     """Tests for LSP references fusion (spec §7)."""
 

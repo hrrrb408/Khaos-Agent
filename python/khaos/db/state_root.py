@@ -362,6 +362,37 @@ def ensure_safe_state_db_file(db_path: Path) -> None:
         )
 
 
+def _create_state_db_file_if_absent(db_path: Path) -> None:
+    """Create a new state DB inode with owner-only permissions.
+
+    SQLite creates a missing file according to the process umask, which is
+    commonly ``0644`` on developer hosts.  The state-root contract requires
+    the database inode itself to be ``0600``; the secure parent directory is
+    not a substitute for that invariant.  ``O_EXCL`` and ``O_NOFOLLOW`` keep
+    the creation race-safe at the final path component.  Existing files are
+    left for ``ensure_safe_state_db_file`` to validate and reject if unsafe.
+    """
+
+    if db_path.exists():
+        return
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = -1
+    try:
+        descriptor = os.open(db_path, flags, 0o600)
+        os.fsync(descriptor)
+    except FileExistsError:
+        # Another trusted opener won the creation race; validate its inode
+        # below instead of replacing or relaxing it.
+        return
+    except OSError as exc:
+        raise StateRootError(
+            f"cannot create state DB {db_path} with owner-only permissions"
+        ) from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
 def open_state_db_safely(db_path: Path) -> Path:
     """Top-level safety gate for the state DB.
 
@@ -391,5 +422,6 @@ def open_state_db_safely(db_path: Path) -> Path:
         )
     # Full safety checks for state-root paths.
     ensure_safe_state_dir(db_path.parent)
+    _create_state_db_file_if_absent(db_path)
     ensure_safe_state_db_file(db_path)
     return db_path

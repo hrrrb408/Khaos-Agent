@@ -328,7 +328,10 @@ async def test_acceptance_4_terminal_write_failure_restart_recovers_as_failed(
         await engine.start()
 
         # Patch finalize to raise.
+        finalize_called = asyncio.Event()
+
         async def failing_finalize(*args, **kwargs):
+            finalize_called.set()
             raise RuntimeError("DB wedged")
 
         db.finalize_scheduled_task = failing_finalize
@@ -340,8 +343,12 @@ async def test_acceptance_4_terminal_write_failure_restart_recovers_as_failed(
             principal_id="alice",
         )
 
-        # Let the executor complete (terminal write fails).
-        await asyncio.sleep(0.3)
+        # Wait for the terminal write to fail instead of assuming a fixed
+        # scheduler delay.  The Windows product runner is materially slower
+        # under the full suite; a short sleep can observe the task's initial
+        # PENDING row before the claim/finalize sequence has run, which makes
+        # the shutdown assertion report a false failure.
+        await asyncio.wait_for(finalize_called.wait(), timeout=5.0)
         # ``stop()`` retries the failed finalize via reconcile — since
         # ``finalize_scheduled_task`` is still patched to fail,
         # ``stop()`` raises ``ServiceShutdownError``.  This simulates

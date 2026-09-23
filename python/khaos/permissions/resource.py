@@ -12,10 +12,11 @@ import hashlib
 import json
 import os
 import shlex
+import unicodedata
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from enum import Enum
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -163,6 +164,203 @@ def resolve_copy_or_move(
     return _canonical_json(
         {"tool": tool_name, "source": source, "destination": destination}
     ), AuthorizationResourceKind.WORKSPACE_COPY_MOVE
+
+
+def resolve_edit_transaction(
+    tool_name: str, arguments: dict[str, Any], root: Path
+) -> tuple[str, AuthorizationResourceKind]:
+    """Bind edit approval to the complete bounded transaction identity.
+
+    File contents are never emitted into the authorization resource. Their
+    hashes are included so an approval cannot be reused for a different
+    payload with the same paths and base generation.
+    """
+    transaction_id = arguments.get("transaction_id")
+    base_generation = arguments.get("base_generation")
+    operations = arguments.get("operations")
+    if (
+        not isinstance(transaction_id, str)
+        or not transaction_id
+        or len(transaction_id) > 128
+        or "\x00" in transaction_id
+        or type(base_generation) is not int
+        or base_generation <= 0
+        or not isinstance(operations, list)
+        or not operations
+        or len(operations) > 64
+    ):
+        raise PermissionError("edit transaction identity is invalid")
+    expected_workspace_digest = arguments.get("expected_workspace_digest")
+    if expected_workspace_digest is not None and (
+        not isinstance(expected_workspace_digest, str)
+        or len(expected_workspace_digest) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in expected_workspace_digest
+        )
+    ):
+        raise PermissionError("edit transaction workspace digest is invalid")
+    intent = arguments.get("intent", "")
+    if not isinstance(intent, str) or len(intent) > 512 or "\x00" in intent:
+        raise PermissionError("edit transaction intent is invalid")
+    identity_operations: list[dict[str, object]] = []
+    touched: set[str] = set()
+    for raw in operations:
+        if not isinstance(raw, dict):
+            raise PermissionError("edit transaction operation is invalid")
+        operation = raw.get("operation")
+        if operation not in {"create", "update", "delete", "rename"}:
+            raise PermissionError("edit transaction operation kind is invalid")
+        path = _resolve_edit_transaction_path(root, raw.get("path"))
+        destination = None
+        if operation == "rename":
+            destination = _resolve_edit_transaction_path(
+                root,
+                raw.get("destination_path"),
+            )
+            if destination == path:
+                raise PermissionError("edit transaction rename target is invalid")
+        elif raw.get("destination_path") is not None:
+            raise PermissionError("edit transaction destination is invalid")
+        for touched_path in (path, destination):
+            if touched_path is None:
+                continue
+            folded = touched_path.casefold()
+            if folded in touched:
+                raise PermissionError("edit transaction touches a path twice")
+            touched.add(folded)
+        expected_exists = raw.get("expected_exists")
+        if expected_exists is not None and type(expected_exists) is not bool:
+            raise PermissionError("edit transaction expected_exists is invalid")
+        expected_digest = raw.get("expected_digest")
+        if expected_digest is not None and (
+            not isinstance(expected_digest, str)
+            or len(expected_digest) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in expected_digest
+            )
+        ):
+            raise PermissionError("edit transaction expected_digest is invalid")
+        content = raw.get("content")
+        if content is not None and (
+            not isinstance(content, str)
+            or "\x00" in content
+            or len(content.encode("utf-8")) > 16 * 1024 * 1024
+        ):
+            raise PermissionError("edit transaction content is invalid")
+        raw_text_edits = raw.get("text_edits", [])
+        if not isinstance(raw_text_edits, list) or len(raw_text_edits) > 256:
+            raise PermissionError("edit transaction text_edits is invalid")
+        for raw_edit in raw_text_edits:
+            if (
+                not isinstance(raw_edit, dict)
+                or set(raw_edit) != {"start", "end", "replacement"}
+            ):
+                raise PermissionError("edit transaction text edit is invalid")
+            start = raw_edit["start"]
+            end = raw_edit["end"]
+            replacement = raw_edit["replacement"]
+            if (
+                type(start) is not int
+                or type(end) is not int
+                or start < 0
+                or end < start
+                or not isinstance(replacement, str)
+                or "\x00" in replacement
+                or len(replacement.encode("utf-8")) > 16 * 1024 * 1024
+            ):
+                raise PermissionError("edit transaction text edit bounds are invalid")
+        if operation == "create":
+            if (
+                content is None
+                or raw_text_edits
+                or expected_exists is True
+                or expected_digest is not None
+            ):
+                raise PermissionError("edit transaction create contract is invalid")
+            if tool_name == "apply_edit_transaction" and expected_exists is not False:
+                raise PermissionError("edit transaction create precondition is missing")
+        elif operation == "update":
+            if (
+                destination is not None
+                or (content is None) == (not raw_text_edits)
+            ):
+                raise PermissionError("edit transaction update contract is invalid")
+            if tool_name == "apply_edit_transaction" and (
+                expected_exists is not True or expected_digest is None
+            ):
+                raise PermissionError("edit transaction update precondition is missing")
+        elif operation == "delete":
+            if content is not None or raw_text_edits:
+                raise PermissionError("edit transaction delete contract is invalid")
+            if tool_name == "apply_edit_transaction" and (
+                expected_exists is not True or expected_digest is None
+            ):
+                raise PermissionError("edit transaction delete precondition is missing")
+        elif operation == "rename":
+            if content is not None or raw_text_edits:
+                raise PermissionError("edit transaction rename contract is invalid")
+            if tool_name == "apply_edit_transaction" and (
+                expected_exists is not True or expected_digest is None
+            ):
+                raise PermissionError("edit transaction rename precondition is missing")
+        payload_digest = hashlib.sha256(
+            _canonical_json(
+                {
+                    "operation": operation,
+                    "path": path,
+                    "destination_path": destination,
+                    "expected_exists": expected_exists,
+                    "expected_digest": expected_digest,
+                    "content": content,
+                    "text_edits": raw_text_edits,
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+        identity_operations.append(
+            {
+                "operation": operation,
+                "path": path,
+                "destination_path": destination,
+                "expected_exists": expected_exists,
+                "expected_digest": expected_digest,
+                "payload_digest": payload_digest,
+            }
+        )
+    transaction_identity = {
+        "tool": tool_name,
+        "transaction_id": transaction_id,
+        "base_generation": base_generation,
+        "expected_workspace_digest": expected_workspace_digest,
+        "intent_digest": hashlib.sha256(intent.encode("utf-8")).hexdigest(),
+        "intent_bytes": len(intent.encode("utf-8")),
+        "operations": identity_operations,
+    }
+    return (
+        _canonical_json(transaction_identity),
+        AuthorizationResourceKind.WORKSPACE,
+    )
+
+
+def _resolve_edit_transaction_path(root: Path, value: Any) -> str:
+    if not isinstance(value, str) or not value or "\x00" in value:
+        raise PermissionError("edit transaction path is invalid")
+    if (
+        "\\" in value
+        or value.startswith("/")
+        or value.endswith("/")
+        or (len(value) >= 2 and value[1] == ":")
+    ):
+        raise PermissionError("edit transaction path is not normalized")
+    if PureWindowsPath(value).is_absolute() or PureWindowsPath(value).drive:
+        raise PermissionError("edit transaction path is absolute")
+    if any(part in {"", ".", ".."} for part in value.split("/")):
+        raise PermissionError("edit transaction path contains dot components")
+    normalized = unicodedata.normalize("NFC", value)
+    if PurePosixPath(normalized).as_posix() != normalized:
+        raise PermissionError("edit transaction path is not canonical")
+    return _resolve_workspace_path(root, normalized)
 
 
 def resolve_terminal_argv(

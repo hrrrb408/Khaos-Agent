@@ -196,6 +196,7 @@ class SubAgentRunner:
                 published_plan_revision_id=task.published_plan_revision_id,
                 plan_step_id=task.plan_step_id,
                 execution_epoch_digest=task.execution_epoch_digest,
+                allowed_extension_capabilities=task.allowed_extension_capabilities,
             )
         project_root = self.project_root or Path.cwd()
         effective_project_id = task.project_id or compute_project_id(project_root)

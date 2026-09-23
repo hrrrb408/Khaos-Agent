@@ -120,6 +120,12 @@ class ToolResult:
     effect_id: str = ""
     reconciliation_hint: str = ""
     retry_safe: bool = True
+    # A bounded, typed receipt retained for the trusted AgentLoop when a
+    # mutation effect has already been applied but the model-facing result
+    # projection cannot fit the remaining output budget.  This is evidence,
+    # not execution or completion authority, and is never injected into the
+    # provider prompt.
+    effect_receipt: dict[str, Any] | None = None
     # Immutable ToolScheduler phase evidence.  Empty is retained only for
     # direct legacy helper calls that bypass ``stream_batch``.
     phase_digest: str = ""

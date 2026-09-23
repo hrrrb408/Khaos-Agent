@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from khaos.coding.workspace.office_authority import OfficeMutationAuthority
+from khaos.config import user_config_path
 from khaos.db import Database
 from khaos.memory.runtime import MemoryHost
 from khaos.routing import ModelRouter
@@ -174,20 +175,54 @@ async def _handle_optional_subagent(
     return {"ok": False, "error": "unknown subagent action"}
 
 
-def load_router_from_config(config_path: Path, project_root: Path | None = None) -> ModelRouter:
+def load_router_from_config(
+    config_path: Path,
+    project_root: Path | None = None,
+    *,
+    credential_broker: Any = None,
+    model_names: set[str] | None = None,
+) -> ModelRouter:
     """Load model router, merging user config for the project template path."""
     expanded_config = config_path.expanduser()
-    if not expanded_config.exists():
-        return create_default_router(str(expanded_config), honor_no_config=False)
     root = project_root or Path.cwd()
     project_config = (root / "config.yaml").resolve()
     resolved_config = expanded_config.resolve()
-    if resolved_config == project_config:
+    if not expanded_config.exists() and resolved_config != project_config:
+        return create_default_router(
+            str(expanded_config),
+            honor_no_config=False,
+            model_names=model_names,
+        )
+    # The default project template is optional for a user's repository. If it
+    # is absent, still compose the trusted user provider layer instead of
+    # silently selecting the mock router after ``khaos setup``.
+    if not expanded_config.exists():
         return create_default_router(
             honor_no_config=False,
             project_root=root,
+            credential_broker=credential_broker,
+            model_names=model_names,
         )
-    return create_default_router(str(expanded_config), honor_no_config=False)
+    # ``~/.khaos/config.yaml`` is the trusted user provider layer.  An
+    # explicit CLI path to that file must still go through the layered loader;
+    # treating it as an untrusted project file would reject its legitimate
+    # ``models.providers.*`` entries as ``trusted-only``.  Keep the project
+    # and user paths on the same merged path and preserve the fail-closed
+    # validation for every other explicit file.
+    trusted_user_config = user_config_path().expanduser().resolve()
+    if resolved_config in {project_config, trusted_user_config}:
+        return create_default_router(
+            honor_no_config=False,
+            project_root=root,
+            credential_broker=credential_broker,
+            model_names=model_names,
+        )
+    return create_default_router(
+        str(expanded_config),
+        honor_no_config=False,
+        credential_broker=credential_broker,
+        model_names=model_names,
+    )
 
 
 __all__ = ["_build_subagent_service", "_handle_optional_subagent", "load_router_from_config"]

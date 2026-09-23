@@ -194,6 +194,15 @@ class TestMoveFile:
 
 
 class TestFileSearchContent:
+    async def test_default_search_path_matches_registry_default(self, tmp_path):
+        target = tmp_path / "a.txt"
+        target.write_text("needle here\n", encoding="utf-8")
+
+        result = await file_search_content(pattern="needle", workspace_root=tmp_path)
+
+        assert result["ok"] is True
+        assert result["match_count"] == 1
+
     async def test_finds_matching_results(self, tmp_path):
         file_path = tmp_path / "a.txt"
         file_path.write_text("alpha\nneedle here\nomega\n", encoding="utf-8")

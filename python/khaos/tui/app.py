@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 import threading
 import time
 import uuid
@@ -18,12 +19,27 @@ from textual.widgets import Static
 
 from khaos.agent import AgentLoop
 from khaos.agent.core import Message
-from khaos.config import PROVIDER_DEFAULTS, check_needs_setup, write_provider_config
+from khaos.config import (
+    PROVIDER_DEFAULTS,
+    check_needs_setup,
+    discover_provider_models,
+    parse_model_selection,
+    provider_supports_model_discovery,
+    write_provider_config,
+)
 from khaos.db import Database
 from khaos.db.state_root import project_id as compute_project_id
 from khaos.memory import MemoryManager
 from khaos.modes import ModeManager
+from khaos.routing.provider import DiscoveredModel
 from khaos.runtime.context import local_principal_id
+from khaos.security.credential_broker import CredentialBroker, CredentialBrokerError
+from khaos.security.credentials import (
+    CredentialAccessMode,
+    CredentialRef,
+    SecretValue,
+    build_platform_credential_store,
+)
 from khaos.skills import SkillManager
 from khaos.tools import create_runtime_registry
 from khaos.tui.chat_panel import ChatPanel
@@ -73,11 +89,16 @@ class KhaosApp(App):
         db_path: str = "khaos.db",
         project_root: Path | None = None,
         mode: str = "",
+        unlock_provider: str | None = None,
+        config_path: Path | None = None,
     ) -> None:
         super().__init__()
         self.db_path = db_path
         self.project_root = project_root or Path.cwd()
         self.mode_override = mode
+        self.unlock_provider = unlock_provider
+        self.config_path = config_path
+        self._unlock_messages: list[str] = []
         # Runtime — populated in on_mount. ``agent_loop`` avoids shadowing
         # Textual's own App attributes.
         self.db: Database | None = None
@@ -85,6 +106,8 @@ class KhaosApp(App):
         self.router = None
         self.memory_manager: MemoryManager | None = None
         self.task_manager = None
+        self.supervision_service = None
+        self.checkpoint_service = None
         self._runtime = None
         self.skill_manager = SkillManager()
         self.agent_loop: AgentLoop | None = None
@@ -93,6 +116,12 @@ class KhaosApp(App):
         self._total_tokens = 0
         self._setup_step = ""
         self._setup_provider = ""
+        self._setup_secret: SecretValue | None = None
+        self._setup_credential_ref: CredentialRef | None = None
+        self._setup_discovery_ref: CredentialRef | None = None
+        self._setup_broker: CredentialBroker | None = None
+        self._setup_models: list[DiscoveredModel] = []
+        self._setup_selected_models: list[DiscoveredModel] = []
 
     # --- layout ------------------------------------------------------------
 
@@ -123,6 +152,8 @@ class KhaosApp(App):
             project_root=self.project_root,
             viewport_width=self.size.width,
         )
+        if self._unlock_messages:
+            chat.append_text("\n".join(self._unlock_messages), markdown=False)
         if self.mode_manager is not None and self.mode_manager.current_mode.value == "coding":
             self._show_project_overview()
 
@@ -211,12 +242,15 @@ class KhaosApp(App):
     async def _bootstrap_agent_runtime(self) -> None:
         if self.db is None or self.mode_manager is None:
             return
-        from khaos.runtime import ProductionRuntimeConfig, build_production_runtime
-        runtime = await build_production_runtime(ProductionRuntimeConfig(
-            db=self.db, project_root=self.project_root, mode_manager=self.mode_manager,
+        from khaos.runtime import RuntimeConfig, build_local_runtime
+        runtime = await build_local_runtime(RuntimeConfig(
+            db=self.db, project_root=self.project_root, config_path=self.config_path,
+            mode_manager=self.mode_manager,
             confirm_callback=self._confirm_callback,
             skill_manager=self.skill_manager,
             principal_id=local_principal_id(),
+            source_transport="cli",
+            session_id=self.session_id,
             # M4 batch 3.1.16A-5-1b: pass the cached project identity so
             # the runtime's AgentLoop._bound_project_id matches the
             # session row's stamp above.
@@ -226,7 +260,47 @@ class KhaosApp(App):
         self.agent_loop = runtime.loop
         self.memory_manager = runtime.memory_manager
         self.task_manager = runtime.task_manager
+        self.supervision_service = getattr(runtime, "supervision_service", None)
+        self.checkpoint_service = getattr(runtime, "checkpoint_service", None)
         self._runtime = runtime
+        if self.unlock_provider:
+            self._unlock_messages = await self._unlock_runtime_credentials(
+                self.unlock_provider
+            )
+
+    async def _unlock_runtime_credentials(self, target: str) -> list[str]:
+        """Unlock only the providers explicitly selected by the human."""
+        broker = self._runtime.credential_broker if self._runtime is not None else None
+        manager = getattr(self.router, "provider_manager", None)
+        providers = getattr(manager, "providers", {})
+        if broker is None or manager is None or not isinstance(providers, dict):
+            return ["credential session: broker not configured"]
+        normalized_target = target.casefold()
+        names = (
+            sorted(str(name) for name in providers)
+            if normalized_target == "all"
+            else [normalized_target]
+        )
+        results: list[str] = []
+        for provider in names:
+            try:
+                config = manager.get_provider(provider)
+                ref = getattr(config, "credential_ref", None)
+                if not isinstance(ref, CredentialRef):
+                    raise CredentialBrokerError("provider has no configured credential")
+                await asyncio.to_thread(
+                    broker.credential_session.unlock,
+                    ref,
+                    provider=provider,
+                )
+            except CredentialBrokerError as exc:
+                code = getattr(exc, "code", None) or type(exc).__name__
+                results.append(f"{provider}: {code}")
+            except KeyError:
+                results.append(f"{provider}: provider is not configured")
+            else:
+                results.append(f"{provider}: UNLOCKED")
+        return results
 
     async def on_unmount(self) -> None:  # type: ignore[override]
         """Await TUI runtime and database cleanup before the loop exits."""
@@ -357,8 +431,12 @@ class KhaosApp(App):
             "支持的 Provider：\n"
             "  1. NVIDIA NIM (免费额度，推荐)\n"
             "  2. Anthropic Claude\n"
-            "  3. OpenAI\n\n"
-            "请输入 provider：1/nvidia、2/anthropic 或 3/openai。",
+            "  3. OpenAI\n"
+            "  4. 智谱 API\n"
+            "  5. 智谱 Coding Plan\n"
+            "  6. 硅基流动 SiliconFlow\n\n"
+            "请输入 provider：1/nvidia、2/anthropic、3/openai、4/zhipu、"
+            "5/zhipu-coding 或 6/siliconflow。",
             markdown=True,
         )
 
@@ -366,7 +444,10 @@ class KhaosApp(App):
         if self._setup_step == "provider":
             provider = self._parse_setup_provider(value)
             if provider is None:
-                self.query_one(ChatPanel).append_error("请输入 1/nvidia、2/anthropic 或 3/openai。")
+                self.query_one(ChatPanel).append_error(
+                    "请输入 1/nvidia、2/anthropic、3/openai、4/zhipu、"
+                    "5/zhipu-coding 或 6/siliconflow。"
+                )
                 return
             self._setup_provider = provider
             self._setup_step = "api_key"
@@ -380,20 +461,239 @@ class KhaosApp(App):
             return
 
         if self._setup_step == "api_key":
-            api_key = value.strip()
-            if len(api_key) <= 10:
+            value = value.strip()
+            if len(value) <= 10:
                 self.query_one(ChatPanel).append_error("API Key 不能为空，且长度需要大于 10。")
                 return
-            write_provider_config(self._setup_provider, api_key)
-            self._setup_step = ""
-            self._setup_provider = ""
-            self._set_input_secret(False)
-            self._set_input_placeholder("Message Khaos…  (/help for commands)")
-            self.query_one(ChatPanel).append_text(
-                "✓ 已保存到 ~/.khaos/config.yaml，正在初始化 Agent…",
-                markdown=False,
+            provider = self._setup_provider
+            try:
+                self._setup_secret = SecretValue(value)
+                self._setup_credential_ref = CredentialRef.for_provider(provider)
+                self._setup_discovery_ref = CredentialRef.for_provider(
+                    provider, name=f"setup-{secrets.token_hex(8)}"
+                )
+                self._setup_broker = CredentialBroker()
+                store = build_platform_credential_store()
+                self._setup_broker.register_credential_store(
+                    self._setup_discovery_ref, store, provider=provider
+                )
+                self._setup_broker.provision_provider_credential(
+                    self._setup_discovery_ref,
+                    self._setup_secret,
+                    provider=provider,
+                )
+            except (CredentialBrokerError, ValueError) as exc:
+                logger.warning(
+                    "TUI provider credential setup failed provider=%s error_type=%s",
+                    provider,
+                    type(exc).__name__,
+                )
+                self._clear_setup_state()
+                self.query_one(ChatPanel).append_error("安全凭据存储不可用，配置未保存。")
+                return
+            del value
+            if provider_supports_model_discovery(provider):
+                self._setup_step = "discovering"
+                self._set_input_secret(False)
+                self._set_input_placeholder("正在获取模型列表…")
+                self.query_one(ChatPanel).append_text(
+                    "正在通过 Provider 获取可用模型列表…",
+                    markdown=False,
+                )
+                assert self._setup_discovery_ref is not None
+                assert self._setup_broker is not None
+                self.run_worker(
+                    self._discover_setup_models(
+                        provider, self._setup_discovery_ref, self._setup_broker
+                    )
+                )
+                return
+            self._save_setup_config()
+            return
+
+        if self._setup_step == "models":
+            indexes = parse_model_selection(value, len(self._setup_models))
+            if indexes is None:
+                self.query_one(ChatPanel).append_error(
+                    "请输入有效的模型编号，例如 1,3 或 all。"
+                )
+                return
+            self._setup_selected_models = [self._setup_models[index] for index in indexes]
+            if len(self._setup_selected_models) > 1:
+                self._setup_step = "default_model"
+                self._set_input_placeholder("选择默认模型编号 [1]")
+                self.query_one(ChatPanel).append_text(
+                    "已选择多个模型，请输入默认模型的编号（直接回车使用第一个）。",
+                    markdown=False,
+                )
+                return
+            self._save_setup_config()
+            return
+
+        if self._setup_step == "default_model":
+            indexes = parse_model_selection(value, len(self._setup_selected_models))
+            if indexes is None or len(indexes) != 1:
+                self.query_one(ChatPanel).append_error("请输入一个有效的默认模型编号。")
+                return
+            self._save_setup_config(default_index=indexes[0])
+
+    async def _discover_setup_models(
+        self,
+        provider: str,
+        credential_ref: CredentialRef,
+        credential_broker: CredentialBroker,
+    ) -> None:
+        """Discover setup models without exposing the credential to the UI."""
+        try:
+            models = await discover_provider_models(
+                provider,
+                credential_ref,
+                credential_broker,
+                CredentialAccessMode.PROVISIONING,
             )
-            self.run_worker(self._finish_setup())
+        except Exception as exc:  # noqa: BLE001 - render only a safe category
+            logger.warning(
+                "provider model discovery failed provider=%s error_type=%s",
+                provider,
+                type(exc).__name__,
+            )
+            self._clear_setup_state()
+            self._setup_step = "provider"
+            self._set_input_placeholder("选择 provider [1]")
+            self.query_one(ChatPanel).append_error(
+                "模型列表获取失败，配置未保存。请检查 provider、Key 或网络后重试。"
+            )
+            return
+
+        if not models:
+            self._clear_setup_state()
+            self._setup_step = "provider"
+            self._set_input_placeholder("选择 provider [1]")
+            self.query_one(ChatPanel).append_error("Provider 未返回可用模型，配置未保存。")
+            return
+
+        self._setup_models = models
+        self._setup_step = "models"
+        self._set_input_placeholder("选择模型编号（如 1,3；all=全部）")
+        lines = ["发现可用模型："]
+        for index, model in enumerate(models, start=1):
+            details: list[str] = []
+            if model.max_context_tokens is not None:
+                details.append(f"context={model.max_context_tokens}")
+            if model.supports_tools is not None:
+                details.append(f"tools={'yes' if model.supports_tools else 'no'}")
+            suffix = f" ({', '.join(details)})" if details else ""
+            lines.append(f"  {index}. {model.model}{suffix}")
+        lines.append("请输入要启用的模型编号（逗号分隔，all=全部，直接回车=第一个）：")
+        self.query_one(ChatPanel).append_text("\n".join(lines), markdown=False)
+
+    def _save_setup_config(self, default_index: int = 0) -> None:
+        """Persist the selected setup models, then rebuild the runtime."""
+        provider = self._setup_provider
+        models = self._setup_selected_models or None
+        default_model = None
+        if models:
+            default_model = models[default_index].model
+        previous_secret: SecretValue | None = None
+        canonical_stored = False
+        try:
+            if (
+                self._setup_secret is None
+                or self._setup_credential_ref is None
+                or self._setup_discovery_ref is None
+                or self._setup_broker is None
+            ):
+                raise CredentialBrokerError("setup credential context is missing")
+            canonical_store = build_platform_credential_store()
+            self._setup_broker.register_credential_store(
+                self._setup_credential_ref,
+                canonical_store,
+                provider=provider,
+            )
+            previous_secret = self._setup_broker.snapshot_provisioned_provider_credential(
+                self._setup_credential_ref,
+                provider=provider,
+            )
+            self._setup_broker.provision_provider_credential(
+                self._setup_credential_ref,
+                self._setup_secret,
+                provider=provider,
+            )
+            canonical_stored = True
+            self._setup_broker.delete_provisioned_provider_credential(
+                self._setup_discovery_ref,
+                provider=provider,
+            )
+            write_provider_config(
+                provider,
+                self._setup_credential_ref,
+                models=models,
+                default_model=default_model,
+            )
+        except Exception as exc:  # noqa: BLE001 - render only a safe category
+            logger.warning(
+                "provider config write failed provider=%s error_type=%s",
+                provider,
+                type(exc).__name__,
+            )
+            if canonical_stored:
+                try:
+                    if previous_secret is None:
+                        self._setup_broker.delete_provisioned_provider_credential(
+                            self._setup_credential_ref,
+                            provider=provider,
+                        )
+                    else:
+                        self._setup_broker.provision_provider_credential(
+                            self._setup_credential_ref,
+                            previous_secret,
+                            provider=provider,
+                        )
+                except CredentialBrokerError:
+                    logger.error(
+                        "TUI provider credential rollback failed provider=%s",
+                        provider,
+                    )
+            self._clear_setup_state()
+            self._set_input_secret(False)
+            self._set_input_placeholder("选择 provider [1]")
+            self._setup_step = "provider"
+            self.query_one(ChatPanel).append_error(
+                "配置保存失败，API Key 未写入。"
+            )
+            return
+        self._clear_setup_state()
+        self._set_input_secret(False)
+        self._set_input_placeholder("Message Khaos…  (/help for commands)")
+        self.query_one(ChatPanel).append_text(
+            "✓ 已保存到 ~/.khaos/config.yaml，正在初始化 Agent…",
+            markdown=False,
+        )
+        self.run_worker(self._finish_setup())
+
+    def _clear_setup_state(self) -> None:
+        """Drop transient setup credentials and model metadata from memory."""
+        broker = self._setup_broker
+        discovery_ref = self._setup_discovery_ref
+        if broker is not None and discovery_ref is not None:
+            try:
+                broker.delete_provisioned_provider_credential(
+                    discovery_ref, provider=discovery_ref.provider
+                )
+            except CredentialBrokerError:
+                logger.error(
+                    "TUI temporary provider credential cleanup failed provider=%s",
+                    discovery_ref.provider,
+                )
+            broker.close()
+        self._setup_step = ""
+        self._setup_provider = ""
+        self._setup_secret = None
+        self._setup_credential_ref = None
+        self._setup_discovery_ref = None
+        self._setup_broker = None
+        self._setup_models = []
+        self._setup_selected_models = []
 
     async def _finish_setup(self) -> None:
         try:
@@ -416,6 +716,23 @@ class KhaosApp(App):
             "claude": "anthropic",
             "3": "openai",
             "openai": "openai",
+            "4": "zhipu",
+            "zhipu": "zhipu",
+            "zhipu-api": "zhipu",
+            "api": "zhipu",
+            "glm": "zhipu",
+            "智谱": "zhipu",
+            "5": "zhipu-coding",
+            "zhipu-coding": "zhipu-coding",
+            "coding": "zhipu-coding",
+            "coding-plan": "zhipu-coding",
+            "glm-coding": "zhipu-coding",
+            "6": "siliconflow",
+            "siliconflow": "siliconflow",
+            "silicon-flow": "siliconflow",
+            "sf": "siliconflow",
+            "硅基流动": "siliconflow",
+            "硅基": "siliconflow",
         }
         return aliases.get(value.strip().lower())
 
@@ -487,6 +804,14 @@ class KhaosApp(App):
             db=self.db,
             skill_manager=self.skill_manager,
             task_manager=self.task_manager,
+            supervision_service=self.supervision_service,
+            checkpoint_service=self.checkpoint_service,
+            credential_broker=(
+                self._runtime.credential_broker
+                if self._runtime is not None
+                else None
+            ),
+            principal_id=local_principal_id(),
             session_id=self.session_id,
             # M4 batch 3.1.16A-5-1b: pass the cached project identity so
             # slash commands (e.g. ``/mode``) stamp the SAME project_id
@@ -591,9 +916,17 @@ def run_tui(
     db_path: str = "khaos.db",
     project_root: Path | None = None,
     mode: str = "",
+    unlock_provider: str | None = None,
+    config_path: Path | None = None,
 ) -> None:
     """Entry point used by the CLI / Makefile."""
-    app = KhaosApp(db_path=db_path, project_root=project_root, mode=mode)
+    app = KhaosApp(
+        db_path=db_path,
+        project_root=project_root,
+        mode=mode,
+        unlock_provider=unlock_provider,
+        config_path=config_path,
+    )
     app.run()
 
 

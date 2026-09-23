@@ -48,6 +48,45 @@ def test_non_network_command_allowed() -> None:
         assert result.allowed is True, f"blocked non-network: {command}"
 
 
+def test_standalone_guard_keeps_language_runtimes_conservative() -> None:
+    """A guard without a trusted execution backend still blocks runtimes."""
+    guard = NetworkGuard()
+    result = guard.check_tool(
+        "terminal_argv", {"argv": ["python3", "tests", "test_cache.py"]}
+    )
+
+    assert result.allowed is False
+    assert "python3" in result.reason
+
+
+def test_kernel_isolated_runtime_commands_are_admitted_without_egress() -> None:
+    """Local tests/builds may run only with a trusted network-none backend."""
+    guard = NetworkGuard(kernel_network_isolation_proven=True)
+    for argv in (
+        ["python3", "-m", "pytest", "-q"],
+        ["node", "scripts", "check.js"],
+        ["npm", "test"],
+        ["cargo", "test"],
+    ):
+        result = guard.check_tool("terminal_argv", {"argv": argv})
+        assert result.allowed is True, f"blocked local runtime: {argv}"
+
+
+def test_kernel_isolated_runtime_does_not_admit_network_enabled_mode() -> None:
+    """The opt-in never bypasses an enabled network policy."""
+    guard = NetworkGuard(
+        network_enabled=True,
+        allowed_domains=["example.com"],
+        kernel_network_isolation_proven=True,
+    )
+    result = guard.check_tool(
+        "terminal_argv", {"argv": ["python3", "scripts", "fetch.py"]}
+    )
+
+    assert result.allowed is False
+    assert "allowlist" in result.reason
+
+
 def test_url_blocked() -> None:
     """browser_navigate is blocked by default (no allowlist)."""
     guard = NetworkGuard()

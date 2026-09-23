@@ -172,6 +172,45 @@ class NativeMemoryProvider:
         record_digest = memory_record_digest(record)
 
         async with self._write_transaction() as conn:
+            # The uniqueness contract covers historical rows as well as
+            # currently injectable rows.  A current-key lookup deliberately
+            # excludes SUPERSEDED/REVOKED/REJECTED records, so it cannot by
+            # itself detect a replay of an older identical candidate.  Check
+            # the complete unique identity first and make that replay
+            # idempotent instead of turning it into a provider failure.
+            duplicate_cursor = await conn.execute(
+                """
+                SELECT memory_id, status FROM memory_nodes
+                WHERE project_id = ? AND namespace = ? AND principal_id = ?
+                  AND session_id = ? AND memory_type = ? AND scope = ? AND key = ?
+                  AND content_hash = ?
+                LIMIT 1
+                """,
+                (
+                    runtime.project_id,
+                    namespace,
+                    principal_id,
+                    session_id,
+                    enum_value(candidate.memory_type),
+                    candidate.scope,
+                    key,
+                    content_hash,
+                ),
+            )
+            duplicate = await duplicate_cursor.fetchone()
+            if duplicate is not None:
+                duplicate_id = str(duplicate["memory_id"])
+                evidence_added = await self._insert_evidence(
+                    conn, request, duplicate_id, now
+                )
+                await self._insert_entities_and_edges(conn, request, duplicate_id, now)
+                return MemoryWriteResult(
+                    memory_id=duplicate_id,
+                    status=MemoryStatus(str(duplicate["status"])),
+                    created=False,
+                    evidence_added=evidence_added,
+                )
+
             existing_cursor = await conn.execute(
                 """
                 SELECT memory_id, content_hash, status FROM memory_nodes

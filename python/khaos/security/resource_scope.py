@@ -28,7 +28,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Final, cast
 
-from khaos.coding.planning.security_identities import CanonicalWorkspaceId
+from khaos.security.identities import CanonicalWorkspaceId
 from khaos.security.protocol_boundary import canonical_digest, strict_json_loads
 from khaos.security.windows_trust import (
     WindowsTrustError,

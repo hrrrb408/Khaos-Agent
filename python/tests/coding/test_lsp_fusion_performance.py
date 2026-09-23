@@ -30,7 +30,7 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = pytest.mark.tree_sitter_real
+pytestmark = [pytest.mark.tree_sitter_real, pytest.mark.posix_host]
 pytest.importorskip("tree_sitter")
 
 from khaos.coding.intelligence.index import IndexStore, RepositoryIndexer

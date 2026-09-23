@@ -19,7 +19,32 @@
 - 📊 可观测性：审计日志、请求指标、权限管理
 - 🌐 API 网关：REST + SSE + 统一认证和速率限制
 
-## 快速开始
+## 快速开始（macOS Local-First）
+
+普通个人 Coding 默认走轻量 macOS Local Runtime，不启动 Go Gateway、
+authorityd、Linux cgroup/bwrap 或浏览器内核。Local 仍保留 Workspace、
+EditTransaction、Permission/Approval、ExecutionService、Verification/Repair
+和 CompletionGate。
+
+```bash
+pip install -e .
+khaos config setup
+khaos chat --mode coding --unlock <provider>
+```
+
+如果只想使用命令行 REPL：
+
+```bash
+khaos chat --mode coding --no-tui --unlock <provider>
+```
+
+运行期凭据默认保持 LOCKED；也可以先启动后在 REPL 中执行
+`/credentials unlock <provider>`。这样 Keychain 只在操作者明确解锁时读取。
+
+严格 Linux 隔离、真实浏览器 Coding 与 Server/Gateway 仍使用显式部署入口，
+不会成为普通 macOS Coding 的启动前置条件。
+
+### 服务端与安全运行时
 
 ```bash
 # Docker（本机开发：只绑定 127.0.0.1，不提供跨主机 HTTP）

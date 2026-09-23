@@ -78,6 +78,19 @@ class ToolExecutionCoordinator:
             invocation_context["office_authority"] = self._office_authority
         if call.get("_approval_context") is not None:
             invocation_context["approval_context"] = call["_approval_context"]
+        # Coding browser effects use the same ordinary ApprovalBroker grant
+        # as every other tool.  Preserve only the opaque binding/argument
+        # digests here; BrowserCodingService verifies them against the typed
+        # action and never accepts approval requests from page content.
+        if call.get("_approval_binding_digest"):
+            invocation_context["browser_approval"] = {
+                "binding_digest": str(call.get("_approval_binding_digest")),
+                "arguments_digest": str(
+                    call.get("_approval_arguments_digest") or ""
+                ),
+                "policy_digest": str(call.get("_approval_policy_digest") or ""),
+                "authorization_epoch": call.get("_approval_authorization_epoch"),
+            }
         if isinstance(step_authority, StepExecutionAuthority):
             invocation_context["step_execution_authority"] = step_authority
             invocation_context["step_execution_digest"] = step_authority.digest()

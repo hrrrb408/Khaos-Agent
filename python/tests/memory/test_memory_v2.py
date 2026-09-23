@@ -125,6 +125,48 @@ async def test_broker_admits_user_fact_and_returns_structured_context(tmp_path):
     await db.close()
 
 
+async def test_native_provider_replays_identical_historical_content_idempotently(tmp_path):
+    """Historical duplicate content must not become a UNIQUE provider error."""
+    db, broker = await _broker(tmp_path)
+    runtime = _runtime()
+    event = await _source_event(broker, runtime, "replay candidate")
+    candidate = _candidate(event.event_id, key="replay", claim="replay: value")
+    provider = NativeMemoryProvider(db)
+
+    first = await provider.add(
+        MemoryWriteRequest(
+            candidate=candidate,
+            runtime=runtime,
+            status=MemoryStatus.SUPERSEDED,
+            authority=MemoryAuthority.USER_STATED,
+            provider_id=provider.provider_id,
+            candidate_event_id="candidate:first",
+        )
+    )
+    replay = await provider.add(
+        MemoryWriteRequest(
+            candidate=candidate,
+            runtime=runtime,
+            status=MemoryStatus.CANDIDATE,
+            authority=MemoryAuthority.USER_STATED,
+            provider_id=provider.provider_id,
+            candidate_event_id="candidate:replay",
+        )
+    )
+
+    assert replay.memory_id == first.memory_id
+    assert replay.status is MemoryStatus.SUPERSEDED
+    assert replay.created is False
+    try:
+        async with db.read_connection() as conn:
+            row = await (
+                await conn.execute("SELECT COUNT(*) AS count FROM memory_nodes")
+            ).fetchone()
+            assert int(row["count"]) == 1
+    finally:
+        await db.close()
+
+
 async def test_supersession_preserves_old_fact_and_historical_query(tmp_path):
     db, broker = await _broker(tmp_path)
     runtime = _runtime()

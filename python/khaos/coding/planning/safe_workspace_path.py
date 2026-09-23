@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import ctypes
-import errno
 import hashlib
 import os
 import secrets
@@ -15,6 +14,8 @@ from khaos.coding.planning.safe_identifiers import (
     SafeWorkspaceRelativePath,
     UnsafePersistedIdentifier,
 )
+
+_O_BINARY = getattr(os, "O_BINARY", 0)
 
 
 class SafePathError(RuntimeError):
@@ -76,7 +77,8 @@ class SafeParentDirectory:
         if not stat.S_ISREG(info.st_mode):
             raise SafePathError("target is not a regular file")
         descriptor = os.open(
-            self.leaf, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            self.leaf,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | _O_BINARY,
             dir_fd=self.parent_fd,
         )
         try:
@@ -97,7 +99,9 @@ class SafeParentDirectory:
         if max_bytes is not None and info.st_size > max_bytes:
             raise SafePathError("target exceeds the bounded file size")
         descriptor = os.open(
-            self.leaf, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=self.parent_fd
+            self.leaf,
+            os.O_RDONLY | os.O_NOFOLLOW | _O_BINARY,
+            dir_fd=self.parent_fd,
         )
         try:
             chunks: list[bytes] = []
@@ -127,7 +131,12 @@ class SafeParentDirectory:
             name = f".khaos-{secrets.token_hex(16)}"
             try:
                 descriptor = os.open(
-                    name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                    name,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | _O_BINARY,
                     mode, dir_fd=self.parent_fd,
                 )
                 return descriptor, name
@@ -252,6 +261,11 @@ class WorkspacePathHandle:
             if parent.lstat() is not None:
                 raise FileExistsError(relative)
             temp = self._write_temp(parent, content, mode)
+            temp_info = os.stat(
+                temp, dir_fd=parent.parent_fd, follow_symlinks=False
+            )
+            if not stat.S_ISREG(temp_info.st_mode) or temp_info.st_nlink != 1:
+                raise SafePathError("created temporary object is not a regular file")
             parent.revalidate()
             if before_publish is not None:
                 before_publish()
@@ -260,6 +274,14 @@ class WorkspacePathHandle:
                 src_dir_fd=parent.parent_fd, dst_dir_fd=parent.parent_fd,
                 follow_symlinks=False,
             )
+            # This is the effect boundary.  Report it before unlinking the
+            # private temporary name or doing any post-publish validation so a
+            # later cleanup/fsync failure cannot hide an already-published
+            # object from the rollback owner.
+            phase("filesystem-applied", MutationObjectIdentity(
+                True, temp_info.st_dev, temp_info.st_ino, "regular",
+                parent.identity[0], parent.identity[1],
+            ))
             os.unlink(temp, dir_fd=parent.parent_fd)
             temp = ""
             installed = parent.lstat()
@@ -296,9 +318,22 @@ class WorkspacePathHandle:
             current = parent.lstat()
             if current is None or current.st_ino != expected_inode:
                 raise SafePathError("update target identity changed")
+            replacement = os.stat(
+                temp, dir_fd=parent.parent_fd, follow_symlinks=False
+            )
+            if not stat.S_ISREG(replacement.st_mode) or replacement.st_nlink != 1:
+                raise SafePathError("updated temporary object is not a regular file")
             if before_publish is not None:
                 before_publish()
             self._exchange(parent.parent_fd, temp, parent.leaf)
+            # ``_exchange`` has made the new inode visible at the target.  The
+            # callback must run before the fallible old-inode check and temp
+            # cleanup, otherwise a post-publish error can lose the effect
+            # record needed for identity-bound recovery.
+            phase("filesystem-applied", MutationObjectIdentity(
+                True, replacement.st_dev, replacement.st_ino, "regular",
+                parent.identity[0], parent.identity[1],
+            ))
             replaced = os.stat(
                 temp, dir_fd=parent.parent_fd, follow_symlinks=False
             )
@@ -333,12 +368,14 @@ class WorkspacePathHandle:
                 raise SafePathError("delete target identity changed")
             parent.revalidate()
             os.unlink(parent.leaf, dir_fd=parent.parent_fd)
-            if parent.lstat() is not None:
-                raise SafePathError("deleted object reappeared")
+            # ``unlink`` is the irreversible effect boundary.  Report it
+            # before the postcondition check and directory fsync.
             phase("filesystem-applied", MutationObjectIdentity(
                 False, source_parent_dev=parent.identity[0],
                 source_parent_ino=parent.identity[1],
             ))
+            if parent.lstat() is not None:
+                raise SafePathError("deleted object reappeared")
             parent.revalidate()
             parent.fsync()
             phase("directory-synced")
@@ -359,31 +396,25 @@ class WorkspacePathHandle:
                 raise FileExistsError(destination)
             source_parent.revalidate()
             destination_parent.revalidate()
-            try:
-                os.link(
-                    source_parent.leaf, destination_parent.leaf,
-                    src_dir_fd=source_parent.parent_fd,
-                    dst_dir_fd=destination_parent.parent_fd,
-                    follow_symlinks=False,
-                )
-            except OSError as exc:
-                if exc.errno in {errno.EXDEV, errno.EPERM, errno.EOPNOTSUPP}:
-                    raise SafePathError("platform cannot provide rename no-replace") from exc
-                raise
-            try:
-                os.unlink(source_parent.leaf, dir_fd=source_parent.parent_fd)
-            except Exception:
-                os.unlink(destination_parent.leaf, dir_fd=destination_parent.parent_fd)
-                raise
+            # A link followed by unlink leaves a visible two-name window and
+            # is not an atomic rename.  Use the native no-replace primitive;
+            # if the host lacks it, fail closed rather than silently falling
+            # back to a weaker mutation.
+            self._rename_no_replace(
+                source_parent.parent_fd,
+                source_parent.leaf,
+                destination_parent.parent_fd,
+                destination_parent.leaf,
+            )
+            phase("filesystem-applied", MutationObjectIdentity(
+                True, current.st_dev, current.st_ino, "regular",
+                source_parent.identity[0], source_parent.identity[1],
+                destination_parent.identity[0], destination_parent.identity[1],
+            ))
             installed = destination_parent.lstat()
             if (source_parent.lstat() is not None or installed is None
                     or not stat.S_ISREG(installed.st_mode)):
                 raise SafePathError("renamed object identity missing")
-            phase("filesystem-applied", MutationObjectIdentity(
-                True, installed.st_dev, installed.st_ino, "regular",
-                source_parent.identity[0], source_parent.identity[1],
-                destination_parent.identity[0], destination_parent.identity[1],
-            ))
             source_parent.revalidate()
             destination_parent.revalidate()
             source_parent.fsync()

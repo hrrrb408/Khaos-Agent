@@ -64,6 +64,15 @@ class Skill:
     # ~/.khaos/skills and BUILTIN for shipped skills.  Prompt rendering wraps
     # PROJECT skills in an explicit untrusted marker.
     trust_tier: SkillTrustTier = SkillTrustTier.PROJECT
+    # M8.7 extension metadata.  These fields remain descriptive: a skill is
+    # declarative prompt guidance and can never load Python or grant a tool.
+    version: str = "1"
+    skill_id: str = ""
+    package_digest: str = ""
+    required_tools: tuple[str, ...] = ()
+    optional_tools: tuple[str, ...] = ()
+    applicable_paths: tuple[str, ...] = ()
+    applicable_languages: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.name:
@@ -84,3 +93,22 @@ class Skill:
                 seen.add(value)
                 normalized.append(value)
         self.triggers = normalized
+        if not isinstance(self.version, str) or not self.version or len(self.version) > 128:
+            raise SkillParseError(f"skill {self.name}: version is invalid")
+        if not self.skill_id:
+            self.skill_id = self.name
+        if not isinstance(self.skill_id, str) or not self.skill_id or len(self.skill_id) > 256:
+            raise SkillParseError(f"skill {self.name}: skill_id is invalid")
+        if self.package_digest and (
+            len(self.package_digest) != 64
+            or any(char not in "0123456789abcdef" for char in self.package_digest)
+        ):
+            raise SkillParseError(f"skill {self.name}: package_digest is invalid")
+        for label in ("required_tools", "optional_tools", "applicable_paths", "applicable_languages"):
+            values = getattr(self, label)
+            if not isinstance(values, (list, tuple)):
+                raise SkillParseError(f"skill {self.name}: {label} must be a list")
+            normalized_values = tuple(sorted({str(value).strip() for value in values if str(value).strip()}))
+            if len(normalized_values) > 64 or any(len(value) > 512 for value in normalized_values):
+                raise SkillParseError(f"skill {self.name}: {label} exceeds its bound")
+            setattr(self, label, normalized_values)

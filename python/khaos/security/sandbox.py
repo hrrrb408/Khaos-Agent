@@ -42,6 +42,8 @@ CAPABILITIES: dict[SandboxMode, set[str]] = {
         "read_file",
         "search_files",
         "file_search_content",
+        "code_search",
+        "code_symbols",
         "list_directory",
         "tree_view",
         "file_info",
@@ -50,11 +52,17 @@ CAPABILITIES: dict[SandboxMode, set[str]] = {
         "git_diff",
         "git_branch",
         "test_run",  # 测试只读
+        "browser_observe",
+        # A transaction preview computes a diff but does not publish a
+        # mutation, so it remains available to read-only Coding sessions.
+        "preview_edit_transaction",
     },
     SandboxMode.WORKSPACE_WRITE: {
         "read_file",
         "search_files",
         "file_search_content",
+        "code_search",
+        "code_symbols",
         "list_directory",
         "tree_view",
         "file_info",
@@ -69,6 +77,8 @@ CAPABILITIES: dict[SandboxMode, set[str]] = {
         "write_file",
         "patch",
         "multi_edit",
+        "preview_edit_transaction",
+        "apply_edit_transaction",
         "copy_file",
         "move_file",
         "git_commit",
@@ -90,6 +100,10 @@ CAPABILITIES: dict[SandboxMode, set[str]] = {
         "browser_click",
         "browser_type",
         "browser_press",
+        "browser_app_open",
+        "browser_observe",
+        "browser_action",
+        "browser_session_close",
     },
     SandboxMode.FULL_ACCESS: {
         # Empty set = allow-all (see check_tool).

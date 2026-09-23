@@ -31,6 +31,48 @@ async def test_runtime_aclose_calls_memory_manager_close():
     memory.aclose.assert_awaited_once()
 
 
+async def test_aclose_closes_explicitly_owned_context_intelligence():
+    """M8.1: close the composed repository-intelligence owner once."""
+    context_intelligence = MagicMock()
+    context_intelligence.close = AsyncMock()
+    result = RuntimeResult(
+        loop=MagicMock(),
+        mode_manager=MagicMock(),
+        task_manager=None,
+        skill_generator=None,
+        tool_scheduler=MagicMock(),
+        memory_manager=MagicMock(aclose=AsyncMock()),
+        skill_manager=MagicMock(),
+        new_verify_fix_loop=None,
+    )
+    result.context_intelligence = context_intelligence
+    result.owns_context_intelligence = True
+
+    await result.aclose()
+
+    context_intelligence.close.assert_awaited_once()
+
+
+async def test_aclose_ignores_synthetic_loop_context_attributes():
+    """A mock/compatibility loop must not create an implicit close owner."""
+    loop = MagicMock()
+    loop.context_intelligence.close = AsyncMock()
+    result = RuntimeResult(
+        loop=loop,
+        mode_manager=MagicMock(),
+        task_manager=None,
+        skill_generator=None,
+        tool_scheduler=MagicMock(),
+        memory_manager=MagicMock(aclose=AsyncMock()),
+        skill_manager=MagicMock(),
+        new_verify_fix_loop=None,
+    )
+
+    await result.aclose()
+
+    loop.context_intelligence.close.assert_not_awaited()
+
+
 async def test_aclose_invokes_office_authority_shutdown():
     """B1: ``office_authority.shutdown`` must actually be reached."""
     office = MagicMock()

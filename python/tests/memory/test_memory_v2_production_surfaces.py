@@ -200,6 +200,38 @@ async def test_codegraph_is_rebuildable_scoped_and_source_inspectable(tmp_path):
     assert await broker.evidence(runtime, f"codegraph:{node_id}") is not None
 
 
+async def test_codegraph_deduplicates_parser_symbols_before_persistence(tmp_path):
+    """Nested and module-level helpers with one name share one graph key."""
+    source_root = tmp_path / "workspace"
+    source_root.mkdir()
+    (source_root / "duplicate.py").write_text(
+        "def outer():\n"
+        "    def helper():\n"
+        "        return 1\n"
+        "    return helper()\n\n"
+        "def helper():\n"
+        "    return 2\n",
+        encoding="utf-8",
+    )
+    db, _broker_instance = await _broker(tmp_path)
+    runtime = replace(_runtime(), repo_id="repo:duplicate", commit_sha="commit:duplicate")
+
+    report = await CodeGraphService(db).build(runtime, source_root)
+
+    assert report.nodes == 3
+    async with db.read_connection() as conn:
+        rows = await (
+            await conn.execute(
+                "SELECT path, node_kind, qualified_name FROM memory_code_nodes "
+                "WHERE project_id = ? AND repo_id = ? AND commit_sha = ? "
+                "ORDER BY path, node_kind, qualified_name",
+                (runtime.project_id, runtime.repo_id, runtime.commit_sha),
+            )
+        ).fetchall()
+    assert len(rows) == 3
+    assert sum(row["qualified_name"] == "helper" for row in rows) == 1
+
+
 async def test_aml_adapter_and_convenience_functions_use_broker_policy(tmp_path):
     _db, broker = await _broker(tmp_path)
     runtime = _runtime()

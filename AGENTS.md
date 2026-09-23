@@ -520,7 +520,7 @@ scope:
 1. **不复制 Claude Code 源码**：自定义非开源许可证，可学习架构设计但不可复制粘贴
 2. **不引入重量级依赖**：Python 层用标准库 + 少量精选依赖（httpx, aiosqlite, aiofiles, google-re2），Go 层用标准库 + gin/echo，Rust 层用 tokio + rusqlite + tiktoken
 3. **所有写操作必须记录审计日志**：audit_log 表记录所有写操作
-4. **环境变量中不出现明文 API Key**：日志脱敏，配置文件支持 `${ENV_VAR}` 引用
+4. **环境变量中不出现明文 Provider API Key**：日志脱敏；普通非敏感配置可使用 `${ENV_VAR}`，Provider 凭据必须使用 `credential_ref` + `CredentialBroker`，不得从环境变量回退
 5. **错误可恢复优先**：工具执行失败不算致命错误，返回模型重决策；模型超时自动 fallback
 6. **测试先行**：新代码必须有对应测试；CI 必须报告相关覆盖率与安全 gate 结果，任何未配置的覆盖率百分比不作为已存在的硬闸门
 7. **Office 变更必须经过 Mutation Authority**：Office `copy_file`/`move_file` 通过 `OfficeMutationAuthority`（复用 `WorkspaceStorageAuthority` + mutation fence + `asyncio.shield`），取消/超时不会在"调用失败"后继续提交副作用。Office Workspace 拥有 baseline + 总量限制 + quarantine。
@@ -532,6 +532,15 @@ scope:
 13. **特权辅助进程的启动身份与进程域是 TCB 边界**（M5.6，No Untrusted Resolution Before Privileged Spawn / Provider Terminal Means Process-Tree Terminal）：hosted credential worker 必须以 `python -I -S <canonical absolute script path>` 启动——固定可信 cwd、不继承 PYTHONPATH、固定 PATH；恶意 repository cwd 中的 fake `khaos` 包、`json.py`、`subprocess.py`、`sitecustomize.py` 不得被导入。command provider 的 argv[0] 必须是绝对路径，解析为 canonical 可执行文件，且不得位于 model-writable workspace 等 untrusted root 之下。Provider 终止证明必须覆盖整个 execution domain（`start_new_session` + killpg + /proc 后代扫描 + survivor KILL 升级；无法证明则保留 quarantine，禁止 false CLOSED）。helper 输出必须以流式计数强制 stdout/stderr/combined 预算，超限立即终止进程域（禁止 `capture_output=True` 事后检查）。Linux coding payload 以 bwrap `--cap-drop ALL` 构造，且 Rust final launcher 必须在 exec 前以 capget/`/proc/self/status` 断言 CapEff/CapPrm/CapInh/CapAmb 全零（verify the postcondition, don't infer it from construction）；`KHAOS_JOB_UID=0` 在 dev 与 production 一律拒绝。
 
 14. **Windows 上经 `os.open` 读/写二进制内容必须显式带 `O_BINARY`**：Windows CRT 在未指定 `O_BINARY`/`O_TEXT` 时默认文本模式——`0x1A` 被当作 EOF 截断、`\r\n` 被折叠为 `\n`，随机 32 字节 Ed25519 公钥约 12% 概率被截断后误判为 "malformed"（2026-08-19 Windows Product Suite 连环 flake 的根因）。key material 等二进制 descriptor 必须带 `getattr(os, "O_BINARY", 0)`（POSIX 无此 flag，`getattr` 保持不变）；参考 `authorityd_protocol._O_BINARY`。回归测试 `test_public_key_load_is_binary_safe` 固化了该约束。
+
+### Provider 凭据安全不变量
+
+- **配置不是密钥存储**：正常 Provider 配置只能保存 Provider、模型、端点元数据和 `credential_ref`；不得保存 `api_key`、token、password 或 `*_env` 凭据选择器。
+- **使用安全诊断**：检查 Provider 请使用 `khaos doctor providers` 或 `khaos credentials status [provider]`（兼容 `khaos config credentials status`），不要读取或打印 `~/.khaos/config.yaml`、完整环境、HTTP headers 或 Provider 响应体。
+- **凭据只在传输边界物化**：AgentLoop、Router、Context、工具、记忆、审计、JSONL、checkpoint、subagent 和任务子进程只接触安全元数据或短期 handle；Provider transport 才能通过 CredentialBroker 生成认证 header。
+- **安全输入与失败关闭**：使用 `khaos credentials set|replace <provider>` 的隐藏输入（兼容 `khaos config credentials ...`）；只有显式操作员 provisioning 路径允许 Keychain UI，Agent/runtime 只用非交互 runtime 路径；禁止把凭据放进命令行参数。平台凭据存储不可用时必须失败关闭，不能回退到明文文件或 Provider 环境变量。
+- **历史暴露凭据必须轮换**：历史会话中曾暴露的 Provider 凭据按已泄露处理，由操作者在独立流程中撤销并替换；Coding Agent 不得读取、验证或代为轮换真实凭据。
+- **macOS Keychain 是受信凭据后端**：通过 Security.framework 的 native API 访问默认 Keychain；显式 provisioning 使用有界、串行的交互 scope，scope 退出前恢复为禁止交互，runtime 始终禁止 UI；synthetic `HOME`、任务沙箱或环境变量不得重定向该后端。native `OSStatus` 只能以有界的类型化类别进入诊断；交互被阻断或后端不可用时必须保持 fail-closed，禁止明文回退。
 
 ---
 
@@ -582,9 +591,45 @@ khaos test --all
 
 ### 配置
 
-编辑 `config.yaml` 设置 LLM provider、API key 等。
+使用 secretless Provider 配置和凭据命令设置 LLM provider；配置只保存安全元数据与 `credential_ref`，不保存 API key。
+
+运行期凭据遵循本地优先会话模型：`CredentialBroker` 持有
+`CredentialSession`，启动时为 `LOCKED`；只有人工显式解锁时才读取 Keychain，
+Provider 运行期使用内存中的短期 lease，不能自动回读 Keychain 或触发系统弹窗。
+DPK、签名应用和 Apple Developer 资质属于可选的未来 macOS 加固，不是普通本地运行前提。
 
 ---
 
-*最后更新：2026-08-18*
+*最后更新：2026-09-12*
 *维护者：瑞邦 + Hermes Agent*
+
+## P4 Qualification Harness Repair Gate
+
+P4-v1 remains historical `FAIL` evidence and is invalid/inconclusive for
+pure model-convergence attribution. The versioned P4-v2 scenario is a
+bounded, read-only repository-understanding task: the model may stop as soon
+as it has enough evidence, and turn/tool limits are maximum resource
+ceilings, never interaction targets. Qualification evidence must use the
+production-shaped AgentLoop/tool path, typed Trace v2 and append-only typed
+JSONL identity; deterministic offline acceptance is required before any fresh
+real-provider P0–P4-v2 run. This gate does not authorize provider calls,
+credential unlocks, full-corpus evaluation, browser benchmarking, or M9.
+
+### 当前本地优先验收状态（2026-09-12）
+
+一次唯一的 synthetic native macOS Keychain 生命周期已人工验收通过：
+SET、显式解锁、三次 fake Provider、LOCK、REPLACE、关闭/重启、再次解锁、
+DELETE 及清理均成功；解锁后的运行期持久化读取和 Keychain UI 均为 0。
+该证据只覆盖本地凭据持久化与会话边界，不代表真实 Provider 或 Coding 能力。
+历史真实凭据仍须由操作者轮换；DPK、签名应用和 Apple Developer 资质仍是可选未来加固。
+
+## Qualification observability closure (2026-09-13)
+
+The offline qualification-observability gate is closed for passive O1-O4
+diagnostics only. Typed CompletionGate results, final-response/parser shape,
+actual Repo Intelligence/Context Engine selection metadata, and timestamp
+provenance are recorded through existing Trace v2 and typed JSONL surfaces.
+These surfaces never authorize execution or completion and never persist raw
+model output, credentials, authorization data, repository contents, or hidden
+oracle data. The gate made zero Provider requests and zero credential reads;
+real capability and full-corpus readiness remain unmeasured/not ready.

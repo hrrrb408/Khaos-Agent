@@ -29,6 +29,8 @@ from khaos.memory.core.contracts import (
     enum_value,
 )
 from khaos.memory.providers.lifecycle import ProviderManifest
+from khaos.security.credential_broker import CredentialBroker, CredentialBrokerError
+from khaos.security.credentials import CredentialRef
 
 
 class MemoryHttpProvider:
@@ -40,7 +42,8 @@ class MemoryHttpProvider:
         self,
         manifest: ProviderManifest,
         *,
-        api_key: str | None = None,
+        credential_ref: CredentialRef | None = None,
+        credential_broker: CredentialBroker | None = None,
         timeout_seconds: float = 10.0,
         max_response_bytes: int = 4 * 1024 * 1024,
     ) -> None:
@@ -52,7 +55,12 @@ class MemoryHttpProvider:
             raise ValueError("memory provider response budget is outside the bounded range")
         self.manifest = manifest
         self.provider_id = manifest.provider_id
-        self._api_key = api_key
+        if credential_ref is not None and credential_ref.provider != self.provider_id.casefold():
+            raise ValueError("memory provider credential_ref belongs to another provider")
+        if credential_ref is not None and credential_broker is None:
+            raise ValueError("memory provider credential_ref requires CredentialBroker")
+        self._credential_ref = credential_ref
+        self._credential_broker = credential_broker
         self._timeout = timeout_seconds
         self._max_response_bytes = max_response_bytes
         self._client: httpx.AsyncClient | None = None
@@ -82,8 +90,6 @@ class MemoryHttpProvider:
         if endpoint is None:
             raise RuntimeError("memory provider endpoint was not validated")
         headers = {"Accept": "application/json", "Content-Type": "application/json"}
-        if self._api_key:
-            headers["Authorization"] = f"Bearer {self._api_key}"
         self._client = httpx.AsyncClient(
             base_url=endpoint,
             headers=headers,
@@ -96,9 +102,12 @@ class MemoryHttpProvider:
         if self._client is None:
             return ProviderHealth(self.provider_id, False, "provider_not_started", "started")
         try:
-            response = await self._client.get("/health")
+            response = await self._client.get(
+                "/health",
+                headers=self._request_headers("GET", "/health"),
+            )
             response.raise_for_status()
-        except (httpx.HTTPError, ValueError) as exc:
+        except (CredentialBrokerError, httpx.HTTPError, ValueError) as exc:
             return ProviderHealth(self.provider_id, False, type(exc).__name__, "failed")
         return ProviderHealth(self.provider_id, True, "remote health check passed", "healthy")
 
@@ -297,9 +306,15 @@ class MemoryHttpProvider:
         if self._client is None:
             raise RuntimeError("memory provider is not started")
         try:
+            headers = self._request_headers(method, path)
             chunks: list[bytes] = []
             total = 0
-            async with self._client.stream(method, path, json=dict(payload)) as response:
+            async with self._client.stream(
+                method,
+                path,
+                json=dict(payload),
+                headers=headers,
+            ) as response:
                 response.raise_for_status()
                 async for chunk in response.aiter_bytes(64 * 1024):
                     total += len(chunk)
@@ -312,6 +327,36 @@ class MemoryHttpProvider:
         if not isinstance(data, dict):
             raise TypeError("remote memory provider response must be a JSON object")
         return data
+
+    def _request_headers(self, method: str, path: str) -> dict[str, str]:
+        """Resolve one provider credential only at the request boundary."""
+
+        if self._credential_ref is None:
+            return {}
+        broker = self._credential_broker
+        if broker is None:
+            raise CredentialBrokerError("memory provider credential broker is missing")
+        binding = {
+            "provider": self.provider_id,
+            "endpoint": self.manifest.endpoint or "",
+            "method": method.upper(),
+            "path": path,
+        }
+        handle = broker.issue_provider_handle(
+            self._credential_ref,
+            provider=self.provider_id,
+            binding=binding,
+            operation="memory.provider.request",
+        )
+        headers: dict[str, str] = {}
+        broker.authorize_provider_headers(
+            headers,
+            handle,
+            provider=self.provider_id,
+            binding=binding,
+            operation="memory.provider.request",
+        )
+        return headers
 
 
 def _optional_string(value: Any) -> str | None:

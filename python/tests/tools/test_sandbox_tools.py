@@ -9,15 +9,14 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
-
 from khaos.coding.execution.capability import DockerSandboxDecision
 from khaos.coding.execution.docker import (
+    _DOCKER_HARDENING_GENERATION,
     DEFAULT_DOCKER_IMAGE,
     DockerBackend,
     DockerBackendClosedError,
-    _ContainerLease,
-    _DOCKER_HARDENING_GENERATION,
     _canonical_digest,
+    _ContainerLease,
     _workspace_mount_policy_digest,
 )
 from khaos.coding.execution.host import HostExecutionBackend
@@ -32,9 +31,9 @@ from khaos.coding.execution.models import (
     ResourceBudget,
 )
 from khaos.coding.execution.service import ExecutionService
-from khaos.coding.workspace.models import WorkspaceState
 from khaos.coding.workspace.boundary import PROTECTED_WORKSPACE_NAMES
-from khaos.tools.registry import create_runtime_registry
+from khaos.coding.workspace.models import WorkspaceState
+from khaos.tools.registry import ToolInvocationBroker, create_runtime_registry
 from khaos.tools.sandbox_tools import sandbox_build, sandbox_exec
 
 
@@ -177,6 +176,33 @@ async def test_sandbox_exec_routes_through_execution_service_and_docker_backend(
     assert context.access_mode == "workspace-write"
     assert context.network_policy is NetworkPolicy.NONE
     assert context.argv == ("python", "-V")
+
+
+@pytest.mark.asyncio
+async def test_sandbox_exec_accepts_broker_process_injection(tmp_path):
+    service, workspace, _ = _service(tmp_path)
+    broker = ToolInvocationBroker(create_runtime_registry())
+
+    result = await broker.invoke(
+        "sandbox_exec",
+        mode="coding",
+        context={
+            "execution_service": service,
+            "workspace_manager": service.workspace_manager,
+            "process_authority": object(),
+            "principal_id": "principal",
+            "project_id": "project",
+            "runtime_id": "runtime",
+            "task_id": "task",
+            "workspace_id": "workspace",
+        },
+        command="python -V",
+        project_dir=str(workspace.worktree_path),
+        timeout=5,
+    )
+
+    assert result["status"] == "passed"
+    assert result["workspace_id"] == "workspace"
 
 
 @pytest.mark.parametrize(

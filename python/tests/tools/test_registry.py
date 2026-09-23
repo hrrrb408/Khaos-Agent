@@ -1,14 +1,14 @@
 import pytest
-
 from khaos.exceptions import ToolNotFoundError
 from khaos.modes.manager import MODE_CONFIGS, Mode
 from khaos.tools import (
-    ToolDefinition,
     ToolCapability,
+    ToolDefinition,
     ToolRegistry,
     create_builtin_registry,
     create_runtime_registry,
 )
+from khaos.tools.registry import ToolInvocationBroker
 
 
 def test_capability_names_are_a_closed_typed_contract():
@@ -218,6 +218,49 @@ def test_runtime_registry_wires_new_tool_handlers():
     assert registry.get("todo_update").handler is not None
 
 
+@pytest.mark.asyncio
+async def test_coding_browser_handlers_do_not_receive_legacy_manager_injection():
+    """Service-backed Coding browser tools must keep their typed boundary."""
+    registry = create_runtime_registry()
+    broker = ToolInvocationBroker(registry)
+    captured: dict[str, dict[str, object]] = {}
+
+    async def capture(**kwargs: object) -> dict[str, object]:
+        name = str(kwargs.pop("_test_name"))
+        captured[name] = kwargs
+        return {}
+
+    context = {
+        "browser_coding_service": object(),
+        "execution_service": object(),
+        "browser_manager": object(),
+        "network_guard": object(),
+    }
+    calls = {
+        "browser_app_open": {"profile_id": "profile-1"},
+        "browser_observe": {"session_id": "session-1"},
+        "browser_action": {
+            "action_id": "action-1",
+            "session_id": "session-1",
+            "sequence": 1,
+            "kind": "read",
+            "effect_class": "read-only",
+        },
+        "browser_session_close": {"session_id": "session-1"},
+    }
+    for name, params in calls.items():
+        registry.get(name).handler = capture
+        await broker.invoke(
+            name,
+            mode="coding",
+            context=context,
+            _test_name=name,
+            **params,
+        )
+        assert "browser_manager" not in captured[name]
+        assert "network_guard" not in captured[name]
+
+
 def test_gateway_view_exports_full_catalogue_with_schema_digest():
     """P1-2 (tool descriptor drift): gateway_view() exports the Python
     production registry's model-visible tools so the Go /api/tools endpoint
@@ -362,6 +405,23 @@ def test_prune_shares_frozen_definitions():
     # The definition is frozen — mutation raises.
     with pytest.raises(PermissionError, match="frozen security field"):
         tool.permission_level = "execute"
+
+
+def test_read_file_schema_matches_one_based_runtime_contract():
+    registry = create_builtin_registry()
+    schema = registry.get("read_file").parameters["properties"]
+
+    assert schema["offset"]["minimum"] == 1
+    assert schema["limit"]["minimum"] == 1
+    assert registry.validate_call(
+        "read_file", {"path": "src/cache.py", "offset": 1, "limit": 1}
+    ) is True
+    assert registry.validate_call(
+        "read_file", {"path": "src/cache.py", "offset": 0, "limit": 1}
+    ) is False
+    assert registry.validate_call(
+        "read_file", {"path": "src/cache.py", "offset": 1, "limit": 0}
+    ) is False
 
 
 # ---------------------------------------------------------------------------

@@ -18,7 +18,10 @@ When enabled, ``allowed_domains`` and ``blocked_domains`` are STILL enforced:
   network is enabled.
 
 When network is disabled, all network access is blocked regardless of the
-allowlist.
+allowlist.  A trusted runtime may separately opt in to admitting local
+language-toolchain commands when its execution backend has already proved
+kernel-enforced network isolation; the backend remains the authority that
+blocks egress from the child process.
 
 The guard is intentionally conservative: when in doubt about whether a
 command reaches the network it blocks, matching Codex's "deny by default"
@@ -31,6 +34,7 @@ import logging
 import re
 import shlex
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 from khaos.security.host_network import (
     HostNetworkAuthority,
@@ -160,6 +164,24 @@ NETWORK_COMMAND_KEYWORDS = frozenset(
     }
 )
 
+# These executables are useful for local project tests and builds, but the
+# interpreter/toolchain itself can also open sockets.  Keep them in a separate
+# set instead of treating them as intrinsically non-networking.  The
+# NetworkGuard only admits them under ``kernel_network_isolation_proven`` with
+# the effective network policy disabled; the OS-enforced execution backend
+# still supplies the actual deny-all egress boundary.
+ISOLATED_LOCAL_RUNTIME_COMMANDS = frozenset(
+    {
+        "python",
+        "python3",
+        "python3.11",
+        "node",
+        "npm",
+        "pip",
+        "cargo",
+    }
+)
+
 NETWORK_GIT_SUBCOMMANDS = frozenset({"push", "pull", "fetch", "clone", "remote", "ls-remote"})
 
 
@@ -182,8 +204,16 @@ class NetworkGuard:
         blocked_domains: list[str] | None = None,
         *,
         host_authority: HostNetworkAuthority | None = None,
+        kernel_network_isolation_proven: bool = False,
     ):
         self.network_enabled = network_enabled
+        if type(kernel_network_isolation_proven) is not bool:
+            raise ValueError("kernel_network_isolation_proven must be boolean")
+        # This is a composition-root fact, never model-controlled input.  It
+        # is intentionally opt-in so standalone NetworkGuard callers retain
+        # the conservative behaviour of classifying runtimes as potentially
+        # network-capable.
+        self.kernel_network_isolation_proven = kernel_network_isolation_proven
         # H3: three-state — ``None`` means "no allowlist configured"
         # (unrestricted subject to blocklist when network is on); an empty
         # set means "explicitly deny all domains"; a non-empty set is the
@@ -209,6 +239,12 @@ class NetworkGuard:
         # can use an isolated loopback HTTP server without weakening the
         # production authority's public-address-only policy.
         self._host_authority = host_authority or HostNetworkAuthority()
+        # Coding app listeners are not general network access.  They are
+        # exact task-owned loopback endpoints declared by BrowserCodingService
+        # before a BrowserContext is admitted.  Keep this separate from the
+        # public-domain allowlist so ``network_enabled=False`` remains the
+        # default for all other destinations.
+        self._local_service_endpoints: frozenset[tuple[str, int]] = frozenset()
 
     @property
     def allowed_domains(self) -> frozenset[str] | None:
@@ -221,6 +257,32 @@ class NetworkGuard:
     def blocked_domains(self) -> frozenset[str]:
         """Return the compiled blocklist without exposing mutable state."""
         return frozenset(self._blocked)
+
+    def bind_local_service_endpoint(self, host: str, port: int) -> None:
+        """Authorize one exact task-owned ``127.0.0.1:<port>`` endpoint.
+
+        This does not enable outbound network access and does not authorize a
+        hostname, wildcard, private address, or arbitrary localhost port.
+        """
+        if host != "127.0.0.1" or type(port) is not int or not 1 <= port <= 65535:
+            raise ValueError("local service endpoint must be 127.0.0.1:<port>")
+        self._local_service_endpoints = frozenset(
+            (*self._local_service_endpoints, (host, port))
+        )
+
+    def unbind_local_service_endpoint(self, host: str, port: int) -> None:
+        """Revoke one exact task-owned loopback endpoint."""
+        if host != "127.0.0.1" or type(port) is not int or not 1 <= port <= 65535:
+            raise ValueError("local service endpoint must be 127.0.0.1:<port>")
+        endpoint = (host, port)
+        self._local_service_endpoints = frozenset(
+            value for value in self._local_service_endpoints if value != endpoint
+        )
+
+    @property
+    def local_service_endpoints(self) -> frozenset[tuple[str, int]]:
+        """Return the exact loopback endpoints admitted for local apps."""
+        return self._local_service_endpoints
 
     async def check_resolved_url(self, url: str) -> NetworkCheckResult:
         """Apply domain policy and reject URLs resolving to special-use IPs."""
@@ -249,6 +311,18 @@ class NetworkGuard:
         Redirect transports must call this for every hop so the effective
         domain policy and DNS/IP policy cannot drift apart.
         """
+        local_target = self._local_target(url)
+        if local_target is not None:
+            # Blocked domains retain precedence even for a declared endpoint.
+            if any(
+                local_target.hostname == blocked
+                or local_target.hostname.endswith(f".{blocked}")
+                for blocked in self._blocked
+            ):
+                raise HostNetworkDeniedError("local service endpoint is blocked by policy")
+            if previous_scheme == "https" and local_target.parsed.scheme == "http":
+                raise HostNetworkDeniedError("HTTPS redirect downgrade is not allowed")
+            return local_target
         domain_result = self._check_url(url)
         if not domain_result.allowed:
             raise HostNetworkDeniedError(domain_result.reason)
@@ -256,6 +330,36 @@ class NetworkGuard:
             url,
             previous_scheme=previous_scheme,
             allowed_schemes=frozenset({"http", "https", "ws", "wss"}),
+        )
+
+    def _local_target(self, url: str) -> ValidatedTarget | None:
+        """Return a no-DNS target only for an exact bound loopback endpoint."""
+        try:
+            parsed = urlparse(url)
+            scheme = parsed.scheme.lower()
+            host = (parsed.hostname or "").strip().casefold()
+            parsed_port = parsed.port
+            port = (
+                parsed_port
+                if parsed_port is not None
+                else (443 if scheme in {"https", "wss"} else 80)
+            )
+        except ValueError:
+            return None
+        if (
+            scheme not in {"http", "https", "ws", "wss"}
+            or parsed.username is not None
+            or parsed.password is not None
+            or host != "127.0.0.1"
+            or not 1 <= port <= 65535
+            or (host, port) not in self._local_service_endpoints
+        ):
+            return None
+        return ValidatedTarget(
+            url=url,
+            parsed=parsed,
+            hostname=host,
+            addresses=(host,),
         )
 
     def check_tool(self, tool_name: str, arguments: dict) -> NetworkCheckResult:
@@ -311,6 +415,18 @@ class NetworkGuard:
     def _check_terminal_command(self, command: str) -> NetworkCheckResult:
         """检查终端命令是否涉及网络。"""
         base = self._base_command(command)
+        if (
+            base in ISOLATED_LOCAL_RUNTIME_COMMANDS
+            and not self.network_enabled
+            and self.kernel_network_isolation_proven
+        ):
+            return NetworkCheckResult(
+                allowed=True,
+                reason=(
+                    "local runtime admitted; network denial is enforced by "
+                    "the kernel sandbox"
+                ),
+            )
         if base not in NETWORK_COMMAND_KEYWORDS:
             return NetworkCheckResult(allowed=True, reason="not a network command")
 

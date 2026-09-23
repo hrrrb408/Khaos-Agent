@@ -43,10 +43,12 @@ from khaos.memory import MemoryEventBridge, RuntimeMemoryContext
 from khaos.modes import ModeManager
 from khaos.rpc.models import ChatRequest, ConfirmRequest
 from khaos.runtime import RequestContext
-from khaos.runtime_profile import RuntimeProfile, resolve_runtime_profile
 from khaos.runtime.context import local_principal_id
+from khaos.runtime_profile import RuntimeProfile, resolve_runtime_profile
 from khaos.scheduler import CronEngine
+from khaos.security.credential_broker import CredentialBroker
 from khaos.security.middleware import SecurityMiddleware
+from khaos.supervision.service import TaskSupervisionService
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +85,12 @@ class AgentService:
         self.project_root = project_root or Path.cwd()
         self.config_path = config_path or self.project_root / "config.yaml"
         self._router = router
+        self._credential_broker = getattr(
+            getattr(router, "provider_manager", None),
+            "credential_broker",
+            None,
+        )
+        self._owns_credential_broker = False
         # Round-5 Batch 5.2 (C-05): per-process boot_id used to tag
         # chat_streams rows so recovery never recovers the current
         # process's own active streams.  Passed through to
@@ -178,6 +186,13 @@ class AgentService:
             if self._effective_policy.audit_enabled
             else None
         )
+        # M8.6: one application-scoped canonical supervision writer is shared
+        # by AgentLoop and TaskService.  It owns only typed projections and
+        # control commands; mutation, approval, merge, and completion remain
+        # with their existing authorities.
+        self.supervision_service = TaskSupervisionService(
+            db, audit_logger=self._audit_logger
+        )
         self.cron_engine = CronEngine(
             db=db,
             executor=self._execute_scheduled_prompt,
@@ -254,6 +269,33 @@ class AgentService:
         self._ready = False
         if self._audit_logger is not None:
             await self._audit_logger.verify_anchor()
+        if self._router is None:
+            from khaos.rpc.composition import load_router_from_config
+
+            self._router = load_router_from_config(
+                self.config_path,
+                project_root=self.project_root,
+            )
+            self._credential_broker = getattr(
+                getattr(self._router, "provider_manager", None),
+                "credential_broker",
+                None,
+            )
+            self._owns_credential_broker = self._credential_broker is not None
+        if not isinstance(self._credential_broker, CredentialBroker):
+            self._credential_broker = CredentialBroker(
+                allow_context_adoption=not self.runtime_profile.is_production,
+            )
+            self._owns_credential_broker = True
+        if self._audit_logger is not None:
+            bind_redactor = getattr(self._audit_logger, "bind_secret_redactor", None)
+            if callable(bind_redactor):
+                bind_redactor(self._credential_broker.secret_redactor)
+        bind_supervision_redactor = getattr(
+            self.supervision_service.repository, "bind_secret_redactor", None
+        )
+        if callable(bind_supervision_redactor):
+            bind_supervision_redactor(self._credential_broker.secret_redactor)
         from khaos.runtime import build_memory_host
 
         host = await build_memory_host(
@@ -265,6 +307,7 @@ class AgentService:
             project_id=self._bound_project_id,
             audit_logger=self._audit_logger,
             effective_policy=self._effective_policy,
+            credential_broker=self._credential_broker,
         )
         # C-1-5a: ``TaskService`` now lazily constructs per-principal
         # TaskManagers on first use (``_manager(ctx)``), so there's no
@@ -466,6 +509,9 @@ class AgentService:
         if self.memory_host is not None:
             await self.memory_host.close()
             self.memory_host = None
+        if self._credential_broker is not None and self._owns_credential_broker:
+            self._credential_broker.close()
+            self._credential_broker = None
         # The shared AuditLogger is process-owned and is closed exactly once,
         # after all runtime/authority shutdown events had a chance to log.
         if self._audit_logger is not None:
@@ -1120,6 +1166,7 @@ class AgentService:
             # ``TaskService.list``.
             approval_broker=self.approval_broker,
             router=self._router,
+            credential_broker=self._credential_broker,
             office_authority=self._office_authority,
             memory_host=self.memory_host,
             principal_id=ctx.principal_id,
@@ -1149,6 +1196,7 @@ class AgentService:
             cron_engine=self.cron_engine,
             subagent_spawner=self.subagent_spawner,
             cleanup_authority=self.runtime_cleanup_authority,
+            supervision_service=self.supervision_service,
         )
         if self.runtime_profile.is_production:
             return await build_production_runtime(runtime_config)

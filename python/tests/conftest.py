@@ -99,6 +99,33 @@ _DOCKER_IMAGE_ANCHOR: str | None = None
 _DOCKER_EXECUTABLE: str | None = None
 
 
+@pytest.fixture(scope="session")
+def trusted_git_environment():
+    """Return the real platform Trusted Git locator/policy/preflight result."""
+    from khaos.coding.workspace.trusted_git_preflight import diagnose_trusted_git
+
+    return asyncio.run(diagnose_trusted_git())
+
+
+@pytest.fixture(autouse=True)
+def _require_trusted_git_for_marked_tests(request: pytest.FixtureRequest):
+    """Gate real Trusted Git integration tests without masking CI failures."""
+    if request.node.get_closest_marker("requires_trusted_git") is None:
+        return
+    report = request.getfixturevalue("trusted_git_environment")
+    if report.status.value == "available":
+        return
+    detail = (
+        f"Trusted Git preflight status={report.status.value}, "
+        f"classification={report.classification}"
+    )
+    if report.classification == "ENVIRONMENT_BLOCKED" and os.environ.get(
+        "CI", ""
+    ).casefold() not in {"1", "true", "yes"}:
+        pytest.skip(f"TEST_FIXTURE_ENVIRONMENT_BLOCKED: {detail}")
+    pytest.fail(f"required Trusted Git integration unavailable: {detail}")
+
+
 def pytest_collection_modifyitems(
     config: pytest.Config, items: list[pytest.Item]
 ) -> None:

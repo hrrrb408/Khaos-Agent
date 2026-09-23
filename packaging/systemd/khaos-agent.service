@@ -11,6 +11,9 @@ WorkingDirectory=/opt/khaos
 EnvironmentFile=/etc/khaos/authorityd.env
 Environment=KHAOS_DEV_MODE=0
 Environment=KHAOS_AUTHORITY_PROFILE=native-production
+Environment=HOME=/var/lib/khaos
+Environment=PLAYWRIGHT_BROWSERS_PATH=/opt/khaos-playwright
+Environment=KHAOS_PYTHON_CAPABILITY_FILE=/var/lib/khaos/rpc-capability
 Environment=KHAOS_SANDBOX_LAUNCHER=/usr/local/bin/khaos-sandbox-launcher
 Environment=KHAOS_EXECUTION_SANDBOX_LAUNCHER=/usr/local/bin/khaos-execution-sandbox-launcher
 Environment=KHAOS_BROWSER_KERNEL_HELPER_SOCKET=/run/khaos-helper/browser-kernel-helper.sock
@@ -21,18 +24,20 @@ Environment=KHAOS_AGENT_UID=10001
 Environment=KHAOS_AUTHORITYD_UID=10003
 Environment=KHAOS_JOB_UID=10004
 Environment=KHAOS_AUTHORITYD_SOCKET_MODE=0660
+Environment=KHAOS_CGROUP_ROOT=/sys/fs/cgroup/system.slice/khaos-agent.service
 SupplementaryGroups=khaos-authority
 RuntimeDirectory=khaos
 RuntimeDirectoryMode=0700
-ExecStart=/opt/khaos/venv/bin/khaos start --socket /run/khaos/agent.sock --db /var/lib/khaos/khaos.db
+ExecStart=/opt/khaos/venv/bin/khaos start --socket /run/khaos/agent.sock --db khaos.db
 Restart=on-failure
+Delegate=yes
 NoNewPrivileges=true
 CapabilityBoundingSet=
 AmbientCapabilities=
 PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/run/khaos /var/lib/khaos /run/khaos-helper
+ReadWritePaths=/run/khaos /var/lib/khaos/.khaos
 ReadOnlyPaths=/run/khaos-authorityd/authorityd.pub /etc/khaos/typed-resource-catalog.json
 
 [Install]

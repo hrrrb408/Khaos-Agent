@@ -1,11 +1,10 @@
 import asyncio
-import threading
 import sys
+import threading
 import time
 from pathlib import Path
 
 import pytest
-
 from khaos.coding.execution import ExecutionRequest, ExecutionService, ResourceBudget
 from khaos.coding.execution.supervisor import ProcessSupervisor
 from khaos.coding.workspace.manager import WorkspaceError, WorkspaceManager
@@ -15,14 +14,14 @@ from khaos.coding.workspace.models import (
     WorkspaceTransition,
 )
 from khaos.coding.workspace.storage import (
+    WorkspaceMutation,
+    WorkspaceStorageAuthority,
     WorkspaceStorageLimits,
     WorkspaceStorageSnapshot,
     WorkspaceStorageViolation,
-    WorkspaceMutation,
     capture_workspace_snapshot,
 )
 from khaos.tools.file_tools import copy_file, write_file
-
 
 pytestmark = pytest.mark.skipif(
     sys.platform == "win32",
@@ -97,6 +96,42 @@ async def test_overwrite_overage_stream_restores_from_recovery_file(tmp_path):
     assert list(recovery.iterdir()) == []
 
 
+def test_finalize_failure_rolls_back_published_effect_and_quarantines(tmp_path):
+    target = tmp_path / "published.txt"
+    baseline = capture_workspace_snapshot(tmp_path)
+    rolled_back = False
+
+    def operation():
+        nonlocal rolled_back
+        target.write_text("published", encoding="utf-8")
+
+        def rollback():
+            nonlocal rolled_back
+            rolled_back = True
+            target.unlink(missing_ok=True)
+
+        def finalize():
+            raise OSError("injected finalize failure")
+
+        return WorkspaceMutation("result", rollback, finalize)
+
+    authority = WorkspaceStorageAuthority()
+    with pytest.raises(WorkspaceStorageViolation) as caught:
+        authority.mutate(
+            "workspace",
+            tmp_path,
+            baseline,
+            WorkspaceStorageLimits(),
+            operation,
+        )
+
+    assert rolled_back is True
+    assert not target.exists()
+    assert caught.value.rollback_succeeded is True
+    assert caught.value.quarantine_required is True
+    assert caught.value.diagnostic["kind"] == "workspace-finalize"
+
+
 @pytest.mark.asyncio
 async def test_repeated_copy_rolls_back_entry_overage(tmp_path):
     (tmp_path / "source.txt").write_text("source", encoding="utf-8")
@@ -159,7 +194,7 @@ def test_chmod_zero_directory_makes_snapshot_incomplete(tmp_path):
 
 
 def test_rename_identity_churn_is_fail_closed(tmp_path, monkeypatch):
-    import khaos.coding.workspace.storage as storage
+    from khaos.coding.workspace import storage
 
     root_identity = (1, 1)
     scans = iter(
@@ -180,7 +215,7 @@ def test_rename_identity_churn_is_fail_closed(tmp_path, monkeypatch):
 
 
 def test_transient_incomplete_scan_retries_to_stable_view(tmp_path, monkeypatch):
-    import khaos.coding.workspace.storage as storage
+    from khaos.coding.workspace import storage
 
     root_identity = (1, 1)
     stable = WorkspaceStorageSnapshot(

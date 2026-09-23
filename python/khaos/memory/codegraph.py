@@ -106,6 +106,7 @@ class CodeGraphService:
         files = list(_iter_source_files(root, self._max_files))
         skipped = 0
         nodes: list[CodeGraphNode] = []
+        node_keys: set[tuple[str, str, str]] = set()
         path_nodes: dict[Path, str] = {}
         symbol_nodes: dict[str, list[str]] = {}
         for path in files:
@@ -132,6 +133,7 @@ class CodeGraphService:
                 {"suffix": path.suffix.lower()},
             )
             nodes.append(file_node)
+            node_keys.add((relative, "file", relative))
             path_nodes[path] = file_node.node_id
             try:
                 symbols = self._parser.parse_symbols(path)
@@ -141,12 +143,24 @@ class CodeGraphService:
                 name = str(symbol.get("name", ""))
                 if not name:
                     continue
+                node_kind = str(symbol.get("kind", "symbol"))
+                node_key = (relative, node_kind, name)
+                # The parser intentionally reports lightweight symbols from
+                # nested scopes and can therefore encounter the same
+                # path/kind/name more than once (for example, a nested helper
+                # with the same name as a module-level helper).  The durable
+                # schema has one such node per snapshot; keep the first
+                # deterministic occurrence instead of violating its UNIQUE
+                # constraint during runtime startup.
+                if node_key in node_keys:
+                    continue
+                node_keys.add(node_key)
                 symbol_node = _make_node(
                     runtime.project_id,
                     effective_repo,
                     effective_commit,
                     relative,
-                    str(symbol.get("kind", "symbol")),
+                    node_kind,
                     name,
                     name.rsplit(".", 1)[-1],
                     int(symbol.get("line", 1)),

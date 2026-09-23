@@ -264,6 +264,7 @@ def test_windows_product_suite_runs_complete_collection_in_isolated_shards():
     assert "Shards run serially" in runner
     assert "Do not overlap child processes" in runner
     assert "DEDICATED_FIRST_SHARD_PREFIXES" in runner
+    assert "python/tests/integration/test_router_import_boundaries.py::" in runner
     assert "global Winsock provider state" in runner
     assert "--collect" in runner
     assert "Collect in a process that exits before any test shard is launched" in runner

@@ -20,9 +20,9 @@ from khaos.coding.execution.platform import (
     LinuxBubblewrapBackend,
     MacOSSandboxBackend,
     UnsupportedBackend,
+    _command_runtime_read_roots,
     _create_linux_cgroup,
     _linux_sandbox_launcher,
-    _linux_processes_postorder,
     _mountinfo_has_cgroup_v2_path,
     _read_windows_output,
     _remove_windows_python_runtime,
@@ -42,6 +42,26 @@ async def test_unsupported_backend_refuses_writable_execution():
 def test_platform_profiles_are_network_denying(tmp_path: Path):
     assert "deny network" in MacOSSandboxBackend().profile(tmp_path)
     assert "--unshare-net" in LinuxBubblewrapBackend().argv_prefix(tmp_path)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS sandbox-exec syntax")
+def test_macos_local_listener_profile_is_accepted_by_seatbelt(tmp_path: Path):
+    """Keep the task-local loopback rule valid for the real Seatbelt parser."""
+    _require_or_skip("sandbox-exec")
+    profile = MacOSSandboxBackend().profile(
+        tmp_path,
+        local_listen_ports=(38123,),
+    )
+    result = subprocess.run(
+        ("/usr/bin/sandbox-exec", "-p", profile, "/usr/bin/true"),
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    if result.returncode != 0 and "Operation not permitted" in result.stderr:
+        pytest.skip("current execution sandbox cannot invoke host sandbox-exec")
+    assert result.returncode == 0, result.stderr
 
 
 def test_execution_launcher_prefers_capability_free_dedicated_copy(
@@ -268,6 +288,25 @@ def test_linux_profile_isolates_proc_ipc_uts_and_parent_lifetime(
         argv[index:index + 3] for index in range(len(argv) - 2)
     )
     assert "--clearenv" in argv
+
+
+@pytest.mark.posix_host
+def test_linux_community_profile_uses_unprivileged_job_mapping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("KHAOS_DEV_MODE", "0")
+    monkeypatch.setenv("KHAOS_AUTHORITY_PROFILE", "community")
+    monkeypatch.delenv("KHAOS_AGENT_UID", raising=False)
+    monkeypatch.delenv("KHAOS_AUTHORITYD_UID", raising=False)
+    monkeypatch.setenv("KHAOS_JOB_UID", "65534")
+    monkeypatch.setattr(
+        "khaos.coding.execution.platform._resolve_bwrap_path",
+        lambda: "/usr/bin/bwrap",
+    )
+    argv = LinuxBubblewrapBackend().argv_prefix(tmp_path)
+    assert argv[argv.index("--uid") + 1] == "65534"
+    assert argv[argv.index("--gid") + 1] == "65534"
+    assert argv[argv.index("--cap-drop") + 1] == "ALL"
 
 
 def test_linux_dev_profile_keeps_bwrap_reaper(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -507,6 +546,36 @@ def test_runtime_roots_include_lexical_virtualenv(tmp_path: Path):
     roots = _runtime_read_roots((str(executable),), tmp_path / "workspace")
 
     assert virtualenv.resolve() in roots
+
+
+@pytest.mark.posix_host
+def test_runtime_roots_follow_approved_path_for_shell_children(tmp_path: Path):
+    base = tmp_path / "base" / "bin" / "python"
+    base.parent.mkdir(parents=True)
+    base.write_text("#!/bin/sh\n", encoding="utf-8")
+    base.chmod(0o755)
+    virtualenv = tmp_path / "venv"
+    (virtualenv / "bin").mkdir(parents=True)
+    (virtualenv / "pyvenv.cfg").write_text("home = /test\n", encoding="utf-8")
+    executable = virtualenv / "bin" / "python3"
+    executable.symlink_to(base)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    roots = _command_runtime_read_roots(
+        ("/bin/sh", "-c", "python3 -m pytest"),
+        workspace,
+        environment={"PATH": str(executable.parent)},
+    )
+
+    assert virtualenv.resolve() in roots
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux runtime roots")
+def test_linux_command_runtime_roots_include_system_runtime_tree(tmp_path: Path):
+    roots = _command_runtime_read_roots(("/bin/sh",), tmp_path)
+
+    assert Path("/usr") in roots
 
 
 def test_windows_python_runtime_staging_is_private_and_reversible(tmp_path: Path):
@@ -867,6 +936,7 @@ async def test_backend_selector_returns_unsupported_when_bwrap_probe_fails(monke
         "writable execution must fail closed when bwrap cannot isolate, "
         "not degrade to a host subprocess"
     )
+    assert writable_backend.reason == "EPERM on RTM_NEWADDR"
     with pytest.raises(PermissionError):
         await writable_backend.execute(object())
 
@@ -874,6 +944,7 @@ async def test_backend_selector_returns_unsupported_when_bwrap_probe_fails(monke
     # are not an OS isolation boundary.
     readonly_backend = BackendSelector().select(writable=False)
     assert isinstance(readonly_backend, UnsupportedBackend)
+    assert readonly_backend.reason == "EPERM on RTM_NEWADDR"
 
 
 @pytest.mark.asyncio
@@ -890,6 +961,7 @@ async def test_backend_selector_fails_closed_when_bwrap_probe_raises(monkeypatch
 
     backend = BackendSelector().select(writable=False)
     assert isinstance(backend, UnsupportedBackend)
+    assert "TimeoutExpired" in backend.reason
     with pytest.raises(PermissionError):
         await backend.execute(object())
 

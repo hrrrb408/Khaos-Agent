@@ -6,6 +6,14 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
+if ! id -u khaos >/dev/null 2>&1; then
+  useradd --system --uid 10001 --home-dir /var/lib/khaos \
+    --shell /usr/sbin/nologin khaos
+elif [ "$(id -u khaos)" -ne 10001 ]; then
+  echo "khaos service user must have UID 10001" >&2
+  exit 1
+fi
+
 if ! id -u khaos-authority >/dev/null 2>&1; then
   useradd --system --uid 10003 --home-dir /nonexistent \
     --shell /usr/sbin/nologin khaos-authority
@@ -44,6 +52,25 @@ chmod 0444 /usr/local/sbin/khaos-browser-kernel-helper.sha256
 setcap cap_sys_admin=ep /usr/local/bin/khaos-sandbox-launcher
 
 install -d -o root -g root -m 0755 /var/lib/khaos
+install -d -o root -g root -m 0755 /opt/khaos-playwright
+install -d -o khaos -g khaos -m 0700 /var/lib/khaos/.khaos
+chown root:root /var/lib/khaos
+chmod 0755 /var/lib/khaos
+chown root:root /opt/khaos-playwright
+chmod 0755 /opt/khaos-playwright
+chown khaos:khaos /var/lib/khaos/.khaos
+chmod 0700 /var/lib/khaos/.khaos
+if [ -L /var/lib/khaos/rpc-capability ] || [ -e /var/lib/khaos/rpc-capability ]; then
+  if [ -L /var/lib/khaos/rpc-capability ] || [ ! -f /var/lib/khaos/rpc-capability ]; then
+    echo "/var/lib/khaos/rpc-capability must be a regular non-symlink file" >&2
+    exit 1
+  fi
+else
+  umask 077
+  head -c 48 /dev/urandom | base64 | tr -d '\n' > /var/lib/khaos/rpc-capability
+fi
+chown khaos:khaos /var/lib/khaos/rpc-capability
+chmod 0400 /var/lib/khaos/rpc-capability
 if [ ! -e /var/lib/khaos/browser-helper.secret ]; then
   umask 077
   head -c 32 /dev/urandom > /var/lib/khaos/browser-helper.secret

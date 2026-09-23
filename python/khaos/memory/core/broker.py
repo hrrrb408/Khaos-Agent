@@ -55,6 +55,7 @@ from khaos.memory.core.policy import (
 )
 from khaos.memory.ledger import SqliteEventLedger
 from khaos.memory.profiles import MemoryProfile
+from khaos.security.secret_redaction import SecretRedactor
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +87,7 @@ class MemoryBroker:
         provider_registry: Any = None,
         audit_sink: Any = None,
         audit_required: bool = False,
+        secret_redactor: SecretRedactor | None = None,
     ) -> None:
         self.provider = provider
         self.ledger = ledger
@@ -97,6 +99,7 @@ class MemoryBroker:
             self.verification_verifier = VerificationReceiptVerifier()
         self.codegraph = codegraph
         self.observability = observability
+        self.secret_redactor = secret_redactor
         self._provider_registry = provider_registry
         self._provider_lock = asyncio.Lock()
         self._rebuild_lock = asyncio.Lock()
@@ -109,7 +112,9 @@ class MemoryBroker:
         elif audit_required:
             self.audit_sink = TrustKernelMemoryAuditSink(None, required=True)
         else:
-            self.audit_sink = DurableMemoryAuditSink(ledger.database)
+            self.audit_sink = DurableMemoryAuditSink(
+                ledger.database, secret_redactor=secret_redactor
+            )
         self.audit_required = audit_required
 
     def bind_provider_registry(self, registry: Any) -> None:

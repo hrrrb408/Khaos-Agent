@@ -6,7 +6,6 @@ from pathlib import Path
 
 from khaos.security.sandbox import Sandbox, SandboxMode
 
-
 # ---------------------------------------------------------------------------
 # check_tool (capability enforcement)
 # ---------------------------------------------------------------------------
@@ -103,6 +102,39 @@ def test_capability_git_push_in_workspace() -> None:
     sandbox = Sandbox(mode=SandboxMode.WORKSPACE_WRITE, workspace_root=Path("/tmp"))
 
     assert sandbox.check_tool("git_push").allowed is True
+
+
+def test_coding_intelligence_and_browser_are_workspace_capabilities() -> None:
+    """Coding read/browser tools must reach their own authority layers."""
+    workspace = Sandbox(mode=SandboxMode.WORKSPACE_WRITE, workspace_root=Path("/tmp"))
+
+    for tool_name in (
+        "code_search",
+        "code_symbols",
+        "browser_app_open",
+        "browser_observe",
+        "browser_action",
+        "browser_session_close",
+    ):
+        assert workspace.check_tool(tool_name).allowed is True
+
+    read_only = Sandbox(mode=SandboxMode.READ_ONLY, workspace_root=Path("/tmp"))
+    assert read_only.check_tool("code_search").allowed is True
+    assert read_only.check_tool("code_symbols").allowed is True
+    assert read_only.check_tool("browser_observe").allowed is True
+    assert read_only.check_tool("browser_action").allowed is False
+
+
+def test_edit_transaction_tools_follow_their_effect_boundaries() -> None:
+    """Preview is read-only; apply is available only for workspace writes."""
+    workspace = Sandbox(mode=SandboxMode.WORKSPACE_WRITE, workspace_root=Path("/tmp"))
+
+    assert workspace.check_tool("preview_edit_transaction").allowed is True
+    assert workspace.check_tool("apply_edit_transaction").allowed is True
+
+    read_only = Sandbox(mode=SandboxMode.READ_ONLY, workspace_root=Path("/tmp"))
+    assert read_only.check_tool("preview_edit_transaction").allowed is True
+    assert read_only.check_tool("apply_edit_transaction").allowed is False
 
 
 def test_read_only_blocks_write_path() -> None:

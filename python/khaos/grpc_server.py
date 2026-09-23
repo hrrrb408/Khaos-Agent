@@ -801,7 +801,11 @@ async def serve_json_lines(
         audit_service = _AuditService(agent._audit_logger or AuditLogger(db))
         # C-1-5a: _TaskService now takes ``db`` (not a TaskManager) and
         # constructs per-principal managers on demand.
-        task_service = _TaskService(db, agent.approval_broker)
+        task_service = _TaskService(
+            db,
+            agent.approval_broker,
+            supervision_service=agent.supervision_service,
+        )
         subagent_service: SubAgentService | None = None
         if enable_subagents:
             # B1: share the _AgentService's office authority AND approval broker so
@@ -1232,6 +1236,37 @@ async def serve_json_lines(
                     async for event in task_service.events(ctx, payload["task_id"]):
                         writer.write((json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8"))
                         await writer.drain()
+                elif method == "TaskService.Supervision":
+                    response = await task_service.supervision(ctx, payload["task_id"])
+                    writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
+                elif method == "TaskService.SupervisionEvents":
+                    async for event in task_service.supervision_events(
+                        ctx,
+                        payload["task_id"],
+                        int(payload.get("after_sequence", 0)),
+                        int(payload.get("limit", 1024)),
+                    ):
+                        writer.write((json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8"))
+                        await writer.drain()
+                elif method in {"TaskService.Pause", "TaskService.Resume"}:
+                    action = method.rsplit(".", 1)[-1].lower()
+                    response = await getattr(task_service, action)(ctx, **payload)
+                    writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
+                elif method == "TaskService.CheckpointList":
+                    response = await task_service.checkpoint_list(ctx, **payload)
+                    writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
+                elif method == "TaskService.Checkpoint":
+                    response = await task_service.checkpoint(ctx, **payload)
+                    writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
+                elif method == "TaskService.CheckpointCreate":
+                    response = await task_service.create_checkpoint(ctx, **payload)
+                    writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
+                elif method == "TaskService.RewindPlan":
+                    response = await task_service.rewind_plan(ctx, **payload)
+                    writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
+                elif method == "TaskService.Rewind":
+                    response = await task_service.rewind(ctx, **payload)
+                    writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
                 elif method == "SubAgentService.Spawn":
                     response = await _handle_optional_subagent(subagent_service, "spawn", ctx, payload)
                     writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))

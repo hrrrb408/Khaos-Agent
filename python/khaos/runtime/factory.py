@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 import uuid
 from collections.abc import Awaitable, Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from dataclasses import fields as dataclass_fields
 from pathlib import Path
 from typing import Any, cast
@@ -20,6 +21,13 @@ from khaos.audit import (
     resolve_safe_audit_anchor_path,
     resolve_safe_audit_log_path,
 )
+from khaos.coding.checkpoints.service import CheckpointService
+from khaos.coding.context_engine import (
+    ContextBudget,
+    ContextEngineService,
+    ToolOutputLimits,
+)
+from khaos.coding.edit_transaction import EditTransactionService
 from khaos.coding.execution import BackendSelector, ExecutionService
 from khaos.coding.intelligence.query_service import ContextIntelligenceService
 from khaos.coding.planning.coordinator import PlanningControlCoordinator
@@ -33,11 +41,26 @@ from khaos.coding.planning.trusted_verification_service import (
     TrustedVerificationService,
 )
 from khaos.coding.task_manager import TaskManager
+from khaos.coding.verification.evidence import VerificationObservationStore
+from khaos.coding.verification.planner import (
+    AutonomousPlannerLimits,
+    AutonomousVerificationPlanner,
+)
+from khaos.coding.verification.service import (
+    AutonomousVerificationCoordinator,
+    AutonomousVerificationFactProvider,
+)
 from khaos.coding.verify_fix import VerifyFixLoop
 from khaos.coding.workspace.manager import WorkspaceManager
 from khaos.coding.workspace.office_authority import OfficeMutationAuthority
 from khaos.db.state_root import project_id as compute_project_id
 from khaos.exceptions import RuntimeCloseError
+from khaos.extensions import (
+    EffectKind,
+    ExtensionPolicy,
+    ExtensionRegistry,
+    ExtensionService,
+)
 from khaos.memory import (
     MemoryBroker,
     MemoryBudget,
@@ -66,6 +89,7 @@ from khaos.memory.providers import (
 from khaos.memory.transfer import MemoryTransferService
 from khaos.modes import ModeManager
 from khaos.permissions import PermissionEngine
+from khaos.project_context import InstructionResolver
 from khaos.routing.router import create_default_router
 from khaos.runtime.authority import RuntimeAuthoritySeal
 from khaos.runtime.lifecycle import CloseState
@@ -77,13 +101,73 @@ from khaos.security.effective_policy import EffectiveSecurityPolicy
 from khaos.security.middleware import SecurityMiddleware
 from khaos.security.network_broker import NetworkBrokerFactory
 from khaos.security.network_guard import NetworkGuard
+from khaos.security.principals import (
+    principal_for_transport,
+    transport_root_delegation_digest,
+)
 from khaos.security.resource_scope import ResourceScopeError, TypedResourcePartialOrder
 from khaos.security.sandbox import Sandbox
 from khaos.skills import SkillGenerator, SkillManager
+from khaos.supervision.service import TaskSupervisionService
 from khaos.tools import create_runtime_registry
+from khaos.tools.budget import ToolBudget
 from khaos.tools.scheduler import ToolScheduler
 
 logger = logging.getLogger(__name__)
+
+
+def _complete_production_principal_binding(
+    *,
+    principal_id: str,
+    principal_kind: str,
+    parent_principal_id: str,
+    delegation_digest: str,
+    source_transport: str,
+    session_id: str,
+    project_id: str,
+    runtime_id: str,
+    policy_digest: str,
+) -> tuple[str, str, str]:
+    """Complete a canonical transport-root identity binding.
+
+    Local and production entry points commonly know the principal, transport,
+    session, and runtime but do not manually assemble the parent and
+    commitment fields. Derivation is allowed only from that complete trusted
+    context. Partial caller-supplied tuples remain fail-closed instead of
+    being padded with a guessed session or digest.
+    """
+    if source_transport == "unknown" and not any(
+        (principal_kind, parent_principal_id, session_id, delegation_digest)
+    ):
+        # Explicit local/test adapters may intentionally use the legacy
+        # untyped envelope. Do not manufacture a partial binding by deriving
+        # only ``principal_kind`` from an unknown transport.
+        return "", "", ""
+    resolved_kind = principal_kind or principal_for_transport(
+        principal_id, source_transport
+    ).kind.value
+    resolved_parent = parent_principal_id
+    resolved_digest = delegation_digest
+    if session_id and source_transport != "unknown":
+        if not resolved_parent:
+            resolved_parent = f"{resolved_kind}:{principal_id}"
+        if not resolved_digest:
+            resolved_digest = transport_root_delegation_digest(
+                principal_id=principal_id,
+                principal_kind=resolved_kind,
+                parent_principal_id=resolved_parent,
+                project_id=project_id,
+                session_id=session_id,
+                runtime_id=runtime_id,
+                source_transport=source_transport,
+                policy_digest=policy_digest,
+            )
+    elif any((resolved_parent, session_id, resolved_digest)):
+        raise ValueError(
+            "production runtime typed principal binding requires a known "
+            "transport and non-empty session_id"
+        )
+    return resolved_kind, resolved_parent, resolved_digest
 
 
 class RuntimeCleanupAuthority:
@@ -175,6 +259,10 @@ class RuntimeConfig:
     memory_host: MemoryHost | None = None
     skill_manager: SkillManager | None = None
     tool_scheduler: ToolScheduler | None = None
+    # Evaluation/development composition may provide the canonical hard tool
+    # budget.  Production callers keep the scheduler-owned default unless the
+    # production authority supplies an equivalent immutable budget.
+    tool_budget: ToolBudget | None = None
     workspace_manager: WorkspaceManager | None = None
     delegated_workspace_manager: WorkspaceManager | None = None
     delegated_execution_context: Any = None
@@ -255,6 +343,34 @@ class RuntimeConfig:
     # ProductionRuntimeConfig deliberately does not expose this hook; its
     # default is the conservative empty provider.
     completion_fact_provider: Any = None
+    # M8.1: a trusted development/evaluation composition may inject the
+    # workspace-bound repository-intelligence facade.  The structural
+    # ProductionRuntimeConfig deliberately omits this field, so the
+    # production factory remains the sole owner of the canonical facade.
+    context_intelligence: Any = None
+    # M8.4: trusted development/evaluation composition seam.  Production
+    # callers use the factory-created ContextEngineService below.
+    context_engine: Any = None
+    # M8.5: trusted development/evaluation seam for the parent-only parallel
+    # subagent coordinator.  Production composition creates this owner below
+    # from the canonical workspace, repository, and verification services.
+    parallel_subagent_coordinator: Any = None
+    # M8.6: application-scoped typed supervision owner.  Production callers
+    # may share this server-lifecycle service; it carries no effect authority.
+    supervision_service: Any = None
+    # M8.7: trusted development seam only.  ProductionRuntimeConfig omits this
+    # field so the factory constructs the sole extension registry/admission
+    # plane from the effective policy.
+    extension_service: Any = None
+    # M8.8: trusted Coding browser/app facade.  Production composition builds
+    # it from the already-owned browser, execution, network, workspace, and
+    # approval services; this hook is retained only for test/development
+    # adapters.
+    browser_coding_service: Any = None
+    # Trusted, immutable app launch profiles supplied by explicit operator
+    # configuration.  The model can select only a registered profile id; it
+    # cannot create or alter the argv/cwd contract at tool-call time.
+    app_profiles: tuple[Any, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -316,6 +432,11 @@ class ProductionRuntimeConfig:
     cron_engine: Any = None
     subagent_spawner: Any = None
     project_id: str = ""
+    supervision_service: Any = None
+    # Explicit operator-owned app profiles are safe to carry through the
+    # structural production config because BrowserCodingService validates the
+    # typed profile before registration and ExecutionService owns the spawn.
+    app_profiles: tuple[Any, ...] = ()
 
     def as_runtime_config(self) -> RuntimeConfig:
         """Materialize the internal config after the structural boundary."""
@@ -361,6 +482,8 @@ class ProductionRuntimeConfig:
             cron_engine=self.cron_engine,
             subagent_spawner=self.subagent_spawner,
             project_id=self.project_id,
+            supervision_service=self.supervision_service,
+            app_profiles=self.app_profiles,
         )
 
 
@@ -482,6 +605,37 @@ class RuntimeResult:
     composition_manifest: dict[str, object] | None = field(
         init=False, default=None
     )
+    # M8.1: repository intelligence is attached by the composition root so
+    # lifecycle cleanup does not infer ownership from the AgentLoop object.
+    # ``init=False`` preserves the established positional construction
+    # contract used by direct tests and compatibility adapters.
+    context_intelligence: Any = field(init=False, default=None, repr=False)
+    owns_context_intelligence: bool = field(
+        init=False, default=False, repr=False
+    )
+    # M8.4: final context selection owner.  It has no external authority or
+    # closeable resource; this field is an observability/composition handle.
+    context_engine: Any = field(init=False, default=None, repr=False)
+    # M8.3: the post-edit planner/executor observation coordinator is attached
+    # by the factory.  It has no independent execution or completion
+    # authority and therefore needs no separate lifecycle shutdown.
+    verification_coordinator: Any = field(init=False, default=None, repr=False)
+    # M8.5: parent-only orchestration handle.  Child worktree lifecycle,
+    # Trusted Git, verification, and completion authority remain owned by the
+    # composed services referenced by this coordinator.
+    parallel_subagent_coordinator: Any = field(
+        init=False, default=None, repr=False
+    )
+    # M8.6: canonical typed supervision and checkpoint owners attached by the
+    # factory without changing the long-standing positional constructor.
+    supervision_service: Any = field(init=False, default=None, repr=False)
+    checkpoint_service: Any = field(init=False, default=None, repr=False)
+    # M8.7: composed ExtensionService handle; it owns registry/admission
+    # metadata, not execution, approval, verification, or completion authority.
+    extension_service: Any = field(init=False, default=None, repr=False)
+    # M8.8: attached by the factory; it has no independent security authority
+    # and is closed before its underlying ExecutionService/BrowserManager.
+    browser_coding_service: Any = field(init=False, default=None, repr=False)
     # M7.3: production-composed planning control coordinator.  It is an
     # orchestration owner only; plan revisions remain passive and TaskStatus
     # lifecycle writes remain owned by their existing control boundaries.
@@ -565,6 +719,7 @@ class RuntimeResult:
         )
         for name, component in (
             ("execution_service", self.execution_service),
+            ("browser_coding_service", self.browser_coding_service),
             ("browser_manager", self.browser_manager),
             (
                 "credential_broker",
@@ -613,6 +768,7 @@ class RuntimeResult:
         """Verify every runtime-owned child exposes an independent proof."""
         for name, component in (
             ("execution_service", self.execution_service),
+            ("browser_coding_service", self.browser_coding_service),
             ("browser_manager", self.browser_manager),
             (
                 "credential_broker",
@@ -868,6 +1024,48 @@ class RuntimeResult:
                 except Exception:
                     failed = True
                     logger.debug("memory host close failed", exc_info=True)
+            # M8.1 repository intelligence owns only derived index resources;
+            # close its persistent connection after memory and before the
+            # execution authority.  The factory records the explicit owner on
+            # RuntimeResult; direct compatibility constructions leave it
+            # unset, so arbitrary loop attributes cannot affect shutdown.
+            if (
+                self.context_intelligence is not None
+                and self.owns_context_intelligence
+            ):
+                context_close = getattr(self.context_intelligence, "close", None)
+                if callable(context_close):
+                    try:
+                        close_context = cast(
+                            Callable[[], Awaitable[object]], context_close
+                        )
+                        await close_context()
+                    except Exception:
+                        failed = True
+                        logger.debug(
+                            "context intelligence close failed", exc_info=True
+                        )
+            # M8.8: browser sessions/apps are children of the composed
+            # facade.  Drain them before shutting down their underlying
+            # ExecutionService and BrowserManager so no page or dev-server
+            # effect can outlive the runtime owner.
+            if self.browser_coding_service is not None:
+                try:
+                    close_browser_coding: object = getattr(
+                        self.browser_coding_service, "aclose", None
+                    ) or getattr(self.browser_coding_service, "close", None)
+                    if callable(close_browser_coding):
+                        close_method = cast(
+                            Callable[[], Awaitable[object]], close_browser_coding
+                        )
+                        await close_method()
+                except Exception:
+                    failed = True
+                    logger.debug(
+                        "browser coding service close failed for runtime %s",
+                        self.runtime_id,
+                        exc_info=True,
+                    )
             if self.execution_service is not None:
                 try:
                     await self.tool_scheduler.aclose()
@@ -1164,6 +1362,7 @@ async def build_memory_host(
     commit_sha: str | None = None,
     audit_logger: AuditLogger | None,
     effective_policy: EffectiveSecurityPolicy,
+    credential_broker: CredentialBroker | None = None,
 ) -> MemoryHost:
     """Build the canonical application-scoped Memory V2 composition.
 
@@ -1194,6 +1393,7 @@ async def build_memory_host(
         db,
         network_allowed=bool(effective_policy.network_enabled),
         config=memory_config,
+        credential_broker=credential_broker,
     )
     target_provider = await memory_registry.activate(profile.provider)
     capabilities = target_provider.provider.capabilities()
@@ -1221,6 +1421,11 @@ async def build_memory_host(
             required=bool(effective_policy.audit_enabled),
         ),
         audit_required=bool(effective_policy.audit_enabled),
+        secret_redactor=(
+            credential_broker.secret_redactor
+            if credential_broker is not None
+            else None
+        ),
     )
     provider_manager = MemoryProviderManager(
         memory_registry,
@@ -1290,7 +1495,6 @@ async def build_runtime(
     # fixtures; it is not a production identity proof.
     from khaos.security.principals import (
         PrincipalDelegationError,
-        principal_for_transport,
         principal_from_kind,
     )
     try:
@@ -1312,6 +1516,10 @@ async def build_runtime(
     # it.  The borrowed AuditLogger digest match runs later, after the
     # effective policy is loaded.
     if runtime_profile.is_production:
+        if cfg.context_engine is not None:
+            raise ValueError(
+                "production runtime cannot inject a ContextEngineService"
+            )
         _enforce_no_testing_composition(cfg)
         _enforce_no_security_injection(cfg)
     root = cfg.project_root.expanduser().resolve()
@@ -1349,13 +1557,40 @@ async def build_runtime(
     # check is the sole authority.  CLI / tests that don't set
     # ``cfg.project_id`` fall back to recompute.
     project_id = cfg.project_id or compute_project_id(root)
+    production_mode = runtime_profile.is_production
+    # Non-production adapters still pass their already-validated kind through
+    # the legacy composition surface.  Keep this local initialized for every
+    # profile because the same value is carried into the composed workspace
+    # and AgentLoop below; production replaces it with the canonical binding.
+    authority_principal_kind = cfg.principal_kind
+    if production_mode or runtime_profile.is_local:
+        (
+            authority_principal_kind,
+            authority_parent_principal_id,
+            authority_delegation_digest,
+        ) = _complete_production_principal_binding(
+            principal_id=cfg.principal_id,
+            principal_kind=cfg.principal_kind,
+            parent_principal_id=cfg.parent_principal_id,
+            delegation_digest=cfg.delegation_digest,
+            source_transport=cfg.source_transport,
+            session_id=cfg.session_id,
+            project_id=project_id,
+            runtime_id=cfg.runtime_id,
+            policy_digest=effective_policy.digest,
+        )
+        cfg = replace(
+            cfg,
+            principal_kind=authority_principal_kind,
+            parent_principal_id=authority_parent_principal_id,
+            delegation_digest=authority_delegation_digest,
+        )
     # P1-1 (production Runtime injection): mint the runtime's authority seal
     # — the unforgeable binding of (principal, project, policy_digest,
     # runtime_id) that every production-built security component must carry.
     # In production mode the factory refuses to install an injected
     # security-critical component below, closing the "second authority"
     # backdoor.  Dev/test mode (KHAOS_DEV_MODE=1) still injects mocks freely.
-    production_mode = runtime_profile.is_production
     authority_seal = RuntimeAuthoritySeal.mint(
         principal_id=cfg.principal_id,
         project_id=project_id,
@@ -1371,16 +1606,11 @@ async def build_runtime(
     # ``AuthorityBroker.default`` and create a second trust path.
     authority_broker: AuthorityBroker | None = None
     owns_authority_broker = False
-    authority_principal_kind = cfg.principal_kind
     if production_mode:
         if typed_resource_order is None:
             raise PermissionError(
                 "production runtime requires an independently loaded typed resource catalog"
             )
-        if not authority_principal_kind:
-            authority_principal_kind = principal_for_transport(
-                cfg.principal_id, cfg.source_transport
-            ).kind.value
         inherited_authority = (
             getattr(cfg.delegated_workspace_manager, "authority_broker", None)
             if cfg.delegated_execution_context is not None
@@ -1468,6 +1698,18 @@ async def build_runtime(
             shared_broker = getattr(cfg.tool_scheduler, "credential_broker", None)
             if isinstance(shared_broker, CredentialBroker):
                 credential_broker = shared_broker
+        if credential_broker is None:
+            # Router construction may have created the platform-backed broker
+            # for secretless provider configuration.  Reuse that canonical
+            # authority instead of creating a parallel provider credential
+            # resolver for the same runtime.
+            router_broker = getattr(
+                getattr(router, "provider_manager", None),
+                "credential_broker",
+                None,
+            )
+            if isinstance(router_broker, CredentialBroker):
+                credential_broker = router_broker
         owns_credential_broker = credential_broker is None
         if credential_broker is None:
             credential_broker = CredentialBroker(
@@ -1491,6 +1733,36 @@ async def build_runtime(
         else:
             runtime_registry = create_runtime_registry()
         exec_tool_names = runtime_registry.exec_tool_names()
+        extension_service = cfg.extension_service
+        if extension_service is None:
+            denied_extension_effects = set()
+            if not effective_policy.network_enabled:
+                denied_extension_effects.add(EffectKind.NETWORK)
+            if effective_policy.mode.value == "read-only":
+                denied_extension_effects.update(
+                    {
+                        EffectKind.WRITE_WORKSPACE,
+                        EffectKind.EXECUTE_PROCESS,
+                        EffectKind.EXTERNAL_WRITE,
+                        EffectKind.EXTERNAL_DELETE,
+                    }
+                )
+            extension_service = ExtensionService(
+                registry=ExtensionRegistry(
+                    tool_registry=runtime_registry,
+                    principal_id=cfg.principal_id,
+                    project_id=project_id,
+                ),
+                policy=ExtensionPolicy(
+                    allowed_network_hosts=frozenset(
+                        effective_policy.network_allowed_domains or ()
+                    ),
+                    denied_effects=frozenset(denied_extension_effects),
+                ),
+                repository=getattr(cfg.db, "extension_repository", None),
+            )
+        elif not isinstance(extension_service, ExtensionService):
+            raise TypeError("RuntimeConfig.extension_service must be an ExtensionService")
         # Construct the shared audit repository before any component that can
         # emit audit events.  Permission and error paths must use this same
         # anchored writer; constructing it later allowed direct DB writers to
@@ -1510,6 +1782,7 @@ async def build_runtime(
                 runtime_id=cfg.runtime_id,
                 policy_digest=effective_policy.digest,
                 project_id=project_id,
+                secret_redactor=credential_broker.secret_redactor,
             )
             await audit_logger.verify_anchor()
         permission_engine = PermissionEngine(
@@ -1521,6 +1794,7 @@ async def build_runtime(
             runtime_id=cfg.runtime_id,
             exec_tool_names=exec_tool_names,
             audit_logger=audit_logger,
+            secret_redactor=credential_broker.secret_redactor,
         )
         await permission_engine.load_rules()
         memory_store = MemoryStore(
@@ -1614,6 +1888,7 @@ async def build_runtime(
                 commit_sha=cfg.commit_sha,
                 audit_logger=audit_logger,
                 effective_policy=effective_policy,
+                credential_broker=credential_broker,
             )
             owns_memory_host = True
             profile = memory_host.profile
@@ -1733,11 +2008,95 @@ async def build_runtime(
         # authority.  ProductionRuntimeConfig intentionally has no reader/index
         # injection seam, so model-controlled or host-path readers cannot replace
         # SafeWorkspaceFS here.
-        context_intelligence = (
-            ContextIntelligenceService(workspace_manager)
-            if production_mode
-            else None
+        context_index_database = None
+        if production_mode and getattr(cfg.db, "path", ":memory:") != ":memory:":
+            # Repository intelligence is derived state, but it must survive a
+            # runtime restart. Keep it in the trusted state directory beside
+            # the lifecycle DB, never under the model-writable worktree.
+            context_index_database = Path(cfg.db.path).with_name("repo-intelligence.db")
+        if production_mode:
+            context_intelligence = ContextIntelligenceService(
+                workspace_manager,
+                index_database=context_index_database,
+            )
+        else:
+            # Test/development composition may provide the same facade used
+            # by the M8 evaluator.  No fallback intelligence path is created
+            # when it is absent; legacy adapters remain explicit at their
+            # compatibility boundaries.
+            context_intelligence = cfg.context_intelligence
+        agent_config = cfg.agent_config or AgentConfig()
+        raw_layer_token_budgets = tuple(
+            int(value)
+            for value in getattr(
+                agent_config,
+                "context_layer_token_budgets",
+                (2_048, 3_072, 5_120, 1_760),
+            )
         )
+        raw_layer_byte_budgets = tuple(
+            int(value)
+            for value in getattr(
+                agent_config,
+                "context_layer_byte_budgets",
+                (48 * 1024, 64 * 1024, 112 * 1024, 32 * 1024),
+            )
+        )
+        if len(raw_layer_token_budgets) != 4 or len(raw_layer_byte_budgets) != 4:
+            raise ValueError("context layer budget must contain four layers")
+        context_budget = ContextBudget(
+            total_tokens=max(
+                int(getattr(agent_config, "context_token_budget", 12_000)),
+                int(getattr(agent_config, "context_output_reserve_tokens", 2_048)) + 1,
+            ),
+            total_bytes=max(
+                int(getattr(agent_config, "context_max_bytes", 256 * 1024)),
+                int(getattr(agent_config, "context_output_reserve_bytes", 32 * 1024)) + 1,
+            ),
+            output_reserve_tokens=max(
+                1, int(getattr(agent_config, "context_output_reserve_tokens", 2_048))
+            ),
+            output_reserve_bytes=max(
+                1, int(getattr(agent_config, "context_output_reserve_bytes", 32 * 1024))
+            ),
+            layer_token_budgets=(
+                raw_layer_token_budgets[0],
+                raw_layer_token_budgets[1],
+                raw_layer_token_budgets[2],
+                raw_layer_token_budgets[3],
+            ),
+            layer_byte_budgets=(
+                raw_layer_byte_budgets[0],
+                raw_layer_byte_budgets[1],
+                raw_layer_byte_budgets[2],
+                raw_layer_byte_budgets[3],
+            ),
+        )
+        if cfg.context_engine is not None and not production_mode:
+            context_engine = cfg.context_engine
+        else:
+            context_engine = ContextEngineService(
+                repo_intelligence=context_intelligence,
+                project_root=root,
+                instruction_resolver=InstructionResolver(root),
+                task_manager=task_manager,
+                tool_registry=runtime_registry,
+                extension_registry=extension_service.registry,
+                skill_manager=skill_manager,
+                default_budget=context_budget,
+                tool_output_limits=ToolOutputLimits(
+                    max_bytes=max(1, int(getattr(agent_config, "tool_output_max_bytes", 64 * 1024))),
+                    max_tokens=max(1, int(getattr(agent_config, "tool_output_max_tokens", 4_096))),
+                    max_lines=max(1, int(getattr(agent_config, "tool_output_max_lines", 512))),
+                ),
+                principal_id=cfg.principal_id,
+                project_id=project_id,
+                recent_message_count=max(
+                    0,
+                    int(getattr(agent_config, "context_recent_message_count", 12)),
+                ),
+            )
+        edit_transaction_service = EditTransactionService()
         # B1: the OfficeMutationAuthority is a server/project-lifecycle object.
         # When ``cfg.office_authority`` is injected (AgentService / SubAgentService
         # share one across every turn), reuse it so the aggregate storage baseline
@@ -1787,6 +2146,16 @@ async def build_runtime(
                     else None
                 ),
                 blocked_domains=list(effective_policy.network_blocked_domains),
+                # Coding process tools are dispatched through the canonical
+                # BackendSelector below, which proves a kernel-enforced
+                # network-none backend before spawn.  Let that trusted
+                # composition fact admit local test/build runtimes without
+                # weakening the standalone NetworkGuard's conservative
+                # treatment of interpreters as potentially network-capable.
+                kernel_network_isolation_proven=isinstance(
+                    getattr(execution_service, "backend_selector", None),
+                    BackendSelector,
+                ),
             )
         # H2: resolve the AuditLogger BEFORE the scheduler block so it is in
         # scope for both the ``cfg.tool_scheduler is None`` branch (where it
@@ -1828,6 +2197,7 @@ async def build_runtime(
                     network_guard=network_guard,
                     audit_logger=audit_logger,
                     effective_policy=effective_policy,
+                    secret_redactor=credential_broker.secret_redactor,
                 ),
                 # H5: the runtime_id identifies this runtime to the
                 # BrowserManager so two concurrent local sessions under the
@@ -1842,6 +2212,7 @@ async def build_runtime(
                 ),
                 credential_broker=credential_broker,
                 plan_router=plan_router,
+                budget=cfg.tool_budget,
             )
         elif production_mode:
             if not isinstance(getattr(scheduler, "plan_router", None), PlanToolRouter):
@@ -1865,12 +2236,44 @@ async def build_runtime(
                 )
         scheduler.set_office_authority(office_authority)
         scheduler.credential_broker = credential_broker
-        if cfg.browser_manager is None:
+        # Browser/App Coding is an optional capability on the desktop path.
+        # Do not import or construct the Playwright/Linux browser authority
+        # merely to start an ordinary local Coding session. An explicitly
+        # injected service remains available to focused tests/adapters.
+        browser_manager = cfg.browser_manager
+        browser_coding_service = cfg.browser_coding_service
+        if (
+            browser_manager is None
+            and browser_coding_service is None
+            and not runtime_profile.is_local
+        ):
             from khaos.tools.browser_tools import BrowserManager
 
             browser_manager = BrowserManager(runtime_profile=runtime_profile)
+        if browser_coding_service is None and browser_manager is not None:
+            from khaos.coding.browser import (
+                BrowserCodingService,
+                BrowserStateRepository,
+            )
+
+            browser_coding_service = BrowserCodingService(
+                browser_manager=browser_manager,
+                execution_service=execution_service,
+                network_guard=network_guard,
+                approval_broker=cfg.approval_broker,
+                workspace_manager=workspace_manager,
+                app_profiles=cfg.app_profiles,
+                policy_digest=getattr(
+                    getattr(scheduler, "security_middleware", None),
+                    "effective_policy_digest",
+                    "",
+                ),
+                runtime_id=cfg.runtime_id,
+                state_repository=BrowserStateRepository(cfg.db),
+                supervision_service=cfg.supervision_service,
+            )
         else:
-            browser_manager = cfg.browser_manager
+            browser_coding_service = cfg.browser_coding_service
         # B1: register the authority on the scheduler only (instance attribute).
         # The previous module-global ``file_tools._office_authority`` was removed
         # — direct callers must pass ``office_authority`` explicitly or fall back
@@ -1887,7 +2290,31 @@ async def build_runtime(
         # overwrote each other's holder — see ``permission_tools.py``
         # docstring for the race description.
         compressor = ContextCompressor(router, memory_manager=memory_manager)
-        verify_factory = VerifyFixLoop
+        from khaos.config import ConfigError, load_config
+
+        verification_limits = AutonomousPlannerLimits()
+        try:
+            verification_config = load_config(
+                cfg.config_path or root / "config.yaml",
+                strict_env=False,
+            )
+            verification_limits = AutonomousPlannerLimits.from_config(
+                verification_config
+            )
+        except (ConfigError, OSError, TypeError, ValueError) as exc:
+            # Verification bounds are not authority inputs.  A malformed or
+            # unavailable optional config must retain the immutable safe
+            # defaults rather than widening or disabling autonomous checks.
+            logger.warning(
+                "autonomous verification config unavailable; using safe defaults: %s",
+                type(exc).__name__,
+            )
+
+        def verify_factory() -> VerifyFixLoop:
+            return VerifyFixLoop(
+                max_fix_attempts=verification_limits.max_repair_cycles
+            )
+
         skill_generator = SkillGenerator()
         cleanup_authority = cfg.cleanup_authority or RuntimeCleanupAuthority()
         from khaos.agent.control.completion_flow import (
@@ -1921,6 +2348,27 @@ async def build_runtime(
             authority=trusted_verification_authority,
             repository=verification_assessment_repository,
         )
+        autonomous_observation_store = getattr(
+            cfg.db, "autonomous_verification_repository", None
+        )
+        if not callable(getattr(autonomous_observation_store, "append", None)) or not callable(
+            getattr(autonomous_observation_store, "latest_for_task", None)
+        ):
+            autonomous_observation_store = VerificationObservationStore()
+        autonomous_verification = AutonomousVerificationCoordinator(
+            execution_service=execution_service,
+            browser_service=browser_coding_service,
+            repo_intelligence=(
+                getattr(context_intelligence, "repo_intelligence", None)
+                if context_intelligence is not None
+                else None
+            ),
+            evidence_store=autonomous_observation_store,
+            planner=AutonomousVerificationPlanner(limits=verification_limits),
+            principal_id=cfg.principal_id,
+            project_id=project_id,
+            repository_id=cfg.repo_id,
+        )
         fact_provider = cfg.completion_fact_provider
         if fact_provider is None:
             fact_provider = TrustedVerificationFactProvider(
@@ -1928,6 +2376,10 @@ async def build_runtime(
                 principal_id=cfg.principal_id,
                 project_id=project_id,
             )
+        fact_provider = AutonomousVerificationFactProvider(
+            fact_provider,
+            autonomous_verification,
+        )
         completion_controller = CompletionProposalController(
             goal_spec_repository=goal_spec_repository,
             decision_repository=decision_repository,
@@ -2008,6 +2460,120 @@ async def build_runtime(
                 registry=scheduler.registry,
                 spawner=cfg.subagent_spawner,
             )
+        # M8.5: compose one parent-only orchestration service from the
+        # existing WorkspaceManager, repository, and M8.3 verification
+        # owners.  The coordinator owns no second AgentLoop, authority, or
+        # completion path.  Delegated M7.8 runtimes deliberately receive no
+        # parallel coordinator, preserving the single delegation depth.
+        parallel_repository = getattr(cfg.db, "parallel_subagent_repository", None)
+        parallel_subagent_coordinator = cfg.parallel_subagent_coordinator
+        merge_coordinator = None
+        if production_mode and parallel_subagent_coordinator is not None:
+            raise PermissionError(
+                "production runtime cannot accept an injected parallel subagent coordinator"
+            )
+        if cfg.delegated_execution_context is not None:
+            if parallel_subagent_coordinator is not None:
+                raise PermissionError(
+                    "delegated runtime cannot accept a parallel subagent coordinator"
+                )
+            parallel_subagent_coordinator = None
+        elif parallel_subagent_coordinator is None and workspace_manager is not None:
+            from khaos.subagents.coordinator import SubagentCoordinator
+            from khaos.subagents.merge import MergeCoordinator
+            from khaos.subagents.workspace import ChildWorkspaceService
+
+            async def refresh_after_merge(**kwargs: object) -> None:
+                """Refresh the canonical parent intelligence after publish."""
+                intelligence = getattr(context_intelligence, "repo_intelligence", None)
+                refresh = getattr(intelligence, "refresh", None)
+                if not callable(refresh):
+                    return
+                workspace = kwargs.get("workspace")
+                if workspace is None:
+                    raise RuntimeError("merge refresh is missing its parent workspace")
+                raw_changed_paths = kwargs.get("changed_paths", ())
+                if not isinstance(raw_changed_paths, (tuple, list)) or not all(
+                    isinstance(path, str) for path in raw_changed_paths
+                ):
+                    raise RuntimeError(
+                        "merge refresh changed_paths must be a sequence of strings"
+                    )
+                refreshed = refresh(
+                    str(getattr(workspace, "id", "")),
+                    task_id=str(kwargs.get("task_id", "")),
+                    principal_id=cfg.principal_id,
+                    project_id=project_id,
+                    paths=tuple(cast(Iterable[str], raw_changed_paths)),
+                    source_revision=str(kwargs.get("commit", "")),
+                )
+                if inspect.isawaitable(refreshed):
+                    await refreshed
+
+            merge_coordinator = MergeCoordinator(
+                workspace_manager,
+                repository=parallel_repository,
+                post_merge_verifier=autonomous_verification.verify_after_merge,
+                repo_intelligence_refresh=(
+                    refresh_after_merge if context_intelligence is not None else None
+                ),
+            )
+            parallel_subagent_coordinator = SubagentCoordinator(
+                ChildWorkspaceService(
+                    workspace_manager,
+                    repository=parallel_repository,
+                ),
+                merge_coordinator=merge_coordinator,
+                repository=parallel_repository,
+            )
+        # M8.6: one typed supervision owner and one checkpoint service are
+        # composed from the existing task/workspace/edit/verification owners.
+        # Neither object is a second permission, mutation, merge, or
+        # completion authority.  Delegated child runtimes observe the parent
+        # execution context but do not receive a user-facing rewind owner.
+        supervision_service = cfg.supervision_service
+        if supervision_service is None:
+            supervision_service = TaskSupervisionService(
+                cfg.db,
+                audit_logger=audit_logger,
+                secret_redactor=credential_broker.secret_redactor,
+            )
+        set_browser_supervision = getattr(
+            browser_coding_service, "set_supervision_service", None
+        )
+        if callable(set_browser_supervision):
+            set_browser_supervision(supervision_service)
+        checkpoint_service = None
+        if cfg.delegated_execution_context is None:
+            checkpoint_service = CheckpointService(
+                workspace_manager,
+                edit_transaction_service,
+                checkpoint_repository=getattr(cfg.db, "checkpoint_repository", None),
+                supervision_service=supervision_service,
+                verification_coordinator=autonomous_verification,
+                repo_intelligence=(
+                    getattr(context_intelligence, "repo_intelligence", None)
+                    if context_intelligence is not None
+                    else None
+                ),
+                parallel_subagent_repository=parallel_repository,
+                principal_id=cfg.principal_id,
+                project_id=project_id,
+                runtime_id=cfg.runtime_id,
+                audit_logger=audit_logger,
+                database=cfg.db,
+            )
+            if merge_coordinator is not None:
+                merge_coordinator.set_supervision_hooks(
+                    checkpoint_service=checkpoint_service,
+                    supervision_service=supervision_service,
+                )
+        if parallel_subagent_coordinator is not None:
+            set_supervision_service = getattr(
+                parallel_subagent_coordinator, "set_supervision_service", None
+            )
+            if callable(set_supervision_service):
+                set_supervision_service(supervision_service)
         recovery_decision_repository = getattr(
             cfg.db, "recovery_decision_repository", None
         )
@@ -2045,6 +2611,7 @@ async def build_runtime(
                 principal_id=cfg.principal_id,
                 project_id=project_id,
                 audit_logger=audit_logger,
+                secret_redactor=credential_broker.secret_redactor,
             ),
             token_engine=get_token_engine(),
             skill_manager=skill_manager if len(skill_manager.registry) else None,
@@ -2057,6 +2624,12 @@ async def build_runtime(
                 cfg.coding_context_builder if not production_mode else None
             ),
             context_intelligence=context_intelligence,
+            repo_intelligence=(
+                getattr(context_intelligence, "repo_intelligence", None)
+                if context_intelligence is not None
+                else None
+            ),
+            edit_transaction_service=edit_transaction_service,
             workspace_manager=workspace_manager,
             execution_service=execution_service,
             approval_broker=cfg.approval_broker,
@@ -2081,10 +2654,12 @@ async def build_runtime(
             channel_admins=cfg.channel_admins,
             cron_engine=cfg.cron_engine,
             browser_manager=browser_manager,
+            browser_coding_service=browser_coding_service,
             subagent_spawner=cfg.subagent_spawner,
             subagent_control_coordinator=subagent_control_coordinator,
             credential_broker=credential_broker,
             completion_controller=completion_controller,
+            completion_fact_provider=fact_provider,
             completion_gate=(
                 None if cfg.delegated_execution_context is not None else completion_gate
             ),
@@ -2104,6 +2679,12 @@ async def build_runtime(
             delegated_execution_context=cfg.delegated_execution_context,
             trusted_verification_authority=trusted_verification_authority,
             trusted_verification_service=trusted_verification_service,
+            verification_coordinator=autonomous_verification,
+            context_engine=context_engine,
+            parallel_subagent_coordinator=parallel_subagent_coordinator,
+            supervision_service=supervision_service,
+            checkpoint_service=checkpoint_service,
+            extension_service=extension_service,
             # M4 batch 3.1.16A-5-1b (CRITICAL): carry the RPC-verified
             # project identity into the AgentLoop so every message / turn
             # write is stamped with it.  ``self._bound_project_id`` (set
@@ -2173,6 +2754,15 @@ async def build_runtime(
         runtime.owns_authority_broker = owns_authority_broker
         runtime.memory_host = memory_host
         runtime.owns_memory_host = owns_memory_host
+        runtime.context_intelligence = context_intelligence
+        runtime.owns_context_intelligence = context_intelligence is not None
+        runtime.context_engine = context_engine
+        runtime.verification_coordinator = autonomous_verification
+        runtime.browser_coding_service = browser_coding_service
+        runtime.parallel_subagent_coordinator = parallel_subagent_coordinator
+        runtime.supervision_service = supervision_service
+        runtime.checkpoint_service = checkpoint_service
+        runtime.extension_service = extension_service
         runtime.recovery_control = recovery_control
         runtime.composition_manifest = composition_manifest
         return runtime
@@ -2201,6 +2791,22 @@ async def build_production_runtime(cfg: ProductionRuntimeConfig) -> RuntimeResul
     # development builder reachable from the production root and would turn
     # the structural config type into a cosmetic boundary.
     return await build_runtime(cfg)
+
+
+async def build_local_runtime(cfg: RuntimeConfig) -> RuntimeResult:
+    """Build the lightweight single-user runtime used by the desktop CLI.
+
+    Local is an explicit product composition, not the development environment
+    switch. The shared factory still constructs the canonical workspace,
+    permission, approval, execution, verification and completion owners; the
+    profile only omits the independently deployed production authority/catalog
+    handshake and other server-only startup requirements.
+    """
+    if not isinstance(cfg, RuntimeConfig):
+        raise TypeError("build_local_runtime requires RuntimeConfig")
+    if cfg.profile not in (None, RuntimeProfile.LOCAL):
+        raise ValueError("build_local_runtime requires RuntimeProfile.LOCAL")
+    return await build_runtime(replace(cfg, profile=RuntimeProfile.LOCAL))
 
 
 async def close_runtime_or_register(runtime: RuntimeResult) -> None:

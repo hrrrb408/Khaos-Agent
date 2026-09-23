@@ -1,0 +1,1 @@
+# TypeScript config fixture

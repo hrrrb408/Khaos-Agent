@@ -9,6 +9,14 @@ class ModelUnavailableError(KhaosError):
     """Raised when no configured model can serve a function."""
 
 
+class ProviderError(ModelUnavailableError):
+    """Raised when a provider cannot serve a request (auth, network, format)."""
+
+    def __init__(self, message: str, *, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+
+
 class ToolNotFoundError(KhaosError):
     """Raised when a requested tool is not registered."""
 

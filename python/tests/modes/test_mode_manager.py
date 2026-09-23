@@ -80,3 +80,16 @@ async def test_detect_and_suggest_does_not_switch(tmp_path):
     assert manager.current_mode is Mode.OFFICE
     await db.close()
 
+
+async def test_load_system_prompt_uses_bundled_prompt_for_plain_repository(tmp_path):
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    manager = ModeManager(db, project_root=tmp_path)
+
+    await manager.switch(Mode.CODING)
+
+    prompt = await manager.load_system_prompt()
+
+    assert "Khaos Coding Agent" in prompt
+    await db.close()

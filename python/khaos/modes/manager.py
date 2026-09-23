@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from importlib import resources
 from pathlib import Path
 
 
@@ -179,9 +180,27 @@ class ModeManager:
         return None
 
     async def load_system_prompt(self) -> str:
-        """Read the active mode's system prompt file."""
+        """Read a project override or the bundled application prompt.
+
+        A user's repository is the workspace, not an installation directory.
+        Keep the historical ``<project>/prompts/<mode>.md`` override for
+        explicit customization, but make the packaged prompt the default so a
+        fresh repository does not need to carry Khaos runtime files.
+        """
         prompt_path = self.project_root / self.mode_config.system_prompt_file
-        return prompt_path.read_text(encoding="utf-8")
+        if prompt_path.is_file():
+            return prompt_path.read_text(encoding="utf-8")
+        prompt_name = Path(self.mode_config.system_prompt_file).name
+        try:
+            return (
+                resources.files("khaos.prompts")
+                .joinpath(prompt_name)
+                .read_text(encoding="utf-8")
+            )
+        except (FileNotFoundError, ModuleNotFoundError) as exc:
+            raise FileNotFoundError(
+                f"bundled system prompt is unavailable: {prompt_name}"
+            ) from exc
 
     @staticmethod
     def parse(value: str) -> Mode:

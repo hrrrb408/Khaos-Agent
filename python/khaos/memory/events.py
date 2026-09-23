@@ -24,6 +24,7 @@ from khaos.memory.core.contracts import (
     TrustHint,
     canonical_json,
 )
+from khaos.security.secret_redaction import SecretRedactor
 
 logger = logging.getLogger(__name__)
 
@@ -31,13 +32,22 @@ logger = logging.getLogger(__name__)
 class MemoryEventBridge:
     """Publish bounded, fully scoped runtime events through a Broker."""
 
-    def __init__(self, broker: Any, *, max_payload_bytes: int = 32 * 1024) -> None:
+    def __init__(
+        self,
+        broker: Any,
+        *,
+        max_payload_bytes: int = 32 * 1024,
+        secret_redactor: SecretRedactor | None = None,
+    ) -> None:
         if broker is None or not callable(getattr(broker, "record_event", None)):
             raise ValueError("MemoryEventBridge requires the canonical MemoryBroker")
         if max_payload_bytes <= 0:
             raise ValueError("max_payload_bytes must be positive")
         self._broker = broker
         self.max_payload_bytes = max_payload_bytes
+        self._secret_redactor = secret_redactor or getattr(
+            broker, "secret_redactor", None
+        )
 
     async def record(
         self,
@@ -53,7 +63,13 @@ class MemoryEventBridge:
     ) -> MemoryEvent:
         """Create and append one host-bound event."""
 
-        bounded = _bound_payload(payload, self.max_payload_bytes)
+        safe_payload: Mapping[str, Any] = payload
+        if self._secret_redactor is not None:
+            candidate = self._secret_redactor.redact_fail_closed(payload)
+            safe_payload = (
+                candidate if isinstance(candidate, Mapping) else {"redacted": True}
+            )
+        bounded = _bound_payload(safe_payload, self.max_payload_bytes)
         event = MemoryEvent.create(
             event_type,
             principal_id=runtime.principal_id,

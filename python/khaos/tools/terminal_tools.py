@@ -10,7 +10,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from khaos.coding.execution.environment import scrub_spawn_environment
+from khaos.coding.execution.environment import (
+    environment_from_spawn_plan,
+    scrub_spawn_environment,
+)
 from khaos.security.command_guard import CommandGuard
 from khaos.security.shell_semantics import (
     MUTATING_EXECUTABLES,
@@ -43,7 +46,6 @@ SAFE_ENV_PREFIXES = (
     "LC_",  # locale variants (LC_ALL, LC_CTYPE, …)
     "TERM",
     "SHELL",
-    "PYTHONPATH",
     "VIRTUAL_ENV",
     "CONDA_PREFIX",
     "PWD",
@@ -157,12 +159,14 @@ async def terminal_argv(
             "error": "ExecutionService unavailable: Coding mode requires sandboxed execution; direct subprocess fallback is disabled",
             "risk_level": "blocked",
         }
-    workdir = _workspace_cwd(cwd, workspace_manager, workspace_id, task_id)
+    workdir = resolve_workspace_cwd(cwd, workspace_manager, workspace_id, task_id)
     from khaos.coding.execution import ExecutionRequest, NetworkPolicy, ResourceBudget
+    environment = environment_from_spawn_plan(spawn_plan)
     request = ExecutionRequest(
         tuple(argv),
         workdir,
-        budget=ResourceBudget(timeout_seconds=timeout_seconds),
+        environment=environment,
+        budget=ResourceBudget(timeout_seconds=float(timeout_seconds)),
         task_id=task_id,
         workspace_id=workspace_id,
         access_mode="read-only" if safety["read_only"] else "workspace-write",
@@ -495,7 +499,13 @@ async def _collect_bounded_stdout(stream: Any, limit: int) -> str:
     return retained.decode("utf-8", errors="replace")
 
 
-def _workspace_cwd(cwd: str, manager: Any, workspace_id: str | None, task_id: str | None) -> Path:
+def resolve_workspace_cwd(
+    cwd: str,
+    manager: Any,
+    workspace_id: str | None,
+    task_id: str | None,
+) -> Path:
+    """Resolve a process cwd relative to the active task workspace."""
     if manager is None or not workspace_id or not task_id:
         return Path(cwd).expanduser().resolve()
     workspace = manager.get(workspace_id)

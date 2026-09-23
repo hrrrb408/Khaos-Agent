@@ -24,7 +24,23 @@ async def test_read_file_paginates_with_line_numbers(tmp_path):
     )
 
     assert result["total_lines"] == 3
+    assert result["returned_length"] == 2
+    assert result["has_more"] is False
+    assert result["next_offset"] is None
     assert result["content"] == "2: b\n3: c"
+
+
+async def test_read_file_exposes_bounded_next_page_metadata(tmp_path):
+    file_path = tmp_path / "note.txt"
+    file_path.write_text("a\nb\nc\n", encoding="utf-8")
+
+    result = await read_file(
+        str(file_path), offset=1, limit=2, workspace_root=tmp_path
+    )
+
+    assert result["returned_length"] == 2
+    assert result["has_more"] is True
+    assert result["next_offset"] == 3
 
 
 async def test_write_file_creates_parent_and_overwrites(tmp_path, office_authority):

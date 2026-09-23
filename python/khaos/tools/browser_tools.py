@@ -45,9 +45,9 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from khaos.runtime_profile import RuntimeProfile, resolve_runtime_profile
 from khaos.security.browser_egress_proxy import BrowserEgressProxy
 from khaos.security.browser_sandbox import BrowserNetworkSandbox, BrowserSandboxError
-from khaos.runtime_profile import RuntimeProfile, resolve_runtime_profile
 
 logger = logging.getLogger(__name__)
 
@@ -268,6 +268,32 @@ class BrowserManager:
     def is_ready(self) -> bool:
         """Playwright 是否已初始化且可用（至少有一个活跃 page）。"""
         return any(entry.get("page") is not None for entry in self._contexts.values())
+
+    def bind_local_service_endpoint(self, host: str, port: int) -> None:
+        """Bind one exact task-owned loopback upstream for Coding apps.
+
+        This is only a declaration consumed when a new BrowserContext and its
+        egress proxy are created.  It is deliberately narrower than a generic
+        localhost allowlist: only ``127.0.0.1`` and one validated TCP port are
+        accepted.  Each egress proxy snapshots the endpoint set at context
+        creation, so adding an endpoint here does not widen an already-created
+        context; a future context receives the new exact endpoint.
+        """
+        if host != "127.0.0.1" or type(port) is not int or not 1 <= port <= 65535:
+            raise ValueError("local browser service endpoint must be 127.0.0.1:<port>")
+        endpoint = (host, port)
+        self._local_service_endpoints = frozenset(
+            (*self._local_service_endpoints, endpoint)
+        )
+
+    def unbind_local_service_endpoint(self, host: str, port: int) -> None:
+        """Remove one exact loopback endpoint after its owned context is gone."""
+        if host != "127.0.0.1" or type(port) is not int or not 1 <= port <= 65535:
+            raise ValueError("local browser service endpoint must be 127.0.0.1:<port>")
+        endpoint = (host, port)
+        self._local_service_endpoints = frozenset(
+            value for value in self._local_service_endpoints if value != endpoint
+        )
 
     @property
     def current_url(self) -> str:
@@ -958,6 +984,7 @@ class BrowserManager:
         runtime_id: str = "",
         project_id: str = "",
         network_guard: Any = None,
+        local_service_endpoints: tuple[tuple[str, int], ...] = (),
     ) -> Page | None:
         """确保浏览器已启动，未启动则自动启动（chromium, headless）。
 
@@ -1008,7 +1035,42 @@ class BrowserManager:
                 project_id=project_id,
                 runtime_id=runtime_id,
                 network_guard=network_guard,
+                local_service_endpoints=local_service_endpoints,
             )
+
+    async def execute_page_operation(
+        self,
+        operation: Callable[[Page], Any],
+        *,
+        principal_id: str = "",
+        session_id: str = "",
+        runtime_id: str = "",
+        project_id: str = "",
+        network_guard: Any = None,
+        local_service_endpoints: tuple[tuple[str, int], ...] = (),
+    ) -> Any:
+        """Run one service-owned semantic operation on the bound Page.
+
+        Coding callers do not receive a Page object and cannot provide
+        JavaScript.  The callback is composed by ``BrowserCodingService`` and
+        is executed through the same ``_safe_execute`` route-guard and
+        real-browser admission path as the legacy browser tools.
+        """
+        if not callable(operation):
+            raise TypeError("browser page operation must be callable")
+        return await self._safe_execute(
+            real=operation,
+            mock=lambda: {
+                "ok": False,
+                "error": "mock browser output cannot become Coding evidence",
+            },
+            principal_id=principal_id,
+            session_id=session_id,
+            runtime_id=runtime_id,
+            project_id=project_id,
+            network_guard=network_guard,
+            local_service_endpoints=local_service_endpoints,
+        )
 
     async def _ensure_page_locked(
         self,
@@ -1018,6 +1080,7 @@ class BrowserManager:
         project_id: str = "",
         runtime_id: str,
         network_guard: Any,
+        local_service_endpoints: tuple[tuple[str, int], ...] = (),
     ) -> Page | None:
         """Create or reuse a page while ``_lifecycle_lock`` is held.
 
@@ -1051,8 +1114,38 @@ class BrowserManager:
                 "cross-principal process sharing is forbidden"
             )
             return None
+        requested_endpoints = (
+            frozenset(local_service_endpoints) if local_service_endpoints else None
+        )
+        scoped_endpoints = (
+            requested_endpoints
+            if requested_endpoints is not None
+            else self._local_service_endpoints
+        )
+        if any(
+            type(endpoint) is not tuple
+            or len(endpoint) != 2
+            or endpoint[0] != "127.0.0.1"
+            or type(endpoint[1]) is not int
+            or not 1 <= endpoint[1] <= 65535
+            for endpoint in scoped_endpoints
+        ):
+            self._last_ensure_error = "browser local service endpoint scope is invalid"
+            return None
         entry = self._contexts.get(key)
         if entry is not None and entry.get("page") is not None:
+            if requested_endpoints is not None and (
+                entry.get("local_service_endpoints") is None
+                or frozenset(entry["local_service_endpoints"]) != requested_endpoints
+            ):
+                # A caller with an exact task endpoint must never silently
+                # reuse a context created under a different (possibly wider)
+                # endpoint snapshot.  The service will allocate a fresh
+                # session key when a new binding is appropriate.
+                self._last_ensure_error = (
+                    "browser context local service endpoint scope is stale"
+                )
+                return None
             # H1 (lifecycle): only bump refcount for a NEW runtime_id.
             # The SAME runtime_id re-entering (e.g. navigate → snapshot →
             # click within one runtime) returns the page WITHOUT bumping,
@@ -1103,7 +1196,7 @@ class BrowserManager:
         egress_proxy = BrowserEgressProxy(
             network_guard,
             bind_host=proxy_bind_host,
-            local_service_endpoints=self._local_service_endpoints,
+            local_service_endpoints=scoped_endpoints,
         )
         # Batch 10.2 (round-10 §五): context creation is now a local
         # transaction.  We track which kernel/user-space resources have
@@ -1228,6 +1321,10 @@ class BrowserManager:
             "refcount": 1,
             "network_guard": network_guard,
             "egress_proxy": egress_proxy,
+            # The proxy's upstream allowlist is immutable for this context.
+            # Keep the snapshot beside the context so a later exact-scope
+            # caller cannot accidentally reuse a broader legacy context.
+            "local_service_endpoints": scoped_endpoints,
             # Round-6 Batch 6.2 (§六): record the kernel-allowed egress
             # port so ``_close_one_context`` can call
             # ``remove_egress_port`` and atomically rebuild the nft
@@ -1521,6 +1618,7 @@ class BrowserManager:
         runtime_id: str = "",
         project_id: str = "",
         network_guard: Any = None,
+        local_service_endpoints: tuple[tuple[str, int], ...] = (),
     ) -> dict[str, Any]:
         """安全执行浏览器操作：Playwright 不可用时走 ``mock``，否则走 ``real``。
 
@@ -1564,6 +1662,7 @@ class BrowserManager:
             runtime_id=runtime_id,
             project_id=project_id,
             network_guard=network_guard,
+            local_service_endpoints=local_service_endpoints,
         )
         if page is None:
             # H2: if ``ensure_page`` stashed a specific failure reason

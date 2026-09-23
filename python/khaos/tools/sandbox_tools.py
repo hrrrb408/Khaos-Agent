@@ -31,14 +31,27 @@ async def sandbox_exec(
     client: Any = None,
     execution_service=None,
     workspace_manager=None,
+    process_authority=None,
+    principal_id: str = "",
+    project_id: str = "",
+    runtime_id: str = "",
     task_id: str | None = None,
     workspace_id: str | None = None,
     sandbox_decision=None,
     executable_identity: str | None = None,
     spawn_plan=None,
     execution_authority: ExecutionAuthority | None = None,
+    network_lease=None,
 ) -> dict[str, Any]:
-    """Execute fixed argv inside the active TaskWorkspace Docker sandbox."""
+    """Execute fixed argv inside the active TaskWorkspace Docker sandbox.
+
+    The identity and process parameters are injected by the
+    ``ToolInvocationBroker`` for every ``process.execute`` handler.  Docker
+    execution remains authorized by ``ExecutionService`` and the concrete
+    ``DockerSandboxDecision``; these parameters are accepted here to keep the
+    common broker/handler contract explicit without introducing a second
+    process authority.
+    """
     argv = tuple(shlex.split(command))
     if not argv:
         raise ValueError("command must not be empty")

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import getpass
 import json
 import os
 import secrets
@@ -16,16 +17,18 @@ from dataclasses import asdict, is_dataclass
 from enum import Enum
 from pathlib import Path
 
-import yaml
-
+from khaos.cli.extensions_commands import cmd_extensions
 from khaos.cli.skills_commands import handle_skills_command
 from khaos.cli.sse import encode_sse
 from khaos.config import (
+    PROVIDER_DEFAULTS,
     USER_CONFIG_PATH,
-    load_config,
-    masked_config,
+    ConfigError,
+    delete_provider_credential,
+    provider_diagnostics,
     reset_user_config,
     run_setup_wizard,
+    set_provider_credential,
     set_user_config_value,
 )
 from khaos.db import Database
@@ -38,6 +41,8 @@ from khaos.db.state_root import (
 )
 from khaos.modes import ModeManager
 from khaos.runtime.context import local_principal_id
+from khaos.security.credential_broker import CredentialBrokerError
+from khaos.security.credentials import CredentialRef
 
 
 async def run_once(args: argparse.Namespace) -> int:
@@ -55,8 +60,7 @@ async def run_once(args: argparse.Namespace) -> int:
         project_id=compute_project_id(Path.cwd()),
     )
     await mode_manager.load()
-    if args.mode:
-        await mode_manager.switch(ModeManager.parse(args.mode))
+    await _apply_initial_mode(mode_manager, args.mode)
 
     session_id = args.session_id or str(uuid.uuid4())
     # M4 batch 3.1.16A-5-1b: compute the project identity from the CWD
@@ -72,13 +76,26 @@ async def run_once(args: argparse.Namespace) -> int:
     )
 
     from khaos.runtime import (
-        ProductionRuntimeConfig,
-        build_production_runtime,
+        RuntimeConfig,
+        build_local_runtime,
         close_runtime_or_register,
     )
     runtime = None
     try:
-        runtime = await build_production_runtime(ProductionRuntimeConfig(db=db, mode_manager=mode_manager, confirm_callback=_confirm_from_args(args), principal_id=local_principal_id(), source_transport="cli", foreground_session=True, project_id=cli_project_id))
+        runtime = await build_local_runtime(
+            RuntimeConfig(
+                db=db,
+                project_root=Path.cwd(),
+                mode_manager=mode_manager,
+                config_path=Path(args.config).expanduser().resolve(),
+                confirm_callback=_confirm_from_args(args),
+                principal_id=local_principal_id(),
+                source_transport="cli",
+                foreground_session=True,
+                session_id=session_id,
+                project_id=cli_project_id,
+            )
+        )
         print(f"session_id: {session_id}", flush=True)
         async for message in runtime.loop.run(args.message, session_id):
             print(encode_sse(message), end="", flush=True)
@@ -104,6 +121,7 @@ async def run_repl(args: argparse.Namespace) -> int:
         project_id=compute_project_id(Path.cwd()),
     )
     await mode_manager.load()
+    await _apply_initial_mode(mode_manager, args.mode)
     session_id = args.session_id or str(uuid.uuid4())
     # M4 batch 3.1.16A-5-1b: see run_once for the rationale.
     cli_project_id = compute_project_id(Path.cwd())
@@ -113,17 +131,61 @@ async def run_repl(args: argparse.Namespace) -> int:
         project_id=cli_project_id,
     )
     from khaos.runtime import (
-        ProductionRuntimeConfig,
-        build_production_runtime,
+        RuntimeConfig,
+        build_local_runtime,
         close_runtime_or_register,
     )
     runtime = None
     try:
-        runtime = await build_production_runtime(ProductionRuntimeConfig(db=db, mode_manager=mode_manager, confirm_callback=_interactive_confirm(args), principal_id=local_principal_id(), source_transport="cli", foreground_session=True, project_id=cli_project_id))
+        runtime = await build_local_runtime(
+            RuntimeConfig(
+                db=db,
+                project_root=Path.cwd(),
+                mode_manager=mode_manager,
+                config_path=Path(args.config).expanduser().resolve(),
+                confirm_callback=_interactive_confirm(args),
+                principal_id=local_principal_id(),
+                source_transport="cli",
+                foreground_session=True,
+                session_id=session_id,
+                project_id=cli_project_id,
+            )
+        )
         loop = runtime.loop
         skill_manager = runtime.skill_manager
         print(f"session_id: {session_id}")
         print(f"mode: {mode_manager.current_mode.value}")
+        if getattr(args, "unlock", None):
+            manager = getattr(loop.router, "provider_manager", None)
+            providers = getattr(manager, "providers", {})
+            target = str(args.unlock).casefold()
+            names = (
+                sorted(str(name) for name in providers)
+                if target == "all"
+                else [target]
+            )
+            for provider in names:
+                try:
+                    if manager is None or runtime.credential_broker is None:
+                        raise CredentialBrokerError(
+                            "credential runtime is not configured"
+                        )
+                    config = manager.get_provider(provider)
+                    ref = getattr(config, "credential_ref", None)
+                    if not isinstance(ref, CredentialRef):
+                        raise CredentialBrokerError(
+                            "provider has no configured credential"
+                        )
+                    await asyncio.to_thread(
+                        runtime.credential_broker.credential_session.unlock,
+                        ref,
+                        provider=provider,
+                    )
+                except (CredentialBrokerError, KeyError) as exc:
+                    code = getattr(exc, "code", None) or type(exc).__name__
+                    print(f"{provider}: {code}", file=sys.stderr)
+                else:
+                    print(f"{provider}: UNLOCKED")
         while True:
             user_input = input("> ").strip()
             if user_input in {"/quit", "/exit"}:
@@ -133,6 +195,20 @@ async def run_repl(args: argparse.Namespace) -> int:
                 if result.handled:
                     print(result.message)
                     continue
+            if user_input == "/credentials" or user_input.startswith("/credentials "):
+                from khaos.tui.commands import TuiContext, handle_command
+
+                result = await handle_command(
+                    user_input,
+                    TuiContext(
+                        loop=loop,
+                        router=loop.router,
+                        credential_broker=runtime.credential_broker,
+                    ),
+                )
+                if result.message:
+                    print(result.message)
+                continue
             if user_input.startswith("/mode "):
                 target = ModeManager.parse(user_input.removeprefix("/mode "))
                 await mode_manager.switch(target)
@@ -154,6 +230,14 @@ async def run_repl(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _apply_initial_mode(
+    mode_manager: ModeManager, requested_mode: str | None
+) -> None:
+    """Apply the CLI's requested initial mode on every chat entry path."""
+    if requested_mode:
+        await mode_manager.switch(ModeManager.parse(requested_mode))
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Create the CLI argument parser."""
     parser = argparse.ArgumentParser(prog="khaos")
@@ -165,6 +249,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--session-id", help="Existing or new session id")
     parser.add_argument("--mode", choices=["office", "coding"], help="Initial mode")
     parser.add_argument("--message", help="Run one message and exit (non-interactive)")
+    parser.add_argument("--config", default="config.yaml", help="Provider and runtime config path")
     parser.add_argument("--no-tui", action="store_true", help="Use the line-oriented REPL instead of the full-screen TUI")
     parser.add_argument("--yes", action="store_true", help="Approve permission prompts")
     parser.add_argument("--remember", action="store_true", help="Remember approved permissions")
@@ -213,8 +298,73 @@ def build_command_parser() -> argparse.ArgumentParser:
     chat_parser.add_argument("--config", default="config.yaml")
     chat_parser.add_argument("--session-id", help="Existing or new session id")
     chat_parser.add_argument("--no-tui", action="store_true", help="Use the line-oriented REPL")
+    chat_parser.add_argument(
+        "--unlock",
+        metavar="PROVIDER",
+        help="Explicitly unlock one configured provider (or all) for this chat session",
+    )
     chat_parser.add_argument("--yes", action="store_true", help="Approve permission prompts")
     chat_parser.add_argument("--remember", action="store_true", help="Remember approved permissions")
+
+    task_parser = subparsers.add_parser(
+        "task", help="Inspect or control one owner-scoped Coding task"
+    )
+    task_parser.add_argument("--project-root", type=Path, default=None)
+    task_parser.add_argument("--db", default=None)
+    task_parser.add_argument("--json", action="store_true", dest="as_json")
+    task_sub = task_parser.add_subparsers(dest="task_command", required=True)
+    for task_command, help_text in (
+        ("status", "Show durable supervision state"),
+        ("events", "Replay durable supervision events"),
+        ("pause", "Request a cooperative pause"),
+        ("resume", "Resume a paused task"),
+        ("cancel", "Cancel and drain a task"),
+    ):
+        command_parser = task_sub.add_parser(task_command, help=help_text)
+        command_parser.add_argument("task_id")
+        if task_command == "events":
+            command_parser.add_argument("--after", type=int, default=0)
+            command_parser.add_argument("--limit", type=int, default=1024)
+        elif task_command in {"pause", "resume", "cancel"}:
+            command_parser.add_argument("--command-id", default=None)
+            command_parser.add_argument("--expected-revision", type=int, default=None)
+
+    checkpoint_parser = subparsers.add_parser(
+        "checkpoint", help="Inspect or request Coding checkpoints"
+    )
+    checkpoint_parser.add_argument("--project-root", type=Path, default=None)
+    checkpoint_parser.add_argument("--db", default=None)
+    checkpoint_parser.add_argument("--json", action="store_true", dest="as_json")
+    checkpoint_sub = checkpoint_parser.add_subparsers(
+        dest="checkpoint_command", required=True
+    )
+    checkpoint_list = checkpoint_sub.add_parser("list", help="List checkpoint metadata")
+    checkpoint_list.add_argument("task_id")
+    checkpoint_show = checkpoint_sub.add_parser("show", help="Show checkpoint metadata")
+    checkpoint_show.add_argument("checkpoint_id")
+    checkpoint_create = checkpoint_sub.add_parser("create", help="Request a user checkpoint")
+    checkpoint_create.add_argument("task_id")
+    checkpoint_create.add_argument("label", nargs="*")
+    checkpoint_create.add_argument("--kind", default="USER_CREATED")
+    checkpoint_create.add_argument("--expected-generation", type=int, default=None)
+    checkpoint_create.add_argument("--idempotency-key", default=None)
+
+    rewind_parser = subparsers.add_parser(
+        "rewind", help="Build or execute a digest-bound Coding rewind"
+    )
+    rewind_parser.add_argument("--project-root", type=Path, default=None)
+    rewind_parser.add_argument("--db", default=None)
+    rewind_parser.add_argument("--json", action="store_true", dest="as_json")
+    rewind_sub = rewind_parser.add_subparsers(dest="rewind_command", required=True)
+    rewind_plan = rewind_sub.add_parser("plan", help="Build a rewind plan")
+    rewind_plan.add_argument("checkpoint_id")
+    rewind_plan.add_argument("--task-id", default=None)
+    rewind_plan.add_argument("--workspace-id", default=None)
+    rewind_plan.add_argument("--idempotency-key", default=None)
+    rewind_execute = rewind_sub.add_parser("execute", help="Execute a stored rewind plan")
+    rewind_execute.add_argument("rewind_id")
+    rewind_execute.add_argument("--task-id", required=True)
+    rewind_execute.add_argument("--plan-digest", default=None)
 
     test_parser = subparsers.add_parser("test", help="Run tests", description="Run tests")
     test_parser.add_argument("--all", action="store_true", help="Run all tests (Python + Go)")
@@ -228,7 +378,78 @@ def build_command_parser() -> argparse.ArgumentParser:
     config_group.add_argument("--get", type=str, help="Get a config value")
     config_group.add_argument("--set", type=str, help="Set a config value (KEY=VALUE)")
 
+    subparsers.add_parser(
+        "setup",
+        help="Run the first-use provider and secure credential setup wizard",
+    )
+
+    credentials_parser = subparsers.add_parser(
+        "credentials", help="Explicitly provision or inspect provider credentials"
+    )
+    credentials_sub = credentials_parser.add_subparsers(dest="credentials_command")
+    for credentials_command in ("set", "replace"):
+        command_parser = credentials_sub.add_parser(
+            credentials_command,
+            help="Read one provider credential from a hidden prompt and store it",
+        )
+        command_parser.add_argument("provider")
+    status_parser = credentials_sub.add_parser(
+        "status", help="Show non-interactive credential status"
+    )
+    status_parser.add_argument("provider", nargs="?")
+    delete_parser = credentials_sub.add_parser(
+        "delete", help="Delete one provider credential through the operator path"
+    )
+    delete_parser.add_argument("provider")
+
     subparsers.add_parser("version", help="Show version")
+
+    extensions_parser = subparsers.add_parser(
+        "extensions",
+        help="Inspect and explicitly manage MCP, Hook, and Skill extensions",
+    )
+    extensions_parser.add_argument("--config", default="config.yaml")
+    extensions_parser.add_argument("--json", action="store_true", dest="as_json")
+    extensions_sub = extensions_parser.add_subparsers(dest="extensions_command")
+    extensions_sub.add_parser("list", help="List configured extension metadata")
+    extensions_show = extensions_sub.add_parser("show", help="Show one extension metadata")
+    extensions_show.add_argument("extension_id")
+    extensions_sub.add_parser("doctor", help="Show extension lifecycle blockers")
+    extensions_enable = extensions_sub.add_parser("enable", help="Enable one validated extension")
+    extensions_enable.add_argument("extension_id")
+    extensions_disable = extensions_sub.add_parser("disable", help="Disable one extension")
+    extensions_disable.add_argument("extension_id")
+
+    doctor_parser = subparsers.add_parser(
+        "doctor",
+        help="Inspect host dependencies and security boundaries",
+    )
+    doctor_sub = doctor_parser.add_subparsers(dest="doctor_command")
+    trusted_git_parser = doctor_sub.add_parser(
+        "trusted-git",
+        help="Inspect Trusted Git candidates, policy, and preflight",
+    )
+    trusted_git_parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="Emit bounded machine-readable diagnostics",
+    )
+    provider_doctor_parser = doctor_sub.add_parser(
+        "providers",
+        help="Inspect secretless provider configuration and credential status",
+    )
+    provider_doctor_parser.add_argument(
+        "--path",
+        default=None,
+        help="Inspect one config path without printing its contents",
+    )
+    provider_doctor_parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="Emit bounded machine-readable diagnostics",
+    )
 
     migrate_parser = subparsers.add_parser(
         "migrate",
@@ -328,6 +549,114 @@ def build_command_parser() -> argparse.ArgumentParser:
     import_parser = memory_sub.add_parser("import", help="Import a scope-bound memory package")
     import_parser.add_argument("path", type=Path)
     import_parser.add_argument("--no-rebuild", action="store_true")
+
+    eval_parser = subparsers.add_parser(
+        "eval",
+        help="Run observation-only capability evaluations",
+    )
+    eval_sub = eval_parser.add_subparsers(dest="eval_command")
+    coding_eval_parser = eval_sub.add_parser(
+        "coding",
+        help="M8.0 Coding capability evaluation",
+    )
+    coding_sub = coding_eval_parser.add_subparsers(dest="coding_command")
+
+    coding_list = coding_sub.add_parser("list", help="List immutable Coding scenarios")
+    coding_list.add_argument("--manifest", type=Path)
+    coding_list.add_argument("--tag")
+    coding_list.add_argument("--json", action="store_true", dest="as_json")
+
+    coding_run = coding_sub.add_parser("run", help="Run one or more Coding scenarios")
+    coding_run.add_argument("scenario_id", nargs="?")
+    coding_run_group = coding_run.add_mutually_exclusive_group(required=False)
+    coding_run_group.add_argument("--tag")
+    coding_run_group.add_argument("--all", action="store_true", dest="all_scenarios")
+    coding_run_group.add_argument("--scenario", dest="scenario_option")
+    coding_run.add_argument("--manifest", type=Path)
+    coding_run.add_argument("--project-root", type=Path)
+    coding_run.add_argument("--db")
+    coding_run.add_argument("--config", type=Path)
+    coding_run.add_argument("--principal-id")
+    coding_run.add_argument("--project-id")
+    coding_run.add_argument("--model")
+    coding_run.add_argument("--provider")
+    coding_run.add_argument(
+        "--unlock",
+        dest="unlock_provider",
+        metavar="PROVIDER",
+        help="Explicitly unlock one configured provider for this evaluation process",
+    )
+    coding_run.add_argument("--khaos-source-sha")
+    coding_run.add_argument(
+        "--task-timeout-seconds",
+        type=float,
+        dest="task_timeout_seconds",
+        help="Override only the bounded total task timeout for this run",
+    )
+    coding_run.add_argument(
+        "--results-jsonl",
+        type=Path,
+        help="Append sanitized CodingBenchmarkResultV1 records to JSONL",
+    )
+    coding_run.add_argument("--task-seed")
+    coding_run.add_argument("--reasoning-effort")
+    coding_run.add_argument("--json", action="store_true", dest="as_json")
+
+    coding_qualify = coding_sub.add_parser(
+        "qualify",
+        help="Run fresh sequential real-provider P0-P4 qualification probes",
+    )
+    coding_qualify.add_argument("--project-root", type=Path)
+    coding_qualify.add_argument("--config", type=Path)
+    coding_qualify.add_argument("--principal-id")
+    coding_qualify.add_argument("--project-id")
+    coding_qualify.add_argument("--model", required=True)
+    coding_qualify.add_argument("--provider", required=True)
+    coding_qualify.add_argument(
+        "--p4-scenario",
+        choices=["p4-readonly-authority", "p4-readonly-authority-v3"],
+        default="p4-readonly-authority",
+        help="Select the versioned read-only P4 qualification scenario",
+    )
+    coding_qualify.add_argument(
+        "--unlock",
+        dest="unlock_provider",
+        metavar="PROVIDER",
+        required=True,
+        help="Explicitly unlock one configured provider for this qualification process",
+    )
+    coding_qualify.add_argument("--khaos-source-sha")
+    coding_qualify.add_argument(
+        "--output",
+        dest="qualification_output",
+        type=Path,
+        help="Write the sanitized qualification record to this path",
+    )
+    coding_qualify.add_argument(
+        "--results-jsonl",
+        type=Path,
+        help="Append one canonical secret-free qualification record to JSONL",
+    )
+
+    coding_report = coding_sub.add_parser("report", help="Report persisted Coding runs")
+    coding_report.add_argument("run_id_positional", nargs="?", help="Run id to report")
+    coding_report.add_argument("--run-id")
+    coding_report.add_argument("--scenario-id")
+    coding_report.add_argument("--manifest", type=Path)
+    coding_report.add_argument("--project-root", type=Path)
+    coding_report.add_argument("--db")
+    coding_report.add_argument("--principal-id")
+    coding_report.add_argument("--project-id")
+    coding_report.add_argument("--limit", type=int, default=100)
+    coding_report.add_argument("--format", choices=["markdown", "json"], default="markdown")
+
+    coding_compare = coding_sub.add_parser("compare", help="Compare two runs of one scenario version")
+    coding_compare.add_argument("baseline_run_id")
+    coding_compare.add_argument("candidate_run_id")
+    coding_compare.add_argument("--project-root", type=Path)
+    coding_compare.add_argument("--db")
+    coding_compare.add_argument("--principal-id")
+    coding_compare.add_argument("--project-id")
 
     return parser
 
@@ -460,44 +789,97 @@ def cmd_test(args: argparse.Namespace) -> None:
 
 
 def cmd_config(args: argparse.Namespace) -> None:
-    """Read or update a YAML configuration file."""
-    config_path = Path(args.path)
-    if not config_path.exists():
-        print(f"Config file not found: {config_path}")
-        print("Creating default config...")
-        config_path.write_text(
-            yaml.safe_dump({"model": "default", "socket": "/tmp/khaos-agent.sock"}, sort_keys=False),
-            encoding="utf-8",
+    """Run safe config diagnostics or set one non-secret value."""
+    if args.get:
+        print(
+            "直接读取配置内容已禁用；请使用 `khaos doctor providers` 查看安全元数据。",
+            file=sys.stderr,
         )
         return
-
-    config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-
-    if args.get:
-        value = config
-        for key in args.get.split("."):
-            if isinstance(value, dict):
-                value = value.get(key)
-            else:
-                value = None
-                break
-        if value is not None:
-            print(f"{args.get} = {value}")
-        else:
-            print(f"Key not found: {args.get}")
-    elif args.set:
-        key, value = args.set.split("=", 1)
-        config[key] = value
-        config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
-        print(f"Set {key} = {value}")
-    else:
-        print(yaml.safe_dump(config, allow_unicode=True, sort_keys=False), end="")
+    if args.set:
+        try:
+            key, value = args.set.split("=", 1)
+            target = set_user_config_value(key, value, args.path)
+        except (ConfigError, ValueError) as exc:
+            print(f"config update rejected: {exc}", file=sys.stderr)
+            return
+        print(f"Set non-secret config field in {target}")
+        return
+    report = provider_diagnostics(args.path)
+    print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
 
 
 def cmd_version() -> None:
     """Show the product version."""
     print("Khaos Agent Platform v0.1.0")
     print("Python + Go + Rust")
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Inspect one supported host dependency without changing system state."""
+    if getattr(args, "doctor_command", None) == "providers":
+        report = provider_diagnostics(getattr(args, "path", None))
+        if getattr(args, "as_json", False):
+            print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+        else:
+            print("Provider credentials")
+            print(f"config: {report['config_status']}")
+            print(f"config_permissions: {report['config_permissions']}")
+            for provider in report["providers"]:
+                print(f"provider: {provider['provider']}")
+                print(f"  models: {', '.join(provider['models']) or 'none'}")
+                print(f"  endpoint_profile: {provider['endpoint_profile']}")
+                print(f"  credential_ref: {provider['credential_ref'] or 'none'}")
+                print(f"  credential_present: {provider['credential_present']}")
+                print(f"  credential_source: {provider['credential_source']}")
+                print(f"  credential_status: {provider['credential_status']}")
+                print(f"  legacy_plaintext_detected: {provider['legacy_plaintext_detected']}")
+        return 0 if report["config_status"] in {"OK", "MISSING"} else 1
+    if getattr(args, "doctor_command", None) != "trusted-git":
+        print(
+            "usage: khaos doctor trusted-git [--json] | providers [--path PATH] [--json]",
+            file=sys.stderr,
+        )
+        return 2
+
+    from khaos.coding.workspace.trusted_git_preflight import (
+        TrustedGitAvailability,
+        diagnose_trusted_git,
+    )
+
+    report = asyncio.run(diagnose_trusted_git())
+    if getattr(args, "as_json", False):
+        print(json.dumps(report.as_dict(), ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        print("Trusted Git")
+        print(f"status: {report.status.value}")
+        print(f"classification: {report.classification}")
+        for candidate in report.candidates:
+            policy = candidate.policy
+            print(f"candidate: {candidate.candidate}")
+            print(f"  canonical: {policy.get('canonical_path') or 'unavailable'}")
+            print(f"  owner_uid: {policy.get('owner_uid') if policy.get('owner_uid') is not None else 'unknown'}")
+            print(f"  mode: {policy.get('mode') if policy.get('mode') is not None else 'unknown'}")
+            print(f"  parent_chain: {policy.get('parent_chain') if policy.get('parent_chain') is not None else 'unknown'}")
+            print(f"  identity: {policy.get('identity') if policy.get('identity') is not None else 'unknown'}")
+            print(f"  digest: {policy.get('digest') if policy.get('digest') is not None else 'unknown'}")
+            print(f"  policy: {policy.get('status') or 'unknown'}")
+            if policy.get("diagnostic"):
+                print(f"  policy_diagnostic: {policy['diagnostic']}")
+            preflight = candidate.preflight
+            if preflight is None:
+                print("  preflight: not_run")
+                continue
+            print(f"  preflight: {preflight.status.value}")
+            print(f"  preflight_classification: {preflight.classification}")
+            print(f"  exit_code: {preflight.returncode if preflight.returncode is not None else 'unknown'}")
+            if preflight.diagnostic:
+                print(f"  diagnostic: {preflight.diagnostic}")
+        if report.selected is not None:
+            print(f"selected: {report.selected.identity.path if report.selected.identity else report.selected.candidate}")
+        else:
+            print("selected: none")
+    return 0 if report.status is TrustedGitAvailability.AVAILABLE else 1
 
 
 def cmd_migrate(args: argparse.Namespace) -> int:
@@ -940,24 +1322,106 @@ def _project_root() -> Path:
     return Path(__file__).resolve().parents[3]
 
 
+def handle_credentials_command(argv: list[str]) -> int:
+    """Handle explicit operator provisioning and non-interactive status.
+
+    The credential value is accepted only through ``getpass``.  No subcommand
+    accepts a secret argument, and status never invokes the provisioning path.
+    """
+    if not argv or argv == ["--help"] or argv == ["-h"]:
+        print(
+            "usage: khaos credentials set|replace <provider> | "
+            "status [provider] | delete <provider>",
+            file=sys.stderr if argv and argv[0].startswith("-") else sys.stdout,
+        )
+        return 0 if argv else 2
+
+    command = argv[0].casefold()
+    if command == "status":
+        if len(argv) > 2:
+            print("usage: khaos credentials status [provider]", file=sys.stderr)
+            return 2
+        provider = argv[1].casefold() if len(argv) == 2 else None
+        if provider is not None and provider not in PROVIDER_DEFAULTS:
+            print("不支持的 provider。", file=sys.stderr)
+            return 2
+        report = provider_diagnostics()
+        if provider is not None:
+            report = dict(report)
+            report["providers"] = [
+                item
+                for item in report.get("providers", [])
+                if isinstance(item, dict) and item.get("provider") == provider
+            ]
+        print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+
+    if command not in {"set", "replace", "delete"}:
+        print(
+            "usage: khaos credentials set|replace <provider> | "
+            "status [provider] | delete <provider>",
+            file=sys.stderr,
+        )
+        return 2
+    if len(argv) != 2:
+        print(f"usage: khaos credentials {command} <provider>", file=sys.stderr)
+        return 2
+    provider = argv[1].casefold()
+    if provider not in PROVIDER_DEFAULTS:
+        print("不支持的 provider。", file=sys.stderr)
+        return 2
+
+    if command == "delete":
+        try:
+            delete_provider_credential(provider)
+        except (ConfigError, ValueError) as exc:
+            print(f"安全凭据删除失败：{exc}", file=sys.stderr)
+            return 1
+        print(f"✓ 已删除 {provider} 的安全凭据。")
+        return 0
+
+    secret = ""
+    try:
+        while True:
+            secret = getpass.getpass(
+                f"输入 {PROVIDER_DEFAULTS[provider]['label']} API Key: "
+            ).strip()
+            if len(secret) > 10:
+                break
+            print("API Key 不能为空，且长度需要大于 10。", file=sys.stderr)
+        set_provider_credential(provider, secret)
+    except (ConfigError, ValueError) as exc:
+        print(f"安全凭据保存失败：{exc}", file=sys.stderr)
+        return 1
+    finally:
+        # Do not retain the user-entered string longer than this command needs.
+        secret = ""
+    print(f"✓ 已保存 {provider} 的安全凭据，配置仅写入 opaque credential_ref。")
+    return 0
+
+
 def handle_config_command(argv: list[str]) -> int:
     """Handle `khaos config` management commands."""
     if not argv:
-        config = masked_config(load_config(strict_env=False))
-        print(yaml.safe_dump(config, allow_unicode=True, sort_keys=False), end="")
+        print(json.dumps(provider_diagnostics(), ensure_ascii=False, indent=2, sort_keys=True))
         return 0
 
     command = argv[0]
     if command == "setup":
-        run_setup_wizard()
-        return 0
+        return 0 if run_setup_wizard() is not None else 1
     if command == "set":
         if len(argv) != 3:
             print("usage: khaos config set <key> <value>", file=sys.stderr)
             return 2
-        target = set_user_config_value(argv[1], argv[2])
+        try:
+            target = set_user_config_value(argv[1], argv[2])
+        except ConfigError as exc:
+            print(f"配置拒绝写入：{exc}", file=sys.stderr)
+            return 2
         print(f"✓ 已保存到 {target}")
         return 0
+    if command == "credentials":
+        return handle_credentials_command(argv[1:])
     if command == "reset":
         removed = reset_user_config()
         if removed:
@@ -966,7 +1430,10 @@ def handle_config_command(argv: list[str]) -> int:
             print(f"{USER_CONFIG_PATH} 不存在")
         return 0
 
-    print("usage: khaos config [setup|set <key> <value>|reset]", file=sys.stderr)
+    print(
+        "usage: khaos config [setup|set <key> <value>|credentials ...|reset]",
+        file=sys.stderr,
+    )
     return 2
 
 
@@ -1021,6 +1488,8 @@ def run_interactive(args: argparse.Namespace) -> None:
             db_path=str(resolved_db),
             project_root=Path.cwd(),
             mode=args.mode or "",
+            unlock_provider=getattr(args, "unlock", None),
+            config_path=Path(args.config).expanduser().resolve(),
         )
         return
     raise SystemExit(asyncio.run(run_repl(args)))
@@ -1030,17 +1499,24 @@ def main() -> None:
     """CLI process entrypoint.
 
     Resolution order:
-      1. Product subcommands: start/chat/test/config/version.
+      1. Product subcommands: start/chat/test/config/version/doctor.
       2. Legacy flags such as ``--message`` for scriptable SSE output.
     """
     argv = sys.argv[1:]
-    command_names = {"start", "chat", "test", "config", "version", "migrate", "memory"}
+    command_names = {
+        "start", "chat", "task", "checkpoint", "rewind", "test", "config",
+        "setup",
+        "version", "doctor", "migrate", "memory", "eval",
+        "extensions", "credentials",
+    }
     if not argv:
         parser = build_command_parser()
         parser.print_help()
         return
     if argv[0] in command_names:
-        if argv[0] == "config" and len(argv) > 1 and argv[1] in {"setup", "set", "reset"}:
+        if argv[0] == "credentials":
+            raise SystemExit(handle_credentials_command(argv[1:]))
+        if argv[0] == "config" and len(argv) > 1 and argv[1] in {"setup", "set", "reset", "credentials"}:
             raise SystemExit(handle_config_command(argv[1:]))
         parser = build_command_parser()
         args = parser.parse_args(argv)
@@ -1048,16 +1524,38 @@ def main() -> None:
             cmd_start(args)
         elif args.command == "chat":
             cmd_chat(args)
+        elif args.command == "task":
+            from khaos.cli.supervision_commands import cmd_task
+
+            raise SystemExit(cmd_task(args))
+        elif args.command == "checkpoint":
+            from khaos.cli.supervision_commands import cmd_checkpoint
+
+            raise SystemExit(cmd_checkpoint(args))
+        elif args.command == "rewind":
+            from khaos.cli.supervision_commands import cmd_rewind
+
+            raise SystemExit(cmd_rewind(args))
         elif args.command == "test":
             cmd_test(args)
         elif args.command == "config":
             cmd_config(args)
+        elif args.command == "setup":
+            raise SystemExit(0 if run_setup_wizard() is not None else 1)
         elif args.command == "version":
             cmd_version()
+        elif args.command == "extensions":
+            raise SystemExit(cmd_extensions(args))
+        elif args.command == "doctor":
+            raise SystemExit(cmd_doctor(args))
         elif args.command == "migrate":
             raise SystemExit(cmd_migrate(args))
         elif args.command == "memory":
             raise SystemExit(cmd_memory(args))
+        elif args.command == "eval":
+            from khaos.cli.eval_commands import cmd_eval
+
+            raise SystemExit(cmd_eval(args))
         return
 
     parser = build_parser()

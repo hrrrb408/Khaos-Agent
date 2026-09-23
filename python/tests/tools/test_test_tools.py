@@ -1,10 +1,17 @@
 """Tests for the test_run feedback-loop tool and its output parsers."""
 
+import asyncio
 import json
+import os
 import subprocess
+import sys
+from pathlib import Path
 
 import pytest
-
+from khaos.coding.execution.environment import (
+    split_command_environment,
+    validate_command_environment,
+)
 from khaos.tools import test_tools
 from khaos.tools.test_tools import (
     _detect_framework,
@@ -13,6 +20,8 @@ from khaos.tools.test_tools import (
     _parse_go,
     _parse_jest,
     _parse_pytest,
+    _parse_tap,
+    _parse_unittest,
 )
 
 
@@ -28,10 +37,17 @@ async def _workspace_execution(tmp_path):
         ["git", "config", "user.email", "t@t.com"],
         ["git", "config", "user.name", "T"],
     ):
-        subprocess.run(cmd, cwd=repo, check=True)
+        await asyncio.to_thread(subprocess.run, cmd, cwd=repo, check=True)
     (repo / "file.txt").write_text("base\n", encoding="utf-8")
-    subprocess.run(["git", "add", "."], cwd=repo, check=True)
-    subprocess.run(["git", "commit", "-qm", "base"], cwd=repo, check=True)
+    await asyncio.to_thread(
+        subprocess.run, ["git", "add", "."], cwd=repo, check=True
+    )
+    await asyncio.to_thread(
+        subprocess.run,
+        ["git", "commit", "-qm", "base"],
+        cwd=repo,
+        check=True,
+    )
     manager = WorkspaceManager(tmp_path / "worktrees")
     workspace = await manager.create(repo, "task")
     execution = ExecutionService(HostExecutionBackend(), manager)
@@ -48,7 +64,22 @@ def test_detect_framework_matches_common_runners():
     assert _detect_framework("jest") == "jest"
     assert _detect_framework("vitest run") == "jest"
     assert _detect_framework("go test ./...") == "go"
+    assert _detect_framework("node --experimental-strip-types --test src/config.test.ts") == "tap"
+    assert _detect_framework("python -m unittest discover -s tests -v") == "unittest"
     assert _detect_framework("npm test") == "generic"
+
+
+def test_command_environment_prefix_is_no_shell_and_bounded():
+    assignments, argv = split_command_environment(
+        ("GO111MODULE=off", "go", "test", "-v", ".")
+    )
+
+    assert assignments == {"GO111MODULE": "off"}
+    assert argv == ("go", "test", "-v", ".")
+    validate_command_environment(assignments, allowed_keys={"GO111MODULE"})
+
+    with pytest.raises(PermissionError):
+        validate_command_environment(assignments, allowed_keys={"PATH"})
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +222,110 @@ def test_parse_go_non_verbose_fail_marker():
 
 
 # ---------------------------------------------------------------------------
+# unittest parsing
+# ---------------------------------------------------------------------------
+
+
+UNITTEST_FAIL_OUTPUT = """\\
+test_falsey (tests.test_cache.CacheTests) ... ok
+test_missing (tests.test_cache.CacheTests) ... FAIL
+test_import (tests.test_cache.CacheTests) ... ERROR
+
+======================================================================
+FAIL: test_missing (tests.test_cache.CacheTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File \"tests/test_cache.py\", line 18, in test_missing
+    self.assertEqual(value, 0)
+AssertionError: None != 0
+
+======================================================================
+ERROR: test_import (tests.test_cache.CacheTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File \"tests/test_cache.py\", line 4, in test_import
+    import missing_module
+ModuleNotFoundError: No module named 'missing_module'
+
+----------------------------------------------------------------------
+Ran 3 tests in 0.002s
+
+FAILED (failures=1, errors=1)
+"""
+
+
+def test_parse_unittest_counts_and_failure_cases():
+    result = _parse_unittest(UNITTEST_FAIL_OUTPUT)
+
+    assert result["passed"] == 1
+    assert result["failed"] == 1
+    assert result["errors"] == 1
+    assert {case["name"] for case in result["failed_cases"]} == {
+        "test_missing (tests.test_cache.CacheTests)",
+        "test_import (tests.test_cache.CacheTests)",
+    }
+
+
+def test_parse_unittest_clean_run_uses_ran_summary():
+    result = _parse_unittest("Ran 3 tests in 0.001s\n\nOK\n")
+
+    assert result == {
+        "passed": 3,
+        "failed": 0,
+        "errors": 0,
+        "failed_cases": [],
+    }
+
+
+def test_parse_tap_counts_node_test_failures():
+    result = _parse_tap(
+        """TAP version 13
+not ok 1 - explicit false is preserved
+1..1
+# tests 1
+# pass 0
+# fail 1
+# cancelled 0
+"""
+    )
+
+    assert result == {
+        "passed": 0,
+        "failed": 1,
+        "errors": 0,
+        "failed_cases": [
+            {
+                "name": "explicit false is preserved",
+                "file": "",
+                "error": "",
+                "line": None,
+            }
+        ],
+    }
+
+
+def test_parse_tap_counts_node_test_success():
+    result = _parse_tap(
+        """TAP version 13
+ok 1 - explicit false is preserved
+ok 2 - missing value defaults
+1..2
+# tests 2
+# pass 2
+# fail 0
+# cancelled 0
+"""
+    )
+
+    assert result == {
+        "passed": 2,
+        "failed": 0,
+        "errors": 0,
+        "failed_cases": [],
+    }
+
+
+# ---------------------------------------------------------------------------
 # generic fallback parsing
 # ---------------------------------------------------------------------------
 
@@ -267,6 +402,248 @@ async def test_test_run_executes_real_command(tmp_path):
     assert result["success"] is True
     assert result["exit_code"] == 0
     assert result["passed"] == 3
+
+
+@pytest.mark.posix_host
+async def test_test_run_pytest_does_not_create_workspace_cache(tmp_path):
+    """Pytest verification must not turn runner cache into workspace drift."""
+    execution, workspace = await _workspace_execution(tmp_path)
+    (workspace.worktree_path / "test_cache_hygiene.py").write_text(
+        "def test_cache_hygiene():\n    assert True\n",
+        encoding="utf-8",
+    )
+
+    result = json.loads(
+        await test_tools.test_run(
+            f"{sys.executable} -m pytest -q",
+            cwd=str(workspace.worktree_path),
+            execution_service=execution,
+            task_id="task",
+            workspace_id=workspace.id,
+        )
+    )
+
+    assert result["success"] is True
+    assert not (workspace.worktree_path / ".pytest_cache").exists()
+
+
+async def test_test_run_legacy_pytest_preserves_approved_venv_runtime(tmp_path):
+    """macOS launcher staging must not discard the project's pytest runtime."""
+    from types import SimpleNamespace
+
+    class _CaptureExecution:
+        request = None
+
+        async def execute(self, request):
+            self.request = request
+            return SimpleNamespace(
+                return_code=0,
+                stdout="1 passed in 0.1s\n",
+                stderr="",
+                status="completed",
+            )
+
+    execution = _CaptureExecution()
+    result = json.loads(
+        await test_tools.test_run(
+            f"{sys.executable} -m pytest -q",
+            cwd=str(tmp_path),
+            execution_service=execution,
+            task_id="task",
+            workspace_id="workspace",
+        )
+    )
+
+    assert result["success"] is True
+    assert execution.request.environment["PYTHONNOUSERSITE"] == "1"
+    venv_root = Path(sys.executable).expanduser().absolute().parents[1]
+    expected = tuple(
+        str(path.resolve())
+        for path in sorted((venv_root / "lib").glob("python*/site-packages"))
+        if path.is_dir()
+    ) if (venv_root / "pyvenv.cfg").is_file() else ()
+    if expected:
+        assert execution.request.environment["PYTHONPATH"] == os.pathsep.join(expected)
+
+
+async def test_test_run_uses_approved_spawn_plan_environment(tmp_path):
+    from types import SimpleNamespace
+
+    class _CaptureExecution:
+        request = None
+
+        async def execute(self, request):
+            self.request = request
+            return SimpleNamespace(
+                return_code=0,
+                stdout="1 passed in 0.1s\n",
+                stderr="",
+                status="completed",
+            )
+
+    execution = _CaptureExecution()
+    spawn_plan = SimpleNamespace(
+        environment=(("LANG", "C.UTF-8"), ("PATH", "/trusted/bin")),
+    )
+
+    result = json.loads(
+        await test_tools.test_run(
+            "pytest -q",
+            cwd=str(tmp_path),
+            execution_service=execution,
+            task_id="task",
+            workspace_id="workspace",
+            spawn_plan=spawn_plan,
+        )
+    )
+
+    assert result["success"] is True
+    assert execution.request.environment == {
+        "LANG": "C.UTF-8",
+        "PATH": "/trusted/bin",
+    }
+
+
+async def test_test_run_binds_environment_prefix_to_approved_spawn_plan(tmp_path):
+    from types import SimpleNamespace
+
+    class _CaptureExecution:
+        request = None
+
+        async def execute(self, request):
+            self.request = request
+            return SimpleNamespace(
+                return_code=0,
+                stdout="1 passed in 0.1s\n",
+                stderr="",
+                status="completed",
+            )
+
+    execution = _CaptureExecution()
+    spawn_plan = SimpleNamespace(
+        environment=(
+            ("GO111MODULE", "off"),
+            ("PATH", "/trusted/bin"),
+        ),
+    )
+
+    result = json.loads(
+        await test_tools.test_run(
+            "GO111MODULE=off go test -v .",
+            cwd=str(tmp_path),
+            execution_service=execution,
+            task_id="task",
+            workspace_id="workspace",
+            spawn_plan=spawn_plan,
+        )
+    )
+
+    assert result["success"] is True
+    assert execution.request.argv == ("go", "test", "-v", ".")
+    assert execution.request.environment == {
+        "GO111MODULE": "off",
+        "PATH": "/trusted/bin",
+    }
+
+
+async def test_test_run_projects_spawn_environment_into_permission_profile(tmp_path):
+    from types import SimpleNamespace
+
+    class _CaptureExecution:
+        request = None
+
+        async def execute(self, request):
+            self.request = request
+            return SimpleNamespace(
+                return_code=0,
+                stdout="1 passed in 0.1s\n",
+                stderr="",
+                status="completed",
+            )
+
+    execution = _CaptureExecution()
+    spawn_plan = SimpleNamespace(
+        environment=(
+            ("PATH", "/trusted/bin"),
+            ("PYTEST_ADDOPTS", "-p no:cacheprovider"),
+        ),
+    )
+
+    result = json.loads(
+        await test_tools.test_run(
+            "pytest -q",
+            cwd=str(tmp_path),
+            execution_service=execution,
+            task_id="task",
+            workspace_id="workspace",
+            spawn_plan=spawn_plan,
+        )
+    )
+
+    assert result["success"] is True
+    assert execution.request.permission_profile.environment_keys == frozenset(
+        {"PATH", "PYTEST_ADDOPTS"}
+    )
+
+
+@pytest.mark.posix_host
+async def test_test_run_accepts_registry_workspace_manager_injection(tmp_path):
+    """The broker's complete process injection contract reaches test_run."""
+    execution, workspace = await _workspace_execution(tmp_path)
+    from khaos.tools.registry import ToolInvocationBroker, create_runtime_registry
+
+    broker = ToolInvocationBroker(create_runtime_registry())
+    result = json.loads(
+        await broker.invoke(
+            "test_run",
+            mode="coding",
+            context={
+                "execution_service": execution,
+                "workspace_manager": execution.workspace_manager,
+                "process_authority": object(),
+                "principal_id": "principal",
+                "project_id": "project",
+                "runtime_id": "runtime",
+                "task_id": "task",
+                "workspace_id": workspace.id,
+            },
+            command="python3 -c \"print('1 passed in 0.1s')\"",
+            cwd=str(workspace.worktree_path),
+        )
+    )
+
+    assert result["success"] is True
+    assert result["passed"] == 1
+
+
+@pytest.mark.posix_host
+async def test_test_run_resolves_relative_cwd_inside_workspace(tmp_path):
+    """Relative process cwd values must bind to the active worktree."""
+    execution, workspace = await _workspace_execution(tmp_path)
+    from khaos.tools.registry import ToolInvocationBroker, create_runtime_registry
+
+    broker = ToolInvocationBroker(create_runtime_registry())
+    result = json.loads(
+        await broker.invoke(
+            "test_run",
+            mode="coding",
+            context={
+                "execution_service": execution,
+                "workspace_manager": execution.workspace_manager,
+                "process_authority": object(),
+                "principal_id": "principal",
+                "project_id": "project",
+                "runtime_id": "runtime",
+                "task_id": "task",
+                "workspace_id": workspace.id,
+            },
+            command="python3 -c \"print('1 passed in 0.1s')\"",
+            cwd=".",
+        )
+    )
+
+    assert result["success"] is True
+    assert result["passed"] == 1
 
 
 @pytest.mark.posix_host

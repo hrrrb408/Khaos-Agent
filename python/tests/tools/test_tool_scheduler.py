@@ -1,6 +1,7 @@
 import asyncio
 import json
 import time
+from types import SimpleNamespace
 
 import pytest
 from khaos.agent.approval import ApprovalBroker
@@ -18,7 +19,77 @@ from khaos.tools.scheduler import (
     ToolExecutionOutcome,
     ToolScheduler,
     _canonical_digest,
+    _execution_argv_for_authority,
 )
+
+
+def test_test_run_authority_disables_pytest_cache_provider() -> None:
+    """The approved test process must not create untracked workspace cache files."""
+    scheduler = ToolScheduler(ToolRegistry(), SimpleNamespace(policy_digest="policy"))
+    tool = SimpleNamespace(
+        name="test_run",
+        permission_level="write",
+        execution_kind="host-sandbox",
+        schema_digest="schema",
+        security_digest="security",
+    )
+    authority = scheduler._build_step_authority(
+        tool=tool,
+        call={
+            "id": "call-test-run",
+            "arguments": {"command": "pytest -q", "cwd": "."},
+        },
+        tool_context={
+            "environment_keys": ("PATH",),
+            "environment": {"PATH": "/trusted/bin"},
+        },
+        resource=None,
+        authorization_epoch=0,
+        approval_target="workspace:test",
+    )
+
+    assert "PYTEST_ADDOPTS" in authority.environment_keys
+    assert authority.environment_digest == _canonical_digest(
+        {"PATH": "/trusted/bin", "PYTEST_ADDOPTS": "-p no:cacheprovider"}
+    )
+
+
+def test_test_run_authority_binds_leading_environment_assignments() -> None:
+    assert _execution_argv_for_authority(
+        "test_run", {"command": "GO111MODULE=off go test -v ."}
+    ) == ("go", "test", "-v", ".")
+    scheduler = ToolScheduler(ToolRegistry(), SimpleNamespace(policy_digest="policy"))
+    tool = SimpleNamespace(
+        name="test_run",
+        permission_level="write",
+        execution_kind="host-sandbox",
+        schema_digest="schema",
+        security_digest="security",
+    )
+    call = {
+        "id": "call-go-test",
+        "arguments": {"command": "GO111MODULE=off go test -v .", "cwd": "."},
+    }
+    authority = scheduler._build_step_authority(
+        tool=tool,
+        call=call,
+        tool_context={
+            "environment_keys": ("PATH",),
+            "environment": {"PATH": "/trusted/bin"},
+        },
+        resource=None,
+        authorization_epoch=0,
+        approval_target="workspace:test",
+    )
+
+    assert authority.environment_keys == ("GO111MODULE", "PATH")
+    assert authority.spawn_plan_digest
+    spawn_plan = call["_spawn_plan"]
+    assert spawn_plan.argv == ("go", "test", "-v", ".")
+    assert spawn_plan.environment == (
+        ("GO111MODULE", "off"),
+        ("PATH", "/trusted/bin"),
+    )
 
 
 async def test_tool_budget_atomic_reservations_do_not_oversubscribe() -> None:
@@ -124,6 +195,39 @@ async def test_scheduler_executes_parallel_and_serial(tmp_path):
         {"value": "b"},
     ]
     assert all(result.phase_digest for result in results)
+    await db.close()
+
+
+async def test_scheduler_defers_parallel_calls_when_output_reservation_is_full(
+    tmp_path,
+):
+    """A large batch of small reads must not fail on pessimistic reservations."""
+    db = Database(tmp_path / "deferred-parallel.db")
+    await db.connect()
+    await db.run_migrations()
+    scheduler = ToolScheduler(
+        _registry(),
+        PermissionEngine(db, default_mode=ApprovalMode.AUTO_APPROVE),
+        budget=ToolBudget(
+            max_calls=3,
+            max_output_per_tool=65536,
+            max_total_output=100000,
+        ),
+    )
+
+    results = await scheduler.execute_batch(
+        [
+            {"id": "read-1", "name": "read", "arguments": {"value": "a"}},
+            {"id": "read-2", "name": "read", "arguments": {"value": "b"}},
+            {"id": "read-3", "name": "read", "arguments": {"value": "c"}},
+        ],
+        mode="coding",
+    )
+
+    assert [result.success for result in results] == [True, True, True]
+    assert [result.output for result in results] == ["a", "b", "c"]
+    assert all(result.error != "Tool budget reservation denied" for result in results)
+    assert scheduler.budget._call_count == 3
     await db.close()
 
 
@@ -491,6 +595,32 @@ async def test_scheduler_budget_exhaustion_stops_serial_calls(tmp_path):
 
     assert results[0].success
     assert results[1].error == "Tool budget exhausted"
+    assert results[1].error_code == "TOOL_BUDGET_EXHAUSTED"
+    await db.close()
+
+
+async def test_scheduler_reports_typed_budget_exhaustion_when_batch_starts_exhausted(
+    tmp_path,
+):
+    db = Database(tmp_path / "pre-exhausted-budget.db")
+    await db.connect()
+    await db.run_migrations()
+    budget = ToolBudget(max_calls=1)
+    budget.record(0)
+    scheduler = ToolScheduler(
+        _registry(),
+        PermissionEngine(db, default_mode=ApprovalMode.AUTO_APPROVE),
+        budget=budget,
+    )
+
+    results = await scheduler.execute_batch(
+        [{"id": "call-1", "name": "read", "arguments": {"value": "x"}}],
+        mode="coding",
+    )
+
+    assert len(results) == 1
+    assert results[0].success is False
+    assert results[0].error_code == "TOOL_BUDGET_EXHAUSTED"
     await db.close()
 
 
@@ -1068,6 +1198,63 @@ async def test_scheduler_does_not_redeliver_unprojected_mutation(tmp_path, monke
     await db.close()
 
 
+async def test_scheduler_preserves_applied_edit_receipt_when_output_budget_is_tight(
+    tmp_path,
+):
+    async def apply_edit(value: str) -> dict:
+        del value
+        return {
+            "status": "applied",
+            "transaction_id": "tx-1",
+            "workspace_id": "ws-1",
+            "base_generation": 1,
+            "resulting_generation": 2,
+            "transaction_digest": "a" * 64,
+            "before_workspace_digest": "b" * 64,
+            "after_workspace_digest": "c" * 64,
+            "operations": [
+                {
+                    "index": 0,
+                    "operation": "update",
+                    "path": "src/app.py",
+                    "destination_path": None,
+                    "before_exists": True,
+                    "after_exists": True,
+                    "before_digest": "d" * 64,
+                    "after_digest": "e" * 64,
+                }
+            ],
+            "verbose_diagnostic": "x" * 4096,
+        }
+
+    db = Database(tmp_path / "applied-receipt-budget.db")
+    await db.connect()
+    await db.run_migrations()
+    scheduler = ToolScheduler(
+        _effect_registry(apply_edit, name="apply_edit_transaction"),
+        PermissionEngine(db, default_mode=ApprovalMode.AUTO_APPROVE),
+        budget=ToolBudget(max_output_per_tool=1024, max_total_output=1024),
+    )
+
+    result = (
+        await scheduler.execute_batch(
+            [{"id": "apply-1", "name": "apply_edit_transaction", "arguments": {"value": "ignored"}}],
+            mode="coding",
+        )
+    )[0]
+
+    assert result.success is True
+    assert result.effect_status == EFFECT_APPLIED
+    assert result.delivery_status == "degraded"
+    assert result.effect_receipt is not None
+    assert result.effect_receipt["transaction_id"] == "tx-1"
+    assert result.output["status"] == "applied"
+    assert "verbose_diagnostic" not in result.output
+    assert scheduler.budget._call_count == 1
+    assert scheduler.budget._reserved_output == 0
+    await db.close()
+
+
 async def test_scheduler_isolates_parallel_error_audit_failure(tmp_path, monkeypatch):
     db = Database(tmp_path / "parallel-audit-fault.db")
     await db.connect()
@@ -1152,6 +1339,59 @@ async def test_scheduler_replays_explicit_idempotency_key_without_reinvoking_han
     assert first.success and second.success
     assert first.effect_id == second.effect_id
     assert second.tool_call_id == "call-1"
+    await db.close()
+
+
+async def test_edit_transaction_idempotency_survives_new_tool_call_and_retry(tmp_path):
+    db = Database(tmp_path / "edit-transaction-idempotency.db")
+    await db.connect()
+    await db.run_migrations()
+    scheduler = ToolScheduler(
+        _effect_registry(_ok, name="apply_edit_transaction"),
+        PermissionEngine(db, default_mode=ApprovalMode.AUTO_APPROVE),
+    )
+    context = {
+        "principal_id": "principal",
+        "project_id": "project",
+        "task_id": "task",
+        "workspace_id": "workspace",
+    }
+    first = scheduler.bind_server_operation_key(
+        {
+            "id": "call-1",
+            "name": "apply_edit_transaction",
+            "arguments": {"transaction_id": "tx-1", "content": "first"},
+        },
+        session_id="session",
+        turn_id="turn-1",
+        attempt_id="attempt-1",
+        tool_context=context,
+    )
+    retry = scheduler.bind_server_operation_key(
+        {
+            "id": "call-2",
+            "name": "apply_edit_transaction",
+            "arguments": {"transaction_id": "tx-1", "content": "first"},
+        },
+        session_id="session",
+        turn_id="turn-2",
+        attempt_id="attempt-2",
+        tool_context=context,
+    )
+    conflicting = scheduler.bind_server_operation_key(
+        {
+            "id": "call-3",
+            "name": "apply_edit_transaction",
+            "arguments": {"transaction_id": "tx-1", "content": "different"},
+        },
+        session_id="session",
+        turn_id="turn-3",
+        attempt_id="attempt-3",
+        tool_context=context,
+    )
+
+    assert first["_idempotency_key"] == retry["_idempotency_key"]
+    assert first["_idempotency_key"] == conflicting["_idempotency_key"]
     await db.close()
 
 
@@ -1362,6 +1602,41 @@ async def test_scheduler_does_not_replay_orphaned_running_operation(tmp_path):
     assert "reconcile" in (
         result.reconciliation_hint + result.warning + result.error
     ).lower()
+    await db.close()
+
+
+async def test_scheduler_repropagates_cancellation_after_handler_dispatch(tmp_path):
+    """A cancelled in-flight handler must not keep its owning batch alive."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def write(value: str) -> str:
+        started.set()
+        await release.wait()
+        return value
+
+    db = Database(tmp_path / "cancelled-dispatch.db")
+    await db.connect()
+    await db.run_migrations()
+    scheduler = ToolScheduler(
+        _effect_registry(write),
+        PermissionEngine(db, default_mode=ApprovalMode.AUTO_APPROVE),
+    )
+
+    task = asyncio.create_task(
+        scheduler.execute_batch(
+            [{"id": "cancel-1", "name": "effect", "arguments": {"value": "x"}}],
+            mode="coding",
+        )
+    )
+    await started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert task.cancelled()
+    release.set()
     await db.close()
 
 

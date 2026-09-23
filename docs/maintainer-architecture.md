@@ -69,7 +69,7 @@ KHAOS.md / AGENTS.md
 | Plan/change approval | `coding/planning/approval/` | `approval/schema.py`（schema/migration）+ approval runtime/store + signed receipt | plan UI、verification | 不能与普通 tool approval 静默合并；schema owner 不执行业务状态转换 |
 | Process effect | `coding/execution/service.py`、`supervisor.py` | `ExecutionService` + platform backend | terminal/test/LSP/browser | restricted backend 不可用时 fail closed，不回退 host |
 | Workspace file effect | `coding/workspace/`、file tools | `SafeWorkspaceFS` / mutation authority | patch/ChangeSet/UI | 新代码不能直接用 `Path.write_*` 替代安全 API |
-| Git effect | `coding/workspace/trusted_git.py`、`tools/git_tools.py` | `TrustedGitRunner` + authority receipt | diff/status renderers | read-only Git 也要经过受控执行上下文 |
+| Git effect | `coding/workspace/trusted_git.py`、`coding/workspace/trusted_git_locator.py`、`coding/workspace/trusted_git_policy.py`、`coding/workspace/trusted_git_preflight.py`、`tools/git_tools.py` | `TrustedGitRunner` + authority receipt；locator/policy/preflight 只负责候选、身份和运行可用性 | diff/status renderers、doctor | read-only Git 也要经过受控执行上下文；进程生命周期仍唯一归 `TrustedGitProcessOwner` |
 | Verification proof | `coding/planning/verification_*` | trusted verification authority/ledger | plan gate、audit/export | 被测代码不能写 canonical input/result |
 | Capability evaluation/metrics | `python/khaos/evaluation/` | `CapabilityEvidenceService`（coherent read snapshot）+ `CapabilityEvaluator`（纯计算）+ `CapabilityEvaluationRepository`（append-only ledger） | report/benchmark/export | 只读观察；不能写 TaskStatus、Gate、approval、verification、recovery、routing 或 prompt authority |
 | Task/workspace identity | `coding/task_manager.py`、`coding/workspace/` | Task/Workspace stores | AgentLoop、TUI、RPC | 客户端只提交引用，不能自报 owner 或 generation |
@@ -138,6 +138,12 @@ event/audit adapter <- domain events
 ```
 
 `runtime/factory.py` 是装配根，可以依赖所有实现；其他模块不能反向 import factory 来取得“全局对象”。
+
+低层安全 authority 共享的稳定 nominal identity 必须放在安全层的中立契约模块中。
+当前 `CanonicalWorkspaceId` 的 canonical owner 是
+`python/khaos/security/identities.py`；`coding/planning/security_identities.py`
+只为兼容旧调用方重新导出该类型。安全基础模块不得为了取得 workspace identity
+反向 import `khaos.coding.planning`，从而把规划实现带入审计、凭据或资源范围的冷启动路径。
 
 ### 5.2 新代码禁止的旁路
 
@@ -333,3 +339,15 @@ cd rust/khaos-core && cargo test --locked --no-default-features
 - **adapter**：只做版本/协议/数据形状转换，不拥有新的业务状态或安全权威。
 - **proof/evidence**：可复核的输入、结果和账本记录；日志或测试输出本身不自动成为 proof。
 - **unknown/quarantine**：系统无法证明成功或清理完成时的安全终态；它不是失败吞掉，也不是成功别名。
+
+## M8 qualification observability boundary (2026-09-13)
+
+Qualification telemetry is a passive projection owned by the evaluation
+surface. Trace v2 and versioned JSONL may persist bounded typed statuses,
+digests, counts, safe workspace-relative path markers, parser-shape results,
+and monotonic timing; they must not persist raw model responses, credentials,
+authorization data, repository contents, hidden-oracle data, or CompletionGate
+authority. Context metadata must describe the exact Context Engine selection
+used for the request and distinguish automatic repository context from
+tool-acquired context. Observability cannot authorize execution, verification,
+completion, recovery, or a Provider request.

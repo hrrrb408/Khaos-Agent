@@ -46,6 +46,7 @@ from pathlib import Path
 from typing import Any
 
 from khaos.audit.anchor import AuditAnchorError, AuditChainAnchor, anchor_filename
+from khaos.security.secret_redaction import SecretRedactor
 from khaos.time_utils import utc_now_naive
 
 logger = logging.getLogger(__name__)
@@ -433,6 +434,7 @@ class AuditLogger:
         runtime_id: str | None = None,
         policy_digest: str | None = None,
         project_id: str = "",
+        secret_redactor: SecretRedactor | None = None,
     ):
         self.db = db
         self.log_path: Path | None = None
@@ -442,6 +444,7 @@ class AuditLogger:
         self._principal_id = principal_id
         self._runtime_id = runtime_id
         self._policy_digest = policy_digest
+        self._secret_redactor = secret_redactor
         # M4 batch 3.1.16A-5-1b: project identity bound at construction
         # and stamped on every persisted row.  Default ``''`` ("unbound")
         # matches the schema column default — legacy callers / tests that
@@ -492,6 +495,15 @@ class AuditLogger:
     def project_id(self) -> str:
         """Return the project scope sealed into the root logger."""
         return self._project_id
+
+    @property
+    def secret_redactor(self) -> SecretRedactor | None:
+        """Return the runtime-scoped output firewall, if configured."""
+        return self._secret_redactor
+
+    def bind_secret_redactor(self, secret_redactor: SecretRedactor | None) -> None:
+        """Attach the canonical runtime redactor without changing identity."""
+        self._secret_redactor = secret_redactor
 
     def bind(
         self,
@@ -859,7 +871,18 @@ class AuditLogger:
         source_transport: str | None = None,
     ) -> int:
         """Write one event under a validated identity binding."""
-        detail_json = json.dumps(detail or {}, ensure_ascii=False, sort_keys=True)
+        safe_action, safe_target, safe_result, safe_detail, safe_transport = (
+            self._sanitize_event(
+                action,
+                target,
+                result,
+                detail,
+                source_transport
+                if source_transport is not None
+                else binding.source_transport,
+            )
+        )
+        detail_json = json.dumps(safe_detail, ensure_ascii=False, sort_keys=True)
         if self._anchor is not None:
             try:
                 # Verify before accepting a new event, so a database that was
@@ -875,9 +898,9 @@ class AuditLogger:
         if self.log_path is not None:
             try:
                 self._append_to_file(
-                    action=action,
-                    target=target,
-                    result=result,
+                    action=safe_action,
+                    target=safe_target,
+                    result=safe_result,
                     detail_json=detail_json,
                     session_id=session_id,
                     principal_id=binding.principal_id,
@@ -887,11 +910,7 @@ class AuditLogger:
                     task_id=task_id,
                     operation_id=operation_id,
                     authority_generation=authority_generation,
-                    source_transport=(
-                        source_transport
-                        if source_transport is not None
-                        else binding.source_transport
-                    ),
+                    source_transport=safe_transport,
                 )
             except Exception:
                 logger.debug(
@@ -901,9 +920,9 @@ class AuditLogger:
                 )
         try:
             row_id = await self.db.insert_audit_log(
-                action=action,
-                target=target,
-                result=result,
+                action=safe_action,
+                target=safe_target,
+                result=safe_result,
                 detail=detail_json,
                 session_id=session_id,
                 principal_id=binding.principal_id,
@@ -912,11 +931,7 @@ class AuditLogger:
                 operation_id=operation_id,
                 policy_digest=binding.policy_digest,
                 authority_generation=authority_generation,
-                source_transport=(
-                    source_transport
-                    if source_transport is not None
-                    else binding.source_transport
-                ),
+                source_transport=safe_transport,
                 project_id=binding.project_id,
             )
             if self._anchor is not None:
@@ -931,8 +946,37 @@ class AuditLogger:
             return row_id
         except Exception:
             # Audit must never break the calling flow; log and continue.
-            logger.exception("audit log write failed for action=%s", action)
+            logger.error(  # noqa: G201 - traceback would bypass the output firewall
+                "audit log write failed for action_type=%s",
+                type(safe_action).__name__,
+                exc_info=True,
+            )
             return -1
+
+    def _sanitize_event(
+        self,
+        action: str,
+        target: str,
+        result: str,
+        detail: dict[str, Any] | None,
+        source_transport: str | None,
+    ) -> tuple[str, str, str, object, str | None]:
+        """Apply the canonical redactor before any audit sink receives data."""
+        transport = (
+            source_transport
+            if source_transport is not None
+            else None
+        )
+        if self._secret_redactor is None:
+            return action, target, result, detail or {}, transport
+        redactor = self._secret_redactor
+        return (
+            redactor.redact_text(action),
+            redactor.redact_text(target),
+            redactor.redact_text(result),
+            redactor.redact_fail_closed(detail or {}),
+            redactor.redact_text(transport) if transport is not None else None,
+        )
 
     def _append_to_file(
         self,

@@ -8,7 +8,9 @@ import sys
 from pathlib import Path
 
 import pytest
-from khaos.cli.main import build_command_parser, cmd_start
+from khaos.cli import supervision_commands
+from khaos.cli.main import _apply_initial_mode, build_command_parser, cmd_start
+from khaos.modes import Mode
 
 
 def run_cli(*args: str) -> subprocess.CompletedProcess[str]:
@@ -48,6 +50,14 @@ def test_test_help():
     assert "Run tests" in result.stdout
 
 
+def test_trusted_git_doctor_parser_exposes_json_mode():
+    args = build_command_parser().parse_args(["doctor", "trusted-git", "--json"])
+
+    assert args.command == "doctor"
+    assert args.doctor_command == "trusted-git"
+    assert args.as_json is True
+
+
 def test_chat_parser_exposes_interactive_options():
     parser = build_command_parser()
     args = parser.parse_args(["chat", "--mode", "coding", "--no-tui", "--yes"])
@@ -56,6 +66,108 @@ def test_chat_parser_exposes_interactive_options():
     assert args.mode == "coding"
     assert args.no_tui is True
     assert args.yes is True
+
+
+def test_setup_parser_exposes_local_first_setup_entrypoint():
+    args = build_command_parser().parse_args(["setup"])
+
+    assert args.command == "setup"
+
+
+async def test_chat_initial_mode_is_applied_by_shared_entrypoint():
+    class FakeModeManager:
+        def __init__(self):
+            self.requested = None
+
+        async def switch(self, mode):
+            self.requested = mode
+
+    manager = FakeModeManager()
+
+    await _apply_initial_mode(manager, "coding")
+
+    assert manager.requested is Mode.CODING
+
+
+def test_m8_6_task_control_parser_is_typed_and_owner_scoped():
+    parser = build_command_parser()
+    args = parser.parse_args([
+        "task", "--json", "pause", "task-1",
+        "--command-id", "cmd-1", "--expected-revision", "4",
+    ])
+
+    assert args.command == "task"
+    assert args.task_command == "pause"
+    assert args.task_id == "task-1"
+    assert args.command_id == "cmd-1"
+    assert args.expected_revision == 4
+    assert args.as_json is True
+
+
+async def test_task_control_does_not_treat_task_diagnostic_as_not_found(
+    monkeypatch, capsys,
+):
+    """A persisted task diagnostic must not block a cancel command."""
+
+    class FakeDatabase:
+        closed = False
+
+        async def close(self):
+            self.closed = True
+
+    class FakeTaskService:
+        def __init__(self):
+            self.cancel_call = None
+
+        async def get(self, _context, task_id):
+            return {
+                "id": task_id,
+                "error": "interrupted by process restart",
+                "status": "blocked",
+            }
+
+        async def cancel(
+            self, _context, task_id, *, command_id=None, expected_revision=None,
+        ):
+            self.cancel_call = (task_id, command_id, expected_revision)
+            return {"ok": True, "task_id": task_id}
+
+    database = FakeDatabase()
+    service = FakeTaskService()
+
+    async def fake_open(_args):
+        return database, service, object()
+
+    monkeypatch.setattr(supervision_commands, "_open", fake_open)
+    args = build_command_parser().parse_args([
+        "task", "--json", "cancel", "task-1",
+        "--command-id", "cancel-1", "--expected-revision", "7",
+    ])
+
+    result = await supervision_commands._task_command_async(args)
+
+    assert result == 0
+    assert service.cancel_call == ("task-1", "cancel-1", 7)
+    assert database.closed is True
+    assert '"ok": true' in capsys.readouterr().out
+
+
+def test_m8_6_checkpoint_and_rewind_parsers_expose_digest_bindings():
+    parser = build_command_parser()
+    checkpoint = parser.parse_args([
+        "checkpoint", "create", "task-1", "before", "merge",
+        "--idempotency-key", "cp-1",
+    ])
+    rewind = parser.parse_args([
+        "rewind", "execute", "rw-1", "--task-id", "task-1",
+        "--plan-digest", "a" * 64,
+    ])
+
+    assert checkpoint.checkpoint_command == "create"
+    assert checkpoint.label == ["before", "merge"]
+    assert checkpoint.idempotency_key == "cp-1"
+    assert rewind.rewind_command == "execute"
+    assert rewind.plan_digest == "a" * 64
 
 
 @pytest.mark.posix_host

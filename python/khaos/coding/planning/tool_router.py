@@ -32,7 +32,7 @@ from khaos.permissions.resource import AuthorizationResourceKind
 
 _TERMINAL_TASK_STATUSES = frozenset({"completed", "failed", "cancelled"})
 _MUTATING_ROLES = frozenset({
-    "file_mutation", "file_create", "file_rename", "file_delete",
+    "file_mutation", "file_transaction", "file_create", "file_rename", "file_delete",
     "verification_command",
 })
 _READ_ROLES = frozenset({"supporting_read"})
@@ -43,6 +43,7 @@ _READ_RESOURCE_KINDS = frozenset({
 })
 _ROLE_RESOURCE_KINDS = {
     "file_mutation": frozenset({AuthorizationResourceKind.WORKSPACE_PATH}),
+    "file_transaction": frozenset({AuthorizationResourceKind.WORKSPACE}),
     "file_create": frozenset({AuthorizationResourceKind.WORKSPACE_COPY_MOVE}),
     "file_rename": frozenset({AuthorizationResourceKind.WORKSPACE_COPY_MOVE}),
     "file_delete": frozenset({AuthorizationResourceKind.WORKSPACE_PATH}),
@@ -401,7 +402,7 @@ class PlanToolRouter:
             if not _role_matches_operation(role, step.operation):
                 continue
             if role_value in {
-                "file_mutation", "file_create", "file_delete",
+                "file_mutation", "file_transaction", "file_create", "file_delete",
             } and tuple(sorted(targets)) != tuple(sorted(step.target_files)):
                 continue
             if role_value == "file_rename" and tuple(sorted(targets)) != tuple(sorted(step.target_files)):
@@ -436,6 +437,14 @@ def snapshot_generation(context: Mapping[str, Any], resource: Any) -> int:
 def _role_matches_operation(role: Any, operation: PlanOperation) -> bool:
     return {
         "file_mutation": {PlanOperation.MODIFY, PlanOperation.DOCUMENT, PlanOperation.CONFIGURE},
+        "file_transaction": {
+            PlanOperation.MODIFY,
+            PlanOperation.DOCUMENT,
+            PlanOperation.CONFIGURE,
+            PlanOperation.CREATE,
+            PlanOperation.DELETE,
+            PlanOperation.RENAME,
+        },
         "file_create": {PlanOperation.CREATE},
         "file_delete": {PlanOperation.DELETE},
         "file_rename": {PlanOperation.RENAME},

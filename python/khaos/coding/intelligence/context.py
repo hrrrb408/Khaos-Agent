@@ -28,6 +28,7 @@ _MAX_ID_LENGTH = 512
 _MAX_QUERY_LENGTH = 16 * 1024
 _MAX_CONTENT_BYTES = 4 * 1024 * 1024
 _MAX_REASON_LENGTH = 256
+_MAX_COLLECTION_ITEMS = 256
 _HEX_DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _PROTECTED_NAMES = frozenset({".git", ".agents", ".codex", ".khaos"})
 
@@ -466,10 +467,16 @@ class ContextRequest:
             raise ContextContractError("reason must be a ContextQueryReason")
         _typed_tuple(self.targets, label="targets", item_type=ContextTarget)
         target_values = self.targets
+        if len(target_values) > _MAX_COLLECTION_ITEMS:
+            raise ContextContractError("targets exceeds its item-count bound")
         if type(self.target_files) is not tuple:
             raise ContextContractError("target_files must be a tuple")
         if type(self.target_symbols) is not tuple:
             raise ContextContractError("target_symbols must be a tuple")
+        if len(self.target_files) > _MAX_COLLECTION_ITEMS:
+            raise ContextContractError("target_files exceeds its item-count bound")
+        if len(self.target_symbols) > _MAX_COLLECTION_ITEMS:
+            raise ContextContractError("target_symbols exceeds its item-count bound")
         normalized_files = {
             normalize_relative_path(path, label="target_files")
             for path in self.target_files
@@ -519,8 +526,15 @@ class ContextRequest:
         object.__setattr__(self, "targets", target_values)
         object.__setattr__(self, "target_files", tuple(sorted(normalized_files)))
         object.__setattr__(self, "target_symbols", tuple(sorted(normalized_symbols)))
+        if (
+            len(normalized_files) > _MAX_COLLECTION_ITEMS
+            or len(normalized_symbols) > _MAX_COLLECTION_ITEMS
+        ):
+            raise ContextContractError("normalized context targets exceed their bound")
         if type(self.changed_files) is not tuple:
             raise ContextContractError("changed_files must be a tuple")
+        if len(self.changed_files) > _MAX_COLLECTION_ITEMS:
+            raise ContextContractError("changed_files exceeds its item-count bound")
         normalized_changed = tuple(
             sorted(
                 {

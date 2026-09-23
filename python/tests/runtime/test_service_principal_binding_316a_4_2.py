@@ -35,9 +35,9 @@ from khaos.agent.approval import ApprovalBinding, ApprovalBroker
 from khaos.audit import AuditLogger
 from khaos.coding.task_manager import TaskManager, TaskStatus
 from khaos.db import Database
+from khaos.memory import SqliteMemoryRepository
 from khaos.rpc import AuditService, MemoryService
 from khaos.rpc.task_service import TaskService
-from khaos.memory import SqliteMemoryRepository
 from khaos.runtime import RequestContext
 
 
@@ -326,6 +326,28 @@ async def test_task_service_cancel_hides_cross_principal_task(tmp_path):
     # Principal A can still cancel their own task.
     alice_cancel = await service.cancel(_ctx("api:alice"), task_id)
     assert alice_cancel["ok"] is True
+    await db.close()
+
+
+async def test_task_service_cancel_accepts_control_binding_for_diagnostic_task(tmp_path):
+    """Cancellation remains callable when a task carries a restart error."""
+    db, task_id = await _make_db_with_alice_task(tmp_path)
+    await db.connect()
+    service = TaskService(db)
+
+    result = await service.cancel(
+        _ctx("api:alice"),
+        task_id,
+        command_id="cancel-diagnostic-task",
+        expected_revision=None,
+    )
+
+    assert result["ok"] is True
+    manager = TaskManager(db=db, principal_id="api:alice")
+    await manager.load()
+    task = await manager.get(task_id)
+    assert task is not None
+    assert task.status is TaskStatus.CANCELLED
     await db.close()
 
 
