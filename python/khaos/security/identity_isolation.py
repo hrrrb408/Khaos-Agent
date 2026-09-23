@@ -275,20 +275,26 @@ def require_distinct_linux_identities(
 
 def linux_job_namespace_args(
     runtime_profile: RuntimeProfile | str | None = None,
+    *,
+    authority_profile: str | None = None,
 ) -> tuple[str, ...]:
     """Return the fail-closed bwrap identity mapping for coding jobs.
 
     The configured job UID is the UID visible inside the private user
-    namespace.  Production additionally requires the deployment contract and
-    distinct agent/authority/job identities; development uses the nobody-like
-    65534 default only under the explicit dev flag.  A job UID of 0 is
+    namespace.  Native Linux production additionally requires the deployment
+    contract and distinct agent/authority/job identities; development and the
+    explicitly selected Community Local Profile use the nobody-like 65534
+    default when no job UID is provisioned.  Community is intentionally a
+    same-user authority profile, so requiring a fictitious second host UID here
+    would make its documented Linux transport unusable.  A job UID of 0 is
     always rejected: the payload identity must never be root, and the
     zero-capability postcondition (``--cap-drop ALL`` plus the launcher's
     final capget assertion) must not depend on UID inference.
     """
     development = not resolve_runtime_profile(runtime_profile).is_production
     contract = read_contract_from_environment()
-    if development:
+    community = authority_profile == "community"
+    if development or community:
         job_uid = contract.job_uid if contract.job_uid is not None else 65534
     else:
         if (

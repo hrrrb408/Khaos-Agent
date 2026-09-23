@@ -65,6 +65,19 @@ def test_linux_production_job_identity_requires_contract(
         linux_job_namespace_args()
 
 
+def test_linux_community_profile_allows_same_user_job_namespace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("khaos.security.identity_isolation.sys_platform", lambda: "linux")
+    monkeypatch.setenv("KHAOS_DEV_MODE", "0")
+    monkeypatch.delenv("KHAOS_AGENT_UID", raising=False)
+    monkeypatch.delenv("KHAOS_AUTHORITYD_UID", raising=False)
+    monkeypatch.setenv("KHAOS_JOB_UID", "65534")
+    assert linux_job_namespace_args(authority_profile="community")[-6:] == (
+        "--uid", "65534", "--gid", "65534", "--cap-drop", "ALL",
+    )
+
+
 def test_linux_production_job_identity_is_distinct(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

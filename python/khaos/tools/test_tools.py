@@ -1,8 +1,8 @@
 """Test feedback-loop tools for coding mode.
 
-Runs a test command, parses runner output (pytest / jest / vitest / go test,
-plus a generic keyword fallback) and returns a structured JSON result that the
-agent loop can reason about when fixing failing tests.
+Runs a test command, parses runner output (pytest / jest / vitest / go test /
+TAP, plus a generic keyword fallback) and returns a structured JSON result
+that the agent loop can reason about when fixing failing tests.
 """
 
 from __future__ import annotations
@@ -15,6 +15,14 @@ import shlex
 from pathlib import Path
 from typing import Any
 
+from khaos.coding.execution.environment import (
+    TASK_ENVIRONMENT_KEYS,
+    environment_from_spawn_plan,
+    split_command_environment,
+    validate_command_environment,
+)
+from khaos.tools.terminal_tools import resolve_workspace_cwd
+
 logger = logging.getLogger(__name__)
 
 # Hard cap for any single test invocation.
@@ -25,18 +33,35 @@ async def test_run(
     command: str,
     cwd: str,
     execution_service=None,
+    workspace_manager=None,
     task_id: str | None = None,
     workspace_id: str | None = None,
     sandbox_decision=None,
+    process_authority=None,
     executable_identity: str | None = None,
     spawn_plan=None,
     execution_authority=None,
     network_lease=None,
+    principal_id: str | None = None,
+    project_id: str | None = None,
+    runtime_id: str | None = None,
 ) -> str:
     """Run a test command and return a structured JSON summary.
 
     Coding Agent reachable handler: fail closed when ExecutionService is
     missing. Direct subprocess fallback is removed — no OS-sandbox auto-fallback.
+
+    ``process_authority`` is injected by the ToolInvocationBroker for every
+    process-backed tool.  Process lifecycle remains owned by
+    ``ExecutionService``; accepting the injected authority here keeps the
+    broker/handler contract explicit without creating a direct subprocess
+    path in this parser-facing tool.
+
+    The remaining identity parameters are also injected by the broker so the
+    handler has the same fail-closed invocation contract as other
+    process-backed tools.  Execution policy is already bound to the supplied
+    ``ExecutionRequest`` and these metadata values are intentionally not used
+    as an alternate authority.
 
     The command is split with :mod:`shlex` and executed via
     :class:`ExecutionService` so no shell is spawned. ``stdout`` and ``stderr``
@@ -58,7 +83,9 @@ async def test_run(
             ensure_ascii=False,
         )
 
-    workdir = str(Path(cwd).expanduser().resolve())
+    workdir = str(
+        resolve_workspace_cwd(cwd, workspace_manager, workspace_id, task_id)
+    )
     try:
         parts = shlex.split(command)
     except ValueError as exc:
@@ -68,12 +95,62 @@ async def test_run(
         )
 
     from khaos.coding.execution import ExecutionRequest, NetworkPolicy, ResourceBudget
+    environment = environment_from_spawn_plan(spawn_plan)
+    if spawn_plan is None:
+        # Legacy/library callers do not have a scheduler-owned plan to supply
+        # the exact child environment.  Still choose the same deterministic
+        # PATH and bytecode hygiene used by the production coding context so
+        # executable identity is stable at the final spawn boundary.
+        environment = {
+            "PATH": os.defpath,
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+        if _is_pytest_argv(tuple(parts)):
+            environment["PYTEST_ADDOPTS"] = "-p no:cacheprovider"
+
+    try:
+        command_environment, command_argv = split_command_environment(tuple(parts))
+        validate_command_environment(
+            command_environment,
+            allowed_keys=(
+                frozenset(environment)
+                if spawn_plan is not None
+                else TASK_ENVIRONMENT_KEYS
+            ),
+        )
+    except (PermissionError, ValueError) as exc:
+        return json.dumps(
+            {"success": False, "error": str(exc)},
+            ensure_ascii=False,
+        )
+    if spawn_plan is not None:
+        if any(
+            environment.get(key) != value
+            for key, value in command_environment.items()
+        ):
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": "command environment does not match the approved spawn plan",
+                },
+                ensure_ascii=False,
+            )
+    else:
+        environment.update(command_environment)
+    parts = list(command_argv)
 
     try:
         result = await execution_service.execute(
             ExecutionRequest(
                 tuple(parts),
                 Path(workdir),
+                environment=environment,
+                # The scheduler binds the exact non-secret environment into
+                # the immutable spawn plan.  Projecting those keys into the
+                # request profile keeps the final ExecutionService digest in
+                # agreement when runtime hygiene (for example pytest cache
+                # suppression) adds an approved key.
+                allowed_environment_keys=frozenset(environment),
                 # ResourceBudget rejects non-positive values. Preserve the
                 # historical zero-timeout test/control surface as an immediate
                 # supervised timeout rather than failing request validation.
@@ -157,6 +234,16 @@ async def test_run(
     return json.dumps(parsed, ensure_ascii=False)
 
 
+def _is_pytest_argv(argv: tuple[str, ...]) -> bool:
+    """Recognize direct pytest launches for runtime workspace hygiene."""
+    for index, value in enumerate(argv):
+        if Path(value).name in {"pytest", "py.test"}:
+            return True
+        if value == "-m" and index + 1 < len(argv) and argv[index + 1] == "pytest":
+            return True
+    return False
+
+
 def _parse_result(command: str, output: str, exit_code: int) -> dict[str, Any]:
     """Dispatch to the runner-specific parser and assemble the result."""
     framework = _detect_framework(command)
@@ -164,6 +251,8 @@ def _parse_result(command: str, output: str, exit_code: int) -> dict[str, Any]:
         "pytest": _parse_pytest,
         "jest": _parse_jest,
         "go": _parse_go,
+        "tap": _parse_tap,
+        "unittest": _parse_unittest,
     }.get(framework)
 
     parsed = parser(output) if parser is not None else _parse_generic(output)
@@ -204,6 +293,12 @@ def _detect_framework(command: str) -> str:
         return "jest"
     if "go test" in lowered or lowered.startswith("go test"):
         return "go"
+    if re.search(r"(?:^|\s)(?:node|nodejs|deno|bun)(?:\s|$)", lowered) and re.search(
+        r"(?:^|\s)--test(?:\s|$)", lowered
+    ):
+        return "tap"
+    if "unittest" in lowered:
+        return "unittest"
     return "generic"
 
 
@@ -410,6 +505,114 @@ def _parse_go(text: str) -> dict[str, Any]:
     # Non-verbose runs only print "FAIL\t<pkg>"; surface at least one failure.
     if failed == 0 and passed == 0 and re.search(r"^FAIL\b", text, re.MULTILINE):
         failed = 1
+
+    return {
+        "passed": passed,
+        "failed": failed,
+        "errors": errors,
+        "failed_cases": failed_cases,
+    }
+
+
+def _parse_unittest(text: str) -> dict[str, Any]:
+    """Parse the bounded summary and failure names emitted by unittest.
+
+    ``unittest`` has no single machine-readable output mode that fits the
+    existing small ``test_run`` contract.  Prefer its terminal ``Ran`` and
+    ``FAILED``/``OK`` summaries, then use verbose ``... ok``/``FAIL``/``ERROR``
+    lines as a conservative fallback.  The parser never treats an
+    unrecognised line as a passing test.
+    """
+
+    ran_match = re.search(r"\bRan\s+(\d+)\s+tests?\b", text)
+    total = int(ran_match.group(1)) if ran_match else 0
+
+    failure_match = re.search(r"\bfailures=(\d+)\b", text)
+    error_match = re.search(r"\berrors=(\d+)\b", text)
+    failed = int(failure_match.group(1)) if failure_match else 0
+    errors = int(error_match.group(1)) if error_match else 0
+
+    failed_cases: list[dict[str, Any]] = []
+    seen_cases: set[tuple[str, str]] = set()
+    for line in text.splitlines():
+        stripped = line.strip()
+        match = re.match(r"^(FAIL|ERROR):\s*(.+)$", stripped)
+        if match is None:
+            continue
+        kind, name = match.groups()
+        key = (kind, name)
+        if key in seen_cases:
+            continue
+        seen_cases.add(key)
+        failed_cases.append(
+            {
+                "name": name,
+                "file": "",
+                "error": kind,
+                "line": None,
+            }
+        )
+
+    if failure_match is None and error_match is None:
+        failed = sum(1 for kind, _name in seen_cases if kind == "FAIL")
+        errors = sum(1 for kind, _name in seen_cases if kind == "ERROR")
+
+    if total:
+        passed = max(total - failed - errors, 0)
+    else:
+        passed = len(
+            [
+                line
+                for line in text.splitlines()
+                if re.search(r"\.\.\.\s+ok\s*$", line)
+            ]
+        )
+
+    if total == 0 and passed == 0 and failed == 0 and errors == 0:
+        if re.search(r"^OK\s*$", text, re.MULTILINE):
+            passed = 1
+        elif re.search(r"^FAILED\b", text, re.MULTILINE):
+            failed = 1
+
+    return {
+        "passed": passed,
+        "failed": failed,
+        "errors": errors,
+        "failed_cases": failed_cases,
+    }
+
+
+def _parse_tap(text: str) -> dict[str, Any]:
+    """Parse the bounded TAP summary emitted by Node's built-in test runner."""
+    tests_match = re.search(r"^#\s+tests\s+(\d+)\s*$", text, re.MULTILINE)
+    pass_match = re.search(r"^#\s+pass\s+(\d+)\s*$", text, re.MULTILINE)
+    fail_match = re.search(r"^#\s+fail\s+(\d+)\s*$", text, re.MULTILINE)
+    cancelled_match = re.search(
+        r"^#\s+cancelled\s+(\d+)\s*$", text, re.MULTILINE
+    )
+
+    failed_cases: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        match = re.match(r"^\s*not ok\s+\d+(?:\s*-\s*)?(.*)$", line)
+        if match is None:
+            continue
+        name = match.group(1).strip() or line.strip()
+        if any(case["name"] == name for case in failed_cases):
+            continue
+        failed_cases.append(
+            {"name": name, "file": "", "error": "", "line": None}
+        )
+
+    if tests_match is not None:
+        passed = int(pass_match.group(1)) if pass_match else 0
+        failed = int(fail_match.group(1)) if fail_match else 0
+        errors = int(cancelled_match.group(1)) if cancelled_match else 0
+        if passed == 0 and failed == 0 and errors == 0:
+            passed = max(int(tests_match.group(1)), 0)
+    else:
+        passed = len(re.findall(r"^\s*ok\s+\d+\b", text, re.MULTILINE))
+        failed = len(failed_cases)
+        errors = 0
 
     return {
         "passed": passed,

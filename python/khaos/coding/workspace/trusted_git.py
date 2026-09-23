@@ -67,6 +67,11 @@ _PROTECTED_GIT_NAME = ".git"
 _MAX_GIT_ERROR_BYTES = 64 * 1024
 _MAX_GIT_SYNC_SECONDS = 120.0
 _MAX_GIT_CHUNK_BYTES = 1024 * 1024
+# ``ls-files --stage -z`` is an index snapshot, not a human-facing
+# diagnostic.  Its size grows with the repository and routinely exceeds the
+# small command-output bound used for ordinary Git responses.  Keep a
+# separate bounded ceiling aligned with bootstrap tree-listing limits.
+_MAX_GIT_INDEX_LISTING_BYTES = 64 * 1024 * 1024
 _MAX_GIT_EFFECT_FILE_BYTES = 256 * 1024 * 1024
 _ALLOWED_COMMANDS = frozenset(
     {
@@ -2186,6 +2191,7 @@ class TrustedGitRunner:
             "ls-files",
             "--stage",
             "-z",
+            max_output_bytes=_MAX_GIT_INDEX_LISTING_BYTES,
             authority=authority.derive(operation_class="git.status"),
         )
         return not _working_tree_matches_index(listing, repository, object_id_length)

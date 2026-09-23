@@ -58,6 +58,34 @@ def _owner(principal_id: str, project_id: str) -> None:
         raise CheckpointBindingError("project_id is required")
 
 
+def _same_checkpoint_content(
+    left: TaskCheckpoint, right: TaskCheckpoint
+) -> bool:
+    """Compare checkpoint identity content while excluding creation time.
+
+    ``checkpoint_id`` is derived from the stable workspace snapshot identity,
+    while ``checkpoint_digest`` also attests the creation timestamp and the
+    current supervision projection revision.  A retry of the same logical
+    capture can therefore have a different digest even though the workspace
+    state is unchanged.  Treat only an exact owner-bound capture match as
+    idempotent; any other digest collision remains fail-closed.
+    """
+    return (
+        left.task_id == right.task_id
+        and left.workspace_id == right.workspace_id
+        and left.project_id == right.project_id
+        and left.repository_generation == right.repository_generation
+        and left.head_commit == right.head_commit
+        and left.tree_digest == right.tree_digest
+        and left.plan_revision == right.plan_revision
+        and left.verification_evidence_digest == right.verification_evidence_digest
+        and left.checkpoint_kind == right.checkpoint_kind
+        and left.label == right.label
+        and left.snapshot_digest == right.snapshot_digest
+        and left.snapshot == right.snapshot
+    )
+
+
 def _checkpoint_from_row(row: Any) -> TaskCheckpoint:
     payload = {
         "checkpoint_id": _row_value(row, "checkpoint_id", 0),
@@ -184,7 +212,15 @@ class CheckpointRepository:
             if existing_row is not None:
                 existing = _checkpoint_from_row(existing_row)
                 if existing.checkpoint_digest != checkpoint.checkpoint_digest:
-                    raise CheckpointConflictError("checkpoint digest collision")
+                    same_owner = (
+                        existing.task_id == checkpoint.task_id
+                        and existing.workspace_id == checkpoint.workspace_id
+                        and str(_row_value(existing_row, "principal_id", 3))
+                        == principal_id
+                        and existing.project_id == checkpoint.project_id
+                    )
+                    if not (same_owner and _same_checkpoint_content(existing, checkpoint)):
+                        raise CheckpointConflictError("checkpoint digest collision")
                 if (
                     existing.task_id != checkpoint.task_id
                     or existing.workspace_id != checkpoint.workspace_id

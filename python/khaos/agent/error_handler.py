@@ -11,7 +11,12 @@ import httpx
 
 from khaos.agent.core import Message
 from khaos.audit.logger import AuditLogger
-from khaos.exceptions import CompressionCircuitOpenError
+from khaos.exceptions import (
+    CompressionCircuitOpenError,
+    ModelUnavailableError,
+    ProviderError,
+)
+from khaos.security.secret_redaction import SecretRedactor
 
 
 class ErrorCode(Enum):
@@ -20,6 +25,7 @@ class ErrorCode(Enum):
     MODEL_TIMEOUT = "MODEL_TIMEOUT"
     MODEL_RATE_LIMITED = "MODEL_RATE_LIMITED"
     MODEL_UNAVAILABLE = "MODEL_UNAVAILABLE"
+    PROVIDER_ERROR = "PROVIDER_ERROR"
     MODEL_CONTEXT_TOO_LONG = "MODEL_CONTEXT_TOO_LONG"
     TOOL_NOT_FOUND = "TOOL_NOT_FOUND"
     TOOL_TIMEOUT = "TOOL_TIMEOUT"
@@ -85,6 +91,7 @@ class ErrorHandler:
         principal_id: str = "legacy",
         project_id: str = "",
         audit_logger: AuditLogger | None = None,
+        secret_redactor: SecretRedactor | None = None,
     ):
         self.db = db
         self.router = router
@@ -93,6 +100,7 @@ class ErrorHandler:
         self.principal_id = principal_id
         self.project_id = project_id
         self._audit_logger = audit_logger
+        self._secret_redactor = secret_redactor
 
     def classify(self, error: Exception) -> ErrorCode:
         """Map an exception to a stable error code."""
@@ -106,6 +114,10 @@ class ErrorHandler:
             return ErrorCode.MODEL_RATE_LIMITED
         if isinstance(error, ModelContextTooLongError):
             return ErrorCode.MODEL_CONTEXT_TOO_LONG
+        if isinstance(error, ProviderError):
+            return ErrorCode.PROVIDER_ERROR
+        if isinstance(error, ModelUnavailableError):
+            return ErrorCode.MODEL_UNAVAILABLE
         if isinstance(error, httpx.TransportError):
             return ErrorCode.MODEL_UNAVAILABLE
         if isinstance(error, TimeoutError):
@@ -132,6 +144,7 @@ class ErrorHandler:
                 self.db,
                 principal_id=self.principal_id,
                 project_id=self.project_id,
+                secret_redactor=self._secret_redactor,
             )
             self._audit_logger = audit_logger
         row_id = await audit_logger.log(
@@ -152,7 +165,7 @@ class ErrorHandler:
     ) -> ErrorEvent:
         """Classify, audit, and return an SSE error event."""
         code = self.classify(error)
-        message = _format_error_message(error)
+        message = _format_error_message(error, self._secret_redactor)
         event = ErrorEvent(
             code=code,
             message=message,
@@ -191,7 +204,20 @@ class ErrorHandler:
         return await self.compressor.compress(messages, threshold)
 
 
-def _format_error_message(error: Exception) -> str:
+def _format_error_message(
+    error: Exception, secret_redactor: SecretRedactor | None = None
+) -> str:
+    if isinstance(error, ProviderError):
+        if getattr(error, "code", None) == "CREDENTIAL_SESSION_LOCKED":
+            return (
+                "provider credential session is locked; "
+                "unlock it explicitly to continue"
+            )
+        if getattr(error, "code", None) == "CREDENTIAL_MISSING":
+            return "provider credential is missing; provision it explicitly to continue"
+        return "model provider request failed"
+    if secret_redactor is not None:
+        return secret_redactor.safe_error(error)
     message = str(error).strip()
     if message:
         return message

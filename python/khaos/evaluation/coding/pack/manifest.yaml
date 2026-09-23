@@ -51,7 +51,7 @@ scenarios:
           max_insertions: 160
           max_deletions: 100
   - scenario_id: browser-validated-feature
-    version: 1
+    version: 4
     kind: BROWSER_VALIDATED_FEATURE
     difficulty: medium
     repository_fixture: browser-validated-feature
@@ -75,7 +75,7 @@ scenarios:
           max_insertions: 140
           max_deletions: 60
   - scenario_id: bugfix-go-counter
-    version: 1
+    version: 2
     kind: BUG_FIX
     difficulty: medium
     repository_fixture: bugfix-go-counter
@@ -96,7 +96,7 @@ scenarios:
           forbidden_changed_files: [.env]
           min_changed_files: 1
           max_changed_files: 3
-          max_insertions: 80
+          max_insertions: 120
           max_deletions: 40
   - scenario_id: bugfix-python-cache
     version: 1
@@ -123,7 +123,7 @@ scenarios:
           max_insertions: 80
           max_deletions: 40
   - scenario_id: bugfix-typescript-config
-    version: 1
+    version: 2
     kind: BUG_FIX
     difficulty: medium
     repository_fixture: bugfix-typescript-config
@@ -147,11 +147,11 @@ scenarios:
           max_insertions: 80
           max_deletions: 40
   - scenario_id: cross-language-python-go-contract
-    version: 1
+    version: 2
     kind: CROSS_LANGUAGE
     difficulty: hard
     repository_fixture: cross-language-python-go-contract
-    user_prompt: Align the Python client and Go server around the checked-in response contract, including the error field and stable integer status.
+    user_prompt: Align the Python client and Go server around the checked-in response contract, including the error field and stable integer status. Preserve the contract's version on the Go response while the Python decoder must retain status and error.
     languages: [python, go]
     expected_files: [contract.json, python/client.py, go/server.go]
     forbidden_files: [.env, .khaos]
@@ -219,13 +219,13 @@ scenarios:
           max_insertions: 160
           max_deletions: 80
   - scenario_id: feature-rust-parser
-    version: 1
+    version: 5
     kind: FEATURE
     difficulty: hard
     repository_fixture: feature-rust-parser
-    user_prompt: Add a small Rust parser for key=value records with typed errors, preserving the existing record representation and public module layout.
+    user_prompt: Add a small Rust parser for key=value records with typed errors, preserving the existing record representation and public module layout. Split at the first '=' while preserving the remainder as the value. Keep the public parse_record entry point and introduce a ParseError type for parse failures.
     languages: [rust]
-    expected_files: [src/lib.rs, src/parser.rs]
+    expected_files: [src/parser.rs]
     forbidden_files: [.env, .khaos]
     tags: [feature, rust]
     oracle:
@@ -236,18 +236,18 @@ scenarios:
           hidden_files: [verify.py]
           network: none
         - kind: DIFF
-          required_changed_files: [src/parser.rs, src/lib.rs]
+          required_changed_files: [src/parser.rs]
           forbidden_changed_files: [.env]
-          min_changed_files: 2
+          min_changed_files: 1
           max_changed_files: 4
           max_insertions: 180
           max_deletions: 100
   - scenario_id: multifile-go-pipeline
-    version: 1
+    version: 2
     kind: MULTI_FILE
     difficulty: hard
     repository_fixture: multifile-go-pipeline
-    user_prompt: Extend the Go pipeline with validation and a result accumulator, updating the service and tests while leaving the public entry point compatible.
+    user_prompt: Extend the Go pipeline with validation and a result accumulator, updating the service and tests while leaving the public Process entry point compatible. Add the exported Validate function in validate.go and an Accumulator type in pipeline.go, and have the service use both.
     languages: [go]
     expected_files: [pipeline.go, validate.go, service.go]
     forbidden_files: [.env, .khaos]
@@ -267,11 +267,11 @@ scenarios:
           max_insertions: 220
           max_deletions: 120
   - scenario_id: multifile-python-settings
-    version: 1
+    version: 2
     kind: MULTI_FILE
     difficulty: hard
     repository_fixture: multifile-python-settings
-    user_prompt: Add layered settings loading with environment overrides, validation, and a stable service facade; update the model and tests together.
+    user_prompt: Add layered settings loading with environment overrides, validation, and a stable service facade; update the model and tests together. Add Settings.from_env and a validate method, make the service resolve the environment override, and use pytest monkeypatch to test it.
     languages: [python]
     expected_files: [settings.py, service.py, tests/test_settings.py]
     forbidden_files: [.env, .khaos]
@@ -290,12 +290,125 @@ scenarios:
           max_changed_files: 5
           max_insertions: 220
           max_deletions: 120
+  - scenario_id: p4-readonly-authority
+    version: 2
+    kind: CODE_REVIEW
+    difficulty: medium
+    repository_fixture: p4-readonly-authority
+    user_prompt: >-
+      Perform a bounded read-only repository-understanding review of the small
+      authority fixture. Identify the authority definition, its consumer, the
+      enforcement boundary, and the invariant connecting those components.
+      Report only one JSON object with a findings array containing findings for
+      the authority definition, its consumer, and the enforcement boundary; each
+      finding must include category, file, and concepts grounded in the files.
+      Use read-only tools as needed. When you have enough evidence to answer
+      accurately, stop using tools and answer. Do not edit files, run commands,
+      access network/browser tools, or use write/test tools.
+    limits:
+      timeout_seconds: 300
+      max_output_bytes: 65536
+      max_diff_bytes: 4194304
+      max_changed_files: 64
+      max_source_files: 16
+      max_source_bytes: 4194304
+      max_tool_events: 256
+      max_model_turns: 12
+      max_tool_calls: 24
+    languages: [python]
+    expected_files: []
+    forbidden_files: [.env, .khaos, .oracle-hidden]
+    tags: [qualification, p4-v2, read-only, review]
+    oracle:
+      kind: REVIEW_FINDING
+      allow_extra_findings: false
+      match_mode: ALL
+      required_findings:
+        - finding_id: authority-definition
+          category: authority-definition
+          file: src/authority.py
+          concepts: [AuthorityLease, issue_lease, definition]
+          severity: medium
+        - finding_id: authority-consumer
+          category: authority-consumer
+          file: src/consumer.py
+          concepts: [consume_lease, AuthorityLease, consumer]
+          severity: medium
+        - finding_id: enforcement-boundary
+          category: enforcement-boundary
+          file: src/policy.py
+          concepts: [require_active, project_id, invariant]
+          severity: high
+  - scenario_id: p4-readonly-authority-v3
+    # Version 5 keeps the public v3 category contract but removes role-label
+    # words from the hidden concept oracle.  The task asks for concepts
+    # grounded in source files; category already carries the role, so the
+    # oracle must require concrete source concepts rather than redundant
+    # labels such as "definition" or "invariant".  The enforcement boundary
+    # needs only its primary guard symbol; requiring an arbitrary second
+    # symbol would reject other source-grounded explanations.
+    version: 5
+    kind: CODE_REVIEW
+    difficulty: medium
+    repository_fixture: p4-readonly-authority
+    review_category_contract: p4-review-category-v3
+    user_prompt: >-
+      Perform a bounded read-only repository-understanding review of the small
+      authority fixture. Identify three findings: the authority definition,
+      its consumer, and the enforcement boundary. The public category enum is
+      exactly authority_definition, consumer, or enforcement_boundary. Use
+      authority_definition for the code location that establishes or defines
+      the authority represented by the finding; use consumer for the code that
+      consumes, depends on, or uses that authority; and use
+      enforcement_boundary for the code location that checks, enforces, or
+      guards use of that authority. Report exactly one JSON object with a
+      findings array containing exactly three findings. Each finding must
+      include category, file, and concepts grounded in the files. Do not use
+      aliases, spaces, hyphens, or camelCase for category values. Use read-only
+      tools as needed. When you have enough evidence to answer accurately, stop
+      using tools and answer. Do not edit files, run commands, access
+      network/browser tools, or use write/test tools.
+    limits:
+      timeout_seconds: 300
+      max_output_bytes: 65536
+      max_diff_bytes: 4194304
+      max_changed_files: 64
+      max_source_files: 16
+      max_source_bytes: 4194304
+      max_tool_events: 256
+      max_model_turns: 12
+      max_tool_calls: 24
+    languages: [python]
+    expected_files: []
+    forbidden_files: [.env, .khaos, .oracle-hidden]
+    tags: [qualification, p4-v3, read-only, review]
+    oracle:
+      kind: REVIEW_FINDING
+      category_contract: p4-review-category-v3
+      allow_extra_findings: false
+      match_mode: ALL
+      required_findings:
+        - finding_id: authority-definition
+          category: authority_definition
+          file: src/authority.py
+          concepts: [AuthorityLease, issue_lease]
+          severity: medium
+        - finding_id: authority-consumer
+          category: consumer
+          file: src/consumer.py
+          concepts: [consume_lease, AuthorityLease]
+          severity: medium
+        - finding_id: enforcement-boundary
+          category: enforcement_boundary
+          file: src/policy.py
+          concepts: [require_active]
+          severity: high
   - scenario_id: refactor-python-repository
-    version: 1
+    version: 3
     kind: REFACTOR
     difficulty: medium
     repository_fixture: refactor-python-repository
-    user_prompt: Refactor the repository adapter behind a narrow protocol without changing observable behavior or introducing a second persistence path.
+    user_prompt: Refactor the repository adapter in src/repository.py behind a narrow typing.Protocol named RepositoryPort, keeping the existing Repository in that module, without changing observable behavior or introducing a second persistence path. The service must depend on RepositoryPort rather than the concrete Repository.
     languages: [python]
     expected_files: [src/repository.py, src/service.py]
     forbidden_files: [.env, .khaos]
@@ -315,11 +428,11 @@ scenarios:
           max_insertions: 140
           max_deletions: 100
   - scenario_id: refactor-typescript-client
-    version: 1
+    version: 3
     kind: REFACTOR
     difficulty: medium
     repository_fixture: refactor-typescript-client
-    user_prompt: Refactor the TypeScript client transport behind a typed adapter while preserving request serialization and the public Client API.
+    user_prompt: Refactor the TypeScript client transport behind a typed adapter while preserving request serialization and the public Client API. Declare interface Transport in transport.ts, keep the Request type, and have Client own a private transport.
     languages: [typescript]
     expected_files: [src/client.ts, src/transport.ts]
     forbidden_files: [.env, .khaos]
@@ -339,11 +452,22 @@ scenarios:
           max_insertions: 140
           max_deletions: 100
   - scenario_id: review-python-cache-race
-    version: 1
+    # Version 5 makes the legacy parser's closed finding shape explicit.  The
+    # previous wording required fields but did not prohibit an extra prose
+    # field, while the parser correctly fails closed on unknown fields.
+    version: 5
     kind: CODE_REVIEW
     difficulty: medium
     repository_fixture: review-python-cache-race
-    user_prompt: Review the cache implementation for correctness under concurrent get-or-compute calls. Return structured findings with file, line, category, and the concepts that justify each finding. Do not modify files.
+    user_prompt: >-
+      Review the cache implementation for correctness under concurrent
+      get-or-compute calls. Return exactly one JSON object with a findings
+      array containing the required finding. The finding must contain only
+      category, file, line, concepts, and severity; use category concurrency,
+      short exact identifiers from the source for concepts, and ground the
+      finding in the source. Do not add summary, description, or any other
+      keys. Do not include prose, Markdown, or a code fence, and do not modify
+      files.
     languages: [python]
     expected_files: []
     forbidden_files: [.env, .khaos]
@@ -356,7 +480,7 @@ scenarios:
         - finding_id: cache-lock
           category: concurrency
           file: src/cache.py
-          line: 12
-          line_tolerance: 4
-          concepts: [lock, compute, duplicate]
+          line: 7
+          line_tolerance: 3
+          concepts: [get_or_compute, _values, _compute]
           severity: high

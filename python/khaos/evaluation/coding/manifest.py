@@ -14,10 +14,8 @@ from khaos.evaluation.coding.contracts import (
     CodingScenario,
     CodingScenarioKind,
     CodingScenarioManifest,
-    OracleSpec,
     oracle_from_payload,
 )
-
 
 _MANIFEST_FIELDS = frozenset({"schema_version", "manifest_id", "version", "scenarios", "digest"})
 _SCENARIO_FIELDS = frozenset(
@@ -37,6 +35,7 @@ _SCENARIO_FIELDS = frozenset(
         "max_changed_files",
         "max_diff_lines",
         "tags",
+        "review_category_contract",
         "digest",
     }
 )
@@ -168,6 +167,7 @@ def _scenario(value: object, *, manifest_root: Path) -> CodingScenario:
         max_changed_files=value.get("max_changed_files"),
         max_diff_lines=value.get("max_diff_lines"),
         tags=_strict_string_sequence(value.get("tags", ()), "scenario.tags"),
+        review_category_contract=value.get("review_category_contract"),
         digest=value.get("digest", ""),
     )
 

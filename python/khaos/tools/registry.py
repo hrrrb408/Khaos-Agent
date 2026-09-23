@@ -43,6 +43,9 @@ _OFFICE_WORKSPACE_FILE_TOOLS = frozenset({
     # root (no symlink escape, no arbitrary host file exfiltration).
     "browser_file_upload",
 })
+_CODING_BROWSER_TOOL_NAMES = frozenset({
+    "browser_app_open", "browser_observe", "browser_action", "browser_session_close",
+})
 _INJECTED_CAPABILITY_FIELDS = frozenset({
     "execution_service", "workspace_manager", "approval_context",
     "principal_id", "project_id", "runtime_id", "network_guard",
@@ -974,7 +977,14 @@ class ToolInvocationBroker:
         if (
             name.startswith("browser_")
             and name != "browser_close"
+            and name not in _CODING_BROWSER_TOOL_NAMES
         ):
+            # Coding browser tools are service-backed semantic handlers.  They
+            # receive BrowserCodingService below and deliberately do not
+            # accept the legacy BrowserManager/page-operation injection.  In
+            # particular, passing a manager through ``**arguments`` would
+            # contaminate the approval digest, while the close handler would
+            # reject the unexpected keyword entirely.
             if "principal_id" not in handler_params:
                 handler_params["principal_id"] = context.get("principal_id", "")
             handler_params.setdefault("session_id", context.get("session_id", ""))
@@ -1244,7 +1254,13 @@ HISTORY_TOOL_SPECS = [
 
 
 def _edit_transaction_parameters() -> dict[str, Any]:
-    """Return the closed model-visible schema for one edit transaction."""
+    """Return the closed model-visible schema for one edit transaction.
+
+    The precondition descriptions are part of the public Coding tool
+    contract. Preview may accept an incomplete CAS proposal so the model can
+    obtain the current digests; apply must carry the corresponding existence
+    and file-digest proof for every existing target.
+    """
     text_edit = {
         "type": "object",
         "properties": {
@@ -1267,9 +1283,27 @@ def _edit_transaction_parameters() -> dict[str, Any]:
                 "enum": ["create", "update", "delete", "rename"],
             },
             "path": {"type": "string", "maxLength": 4096},
-            "destination_path": {"type": "string", "maxLength": 4096},
-            "expected_exists": {"type": "boolean"},
-            "expected_digest": {"type": "string", "maxLength": 64},
+            "destination_path": {
+                "type": "string",
+                "maxLength": 4096,
+                "description": "Required only for rename; it must be a different workspace-relative path.",
+            },
+            "expected_exists": {
+                "type": "boolean",
+                "description": (
+                    "Apply precondition: use false for create, true for an "
+                    "existing update/delete/rename source. Preview may omit it."
+                ),
+            },
+            "expected_digest": {
+                "type": "string",
+                "maxLength": 64,
+                "description": (
+                    "Apply precondition for update/delete/rename: copy the "
+                    "target's before_digest from preview or content_sha256 "
+                    "from read_file; never invent this value."
+                ),
+            },
             "content": {
                 "type": "string",
                 "maxLength": 16 * 1024 * 1024,
@@ -1289,14 +1323,28 @@ def _edit_transaction_parameters() -> dict[str, Any]:
         "type": "object",
         "properties": {
             "transaction_id": {"type": "string", "maxLength": 128},
-            "base_generation": {"type": "integer", "minimum": 1},
+            "base_generation": {
+                "type": "integer",
+                "minimum": 1,
+                "description": (
+                    "Use the active workspace_generation from read_file or "
+                    "the preview base_generation; apply must reuse that value."
+                ),
+            },
             "operations": {
                 "type": "array",
                 "items": operation,
                 "minItems": 1,
                 "maxItems": 64,
             },
-            "expected_workspace_digest": {"type": "string", "maxLength": 64},
+            "expected_workspace_digest": {
+                "type": "string",
+                "maxLength": 64,
+                "description": (
+                    "Optional workspace CAS value; when supplied, use the "
+                    "preview before_workspace_digest for the same generation."
+                ),
+            },
             "intent": {"type": "string", "maxLength": 512},
         },
         "required": ["transaction_id", "base_generation", "operations"],
@@ -1374,13 +1422,28 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
     registry.register(
         ToolDefinition(
             name="read_file",
-            description="Read file content with pagination and line numbers.",
+            description=(
+                "Read a bounded file page with one-based line numbers. "
+                "offset and limit must be positive; the result includes "
+                "next_offset and has_more when another page is available. "
+                "In Coding mode it also includes the server-computed "
+                "content_sha256 and workspace_generation needed for "
+                "apply_edit_transaction."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
                     "path": {"type": "string"},
-                    "offset": {"type": "integer"},
-                    "limit": {"type": "integer"},
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "One-based first line to return (default: 1)",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Maximum number of lines to return (default: 500)",
+                    },
                 },
                 "required": ["path"],
             },
@@ -1475,7 +1538,9 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
             name="preview_edit_transaction",
             description=(
                 "Preview a bounded multi-file edit against the active workspace "
-                "generation and return a deterministic diff."
+                "generation and return a deterministic diff. Preview can omit "
+                "file CAS fields; use its base_generation and each operation's "
+                "before_digest when constructing the later apply request."
             ),
             parameters=_edit_transaction_parameters(),
             modes=["coding"],
@@ -1496,7 +1561,9 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
             name="apply_edit_transaction",
             description=(
                 "Apply a generation-bound multi-file edit with precondition "
-                "validation, atomic publish, verification, and rollback."
+                "validation, atomic publish, verification, and rollback. Reuse "
+                "the preview base_generation and include expected_exists plus "
+                "expected_digest for every existing target."
             ),
             parameters=_edit_transaction_parameters(),
             modes=["coding"],

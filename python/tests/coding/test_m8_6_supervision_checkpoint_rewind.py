@@ -7,6 +7,7 @@ import hashlib
 from pathlib import Path
 
 import pytest
+from khaos.coding.checkpoints.repository import CheckpointConflictError
 from khaos.coding.checkpoints.service import CheckpointService
 from khaos.coding.edit_transaction import (
     EditOperation,
@@ -506,6 +507,62 @@ def _model_result(
             after_digest=hashlib.sha256(after.encode()).hexdigest(),
         ),),
     )
+
+
+@pytest.mark.posix_host
+@pytest.mark.asyncio
+async def test_checkpoint_retry_same_capture_is_timestamp_independent(tmp_path: Path):
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    (worktree / "tracked.txt").write_text("before", encoding="utf-8")
+    workspace = TaskWorkspace(
+        id="workspace-checkpoint-retry", task_id="task-checkpoint-retry",
+        repository_root=tmp_path, worktree_path=worktree,
+        base_ref="main", base_sha="a" * 40, branch_name="task-checkpoint-retry",
+        state=WorkspaceState.READY,
+        principal_id="principal-a", project_id="project-a",
+    )
+    manager = _FakeWorkspaceManager(workspace)
+    db = await _database(tmp_path)
+    try:
+        supervision = TaskSupervisionService(db)
+        owner = {
+            "task_id": workspace.task_id,
+            "workspace_id": workspace.id,
+            "principal_id": workspace.principal_id,
+            "project_id": workspace.project_id,
+        }
+        await supervision.start_task(**owner, goal="checkpoint retry")
+        checkpoints = CheckpointService(
+            manager, _FakeEditService(manager), db.checkpoint_repository, supervision,
+        )
+
+        first = await checkpoints.create_checkpoint(
+            **owner, kind="PRE_EDIT", label="before coding edit",
+            expected_generation=workspace.generation, known_state=True,
+        )
+        retry = await checkpoints.create_checkpoint(
+            **owner, kind="PRE_EDIT", label="before coding edit",
+            expected_generation=workspace.generation, known_state=True,
+        )
+
+        assert retry.checkpoint_id == first.checkpoint_id
+        assert retry.checkpoint_digest == first.checkpoint_digest
+        assert len(await checkpoints.list_checkpoints(
+            workspace.task_id,
+            workspace_id=workspace.id,
+            principal_id=workspace.principal_id,
+            project_id=workspace.project_id,
+        )) == 1
+
+        with pytest.raises(CheckpointConflictError):
+            await checkpoints.create_checkpoint(
+                **owner, kind="PRE_EDIT", label="before coding edit",
+                expected_generation=workspace.generation, plan_revision=1,
+                known_state=True,
+            )
+    finally:
+        await db.close()
 
 
 # These fixture tests exercise SafeWorkspaceFS-backed M8.2 filesystem effects.

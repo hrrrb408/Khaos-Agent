@@ -129,6 +129,30 @@ async def test_dirty_main_worktree_is_rejected(tmp_path: Path):
 
 @pytest.mark.asyncio
 @pytest.mark.requires_trusted_git
+async def test_large_clean_main_worktree_status_stays_bounded(tmp_path: Path):
+    """A clean repository with a large index is still eligible for a worktree."""
+    repository = _repo(tmp_path / "repo")
+    for index in range(700):
+        (repository / f"tracked-{index:04d}.txt").write_text("tracked\n")
+    await asyncio.to_thread(
+        subprocess.run, ["git", "add", "."], cwd=repository, check=True
+    )
+    await asyncio.to_thread(
+        subprocess.run,
+        ["git", "commit", "-qm", "large index"],
+        cwd=repository,
+        check=True,
+    )
+
+    manager = WorkspaceManager(tmp_path / "worktrees")
+    workspace = await manager.create(repository, "task-large-index")
+    assert workspace.state is WorkspaceState.READY
+    await manager.transition(workspace.id, WorkspaceState.FAILED)
+    await manager.cleanup(workspace.id, force=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.requires_trusted_git
 async def test_git_pointer_redirection_is_rejected_before_host_git(tmp_path: Path):
     repository = _repo(tmp_path / "repo")
     manager = WorkspaceManager(tmp_path / "worktrees")

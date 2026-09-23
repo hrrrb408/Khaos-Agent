@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import replace
+import os
 import sqlite3
+from dataclasses import replace
+from pathlib import Path
 
 import pytest
-
+from khaos.db import Database
 from khaos.evaluation.coding import (
     AgentExecution,
     AgentInvokerCallable,
@@ -19,7 +21,7 @@ from khaos.evaluation.coding import (
     builtin_manifest_path,
     load_builtin_manifest,
 )
-from khaos.db import Database
+from khaos.routing.model_client import ProviderRequestObservation
 
 
 def _local_scenario():
@@ -70,6 +72,26 @@ async def _slow_agent(scenario, fixture, trace):
     raise AssertionError("timeout test agent should be cancelled")
 
 
+async def _slow_agent_with_provider_request(scenario, fixture, trace):
+    trace.record_provider_observations(
+        [
+            ProviderRequestObservation(
+                provider="configured-provider",
+                model="configured-model",
+                attempt=1,
+                max_attempts=3,
+                status_code=None,
+                started_at="2026-09-18T00:00:00+00:00",
+                latency_ms=10,
+                first_byte_latency_ms=None,
+                retryable=False,
+            )
+        ]
+    )
+    await asyncio.sleep(1)
+    raise AssertionError("provider-timeout test agent should be cancelled")
+
+
 async def _symlink_final_root_agent(scenario, fixture, trace):
     alias = fixture._private_root / "agent-alias"
     alias.symlink_to(fixture.agent_root, target_is_directory=True)
@@ -80,6 +102,47 @@ async def _symlink_final_root_agent(scenario, fixture, trace):
         runtime_id="fake-runtime",
         model="test-model",
         provider="test-provider",
+    )
+
+
+async def _canonical_final_root_agent(scenario, fixture, trace):
+    """Return the owned worktree through a symlinked parent spelling."""
+
+    return AgentExecution(
+        status="COMPLETED",
+        completion_status="completed",
+        final_root=fixture.agent_root.resolve(),
+        runtime_id="fake-runtime",
+        model="test-model",
+        provider="test-provider",
+    )
+
+
+async def _failed_agent_with_external_root(scenario, fixture, trace):
+    """Model/provider admission failure must not nominate an external root."""
+
+    return AgentExecution(
+        status="ERROR",
+        completion_status=None,
+        final_root=Path("/tmp/untrusted-evaluation-root"),
+        runtime_id="failed-runtime",
+        model="configured-model",
+        provider="configured-provider",
+        error="no available model for function: coding",
+    )
+
+
+async def _failed_agent_with_provider_read_timeout(scenario, fixture, trace):
+    """A redacted HTTP timeout remains a provider failure."""
+
+    return AgentExecution(
+        status="ERROR",
+        completion_status=None,
+        final_root=fixture.agent_root,
+        runtime_id="failed-runtime",
+        model="configured-model",
+        provider="configured-provider",
+        error="ReadTimeout",
     )
 
 
@@ -222,13 +285,80 @@ async def test_runner_records_timeout_and_cleans_private_fixture(tmp_path) -> No
         fixture_manager=FixtureManager(builtin_manifest_path(), private_root=tmp_path),
         oracle=CodingOracle(),
         agent_invoker=_slow_agent,
+        model="configured-model",
+        provider="configured-provider",
     )
 
     result = await runner.run(source.scenario_id)
 
     assert result.verdict.value == "TIMEOUT"
     assert result.failure_reason.value == "TIMEOUT"
+    assert result.agent.model == "configured-model"
+    assert result.agent.provider == "configured-provider"
+    assert result.identity.model == "configured-model"
+    assert result.identity.provider == "configured-provider"
     assert not tuple(tmp_path.glob(".khaos-m8-*"))
+
+
+@pytest.mark.asyncio
+async def test_runner_attributes_inflight_provider_timeout_as_provider_failure(tmp_path) -> None:
+    """An unanswered provider request must not be labeled model reasoning."""
+
+    source = _local_scenario()
+    scenario = replace(
+        source,
+        limits=replace(source.limits, timeout_seconds=0.01),
+        digest="",
+    )
+    manifest = load_builtin_manifest()
+    runner = CodingEvaluationRunner(
+        manifest=replace(
+            manifest,
+            scenarios=tuple(
+                scenario if item.scenario_id == source.scenario_id else item
+                for item in manifest.scenarios
+            ),
+            digest="",
+        ),
+        fixture_manager=FixtureManager(builtin_manifest_path(), private_root=tmp_path),
+        oracle=CodingOracle(),
+        agent_invoker=_slow_agent_with_provider_request,
+    )
+
+    result = await runner.run(source.scenario_id)
+
+    assert result.verdict.value == "TIMEOUT"
+    assert result.failure_reason.value == "PROVIDER_FAILURE"
+    assert result.metrics.provider_requests == 1
+    assert result.metrics.provider_usage_status == "PROVIDER_NOT_REPORTED"
+    assert not tuple(tmp_path.glob(".khaos-m8-*"))
+
+
+@pytest.mark.asyncio
+async def test_runner_timeout_override_preserves_scenario_identity(tmp_path) -> None:
+    source = _local_scenario()
+    manifest = load_builtin_manifest()
+    manifest = replace(
+        manifest,
+        scenarios=tuple(
+            source if item.scenario_id == source.scenario_id else item
+            for item in manifest.scenarios
+        ),
+        digest="",
+    )
+    runner = CodingEvaluationRunner(
+        manifest=manifest,
+        fixture_manager=FixtureManager(builtin_manifest_path(), private_root=tmp_path),
+        oracle=CodingOracle(),
+        agent_invoker=_slow_agent,
+        task_timeout_seconds=0.01,
+    )
+
+    result = await runner.run(source.scenario_id)
+
+    assert result.verdict.value == "TIMEOUT"
+    assert result.identity.scenario_digest == source.digest
+    assert result.identity.scenario_digest == manifest.get(source.scenario_id).digest
 
 
 @pytest.mark.asyncio
@@ -292,4 +422,92 @@ async def test_runner_rejects_symlink_final_workspace(tmp_path) -> None:
 
     assert result.verdict.value == "INVALID_FIXTURE"
     assert result.failure_reason.value == "INVALID_FIXTURE"
+    assert not tuple(tmp_path.glob(".khaos-m8-*"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "posix", reason="covers POSIX canonical / symlink paths")
+async def test_runner_accepts_canonical_owned_workspace_under_symlinked_parent(tmp_path) -> None:
+    source = _local_scenario()
+    manifest = load_builtin_manifest()
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    alias_parent = tmp_path / "alias-parent"
+    alias_parent.symlink_to(real_parent, target_is_directory=True)
+    manager = FixtureManager(
+        builtin_manifest_path(),
+        private_root=alias_parent / "runs",
+    )
+    runner = CodingEvaluationRunner(
+        manifest=replace(
+            manifest,
+            scenarios=tuple(
+                source if item.scenario_id == source.scenario_id else item
+                for item in manifest.scenarios
+            ),
+            digest="",
+        ),
+        fixture_manager=manager,
+        oracle=CodingOracle(),
+        agent_invoker=_canonical_final_root_agent,
+    )
+
+    result = await runner.run(source.scenario_id)
+
+    assert result.verdict.value != "INVALID_FIXTURE"
+    assert result.agent.error is None
+    assert result.oracle is not None
+    assert not tuple(real_parent.glob("runs/.khaos-m8-*"))
+
+
+@pytest.mark.asyncio
+async def test_runner_preserves_agent_error_when_failed_adapter_reports_external_root(tmp_path) -> None:
+    source = _local_scenario()
+    manifest = load_builtin_manifest()
+    runner = CodingEvaluationRunner(
+        manifest=replace(
+            manifest,
+            scenarios=tuple(
+                source if item.scenario_id == source.scenario_id else item
+                for item in manifest.scenarios
+            ),
+            digest="",
+        ),
+        fixture_manager=FixtureManager(builtin_manifest_path(), private_root=tmp_path),
+        oracle=CodingOracle(),
+        agent_invoker=_failed_agent_with_external_root,
+    )
+
+    result = await runner.run(source.scenario_id)
+
+    assert result.verdict.value == "AGENT_ERROR"
+    assert result.failure_reason.value == "PROVIDER_FAILURE"
+    assert result.agent.error == "no available model for function: coding"
+    assert not tuple(tmp_path.glob(".khaos-m8-*"))
+
+
+@pytest.mark.asyncio
+async def test_runner_classifies_redacted_provider_read_timeout(tmp_path) -> None:
+    """Provider transport timeouts must not be reported as coding failures."""
+
+    source = _local_scenario()
+    manifest = load_builtin_manifest()
+    runner = CodingEvaluationRunner(
+        manifest=replace(
+            manifest,
+            scenarios=tuple(
+                source if item.scenario_id == source.scenario_id else item
+                for item in manifest.scenarios
+            ),
+            digest="",
+        ),
+        fixture_manager=FixtureManager(builtin_manifest_path(), private_root=tmp_path),
+        oracle=CodingOracle(),
+        agent_invoker=_failed_agent_with_provider_read_timeout,
+    )
+
+    result = await runner.run(source.scenario_id)
+
+    assert result.verdict.value == "AGENT_ERROR"
+    assert result.failure_reason.value == "PROVIDER_FAILURE"
     assert not tuple(tmp_path.glob(".khaos-m8-*"))

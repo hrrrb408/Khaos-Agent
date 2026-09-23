@@ -25,6 +25,7 @@ from khaos.routing.providers.base import (
     ProviderError,
     register_provider_type,
 )
+from khaos.security.credential_broker import CredentialBroker, CredentialBrokerError
 
 
 class AnthropicProvider(BaseProvider):
@@ -58,8 +59,27 @@ class AnthropicProvider(BaseProvider):
             "anthropic-version": "2023-06-01",
             "accept": "text/event-stream",
         }
-        if self.config.api_key:
-            headers["x-api-key"] = self.config.api_key
+        if self.config.credential_ref is not None:
+            if self.credential_broker is None:
+                raise ProviderError("provider credential broker unavailable")
+            try:
+                handle = self.credential_broker.issue_provider_handle(
+                    self.config.credential_ref,
+                    provider=self.config.name,
+                    binding={"provider": self.config.name, "operation": "provider.request"},
+                    operation="provider.request",
+                )
+                self.credential_broker.authorize_provider_headers(
+                    headers,
+                    handle,
+                    provider=self.config.name,
+                    binding={"provider": self.config.name, "operation": "provider.request"},
+                    operation="provider.request",
+                    header_name="x-api-key",
+                    scheme="",
+                )
+            except CredentialBrokerError as exc:
+                raise ProviderError("provider credential unavailable") from exc
         return headers
 
     def build_payload(
@@ -154,9 +174,11 @@ class AnthropicProvider(BaseProvider):
     ) -> AsyncIterator[Message]:
         async with client.stream("POST", url, headers=headers, json=payload) as response:
             if response.status_code != 200:
-                body = (await response.aread()).decode("utf-8", errors="replace")
+                # Consume and discard the provider body.  Error payloads are
+                # untrusted and may echo an Authorization header or token.
+                await response.aread()
                 raise ProviderError(
-                    f"Anthropic HTTP {response.status_code}: {body[:300]}"
+                    f"Anthropic request returned HTTP {response.status_code}"
                 )
             parser = _AnthropicStreamParser()
             async for line in response.aiter_lines():

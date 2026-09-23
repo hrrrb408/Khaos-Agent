@@ -6,6 +6,7 @@ import uuid
 from collections.abc import Mapping
 from typing import Any
 
+from khaos.security.secret_redaction import SecretRedactor
 from khaos.supervision.contracts import (
     ControlCommandResult,
     CurrentActivity,
@@ -53,8 +54,17 @@ class TaskSupervisionService:
         *,
         repository: TaskSupervisionRepository | None = None,
         audit_logger: Any | None = None,
+        secret_redactor: SecretRedactor | None = None,
     ) -> None:
-        self.repository = repository or TaskSupervisionRepository(database)
+        if repository is None:
+            if database is None:
+                raise ValueError("database is required when repository is absent")
+            repository = TaskSupervisionRepository(database)
+        self.repository = repository
+        self._secret_redactor = secret_redactor
+        bind_redactor = getattr(self.repository, "bind_secret_redactor", None)
+        if callable(bind_redactor):
+            bind_redactor(secret_redactor)
         self.control = TaskControlService(
             repository=self.repository, audit_logger=audit_logger
         )
@@ -74,6 +84,12 @@ class TaskSupervisionService:
         severity: SupervisionSeverity | str = SupervisionSeverity.INFO,
         event_id: str | None = None,
     ) -> SupervisionEvent:
+        safe_payload: Mapping[str, object] = payload or {}
+        if self._secret_redactor is not None:
+            candidate = self._secret_redactor.redact_fail_closed(safe_payload)
+            safe_payload = (
+                candidate if isinstance(candidate, Mapping) else {"redacted": True}
+            )
         event = SupervisionEvent(
             event_id=event_id or uuid.uuid4().hex,
             task_id=task_id,
@@ -83,7 +99,7 @@ class TaskSupervisionService:
             plan_revision=plan_revision,
             actor=actor,
             severity=severity,
-            payload=dict(payload or {}),
+            payload=dict(safe_payload),
             principal_id=principal_id,
             project_id=project_id,
         )

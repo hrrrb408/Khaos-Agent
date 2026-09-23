@@ -5,12 +5,13 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
-import time
-from collections.abc import Awaitable, Callable, Sequence
+import math
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Protocol, cast
 
 from khaos.evaluation.coding.contracts import (
+    REVIEW_CATEGORY_CONTRACT_V3,
     CodingContractError,
     CodingFailureReason,
     CodingRunIdentity,
@@ -20,19 +21,28 @@ from khaos.evaluation.coding.contracts import (
     DiffOracleSpec,
     digest_payload,
 )
-from khaos.evaluation.coding.fixtures import FixtureError, FixtureManager, MaterializedFixture
+from khaos.evaluation.coding.fixtures import (
+    FixtureError,
+    FixtureManager,
+    MaterializedFixture,
+)
 from khaos.evaluation.coding.metrics import CodingMetrics, CodingTraceCollector
 from khaos.evaluation.coding.oracle import (
     CodingOracle,
     DiffSummary,
-    OracleEvaluation,
     OracleCheckResult,
     OracleError,
+    OracleEvaluation,
     OracleKind,
     snapshot_tree,
     summarize_diff,
 )
-from khaos.evaluation.coding.results import AgentExecution, CodingEvaluationRun, new_run_id, utc_timestamp
+from khaos.evaluation.coding.results import (
+    AgentExecution,
+    CodingEvaluationRun,
+    new_run_id,
+    utc_timestamp,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +90,10 @@ class CodingEvaluationRunner:
         project_id: str = "coding-evaluation",
         khaos_source_sha: str = "unknown",
         config_digest: str | None = None,
+        model: str = "unknown",
+        provider: str = "unknown",
+        task_timeout_seconds: float | None = None,
+        provider_observations: Sequence[object] | None = None,
     ) -> None:
         self.manifest = manifest
         self.fixture_manager = fixture_manager
@@ -95,6 +109,20 @@ class CodingEvaluationRunner:
         self.project_id = project_id
         self.khaos_source_sha = khaos_source_sha or "unknown"
         self.config_digest = config_digest or digest_payload({"config": "unknown"})
+        self.model = model or "unknown"
+        self.provider = provider or "unknown"
+        self.provider_observations = provider_observations
+        if task_timeout_seconds is not None:
+            if (
+                isinstance(task_timeout_seconds, bool)
+                or not isinstance(task_timeout_seconds, (int, float))
+                or not math.isfinite(float(task_timeout_seconds))
+                or not 0 < float(task_timeout_seconds) <= 3600
+            ):
+                raise ValueError("task_timeout_seconds is outside (0, 3600]")
+            self.task_timeout_seconds = float(task_timeout_seconds)
+        else:
+            self.task_timeout_seconds = None
         if not principal_id or not project_id:
             raise ValueError("coding evaluation owner identity is required")
 
@@ -105,11 +133,18 @@ class CodingEvaluationRunner:
         return await self.run_scenario(scenario)
 
     async def run_scenario(self, scenario: CodingScenario) -> CodingEvaluationRun:
+        run_id = new_run_id()
         started_at = utc_timestamp()
         trace = CodingTraceCollector(
             max_events=scenario.limits.max_tool_events,
             max_model_turns=scenario.limits.max_model_turns,
             max_tool_calls=scenario.limits.max_tool_calls,
+            run_id=run_id,
+        )
+        provider_observation_start = (
+            len(self.provider_observations)
+            if self.provider_observations is not None
+            else None
         )
         fixture: MaterializedFixture | None = None
         agent: AgentExecution | None = None
@@ -132,9 +167,14 @@ class CodingEvaluationRunner:
             )
             trace.record("fixture", scenario.scenario_id, success=True)
             try:
-                async with asyncio.timeout(scenario.limits.timeout_seconds):
+                timeout_seconds = (
+                    self.task_timeout_seconds
+                    if self.task_timeout_seconds is not None
+                    else scenario.limits.timeout_seconds
+                )
+                async with asyncio.timeout(timeout_seconds):
                     agent = await self.agent_invoker.run(scenario, fixture, trace)
-            except TimeoutError as exc:
+            except TimeoutError:
                 error = "agent runtime exceeded scenario timeout"
                 verdict = CodingVerdict.TIMEOUT
                 agent = AgentExecution(
@@ -142,14 +182,14 @@ class CodingEvaluationRunner:
                     completion_status=None,
                     final_root=fixture.agent_root,
                     runtime_id="unknown",
-                    model="unknown",
-                    provider="unknown",
+                    model=self.model,
+                    provider=self.provider,
                     error=error,
                 )
                 trace.record("agent", "timeout", success=False)
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - runtime boundary becomes typed evidence
                 error = _safe_error(exc)
                 verdict = CodingVerdict.AGENT_ERROR
                 agent = AgentExecution(
@@ -157,13 +197,23 @@ class CodingEvaluationRunner:
                     completion_status=None,
                     final_root=fixture.agent_root,
                     runtime_id="unknown",
-                    model="unknown",
-                    provider="unknown",
+                    model=self.model,
+                    provider=self.provider,
                     error=error,
                 )
                 trace.record("agent", "error", success=False)
             assert agent is not None
-            final_root = _validated_final_root(agent.final_root, fixture)
+            # A failed runtime must not be allowed to nominate an arbitrary
+            # path for post-failure inspection.  Some adapters retain a
+            # partially constructed workspace even when model/provider
+            # admission fails; that path is not successful-agent evidence.
+            # Keep the failure typed as an agent/runtime result and inspect
+            # only the fixture-owned baseline tree.
+            final_root = (
+                _validated_final_root(agent.final_root, fixture)
+                if agent.completed
+                else fixture.agent_root
+            )
             after = snapshot_tree(
                 final_root,
                 max_files=scenario.limits.max_changed_files + scenario.limits.max_source_files,
@@ -278,7 +328,7 @@ class CodingEvaluationRunner:
                 error=error,
             )
         identity = CodingRunIdentity(
-            run_id=new_run_id(),
+            run_id=run_id,
             scenario_id=scenario.scenario_id,
             scenario_version=scenario.version,
             scenario_digest=scenario.digest,
@@ -306,6 +356,23 @@ class CodingEvaluationRunner:
                 CodingVerdict.INVALID_FIXTURE,
             }:
                 verdict = CodingVerdict.ORACLE_ERROR
+        if oracle_evaluation is not None:
+            review_check = next(
+                (
+                    check
+                    for check in oracle_evaluation.checks
+                    if check.kind is OracleKind.REVIEW_FINDING
+                ),
+                None,
+            )
+            if review_check is not None:
+                review_evidence = dict(review_check.evidence)
+                review_evidence["passed"] = review_check.passed
+                trace.record_semantic_review(review_evidence)
+        if provider_observation_start is not None and self.provider_observations is not None:
+            trace.record_provider_observations(
+                self.provider_observations[provider_observation_start:]
+            )
         metrics = trace.finish(
             verdict=verdict,
             agent_status=agent.status,
@@ -335,6 +402,8 @@ class CodingEvaluationRunner:
             agent=agent,
             oracle=oracle_evaluation,
             diff=diff,
+            trace=trace,
+            metrics=metrics,
         )
         run = CodingEvaluationRun.new(
             identity=identity,
@@ -411,7 +480,7 @@ class CodingEvaluationRunner:
             error=error[:1024],
         )
         identity = CodingRunIdentity(
-            run_id=new_run_id(),
+            run_id=trace.run_id,
             scenario_id=scenario.scenario_id,
             scenario_version=scenario.version,
             scenario_digest=scenario.digest,
@@ -463,21 +532,28 @@ class CodingEvaluationRunner:
 
 def _validated_final_root(value: object, fixture: MaterializedFixture) -> Path:
     if value is None:
-        root = fixture.agent_root
+        lexical_root = fixture.agent_root
     elif isinstance(value, (str, Path)):
-        root = Path(value)
+        lexical_root = Path(value)
     else:
         raise FixtureError("agent final workspace path is invalid")
-    root = root.expanduser().absolute()
-    if root.is_symlink():
+    lexical_root = lexical_root.expanduser().absolute()
+    if lexical_root.is_symlink():
         raise FixtureError("agent final workspace must not be a symlink")
-    private = fixture._private_root.expanduser().absolute()
-    oracle_root = (private / "oracle").resolve()
-    if root.resolve() == oracle_root or oracle_root in root.resolve().parents:
+    try:
+        # ``/tmp`` is a symlink to ``/private/tmp`` on macOS.  Compare the
+        # Agent worktree and fixture authority root in the same canonical
+        # namespace, while retaining the lexical symlink rejection above.
+        root = lexical_root.resolve(strict=True)
+        private = fixture._private_root.expanduser().resolve(strict=True)
+    except OSError as exc:
+        raise FixtureError("agent final workspace cannot be resolved") from exc
+    oracle_root = private / "oracle"
+    if root == oracle_root or oracle_root in root.parents:
         raise FixtureError("oracle-owned workspace cannot be used as agent output")
     if root != private and private not in root.parents:
         raise FixtureError("agent final workspace is outside the private fixture root")
-    if root.is_symlink() or not root.is_dir():
+    if not root.is_dir():
         raise FixtureError("agent final workspace is not a regular directory")
     return root
 
@@ -554,30 +630,58 @@ def _classify_failure(
     agent: AgentExecution,
     oracle: OracleEvaluation | None,
     diff: DiffSummary,
+    trace: CodingTraceCollector | None = None,
+    metrics: CodingMetrics | None = None,
 ) -> CodingFailureReason | None:
     """Map a terminal observation to a stable, non-authoritative reason."""
 
     if verdict is CodingVerdict.PASS:
         return None
     direct = {
-        CodingVerdict.TIMEOUT: CodingFailureReason.TIMEOUT,
-        CodingVerdict.AGENT_ERROR: CodingFailureReason.AGENT_ERROR,
         CodingVerdict.ORACLE_ERROR: CodingFailureReason.ORACLE_ERROR,
         CodingVerdict.INVALID_FIXTURE: CodingFailureReason.INVALID_FIXTURE,
         CodingVerdict.INSUFFICIENT_EVIDENCE: CodingFailureReason.INSUFFICIENT_EVIDENCE,
     }
+    if verdict is CodingVerdict.TIMEOUT:
+        # An outer task deadline cancels the AgentLoop while ModelClient is
+        # still waiting for the provider response.  That is a provider
+        # failure, not a model reasoning limit.  Require the bounded
+        # observation to show that no first response byte arrived and no
+        # typed provider error was already projected; otherwise preserve the
+        # ordinary task-timeout attribution.
+        if _timed_out_during_provider_request(metrics):
+            return CodingFailureReason.PROVIDER_FAILURE
+        return CodingFailureReason.TIMEOUT
+    if verdict is CodingVerdict.AGENT_ERROR:
+        if agent.status == "TOOL_BUDGET_EXHAUSTED" or (
+            agent.error is not None
+            and "TOOL_BUDGET_EXHAUSTED" in agent.error
+        ):
+            return CodingFailureReason.TOOL_BUDGET_EXHAUSTED
+        return (
+            CodingFailureReason.PROVIDER_FAILURE
+            if _looks_like_provider_failure(agent.error)
+            else CodingFailureReason.AGENT_ERROR
+        )
     if verdict in direct:
         return direct[verdict]
     if oracle is None:
         return CodingFailureReason.EDIT_FAILURE
     failed_kinds = {check.kind.value for check in oracle.checks if not check.passed}
     if "REVIEW_FINDING" in failed_kinds:
+        if (
+            scenario.review_category_contract == REVIEW_CATEGORY_CONTRACT_V3
+            and _response_contract_failed(trace)
+        ):
+            return CodingFailureReason.OUTPUT_CONTRACT_FAILURE
         review_check = next(
             check for check in oracle.checks if check.kind.value == "REVIEW_FINDING"
         )
         unmatched_count = review_check.evidence.get("unmatched_count", 0)
         false_positive_count = review_check.evidence.get("false_positive_count", 0)
         duplicate_count = review_check.evidence.get("duplicate_count", 0)
+        if scenario.review_category_contract == REVIEW_CATEGORY_CONTRACT_V3:
+            return CodingFailureReason.SEMANTIC_REVIEW_FAILURE
         if isinstance(unmatched_count, int) and unmatched_count > 0:
             return CodingFailureReason.REVIEW_MISSED_FINDING
         if (
@@ -623,6 +727,79 @@ def _classify_failure(
     if "COMMAND" in failed_kinds:
         return CodingFailureReason.TEST_FAILURE
     return CodingFailureReason.EDIT_FAILURE
+
+
+def _timed_out_during_provider_request(metrics: CodingMetrics | None) -> bool:
+    """Detect a task deadline that interrupted an unresponsive provider call."""
+
+    if metrics is None or not isinstance(metrics.observability, Mapping):
+        return False
+    provider = metrics.observability.get("provider")
+    if not isinstance(provider, Mapping):
+        return False
+    requests = provider.get("requests")
+    if not isinstance(requests, list) or not requests:
+        return False
+    latest = requests[-1]
+    if not isinstance(latest, Mapping):
+        return False
+    return (
+        latest.get("first_byte_latency_ms") is None
+        and latest.get("provider_error_type") is None
+    )
+
+
+def _response_contract_failed(trace: CodingTraceCollector | None) -> bool:
+    """Return whether the final response failed before semantic evaluation."""
+
+    if trace is None:
+        return False
+    for event in reversed(trace.events):
+        if event.event_type != "response_parse_evaluated":
+            continue
+        metadata = event.safe_event_metadata
+        if not isinstance(metadata, Mapping):
+            return False
+        return any(
+            metadata.get(name) == "FAIL"
+            for name in (
+                "json_decode_status",
+                "schema_validation_status",
+                "typed_parse_status",
+            )
+        )
+    return False
+
+
+def _looks_like_provider_failure(error: str | None) -> bool:
+    """Classify provider/model admission failures without retaining raw text."""
+
+    if not error:
+        return False
+    normalized = error.casefold()
+    markers = (
+        "no available model",
+        "model unavailable",
+        "provider",
+        "rate limit",
+        "authentication",
+        "api key",
+        "credential",
+        "http 401",
+        "http 403",
+        "http 429",
+        # ``ErrorHandler`` intentionally emits only a redacted exception
+        # class when an HTTP timeout has no message.  Preserve the provider
+        # failure boundary instead of turning that typed transport outcome
+        # into a coding/tool failure.
+        "readtimeout",
+        "connecttimeout",
+        "writetimeout",
+        "pooltimeout",
+        "model timeout",
+        "model_timeout",
+    )
+    return any(marker in normalized for marker in markers)
 
 
 def _flatten_oracles(spec):

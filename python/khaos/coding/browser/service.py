@@ -1693,7 +1693,24 @@ class BrowserCodingService:
     ) -> ExecutionRequest:
         environment = {key: value for key, value in profile.environment}
         environment["PORT"] = str(port)
-        allowed = frozenset({"PATH", "LANG", "LC_ALL", "TMPDIR", "PORT", *environment})
+        # A trusted Python app must not materialize bytecode in the
+        # model-controlled workspace.  Such files would look like an
+        # untracked mutation to the next pre-edit checkpoint and could block
+        # an otherwise valid follow-up edit.  Keep this fixed by the
+        # composition root rather than allowing a profile or model input to
+        # choose the value.
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        allowed = frozenset(
+            {
+                "PATH",
+                "LANG",
+                "LC_ALL",
+                "TMPDIR",
+                "PORT",
+                "PYTHONDONTWRITEBYTECODE",
+                *environment,
+            }
+        )
         permission = PermissionProfile(
             filesystem=FileSystemAccess.READ_ONLY,
             network=NetworkPolicy.NONE,

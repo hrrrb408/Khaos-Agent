@@ -24,12 +24,18 @@ pytestmark = pytest.mark.skipif(not _TEXTUAL_AVAILABLE, reason="textual not inst
 def test_app_constructs_with_runtime(tmp_path):
     from khaos.tui.app import KhaosApp
 
-    app = KhaosApp(db_path=str(tmp_path / "khaos.db"), project_root=tmp_path)
+    config_path = tmp_path / "provider-config.yaml"
+    app = KhaosApp(
+        db_path=str(tmp_path / "khaos.db"),
+        project_root=tmp_path,
+        config_path=config_path,
+    )
 
     # Construction wires the runtime handles without needing a live DB.
     assert app.session_id  # a uuid was generated
     assert app.router is None
     assert app.skill_manager is not None
+    assert app.config_path == config_path
     # The default mode reflects the override-free state.
     assert app._mode_label() == "office"
 
@@ -54,6 +60,19 @@ def test_app_help_text_advertises_all_commands():
 
     for cmd in ["/mode", "/skills", "/memory", "/tools", "/model", "/session", "/help", "/clear", "/quit"]:
         assert cmd in HELP_TEXT
+
+
+def test_setup_provider_accepts_zhipu_aliases():
+    from khaos.tui.app import KhaosApp
+
+    assert KhaosApp._parse_setup_provider("4") == "zhipu"
+    assert KhaosApp._parse_setup_provider("zhipu") == "zhipu"
+    assert KhaosApp._parse_setup_provider("glm") == "zhipu"
+    assert KhaosApp._parse_setup_provider("智谱") == "zhipu"
+    assert KhaosApp._parse_setup_provider("5") == "zhipu-coding"
+    assert KhaosApp._parse_setup_provider("coding-plan") == "zhipu-coding"
+    assert KhaosApp._parse_setup_provider("6") == "siliconflow"
+    assert KhaosApp._parse_setup_provider("硅基流动") == "siliconflow"
 
 
 def test_permission_dialog_friendly_target_prefers_arguments():

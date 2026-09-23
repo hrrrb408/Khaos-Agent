@@ -1,5 +1,4 @@
 import asyncio
-import hashlib
 import inspect
 import json
 import os
@@ -96,6 +95,8 @@ def _read_context(tmp_path, *, task_id="task-a", state=WorkspaceState.RUNNING, o
         "execution_service": service,
         "access_mode": "vcs.remote-write",
         "network_policy": "unrestricted-with-approval",
+        "principal_id": "test-principal",
+        "requester": "test-session",
     }
 
 

@@ -8,7 +8,7 @@ import logging
 import os
 import uuid
 from collections.abc import Awaitable, Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from dataclasses import fields as dataclass_fields
 from pathlib import Path
 from typing import Any, cast
@@ -101,14 +101,73 @@ from khaos.security.effective_policy import EffectiveSecurityPolicy
 from khaos.security.middleware import SecurityMiddleware
 from khaos.security.network_broker import NetworkBrokerFactory
 from khaos.security.network_guard import NetworkGuard
+from khaos.security.principals import (
+    principal_for_transport,
+    transport_root_delegation_digest,
+)
 from khaos.security.resource_scope import ResourceScopeError, TypedResourcePartialOrder
 from khaos.security.sandbox import Sandbox
 from khaos.skills import SkillGenerator, SkillManager
 from khaos.supervision.service import TaskSupervisionService
 from khaos.tools import create_runtime_registry
+from khaos.tools.budget import ToolBudget
 from khaos.tools.scheduler import ToolScheduler
 
 logger = logging.getLogger(__name__)
+
+
+def _complete_production_principal_binding(
+    *,
+    principal_id: str,
+    principal_kind: str,
+    parent_principal_id: str,
+    delegation_digest: str,
+    source_transport: str,
+    session_id: str,
+    project_id: str,
+    runtime_id: str,
+    policy_digest: str,
+) -> tuple[str, str, str]:
+    """Complete a canonical transport-root identity binding.
+
+    Local and production entry points commonly know the principal, transport,
+    session, and runtime but do not manually assemble the parent and
+    commitment fields. Derivation is allowed only from that complete trusted
+    context. Partial caller-supplied tuples remain fail-closed instead of
+    being padded with a guessed session or digest.
+    """
+    if source_transport == "unknown" and not any(
+        (principal_kind, parent_principal_id, session_id, delegation_digest)
+    ):
+        # Explicit local/test adapters may intentionally use the legacy
+        # untyped envelope. Do not manufacture a partial binding by deriving
+        # only ``principal_kind`` from an unknown transport.
+        return "", "", ""
+    resolved_kind = principal_kind or principal_for_transport(
+        principal_id, source_transport
+    ).kind.value
+    resolved_parent = parent_principal_id
+    resolved_digest = delegation_digest
+    if session_id and source_transport != "unknown":
+        if not resolved_parent:
+            resolved_parent = f"{resolved_kind}:{principal_id}"
+        if not resolved_digest:
+            resolved_digest = transport_root_delegation_digest(
+                principal_id=principal_id,
+                principal_kind=resolved_kind,
+                parent_principal_id=resolved_parent,
+                project_id=project_id,
+                session_id=session_id,
+                runtime_id=runtime_id,
+                source_transport=source_transport,
+                policy_digest=policy_digest,
+            )
+    elif any((resolved_parent, session_id, resolved_digest)):
+        raise ValueError(
+            "production runtime typed principal binding requires a known "
+            "transport and non-empty session_id"
+        )
+    return resolved_kind, resolved_parent, resolved_digest
 
 
 class RuntimeCleanupAuthority:
@@ -200,6 +259,10 @@ class RuntimeConfig:
     memory_host: MemoryHost | None = None
     skill_manager: SkillManager | None = None
     tool_scheduler: ToolScheduler | None = None
+    # Evaluation/development composition may provide the canonical hard tool
+    # budget.  Production callers keep the scheduler-owned default unless the
+    # production authority supplies an equivalent immutable budget.
+    tool_budget: ToolBudget | None = None
     workspace_manager: WorkspaceManager | None = None
     delegated_workspace_manager: WorkspaceManager | None = None
     delegated_execution_context: Any = None
@@ -1299,6 +1362,7 @@ async def build_memory_host(
     commit_sha: str | None = None,
     audit_logger: AuditLogger | None,
     effective_policy: EffectiveSecurityPolicy,
+    credential_broker: CredentialBroker | None = None,
 ) -> MemoryHost:
     """Build the canonical application-scoped Memory V2 composition.
 
@@ -1329,6 +1393,7 @@ async def build_memory_host(
         db,
         network_allowed=bool(effective_policy.network_enabled),
         config=memory_config,
+        credential_broker=credential_broker,
     )
     target_provider = await memory_registry.activate(profile.provider)
     capabilities = target_provider.provider.capabilities()
@@ -1356,6 +1421,11 @@ async def build_memory_host(
             required=bool(effective_policy.audit_enabled),
         ),
         audit_required=bool(effective_policy.audit_enabled),
+        secret_redactor=(
+            credential_broker.secret_redactor
+            if credential_broker is not None
+            else None
+        ),
     )
     provider_manager = MemoryProviderManager(
         memory_registry,
@@ -1425,7 +1495,6 @@ async def build_runtime(
     # fixtures; it is not a production identity proof.
     from khaos.security.principals import (
         PrincipalDelegationError,
-        principal_for_transport,
         principal_from_kind,
     )
     try:
@@ -1488,13 +1557,40 @@ async def build_runtime(
     # check is the sole authority.  CLI / tests that don't set
     # ``cfg.project_id`` fall back to recompute.
     project_id = cfg.project_id or compute_project_id(root)
+    production_mode = runtime_profile.is_production
+    # Non-production adapters still pass their already-validated kind through
+    # the legacy composition surface.  Keep this local initialized for every
+    # profile because the same value is carried into the composed workspace
+    # and AgentLoop below; production replaces it with the canonical binding.
+    authority_principal_kind = cfg.principal_kind
+    if production_mode or runtime_profile.is_local:
+        (
+            authority_principal_kind,
+            authority_parent_principal_id,
+            authority_delegation_digest,
+        ) = _complete_production_principal_binding(
+            principal_id=cfg.principal_id,
+            principal_kind=cfg.principal_kind,
+            parent_principal_id=cfg.parent_principal_id,
+            delegation_digest=cfg.delegation_digest,
+            source_transport=cfg.source_transport,
+            session_id=cfg.session_id,
+            project_id=project_id,
+            runtime_id=cfg.runtime_id,
+            policy_digest=effective_policy.digest,
+        )
+        cfg = replace(
+            cfg,
+            principal_kind=authority_principal_kind,
+            parent_principal_id=authority_parent_principal_id,
+            delegation_digest=authority_delegation_digest,
+        )
     # P1-1 (production Runtime injection): mint the runtime's authority seal
     # — the unforgeable binding of (principal, project, policy_digest,
     # runtime_id) that every production-built security component must carry.
     # In production mode the factory refuses to install an injected
     # security-critical component below, closing the "second authority"
     # backdoor.  Dev/test mode (KHAOS_DEV_MODE=1) still injects mocks freely.
-    production_mode = runtime_profile.is_production
     authority_seal = RuntimeAuthoritySeal.mint(
         principal_id=cfg.principal_id,
         project_id=project_id,
@@ -1510,16 +1606,11 @@ async def build_runtime(
     # ``AuthorityBroker.default`` and create a second trust path.
     authority_broker: AuthorityBroker | None = None
     owns_authority_broker = False
-    authority_principal_kind = cfg.principal_kind
     if production_mode:
         if typed_resource_order is None:
             raise PermissionError(
                 "production runtime requires an independently loaded typed resource catalog"
             )
-        if not authority_principal_kind:
-            authority_principal_kind = principal_for_transport(
-                cfg.principal_id, cfg.source_transport
-            ).kind.value
         inherited_authority = (
             getattr(cfg.delegated_workspace_manager, "authority_broker", None)
             if cfg.delegated_execution_context is not None
@@ -1607,6 +1698,18 @@ async def build_runtime(
             shared_broker = getattr(cfg.tool_scheduler, "credential_broker", None)
             if isinstance(shared_broker, CredentialBroker):
                 credential_broker = shared_broker
+        if credential_broker is None:
+            # Router construction may have created the platform-backed broker
+            # for secretless provider configuration.  Reuse that canonical
+            # authority instead of creating a parallel provider credential
+            # resolver for the same runtime.
+            router_broker = getattr(
+                getattr(router, "provider_manager", None),
+                "credential_broker",
+                None,
+            )
+            if isinstance(router_broker, CredentialBroker):
+                credential_broker = router_broker
         owns_credential_broker = credential_broker is None
         if credential_broker is None:
             credential_broker = CredentialBroker(
@@ -1679,6 +1782,7 @@ async def build_runtime(
                 runtime_id=cfg.runtime_id,
                 policy_digest=effective_policy.digest,
                 project_id=project_id,
+                secret_redactor=credential_broker.secret_redactor,
             )
             await audit_logger.verify_anchor()
         permission_engine = PermissionEngine(
@@ -1690,6 +1794,7 @@ async def build_runtime(
             runtime_id=cfg.runtime_id,
             exec_tool_names=exec_tool_names,
             audit_logger=audit_logger,
+            secret_redactor=credential_broker.secret_redactor,
         )
         await permission_engine.load_rules()
         memory_store = MemoryStore(
@@ -1783,6 +1888,7 @@ async def build_runtime(
                 commit_sha=cfg.commit_sha,
                 audit_logger=audit_logger,
                 effective_policy=effective_policy,
+                credential_broker=credential_broker,
             )
             owns_memory_host = True
             profile = memory_host.profile
@@ -2040,6 +2146,16 @@ async def build_runtime(
                     else None
                 ),
                 blocked_domains=list(effective_policy.network_blocked_domains),
+                # Coding process tools are dispatched through the canonical
+                # BackendSelector below, which proves a kernel-enforced
+                # network-none backend before spawn.  Let that trusted
+                # composition fact admit local test/build runtimes without
+                # weakening the standalone NetworkGuard's conservative
+                # treatment of interpreters as potentially network-capable.
+                kernel_network_isolation_proven=isinstance(
+                    getattr(execution_service, "backend_selector", None),
+                    BackendSelector,
+                ),
             )
         # H2: resolve the AuditLogger BEFORE the scheduler block so it is in
         # scope for both the ``cfg.tool_scheduler is None`` branch (where it
@@ -2081,6 +2197,7 @@ async def build_runtime(
                     network_guard=network_guard,
                     audit_logger=audit_logger,
                     effective_policy=effective_policy,
+                    secret_redactor=credential_broker.secret_redactor,
                 ),
                 # H5: the runtime_id identifies this runtime to the
                 # BrowserManager so two concurrent local sessions under the
@@ -2095,6 +2212,7 @@ async def build_runtime(
                 ),
                 credential_broker=credential_broker,
                 plan_router=plan_router,
+                budget=cfg.tool_budget,
             )
         elif production_mode:
             if not isinstance(getattr(scheduler, "plan_router", None), PlanToolRouter):
@@ -2118,13 +2236,21 @@ async def build_runtime(
                 )
         scheduler.set_office_authority(office_authority)
         scheduler.credential_broker = credential_broker
-        if cfg.browser_manager is None:
+        # Browser/App Coding is an optional capability on the desktop path.
+        # Do not import or construct the Playwright/Linux browser authority
+        # merely to start an ordinary local Coding session. An explicitly
+        # injected service remains available to focused tests/adapters.
+        browser_manager = cfg.browser_manager
+        browser_coding_service = cfg.browser_coding_service
+        if (
+            browser_manager is None
+            and browser_coding_service is None
+            and not runtime_profile.is_local
+        ):
             from khaos.tools.browser_tools import BrowserManager
 
             browser_manager = BrowserManager(runtime_profile=runtime_profile)
-        else:
-            browser_manager = cfg.browser_manager
-        if cfg.browser_coding_service is None:
+        if browser_coding_service is None and browser_manager is not None:
             from khaos.coding.browser import (
                 BrowserCodingService,
                 BrowserStateRepository,
@@ -2410,6 +2536,7 @@ async def build_runtime(
             supervision_service = TaskSupervisionService(
                 cfg.db,
                 audit_logger=audit_logger,
+                secret_redactor=credential_broker.secret_redactor,
             )
         set_browser_supervision = getattr(
             browser_coding_service, "set_supervision_service", None
@@ -2484,6 +2611,7 @@ async def build_runtime(
                 principal_id=cfg.principal_id,
                 project_id=project_id,
                 audit_logger=audit_logger,
+                secret_redactor=credential_broker.secret_redactor,
             ),
             token_engine=get_token_engine(),
             skill_manager=skill_manager if len(skill_manager.registry) else None,
@@ -2663,6 +2791,22 @@ async def build_production_runtime(cfg: ProductionRuntimeConfig) -> RuntimeResul
     # development builder reachable from the production root and would turn
     # the structural config type into a cosmetic boundary.
     return await build_runtime(cfg)
+
+
+async def build_local_runtime(cfg: RuntimeConfig) -> RuntimeResult:
+    """Build the lightweight single-user runtime used by the desktop CLI.
+
+    Local is an explicit product composition, not the development environment
+    switch. The shared factory still constructs the canonical workspace,
+    permission, approval, execution, verification and completion owners; the
+    profile only omits the independently deployed production authority/catalog
+    handshake and other server-only startup requirements.
+    """
+    if not isinstance(cfg, RuntimeConfig):
+        raise TypeError("build_local_runtime requires RuntimeConfig")
+    if cfg.profile not in (None, RuntimeProfile.LOCAL):
+        raise ValueError("build_local_runtime requires RuntimeProfile.LOCAL")
+    return await build_runtime(replace(cfg, profile=RuntimeProfile.LOCAL))
 
 
 async def close_runtime_or_register(runtime: RuntimeResult) -> None:

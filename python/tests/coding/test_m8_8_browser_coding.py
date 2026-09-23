@@ -260,6 +260,11 @@ async def test_browser_service_binds_app_session_and_redacts_observation(
     assert result.session.allowed_origins[0].startswith("http://127.0.0.1:")
     assert execution.requests[0].network_policy.value == "none"
     assert execution.requests[0].environment["APP_MODE"] == "fixture"
+    assert execution.requests[0].environment["PYTHONDONTWRITEBYTECODE"] == "1"
+    assert (
+        "PYTHONDONTWRITEBYTECODE"
+        in execution.requests[0].permission_profile.environment_keys
+    )
     assert execution.requests[0].permission_profile.local_listen_ports == (
         result.session.allowed_origins[0].rsplit(":", 1)[1] and int(result.session.allowed_origins[0].rsplit(":", 1)[1]),
     )
@@ -624,7 +629,7 @@ def test_browser_local_listener_backend_boundary_is_fail_closed(tmp_path) -> Non
         writable=False,
         local_listen_ports=(38123,),
     )
-    assert '(allow network-inbound (local ip "127.0.0.1") (local tcp "38123"))' in profile
+    assert '(allow network-inbound (local tcp "localhost:38123"))' in profile
     assert profile.endswith("(deny network*)")
     with pytest.raises(PermissionError, match="network namespace"):
         LinuxBubblewrapBackend().argv_prefix(

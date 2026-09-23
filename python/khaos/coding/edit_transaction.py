@@ -20,6 +20,7 @@ from typing import Any
 
 from khaos.coding.planning.safe_workspace_path import MutationObjectIdentity
 from khaos.coding.workspace.boundary import (
+    CreatedDirectoryIdentity,
     SafeWorkspaceFS,
     WorkspaceBoundaryError,
     WorkspaceFileSnapshot,
@@ -1167,6 +1168,7 @@ def _apply_sync(
     root = workspace.worktree_path
     prepared: list[_PreparedEdit] = []
     applied: list[_AppliedEdit] = []
+    created_parent_directories: list[CreatedDirectoryIdentity] = []
     committed = False
     with SafeWorkspaceFS(root) as filesystem:
         try:
@@ -1203,6 +1205,18 @@ def _apply_sync(
                     published_identity = identity
 
                 try:
+                    parent_target = (
+                        operation.destination_path
+                        if operation.operation is EditOperationKind.RENAME
+                        else operation.path
+                    )
+                    if parent_target is None:
+                        raise EditTransactionApplyError(
+                            "edit operation target is missing"
+                        )
+                    created_parent_directories.extend(
+                        filesystem.ensure_parent_directories(parent_target)
+                    )
                     if operation.operation in {
                         EditOperationKind.CREATE,
                         EditOperationKind.UPDATE,
@@ -1353,6 +1367,10 @@ def _apply_sync(
                 try:
                     with SafeWorkspaceFS(root) as rollback_filesystem:
                         _rollback_applied(rollback_filesystem, applied)
+                        if created_parent_directories:
+                            rollback_filesystem.remove_empty_directories(
+                                tuple(created_parent_directories)
+                            )
                 except WorkspaceStorageViolation:
                     raise
                 except Exception as exc:
@@ -1364,11 +1382,15 @@ def _apply_sync(
             committed = True
             return WorkspaceMutation(result, rollback, finalize)
         except Exception as exc:
-            if applied:
-                try:
+            try:
+                if applied:
                     _rollback_applied(filesystem, applied)
-                except Exception as rollback_error:  # noqa: BLE001 - recovery must quarantine
-                    raise _recovery_violation(transaction, rollback_error) from exc
+                if created_parent_directories:
+                    filesystem.remove_empty_directories(
+                        tuple(created_parent_directories)
+                    )
+            except Exception as rollback_error:  # noqa: BLE001 - recovery must quarantine
+                raise _recovery_violation(transaction, rollback_error) from exc
             if isinstance(
                 exc,
                 (

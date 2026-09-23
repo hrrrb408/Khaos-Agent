@@ -43,9 +43,16 @@ async def read_file(path: str, offset: int = 1, limit: int = 500, workspace_mana
         workspace = workspace_manager.get(workspace_id or "")
         if workspace is None or workspace.task_id != task_id:
             raise PermissionError("coding read requires matching active TaskWorkspace")
-        return await asyncio.to_thread(
+        result = await asyncio.to_thread(
             _workspace_read_sync, workspace.worktree_path, path, offset, limit
         )
+        # These are read-only, server-computed preconditions for the
+        # generation-bound edit transaction. Returning them with the normal
+        # file snapshot lets a Coding model prepare a canonical transaction
+        # without guessing a generation or hashing content in an untrusted
+        # process. They contain no additional file content or credential.
+        result["workspace_generation"] = int(getattr(workspace, "generation", 1))
+        return result
     if workspace_root is not None:
         return await asyncio.to_thread(
             _workspace_read_sync, workspace_root, path, offset, limit
@@ -464,8 +471,8 @@ async def move_file(src: str, dst: str, workspace_manager=None, task_id: str | N
 
 
 async def file_search_content(
-    path: str,
-    pattern: str,
+    path: str = ".",
+    pattern: str = "",
     max_results: int = 50,
     workspace_manager=None,
     task_id: str | None = None,
@@ -473,6 +480,8 @@ async def file_search_content(
     workspace_root: Path | None = None,
 ) -> dict[str, Any]:
     """Search text file contents for a substring or basic regular expression."""
+    if not pattern:
+        raise ValueError("file_search_content requires pattern")
     if workspace_manager is not None:
         workspace = workspace_manager.get(workspace_id or "")
         if workspace is None or workspace.task_id != task_id:
@@ -588,9 +597,10 @@ def _workspace_write_sync(
     from khaos.coding.workspace.boundary import SafeWorkspaceFS
     from khaos.coding.workspace.storage import WorkspaceMutation
 
+    created_parents = ()
+    before = None
     with SafeWorkspaceFS(root) as filesystem:
         relative = filesystem.relative(path)
-        before = filesystem.snapshot_file(path, recovery_root=recovery_root)
         published_identity: object | None = None
 
         def on_publish(identity: object) -> None:
@@ -598,6 +608,8 @@ def _workspace_write_sync(
             published_identity = identity
 
         try:
+            created_parents = filesystem.ensure_parent_directories(path)
+            before = filesystem.snapshot_file(path, recovery_root=recovery_root)
             encoded = content.encode("utf-8")
             filesystem.write_bytes(
                 path,
@@ -620,16 +632,31 @@ def _workspace_write_sync(
                     )
                 except Exception as recovery_error:  # noqa: BLE001 - recovery must quarantine
                     raise _recovery_violation(path, recovery_error) from exc
-            before.cleanup()
+            if before is not None:
+                before.cleanup()
+            if created_parents:
+                filesystem.remove_empty_directories(created_parents)
             raise
         value = {
             "path": str(filesystem.root / relative),
             "bytes": len(encoded),
         }
+
+    def rollback() -> None:
+        try:
+            _rollback_file(root, path, before, after)
+        finally:
+            if created_parents:
+                with SafeWorkspaceFS(root) as filesystem:
+                    filesystem.remove_empty_directories(created_parents)
+
+    def finalize() -> None:
+        before.cleanup()
+
     return WorkspaceMutation(
         value,
-        lambda: _rollback_file(root, path, before, after),
-        before.cleanup,
+        rollback,
+        finalize,
     )
 
 
@@ -1094,14 +1121,22 @@ def _workspace_read_sync(
         raise ValueError("offset and limit must be >= 1")
     with SafeWorkspaceFS(root) as filesystem:
         relative = filesystem.relative(path)
-        lines = filesystem.read_bytes(path).decode("utf-8").splitlines()
+        raw_content = filesystem.read_bytes(path)
+        lines = raw_content.decode("utf-8").splitlines()
         start = offset - 1
         selected = lines[start:start + limit]
+        returned_length = len(selected)
+        next_start = start + returned_length
+        has_more = next_start < len(lines)
         return {
             "path": str(filesystem.root / relative),
             "offset": offset,
             "limit": limit,
             "total_lines": len(lines),
+            "returned_length": returned_length,
+            "has_more": has_more,
+            "next_offset": offset + returned_length if has_more else None,
+            "content_sha256": hashlib.sha256(raw_content).hexdigest(),
             "content": "\n".join(
                 f"{start + index + 1}: {line}"
                 for index, line in enumerate(selected)

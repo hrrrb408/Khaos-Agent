@@ -33,7 +33,7 @@ class ContextSerializer:
 
     def serialize(self, selection: ContextSelection) -> SerializedContext:
         messages: list[ContextMessage] = []
-        for item in selection.selected:
+        for item in self._provider_order(selection.selected):
             metadata = dict(item.metadata)
             role = str(metadata.get("role") or self._default_role(item))
             tool_call_id = metadata.get("tool_call_id")
@@ -98,6 +98,40 @@ class ContextSerializer:
             stable_prefix_tokens=prefix_tokens,
             stable_prefix_bytes=prefix_bytes,
         )
+
+    @staticmethod
+    def _provider_order(items: tuple[ContextItem, ...]) -> tuple[ContextItem, ...]:
+        """Keep tool-call exchanges chronological on the provider wire.
+
+        Selector order is intentionally layer-first so stable policy and
+        task context win bounded admission. That order is not a valid chat
+        transcript order: assistant tool calls are L1 while their tool
+        results are L3. Move the ordered transcript after non-transcript
+        context and sort only that transcript by its original sequence.
+        This preserves bounded selection decisions while ensuring each
+        assistant/tool exchange remains in the order observed by AgentLoop.
+        """
+
+        transcript: list[ContextItem] = []
+        background: list[ContextItem] = []
+        for item in items:
+            role = item.metadata.get("role")
+            is_transcript = item.kind in {
+                ContextItemKind.CONVERSATION,
+                ContextItemKind.TOOL_RESULT,
+            }
+            # Browser observations can carry role=tool while retaining their
+            # browser-specific kind/provenance. Keep those messages with the
+            # transcript so browser tool calls cannot be separated from
+            # their results by layer ordering.
+            if role in {"assistant", "tool"}:
+                is_transcript = True
+            if is_transcript:
+                transcript.append(item)
+            else:
+                background.append(item)
+        transcript.sort(key=lambda item: (item.sequence, item.item_id))
+        return (*background, *transcript)
 
     @staticmethod
     def _default_role(item: ContextItem) -> str:

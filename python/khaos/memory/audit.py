@@ -11,6 +11,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from khaos.memory.core.contracts import RuntimeMemoryContext
+from khaos.security.secret_redaction import SecretRedactor
 
 
 class TrustKernelMemoryAuditSink:
@@ -112,8 +113,14 @@ class DurableMemoryAuditSink:
     enabled.
     """
 
-    def __init__(self, database: Any) -> None:
+    def __init__(
+        self,
+        database: Any,
+        *,
+        secret_redactor: SecretRedactor | None = None,
+    ) -> None:
         self._database = database
+        self._secret_redactor = secret_redactor
 
     async def log_decision(
         self,
@@ -126,6 +133,13 @@ class DurableMemoryAuditSink:
         payload = dict(detail or {})
         if memory_id:
             payload.setdefault("memory_id", memory_id)
+        if self._secret_redactor is not None:
+            candidate = self._secret_redactor.redact_fail_closed(payload)
+            payload = (
+                dict(candidate)
+                if isinstance(candidate, Mapping)
+                else {"redacted": True}
+            )
         async with self._database.transaction() as conn:
             await conn.execute(
                 "INSERT INTO memory_audit (action, memory_id, provider_id, "

@@ -187,6 +187,14 @@ class ContextSelector:
 
     @staticmethod
     def _sort_key(item: ContextItem, requirements: ContextRequirements) -> tuple[object, ...]:
+        # The current goal is the model's task-bearing user input.  It must be
+        # admitted before an oversized L0 project-instruction item consumes
+        # the available total budget.  L0 remains first on the provider wire
+        # (see the final layer sort in ``select``), while this admission-order
+        # priority prevents a context that contains only system messages.
+        # Such a context is not actionable for OpenAI-compatible providers
+        # and, more importantly, silently drops the operator's request.
+        goal_priority = 0 if item.kind is ContextItemKind.GOAL else 1
         target_match = 0
         if item.path and item.path in requirements.target_files:
             target_match = 1
@@ -195,6 +203,7 @@ class ContextSelector:
         if item.path and item.path in requirements.changed_files:
             target_match = 1
         return (
+            goal_priority,
             0 if ContextSelector._is_required(item, requirements) else 1,
             -target_match,
             -item.priority,

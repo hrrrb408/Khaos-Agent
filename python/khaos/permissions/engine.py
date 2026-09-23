@@ -88,12 +88,14 @@ class PermissionEngine:
         runtime_id: str = "",
         exec_tool_names: frozenset[str] | None = None,
         audit_logger: AuditLogger | None = None,
+        secret_redactor=None,
     ):
         self.db = db
         # AuditLogger is the sole production audit repository.  Keeping the
         # writer on the engine prevents permission paths from bypassing the
         # independent chain anchor and the runtime attribution fields.
         self._audit_logger = audit_logger
+        self._secret_redactor = secret_redactor
         self._default_mode = default_mode
         self._rules: list[PermissionRule] = []
         # H3: policy-level command approval list.  Checked BEFORE persistent
@@ -452,6 +454,7 @@ class PermissionEngine:
                 runtime_id=self._runtime_id,
                 policy_digest=self._policy_digest,
                 project_id=self._project_id,
+                secret_redactor=self._secret_redactor,
             )
             self._audit_logger = audit_logger
         row_id = await audit_logger.log(

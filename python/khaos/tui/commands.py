@@ -7,6 +7,7 @@ unit-testable without a running Textual app. The TUI widgets call into
 
 from __future__ import annotations
 
+import asyncio
 import shlex
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -14,6 +15,8 @@ from pathlib import Path
 from typing import Any
 
 from khaos.runtime.context import local_principal_id
+from khaos.security.credential_broker import CredentialBrokerError
+from khaos.security.credentials import CredentialRef
 from khaos.skills import SkillManager
 
 
@@ -45,6 +48,10 @@ class TuiContext:
     # machine or reading the worktree directly.
     supervision_service: Any = None
     checkpoint_service: Any = None
+    # The runtime-owned CredentialBroker is the only credential authority.
+    # Slash commands may request an explicit unlock/lock; Agent tools never
+    # receive this handle.
+    credential_broker: Any = None
     principal_id: str = ""
     # Optional cron engine for the /cron command.
     cron_engine: Any = None
@@ -107,6 +114,9 @@ Khaos TUI — slash commands:
   /memory import <path>     Import a scope-bound package
   /tools [mode]             List available tools (optionally per mode)
   /model <name>             Show or set the active model (set is advisory)
+  /credentials status       Show safe persistent/session credential state
+  /credentials unlock <p>  Explicitly unlock one configured provider
+  /credentials lock <p>    Lock one provider's in-memory lease
   /tasks                    List active coding tasks (all tasks with -a)
   /task <id>                Show details for one coding task
   /status [task_id]         Show typed supervision state
@@ -181,6 +191,8 @@ async def handle_command(line: str, ctx: TuiContext) -> CommandResult:
         return _cmd_tools(args, ctx)
     if cmd == "/model":
         return _cmd_model(args, ctx)
+    if cmd == "/credentials":
+        return await _cmd_credentials(args, ctx)
     if cmd == "/tasks":
         return await _cmd_tasks(args, ctx)
     if cmd == "/task":
@@ -203,6 +215,95 @@ async def handle_command(line: str, ctx: TuiContext) -> CommandResult:
         return _cmd_session(args, ctx)
 
     return CommandResult(handled=True, message=f"unknown command: {cmd}\n\n{HELP_TEXT}")
+
+
+def _configured_credential_ref(ctx: TuiContext, provider: str) -> CredentialRef:
+    """Resolve a provider name through the already-composed router only."""
+    if ctx.router is None:
+        raise CredentialBrokerError("provider router is not configured")
+    manager = getattr(ctx.router, "provider_manager", None)
+    if manager is None:
+        raise CredentialBrokerError("provider manager is not configured")
+    try:
+        config = manager.get_provider(provider.casefold())
+    except (KeyError, AttributeError) as exc:
+        raise CredentialBrokerError("provider is not configured") from exc
+    ref = getattr(config, "credential_ref", None)
+    if not isinstance(ref, CredentialRef):
+        raise CredentialBrokerError("provider has no configured credential")
+    return ref
+
+
+def _credential_error_message(exc: CredentialBrokerError) -> str:
+    """Render only typed, secret-free session failure metadata."""
+    code = getattr(exc, "code", None)
+    if isinstance(code, str) and code:
+        return code
+    return type(exc).__name__
+
+
+async def _cmd_credentials(args: list[str], ctx: TuiContext) -> CommandResult:
+    """Handle explicit human credential-session operations in the TUI."""
+    broker = ctx.credential_broker
+    if broker is None:
+        return CommandResult(handled=True, message="credential broker not configured")
+    action = args[0].casefold() if args else "status"
+    targets = args[1:] if args else []
+    if action not in {"status", "unlock", "lock"}:
+        return CommandResult(
+            handled=True,
+            message="usage: /credentials status | unlock <provider|all> | lock <provider|all>",
+        )
+    manager = getattr(ctx.router, "provider_manager", None)
+    providers = getattr(manager, "providers", {}) if manager is not None else {}
+    if not isinstance(providers, dict):
+        return CommandResult(handled=True, message="provider manager not configured")
+    if action == "status":
+        selected = targets or sorted(str(name) for name in providers)
+        lines: list[str] = []
+        for provider in selected:
+            try:
+                ref = _configured_credential_ref(ctx, provider)
+                status = broker.credential_session.status(ref, provider=provider)
+                lines.append(
+                    f"{provider}: {status['session']} "
+                    f"({status['runtime_credential']})"
+                )
+            except CredentialBrokerError as exc:
+                lines.append(f"{provider}: {_credential_error_message(exc)}")
+        return CommandResult(
+            handled=True,
+            message="\n".join(lines) if lines else "no configured provider credentials",
+        )
+
+    if not targets or len(targets) != 1:
+        return CommandResult(
+            handled=True,
+            message=f"usage: /credentials {action} <provider|all>",
+        )
+    target = targets[0].casefold()
+    selected = (
+        sorted(str(name) for name in providers)
+        if target == "all"
+        else [target]
+    )
+    results: list[str] = []
+    for provider in selected:
+        try:
+            ref = _configured_credential_ref(ctx, provider)
+            if action == "unlock":
+                await asyncio.to_thread(
+                    broker.credential_session.unlock,
+                    ref,
+                    provider=provider,
+                )
+                results.append(f"{provider}: UNLOCKED")
+            else:
+                broker.credential_session.lock(ref, provider=provider)
+                results.append(f"{provider}: LOCKED")
+        except CredentialBrokerError as exc:
+            results.append(f"{provider}: {_credential_error_message(exc)}")
+    return CommandResult(handled=True, message="\n".join(results))
 
 
 def _cmd_channels(args: list[str], ctx: TuiContext) -> CommandResult:

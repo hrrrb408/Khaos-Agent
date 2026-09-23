@@ -2,8 +2,8 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
-
 from khaos.coding.execution import ExecutionService, HostExecutionBackend
+from khaos.coding.execution.environment import environment_from_spawn_plan
 from khaos.tools.terminal_tools import (
     BackgroundProcessAuthority,
     check_command_safety,
@@ -180,6 +180,35 @@ async def test_terminal_argv_never_parses_shell_operators(tmp_path):
     )
     assert result["stdout"] == "hello | touch escaped\n"
     assert not (tmp_path / "escaped").exists()
+
+
+async def test_terminal_argv_uses_approved_spawn_plan_environment(tmp_path):
+    class _CaptureExecution:
+        request = None
+
+        async def execute(self, request):
+            self.request = request
+            return SimpleNamespace(
+                return_code=0,
+                stdout="ok\n",
+                stderr="",
+                status="completed",
+            )
+
+    execution = _CaptureExecution()
+    spawn_plan = SimpleNamespace(
+        environment=(("LANG", "C.UTF-8"), ("PATH", "/trusted/bin")),
+    )
+
+    result = await terminal_argv(
+        ["echo", "ok"],
+        cwd=str(tmp_path),
+        execution_service=execution,
+        spawn_plan=spawn_plan,
+    )
+
+    assert result["returncode"] == 0
+    assert execution.request.environment == environment_from_spawn_plan(spawn_plan)
 
 
 async def test_terminal_shell_requires_explicit_absolute_shell(tmp_path):

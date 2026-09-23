@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import replace
 from enum import Enum
 from pathlib import Path
@@ -29,6 +29,8 @@ from khaos.coding.context_engine.contracts import (
     ContextMetricsSnapshot,
     ContextOperation,
     ContextRequirements,
+    ContextSelectionIdentity,
+    ContextSelectionReason,
     ContextSource,
     ContextTrust,
     ModelContext,
@@ -39,6 +41,7 @@ from khaos.coding.context_engine.discovery import (
     DeferredToolDiscovery,
     LazySkillDiscovery,
 )
+from khaos.coding.context_engine.observability import project_context_selection
 from khaos.coding.context_engine.selector import ContextSelector
 from khaos.coding.context_engine.serializer import ContextSerializer
 from khaos.coding.context_engine.tools import (
@@ -57,6 +60,7 @@ from khaos.security.protocol_boundary import canonical_digest
 from khaos.skills.skill import Skill
 
 _ContextEnum = TypeVar("_ContextEnum", bound=Enum)
+_MAX_SELECTION_HISTORY = 128
 
 
 class ContextEngineService:
@@ -102,6 +106,12 @@ class ContextEngineService:
         self._locks: dict[tuple[str, str, str], asyncio.Lock] = {}
         self._locks_guard = RLock()
         self._metrics_lock = RLock()
+        self._last_selection_observation: dict[str, object] = {}
+        self._selection_observer: Callable[[ModelContext, object | None], None] | None = None
+        self._selection_sequence = 0
+        self._selection_history: list[dict[str, object]] = []
+        self._initial_selection_id: str | None = None
+        self._rebalance_count = 0
         self._metrics: dict[str, int | None] = {
             "context_builds": 0,
             "context_input_tokens": 0,
@@ -138,7 +148,24 @@ class ContextEngineService:
             "extension_context_bytes": 0,
             "extension_tool_schema_bytes": 0,
             "active_skills": 0,
+            "context_selection_count": 0,
+            "context_rebalance_count": 0,
         }
+
+    def bind_selection_observer(
+        self,
+        observer: Callable[[ModelContext, object | None], None] | None,
+    ) -> None:
+        """Attach a passive observer for the exact build result.
+
+        The observer is a telemetry port only.  It is invoked after the
+        immutable context result has been created and never participates in
+        selection, execution, approval, verification, or completion.
+        """
+
+        if observer is not None and not callable(observer):
+            raise TypeError("context selection observer is invalid")
+        self._selection_observer = observer
 
     async def build(
         self,
@@ -149,11 +176,13 @@ class ContextEngineService:
         extension_items: Iterable[object] = (),
         scope_id: str = "parent",
         partial: bool = False,
+        selection_reason: ContextSelectionReason | str = ContextSelectionReason.BUILD,
     ) -> ModelContext:
         """Select and serialize one immutable context snapshot."""
 
         if type(requirements) is not ContextRequirements:
             raise TypeError("context requirements are required")
+        selection_reason = _normalize_selection_reason(selection_reason)
         values = [item for item in candidates if type(item) is ContextItem]
         if repo_bundle is not None:
             values.extend(self.items_from_repo_bundle(repo_bundle, requirements=requirements))
@@ -194,7 +223,12 @@ class ContextEngineService:
         cached = self.cache.get(key)
         if cached is not None and not self._working_set_changed(state_key, state_digest):
             self._inc("context_cache_hits")
-            return replace(cached, cache_hit=True, partial=partial or cached.partial)
+            return self._reuse_cached_context(
+                cached,
+                partial=partial or cached.partial,
+                selection_reason=selection_reason,
+                repo_bundle=repo_bundle,
+            )
         if cached is not None:
             partial = True
             self._inc("context_stale_retries")
@@ -205,12 +239,22 @@ class ContextEngineService:
             race = self._working_set_changed(state_key, state_digest)
             if cached is not None and not race:
                 self._inc("context_cache_hits")
-                return replace(cached, cache_hit=True, partial=partial or cached.partial)
+                return self._reuse_cached_context(
+                    cached,
+                    partial=partial or cached.partial,
+                    selection_reason=selection_reason,
+                    repo_bundle=repo_bundle,
+                )
             if race:
                 partial = True
                 self._inc("context_stale_retries")
             selection = self.selector.select(values, requirements)
             serialized = self.serializer.serialize(selection)
+            selection_projection = project_context_selection(selection)
+            selection_identity = self._new_selection_identity(
+                selection_reason,
+                str(selection_projection["selection_digest"]),
+            )
             context = ModelContext(
                 messages=serialized.messages,
                 selection=selection,
@@ -218,10 +262,17 @@ class ContextEngineService:
                 context_digest=serialized.context_digest,
                 cache_hit=False,
                 partial=partial or race,
+                selection_identity=selection_identity,
             )
             if not race:
                 self.cache.put(key, context)
-            self._record_build(context, serialized.stable_prefix_tokens, serialized.stable_prefix_bytes)
+            self._record_build(
+                context,
+                serialized.stable_prefix_tokens,
+                serialized.stable_prefix_bytes,
+                selection_projection=selection_projection,
+                repo_bundle=repo_bundle,
+            )
             return context
 
     async def build_for_agent(
@@ -494,6 +545,7 @@ class ContextEngineService:
             repo_bundle=repo_bundle,
             extension_items=extension_items,
             scope_id=scope_id,
+            selection_reason=ContextSelectionReason.INITIAL_BUILD,
         )
 
     @staticmethod
@@ -857,7 +909,12 @@ class ContextEngineService:
                 )
             )
             self._inc("context_compactions")
-        context = await self.build(requirements, candidates, scope_id=scope_id)
+        context = await self.build(
+            requirements,
+            candidates,
+            scope_id=scope_id,
+            selection_reason=ContextSelectionReason.REBALANCE,
+        )
         if len(context.selection.evicted) or context.selection.compressed:
             self._inc("context_compactions")
         return [self._to_agent_message(message) for message in context.messages]
@@ -916,6 +973,7 @@ class ContextEngineService:
             requirements,
             candidates,
             scope_id=scope_id,
+            selection_reason=ContextSelectionReason.CHILD_CONTEXT,
         )
 
     def tool_schemas(
@@ -1303,7 +1361,8 @@ class ContextEngineService:
 
     def metrics_snapshot(self) -> ContextMetricsSnapshot:
         with self._metrics_guard():
-            values = dict(self._metrics)
+            values: dict[str, object] = dict(self._metrics)
+            values.update(self._last_selection_observation)
         # The public snapshot has a deliberately mixed int/None vocabulary,
         # while the internal counters are initialized as integers and a few
         # optional measurements may be set to None at runtime.  Keep the
@@ -1600,7 +1659,24 @@ class ContextEngineService:
             "context_generation",
             metadata.get("generation", metadata.get("repository_generation")),
         )
-        if type(candidate_generation) in {str, int}:
+        # ``context_generation`` on a live tool/browser message is the
+        # workspace mutation epoch (for example ``1``), while the context
+        # requirement is commonly bound to the full repository identity
+        # (for example ``1:<manifest-digest>``). Treating the short runtime
+        # epoch as a repository generation makes every tool result look stale
+        # and silently removes the evidence the next model turn needs. Live
+        # transcript items inherit the current requirement generation; typed
+        # repository/context items may still carry their explicit generation
+        # identity and are filtered normally by the build boundary.
+        if (
+            type(candidate_generation) in {str, int}
+            and kind
+            not in {
+                ContextItemKind.CONVERSATION,
+                ContextItemKind.TOOL_RESULT,
+                ContextItemKind.BROWSER_OBSERVATION,
+            }
+        ):
             generation = str(candidate_generation)
         content = _strip_context_wrapper(content, trust)
         return ContextItem(
@@ -1639,7 +1715,15 @@ class ContextEngineService:
         setattr(result, "_context_engine_message", True)  # noqa: B010 - private provenance marker
         return result
 
-    def _record_build(self, context: ModelContext, prefix_tokens: int, prefix_bytes: int) -> None:
+    def _record_build(
+        self,
+        context: ModelContext,
+        prefix_tokens: int,
+        prefix_bytes: int,
+        *,
+        selection_projection: Mapping[str, object] | None = None,
+        repo_bundle: object | None = None,
+    ) -> None:
         selection = context.selection
         self._inc("context_builds")
         self._inc("context_input_tokens", selection.total_tokens)
@@ -1659,6 +1743,110 @@ class ContextEngineService:
         self._inc("context_diagnostics_selected", sum(1 for item in selection.selected if item.kind is ContextItemKind.DIAGNOSTIC))
         if context.partial:
             self._inc("context_partial_builds")
+        self._record_effective_selection(
+            context,
+            selection_projection=selection_projection,
+            repo_bundle=repo_bundle,
+        )
+
+    def _record_effective_selection(
+        self,
+        context: ModelContext,
+        *,
+        selection_projection: Mapping[str, object] | None = None,
+        repo_bundle: object | None = None,
+    ) -> None:
+        """Record one build result and notify the passive observability port."""
+
+        observation = _selection_observation(
+            context,
+            projection=selection_projection,
+        )
+        history_entry = _selection_history_entry(observation)
+        with self._metrics_guard():
+            if history_entry is not None:
+                self._selection_history.append(history_entry)
+                if len(self._selection_history) > _MAX_SELECTION_HISTORY:
+                    del self._selection_history[:-_MAX_SELECTION_HISTORY]
+            selection_count = self._metrics.get("context_selection_count")
+            self._last_selection_observation = {
+                **observation,
+                "context_selection_count": (
+                    selection_count if type(selection_count) is int else None
+                ),
+                "context_initial_selection_id": self._initial_selection_id,
+                "context_rebalance_count": self._rebalance_count,
+                "context_selection_history": tuple(
+                    dict(entry) for entry in self._selection_history
+                ),
+            }
+        observer = self._selection_observer
+        if observer is not None:
+            try:
+                observer(context, repo_bundle)
+            except Exception:  # noqa: BLE001 - telemetry cannot affect the loop
+                return
+
+    def _new_selection_identity(
+        self,
+        reason: ContextSelectionReason,
+        selection_digest: str,
+    ) -> ContextSelectionIdentity:
+        """Allocate the one run-local identity for an effective build."""
+
+        if not isinstance(selection_digest, str):
+            raise TypeError("context selection digest is invalid")
+        with self._metrics_guard():
+            self._selection_sequence += 1
+            sequence = self._selection_sequence
+            identity = ContextSelectionIdentity(
+                selection_id=f"ctxsel-{sequence}",
+                selection_sequence=sequence,
+                selection_reason=reason.value,
+                selection_digest=selection_digest,
+            )
+            current = self._metrics.get("context_selection_count")
+            self._metrics["context_selection_count"] = (
+                (current if type(current) is int else 0) + 1
+            )
+            if (
+                self._initial_selection_id is None
+                and reason in {
+                    ContextSelectionReason.BUILD,
+                    ContextSelectionReason.INITIAL_BUILD,
+                }
+            ):
+                self._initial_selection_id = identity.selection_id
+            if reason is ContextSelectionReason.REBALANCE:
+                self._rebalance_count += 1
+                self._metrics["context_rebalance_count"] = self._rebalance_count
+            return identity
+
+    def _reuse_cached_context(
+        self,
+        cached: ModelContext,
+        *,
+        partial: bool,
+        selection_reason: ContextSelectionReason,
+        repo_bundle: object | None,
+    ) -> ModelContext:
+        """Give each effective build invocation its own lifecycle identity."""
+
+        cached_identity = cached.selection_identity
+        selection_digest = (
+            cached_identity.selection_digest
+            if isinstance(cached_identity, ContextSelectionIdentity)
+            else str(project_context_selection(cached.selection)["selection_digest"])
+        )
+        identity = self._new_selection_identity(selection_reason, selection_digest)
+        context = replace(
+            cached,
+            cache_hit=True,
+            partial=partial,
+            selection_identity=identity,
+        )
+        self._record_effective_selection(context, repo_bundle=repo_bundle)
+        return context
 
     def _lock_for(self, key: tuple[str, str, str]) -> asyncio.Lock:
         with self._locks_guard:
@@ -1742,6 +1930,112 @@ def _enum_from_value(
             return enum_type[value]
         except (KeyError, TypeError):
             return None
+
+
+def _normalize_selection_reason(
+    value: ContextSelectionReason | str,
+) -> ContextSelectionReason:
+    """Normalize the bounded lifecycle reason used by the build boundary."""
+
+    if isinstance(value, ContextSelectionReason):
+        return value
+    if not isinstance(value, str):
+        raise TypeError("context selection reason is invalid")
+    try:
+        return ContextSelectionReason(value)
+    except ValueError:
+        try:
+            return ContextSelectionReason[value]
+        except KeyError as exc:
+            raise ValueError("context selection reason is invalid") from exc
+
+
+def _selection_observation(
+    context: ModelContext,
+    *,
+    projection: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    """Project one exact selection to safe metrics without payload content."""
+
+    projection = projection or project_context_selection(context.selection)
+    identity = context.selection_identity
+    selection_items = cast(
+        list[Mapping[str, object]],
+        projection["selection_items"],
+    )
+    selected_repository_paths = cast(
+        list[str],
+        projection["selected_repository_paths"],
+    )
+    return {
+        "context_selection_observability_schema_version": projection[
+            "context_selection_observability_schema_version"
+        ],
+        "context_selection_detail_status": projection[
+            "context_selection_detail_status"
+        ],
+        "context_selection_digest": projection["selection_digest"],
+        "context_selection_id": (
+            identity.selection_id
+            if isinstance(identity, ContextSelectionIdentity)
+            else None
+        ),
+        "context_selection_sequence": (
+            identity.selection_sequence
+            if isinstance(identity, ContextSelectionIdentity)
+            else None
+        ),
+        "context_selection_reason": (
+            identity.selection_reason
+            if isinstance(identity, ContextSelectionIdentity)
+            else None
+        ),
+        "context_selected_repository_paths": tuple(selected_repository_paths),
+        "context_automatic_repo_items_selected": projection[
+            "automatic_repo_items_selected"
+        ],
+        "context_tool_acquired_items_selected": projection[
+            "tool_acquired_items_selected"
+        ],
+        "context_non_repository_items_selected": projection[
+            "non_repository_items_selected"
+        ],
+        "context_selection_metadata": tuple(selection_items),
+        "context_selection_projection_original_count": projection[
+            "selection_items_original_count"
+        ],
+        "context_selection_projection_persisted_count": projection[
+            "selection_items_persisted_count"
+        ],
+        "context_selection_projection_truncated": projection[
+            "selection_items_projection_truncated"
+        ],
+    }
+
+
+def _selection_history_entry(
+    observation: Mapping[str, object],
+) -> dict[str, object] | None:
+    """Return bounded identity-only history metadata for one selection."""
+
+    selection_id = observation.get("context_selection_id")
+    sequence = observation.get("context_selection_sequence")
+    reason = observation.get("context_selection_reason")
+    digest = observation.get("context_selection_digest")
+    if not (
+        isinstance(selection_id, str)
+        and type(sequence) is int
+        and sequence > 0
+        and isinstance(reason, str)
+        and isinstance(digest, str)
+    ):
+        return None
+    return {
+        "selection_id": selection_id,
+        "selection_sequence": sequence,
+        "selection_reason": reason,
+        "selection_digest": digest,
+    }
 
 
 def _pending_generation_matches(

@@ -1,10 +1,13 @@
 import asyncio
 import json
+import os
+import sys
 
 import pytest
 from khaos.agent import AgentConfig, AgentLoop, Message
 from khaos.agent.compressor import CompressionLevel, CompressionResult
 from khaos.agent.core import (
+    _default_runtime_environment,
     _sanitize_tool_activity_arguments,
     _sanitize_tool_activity_output,
 )
@@ -14,7 +17,24 @@ from khaos.modes import Mode, ModeManager
 from khaos.permissions import PermissionEngine
 from khaos.routing.router import create_default_router
 from khaos.tools import create_runtime_registry
-from khaos.tools.scheduler import ToolResult, ToolScheduler
+from khaos.tools.scheduler import ToolBudget, ToolResult, ToolScheduler
+
+
+def test_runtime_environment_prefers_running_khaos_interpreter(
+    monkeypatch, tmp_path
+):
+    executable = tmp_path / "venv" / "bin" / "python"
+    monkeypatch.setattr(sys, "executable", str(executable))
+    monkeypatch.setenv("PATH", os.pathsep.join(("/usr/bin", "/bin")))
+
+    path_entries = _default_runtime_environment("PATH").split(os.pathsep)
+
+    assert path_entries[0] == str(executable.parent)
+    assert path_entries[1:] == ["/usr/bin", "/bin"]
+
+
+def test_runtime_environment_disables_python_bytecode_side_effects():
+    assert _default_runtime_environment("PYTHONDONTWRITEBYTECODE") == "1"
 
 
 async def test_task_activity_uses_original_tool_arguments():
@@ -43,6 +63,30 @@ async def test_task_activity_uses_original_tool_arguments():
 
     assert loop.task_manager.viewed == [("task-1", "src/a.py")]
     assert loop.task_manager.modified == [("task-1", "src/b.py")]
+
+
+async def test_checkpoint_rejection_is_a_retryable_no_effect_tool_result():
+    events = [
+        event
+        async for event in AgentLoop._checkpoint_rejection_events(
+            [
+                {
+                    "id": "apply-1",
+                    "name": "apply_edit_transaction",
+                    "arguments": {"transaction_id": "tx-1"},
+                }
+            ]
+        )
+    ]
+
+    assert len(events) == 1
+    result = events[0].result
+    assert result is not None
+    assert result.success is False
+    assert result.error_code == "CHECKPOINT_UNAVAILABLE"
+    assert result.effect_status == "not_started"
+    assert result.retry_safe is True
+    assert result.arguments == {"transaction_id": "tx-1"}
 
 
 def test_edit_transaction_activity_redacts_source_and_replacement_text():
@@ -127,6 +171,48 @@ async def test_agent_loop_streams_and_persists_messages(tmp_path):
     await db.close()
 
 
+async def test_agent_loop_persists_observation_before_streaming_it():
+    loop = AgentLoop.__new__(AgentLoop)
+    persisted: list[tuple[str, Message, dict]] = []
+
+    async def persist(session_id, message, **kwargs):
+        persisted.append((session_id, message, kwargs))
+
+    loop._persist_message = persist
+    observation = Message(
+        role="system",
+        content="bounded verification observation",
+        event="verification_result",
+        metadata={"status": "passed"},
+    )
+
+    streamed = [
+        message
+        async for message in loop._persist_and_stream_message(
+            "session-1",
+            observation,
+            task_id="task-1",
+            workspace_id="workspace-1",
+            commit_sha="a" * 40,
+        )
+    ]
+
+    assert streamed == [observation]
+    assert persisted == [
+        (
+            "session-1",
+            observation,
+            {
+                "task_id": "task-1",
+                "workspace_id": "workspace-1",
+                "repo_id": None,
+                "commit_sha": "a" * 40,
+                "branch": None,
+            },
+        )
+    ]
+
+
 async def test_agent_loop_enforces_budget_before_provider_call(tmp_path):
     class CountingRouter:
         def __init__(self):
@@ -190,6 +276,138 @@ async def test_agent_loop_enforces_budget_during_stream(tmp_path):
     assert router.calls == 1
     assert events[-1].event == "done"
     assert events[-1].stop_reason == "max_budget"
+    assert not any(message.event == "error" for message in events)
+    await db.close()
+
+
+async def test_agent_loop_enforces_model_stream_timeout(tmp_path):
+    class HangingRouter:
+        async def call(self, function, messages, **kwargs):
+            del function, messages, kwargs
+            await asyncio.sleep(2)
+            yield Message(role="assistant", content="unreachable")
+
+    (tmp_path / "prompts").mkdir()
+    (tmp_path / "prompts" / "office.md").write_text("office prompt", encoding="utf-8")
+    (tmp_path / "prompts" / "coding.md").write_text("coding prompt", encoding="utf-8")
+    db = Database(tmp_path / "stream-timeout.db")
+    await db.connect()
+    await db.run_migrations()
+    await db.create_session("s1")
+    loop = AgentLoop(
+        AgentConfig(stream_timeout=1),
+        ModeManager(db, project_root=tmp_path),
+        HangingRouter(),
+        db,
+    )
+
+    events = [message async for message in loop.run("hello", "s1")]
+
+    assert events[-1].event == "error"
+    assert events[-1].metadata["code"] == "MODEL_TIMEOUT"
+    await db.close()
+
+
+async def test_agent_loop_preserves_typed_tool_budget_exhaustion(tmp_path):
+    class OverExplorerRouter:
+        def __init__(self):
+            self.calls = 0
+
+        async def call(self, function, messages, **kwargs):
+            del function, messages, kwargs
+            self.calls += 1
+            yield Message(
+                role="assistant",
+                content="",
+                tool_calls=[
+                    {
+                        "id": "over-explorer-1",
+                        "name": "read_file",
+                        "arguments": {"path": "src/example.py"},
+                    }
+                ],
+                stop_reason="tool_use",
+            )
+
+    (tmp_path / "prompts").mkdir()
+    (tmp_path / "prompts" / "office.md").write_text("office prompt", encoding="utf-8")
+    (tmp_path / "prompts" / "coding.md").write_text("coding prompt", encoding="utf-8")
+    db = Database(tmp_path / "typed-budget.db")
+    await db.connect()
+    await db.run_migrations()
+    await db.create_session("s1", mode="coding")
+    mode_manager = ModeManager(db, project_root=tmp_path)
+    await mode_manager.switch(Mode.CODING)
+    budget = ToolBudget(max_calls=1)
+    budget.record(0)
+    scheduler = ToolScheduler(create_runtime_registry(), PermissionEngine(db), budget=budget)
+    router = OverExplorerRouter()
+    loop = AgentLoop(
+        AgentConfig(),
+        mode_manager,
+        router,
+        db,
+        tool_scheduler=scheduler,
+    )
+
+    events = [message async for message in loop.run("inspect the repository", "s1")]
+
+    assert router.calls == 1
+    assert events[-1].event == "error"
+    assert events[-1].metadata["code"] == "TOOL_BUDGET_EXHAUSTED"
+    assert events[-1].metadata["terminal_status"] == "failed"
+    await db.close()
+
+
+async def test_agent_loop_executes_tool_calls_even_when_finish_reason_is_end_turn(tmp_path):
+    class MislabelledToolRouter:
+        def __init__(self):
+            self.calls = 0
+
+        async def call(self, function, messages, **kwargs):
+            del function, messages, kwargs
+            self.calls += 1
+            if self.calls == 1:
+                yield Message(
+                    role="assistant",
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": "mislabelled-read",
+                            "name": "read_file",
+                            "arguments": {"path": "src/example.py"},
+                        }
+                    ],
+                    stop_reason="end_turn",
+                )
+                return
+            yield Message(role="assistant", content="done", stop_reason="end_turn")
+
+    (tmp_path / "prompts").mkdir()
+    (tmp_path / "prompts" / "office.md").write_text("office prompt", encoding="utf-8")
+    (tmp_path / "prompts" / "coding.md").write_text("coding prompt", encoding="utf-8")
+    db = Database(tmp_path / "tool-stop-reason.db")
+    await db.connect()
+    await db.run_migrations()
+    await db.create_session("s1", mode="coding")
+    mode_manager = ModeManager(db, project_root=tmp_path)
+    await mode_manager.switch(Mode.CODING)
+    scheduler = ToolScheduler(create_runtime_registry(), PermissionEngine(db))
+    router = MislabelledToolRouter()
+    loop = AgentLoop(
+        AgentConfig(),
+        mode_manager,
+        router,
+        db,
+        tool_scheduler=scheduler,
+        confirm_callback=lambda request: {"approved": True},
+    )
+
+    events = [message async for message in loop.run("inspect the repository", "s1")]
+
+    assert router.calls == 2
+    assert any(message.event == "tool_result" for message in events)
+    assert events[-1].event == "done"
     assert not any(message.event == "error" for message in events)
     await db.close()
 

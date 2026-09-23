@@ -193,6 +193,86 @@ async def test_preview_is_deterministic_and_does_not_write(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_preview_and_apply_support_missing_parent_directories(tmp_path: Path):
+    manager, workspace = _manager_for(tmp_path)
+    transaction = EditTransaction(
+        "nested-create-1",
+        workspace.id,
+        workspace.generation,
+        (
+            _operation(
+                "create",
+                "tests/fixtures/cache_case.py",
+                expected_exists=False,
+                content="VALUE = 1\n",
+            ),
+        ),
+    )
+    service = EditTransactionService()
+
+    preview = await service.preview(
+        transaction,
+        workspace_manager=manager,
+        task_id=workspace.task_id,
+        workspace_id=workspace.id,
+    )
+
+    assert preview.operations[0].before_exists is False
+    assert preview.operations[0].after_exists is True
+    assert not (tmp_path / "tests").exists()
+
+    result = await service.apply(
+        transaction,
+        workspace_manager=manager,
+        task_id=workspace.task_id,
+        workspace_id=workspace.id,
+    )
+
+    assert result.resulting_generation == 2
+    assert (tmp_path / "tests/fixtures/cache_case.py").read_text(
+        encoding="utf-8"
+    ) == "VALUE = 1\n"
+
+
+@pytest.mark.asyncio
+async def test_nested_create_removes_new_parents_on_publish_failure(
+    tmp_path: Path,
+    monkeypatch,
+):
+    manager, workspace = _manager_for(tmp_path)
+    transaction = EditTransaction(
+        "nested-create-rollback-1",
+        workspace.id,
+        workspace.generation,
+        (
+            _operation(
+                "create",
+                "nested/tests/test_cache.py",
+                expected_exists=False,
+                content="VALUE = 1\n",
+            ),
+        ),
+    )
+    original_write_bytes = SafeWorkspaceFS.write_bytes
+
+    def fail_after_publish(self, path, content, **kwargs):
+        original_write_bytes(self, path, content, **kwargs)
+        raise OSError("injected nested transaction failure")
+
+    monkeypatch.setattr(SafeWorkspaceFS, "write_bytes", fail_after_publish)
+    with pytest.raises(EditTransactionApplyError, match="nested transaction failure"):
+        await EditTransactionService().apply(
+            transaction,
+            workspace_manager=manager,
+            task_id=workspace.task_id,
+            workspace_id=workspace.id,
+        )
+
+    assert not (tmp_path / "nested").exists()
+    assert workspace.generation == 1
+
+
+@pytest.mark.asyncio
 async def test_preview_serializes_with_workspace_mutations(tmp_path: Path):
     target = tmp_path / "app.py"
     target.write_text("old\n", encoding="utf-8")

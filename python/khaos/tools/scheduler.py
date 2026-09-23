@@ -16,7 +16,12 @@ from typing import Any, cast
 
 from khaos.agent.approval import StepExecutionAuthority
 from khaos.coding.execution.capability import DockerSandboxDecision, SandboxDecision
-from khaos.coding.execution.environment import is_non_inheritable_secret_key
+from khaos.coding.execution.environment import (
+    TASK_ENVIRONMENT_KEYS,
+    is_non_inheritable_secret_key,
+    split_command_environment,
+    validate_command_environment,
+)
 from khaos.coding.execution.identity import (
     container_command_identity,
     executable_identity,
@@ -76,6 +81,7 @@ from khaos.tools.budget import (
 from khaos.tools.execution_coordinator import ToolExecutionCoordinator
 from khaos.tools.operation_store import OperationClaim, ToolOperationStore
 from khaos.tools.registry import ToolInvocationBroker, ToolRegistry
+from khaos.tools.result_codec import ToolResultCodec
 from khaos.tools.result_finalizer import ToolResultFinalizer
 from khaos.tools.result_store import ToolResultStore
 from khaos.tools.scheduler_models import (
@@ -190,6 +196,10 @@ class ToolScheduler:
         self._result_finalizer = ToolResultFinalizer(
             audit_writer=self.permission_engine,
             operation_store=self._operation_store,
+            secret_redactor=(
+                getattr(self.security_middleware, "secret_redactor", None)
+                or getattr(self.credential_broker, "secret_redactor", None)
+            ),
         )
         # Approval adapters have their own bounded lifecycle owner. The
         # scheduler only projects PermissionRequest and consumes its result.
@@ -310,11 +320,25 @@ class ToolScheduler:
                         name=normalized["name"],
                         success=False,
                         error="Tool batch exceeds max_batch_calls",
+                        error_code="TOOL_BATCH_LIMIT",
                         arguments=normalized["arguments"],
                     ),
                 )
             return
         if self.budget.is_exhausted:
+            for call in tool_calls:
+                normalized = self._normalize_call(call)
+                yield SchedulerEvent(
+                    event="tool_result",
+                    result=ToolResult(
+                        tool_call_id=normalized["id"],
+                        name=normalized["name"],
+                        success=False,
+                        error="Tool budget exhausted",
+                        error_code="TOOL_BUDGET_EXHAUSTED",
+                        arguments=normalized["arguments"],
+                    ),
+                )
             return
         tool_context = dict(tool_context or {})
         if "credential_broker" not in tool_context:
@@ -908,21 +932,21 @@ class ToolScheduler:
                 call["_authorization_epoch"] = dispatch_epoch
 
         parallel_calls, serial_calls = self.registry.get_parallel_tools(approved_calls)
+        deferred_parallel_calls: list[dict] = []
         if parallel_calls:
             tasks = []
             task_calls: list[dict] = []
             for call in parallel_calls:
                 reservation = await self.budget.reserve(parallel=True)
                 if reservation is None:
-                    await self._close_network_broker(call)
-                    yield SchedulerEvent(
-                        event="tool_result",
-                        result=ToolResult(
-                            tool_call_id=call["id"], name=call["name"],
-                            success=False, error="Tool budget reservation denied",
-                            arguments=call["arguments"],
-                        ),
-                    )
+                    # A parallel reservation can be temporarily unavailable
+                    # while an earlier call holds pessimistic output capacity.
+                    # Defer the call to the serial phase so a small, valid
+                    # read is not turned into a false tool failure merely
+                    # because its batch was larger than the reservation
+                    # window.  The serial phase rechecks the hard budget after
+                    # active parallel calls release their reservations.
+                    deferred_parallel_calls.append(call)
                     continue
                 self._advance_tool_phase(call, ToolPhase.DISPATCHING)
                 tasks.append(
@@ -959,7 +983,7 @@ class ToolScheduler:
                     )
                     continue
                 yield SchedulerEvent(event="tool_result", result=result)
-        for call in serial_calls:
+        for call in [*deferred_parallel_calls, *serial_calls]:
             reservation = await self.budget.reserve(parallel=False)
             if reservation is None:
                 await self._close_network_broker(call)
@@ -970,6 +994,7 @@ class ToolScheduler:
                         name=call["name"],
                         success=False,
                         error="Tool budget exhausted",
+                        error_code="TOOL_BUDGET_EXHAUSTED",
                         arguments=call["arguments"],
                     ),
                 )
@@ -1301,7 +1326,14 @@ class ToolScheduler:
                     tool.name,
                     effect_id,
                 )
-                return result
+                # Preserve structured unknown-effect evidence, but do not
+                # consume the cancellation that belongs to the owning batch.
+                # A deadline/user cancellation must unwind the scheduler so
+                # AgentLoop and the evaluation runner can terminate and
+                # classify the enclosing operation.  Returning the synthetic
+                # result here used to turn a cancelled handler into a normal
+                # tool result, leaving the owner alive after its deadline.
+                raise
             return ToolResult(
                 tool_call_id=call["id"],
                 name=tool.name,
@@ -1454,9 +1486,28 @@ class ToolScheduler:
             # Redaction can change length, so commit the post-redaction size.
             output_chars = _measure_tool_output(output, reservation.output_limit)
         except Exception as exc:  # noqa: BLE001 - delivery failure is reported separately
-            await self._release_best_effort(reservation)
             delivery_status = DELIVERY_DEGRADED
             warning = f"effect completed but result delivery failed: {exc}"
+            effect_receipt = ToolResultCodec.project_applied_effect_receipt(
+                tool.name, output
+            )
+            safe_output = (
+                ToolResultCodec.compact_applied_effect_receipt(effect_receipt)
+                if effect_receipt is not None
+                else ""
+            )
+            if effect_receipt is not None:
+                try:
+                    compact_output_chars = _measure_tool_output(
+                        safe_output, reservation.output_limit
+                    )
+                    await reservation.commit(compact_output_chars)
+                except Exception as commit_error:  # noqa: BLE001 - fail closed on delivery budget
+                    await self._release_best_effort(reservation)
+                    safe_output = ""
+                    warning += f"; compact receipt delivery failed: {commit_error}"
+            else:
+                await self._release_best_effort(reservation)
             audit_error = await self._result_finalizer.audit_best_effort(
                 tool.name,
                 target,
@@ -1483,7 +1534,7 @@ class ToolScheduler:
                 # caller's perspective and carries the degraded delivery
                 # state instead of inviting a blind replay.
                 success=effect_applied,
-                output="",
+                output=safe_output,
                 error="" if effect_applied else str(exc),
                 duration_ms=int((time.monotonic() - start) * 1000),
                 arguments=call["arguments"],
@@ -1493,6 +1544,7 @@ class ToolScheduler:
                 effect_id=effect_id,
                 reconciliation_hint=reconciliation_hint,
                 retry_safe=effect_status == EFFECT_NOT_APPLIED,
+                effect_receipt=effect_receipt,
             )
             result = await self._result_finalizer.finish_and_store(
                 operation_claim,
@@ -1753,11 +1805,30 @@ class ToolScheduler:
                 key: os.environ.get(key, _default_environment_value(key))
                 for key in normalized_environment_keys
             }
-        environment_digest = _canonical_digest(environment_payload)
         executable_scope = call.get("_executable_identity") or tool_context.get(
             "executable_identity"
         )
         argv = _execution_argv_for_authority(tool.name, call.get("arguments", {}))
+        if tool.name == "test_run":
+            command_environment = _command_environment_for_authority(
+                tool.name, call.get("arguments", {})
+            )
+            environment_payload.update(command_environment)
+            normalized_environment_keys = tuple(
+                sorted({*normalized_environment_keys, *command_environment})
+            )
+        # Pytest's cache provider writes ``.pytest_cache`` into the task
+        # worktree.  That is a tool-owned runtime artifact, not a model edit,
+        # but the workspace checkpoint authority must fail closed on any
+        # unaccounted drift.  Bind the deterministic opt-out into the same
+        # approved spawn environment used by ``test_run`` so the handler and
+        # ExecutionService cannot disagree about the process contract.
+        if tool.name == "test_run" and _is_pytest_argv(argv):
+            environment_payload["PYTEST_ADDOPTS"] = "-p no:cacheprovider"
+            normalized_environment_keys = tuple(
+                sorted({*normalized_environment_keys, "PYTEST_ADDOPTS"})
+            )
+        environment_digest = _canonical_digest(environment_payload)
         execution_kind = str(getattr(tool, "execution_kind", "host-sandbox"))
         if execution_kind == "docker" and argv and not executable_scope:
             decision = call.get("_sandbox_decision") or tool_context.get(
@@ -1985,8 +2056,16 @@ class ToolScheduler:
                 )
             return
         if argv:
+            execution_environment = dict(
+                tool_context.get("environment") or os.environ
+            )
+            if tool.name == "test_run":
+                command_environment = _command_environment_for_authority(
+                    tool.name, call.get("arguments", {})
+                )
+                execution_environment.update(command_environment)
             call["_executable_identity"] = executable_identity(
-                argv, tool_context.get("environment") or os.environ
+                argv, execution_environment
             )
         selector = getattr(service, "backend_selector", None)
         selector_method = getattr(selector, "select_async_with_decision", None)
@@ -2299,7 +2378,10 @@ def _execution_argv_for_authority(
             return (shell, "-c", script) if shell and script else ()
         if tool_name == "test_run":
             command = str(arguments.get("command") or "")
-            return tuple(shlex.split(command)) if command else ()
+            if not command:
+                return ()
+            _, argv = split_command_environment(tuple(shlex.split(command)))
+            return argv
         if tool_name == "terminal":
             command = str(arguments.get("command") or "")
             return tuple(shlex.split(command)) if command else ()
@@ -2309,6 +2391,30 @@ def _execution_argv_for_authority(
     except ValueError:
         return ()
     return ()
+
+
+def _command_environment_for_authority(
+    tool_name: str, arguments: dict[str, Any]
+) -> dict[str, str]:
+    """Return approved leading environment assignments for one command."""
+    if tool_name != "test_run":
+        return {}
+    command = str(arguments.get("command") or "")
+    if not command:
+        return {}
+    assignments, _ = split_command_environment(tuple(shlex.split(command)))
+    validate_command_environment(assignments, allowed_keys=TASK_ENVIRONMENT_KEYS)
+    return assignments
+
+
+def _is_pytest_argv(argv: tuple[str, ...]) -> bool:
+    """Recognize direct pytest launches without interpreting model shell text."""
+    for index, value in enumerate(argv):
+        if Path(value).name in {"pytest", "py.test"}:
+            return True
+        if value == "-m" and index + 1 < len(argv) and argv[index + 1] == "pytest":
+            return True
+    return False
 
 
 def _sandbox_writable_for_authority(

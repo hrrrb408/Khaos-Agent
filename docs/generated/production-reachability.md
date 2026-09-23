@@ -17,8 +17,8 @@
 
 ## Import reachability result
 
-- Reachable repository modules: `353`.
-- Resolved import edges: `2967`.
+- Reachable repository modules: `357`.
+- Resolved import edges: `3067`.
 - Forbidden production edges: `0`.
 - Unresolved internal edges: `0`.
 
@@ -79,6 +79,7 @@
 - `khaos.coding.context_engine.compression`
 - `khaos.coding.context_engine.contracts`
 - `khaos.coding.context_engine.discovery`
+- `khaos.coding.context_engine.observability`
 - `khaos.coding.context_engine.selector`
 - `khaos.coding.context_engine.serializer`
 - `khaos.coding.context_engine.service`
@@ -321,10 +322,12 @@
 - `khaos.security.credential_broker`
 - `khaos.security.credential_provider_host`
 - `khaos.security.credential_provider_worker`
+- `khaos.security.credentials`
 - `khaos.security.delegation_issuer`
 - `khaos.security.effective_policy`
 - `khaos.security.git_evidence`
 - `khaos.security.host_network`
+- `khaos.security.identities`
 - `khaos.security.identity_isolation`
 - `khaos.security.kernel_helper_client`
 - `khaos.security.local_trust`
@@ -342,6 +345,7 @@
 - `khaos.security.protocol_boundary`
 - `khaos.security.resource_scope`
 - `khaos.security.sandbox`
+- `khaos.security.secret_redaction`
 - `khaos.security.secret_scanner`
 - `khaos.security.shell_semantics`
 - `khaos.security.windows_native_ffi`

@@ -35,6 +35,8 @@ from khaos.rpc.protocol import (
 from khaos.channels import ChannelType, PlatformMessage, Sender
 from khaos.runtime import RequestContext
 from khaos.runtime.context import local_principal_id
+from khaos.security.credential_broker import CredentialBroker
+from khaos.security.credentials import CredentialRef, InMemoryCredentialStore, SecretValue
 
 
 def _test_ctx(*, principal_id: str = "", session_id: str = "") -> RequestContext:
@@ -1375,9 +1377,31 @@ def test_parse_json_line_rejects_non_object_payload():
 
 
 async def test_load_router_from_nvidia_config(tmp_path, monkeypatch):
-    monkeypatch.setenv("NVIDIA_API_KEY", "secret")
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     config = tmp_path / "config.yaml"
+    credential_ref = CredentialRef.for_provider("nvidia", "test")
+    credential_store = InMemoryCredentialStore()
+    credential_store.put(credential_ref, SecretValue("synthetic-provider-secret"))
+    credential_broker = CredentialBroker()
+    credential_broker.register_credential_store(credential_ref, credential_store)
+    user_config = tmp_path / "home" / ".khaos" / "config.yaml"
+    user_config.parent.mkdir(parents=True)
+    user_config.write_text(
+        f"""
+models:
+  providers:
+    nvidia:
+      type: openai_compatible
+      base_url: "https://integrate.api.nvidia.com/v1"
+      credential_ref: "{credential_ref.to_config()}"
+      models:
+        - name: "qwen/qwen3.5-122b-a10b"
+          max_context_tokens: 32768
+          supports_tools: true
+          supports_vision: false
+""",
+        encoding="utf-8",
+    )
     config.write_text(
         """
 models:
@@ -1388,12 +1412,20 @@ models:
         encoding="utf-8",
     )
 
-    router = load_router_from_config(config, project_root=tmp_path)
-    model = await router.resolve_model("agent_loop")
-    provider = router.provider_manager.get_provider("nvidia")
+    try:
+        router = load_router_from_config(
+            config,
+            project_root=tmp_path,
+            credential_broker=credential_broker,
+        )
+        model = await router.resolve_model("agent_loop")
+        provider = router.provider_manager.get_provider("nvidia")
 
-    assert model.model == "qwen/qwen3.5-122b-a10b"
-    assert provider.api_key == "secret"
+        assert model.model == "qwen/qwen3.5-122b-a10b"
+        assert provider.credential_ref == credential_ref
+        assert not hasattr(provider, "api_key")
+    finally:
+        credential_broker.close()
 
 
 async def test_load_router_rejects_project_provider_before_user_secret_merge(tmp_path, monkeypatch):

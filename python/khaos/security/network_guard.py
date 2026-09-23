@@ -18,7 +18,10 @@ When enabled, ``allowed_domains`` and ``blocked_domains`` are STILL enforced:
   network is enabled.
 
 When network is disabled, all network access is blocked regardless of the
-allowlist.
+allowlist.  A trusted runtime may separately opt in to admitting local
+language-toolchain commands when its execution backend has already proved
+kernel-enforced network isolation; the backend remains the authority that
+blocks egress from the child process.
 
 The guard is intentionally conservative: when in doubt about whether a
 command reaches the network it blocks, matching Codex's "deny by default"
@@ -161,6 +164,24 @@ NETWORK_COMMAND_KEYWORDS = frozenset(
     }
 )
 
+# These executables are useful for local project tests and builds, but the
+# interpreter/toolchain itself can also open sockets.  Keep them in a separate
+# set instead of treating them as intrinsically non-networking.  The
+# NetworkGuard only admits them under ``kernel_network_isolation_proven`` with
+# the effective network policy disabled; the OS-enforced execution backend
+# still supplies the actual deny-all egress boundary.
+ISOLATED_LOCAL_RUNTIME_COMMANDS = frozenset(
+    {
+        "python",
+        "python3",
+        "python3.11",
+        "node",
+        "npm",
+        "pip",
+        "cargo",
+    }
+)
+
 NETWORK_GIT_SUBCOMMANDS = frozenset({"push", "pull", "fetch", "clone", "remote", "ls-remote"})
 
 
@@ -183,8 +204,16 @@ class NetworkGuard:
         blocked_domains: list[str] | None = None,
         *,
         host_authority: HostNetworkAuthority | None = None,
+        kernel_network_isolation_proven: bool = False,
     ):
         self.network_enabled = network_enabled
+        if type(kernel_network_isolation_proven) is not bool:
+            raise ValueError("kernel_network_isolation_proven must be boolean")
+        # This is a composition-root fact, never model-controlled input.  It
+        # is intentionally opt-in so standalone NetworkGuard callers retain
+        # the conservative behaviour of classifying runtimes as potentially
+        # network-capable.
+        self.kernel_network_isolation_proven = kernel_network_isolation_proven
         # H3: three-state — ``None`` means "no allowlist configured"
         # (unrestricted subject to blocklist when network is on); an empty
         # set means "explicitly deny all domains"; a non-empty set is the
@@ -386,6 +415,18 @@ class NetworkGuard:
     def _check_terminal_command(self, command: str) -> NetworkCheckResult:
         """检查终端命令是否涉及网络。"""
         base = self._base_command(command)
+        if (
+            base in ISOLATED_LOCAL_RUNTIME_COMMANDS
+            and not self.network_enabled
+            and self.kernel_network_isolation_proven
+        ):
+            return NetworkCheckResult(
+                allowed=True,
+                reason=(
+                    "local runtime admitted; network denial is enforced by "
+                    "the kernel sandbox"
+                ),
+            )
         if base not in NETWORK_COMMAND_KEYWORDS:
             return NetworkCheckResult(allowed=True, reason="not a network command")
 

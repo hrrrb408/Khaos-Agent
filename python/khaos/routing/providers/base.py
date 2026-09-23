@@ -8,13 +8,10 @@ from collections.abc import AsyncIterator
 import httpx
 
 from khaos.agent.core import Message
-from khaos.exceptions import KhaosError
-from khaos.routing.provider import ModelSpec, ProviderConfig
-
-
-class ProviderError(KhaosError):
-    """Raised when a provider cannot serve a request (auth, network, format)."""
-
+from khaos.exceptions import ProviderError
+from khaos.routing.provider import DiscoveredModel, ModelSpec, ProviderConfig
+from khaos.security.credential_broker import CredentialBroker
+from khaos.security.credentials import CredentialAccessMode
 
 
 class BaseProvider(ABC):
@@ -31,9 +28,15 @@ class BaseProvider(ABC):
     #: The ``type`` string this provider answers to in ``config.yaml``.
     type_name: str = ""
 
-    def __init__(self, config: ProviderConfig, http_client: httpx.AsyncClient | None = None):
+    def __init__(
+        self,
+        config: ProviderConfig,
+        http_client: httpx.AsyncClient | None = None,
+        credential_broker: CredentialBroker | None = None,
+    ):
         self.config = config
         self.http_client = http_client
+        self.credential_broker = credential_broker
 
     @abstractmethod
     async def stream_chat(
@@ -49,6 +52,21 @@ class BaseProvider(ABC):
     def supports(self, model: ModelSpec) -> bool:
         """True when this provider can serve ``model`` (default: yes)."""
         return True
+
+    async def list_models(
+        self,
+        *,
+        access_mode: CredentialAccessMode = CredentialAccessMode.RUNTIME,
+    ) -> list[DiscoveredModel]:
+        """Return provider models when the provider exposes discovery.
+
+        Model discovery is optional because not every provider has a
+        compatible catalog endpoint.  Setup callers must treat this as a
+        typed provider failure rather than silently inventing a model list.
+        """
+        raise ProviderError(
+            f"provider {self.config.name!r} does not support model discovery"
+        )
 
     @staticmethod
     def _client_or_new(http_client: httpx.AsyncClient | None, timeout: int):
@@ -76,6 +94,7 @@ def known_provider_types() -> list[str]:
 def build_provider(
     config: ProviderConfig,
     http_client: httpx.AsyncClient | None = None,
+    credential_broker: CredentialBroker | None = None,
 ) -> BaseProvider:
     """Construct the provider for ``config.type``.
 
@@ -86,7 +105,11 @@ def build_provider(
     cls = _PROVIDER_REGISTRY.get(type_name) or _PROVIDER_REGISTRY.get("openai_compatible")
     if cls is None:  # pragma: no cover - openai_compatible always registers first
         raise ProviderError(f"no provider registered for type {type_name!r}")
-    return cls(config, http_client=http_client)
+    return cls(
+        config,
+        http_client=http_client,
+        credential_broker=credential_broker,
+    )
 
 
 __all__ = [

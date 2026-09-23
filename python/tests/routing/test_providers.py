@@ -17,6 +17,8 @@ from khaos.routing.providers import (
     known_provider_types,
 )
 from khaos.routing.providers.base import ProviderError
+from khaos.security.credential_broker import CredentialBroker
+from khaos.security.credentials import CredentialRef, InMemoryCredentialStore, SecretValue
 
 
 # --- factory & registry --------------------------------------------------
@@ -35,14 +37,14 @@ def test_build_provider_returns_correct_class_per_type():
         ("openai", OpenAICompatibleProvider),
         ("anthropic", AnthropicProvider),
     ]:
-        cfg = ProviderConfig(name="x", base_url="http://x", api_key="k", type=type_name)
+        cfg = ProviderConfig(name="x", base_url="http://x", type=type_name)
         provider = build_provider(cfg)
 
         assert isinstance(provider, expected_cls)
 
 
 def test_build_provider_falls_back_to_openai_for_unknown_type():
-    cfg = ProviderConfig(name="x", base_url="http://x", api_key="k", type="exotic-vendor")
+    cfg = ProviderConfig(name="x", base_url="http://x", type="exotic-vendor")
 
     provider = build_provider(cfg)
 
@@ -53,7 +55,29 @@ def test_build_provider_falls_back_to_openai_for_unknown_type():
 
 
 def _anthropic():
-    return AnthropicProvider(ProviderConfig(name="anthropic", base_url="https://api.anthropic.com", api_key="k", type="anthropic"))
+    return AnthropicProvider(
+        ProviderConfig(
+            name="anthropic", base_url="https://api.anthropic.com", type="anthropic"
+        )
+    )
+
+
+def _authenticated_anthropic():
+    broker = CredentialBroker()
+    ref = CredentialRef.for_provider("anthropic", name="test")
+    store = InMemoryCredentialStore()
+    broker.register_credential_store(ref, store, provider="anthropic")
+    broker.put_provider_credential(ref, SecretValue("k"), provider="anthropic")
+    provider = AnthropicProvider(
+        ProviderConfig(
+            name="anthropic",
+            base_url="https://api.anthropic.com",
+            credential_ref=ref,
+            type="anthropic",
+        ),
+        credential_broker=broker,
+    )
+    return broker, provider
 
 
 def test_anthropic_lifts_system_prompt_to_top_level():
@@ -135,13 +159,15 @@ def test_anthropic_build_payload_shape():
 
 
 def test_anthropic_headers_use_x_api_key_not_bearer():
-    provider = _anthropic()
+    broker, provider = _authenticated_anthropic()
+    try:
+        headers = provider.build_headers()
 
-    headers = provider.build_headers()
-
-    assert headers["x-api-key"] == "k"
-    assert headers["anthropic-version"] == "2023-06-01"
-    assert "authorization" not in headers
+        assert headers["x-api-key"] == "k"
+        assert headers["anthropic-version"] == "2023-06-01"
+        assert "authorization" not in headers
+    finally:
+        broker.close()
 
 
 # --- Anthropic streaming parsing (via httpx mock) ------------------------
@@ -225,9 +251,7 @@ async def test_anthropic_stream_surfaces_http_errors():
 # --- ProviderManager integration -----------------------------------------
 
 
-def test_provider_manager_builds_clients_per_type(monkeypatch):
-    monkeypatch.setenv("NVIDIA_API_KEY", "n")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "a")
+def test_provider_manager_builds_clients_per_type():
     # Use the config.yaml layout: models.providers.<name>.models[]
     manager = ProviderManager.from_config(
         {
@@ -236,7 +260,7 @@ def test_provider_manager_builds_clients_per_type(monkeypatch):
                     "nvidia": {
                         "type": "openai_compatible",
                         "base_url": "http://n",
-                        "api_key": "${NVIDIA_API_KEY}",
+                        "credential_ref": "khaos/providers/nvidia/test",
                         "models": [
                             {"name": "qwen", "max_context_tokens": 32000, "supports_tools": True}
                         ],
@@ -244,7 +268,7 @@ def test_provider_manager_builds_clients_per_type(monkeypatch):
                     "anthropic": {
                         "type": "anthropic",
                         "base_url": "https://api.anthropic.com",
-                        "api_key": "${ANTHROPIC_API_KEY}",
+                        "credential_ref": "khaos/providers/anthropic/test",
                         "models": [
                             {"name": "claude", "max_context_tokens": 200000, "supports_tools": True}
                         ],
@@ -268,7 +292,7 @@ def test_openai_compatible_provider_streams_through_model_client():
     from khaos.routing.model_client import ModelClient
 
     provider = OpenAICompatibleProvider(
-        ProviderConfig(name="x", base_url="http://x", api_key="k", type="openai_compatible")
+        ProviderConfig(name="x", base_url="http://x", type="openai_compatible")
     )
 
     # It wraps a ModelClient internally.
@@ -284,7 +308,6 @@ async def test_router_dispatches_anthropic_model_via_provider_client(monkeypatch
         ProviderConfig(
             name="anthropic",
             base_url="https://api.anthropic.com",
-            api_key="a",
             type="anthropic",
         )
     )

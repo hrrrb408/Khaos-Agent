@@ -17,7 +17,7 @@ models:
 
 defaults:
   mode: office
-  stream_timeout: 120
+  stream_timeout: 600
   compression_threshold: 128000
 
 web:

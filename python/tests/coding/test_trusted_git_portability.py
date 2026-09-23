@@ -78,6 +78,15 @@ def test_locator_is_static_and_ignores_caller_path(
     assert all("/usr/local/bin" not in str(candidate) for candidate in candidates)
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS candidate ordering")
+def test_macos_prefers_concrete_command_line_tools_git() -> None:
+    candidates = PlatformTrustedGitLocator().candidates()
+    assert candidates[:2] == (
+        Path("/Library/Developer/CommandLineTools/usr/bin/git"),
+        Path("/usr/bin/git"),
+    )
+
+
 def test_untrusted_candidate_is_rejected_by_policy(tmp_path: Path) -> None:
     candidate = tmp_path / "git"
     candidate.write_bytes(b"attacker")
@@ -255,12 +264,7 @@ async def test_runner_preflight_fallback_is_cached_by_identity(
         second = await runner.ensure_preflight()
         assert first.status is TrustedGitAvailability.AVAILABLE
         assert second == first
-        expected_calls = (
-            2
-            if sys.platform == "darwin" and runner.executable != Path("/usr/bin/git")
-            else 1
-        )
-        assert calls == expected_calls
+        assert calls == 1
     finally:
         await runner.close()
         broker.close()

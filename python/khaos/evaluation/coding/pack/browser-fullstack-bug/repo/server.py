@@ -1,4 +1,5 @@
 import json
+import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 
@@ -17,4 +18,5 @@ class TaskHandler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    HTTPServer(("127.0.0.1", 0), TaskHandler).serve_forever()
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else 0
+    HTTPServer(("127.0.0.1", port), TaskHandler).serve_forever()

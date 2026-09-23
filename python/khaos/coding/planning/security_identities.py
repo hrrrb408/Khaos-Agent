@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from typing import NewType
 
+from khaos.security.identities import CanonicalWorkspaceId
+
 # These aliases deliberately remain ``NewType`` values for this migration
 # step.  They preserve the string/int wire representation while making it
 # impossible for the type checker to silently exchange identities from
@@ -17,7 +19,6 @@ PrincipalId = NewType("PrincipalId", str)
 ProjectId = NewType("ProjectId", str)
 RuntimeId = NewType("RuntimeId", str)
 TaskId = NewType("TaskId", str)
-CanonicalWorkspaceId = NewType("CanonicalWorkspaceId", str)
 WorkspaceGeneration = NewType("WorkspaceGeneration", int)
 SessionId = NewType("SessionId", str)
 ApprovalRequestId = NewType("ApprovalRequestId", str)

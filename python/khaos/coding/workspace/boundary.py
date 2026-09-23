@@ -251,7 +251,16 @@ class SafeWorkspaceFS:
     ) -> WorkspaceFileSnapshot:
         """Capture a missing or single-link regular file through fixed dirfds."""
         relative = self.relative(target)
-        parent = self._parent(relative)
+        try:
+            parent = self._parent(relative)
+        except WorkspaceBoundaryError as exc:
+            # A missing intermediate directory means the requested leaf is
+            # absent.  Keep the distinction from unsafe parents: _parent()
+            # opens every existing component with O_NOFOLLOW, so only the
+            # FileNotFoundError case is safe to treat as a missing leaf.
+            if isinstance(exc.__cause__, FileNotFoundError):
+                return WorkspaceFileSnapshot(False)
+            raise
         try:
             info = parent.lstat()
             if info is None:
@@ -636,6 +645,15 @@ class SafeWorkspaceFS:
                     )
                 os.close(descriptor)
                 descriptor = child
+        except OSError as exc:
+            if created:
+                try:
+                    self.remove_empty_directories(tuple(created))
+                except Exception as cleanup_error:
+                    raise WorkspaceBoundaryError(
+                        "created parent directory cleanup failed"
+                    ) from cleanup_error
+            raise WorkspaceBoundaryError(str(exc)) from exc
         finally:
             os.close(descriptor)
         return tuple(created)

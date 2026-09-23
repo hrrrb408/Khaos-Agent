@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import sys
@@ -187,6 +188,49 @@ async def test_coding_file_tools_share_safe_workspace_capability(tmp_path):
     assert (await move_file("b.txt", "c.txt", **context))["ok"] is True
     assert (tmp_path / "a.txt").read_text(encoding="utf-8") == "omega gamma"
     assert (tmp_path / "c.txt").read_text(encoding="utf-8") == "omega gamma"
+
+
+@pytest.mark.asyncio
+async def test_coding_write_creates_parent_directories(tmp_path):
+    manager = _workspace_manager(tmp_path)
+
+    result = await write_file(
+        "tests/fixtures/cache_case.py",
+        "VALUE = 1\n",
+        workspace_manager=manager,
+        task_id="task",
+        workspace_id="ws",
+    )
+
+    assert result["bytes"] == len("VALUE = 1\n")
+    assert (tmp_path / "tests/fixtures/cache_case.py").read_text(
+        encoding="utf-8"
+    ) == "VALUE = 1\n"
+
+
+@pytest.mark.asyncio
+async def test_coding_write_removes_created_parent_directories_on_failure(
+    tmp_path, monkeypatch
+):
+    manager = _workspace_manager(tmp_path)
+    original = SafeWorkspaceFS.write_bytes
+
+    def fail_after_publish(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        raise OSError("injected nested post-publish write failure")
+
+    monkeypatch.setattr(SafeWorkspaceFS, "write_bytes", fail_after_publish)
+    with pytest.raises(OSError, match="nested post-publish write"):
+        await write_file(
+            "nested/tests/test_cache.py",
+            "VALUE = 1\n",
+            workspace_manager=manager,
+            task_id="task",
+            workspace_id="ws",
+        )
+
+    assert not (tmp_path / "nested").exists()
+    assert manager.get("ws").generation == 1
 
 
 @pytest.mark.asyncio
@@ -396,3 +440,19 @@ async def test_coding_read_and_search_do_not_follow_workspace_symlinks(tmp_path)
     assert {item["name"] for item in listing["files"]} == {"safe.txt"}
     tree = await tree_view(".", **context)
     assert "leak.txt" not in tree["tree"] and "escape" not in tree["tree"]
+
+
+async def test_coding_read_exposes_edit_transaction_preconditions(tmp_path):
+    content = "one\ntwo\n"
+    (tmp_path / "module.py").write_text(content, encoding="utf-8")
+    manager = _workspace_manager(tmp_path)
+
+    result = await read_file(
+        "module.py",
+        workspace_manager=manager,
+        task_id="task",
+        workspace_id="ws",
+    )
+
+    assert result["content_sha256"] == hashlib.sha256(content.encode()).hexdigest()
+    assert result["workspace_generation"] == 1

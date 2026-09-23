@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, replace
 from typing import Any, Protocol
 
 from khaos.security.protocol_boundary import canonical_json_bytes
+from khaos.security.secret_redaction import SecretRedactor
 from khaos.supervision.contracts import (
     ControlState,
     CurrentActivity,
     PlanProjection,
+    SupervisionActor,
     SupervisionEvent,
     SupervisionEventType,
+    SupervisionSeverity,
     SupervisionStatus,
     TaskSupervisionState,
 )
@@ -156,7 +160,15 @@ def _apply_event(
     ):
         raise SupervisionBindingError("supervision event and state owners differ")
 
-    status = _STATUS_BY_EVENT.get(event.event_type, state.status)
+    try:
+        event_type = SupervisionEventType(event.event_type)
+    except ValueError:
+        event_type = None
+    status = (
+        _STATUS_BY_EVENT.get(event_type, state.status)
+        if event_type is not None
+        else state.status
+    )
     payload_status = payload.get("status")
     if payload_status is not None:
         try:
@@ -333,8 +345,18 @@ def _decode_control(row: Any) -> ControlSnapshot:
 class TaskSupervisionRepository:
     """Own append-only supervision events and their restart-safe projection."""
 
-    def __init__(self, database: SupervisionRepositoryDatabase) -> None:
+    def __init__(
+        self,
+        database: SupervisionRepositoryDatabase,
+        *,
+        secret_redactor: SecretRedactor | None = None,
+    ) -> None:
         self._database = database
+        self._secret_redactor = secret_redactor
+
+    def bind_secret_redactor(self, secret_redactor: SecretRedactor | None) -> None:
+        """Attach the canonical output firewall without changing ownership."""
+        self._secret_redactor = secret_redactor
 
     async def append(
         self,
@@ -353,6 +375,12 @@ class TaskSupervisionRepository:
             raise SupervisionBindingError("event principal does not match owner")
         if event.project_id and event.project_id != owner_project:
             raise SupervisionBindingError("event project does not match owner")
+        safe_payload: Mapping[str, object] = event.payload
+        if self._secret_redactor is not None:
+            candidate = self._secret_redactor.redact_fail_closed(safe_payload)
+            safe_payload = (
+                candidate if isinstance(candidate, Mapping) else {"redacted": True}
+            )
         bound = SupervisionEvent(
             event_id=event.event_id,
             task_id=event.task_id,
@@ -363,7 +391,7 @@ class TaskSupervisionRepository:
             plan_revision=event.plan_revision,
             actor=event.actor,
             severity=event.severity,
-            payload=event.payload,
+            payload=dict(safe_payload),
             created_at=event.created_at,
             principal_id=owner_principal,
             project_id=owner_project,
@@ -414,11 +442,23 @@ class TaskSupervisionRepository:
                     owner_principal,
                     owner_project,
                     persisted.sequence,
-                    persisted.event_type.value,
+                    (
+                        persisted.event_type.value
+                        if isinstance(persisted.event_type, SupervisionEventType)
+                        else persisted.event_type
+                    ),
                     persisted.repository_generation,
                     persisted.plan_revision,
-                    persisted.actor.value,
-                    persisted.severity.value,
+                    (
+                        persisted.actor.value
+                        if isinstance(persisted.actor, SupervisionActor)
+                        else persisted.actor
+                    ),
+                    (
+                        persisted.severity.value
+                        if isinstance(persisted.severity, SupervisionSeverity)
+                        else persisted.severity
+                    ),
                     payload_json,
                     persisted.event_digest,
                     persisted.created_at,

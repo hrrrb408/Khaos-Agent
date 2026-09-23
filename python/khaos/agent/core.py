@@ -9,9 +9,10 @@ import json
 import logging
 import os
 import re
+import sys
 import time
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -56,10 +57,46 @@ _BROWSER_CODING_TOOL_NAMES = frozenset(
 )
 
 
+def _runtime_environment_path() -> str:
+    """Put the running Khaos interpreter ahead of the inherited PATH.
+
+    Coding tasks execute through the approved spawn plan, so the environment
+    captured here is the one later materialized by the tool handlers.  A
+    virtual environment normally contains all of Khaos's test/runtime tools,
+    but its ``bin`` directory is not necessarily present in the operator's
+    interactive PATH.  Keep the parent PATH for non-Python project tools,
+    while making both ``python`` and ``python3`` resolve to the interpreter
+    that owns this Khaos process.
+    """
+    configured_path = os.environ.get("PATH") or os.defpath
+    executable = getattr(sys, "executable", "")
+    runtime_bin = ""
+    if (
+        isinstance(executable, str)
+        and executable
+        and "\x00" not in executable
+        and os.path.isabs(executable)
+    ):
+        # Do not resolve the executable symlink: the lexical venv/bin
+        # directory contains the venv's scripts and is the intended
+        # runtime surface for child tools.
+        runtime_bin = os.path.dirname(executable)
+
+    entries = [runtime_bin] if runtime_bin else []
+    entries.extend(
+        entry
+        for entry in configured_path.split(os.pathsep)
+        if entry and entry != runtime_bin
+    )
+    return os.pathsep.join(entries) or os.defpath
+
+
 def _default_runtime_environment(key: str) -> str:
     """Return the deterministic value used in the spawn authority snapshot."""
     if key == "PATH":
-        return os.defpath
+        return _runtime_environment_path()
+    if key == "PYTHONDONTWRITEBYTECODE":
+        return "1"
     if key == "LANG":
         return "C.UTF-8"
     return ""
@@ -212,6 +249,7 @@ class StopReason(Enum):
     TOOL_USE = "tool_use"
     MAX_TURNS = "max_turns"
     MAX_BUDGET = "max_budget"
+    TOOL_BUDGET_EXHAUSTED = "tool_budget_exhausted"
     USER_ABORT = "user_abort"
     ERROR = "error"
 
@@ -222,7 +260,7 @@ class AgentConfig:
 
     max_turns: int = 100
     max_budget_tokens: int = 500000
-    stream_timeout: int = 120
+    stream_timeout: int = 600
     compression_threshold: int = 128000
     # Token budget for the injected project-structure tree (coding mode only).
     project_structure_token_budget: int = 2000
@@ -421,6 +459,11 @@ class AgentLoop:
         # projection.  The bundle is turn-local and never becomes authority;
         # ContextEngineService consumes its bounded candidate records.
         self._active_context_bundle = None
+        # Passive evaluation observability sink.  It receives only typed,
+        # bounded context metadata and never participates in execution,
+        # admission, verification, or completion authority.
+        self._observability_sink = None
+        self._context_selection_observer_bound = False
         # Phase 6: 项目约定文件加载器（KHAOS.md / AGENTS.md）。注入优先级
         # 高于 memory / skill，因为它们是项目级硬规则。
         self.project_context_loader = project_context_loader
@@ -465,6 +508,11 @@ class AgentLoop:
         self.active_workspace = None
         self._active_session_id = ""
         self._active_task_id: str | None = None
+        # Evaluation adapters need the task identity after ``run`` has
+        # finalized its turn.  Keep the last bound identity as an
+        # observability/cleanup projection; it never grants lifecycle or
+        # completion authority.
+        self._last_task_id: str | None = None
         self._supervision_runtime_registered = False
         self._recovery_cycles_this_turn = 0
         self._context_needs_rebuild = False
@@ -508,6 +556,7 @@ class AgentLoop:
         self.subagent_spawner = subagent_spawner
         self.subagent_control_coordinator = subagent_control_coordinator
         self.credential_broker = credential_broker
+        self.secret_redactor = getattr(credential_broker, "secret_redactor", None)
         self.channel_admins = (
             channel_admins if channel_admins is not None else frozenset()
         )
@@ -596,6 +645,49 @@ class AgentLoop:
                 for call in tool_calls
             ]
         )
+
+    @staticmethod
+    async def _checkpoint_rejection_events(
+        tool_calls: list[dict[str, Any]],
+    ) -> AsyncIterator[Any]:
+        """Return typed no-effect results when mutation admission cannot checkpoint.
+
+        Checkpoint capture is a prerequisite fence for Coding mutations.  A
+        failed capture must therefore prevent the entire model-produced batch
+        from reaching the scheduler, but it is still a normal, retryable
+        tool-admission observation: no handler has started and no effect is
+        uncertain.  Keeping this projection at the AgentLoop boundary lets
+        the model re-read/reconcile the workspace instead of converting a
+        safe rejection into an outer-loop ``AGENT_ERROR``.
+        """
+        from khaos.tools.scheduler_models import (
+            EFFECT_NOT_STARTED,
+            SchedulerEvent,
+            ToolResult,
+        )
+
+        for call in tool_calls:
+            arguments = call.get("arguments", {})
+            if not isinstance(arguments, dict):
+                arguments = {}
+            yield SchedulerEvent(
+                event="tool_result",
+                result=ToolResult(
+                    tool_call_id=str(call.get("id") or ""),
+                    name=str(call.get("name") or ""),
+                    success=False,
+                    error=(
+                        "coding tool batch was not executed because the required "
+                        "pre-edit checkpoint was unavailable; no tool effect was "
+                        "started. Re-read the workspace and retry through "
+                        "EditTransaction."
+                    ),
+                    error_code="CHECKPOINT_UNAVAILABLE",
+                    arguments=arguments,
+                    effect_status=EFFECT_NOT_STARTED,
+                    retry_safe=True,
+                ),
+            )
 
     @staticmethod
     def _finish_turn_phase(
@@ -693,6 +785,34 @@ class AgentLoop:
             metadata=metadata,
             created_at=time.time(),
         )
+
+    def bind_observability_sink(self, sink: object | None) -> None:
+        """Attach a passive observer for typed context selections."""
+
+        self._observability_sink = sink
+        binder = getattr(self.context_engine, "bind_selection_observer", None)
+        if callable(binder):
+            binder(self._observe_context_selection if sink is not None else None)
+            self._context_selection_observer_bound = True
+
+    def _observe_context_selection(
+        self,
+        context: object,
+        repo_bundle: object | None = None,
+    ) -> None:
+        """Forward one Context Engine result to passive evaluation telemetry."""
+
+        observer = self._observability_sink
+        record_selection = getattr(observer, "record_context_selection", None)
+        if not callable(record_selection):
+            return
+        try:
+            record_selection(context, repo_bundle=repo_bundle)
+        except Exception:
+            logger.warning(
+                "context observability sink rejected a selection snapshot",
+                exc_info=True,
+            )
 
     async def run(
         self,
@@ -938,6 +1058,7 @@ class AgentLoop:
             )
 
             turn_count = 0
+            model_response_count = 0
 
             while turn_count < self.config.max_turns:
                 if orchestration_phase.phase is not TurnPhase.MODEL_EXECUTING:
@@ -948,6 +1069,7 @@ class AgentLoop:
                     budget_exhausted = True
                     stop_reason = StopReason.MAX_BUDGET.value
                     break
+                checkpoint_rejected = False
                 if (
                     active_task_id
                     and self.supervision_service is not None
@@ -1002,10 +1124,12 @@ class AgentLoop:
                     assistant_content = ""
                     tool_calls: list[dict] = []
                     stop_reason = StopReason.END_TURN.value
+                    model_response_count += 1
+                    model_response_id = f"{turn.turn_id}:{model_response_count}"
                     tools_schema = self._build_tools_schema(user_input)
                     call_kwargs = {"tools": tools_schema} if tools_schema is not None else {}
 
-                    async for chunk in self.router.call(
+                    async for chunk in self._stream_model_response(
                         self.mode_manager.mode_config.preferred_model_function,
                         messages,
                         **call_kwargs,
@@ -1014,6 +1138,7 @@ class AgentLoop:
                             chunk.metadata.update({
                                 "turn_id": turn.turn_id,
                                 "attempt_id": turn.attempt_id,
+                                "model_response_id": model_response_id,
                                 "orchestration_phase": orchestration_phase.phase.value,
                                 "orchestration_phase_digest": orchestration_phase.digest(),
                             })
@@ -1089,12 +1214,22 @@ class AgentLoop:
                                         **tool_call,
                                         "turn_id": turn.turn_id,
                                         "attempt_id": turn.attempt_id,
+                                        "model_response_id": model_response_id,
                                         "event_sequence": turn_event.sequence,
                                     },
                                     created_at=time.time(),
                                 )
                         if chunk.stop_reason:
                             stop_reason = chunk.stop_reason
+
+                    # A few OpenAI-compatible endpoints report ``stop``
+                    # after emitting structured tool calls.  Tool calls are
+                    # authoritative for the next AgentLoop phase: letting a
+                    # misleading finish reason fall through would skip the
+                    # scheduler, then make TurnCoordinator reject the
+                    # terminal event because the calls have no results.
+                    if tool_calls:
+                        stop_reason = StopReason.TOOL_USE.value
 
                     if budget_exhausted:
                         break
@@ -1157,6 +1292,7 @@ class AgentLoop:
                         "tool_calls": list(tool_calls)[:32],
                         "turn_id": turn.turn_id,
                         "attempt_id": turn.attempt_id,
+                        "model_response_id": model_response_id,
                     },
                 )
                 messages.append(assistant_msg)
@@ -1237,11 +1373,21 @@ class AgentLoop:
                             getattr(active_workspace, "worktree_path", "")
                         ),
                         "environment_keys": (
-                            "LANG", "LC_ALL", "PATH", "TMPDIR"
+                            "LANG", "LC_ALL", "PATH", "TMPDIR",
+                            "PYTHONDONTWRITEBYTECODE",
                         ),
                         "environment": {
-                            key: os.environ.get(key, _default_runtime_environment(key))
-                            for key in ("LANG", "LC_ALL", "PATH", "TMPDIR")
+                            key: (
+                                _default_runtime_environment(key)
+                                if key in {"PATH", "PYTHONDONTWRITEBYTECODE"}
+                                else os.environ.get(
+                                    key, _default_runtime_environment(key)
+                                )
+                            )
+                            for key in (
+                                "LANG", "LC_ALL", "PATH", "TMPDIR",
+                                "PYTHONDONTWRITEBYTECODE",
+                            )
                         },
                         "sandbox_backend": execution_backend_identity,
                         "workspace_manager": self.workspace_manager,
@@ -1374,6 +1520,13 @@ class AgentLoop:
                             raise PermissionError(
                                 "mutating Coding work requires a checkpoint owner"
                             )
+                        from khaos.coding.checkpoints.repository import (
+                            CheckpointRepositoryError,
+                        )
+                        from khaos.coding.workspace.boundary import (
+                            WorkspaceBoundaryError,
+                        )
+
                         try:
                             await self.checkpoint_service.create_checkpoint(
                                 task_id=active_task_id,
@@ -1384,7 +1537,11 @@ class AgentLoop:
                                 principal_id=self.principal_id,
                                 project_id=self.project_id,
                             )
-                        except Exception as exc:
+                        except CheckpointRepositoryError:
+                            # Repository binding/collision errors are durable
+                            # integrity failures, not model-retryable absence.
+                            raise
+                        except (OSError, RuntimeError, WorkspaceBoundaryError) as exc:
                             logger.warning(
                                 "pre-edit checkpoint refused: %s",
                                 type(exc).__name__,
@@ -1394,16 +1551,16 @@ class AgentLoop:
                                 workspace_id=self.active_workspace.id,
                                 principal_id=self.principal_id,
                                 project_id=self.project_id,
-                                event_type="task.failed",
+                                event_type="capability.denied",
                                 payload={
-                                    "reason": "pre-edit checkpoint unavailable",
+                                    "capability_id": "coding.edit_transaction",
+                                    "reason_code": "CHECKPOINT_UNAVAILABLE",
                                     "error_type": type(exc).__name__,
+                                    "status": "not_started",
                                 },
-                                severity="error",
+                                severity="warning",
                             )
-                            raise PermissionError(
-                                "pre-edit checkpoint is required before mutation"
-                            ) from exc
+                            checkpoint_rejected = True
                     await self.supervision_service.emit(
                         task_id=active_task_id,
                         workspace_id=getattr(self.active_workspace, "id", ""),
@@ -1431,7 +1588,14 @@ class AgentLoop:
                 )
                 if "tool_context" not in inspect.signature(self.tool_scheduler.stream_batch).parameters:
                     stream_args.pop("tool_context")
-                event_stream = self.tool_scheduler.stream_batch(tool_calls, self.mode_manager.current_mode.value, **stream_args)
+                if checkpoint_rejected:
+                    # A mutation-bearing batch is rejected as a whole.  This
+                    # preserves batch atomicity and avoids dispatching a
+                    # sibling terminal/extension call when the required
+                    # mutation checkpoint could not be captured.
+                    event_stream = self._checkpoint_rejection_events(tool_calls)
+                else:
+                    event_stream = self.tool_scheduler.stream_batch(tool_calls, self.mode_manager.current_mode.value, **stream_args)
                 verification_phase_entered = False
                 async for event in event_stream:
                     if event.permission_request is not None:
@@ -1519,6 +1683,14 @@ class AgentLoop:
                         )
                     if event.result is not None:
                         result = event.result
+                        if str(result.error_code or "").upper() == "TOOL_BUDGET_EXHAUSTED":
+                            # ToolBudget is the authoritative execution
+                            # boundary.  Preserve its typed outcome through
+                            # the normal AgentLoop terminal path instead of
+                            # allowing an empty scheduler stream to become a
+                            # generic agent-loop failure.
+                            budget_exhausted = True
+                            stop_reason = StopReason.TOOL_BUDGET_EXHAUSTED.value
                         bounded_envelope = None
                         if self.context_engine is not None:
                             bounded_envelope = self.context_engine.bound_tool_result(result)
@@ -1714,7 +1886,9 @@ class AgentLoop:
                                 # to completion or repair logic.
                                 self.verification_coordinator.invalidate(active_task_id)
                                 edit_result = edit_transaction_result_from_tool_output(
-                                    result.output
+                                    result.effect_receipt
+                                    if result.effect_receipt is not None
+                                    else result.output
                                 )
                                 if self.checkpoint_service is not None:
                                     await self.checkpoint_service.record_transaction(
@@ -1953,7 +2127,7 @@ class AgentLoop:
                                         {"summary": "autonomous verification is green"},
                                         task_id=active_task_id,
                                     )
-                                await self._persist_message(
+                                async for observed_message in self._persist_and_stream_message(
                                     session_id,
                                     verification_msg,
                                     task_id=active_task_id,
@@ -1963,7 +2137,8 @@ class AgentLoop:
                                     commit_sha=getattr(
                                         self.active_workspace, "base_sha", None
                                     ),
-                                )
+                                ):
+                                    yield observed_message
                                 if self.task_manager is not None and active_task_id:
                                     if autonomous_run.status.value == "passed":
                                         await self.task_manager.update_status(
@@ -2026,14 +2201,15 @@ class AgentLoop:
                                     created_at=time.time(),
                                 )
                                 messages.append(unavailable_msg)
-                                await self._persist_message(
+                                async for observed_message in self._persist_and_stream_message(
                                     session_id,
                                     unavailable_msg,
                                     task_id=active_task_id,
                                     workspace_id=getattr(
                                         self.active_workspace, "id", None
                                     ),
-                                )
+                                ):
+                                    yield observed_message
                         if result.name == "test_run" and self.task_manager is not None and active_task_id:
                             await self.task_manager.update_status(active_task_id, "waiting_test")
                         if result.name == "test_run":
@@ -2333,8 +2509,11 @@ class AgentLoop:
                     )
             terminal_status = (
                 "failed"
-                if stop_reason == StopReason.MAX_BUDGET.value
-                and turn.active_tool_calls
+                if stop_reason == StopReason.TOOL_BUDGET_EXHAUSTED.value
+                or (
+                    stop_reason == StopReason.MAX_BUDGET.value
+                    and turn.active_tool_calls
+                )
                 else "completed"
             )
             orchestration_phase = self._finish_turn_phase(
@@ -2344,22 +2523,37 @@ class AgentLoop:
             terminal = await turn.terminal(
                 terminal_status,
                 reason=stop_reason or StopReason.END_TURN.value,
-                error_code=("MAX_BUDGET" if terminal_status == "failed" else None),
+                error_code=(
+                    "TOOL_BUDGET_EXHAUSTED"
+                    if stop_reason == StopReason.TOOL_BUDGET_EXHAUSTED.value
+                    else "MAX_BUDGET"
+                    if terminal_status == "failed"
+                    else None
+                ),
             )
             if terminal_status == "failed":
+                error_code = (
+                    "TOOL_BUDGET_EXHAUSTED"
+                    if stop_reason == StopReason.TOOL_BUDGET_EXHAUSTED.value
+                    else "MAX_BUDGET"
+                )
                 yield Message(
                     role="system",
                     content=(
-                        "token budget exhausted; outstanding tool calls were not "
-                        "executed"
+                        "tool budget exhausted; outstanding tool calls were not executed"
+                        if error_code == "TOOL_BUDGET_EXHAUSTED"
+                        else "token budget exhausted; outstanding tool calls were not executed"
                     ),
                     stop_reason="error",
                     event="error",
                     metadata={
-                        "code": "MAX_BUDGET",
+                        "code": error_code,
                         "message": (
-                            "Token budget exhausted with outstanding tool calls."
+                            "Tool call budget exhausted with outstanding tool calls."
+                            if error_code == "TOOL_BUDGET_EXHAUSTED"
+                            else "Token budget exhausted with outstanding tool calls."
                         ),
+                        "terminal_status": terminal_status,
                         "turn_id": turn.turn_id,
                         "attempt_id": turn.attempt_id,
                         "event_sequence": terminal.sequence,
@@ -2379,6 +2573,8 @@ class AgentLoop:
                         "turn_id": turn.turn_id,
                         "attempt_id": turn.attempt_id,
                         "event_sequence": terminal.sequence,
+                        "terminal_status": terminal_status,
+                        "terminal_reason": stop_reason,
                         "orchestration_phase": orchestration_phase.phase.value,
                         "orchestration_phase_digest": orchestration_phase.digest(),
                     },
@@ -2411,10 +2607,17 @@ class AgentLoop:
                     "interrupted", reason="user-cancelled", error_code="USER_ABORT"
                 )
             raise
-        except Exception as exc:
-            logger.exception("Agent loop error")
+        except Exception as exc:  # noqa: BLE001 - outer loop must fail closed
+            safe_error = (
+                self.secret_redactor.safe_error(exc)
+                if self.secret_redactor is not None
+                else type(exc).__name__
+            )
+            logger.error("Agent loop error type=%s", type(exc).__name__)
             if self.task_manager is not None and active_task_id:
-                await self.task_manager.update_status(active_task_id, "failed", error=str(exc))
+                await self.task_manager.update_status(
+                    active_task_id, "failed", error=safe_error
+                )
             if (
                 self.supervision_service is not None
                 and self._supervision_runtime_registered
@@ -2441,6 +2644,8 @@ class AgentLoop:
             error_code = (
                 "COMPRESSION_CIRCUIT_OPEN"
                 if isinstance(exc, CompressionCircuitOpenError)
+                else "MODEL_TIMEOUT"
+                if isinstance(exc, (asyncio.TimeoutError, TimeoutError))
                 else "ORCHESTRATION_PHASE_ERROR"
                 if isinstance(exc, OrchestrationPhaseError)
                 else "INTERNAL_ERROR"
@@ -2464,12 +2669,12 @@ class AgentLoop:
             else:
                 yield Message(
                     role="system",
-                    content=f"error: {exc}",
+                    content=f"error: {safe_error}",
                     stop_reason="error",
                     event="error",
                     metadata={
                         "code": error_code,
-                        "message": str(exc),
+                        "message": safe_error,
                         "turn_id": turn.turn_id,
                         "attempt_id": turn.attempt_id,
                         "event_sequence": (
@@ -2495,6 +2700,7 @@ class AgentLoop:
                     logger.exception(
                         "failed to persist interrupted turn: %s", turn.turn_id
                     )
+            self._last_task_id = active_task_id
             self._active_task_id = None
             if (
                 self.supervision_service is not None
@@ -2507,6 +2713,30 @@ class AgentLoop:
                     project_id=self.project_id,
                 )
                 self._supervision_runtime_registered = False
+
+    async def _persist_and_stream_message(
+        self,
+        session_id: str,
+        message: Message,
+        *,
+        task_id: str | None = None,
+        workspace_id: str | None = None,
+        repo_id: str | None = None,
+        commit_sha: str | None = None,
+        branch: str | None = None,
+    ) -> AsyncIterator[Message]:
+        """Persist one observation before exposing it to passive observers."""
+
+        await self._persist_message(
+            session_id,
+            message,
+            task_id=task_id,
+            workspace_id=workspace_id,
+            repo_id=repo_id,
+            commit_sha=commit_sha,
+            branch=branch,
+        )
+        yield message
 
     async def _persist_message(
         self,
@@ -2530,13 +2760,34 @@ class AgentLoop:
         ``insert_message``'s ``ON CONFLICT`` does NOT touch
         ``project_id`` — owner-preserving.
         """
+        persisted_message = message
+        if self.secret_redactor is not None:
+            redactor = self.secret_redactor
+            safe_tool_calls = redactor.redact_fail_closed(message.tool_calls)
+            safe_metadata = redactor.redact_fail_closed(message.metadata)
+            persisted_message = replace(
+                message,
+                content=redactor.redact_text(message.content),
+                tool_calls=(
+                    safe_tool_calls if isinstance(safe_tool_calls, list) else []
+                ),
+                metadata=(
+                    dict(safe_metadata)
+                    if isinstance(safe_metadata, dict)
+                    else {"redacted": True}
+                ),
+            )
         rowid = await self.db.insert_message(
-            session_id, message,
+            session_id, persisted_message,
             principal_id=self.principal_id,
             project_id=self.project_id,
         )
         await self.db.insert_message_fts(
-            session_id, message.role, message.content, message.token_count, rowid=rowid
+            session_id,
+            persisted_message.role,
+            persisted_message.content,
+            persisted_message.token_count,
+            rowid=rowid,
         )
         # Memory V2 observes the durable message after the canonical session
         # write.  Event-ledger failure is deliberately isolated from the
@@ -2546,7 +2797,7 @@ class AgentLoop:
         if callable(record_event):
             try:
                 await record_event(
-                    message,
+                    persisted_message,
                     session_id=session_id,
                     task_id=(
                         task_id
@@ -2616,6 +2867,26 @@ class AgentLoop:
                 self.config.max_budget_tokens,
             )
         return exceeded
+
+    async def _stream_model_response(
+        self,
+        function: str,
+        messages: list[Message],
+        **kwargs: Any,
+    ) -> AsyncIterator[Message]:
+        """Stream one model response under the configured hard deadline.
+
+        Provider transports have their own timeout settings, but the
+        AgentLoop must also bound the model-facing stream when a custom or
+        shared transport does not carry those settings. This keeps an
+        unresponsive provider from outliving the current turn and allows the
+        normal typed error boundary to classify the timeout.
+        """
+
+        timeout_seconds = max(1, int(self.config.stream_timeout))
+        async with asyncio.timeout(timeout_seconds):
+            async for chunk in self.router.call(function, messages, **kwargs):
+                yield chunk
 
     def _ensure_completion_controller(self) -> CompletionProposalController | None:
         """Build the default proposal controller for a DB-backed coding task.
@@ -3246,11 +3517,18 @@ class AgentLoop:
 
         if stop_reason == StopReason.MAX_TURNS.value:
             await self.task_manager.update_status(task_id, TaskStatus.FAILED, error="max_turns exhausted without completion")
-        elif stop_reason == StopReason.MAX_BUDGET.value:
+        elif stop_reason in {
+            StopReason.MAX_BUDGET.value,
+            StopReason.TOOL_BUDGET_EXHAUSTED.value,
+        }:
             await self.task_manager.update_status(
                 task_id,
                 TaskStatus.FAILED,
-                error="token budget exhausted without completion",
+                error=(
+                    "tool call budget exhausted without completion"
+                    if stop_reason == StopReason.TOOL_BUDGET_EXHAUSTED.value
+                    else "token budget exhausted without completion"
+                ),
             )
         elif self.verify_fix_loop is not None:
             verification_state = self.verify_fix_loop.verification_state
@@ -3358,6 +3636,11 @@ class AgentLoop:
                 operation=self._context_operation(user_input),
                 target_path=self._context_target_path(user_input),
             )
+            if not self._context_selection_observer_bound:
+                self._observe_context_selection(
+                    context,
+                    self._active_context_bundle,
+                )
             return [self._context_message_to_message(message) for message in context.messages]
         return await self._build_legacy_context(session_id, user_input)
 
@@ -4004,6 +4287,16 @@ class AgentLoop:
         tool_defs = registry.list_by_mode(mode)
         if not tool_defs:
             return None
+        if mode == "coding":
+            from khaos.coding.context_engine.discovery import (
+                LEGACY_CODING_MUTATION_TOOL_NAMES,
+            )
+
+            tool_defs = [
+                tool_def
+                for tool_def in tool_defs
+                if tool_def.name not in LEGACY_CODING_MUTATION_TOOL_NAMES
+            ]
         return [
             {
                 "type": "function",

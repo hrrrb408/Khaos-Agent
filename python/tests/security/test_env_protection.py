@@ -81,6 +81,7 @@ def fake_credential_env(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-secret-9876543210")
     monkeypatch.setenv("MY_DB_PASSWORD", "supersecret")
     monkeypatch.setenv("GITHUB_TOKEN", "ghp_abcdef1234567890")
+    monkeypatch.setenv("PYTHONPATH", "/tmp/untrusted-python-path")
 
 
 def test_safe_env_excludes_api_keys(fake_credential_env) -> None:
@@ -91,6 +92,7 @@ def test_safe_env_excludes_api_keys(fake_credential_env) -> None:
     assert "ANTHROPIC_API_KEY" not in env
     assert "MY_DB_PASSWORD" not in env
     assert "GITHUB_TOKEN" not in env
+    assert "PYTHONPATH" not in env
 
 
 def test_safe_env_includes_path(fake_credential_env) -> None:

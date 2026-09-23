@@ -265,15 +265,31 @@ def test_systemd_units_deprivilege_python_and_pin_helper_client_pid() -> None:
     assert "KHAOS_BROWSER_KERNEL_HELPER_CLIENT_PID" in helper
     assert "KHAOS_BROWSER_HELPER_NETNS_ROOT=/run/khaos-helper/netns" in helper
     assert "KHAOS_BROWSER_HELPER_CGROUP_ROOT=/sys/fs/cgroup/khaos-browser" in helper
-    assert "CAP_NET_ADMIN CAP_SYS_ADMIN" in helper
+    assert "CAP_NET_ADMIN CAP_SYS_ADMIN CAP_KILL CAP_CHOWN CAP_FOWNER" in helper
     assert "sha256sum" in helper
     assert ".sha256" in helper
     assert "/run/netns" not in helper
+    assert "Environment=HOME=/var/lib/khaos" in agent
+    assert "Environment=PLAYWRIGHT_BROWSERS_PATH=/opt/khaos-playwright" in agent
+    assert (
+        "Environment=KHAOS_CGROUP_ROOT="
+        "/sys/fs/cgroup/system.slice/khaos-agent.service" in agent
+    )
+    assert "Delegate=yes" in agent
+    assert "Environment=KHAOS_PYTHON_CAPABILITY_FILE=/var/lib/khaos/rpc-capability" in agent
+    assert "--db khaos.db" in agent
+    assert "/var/lib/khaos/khaos.db" not in agent
+    assert "ReadWritePaths=/run/khaos /var/lib/khaos/.khaos" in agent
+    assert "ReadWritePaths=/run/khaos /var/lib/khaos/.khaos /run/khaos-helper" not in agent
 
 
 def test_installer_never_grants_kernel_capabilities_to_python() -> None:
     installer = (ROOT / "scripts/install-native-tcb.sh").read_text(encoding="utf-8")
 
+    assert "useradd --system --uid 10001 --home-dir /var/lib/khaos" in installer
+    assert 'id -u khaos)" -ne 10001' in installer
+    assert "/var/lib/khaos/rpc-capability" in installer
+    assert "chmod 0400 /var/lib/khaos/rpc-capability" in installer
     assert "setcap cap_sys_admin=ep /usr/local/bin/khaos-sandbox-launcher" in installer
     assert "/usr/local/bin/khaos-execution-sandbox-launcher" in installer
     assert "setcap cap_sys_admin=ep /usr/local/bin/khaos-execution-sandbox-launcher" not in installer
@@ -282,6 +298,14 @@ def test_installer_never_grants_kernel_capabilities_to_python() -> None:
     assert "setcap" not in "\n".join(
         line for line in installer.splitlines() if "python" in line.lower()
     )
+    assert "install -d -o khaos -g khaos -m 0700 /var/lib/khaos/.khaos" in installer
+    assert "install -d -o root -g root -m 0755 /opt/khaos-playwright" in installer
+    assert "chown root:root /var/lib/khaos" in installer
+    assert "chmod 0755 /var/lib/khaos" in installer
+    assert "chown root:root /opt/khaos-playwright" in installer
+    assert "chmod 0755 /opt/khaos-playwright" in installer
+    assert "chown khaos:khaos /var/lib/khaos/.khaos" in installer
+    assert "chmod 0700 /var/lib/khaos/.khaos" in installer
 
 
 def test_systemd_execution_launcher_is_capability_free() -> None:

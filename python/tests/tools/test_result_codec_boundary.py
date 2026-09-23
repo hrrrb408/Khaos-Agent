@@ -40,6 +40,54 @@ def test_typed_outcome_rejects_invalid_effect_metadata() -> None:
         )
 
 
+def test_applied_effect_receipt_is_bounded_and_does_not_copy_verbose_output() -> None:
+    output = {
+        "status": "applied",
+        "transaction_id": "tx-1",
+        "workspace_id": "ws-1",
+        "base_generation": 1,
+        "resulting_generation": 2,
+        "transaction_digest": "a" * 64,
+        "before_workspace_digest": "b" * 64,
+        "after_workspace_digest": "c" * 64,
+        "operations": [
+            {
+                "index": 0,
+                "operation": "update",
+                "path": "src/app.py",
+                "destination_path": None,
+                "before_exists": True,
+                "after_exists": True,
+                "before_digest": "d" * 64,
+                "after_digest": "e" * 64,
+            }
+        ],
+        "verbose_diagnostic": "source text that must not enter the receipt" * 1000,
+    }
+
+    receipt = ToolResultCodec.project_applied_effect_receipt(
+        "apply_edit_transaction", output
+    )
+
+    assert receipt is not None
+    assert "verbose_diagnostic" not in receipt
+    assert receipt["operations"][0]["path"] == "src/app.py"
+    compact = ToolResultCodec.compact_applied_effect_receipt(receipt)
+    assert compact["status"] == "applied"
+    assert compact["operation_count"] == 1
+    assert "verbose_diagnostic" not in compact
+
+
+def test_applied_effect_receipt_rejects_malformed_identity() -> None:
+    assert (
+        ToolResultCodec.project_applied_effect_receipt(
+            "apply_edit_transaction",
+            {"status": "applied", "transaction_id": "not-enough-fields"},
+        )
+        is None
+    )
+
+
 def test_durable_result_codec_filters_unknown_fields_and_falls_back_closed() -> None:
     result = ToolResult(
         tool_call_id="call-1",
@@ -72,3 +120,44 @@ def test_durable_result_codec_filters_unknown_fields_and_falls_back_closed() -> 
     assert unresolved.success is False
     assert unresolved.effect_status == EFFECT_UNKNOWN
     assert unresolved.retry_safe is False
+
+
+def test_durable_codec_restores_an_applied_effect_receipt() -> None:
+    receipt = {
+        "status": "applied",
+        "transaction_id": "tx-1",
+        "workspace_id": "ws-1",
+        "base_generation": 1,
+        "resulting_generation": 2,
+        "transaction_digest": "a" * 64,
+        "before_workspace_digest": "b" * 64,
+        "after_workspace_digest": "c" * 64,
+        "operations": [
+            {
+                "index": 0,
+                "operation": "update",
+                "path": "src/app.py",
+                "destination_path": None,
+                "before_exists": True,
+                "after_exists": True,
+                "before_digest": "d" * 64,
+                "after_digest": "e" * 64,
+            }
+        ],
+    }
+    result = ToolResult(
+        tool_call_id="call-1",
+        name="apply_edit_transaction",
+        success=True,
+        output={"status": "applied"},
+        effect_status=EFFECT_APPLIED,
+        effect_receipt=receipt,
+    )
+
+    restored = ToolResultCodec.deserialize_operation_result(
+        {"result_json": ToolResultCodec.serialize_operation_result(result)},
+        call={"id": "call-1", "arguments": {}},
+        tool=SimpleNamespace(name="apply_edit_transaction"),
+    )
+
+    assert restored.effect_receipt == receipt

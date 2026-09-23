@@ -23,6 +23,7 @@ MAX_CONTEXT_ITEM_BYTES = 256 * 1024
 MAX_CONTEXT_METADATA_BYTES = 16 * 1024
 MAX_CONTEXT_ITEMS = 1024
 _HEX_DIGEST = re.compile(r"^[0-9a-f]{64}$")
+_SELECTION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 
 
 class ContextContractError(ValueError):
@@ -137,6 +138,15 @@ class ContextOperation(str, Enum):
     EDITING = "editing"
     VERIFICATION_REPAIR = "verification_repair"
     COMPLETION = "completion"
+
+
+class ContextSelectionReason(str, Enum):
+    """Canonical lifecycle reason for one effective context selection."""
+
+    BUILD = "BUILD"
+    INITIAL_BUILD = "INITIAL_BUILD"
+    REBALANCE = "REBALANCE"
+    CHILD_CONTEXT = "CHILD_CONTEXT"
 
 
 def _validate_text(value: object, *, label: str, max_length: int = 4096) -> str:
@@ -373,7 +383,7 @@ class ContextItem:
     def identity_key(self) -> tuple[object, ...]:
         """Return the stable key used for de-duplication and overlap merging."""
 
-        return (
+        identity = (
             self.kind.value,
             self.source.value,
             self.workspace_id,
@@ -384,6 +394,16 @@ class ContextItem:
             self.region_end,
             self.digest,
         )
+        # Conversation and tool-result items are an ordered protocol
+        # transcript, not a set of interchangeable observations. Two model
+        # turns can have identical text while carrying different tool-call
+        # ids, and collapsing them here can leave a provider-facing assistant
+        # call without its result. Repository/file observations retain the
+        # content identity above so their normal de-duplication behavior is
+        # unchanged.
+        if self.kind in {ContextItemKind.CONVERSATION, ContextItemKind.TOOL_RESULT}:
+            return (*identity, self.sequence)
+        return identity
 
     def reference(self) -> ContextItem:
         """Return a persistence-safe reference with content omitted."""
@@ -868,6 +888,47 @@ class TaskStateSummary:
 
 
 @dataclass(frozen=True, slots=True)
+class ContextSelectionIdentity:
+    """Identity of one Context Engine build result.
+
+    The invocation identity is intentionally separate from the safe content
+    digest.  ``selection_id`` and ``selection_sequence`` identify the build
+    instance; ``selection_digest`` identifies the bounded projection of what
+    that build selected.  No prompt, repository content, credential, or host
+    path is part of this contract.
+    """
+
+    selection_id: str
+    selection_sequence: int
+    selection_reason: str
+    selection_digest: str
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.selection_id) is not str
+            or not _SELECTION_ID.fullmatch(self.selection_id)
+        ):
+            raise ContextContractError("context selection id is invalid")
+        if type(self.selection_sequence) is not int or self.selection_sequence <= 0:
+            raise ContextContractError("context selection sequence is invalid")
+        reason = self.selection_reason
+        if isinstance(reason, ContextSelectionReason):
+            reason = reason.value
+        if type(reason) is not str:
+            raise ContextContractError("context selection reason is invalid")
+        try:
+            reason = ContextSelectionReason(reason).value
+        except ValueError as exc:
+            raise ContextContractError("context selection reason is invalid") from exc
+        object.__setattr__(self, "selection_reason", reason)
+        if (
+            type(self.selection_digest) is not str
+            or not _HEX_DIGEST.fullmatch(self.selection_digest)
+        ):
+            raise ContextContractError("context selection digest is invalid")
+
+
+@dataclass(frozen=True, slots=True)
 class ModelContext:
     """Final bounded provider input and selection evidence."""
 
@@ -877,6 +938,7 @@ class ModelContext:
     context_digest: str
     cache_hit: bool = False
     partial: bool = False
+    selection_identity: ContextSelectionIdentity | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -918,6 +980,30 @@ class ContextMetricsSnapshot:
     extension_context_bytes: int = 0
     extension_tool_schema_bytes: int = 0
     active_skills: int = 0
+    # Last exact selection metadata is intentionally separate from aggregate
+    # counters.  It contains only typed identities/path markers and digests,
+    # never context payload text.
+    context_selection_digest: str | None = None
+    context_selected_repository_paths: tuple[str, ...] = ()
+    context_automatic_repo_items_selected: int | None = None
+    context_tool_acquired_items_selected: int | None = None
+    context_non_repository_items_selected: int | None = None
+    context_selection_observability_schema_version: int | None = None
+    context_selection_detail_status: str | None = None
+    # The exact ordered selection projection is metadata-only.  It is kept
+    # separate from aggregate counters so legacy readers can distinguish a
+    # missing detail projection from a known empty selection.
+    context_selection_metadata: tuple[Mapping[str, object], ...] = ()
+    context_selection_projection_original_count: int | None = None
+    context_selection_projection_persisted_count: int | None = None
+    context_selection_projection_truncated: bool | None = None
+    context_selection_id: str | None = None
+    context_selection_sequence: int | None = None
+    context_selection_reason: str | None = None
+    context_selection_count: int | None = None
+    context_initial_selection_id: str | None = None
+    context_rebalance_count: int | None = None
+    context_selection_history: tuple[Mapping[str, object], ...] = ()
 
     @property
     def memory_items_selected(self) -> int | None:

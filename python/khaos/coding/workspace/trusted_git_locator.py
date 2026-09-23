@@ -40,8 +40,10 @@ class TrustedGitLocator(Protocol):
 class PlatformTrustedGitLocator:
     """Locate the small, statically-reviewed platform candidate set.
 
-    macOS includes the system shim first and the separately installed Command
-    Line Tools binary second.  The latter is intentionally not Homebrew or a
+    macOS includes the separately installed Command Line Tools binary first
+    and the system shim second.  The concrete Command Line Tools binary does
+    not need to resolve the host developer directory, which matters inside a
+    restricted coding sandbox.  It is intentionally not Homebrew or a
     user-installed executable; both paths are subsequently subjected to the
     same root-owner, parent-chain, identity, and digest policy.
     """
@@ -51,7 +53,7 @@ class PlatformTrustedGitLocator:
         if os.name == "nt":
             return (_WINDOWS_GIT,)
         if sys.platform == "darwin":
-            return (_MACOS_SYSTEM_GIT, _MACOS_COMMAND_LINE_TOOLS_GIT)
+            return (_MACOS_COMMAND_LINE_TOOLS_GIT, _MACOS_SYSTEM_GIT)
         return (_LINUX_SYSTEM_GIT,)
 
 

@@ -48,7 +48,12 @@ async def _task_command_async(args: Any) -> int:
     try:
         task_id = args.task_id
         task = await service.get(context, task_id)
-        if "error" in task:
+        # ``CodingTask.to_dict()`` always includes the optional ``error``
+        # field, including for a real task carrying a recoverable or
+        # process-restart diagnostic.  Only the service's explicit not-found
+        # sentinel is an error here; otherwise task control commands such as
+        # cancel must remain usable for blocked/failed-diagnostic tasks.
+        if task.get("error") == "task not found":
             _print(task, as_json=args.as_json)
             return 1
         command = args.task_command

@@ -1,6 +1,21 @@
 """M8.0 Coding capability evaluation, isolated from M7.9 control metrics."""
 
+from khaos.evaluation.coding.benchmark import (
+    LEGACY_OBSERVABILITY_NOT_AVAILABLE,
+    BenchmarkRunConfig,
+    CodingBenchmarkJsonlWriter,
+    CodingBenchmarkResultV1,
+    CodingFailureTaxonomy,
+    CodingQualificationJsonlWriter,
+    CodingQualificationRecordV1,
+    CodingResultState,
+    CodingRootCause,
+    aggregate_benchmark_results,
+    capture_working_tree_identity,
+    infer_root_cause,
+)
 from khaos.evaluation.coding.contracts import (
+    REVIEW_CATEGORY_CONTRACT_V3,
     CodingContractError,
     CodingFailureReason,
     CodingResourceLimits,
@@ -16,6 +31,7 @@ from khaos.evaluation.coding.contracts import (
     FileStateOracleSpec,
     FindingMatchMode,
     OracleKind,
+    ReviewCategory,
     ReviewFindingExpectation,
     ReviewOracleSpec,
 )
@@ -31,6 +47,15 @@ from khaos.evaluation.coding.manifest import (
     load_manifest,
     resolve_fixture_path,
 )
+from khaos.evaluation.coding.metrics import (
+    CodingMetrics,
+    CodingTraceCollector,
+    CodingTraceEvent,
+)
+from khaos.evaluation.coding.observability import (
+    SEMANTIC_ATTRIBUTION_SCHEMA_VERSION,
+    project_review_findings,
+)
 from khaos.evaluation.coding.oracle import (
     CodingOracle,
     CommandExecution,
@@ -40,16 +65,15 @@ from khaos.evaluation.coding.oracle import (
     OracleError,
     OracleEvaluation,
     ReviewFinding,
+    evaluate_review_findings,
     snapshot_tree,
     summarize_diff,
 )
-from khaos.evaluation.coding.repository import (
-    CodingEvaluationConflictError,
-    CodingEvaluationIntegrityError,
-    CodingEvaluationRepository,
-    CodingEvaluationRepositoryError,
+from khaos.evaluation.coding.qualification import (
+    evaluate_p4_v2_findings,
+    evaluate_p4_v3_findings,
+    run_provider_qualification,
 )
-from khaos.evaluation.coding.metrics import CodingMetrics, CodingTraceCollector, CodingTraceEvent
 from khaos.evaluation.coding.report import (
     CodingComparison,
     compare_runs,
@@ -57,11 +81,25 @@ from khaos.evaluation.coding.report import (
     report_markdown,
     report_payload,
 )
+from khaos.evaluation.coding.repository import (
+    CodingEvaluationConflictError,
+    CodingEvaluationIntegrityError,
+    CodingEvaluationRepository,
+    CodingEvaluationRepositoryError,
+)
 from khaos.evaluation.coding.results import (
     AgentExecution,
     CodingEvaluationRun,
     new_run_id,
     utc_timestamp,
+)
+from khaos.evaluation.coding.review_contract import (
+    P4_V3_CATEGORY_ROLE_DEFINITIONS,
+    P4_V3_REQUIRED_FINDING_COUNT,
+    p4_v3_response_schema,
+    p4_v3_schema_digest,
+    validate_p4_v3_response,
+    validate_p4_v3_response_schema,
 )
 from khaos.evaluation.coding.runner import (
     AgentInvokerCallable,
@@ -73,12 +111,25 @@ from khaos.evaluation.coding.sandbox import (
     CodingSandboxUnavailableError,
     build_oracle_execution_service,
 )
-from khaos.evaluation.coding.service import CodingEvaluationService, CodingScenarioSummary
+from khaos.evaluation.coding.service import (
+    CodingEvaluationService,
+    CodingScenarioSummary,
+)
 
 __all__ = [
-    "CodingContractError",
-    "CodingFailureReason",
+    "LEGACY_OBSERVABILITY_NOT_AVAILABLE",
+    "P4_V3_CATEGORY_ROLE_DEFINITIONS",
+    "P4_V3_REQUIRED_FINDING_COUNT",
+    "REVIEW_CATEGORY_CONTRACT_V3",
+    "SEMANTIC_ATTRIBUTION_SCHEMA_VERSION",
+    "AgentExecution",
+    "AgentInvokerCallable",
+    "BenchmarkRunConfig",
+    "CodingAgentInvoker",
+    "CodingBenchmarkJsonlWriter",
+    "CodingBenchmarkResultV1",
     "CodingComparison",
+    "CodingContractError",
     "CodingEvaluationConflictError",
     "CodingEvaluationIntegrityError",
     "CodingEvaluationRepository",
@@ -86,19 +137,23 @@ __all__ = [
     "CodingEvaluationRun",
     "CodingEvaluationRunner",
     "CodingEvaluationService",
+    "CodingFailureReason",
+    "CodingFailureTaxonomy",
     "CodingMetrics",
-    "CodingTraceCollector",
-    "CodingTraceEvent",
-    "RuntimeCodingAgentInvoker",
-    "CodingSandboxUnavailableError",
-    "build_oracle_execution_service",
     "CodingOracle",
+    "CodingQualificationJsonlWriter",
+    "CodingQualificationRecordV1",
     "CodingResourceLimits",
+    "CodingResultState",
+    "CodingRootCause",
     "CodingRunIdentity",
+    "CodingSandboxUnavailableError",
     "CodingScenario",
     "CodingScenarioKind",
     "CodingScenarioManifest",
     "CodingScenarioSummary",
+    "CodingTraceCollector",
+    "CodingTraceEvent",
     "CodingVerdict",
     "CommandExecution",
     "CommandOracleSpec",
@@ -112,27 +167,39 @@ __all__ = [
     "FixtureError",
     "FixtureManager",
     "MaterializedFixture",
-    "AgentExecution",
-    "AgentInvokerCallable",
-    "CodingAgentInvoker",
     "OracleCheckResult",
     "OracleError",
     "OracleEvaluation",
     "OracleKind",
     "OracleWorkspace",
+    "ReviewCategory",
     "ReviewFinding",
     "ReviewFindingExpectation",
     "ReviewOracleSpec",
+    "RuntimeCodingAgentInvoker",
+    "aggregate_benchmark_results",
+    "build_oracle_execution_service",
     "builtin_manifest_path",
+    "capture_working_tree_identity",
     "compare_runs",
+    "evaluate_p4_v2_findings",
+    "evaluate_p4_v3_findings",
+    "evaluate_review_findings",
+    "infer_root_cause",
     "load_builtin_manifest",
     "load_manifest",
-    "resolve_fixture_path",
     "new_run_id",
+    "p4_v3_response_schema",
+    "p4_v3_schema_digest",
+    "project_review_findings",
     "report_json",
     "report_markdown",
     "report_payload",
+    "resolve_fixture_path",
+    "run_provider_qualification",
     "snapshot_tree",
     "summarize_diff",
     "utc_timestamp",
+    "validate_p4_v3_response",
+    "validate_p4_v3_response_schema",
 ]

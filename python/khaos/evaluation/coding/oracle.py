@@ -7,16 +7,16 @@ the oracle does not create an independent subprocess security mechanism.
 
 from __future__ import annotations
 
-import asyncio
 import difflib
 import hashlib
 import json
 import os
 import stat
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Protocol
+from typing import Protocol
 
 from khaos.coding.execution import (
     ExecutionRequest,
@@ -26,7 +26,7 @@ from khaos.coding.execution import (
     ResourceBudget,
 )
 from khaos.evaluation.coding.contracts import (
-    CodingContractError,
+    REVIEW_CATEGORY_CONTRACT_V3,
     CodingVerdict,
     CommandOracleSpec,
     CompositeOracleSpec,
@@ -35,11 +35,12 @@ from khaos.evaluation.coding.contracts import (
     FindingMatchMode,
     OracleKind,
     OracleSpec,
+    ReviewCategory,
     ReviewFindingExpectation,
     ReviewOracleSpec,
 )
 from khaos.evaluation.coding.fixtures import MaterializedFixture, OracleWorkspace
-from khaos.security.protocol_boundary import canonical_digest, canonical_json_bytes
+from khaos.security.protocol_boundary import canonical_digest
 
 
 class OracleError(RuntimeError):
@@ -233,14 +234,18 @@ class DiffSummary:
 class ReviewFinding:
     """Sanitized agent-provided structured review finding."""
 
-    category: str
+    category: ReviewCategory | str
     file: str
     concepts: tuple[str, ...]
     line: int | None = None
     severity: str = "medium"
 
     def __post_init__(self) -> None:
-        if not isinstance(self.category, str) or not self.category.strip():
+        if isinstance(self.category, ReviewCategory):
+            normalized_category: ReviewCategory | str = self.category
+        elif isinstance(self.category, str) and self.category.strip():
+            normalized_category = self.category.strip()
+        else:
             raise OracleError("review finding category is invalid")
         if (
             not isinstance(self.file, str)
@@ -261,7 +266,7 @@ class ReviewFinding:
             raise OracleError("review finding line is invalid")
         if self.severity not in {"low", "medium", "high", "critical"}:
             raise OracleError("review finding severity is invalid")
-        object.__setattr__(self, "category", self.category.strip())
+        object.__setattr__(self, "category", normalized_category)
         object.__setattr__(self, "file", Path(self.file).as_posix())
         object.__setattr__(self, "concepts", tuple(item.strip() for item in self.concepts))
 
@@ -297,9 +302,32 @@ class ReviewFinding:
             raise OracleError("review finding concepts contain duplicates")
         return cls(category.strip(), Path(file).as_posix(), normalized_concepts, line, str(severity))
 
+    @classmethod
+    def from_mapping_v3(cls, value: Mapping[str, object]) -> ReviewFinding:
+        """Parse a P4-v3 finding using only the canonical public enum."""
+
+        finding = cls.from_mapping(value)
+        try:
+            category = ReviewCategory(finding.category)
+        except (TypeError, ValueError) as exc:
+            raise OracleError(
+                "review finding category is not a canonical v3 value"
+            ) from exc
+        return cls(
+            category,
+            finding.file,
+            finding.concepts,
+            finding.line,
+            finding.severity,
+        )
+
     def to_payload(self) -> dict[str, object]:
         return {
-            "category": self.category,
+            "category": (
+                self.category.value
+                if isinstance(self.category, ReviewCategory)
+                else self.category
+            ),
             "file": self.file,
             "concepts": list(self.concepts),
             "line": self.line,
@@ -614,11 +642,16 @@ def _review(spec: ReviewOracleSpec, findings: tuple[ReviewFinding, ...]) -> Orac
     matched: list[str] = []
     used: set[int] = set()
     duplicate_indices: set[int] = set()
+    matcher = (
+        _finding_matches_v3
+        if spec.category_contract == REVIEW_CATEGORY_CONTRACT_V3
+        else _finding_matches
+    )
     for expected in spec.required_findings:
         candidates = [
             (index, finding)
             for index, finding in enumerate(findings)
-            if _finding_matches(expected, finding)
+            if matcher(expected, finding)
         ]
         if candidates:
             unused = [(index, finding) for index, finding in candidates if index not in used]
@@ -655,8 +688,43 @@ def _review(spec: ReviewOracleSpec, findings: tuple[ReviewFinding, ...]) -> Orac
 
 
 def _finding_matches(expected: ReviewFindingExpectation, actual: ReviewFinding) -> bool:
-    if expected.category.casefold() != actual.category.casefold():
+    if not _legacy_category_keys(expected.category) & _legacy_category_keys(actual.category):
         return False
+    return _finding_location_matches(expected, actual, ignore_legacy_category_terms=True)
+
+
+def _legacy_category_keys(category: ReviewCategory | str) -> frozenset[str]:
+    """Compare legacy review labels without treating separators as semantics."""
+
+    value = category.value if isinstance(category, ReviewCategory) else category
+    parts = value.casefold().replace("_", "-").split("-")
+    keys = {"".join(parts)}
+    if len(parts) > 1 and parts[0] == "authority":
+        keys.add("".join(parts[1:]))
+    return frozenset(keys)
+
+
+def _finding_matches_v3(
+    expected: ReviewFindingExpectation,
+    actual: ReviewFinding,
+) -> bool:
+    """Match v3 findings without converting the canonical enum to aliases."""
+
+    if not isinstance(expected.category, ReviewCategory):
+        return False
+    if not isinstance(actual.category, ReviewCategory):
+        return False
+    if expected.category is not actual.category:
+        return False
+    return _finding_location_matches(expected, actual)
+
+
+def _finding_location_matches(
+    expected: ReviewFindingExpectation,
+    actual: ReviewFinding,
+    *,
+    ignore_legacy_category_terms: bool = False,
+) -> bool:
     if Path(expected.file).as_posix() != Path(actual.file).as_posix():
         return False
     expected_start = expected.line_start if expected.line_start is not None else expected.line
@@ -666,8 +734,41 @@ def _finding_matches(expected: ReviewFindingExpectation, actual: ReviewFinding) 
             return False
         if expected_end is not None and actual.line > expected_end + expected.line_tolerance:
             return False
-    concepts = {concept.casefold() for concept in actual.concepts}
-    return all(concept.casefold() in concepts for concept in expected.concepts)
+    expected_concepts = expected.concepts
+    if ignore_legacy_category_terms:
+        category_value = (
+            expected.category.value
+            if isinstance(expected.category, ReviewCategory)
+            else expected.category
+        )
+        category_terms = set(
+            category_value.casefold().replace("_", "-").split("-")
+        )
+        retained = tuple(
+            concept
+            for concept in expected_concepts
+            if concept.casefold() not in category_terms
+        )
+        # A role label is redundant when the finding category already carries
+        # it, but a finding must still carry at least one concrete concept.
+        if retained:
+            expected_concepts = retained
+    concepts = tuple(concept.casefold() for concept in actual.concepts)
+    return all(
+        any(concept.casefold() in actual_concept for actual_concept in concepts)
+        for concept in expected_concepts
+    )
+
+
+def evaluate_review_findings(
+    spec: ReviewOracleSpec,
+    findings: tuple[ReviewFinding, ...],
+) -> OracleCheckResult:
+    """Evaluate typed review findings without executing or mutating a workspace."""
+
+    if not isinstance(spec, ReviewOracleSpec):
+        raise OracleError("review evaluation requires a review oracle")
+    return _review(spec, tuple(findings))
 
 
 def snapshot_tree(root: Path, *, max_files: int = 256, max_bytes: int = 16 * 1024 * 1024) -> dict[str, bytes]:
@@ -840,6 +941,7 @@ __all__ = [
     "OracleError",
     "OracleEvaluation",
     "ReviewFinding",
+    "evaluate_review_findings",
     "snapshot_tree",
     "summarize_diff",
 ]

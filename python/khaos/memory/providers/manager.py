@@ -5,8 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
-import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -29,6 +27,11 @@ from khaos.memory.providers.lifecycle import (
     ProviderManifest,
 )
 from khaos.memory.providers.native import NativeMemoryProvider
+from khaos.security.credential_broker import CredentialBroker
+from khaos.security.credentials import (
+    CredentialRef,
+    build_platform_credential_store,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -294,6 +297,7 @@ def build_native_registry(
     *,
     network_allowed: bool = False,
     config: Any = None,
+    credential_broker: CredentialBroker | None = None,
 ) -> MemoryProviderRegistry:
     """Create the local registry and explicitly configured remote adapters.
 
@@ -327,13 +331,15 @@ def build_native_registry(
         ),
     )
     registry.register(native_manifest, lambda manifest: NativeMemoryProvider(db))
-    _register_http_providers(registry, config)
+    _register_http_providers(registry, config, credential_broker=credential_broker)
     return registry
 
 
 def _register_http_providers(
     registry: MemoryProviderRegistry,
     config: Any,
+    *,
+    credential_broker: CredentialBroker | None = None,
 ) -> None:
     if not isinstance(config, dict):
         return
@@ -356,8 +362,42 @@ def _register_http_providers(
     for raw in entries:
         if not isinstance(raw, dict):
             raise ProviderLifecycleError("memory provider entries must be mappings")
+        if "api_key_env" in raw or "api_key" in raw:
+            raise ProviderLifecycleError(
+                "memory provider plaintext credentials are unsupported; use credential_ref"
+            )
+        provider_id = raw.get("provider_id", raw.get("id"))
+        if not isinstance(provider_id, str):
+            raise ProviderLifecycleError("memory provider entries require id")
+        raw_ref = raw.get("credential_ref")
+        credential_ref = None
+        if raw_ref is not None:
+            try:
+                credential_ref = CredentialRef.from_config(provider_id, raw_ref)
+            except (TypeError, ValueError) as exc:
+                raise ProviderLifecycleError(
+                    "memory provider credential_ref is malformed"
+                ) from exc
+            if credential_broker is None:
+                raise ProviderLifecycleError(
+                    "memory provider credential_ref requires the canonical CredentialBroker"
+                )
+            status = credential_broker.provider_credential_status(
+                credential_ref,
+                provider=provider_id,
+            )
+            if status.get("status") == "UNREGISTERED":
+                credential_broker.register_credential_store(
+                    credential_ref,
+                    build_platform_credential_store(),
+                    provider=provider_id,
+                )
         manifest = ProviderManifest.from_mapping(
-            {key: value for key, value in raw.items() if key not in {"adapter", "api_key_env"}}
+            {
+                key: value
+                for key, value in raw.items()
+                if key not in {"adapter", "credential_ref"}
+            }
         )
         if manifest.provider_id == "khaos-native":
             continue
@@ -366,24 +406,14 @@ def _register_http_providers(
             raise ProviderLifecycleError(
                 f"unsupported memory provider adapter: {adapter}"
             )
-        api_key = _read_api_key(raw)
         registry.register(
             manifest,
-            lambda manifest, key=api_key: MemoryHttpProvider(
+            lambda manifest, ref=credential_ref, broker=credential_broker: MemoryHttpProvider(
                 manifest,
-                api_key=key,
+                credential_ref=ref,
+                credential_broker=broker,
             ),
         )
-
-
-def _read_api_key(raw: dict[str, Any]) -> str | None:
-    env_name = raw.get("api_key_env")
-    if env_name is None:
-        return None
-    if not isinstance(env_name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", env_name):
-        raise ProviderLifecycleError("memory provider api_key_env is malformed")
-    value = os.environ.get(env_name, "")
-    return value or None
 
 
 __all__ = ["MemoryProviderManager", "ProviderStatus", "build_native_registry"]

@@ -3,7 +3,8 @@ import pytest
 from khaos.agent import ErrorCode, ErrorEvent, ErrorHandler, Message
 from khaos.agent.error_handler import ModelContextTooLongError, ModelRateLimitError
 from khaos.db import Database
-from khaos.exceptions import CompressionCircuitOpenError
+from khaos.exceptions import CompressionCircuitOpenError, ModelUnavailableError
+from khaos.routing.providers.base import ProviderError
 from khaos.runtime.context import RequestContext
 
 
@@ -26,8 +27,20 @@ def test_classify_errors():
     assert handler.classify(httpx.ConnectError("network down")) is ErrorCode.MODEL_UNAVAILABLE
     assert handler.classify(ModelRateLimitError()) is ErrorCode.MODEL_RATE_LIMITED
     assert handler.classify(ModelContextTooLongError()) is ErrorCode.MODEL_CONTEXT_TOO_LONG
+    assert handler.classify(ModelUnavailableError()) is ErrorCode.MODEL_UNAVAILABLE
+    assert handler.classify(ProviderError("HTTP 401")) is ErrorCode.PROVIDER_ERROR
     assert handler.classify(PermissionError()) is ErrorCode.PERMISSION_DENIED
     assert handler.classify(CompressionCircuitOpenError()) is ErrorCode.COMPRESSION_CIRCUIT_OPEN
+
+
+async def test_provider_error_is_typed_and_does_not_echo_exception_text():
+    event = await ErrorHandler().handle(
+        ProviderError("HTTP 401 response contained synthetic-provider-secret")
+    )
+
+    assert event.code is ErrorCode.PROVIDER_ERROR
+    assert event.message == "model provider request failed"
+    assert "synthetic-provider-secret" not in event.message
 
 
 async def test_handle_uses_exception_type_when_message_is_empty(tmp_path):

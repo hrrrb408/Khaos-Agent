@@ -21,6 +21,7 @@ from khaos.exceptions import ModelUnavailableError
 from khaos.routing.model_client import ModelClient
 from khaos.routing.provider import ModelSpec, ProviderConfig, ProviderManager
 from khaos.routing.table import RoutingRule, RoutingTable
+from khaos.security.credential_broker import CredentialBroker
 
 
 class ModelRouter:
@@ -34,7 +35,9 @@ class ModelRouter:
     ):
         self.provider_manager = provider_manager or _default_provider_manager()
         self.mock_response = mock_response
-        self.model_client = model_client or ModelClient()
+        self.model_client = model_client or ModelClient(
+            credential_broker=getattr(self.provider_manager, "credential_broker", None)
+        )
         self._routing_table = RoutingTable.empty()
 
     @property
@@ -276,6 +279,8 @@ def create_default_router(
     *,
     honor_no_config: bool = True,
     project_root: Path | None = None,
+    credential_broker: CredentialBroker | None = None,
+    model_names: set[str] | None = None,
 ) -> ModelRouter:
     """Create router from config.yaml, falling back to mock if no config.
 
@@ -299,9 +304,17 @@ def create_default_router(
         from khaos.routing.provider import ProviderManager
 
         default_model = models_config.get("default_model", "")
-        active_config = config_for_models(config, {str(default_model)} if default_model else set())
+        selected_model_names = (
+            {str(name) for name in model_names}
+            if model_names is not None
+            else ({str(default_model)} if default_model else set())
+        )
+        active_config = config_for_models(config, selected_model_names)
         active_config = expand_config_placeholders(active_config, strict=True)
-        pm = ProviderManager.from_config(active_config)
+        pm = ProviderManager.from_config(
+            active_config,
+            credential_broker=credential_broker,
+        )
 
         router = ModelRouter(provider_manager=pm)
         if default_model:

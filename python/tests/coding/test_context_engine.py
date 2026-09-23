@@ -81,6 +81,46 @@ def test_selector_is_bounded_and_keeps_l0_policy() -> None:
     assert len(selection.evicted) > 0
 
 
+def test_selector_keeps_goal_when_l0_project_instruction_is_oversized() -> None:
+    """An oversized project instruction must not evict the current goal."""
+    budget = ContextBudget()
+    requirements = ContextRequirements(budget=budget)
+    system = ContextItem(
+        kind=ContextItemKind.TASK_STATE,
+        payload="trusted system policy",
+        layer=ContextLayer.L0,
+        source=ContextSource.SYSTEM,
+        trust=ContextTrust.TRUSTED_SYSTEM,
+        required=True,
+        sequence=0,
+    )
+    project = ContextItem(
+        kind=ContextItemKind.PROJECT_INSTRUCTION,
+        payload="project guidance " * 10_000,
+        layer=ContextLayer.L0,
+        source=ContextSource.PROJECT,
+        trust=ContextTrust.TRUSTED_PROJECT,
+        required=True,
+        sequence=1,
+    )
+    goal = ContextItem(
+        kind=ContextItemKind.GOAL,
+        payload="Return exactly ACK.",
+        layer=ContextLayer.L1,
+        source=ContextSource.RUNTIME,
+        trust=ContextTrust.TRUSTED_RUNTIME,
+        required=True,
+        sequence=2,
+        metadata={"role": "user"},
+    )
+
+    selection = ContextSelector().select([system, project, goal], requirements)
+
+    assert goal in selection.selected
+    assert any(item.kind is ContextItemKind.PROJECT_INSTRUCTION for item in selection.selected)
+    assert not any(item.kind is ContextItemKind.GOAL for item in selection.evicted)
+
+
 def test_overlapping_regions_merge_without_trust_elevation() -> None:
     left = _item("src/a.py", priority=20, payload="line 1\nline 2")
     left = replace(left, region_start=1, region_end=2)
@@ -522,6 +562,73 @@ async def test_diagnostic_lifecycle_and_rebalance_preserve_trust() -> None:
     )
 
 
+@pytest.mark.asyncio
+async def test_rebalance_preserves_ordered_tool_call_exchanges() -> None:
+    engine = ContextEngineService(
+        default_budget=ContextBudget(total_tokens=2_000, total_bytes=64 * 1024),
+        recent_message_count=12,
+    )
+    messages = [
+        SimpleNamespace(role="system", content="system policy"),
+        SimpleNamespace(role="user", content="inspect the cache"),
+        SimpleNamespace(
+            role="assistant",
+            content="same plan text",
+            tool_calls=[
+                {"id": "call-1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}},
+            ],
+        ),
+        SimpleNamespace(
+            role="tool",
+            content="same result",
+            tool_call_id="call-1",
+            metadata={"context_generation": 1},
+        ),
+        SimpleNamespace(
+            role="assistant",
+            content="same plan text",
+            tool_calls=[
+                {"id": "call-2", "type": "function", "function": {"name": "read_file", "arguments": "{}"}},
+            ],
+        ),
+        SimpleNamespace(
+            role="tool",
+            content="same result",
+            tool_call_id="call-2",
+            metadata={"context_generation": 1},
+        ),
+    ]
+
+    rebalanced = await engine.rebalance_messages(
+        messages,
+        requirements=ContextRequirements(
+            task_id="task-1",
+            workspace_id="ws",
+            generation="g1",
+            recent_message_count=12,
+            budget=engine.default_budget,
+        ),
+    )
+
+    assert [message.role for message in rebalanced] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+        "tool",
+    ]
+    assert [message.tool_call_id for message in rebalanced if message.role == "tool"] == [
+        "call-1",
+        "call-2",
+    ]
+    assert [
+        message.tool_calls[0]["id"]
+        for message in rebalanced
+        if message.role == "assistant"
+    ] == ["call-1", "call-2"]
+
+
 def test_deferred_tool_visibility_does_not_change_registry_authority() -> None:
     definitions = [
         SimpleNamespace(name="read_file", description="read", parameters={}),
@@ -559,6 +666,34 @@ def test_deferred_tool_visibility_does_not_change_registry_authority() -> None:
         "read_file",
         "spawn_subagent",
     ]
+
+
+def test_coding_model_surface_prefers_canonical_edit_transaction() -> None:
+    from khaos.tools import create_runtime_registry
+
+    registry = create_runtime_registry()
+    engine = ContextEngineService(tool_registry=registry)
+    schemas = engine.tool_schemas(mode="coding", intent="repair a parser") or []
+    names = {item["function"]["name"] for item in schemas}
+
+    assert {"preview_edit_transaction", "apply_edit_transaction"} <= names
+    assert not names & {"write_file", "patch", "multi_edit", "delete_file"}
+
+    definitions = {
+        item["function"]["name"]: item["function"]
+        for item in schemas
+    }
+    assert "before_digest" in definitions["preview_edit_transaction"]["description"]
+    assert "expected_digest" in definitions["apply_edit_transaction"]["description"]
+    operation_properties = definitions["apply_edit_transaction"]["parameters"]["properties"][
+        "operations"
+    ]["items"]["properties"]
+    assert "content_sha256" in operation_properties["expected_digest"]["description"]
+
+    # The compatibility handlers remain registered and callable by explicit
+    # integrations; discovery alone does not change execution authority.
+    registry_names = {item.name for item in registry.list_by_mode("coding")}
+    assert {"write_file", "patch", "multi_edit", "delete_file"} <= registry_names
 
 
 @pytest.mark.asyncio

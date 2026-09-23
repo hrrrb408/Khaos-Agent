@@ -34,6 +34,14 @@ CORE_TOOL_NAMES = frozenset(
     }
 )
 
+# M8.3 keeps these handlers available for older integrations, but the default
+# Coding model surface must use the generation-bound transaction authority.
+# Direct registry invocation remains unchanged; this is only a model
+# discovery policy.
+LEGACY_CODING_MUTATION_TOOL_NAMES = frozenset(
+    {"write_file", "patch", "multi_edit", "delete_file"}
+)
+
 
 @dataclass(frozen=True, slots=True)
 class ToolDiscoveryResult:
@@ -72,6 +80,13 @@ class DeferredToolDiscovery:
         for definition in sorted(definitions, key=lambda item: str(getattr(item, "name", ""))):
             name = str(getattr(definition, "name", ""))
             if allowed is not None and name not in allowed:
+                continue
+            if (
+                self.mode == "coding"
+                and allowed is None
+                and name in LEGACY_CODING_MUTATION_TOOL_NAMES
+            ):
+                deferred += 1
                 continue
             # M8.4's deferred specialist set is a Coding-mode optimization.
             # Office mode keeps its existing registered visibility (including

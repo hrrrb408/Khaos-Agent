@@ -48,7 +48,7 @@ async def test_audit_projection_is_best_effort_and_preserves_error_boundary() ->
     writer.audit.side_effect = RuntimeError("audit unavailable")
     assert await finalizer.audit_best_effort(
         "read", "README.md", "error", {}, "session-1"
-    ) == "audit unavailable"
+    ) == "RuntimeError"
 
 
 @pytest.mark.asyncio

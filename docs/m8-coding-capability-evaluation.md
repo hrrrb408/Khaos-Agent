@@ -52,7 +52,7 @@ M8.0 的 `coding_evaluation_runs` 表由迁移 v27 创建，并带 UPDATE/DELETE
 | `multifile-python-settings` | MULTI_FILE | Python | hard | COMMAND + DIFF | 4 |
 | `refactor-python-repository` | REFACTOR | Python | medium | COMMAND + DIFF | 3 |
 | `refactor-typescript-client` | REFACTOR | TypeScript | medium | COMMAND + DIFF | 3 |
-| `review-python-cache-race` | CODE_REVIEW | Python | medium | REVIEW_FINDING + read-only DIFF | 3 |
+| `review-python-cache-race` | CODE_REVIEW | Python | medium | REVIEW_FINDING + read-only DIFF | 4 |
 
 分类计数为 BUG_FIX 3、FEATURE 2、REFACTOR 2、MULTI_FILE 2、CROSS_LANGUAGE 2、CODE_REVIEW 1；覆盖 Python、Go、Rust、TypeScript。
 

@@ -48,7 +48,17 @@ class TaskService:
     ):
         self.db = db
         self.approval_broker = approval_broker
-        self.supervision_service = supervision_service or TaskSupervisionService(db)
+        # The manager cache is independently useful to lightweight callers
+        # that do not have a durable database (for example, the cache/LRU
+        # concurrency tests).  Keep that construction path available while
+        # retaining the fail-closed supervision boundary: production
+        # composition always supplies a database-backed supervision service,
+        # and a database-less service has no durable supervision authority.
+        self.supervision_service = (
+            supervision_service
+            if supervision_service is not None
+            else (TaskSupervisionService(db) if db is not None else None)
+        )
         self.checkpoint_service = checkpoint_service
         # Round-4 review Batch 4 (§13.2): per-(principal, project)
         # TaskManager cache with LRU eviction.  Previously the cache was
@@ -91,12 +101,14 @@ class TaskService:
             return manager, None, None
         workspace_id = task.metadata.get("workspace_id")
         if not isinstance(workspace_id, str) or not workspace_id:
-            state = await self.supervision_service.state(
-                task_id,
-                principal_id=ctx.principal_id,
-                project_id=self._project_id(ctx),
-            )
-            workspace_id = state.workspace_id if state is not None else None
+            supervision_service = self.supervision_service
+            if supervision_service is not None:
+                state = await supervision_service.state(
+                    task_id,
+                    principal_id=ctx.principal_id,
+                    project_id=self._project_id(ctx),
+                )
+                workspace_id = state.workspace_id if state is not None else None
         return manager, task, workspace_id
 
     async def _runtime_checkpoint_service(
@@ -104,7 +116,10 @@ class TaskService:
     ) -> CheckpointService | None:
         if self.checkpoint_service is not None:
             return self.checkpoint_service
-        handle = await self.supervision_service.control.runtime_handle(
+        supervision_service = self.supervision_service
+        if supervision_service is None:
+            return None
+        handle = await supervision_service.control.runtime_handle(
             task_id,
             principal_id=ctx.principal_id,
             project_id=self._project_id(ctx),
@@ -238,7 +253,13 @@ class TaskService:
         manager = await self._manager(ctx)
         return (await manager.create(goal)).to_dict()
 
-    async def cancel(self, ctx: RequestContext, task_id: str) -> dict:
+    async def cancel(
+        self,
+        ctx: RequestContext,
+        task_id: str,
+        command_id: str | None = None,
+        expected_revision: int | None = None,
+    ) -> dict:
         from khaos.coding.task_manager import TransitionResult
 
         # C-1-5a: hide cross-principal tasks (treat as not found) so
@@ -262,6 +283,8 @@ class TaskService:
                 workspace_id=workspace_id,
                 principal_id=ctx.principal_id,
                 project_id=self._project_id(ctx),
+                command_id=command_id,
+                expected_revision=expected_revision,
             )
             return self._control_payload(result)
 
@@ -292,6 +315,8 @@ class TaskService:
                 workspace_id=workspace_id,
                 principal_id=ctx.principal_id,
                 project_id=self._project_id(ctx),
+                command_id=command_id,
+                expected_revision=expected_revision,
             )
             response = self._control_payload(control_result)
             response["ok"] = True

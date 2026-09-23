@@ -36,7 +36,14 @@ class CodingScenarioKind(StrEnum):
     FEATURE = "FEATURE"
     REFACTOR = "REFACTOR"
     MULTI_FILE = "MULTI_FILE"
+    MULTI_FILE_CHANGE = "MULTI_FILE_CHANGE"
+    CROSS_MODULE_CHANGE = "CROSS_MODULE_CHANGE"
     CROSS_LANGUAGE = "CROSS_LANGUAGE"
+    TEST_REPAIR = "TEST_REPAIR"
+    BUILD_REPAIR = "BUILD_REPAIR"
+    API_CHANGE = "API_CHANGE"
+    DEPENDENCY_UPDATE = "DEPENDENCY_UPDATE"
+    PERFORMANCE_BUG = "PERFORMANCE_BUG"
     CODE_REVIEW = "CODE_REVIEW"
 
 
@@ -66,6 +73,10 @@ class CodingFailureReason(StrEnum):
     EXCESSIVE_DIFF = "EXCESSIVE_DIFF"
     REVIEW_MISSED_FINDING = "REVIEW_MISSED_FINDING"
     REVIEW_FALSE_POSITIVE = "REVIEW_FALSE_POSITIVE"
+    OUTPUT_CONTRACT_FAILURE = "OUTPUT_CONTRACT_FAILURE"
+    SEMANTIC_REVIEW_FAILURE = "SEMANTIC_REVIEW_FAILURE"
+    PROVIDER_FAILURE = "PROVIDER_FAILURE"
+    TOOL_BUDGET_EXHAUSTED = "TOOL_BUDGET_EXHAUSTED"
     AGENT_ERROR = "AGENT_ERROR"
     ORACLE_ERROR = "ORACLE_ERROR"
     INVALID_FIXTURE = "INVALID_FIXTURE"
@@ -87,6 +98,18 @@ class FindingMatchMode(StrEnum):
 
     ALL = "ALL"
     ANY = "ANY"
+
+
+class ReviewCategory(StrEnum):
+    """Canonical public ontology for versioned review findings."""
+
+    AUTHORITY_DEFINITION = "authority_definition"
+    CONSUMER = "consumer"
+    ENFORCEMENT_BOUNDARY = "enforcement_boundary"
+
+
+REVIEW_CATEGORY_CONTRACT_V3 = "p4-review-category-v3"
+P4_V3_REQUIRED_FINDING_COUNT = 3
 
 
 _ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{1,95}$")
@@ -396,7 +419,7 @@ class ReviewFindingExpectation:
     """One ground-truth code-review finding."""
 
     finding_id: str
-    category: str
+    category: ReviewCategory | str
     file: str
     concepts: tuple[str, ...]
     severity: str = "medium"
@@ -407,7 +430,12 @@ class ReviewFindingExpectation:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "finding_id", _require_id(self.finding_id, "finding_id"))
-        object.__setattr__(self, "category", _require_text(self.category, "finding.category", max_bytes=256))
+        if not isinstance(self.category, ReviewCategory):
+            object.__setattr__(
+                self,
+                "category",
+                _require_text(self.category, "finding.category", max_bytes=256),
+            )
         object.__setattr__(self, "file", _require_path(self.file, "finding.file"))
         object.__setattr__(self, "concepts", _require_string_tuple(self.concepts, "finding.concepts", max_items=32))
         if self.severity not in {"low", "medium", "high", "critical"}:
@@ -439,7 +467,11 @@ class ReviewFindingExpectation:
     def to_payload(self) -> dict[str, object]:
         return {
             "finding_id": self.finding_id,
-            "category": self.category,
+            "category": (
+                self.category.value
+                if isinstance(self.category, ReviewCategory)
+                else self.category
+            ),
             "file": self.file,
             "concepts": list(self.concepts),
             "severity": self.severity,
@@ -457,6 +489,7 @@ class ReviewOracleSpec:
     required_findings: tuple[ReviewFindingExpectation, ...]
     allow_extra_findings: bool = True
     match_mode: FindingMatchMode = FindingMatchMode.ALL
+    category_contract: str | None = None
     kind: OracleKind = field(default=OracleKind.REVIEW_FINDING, init=False)
 
     def __post_init__(self) -> None:
@@ -474,16 +507,33 @@ class ReviewOracleSpec:
             match_mode = FindingMatchMode(self.match_mode)
         except (TypeError, ValueError) as exc:
             raise CodingContractError("review match_mode is invalid") from exc
+        if self.category_contract is not None:
+            if self.category_contract != REVIEW_CATEGORY_CONTRACT_V3:
+                raise CodingContractError("review category contract is unsupported")
+            if len(self.required_findings) != P4_V3_REQUIRED_FINDING_COUNT:
+                raise CodingContractError(
+                    "v3 review oracle requires exactly three findings"
+                )
+            if any(
+                not isinstance(finding.category, ReviewCategory)
+                for finding in self.required_findings
+            ):
+                raise CodingContractError(
+                    "v3 review categories must use the canonical enum"
+                )
         object.__setattr__(self, "required_findings", tuple(self.required_findings))
         object.__setattr__(self, "match_mode", match_mode)
 
     def to_payload(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "kind": self.kind.value,
             "required_findings": [finding.to_payload() for finding in self.required_findings],
             "allow_extra_findings": self.allow_extra_findings,
             "match_mode": self.match_mode.value,
         }
+        if self.category_contract is not None:
+            payload["category_contract"] = self.category_contract
+        return payload
 
 
 OracleLeafSpec: TypeAlias = CommandOracleSpec | FileStateOracleSpec | DiffOracleSpec | ReviewOracleSpec
@@ -521,7 +571,7 @@ def oracle_from_payload(value: object) -> OracleSpec:
         OracleKind.COMMAND: frozenset({"kind", "argv", "cwd", "timeout_seconds", "max_output_bytes", "expected_exit_code", "hidden_files", "environment", "network"}),
         OracleKind.FILE_STATE: frozenset({"kind", "checks"}),
         OracleKind.DIFF: frozenset({"kind", "required_changed_files", "forbidden_changed_files", "min_changed_files", "max_changed_files", "max_insertions", "max_deletions", "max_diff_lines", "allow_binary"}),
-        OracleKind.REVIEW_FINDING: frozenset({"kind", "required_findings", "allow_extra_findings", "match_mode"}),
+        OracleKind.REVIEW_FINDING: frozenset({"kind", "required_findings", "allow_extra_findings", "match_mode", "category_contract"}),
         OracleKind.COMPOSITE: frozenset({"kind", "children"}),
     }
     if set(data) - allowed[kind]:
@@ -576,16 +626,28 @@ def oracle_from_payload(value: object) -> OracleSpec:
         raw_findings = data.get("required_findings")
         if not isinstance(raw_findings, list):
             raise CodingContractError("review required_findings must be a list")
+        category_contract = data.get("category_contract")
+        if category_contract is not None and not isinstance(category_contract, str):
+            raise CodingContractError("review category_contract must be a string")
         findings: list[ReviewFindingExpectation] = []
         for raw in raw_findings:
             item = _mapping(raw, "review.finding")
             if set(item) - {"finding_id", "category", "file", "concepts", "severity", "line", "line_tolerance", "line_start", "line_end"}:
                 raise CodingContractError("review finding contains unknown fields")
-            findings.append(ReviewFindingExpectation(**dict(item)))
+            item_payload = dict(item)
+            if category_contract == REVIEW_CATEGORY_CONTRACT_V3:
+                try:
+                    item_payload["category"] = ReviewCategory(item_payload.get("category"))
+                except (TypeError, ValueError) as exc:
+                    raise CodingContractError(
+                        "review finding category is not a canonical v3 value"
+                    ) from exc
+            findings.append(ReviewFindingExpectation(**item_payload))
         return ReviewOracleSpec(
             required_findings=tuple(findings),
             allow_extra_findings=_bounded_bool(data.get("allow_extra_findings"), "review.allow_extra_findings", True),
             match_mode=FindingMatchMode(data.get("match_mode", FindingMatchMode.ALL.value)),
+            category_contract=category_contract,
         )
     raw_children = data.get("children")
     if not isinstance(raw_children, list):
@@ -612,6 +674,7 @@ class CodingScenario:
     max_changed_files: int | None = None
     max_diff_lines: int | None = None
     tags: tuple[str, ...] = ()
+    review_category_contract: str | None = None
     digest: str = ""
 
     def __post_init__(self) -> None:
@@ -629,12 +692,35 @@ class CodingScenario:
         if not languages or any(language not in _LANGUAGES for language in languages):
             raise CodingContractError("scenario.languages contains an unsupported language")
         object.__setattr__(self, "languages", languages)
-        if not isinstance(self.difficulty, str) or self.difficulty not in {"easy", "medium", "hard"}:
+        if not isinstance(self.difficulty, str) or self.difficulty not in {
+            "easy",
+            "medium",
+            "hard",
+            "long_horizon",
+        }:
             raise CodingContractError("scenario.difficulty is invalid")
         if not isinstance(self.limits, CodingResourceLimits):
             raise CodingContractError("scenario.limits is invalid")
         if not isinstance(self.oracle, (CommandOracleSpec, FileStateOracleSpec, DiffOracleSpec, ReviewOracleSpec, CompositeOracleSpec)):
             raise CodingContractError("scenario.oracle is invalid")
+        oracle_category_contract = (
+            self.oracle.category_contract
+            if isinstance(self.oracle, ReviewOracleSpec)
+            else None
+        )
+        if oracle_category_contract is not None and (
+            self.review_category_contract != oracle_category_contract
+        ):
+            raise CodingContractError(
+                "scenario and oracle review category contracts disagree"
+            )
+        if self.review_category_contract is not None:
+            if self.review_category_contract != REVIEW_CATEGORY_CONTRACT_V3:
+                raise CodingContractError("scenario review category contract is unsupported")
+            if not isinstance(self.oracle, ReviewOracleSpec):
+                raise CodingContractError(
+                    "review category contract requires a review oracle"
+                )
         if self.base_revision is not None:
             _require_text(self.base_revision, "base_revision", max_bytes=256)
         for name in ("max_changed_files", "max_diff_lines"):
@@ -654,7 +740,7 @@ class CodingScenario:
         object.__setattr__(self, "digest", expected_digest)
 
     def _payload_without_digest(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "scenario_id": self.scenario_id,
             "version": self.version,
             "kind": self.kind.value,
@@ -671,6 +757,9 @@ class CodingScenario:
             "max_diff_lines": self.max_diff_lines,
             "tags": list(self.tags),
         }
+        if self.review_category_contract is not None:
+            payload["review_category_contract"] = self.review_category_contract
+        return payload
 
     def to_payload(self) -> dict[str, object]:
         return {**self._payload_without_digest(), "digest": self.digest}
@@ -817,6 +906,8 @@ def digest_payload(payload: object) -> str:
 
 
 __all__ = [
+    "P4_V3_REQUIRED_FINDING_COUNT",
+    "REVIEW_CATEGORY_CONTRACT_V3",
     "CodingContractError",
     "CodingFailureReason",
     "CodingResourceLimits",
@@ -833,6 +924,7 @@ __all__ = [
     "FindingMatchMode",
     "OracleKind",
     "OracleSpec",
+    "ReviewCategory",
     "ReviewFindingExpectation",
     "ReviewOracleSpec",
     "digest_payload",

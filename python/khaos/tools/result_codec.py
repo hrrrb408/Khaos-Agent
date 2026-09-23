@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Mapping
 from dataclasses import asdict
 from typing import Any
 
@@ -43,10 +44,168 @@ _LEGACY_FAILURE_MARKERS = frozenset(
         "unavailable",
     }
 )
+_APPLIED_RECEIPT_OPERATION_KINDS = frozenset(
+    {"create", "update", "delete", "rename"}
+)
+_MAX_APPLIED_RECEIPT_OPERATIONS = 64
+_MAX_APPLIED_RECEIPT_TEXT = 512
+_MAX_APPLIED_RECEIPT_BYTES = 128 * 1024
 
 
 class ToolResultCodec:
     """Pure codec for handler outcomes and durable ``ToolResult`` rows."""
+
+    @staticmethod
+    def project_applied_effect_receipt(
+        tool_name: str, output: object
+    ) -> dict[str, Any] | None:
+        """Project a canonical applied-edit result into bounded evidence.
+
+        A mutation may have crossed its effect boundary before the ordinary
+        model-facing output projection fails (for example, because the
+        remaining aggregate tool-output budget is smaller than the handler's
+        result).  The AgentLoop still needs the exact generation/digest facts
+        to record the mutation before verification.  This method copies only
+        the reviewed ``apply_edit_transaction`` result shape; it never
+        coerces values or preserves source/replacement text.
+        """
+        if tool_name != "apply_edit_transaction" or not isinstance(output, Mapping):
+            return None
+        if output.get("status") != "applied":
+            return None
+
+        def text(value: object) -> str | None:
+            if (
+                type(value) is not str
+                or not value
+                or len(value) > _MAX_APPLIED_RECEIPT_TEXT
+                or "\x00" in value
+            ):
+                return None
+            return value
+
+        def digest(value: object, *, optional: bool = False) -> str | None:
+            if optional and value is None:
+                return None
+            if (
+                type(value) is not str
+                or len(value) != 64
+                or any(character not in "0123456789abcdef" for character in value)
+            ):
+                return None
+            return value
+
+        def generation(value: object) -> int | None:
+            if type(value) is not int or value <= 0:
+                return None
+            return value
+
+        transaction_id = text(output.get("transaction_id"))
+        workspace_id = text(output.get("workspace_id"))
+        base_generation = generation(output.get("base_generation"))
+        resulting_generation = generation(output.get("resulting_generation"))
+        transaction_digest = digest(output.get("transaction_digest"))
+        before_workspace_digest = digest(output.get("before_workspace_digest"))
+        after_workspace_digest = digest(output.get("after_workspace_digest"))
+        operations_value = output.get("operations")
+        if (
+            transaction_id is None
+            or workspace_id is None
+            or base_generation is None
+            or resulting_generation is None
+            or resulting_generation <= base_generation
+            or transaction_digest is None
+            or before_workspace_digest is None
+            or after_workspace_digest is None
+            or not isinstance(operations_value, list)
+            or not operations_value
+            or len(operations_value) > _MAX_APPLIED_RECEIPT_OPERATIONS
+        ):
+            return None
+
+        operations: list[dict[str, Any]] = []
+        for item in operations_value:
+            if not isinstance(item, Mapping):
+                return None
+            index = item.get("index")
+            operation = item.get("operation")
+            path = text(item.get("path"))
+            destination_path = item.get("destination_path")
+            if destination_path is not None:
+                destination_path = text(destination_path)
+            before_exists = item.get("before_exists")
+            after_exists = item.get("after_exists")
+            before_digest = digest(item.get("before_digest"), optional=True)
+            after_digest = digest(item.get("after_digest"), optional=True)
+            if (
+                type(index) is not int
+                or index < 0
+                or type(operation) is not str
+                or operation not in _APPLIED_RECEIPT_OPERATION_KINDS
+                or path is None
+                or (item.get("destination_path") is not None and destination_path is None)
+                or type(before_exists) is not bool
+                or type(after_exists) is not bool
+                or (item.get("before_digest") is not None and before_digest is None)
+                or (item.get("after_digest") is not None and after_digest is None)
+            ):
+                return None
+            operations.append(
+                {
+                    "index": index,
+                    "operation": operation,
+                    "path": path,
+                    "destination_path": destination_path,
+                    "before_exists": before_exists,
+                    "after_exists": after_exists,
+                    "before_digest": before_digest,
+                    "after_digest": after_digest,
+                }
+            )
+        if sorted(item["index"] for item in operations) != list(range(len(operations))):
+            return None
+
+        receipt = {
+            "status": "applied",
+            "transaction_id": transaction_id,
+            "workspace_id": workspace_id,
+            "base_generation": base_generation,
+            "resulting_generation": resulting_generation,
+            "transaction_digest": transaction_digest,
+            "before_workspace_digest": before_workspace_digest,
+            "after_workspace_digest": after_workspace_digest,
+            "operations": operations,
+        }
+        try:
+            encoded = json.dumps(
+                receipt,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        except (TypeError, ValueError):
+            return None
+        if len(encoded) > _MAX_APPLIED_RECEIPT_BYTES:
+            return None
+        return receipt
+
+    @staticmethod
+    def compact_applied_effect_receipt(
+        receipt: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Return a tiny model-facing acknowledgement for an applied edit."""
+        if receipt is None:
+            return {}
+        return {
+            "status": "applied",
+            "transaction_id": receipt["transaction_id"],
+            "workspace_id": receipt["workspace_id"],
+            "base_generation": receipt["base_generation"],
+            "resulting_generation": receipt["resulting_generation"],
+            "transaction_digest": receipt["transaction_digest"],
+            "after_workspace_digest": receipt["after_workspace_digest"],
+            "operation_count": len(receipt["operations"]),
+        }
 
     @staticmethod
     def normalize_effect_outcome(
@@ -200,6 +359,9 @@ class ToolResultCodec:
                             or ""
                         ),
                         retry_safe=bool(values.get("retry_safe", False)),
+                        effect_receipt=ToolResultCodec.project_applied_effect_receipt(
+                            str(tool.name), values.get("effect_receipt")
+                        ),
                     )
             except (TypeError, ValueError, json.JSONDecodeError):
                 logger.error(

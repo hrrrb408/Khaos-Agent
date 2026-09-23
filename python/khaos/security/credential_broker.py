@@ -27,6 +27,7 @@ import time
 from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from khaos.security.credential_provider_host import (
@@ -37,7 +38,22 @@ from khaos.security.credential_provider_worker import (
     ProviderSpecError,
     validate_provider_spec,
 )
+from khaos.security.credentials import (
+    _TRANSPORT_CAPABILITY,
+    CredentialAccessMode,
+    CredentialHandle,
+    CredentialNotFound,
+    CredentialProvisioningCancelled,
+    CredentialRef,
+    CredentialStore,
+    CredentialStoreDiagnostic,
+    CredentialStoreError,
+    CredentialStoreUnavailable,
+    SecretValue,
+    credential_store_backend,
+)
 from khaos.security.resource_scope import CredentialScope
+from khaos.security.secret_redaction import SecretRedactor
 
 CredentialLoader = Callable[[], Mapping[str, str]]
 
@@ -51,6 +67,60 @@ _ENVIRONMENT_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 
 class CredentialBrokerError(PermissionError):
     """Raised when a credential lease cannot be issued or materialized."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        diagnostic: CredentialStoreDiagnostic | None = None,
+        code: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.diagnostic = diagnostic
+        self.code = code
+
+    def safe_metadata(self) -> dict[str, object]:
+        """Return bounded broker failure metadata without secret material."""
+        payload: dict[str, object] = {"error_type": type(self).__name__}
+        if self.code is not None:
+            payload["code"] = self.code
+        if self.diagnostic is not None:
+            payload["diagnostic"] = self.diagnostic.to_payload()
+        return payload
+
+
+class CredentialSessionError(CredentialBrokerError):
+    """Base error for the explicit trusted-runtime credential session."""
+
+
+class CredentialSessionLocked(CredentialSessionError):
+    """A runtime request was made without an active credential session lease."""
+
+    def __init__(self, message: str = "credential session is locked") -> None:
+        super().__init__(message, code="CREDENTIAL_SESSION_LOCKED")
+
+
+class CredentialSessionMissing(CredentialSessionError):
+    """The requested provider has no persistent credential to unlock."""
+
+    def __init__(self, message: str = "credential is missing") -> None:
+        super().__init__(message, code="CREDENTIAL_MISSING")
+
+
+class CredentialUnlockCancelled(CredentialSessionError):
+    """The operator cancelled an explicit interactive unlock operation."""
+
+    def __init__(
+        self,
+        message: str = "credential unlock was cancelled",
+        *,
+        diagnostic: CredentialStoreDiagnostic | None = None,
+    ) -> None:
+        super().__init__(
+            message,
+            diagnostic=diagnostic,
+            code="CREDENTIAL_UNLOCK_CANCELLED",
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,6 +225,16 @@ class _ProviderRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class _ProviderCredentialRecord:
+    """Broker-owned mapping from one provider reference to one store."""
+
+    provider: str
+    ref: CredentialRef
+    store: CredentialStore
+    session_required: bool
+
+
+@dataclass(frozen=True, slots=True)
 class _LeaseRecord:
     lease: CredentialLease
     provider: _ProviderRecord
@@ -166,6 +246,65 @@ class _MaterializationRecord:
     lease_id: str
     generation: int
     canceled: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class CredentialSessionLease:
+    """Opaque process-lifetime lease metadata for one unlocked provider."""
+
+    provider: str
+    ref: CredentialRef
+    generation: int
+    issued_at: float
+
+    def summary(self) -> dict[str, object]:
+        """Return only non-secret session metadata."""
+        return {
+            "provider": self.provider,
+            "credential_ref": self.ref.value,
+            "generation": self.generation,
+            "issued_at": self.issued_at,
+            "lifetime": "trusted-runtime-session",
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class _SessionCredential:
+    lease: CredentialSessionLease
+    secret: SecretValue
+
+
+class CredentialSession:
+    """Operator-controlled session facade owned by one CredentialBroker.
+
+    This facade never exposes a secret.  It exists so the explicit unlock/lock
+    lifecycle is visible to trusted CLI/TUI composition without creating a
+    second credential store or authority.  Agent tools are not given this
+    facade and the runtime path only consumes its private Broker cache.
+    """
+
+    def __init__(self, broker: CredentialBroker) -> None:
+        self._broker = broker
+
+    def unlock(
+        self, ref: CredentialRef, *, provider: str | None = None
+    ) -> CredentialSessionLease:
+        """Load one persistent credential during an explicit operator action."""
+        return self._broker.unlock_provider_credential(ref, provider=provider)
+
+    def lock(self, ref: CredentialRef, *, provider: str | None = None) -> None:
+        """Invalidate one in-memory lease without touching persistence."""
+        self._broker.lock_provider_credential(ref, provider=provider)
+
+    def lock_all(self) -> None:
+        """Invalidate every in-memory lease owned by this Broker."""
+        self._broker.lock_all_credentials()
+
+    def status(
+        self, ref: CredentialRef, *, provider: str | None = None
+    ) -> dict[str, object]:
+        """Return safe state for one provider session."""
+        return self._broker.credential_session_status(ref, provider=provider)
 
 
 def credential_binding_digest(
@@ -260,6 +399,602 @@ class CredentialBroker:
         self._closing = False
         self._closed = False
         self._quarantined = False
+        # Provider credential stores are deliberately a second capability of
+        # this same broker, not a parallel authority.  The broker is the only
+        # runtime component that may turn a SecretValue into transport bytes.
+        self._broker_id = secrets.token_urlsafe(18)
+        self._credential_stores: dict[str, _ProviderCredentialRecord] = {}
+        self._session_credentials: dict[str, _SessionCredential] = {}
+        # Explicit deletion is remembered only in this live Broker. This
+        # lets post-delete runtime requests report CREDENTIAL_MISSING without
+        # probing the persistent store or triggering Keychain UI.
+        self._session_missing: set[str] = set()
+        self._session_generation = 0
+        self._credential_session = CredentialSession(self)
+        self._secret_redactor = SecretRedactor()
+
+    @property
+    def secret_redactor(self) -> SecretRedactor:
+        """Return the process-local redactor owned by this broker."""
+        return self._secret_redactor
+
+    @property
+    def credential_session(self) -> CredentialSession:
+        """Return the operator-facing session facade owned by this Broker."""
+        return self._credential_session
+
+    def register_credential_store(
+        self,
+        ref: CredentialRef,
+        store: CredentialStore,
+        *,
+        provider: str | None = None,
+        session_required: bool | None = None,
+    ) -> None:
+        """Register a provider-bound platform store with this broker.
+
+        Registration carries only an opaque reference.  A store cannot be
+        looked up under another provider name, which prevents cross-provider
+        credential confusion in router configuration.
+        """
+        if not isinstance(ref, CredentialRef):
+            raise CredentialBrokerError("credential reference is invalid")
+        provider_name = provider.casefold() if isinstance(provider, str) else ref.provider
+        if provider_name != ref.provider:
+            raise CredentialBrokerError("credential reference provider mismatch")
+        if not isinstance(store, CredentialStore):
+            raise CredentialBrokerError("credential store is invalid")
+        if session_required is None:
+            session_required = bool(getattr(store, "requires_session_unlock", False))
+        if type(session_required) is not bool:
+            raise CredentialBrokerError("credential session policy is invalid")
+        with self._lock:
+            self._ensure_open()
+            existing = self._credential_stores.get(ref.value)
+            if existing is not None and existing.provider != provider_name:
+                raise CredentialBrokerError("credential reference is already bound")
+            if existing is not None and (
+                existing.store is not store
+                or existing.session_required != session_required
+            ):
+                self._session_credentials.pop(ref.value, None)
+                self._session_missing.discard(ref.value)
+            self._credential_stores[ref.value] = _ProviderCredentialRecord(
+                provider=provider_name,
+                ref=ref,
+                store=store,
+                session_required=session_required,
+            )
+
+    def provider_credential_status(
+        self, ref: CredentialRef, *, provider: str | None = None
+    ) -> dict[str, object]:
+        """Return presence/backend metadata without loading a secret."""
+        if not isinstance(ref, CredentialRef):
+            raise CredentialBrokerError("credential reference is invalid")
+        provider_name = provider.casefold() if isinstance(provider, str) else ref.provider
+        if provider_name != ref.provider:
+            raise CredentialBrokerError("credential reference provider mismatch")
+        with self._lock:
+            record = self._credential_stores.get(ref.value)
+            active_session = self._session_credentials.get(ref.value)
+        if record is None:
+            return {
+                "provider": provider_name,
+                "credential_ref": ref.value,
+                "credential_present": False,
+                "backend": "unregistered",
+                "status": "UNREGISTERED",
+                "session": "LOCKED",
+                "runtime_credential": "UNAVAILABLE",
+            }
+        if record.session_required and active_session is not None:
+            return {
+                "provider": provider_name,
+                "credential_ref": ref.value,
+                "credential_present": True,
+                "backend": credential_store_backend(record.store),
+                "status": "PRESENT",
+                "session": "UNLOCKED",
+                "runtime_credential": "AVAILABLE",
+                "session_generation": active_session.lease.generation,
+            }
+        try:
+            present = bool(
+                record.store.exists(
+                    ref, access_mode=CredentialAccessMode.RUNTIME
+                )
+            )
+        except CredentialStoreError as exc:
+            payload = {
+                "provider": provider_name,
+                "credential_ref": ref.value,
+                "credential_present": None,
+                "backend": credential_store_backend(record.store),
+                "status": (
+                    "INTERACTION_REQUIRED"
+                    if exc.diagnostic is not None
+                    and exc.diagnostic.category == "INTERACTION_REQUIRED"
+                    else "UNAVAILABLE"
+                ),
+                "session": "LOCKED" if record.session_required else "NOT_REQUIRED",
+                "runtime_credential": "UNAVAILABLE",
+            }
+            if isinstance(exc.diagnostic, CredentialStoreDiagnostic):
+                payload["diagnostic"] = exc.diagnostic.to_payload()
+            return payload
+        except Exception:  # noqa: BLE001 - status diagnostics fail closed
+            return {
+                "provider": provider_name,
+                "credential_ref": ref.value,
+                "credential_present": None,
+                "backend": credential_store_backend(record.store),
+                "status": "ERROR",
+                "session": "LOCKED" if record.session_required else "NOT_REQUIRED",
+                "runtime_credential": "UNAVAILABLE",
+            }
+        return {
+            "provider": provider_name,
+            "credential_ref": ref.value,
+            "credential_present": present,
+            "backend": credential_store_backend(record.store),
+            "status": "PRESENT" if present else "MISSING",
+            "session": "LOCKED" if record.session_required else "NOT_REQUIRED",
+            "runtime_credential": (
+                "AVAILABLE" if present and not record.session_required else "UNAVAILABLE"
+            ),
+        }
+
+    def credential_session_status(
+        self, ref: CredentialRef, *, provider: str | None = None
+    ) -> dict[str, object]:
+        """Return session state without consulting the persistent store."""
+        record = self._credential_record(ref, provider=provider)
+        with self._lock:
+            active = self._session_credentials.get(ref.value)
+            missing = ref.value in self._session_missing
+        if active is None:
+            if missing:
+                return {
+                    "provider": record.provider,
+                    "credential_ref": ref.value,
+                    "session": "LOCKED",
+                    "runtime_credential": "MISSING",
+                    "credential": "MISSING",
+                    "session_generation": None,
+                }
+            return {
+                "provider": record.provider,
+                "credential_ref": ref.value,
+                "session": "LOCKED",
+                "runtime_credential": "UNAVAILABLE",
+                "session_generation": None,
+            }
+        return {
+            "provider": record.provider,
+            "credential_ref": ref.value,
+            "session": "UNLOCKED",
+            "runtime_credential": "AVAILABLE",
+            "session_generation": active.lease.generation,
+        }
+
+    def unlock_provider_credential(
+        self, ref: CredentialRef, *, provider: str | None = None
+    ) -> CredentialSessionLease:
+        """Explicitly load one persistent credential into the Broker session.
+
+        This is the only session path that may use the provisioning access
+        mode.  Runtime transport never calls the persistent store for a
+        session-required provider.
+        """
+        record = self._credential_record(ref, provider=provider)
+        try:
+            secret = record.store.get(
+                ref, access_mode=CredentialAccessMode.PROVISIONING
+            )
+        except CredentialNotFound as exc:
+            with self._lock:
+                if self._credential_stores.get(ref.value) is record:
+                    self._session_credentials.pop(ref.value, None)
+                    self._session_missing.add(ref.value)
+            raise CredentialSessionMissing() from exc
+        except CredentialProvisioningCancelled as exc:
+            raise CredentialUnlockCancelled(
+                diagnostic=exc.diagnostic
+            ) from exc
+        except CredentialStoreError as exc:
+            raise CredentialSessionError(
+                "credential unlock failed",
+                diagnostic=exc.diagnostic,
+                code="CREDENTIAL_UNLOCK_FAILED",
+            ) from exc
+        except Exception as exc:
+            raise CredentialSessionError(
+                "credential unlock failed", code="CREDENTIAL_UNLOCK_FAILED"
+            ) from exc
+        with self._lock:
+            self._ensure_open()
+            current = self._credential_stores.get(ref.value)
+            if current is not record:
+                raise CredentialSessionError(
+                    "credential store changed during unlock",
+                    code="CREDENTIAL_UNLOCK_FAILED",
+                )
+            self._session_generation += 1
+            lease = CredentialSessionLease(
+                provider=record.provider,
+                ref=record.ref,
+                generation=self._session_generation,
+                issued_at=time.time(),
+            )
+            self._session_credentials[ref.value] = _SessionCredential(
+                lease=lease,
+                secret=secret,
+            )
+            self._session_missing.discard(ref.value)
+            return lease
+
+    def lock_provider_credential(
+        self, ref: CredentialRef, *, provider: str | None = None
+    ) -> None:
+        """Invalidate one in-memory credential lease without deleting it."""
+        record = self._credential_record(ref, provider=provider)
+        with self._lock:
+            self._session_credentials.pop(record.ref.value, None)
+
+    def lock_all_credentials(self) -> None:
+        """Invalidate every in-memory credential lease owned by this Broker."""
+        with self._lock:
+            self._session_credentials.clear()
+
+    def provision_provider_credential(
+        self,
+        ref: CredentialRef,
+        secret: SecretValue,
+        *,
+        provider: str | None = None,
+    ) -> None:
+        """Store one operator-supplied secret through the provisioning path.
+
+        This method is intentionally named for its authority.  It must only
+        be reached from explicit operator setup/replace flows; runtime model
+        and tool paths use ``authorize_provider_headers`` and never call it.
+        """
+        if not isinstance(secret, SecretValue):
+            raise CredentialBrokerError("provider credentials require SecretValue")
+        record = self._credential_record(ref, provider=provider)
+        try:
+            record.store.put(
+                ref,
+                secret,
+                access_mode=CredentialAccessMode.PROVISIONING,
+            )
+        except CredentialStoreError as exc:
+            raise CredentialBrokerError(
+                "credential provisioning failed", diagnostic=exc.diagnostic
+            ) from exc
+        except Exception as exc:
+            raise CredentialBrokerError("credential provisioning failed") from exc
+        # A replacement must never leave a stale runtime secret usable.  The
+        # operator can explicitly unlock the new persistent value afterwards.
+        with self._lock:
+            self._session_credentials.pop(ref.value, None)
+            self._session_missing.discard(ref.value)
+
+    def put_provider_credential(
+        self,
+        ref: CredentialRef,
+        secret: SecretValue,
+        *,
+        provider: str | None = None,
+    ) -> None:
+        """Compatibility alias for the explicit operator provisioning path."""
+        self.provision_provider_credential(ref, secret, provider=provider)
+
+    def snapshot_provisioned_provider_credential(
+        self, ref: CredentialRef, *, provider: str | None = None
+    ) -> SecretValue | None:
+        """Snapshot an existing credential for an atomic operator replace.
+
+        The value remains wrapped in memory and is only used by the trusted
+        configuration transaction to restore a previous value after a config
+        publication failure.  Runtime callers have no corresponding method.
+        """
+        record = self._credential_record(ref, provider=provider)
+        try:
+            if not record.store.exists(
+                ref, access_mode=CredentialAccessMode.PROVISIONING
+            ):
+                return None
+            return record.store.get(
+                ref, access_mode=CredentialAccessMode.PROVISIONING
+            )
+        except CredentialNotFound:
+            return None
+        except CredentialStoreError as exc:
+            raise CredentialBrokerError(
+                "credential provisioning snapshot failed", diagnostic=exc.diagnostic
+            ) from exc
+        except Exception as exc:
+            raise CredentialBrokerError(
+                "credential provisioning snapshot failed"
+            ) from exc
+
+    def delete_provisioned_provider_credential(
+        self, ref: CredentialRef, *, provider: str | None = None
+    ) -> None:
+        """Delete one credential from the explicit operator path.
+
+        There is deliberately no runtime auto-delete operation.  A provider
+        read failure cannot destroy a stored credential.
+        """
+        record = self._credential_record(ref, provider=provider)
+        try:
+            record.store.delete(
+                ref,
+                access_mode=CredentialAccessMode.PROVISIONING,
+            )
+        except CredentialStoreError as exc:
+            raise CredentialBrokerError(
+                "credential deletion failed", diagnostic=exc.diagnostic
+            ) from exc
+        except Exception as exc:
+            raise CredentialBrokerError("credential deletion failed") from exc
+        with self._lock:
+            self._session_credentials.pop(ref.value, None)
+            self._session_missing.add(ref.value)
+
+    def delete_provider_credential(
+        self, ref: CredentialRef, *, provider: str | None = None
+    ) -> None:
+        """Compatibility alias for explicit operator credential deletion."""
+        self.delete_provisioned_provider_credential(ref, provider=provider)
+
+    def issue_provider_handle(
+        self,
+        ref: CredentialRef,
+        *,
+        provider: str | None = None,
+        binding: Mapping[str, object] | str,
+        operation: str = "provider.request",
+        ttl_seconds: float = 120.0,
+    ) -> CredentialHandle:
+        """Issue a runtime, non-interactive handle for one provider operation."""
+        return self._issue_provider_handle(
+            ref,
+            provider=provider,
+            binding=binding,
+            operation=operation,
+            ttl_seconds=ttl_seconds,
+            access_mode=CredentialAccessMode.RUNTIME,
+        )
+
+    def issue_provisioning_provider_handle(
+        self,
+        ref: CredentialRef,
+        *,
+        provider: str | None = None,
+        binding: Mapping[str, object] | str,
+        operation: str = "provider.discovery",
+        ttl_seconds: float = 120.0,
+    ) -> CredentialHandle:
+        """Issue a provisioning-only handle for explicit model discovery."""
+        if operation != "provider.discovery":
+            raise CredentialBrokerError(
+                "provisioning handles are limited to provider discovery"
+            )
+        return self._issue_provider_handle(
+            ref,
+            provider=provider,
+            binding=binding,
+            operation=operation,
+            ttl_seconds=ttl_seconds,
+            access_mode=CredentialAccessMode.PROVISIONING,
+        )
+
+    def _issue_provider_handle(
+        self,
+        ref: CredentialRef,
+        *,
+        provider: str | None,
+        binding: Mapping[str, object] | str,
+        operation: str,
+        ttl_seconds: float,
+        access_mode: CredentialAccessMode,
+    ) -> CredentialHandle:
+        """Issue a handle after an explicitly selected store-mode check."""
+        mode = access_mode
+        if ttl_seconds <= 0 or ttl_seconds > self.max_ttl_seconds:
+            raise CredentialBrokerError("credential handle TTL is outside its bound")
+        record = self._credential_record(ref, provider=provider)
+        session_generation = (
+            self._runtime_session_generation(record, ref)
+            if mode is CredentialAccessMode.RUNTIME
+            else None
+        )
+        if session_generation is None:
+            try:
+                if not record.store.exists(ref, access_mode=mode):
+                    raise CredentialBrokerError("provider credential is not present")
+            except CredentialBrokerError:
+                raise
+            except CredentialStoreError as exc:
+                raise CredentialBrokerError(
+                    "credential store unavailable", diagnostic=exc.diagnostic
+                ) from exc
+            except Exception as exc:
+                raise CredentialBrokerError(
+                    "credential store presence check failed"
+                ) from exc
+        now = datetime.now(UTC)
+        return CredentialHandle(
+            provider=record.provider,
+            ref=record.ref,
+            operation=operation,
+            binding_digest=credential_binding_digest(binding, operation),
+            broker_id=self._broker_id,
+            issued_at=now,
+            expires_at=now + timedelta(seconds=ttl_seconds),
+            access_mode=mode,
+            session_generation=session_generation,
+        )
+
+    def authorize_provider_headers(
+        self,
+        headers: dict[str, str],
+        handle: CredentialHandle,
+        *,
+        provider: str,
+        binding: Mapping[str, object] | str,
+        operation: str = "provider.request",
+        header_name: str = "Authorization",
+        scheme: str = "Bearer",
+    ) -> None:
+        """Resolve a handle directly into a mutable transport header map.
+
+        This is the narrow transport boundary.  No caller receives the raw
+        value; the value exists only long enough for the HTTP client to build
+        its request.  All validation happens before the store is touched.
+        """
+        self._authorize_provider_headers(
+            headers,
+            handle,
+            provider=provider,
+            binding=binding,
+            operation=operation,
+            header_name=header_name,
+            scheme=scheme,
+            access_mode=CredentialAccessMode.RUNTIME,
+        )
+
+    def authorize_provisioning_provider_headers(
+        self,
+        headers: dict[str, str],
+        handle: CredentialHandle,
+        *,
+        provider: str,
+        binding: Mapping[str, object] | str,
+        operation: str = "provider.discovery",
+        header_name: str = "Authorization",
+        scheme: str = "Bearer",
+    ) -> None:
+        """Resolve a provisioning handle only for explicit setup discovery."""
+        if operation != "provider.discovery":
+            raise CredentialBrokerError(
+                "provisioning headers are limited to provider discovery"
+            )
+        self._authorize_provider_headers(
+            headers,
+            handle,
+            provider=provider,
+            binding=binding,
+            operation=operation,
+            header_name=header_name,
+            scheme=scheme,
+            access_mode=CredentialAccessMode.PROVISIONING,
+        )
+
+    def _authorize_provider_headers(
+        self,
+        headers: dict[str, str],
+        handle: CredentialHandle,
+        *,
+        provider: str,
+        binding: Mapping[str, object] | str,
+        operation: str,
+        header_name: str,
+        scheme: str,
+        access_mode: CredentialAccessMode,
+    ) -> None:
+        """Shared validation/materialization for the two named authorities."""
+        mode = access_mode
+        if not isinstance(headers, dict) or not isinstance(handle, CredentialHandle):
+            raise CredentialBrokerError("provider transport authorization is invalid")
+        provider_name = provider.casefold() if isinstance(provider, str) else ""
+        if provider_name != handle.provider or handle.broker_id != self._broker_id:
+            raise CredentialBrokerError("provider credential handle is not owned by broker")
+        if handle.access_mode is not mode:
+            raise CredentialBrokerError("provider credential handle access mode mismatched")
+        if handle.operation != operation or handle.expired:
+            raise CredentialBrokerError("provider credential handle is expired or mismatched")
+        expected_binding = credential_binding_digest(binding, operation)
+        if handle.binding_digest != expected_binding:
+            raise CredentialBrokerError("provider credential target binding changed")
+        if not header_name or any(
+            ord(char) < 0x20 or ord(char) == 0x7F for char in f"{header_name}{scheme}"
+        ):
+            raise CredentialBrokerError("provider authorization header is invalid")
+        record = self._credential_record(handle.ref, provider=provider_name)
+        try:
+            session_secret = (
+                self._runtime_session_secret(record, handle)
+                if mode is CredentialAccessMode.RUNTIME
+                else None
+            )
+            secret = session_secret
+            if secret is None:
+                secret = record.store.get(handle.ref, access_mode=mode)
+            self._secret_redactor.register(secret)
+            raw = secret._reveal_for_transport(_TRANSPORT_CAPABILITY)
+        except CredentialNotFound as exc:
+            raise CredentialBrokerError("provider credential is not present") from exc
+        except CredentialStoreError as exc:
+            raise CredentialBrokerError(
+                "credential store unavailable", diagnostic=exc.diagnostic
+            ) from exc
+        except CredentialBrokerError:
+            raise
+        except Exception as exc:
+            raise CredentialBrokerError("credential store read failed") from exc
+        headers[header_name] = f"{scheme} {raw}" if scheme else raw
+
+    def _runtime_session_generation(
+        self, record: _ProviderCredentialRecord, ref: CredentialRef
+    ) -> int | None:
+        """Return the active session generation without touching the store."""
+        with self._lock:
+            active = self._session_credentials.get(ref.value)
+            missing = ref.value in self._session_missing
+        if active is None:
+            if missing:
+                raise CredentialSessionMissing()
+            if record.session_required:
+                raise CredentialSessionLocked()
+            return None
+        return active.lease.generation
+
+    def _runtime_session_secret(
+        self, record: _ProviderCredentialRecord, handle: CredentialHandle
+    ) -> SecretValue | None:
+        """Return a cached secret only when the handle matches the session."""
+        with self._lock:
+            active = self._session_credentials.get(handle.ref.value)
+        if active is None:
+            with self._lock:
+                missing = handle.ref.value in self._session_missing
+            if missing:
+                raise CredentialSessionMissing()
+            if record.session_required or handle.session_generation is not None:
+                raise CredentialSessionLocked()
+            return None
+        if handle.session_generation != active.lease.generation:
+            raise CredentialSessionLocked("credential session lease is stale")
+        return active.secret
+
+    def _credential_record(
+        self, ref: CredentialRef, *, provider: str | None = None
+    ) -> _ProviderCredentialRecord:
+        if not isinstance(ref, CredentialRef):
+            raise CredentialBrokerError("credential reference is invalid")
+        provider_name = provider.casefold() if isinstance(provider, str) else ref.provider
+        if provider_name != ref.provider:
+            raise CredentialBrokerError("credential reference provider mismatch")
+        with self._lock:
+            self._ensure_open()
+            record = self._credential_stores.get(ref.value)
+        if record is None or record.provider != provider_name or record.ref != ref:
+            raise CredentialBrokerError("provider credential is not registered")
+        return record
 
     def register(
         self,
@@ -665,6 +1400,10 @@ class CredentialBroker:
                 f"credential-lease:{lease_id}" for lease_id in self._leases
             ]
             resources.extend(
+                f"credential-session:{ref}"
+                for ref in self._session_credentials
+            )
+            resources.extend(
                 f"credential-materialization:{transaction_id}"
                 for transaction_id in self._materializations
             )
@@ -684,7 +1423,11 @@ class CredentialBroker:
     def terminal_postcondition(self) -> bool:
         """Prove that no lease or provider transaction remains owned."""
         with self._lock:
-            return not self._leases and not self._materializations
+            return (
+                not self._leases
+                and not self._materializations
+                and not self._session_credentials
+            )
 
     def close(self) -> None:
         """Close admission without falsely claiming in-flight materialization is gone."""
@@ -693,6 +1436,8 @@ class CredentialBroker:
                 return
             self._closing = True
             self._leases.clear()
+            self._session_credentials.clear()
+            self._session_missing.clear()
             # Every owned provider host receives SIGTERM immediately; the
             # hosted workers finish the kill ladder and abort their
             # transactions, so a hung provider delays close by the bounded
@@ -708,6 +1453,10 @@ class CredentialBroker:
                 return
             self._closed = True
             self._loaders.clear()
+            self._credential_stores.clear()
+            self._session_credentials.clear()
+            self._session_missing.clear()
+            self._secret_redactor.clear()
             self._quarantined = False
         # Already-submitted provider calls remain owned until they settle;
         # shutdown only rejects new submissions on the dedicated executor.
@@ -749,6 +1498,7 @@ class CredentialBroker:
                 self._closed
                 and not self._leases
                 and not self._materializations
+                and not self._session_credentials
                 and not self._any_host_alive_locked()
             )
 
@@ -918,6 +1668,10 @@ class CredentialBroker:
         ):
             self._closed = True
             self._loaders.clear()
+            self._credential_stores.clear()
+            self._session_credentials.clear()
+            self._session_missing.clear()
+            self._secret_redactor.clear()
             self._quarantined = False
             self._retained_hosts.clear()
             # Terminal: no owned provider call remains, so the dedicated
@@ -1003,6 +1757,17 @@ __all__ = [
     "CredentialBroker",
     "CredentialBrokerError",
     "CredentialEnvironmentSchema",
+    "CredentialHandle",
     "CredentialLease",
+    "CredentialRef",
+    "CredentialSession",
+    "CredentialSessionError",
+    "CredentialSessionLease",
+    "CredentialSessionLocked",
+    "CredentialSessionMissing",
+    "CredentialStore",
+    "CredentialStoreUnavailable",
+    "CredentialUnlockCancelled",
+    "SecretValue",
     "credential_binding_digest",
 ]

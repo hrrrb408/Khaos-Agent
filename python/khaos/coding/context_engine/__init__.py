@@ -15,6 +15,8 @@ from khaos.coding.context_engine.contracts import (
     ContextOperation,
     ContextRequirements,
     ContextSelection,
+    ContextSelectionIdentity,
+    ContextSelectionReason,
     ContextSource,
     ContextTrust,
     ModelContext,
@@ -23,6 +25,7 @@ from khaos.coding.context_engine.contracts import (
 )
 from khaos.coding.context_engine.discovery import (
     CORE_TOOL_NAMES,
+    LEGACY_CODING_MUTATION_TOOL_NAMES,
     DeferredToolDiscovery,
     LazySkillDiscovery,
     SkillMetadata,
@@ -51,6 +54,7 @@ __all__ = [
     "CONTEXT_SCHEMA_VERSION",
     "CORE_TOOL_NAMES",
     "GENERATION_BOUND_SOURCES",
+    "LEGACY_CODING_MUTATION_TOOL_NAMES",
     "CompactionResult",
     "ContextBudget",
     "ContextCache",
@@ -67,6 +71,8 @@ __all__ = [
     "ContextOperation",
     "ContextRequirements",
     "ContextSelection",
+    "ContextSelectionIdentity",
+    "ContextSelectionReason",
     "ContextSelector",
     "ContextSerializer",
     "ContextSource",

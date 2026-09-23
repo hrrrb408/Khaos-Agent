@@ -95,7 +95,7 @@ class PermissionProfile:
         default_factory=lambda: _default_unreadable_roots()
     )
     environment_keys: frozenset[str] = frozenset(
-        {"PATH", "LANG", "LC_ALL", "TMPDIR"}
+        {"PATH", "LANG", "LC_ALL", "TMPDIR", "PYTHONDONTWRITEBYTECODE"}
     )
     resources: ResourceBudget = field(default_factory=ResourceBudget)
     # Exact task-owned loopback listeners for a local Coding app.  This is
@@ -407,7 +407,9 @@ class ExecutionRequest:
     cwd: Path
     writable_roots: tuple[Path, ...] = ()
     environment: dict[str, str] = field(default_factory=dict)
-    allowed_environment_keys: frozenset[str] = frozenset({"PATH", "LANG", "LC_ALL", "TMPDIR"})
+    allowed_environment_keys: frozenset[str] = frozenset(
+        {"PATH", "LANG", "LC_ALL", "TMPDIR", "PYTHONDONTWRITEBYTECODE"}
+    )
     network_policy: NetworkPolicy = NetworkPolicy.NONE
     network_broker: NetworkLease | None = None
     budget: ResourceBudget = field(default_factory=ResourceBudget)
@@ -543,10 +545,14 @@ def _default_unreadable_roots() -> tuple[Path, ...]:
     """Host credential locations hidden from restricted Agent execution."""
     home = Path.home().expanduser().resolve()
     return (
+        home / ".khaos",
         home / ".ssh",
         home / ".gnupg",
         home / ".aws",
         home / ".kube",
+        home / ".netrc",
+        home / ".docker",
+        home / ".azure",
         home / ".config" / "gcloud",
         home / "Library" / "Keychains",
     )

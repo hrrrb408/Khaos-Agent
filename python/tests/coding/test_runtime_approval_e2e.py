@@ -95,7 +95,7 @@ async def test_fake_agent_runtime_changes_only_worktree_then_approved_apply(tmp_
             "id": "write", "name": "write_file", "arguments": {"path": "README.txt", "content": "after\n"},
         }], stop_reason="tool_use")],
         [Message(role="assistant", content="", tool_calls=[{
-            "id": "terminal", "name": "terminal_argv", "arguments": {"argv": ["cat", "README.txt"], "cwd": "PLACEHOLDER"},
+            "id": "terminal", "name": "terminal_argv", "arguments": {"argv": ["cat", "README.txt"], "cwd": "PLACEHOLDER", "timeout_seconds": 30},
         }], stop_reason="tool_use")],
         [Message(role="assistant", content="done", stop_reason="end_turn")],
     ]
