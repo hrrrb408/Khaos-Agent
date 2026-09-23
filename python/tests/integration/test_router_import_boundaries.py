@@ -76,9 +76,23 @@ def _clean_process_environment(
             value = os.environ.get(variable)
             if value:
                 environment[variable] = value
+        # Windows has no passwd-database fallback for Path.home().  Keep the
+        # probe independent from the runner's ambient account while giving
+        # the audit module its explicit service-style trust root.  Probes
+        # that provide a synthetic home also need USERPROFILE because
+        # pathlib ignores HOME on Windows.
+        if home is not None:
+            environment["HOME"] = str(home)
+            environment["USERPROFILE"] = str(home)
+            trusted_home = home
+        else:
+            trusted_home = python_root.parent
+        environment["KHAOS_AUDIT_TRUSTED_DIR"] = str(
+            trusted_home / ".khaos" / "audit"
+        )
     else:
         environment["PATH"] = "/usr/bin:/bin:/opt/homebrew/bin"
-    if home is not None:
+    if home is not None and os.name != "nt":
         environment["HOME"] = str(home)
     return environment
 

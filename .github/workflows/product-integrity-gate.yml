@@ -115,7 +115,12 @@ jobs:
   python-product-windows:
     name: Python Product Suite (Windows 3.11)
     runs-on: windows-2025
-    timeout-minutes: 90
+    # The complete Windows collection is intentionally split into serial
+    # isolated shards to protect shared Winsock/native state.  That makes the
+    # full cell approach 90 minutes on a hosted runner; leave CI headroom for
+    # normal runner variance instead of converting a healthy suite into a
+    # cancelled required check.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
@@ -143,7 +148,7 @@ jobs:
         # The runner executes the complete applicable collection, but in
         # isolated processes.  This keeps a leaked asyncio/Winsock/native
         # resource in one shard from starving later tests or hiding the real
-        # result behind the 90-minute job timeout.
+        # result behind the 120-minute job timeout.
         run: >-
           uv run python scripts/run_windows_product_suite.py --shards 4
           --marker "not browser_real and not docker_sandbox_real and not production_sandbox_real and not kernel_real and not platform_sandbox_real and not posix_host"
