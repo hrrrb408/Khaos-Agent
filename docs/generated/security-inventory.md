@@ -61,7 +61,7 @@
 - `python/khaos/coding/execution/identity.py`: `f5b21dd9098def1ea894b4830181fd9a6be1196b00235a404027794f8b4b0bef`
 - `python/khaos/coding/execution/models.py`: `dcc101596223e82d65d71b4310c0d6b495b9836661e08448a992d47907d4aea2`
 - `python/khaos/coding/execution/native_launcher.py`: `f53d8b878c4d666100c60b71f4d96e979a511fb00e55ac95d77a0278c3074f77`
-- `python/khaos/coding/execution/platform.py`: `21aae3dac6ae34d664723d6b1bca02f3005503fe814a569c433c62644ff762b9`
+- `python/khaos/coding/execution/platform.py`: `94a2c9d0c71cee80cba9c553127e98c50e91d0e4952d0220e39b13a51c0cd9b5`
 - `python/khaos/coding/execution/resource_owner.py`: `9304e64dda07b968159333fab1abae603ca19b43c972a2794c77b65dd06b52e8`
 - `python/khaos/coding/execution/service.py`: `a00938c4d9ab24832bb701e5112943189938700e570bb2ffc843246df3176ae7`
 - `python/khaos/coding/execution/binding.py`: `99f3d8eb14d80a837ecf0f0d076d556ccdb366b8798c9e0fde6c69d0bb1a5501`
@@ -107,11 +107,11 @@
 - `python/khaos/tools/result_codec.py`: `0da76b3b30380d105a95a7da24741a74ac5b4f9ecb6404aaf415b40943b7af24`
 - `python/khaos/tools/result_finalizer.py`: `b5d57b0aff449fdd92bd8da57a8f21d2f3e10dd29b1713b64e5f78aaeef6e23b`
 - `python/khaos/rpc/protocol.py`: `ba1412c0d55e9347621bba541d7bec722bac628e6743d384511a86c8a56c75b1`
-- `python/khaos/runtime_profile.py`: `1015564e2a18975a2767d949bb9471b6976968bf9e437d279aa6dd57ae8ce79a`
+- `python/khaos/runtime_profile.py`: `b830fbfd8f94d5bdac1dd551e9ed63a2d394fa020d006a1d1c35bac1c722f89c`
 - `python/khaos/rpc/models.py`: `3173ba3356d970604df7540af92c1d96e8777813292bb1dab26e142bc572228e`
 - `python/khaos/rpc/agent_service.py`: `b1d38a4a009d8442fad32a8977cd2739f94a01e126604ce3cb533d7266832679`
 - `python/khaos/rpc/task_service.py`: `1e10507e833ff237d21f0526bc0ae67a2b96d4aefce03a53d8fecf13a1734fe1`
-- `python/khaos/rpc/composition.py`: `47a0bd12af116b9dc9b4d4e6535fb3c46710f663c053855eb17008558af0111c`
+- `python/khaos/rpc/composition.py`: `b6cdd66cc3f3ea1937fd51684bc291ab1563b927bee41a4ca0d4a4a5da3a6899`
 - `rust/khaos-core/src/bin/khaos-exec-launcher.rs`: `c5eb7343002ecb7f74e1ca10df5d5edaf4de39f90ecc68064cb355b56b2fda71`
 - `rust/khaos-core/src/bin/khaos-sandbox-launcher.rs`: `ff2cd158b0c909c20880c3c56a07615d11af7db24d6df84505a9259820bd6190`
 - `python/khaos/grpc_server.py`: `756f94d77262689002bef30aea0682d60040a184b138423294c88dba3fa9908d`

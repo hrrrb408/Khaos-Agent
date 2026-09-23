@@ -4,10 +4,10 @@
 > Every host-spawn primitive detected by this enforced static verifier must have an owner, threat model, and enforcement boundary. Indirect or dynamic dispatch is not proven by this inventory.
 
 - `python/khaos/cli/eval_commands.py:817` `subprocess.run` in `<module>._git_sha` owner=`CodingEvaluationCLI` threat-model=`trusted-source-git-provenance` boundary=`coding-evaluation-cli`
-- `python/khaos/cli/main.py:650` `subprocess.run` in `<module>.cmd_start` owner=`CliGatewayProcess` threat-model=`user-authorized-local-gateway` boundary=`cli-runtime`
-- `python/khaos/cli/main.py:664` `subprocess.Popen` in `<module>.cmd_start` owner=`CliGatewayProcess` threat-model=`user-authorized-local-gateway` boundary=`cli-runtime`
-- `python/khaos/cli/main.py:725` `subprocess.run` in `<module>.cmd_test` owner=`CliGatewayProcess` threat-model=`user-authorized-local-gateway` boundary=`cli-runtime`
-- `python/khaos/cli/main.py:735` `subprocess.run` in `<module>.cmd_test` owner=`CliGatewayProcess` threat-model=`user-authorized-local-gateway` boundary=`cli-runtime`
+- `python/khaos/cli/main.py:681` `subprocess.run` in `<module>.cmd_start` owner=`CliGatewayProcess` threat-model=`user-authorized-local-gateway` boundary=`cli-runtime`
+- `python/khaos/cli/main.py:695` `subprocess.Popen` in `<module>.cmd_start` owner=`CliGatewayProcess` threat-model=`user-authorized-local-gateway` boundary=`cli-runtime`
+- `python/khaos/cli/main.py:756` `subprocess.run` in `<module>.cmd_test` owner=`CliGatewayProcess` threat-model=`user-authorized-local-gateway` boundary=`cli-runtime`
+- `python/khaos/cli/main.py:766` `subprocess.run` in `<module>.cmd_test` owner=`CliGatewayProcess` threat-model=`user-authorized-local-gateway` boundary=`cli-runtime`
 - `python/khaos/coding/execution/capability.py:263` `subprocess.run` in `<module>._capability_evidence` owner=`SandboxCapabilityProbe` threat-model=`trusted-tcb-probe` boundary=`execution-capability`
 - `python/khaos/coding/execution/native_launcher.py:368` `subprocess.run` in `<module>._darwin_signature_mode` owner=`NativeLauncherBoundary` threat-model=`fd-bound-exec-and-host-signature-probe` boundary=`native-launcher`
 - `python/khaos/coding/execution/native_launcher.py:378` `subprocess.run` in `<module>._darwin_signature_mode` owner=`NativeLauncherBoundary` threat-model=`fd-bound-exec-and-host-signature-probe` boundary=`native-launcher`
@@ -19,8 +19,8 @@
 - `python/khaos/coding/execution/native_launcher_runtime.py:418` `subprocess.run` in `<module>._authority_path` owner=`NativeLauncherTCB` threat-model=`fd-bound-exec-and-codesign` boundary=`native-launcher`
 - `python/khaos/coding/execution/platform.py:212` `subprocess.run` in `<module>.probe_capability` owner=`ExecutionBackend` threat-model=`kernel-sandbox-and-resource-control` boundary=`execution-service`
 - `python/khaos/coding/execution/platform.py:482` `asyncio.create_subprocess_exec` in `<module>.execute` owner=`ExecutionBackend` threat-model=`kernel-sandbox-and-resource-control` boundary=`execution-service`
-- `python/khaos/coding/execution/platform.py:1231` `subprocess.run` in `<module>.probe_capability` owner=`ExecutionBackend` threat-model=`kernel-sandbox-and-resource-control` boundary=`execution-service`
-- `python/khaos/coding/execution/platform.py:1686` `subprocess.run` in `<module>.probe_capability` owner=`ExecutionBackend` threat-model=`kernel-sandbox-and-resource-control` boundary=`execution-service`
+- `python/khaos/coding/execution/platform.py:1236` `subprocess.run` in `<module>.probe_capability` owner=`ExecutionBackend` threat-model=`kernel-sandbox-and-resource-control` boundary=`execution-service`
+- `python/khaos/coding/execution/platform.py:1691` `subprocess.run` in `<module>.probe_capability` owner=`ExecutionBackend` threat-model=`kernel-sandbox-and-resource-control` boundary=`execution-service`
 - `python/khaos/coding/execution/service.py:1045` `asyncio.create_subprocess_exec` in `<module>._start_managed_after_admission` owner=`ExecutionService` threat-model=`authority-bound-child-spawn` boundary=`execution-service`
 - `python/khaos/coding/execution/supervisor.py:474` `asyncio.create_subprocess_exec` in `<module>.run` owner=`ProcessSupervisor` threat-model=`child-tree-lifecycle` boundary=`execution-service`
 - `python/khaos/coding/execution/supervisor.py:1613` `subprocess.run` in `<module>._darwin_deleted_open_file_usage` owner=`ProcessSupervisor` threat-model=`child-tree-lifecycle` boundary=`execution-service`
