@@ -28,8 +28,12 @@ on:
   workflow_call:
   pull_request:
     branches: [main]
+  # Pull requests are the authoritative product gate for feature branches.
+  # Keep push validation for main, but avoid a second same-context run on
+  # feature branches: its cancellation can leave a failed required check
+  # beside the successful pull_request result.
   push:
-    branches: [main, "feature/**", "codex/**"]
+    branches: [main]
   workflow_dispatch:
 
 jobs:
