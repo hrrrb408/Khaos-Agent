@@ -31,15 +31,44 @@ _IMPORT_ORDERS = (
 )
 
 
-def _clean_process_environment(python_root: Path) -> dict[str, str]:
+def _clean_process_environment(
+    python_root: Path,
+    *,
+    home: Path | None = None,
+) -> dict[str, str]:
     """Use only deterministic non-secret process inputs for import probes."""
 
-    return {
+    environment = {
         "PATH": "/usr/bin:/bin:/opt/homebrew/bin",
         "PYTHONNOUSERSITE": "1",
         "PYTHONPATH": str(python_root),
         "LC_ALL": "C",
     }
+    if home is not None:
+        environment["HOME"] = str(home)
+    return environment
+
+
+def _write_router_user_config(home: Path) -> None:
+    """Create the metadata-only trusted user layer used by router probes."""
+
+    config_path = home / ".khaos" / "config.yaml"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(
+        """models:
+  default_model: glm-5.3
+  providers:
+    zhipu-coding:
+      type: openai_compatible
+      base_url: https://open.bigmodel.cn/api/coding/paas/v4
+      credential_ref: khaos/providers/zhipu-coding/test
+      models:
+        - name: glm-5.3
+          model: glm-5.3
+          max_context_tokens: 128000
+""",
+        encoding="utf-8",
+    )
 
 
 def _run_python_probe(source: str) -> subprocess.CompletedProcess[str]:
@@ -92,10 +121,13 @@ def test_planning_reexports_security_workspace_identity() -> None:
     assert result.returncode == 0, result.stderr
 
 
-def test_production_router_smoke_does_not_materialize_credentials() -> None:
+def test_production_router_smoke_does_not_materialize_credentials(
+    tmp_path: Path,
+) -> None:
     """The production router can initialize without provider side effects."""
 
     python_root = Path(__file__).resolve().parents[2]
+    _write_router_user_config(tmp_path)
     root_literal = repr(str(python_root.parent))
     source = (
         "import json; "
@@ -119,7 +151,7 @@ def test_production_router_smoke_does_not_materialize_credentials() -> None:
         text=True,
         timeout=30,
         cwd=str(python_root.parent),
-        env=_clean_process_environment(python_root),
+        env=_clean_process_environment(python_root, home=tmp_path),
     )
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
@@ -131,10 +163,13 @@ def test_production_router_smoke_does_not_materialize_credentials() -> None:
     }
 
 
-def test_qualification_bootstrap_imports_without_provider_call() -> None:
+def test_qualification_bootstrap_imports_without_provider_call(
+    tmp_path: Path,
+) -> None:
     """Qualification setup resolves its contracts before session/provider use."""
 
     python_root = Path(__file__).resolve().parents[2]
+    _write_router_user_config(tmp_path)
     root_literal = repr(str(python_root.parent))
     source = (
         "import json; "
@@ -174,7 +209,7 @@ def test_qualification_bootstrap_imports_without_provider_call() -> None:
         text=True,
         timeout=45,
         cwd=str(python_root.parent),
-        env=_clean_process_environment(python_root),
+        env=_clean_process_environment(python_root, home=tmp_path),
     )
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
