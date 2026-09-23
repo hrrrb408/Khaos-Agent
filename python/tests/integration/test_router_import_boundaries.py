@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -39,11 +40,44 @@ def _clean_process_environment(
     """Use only deterministic non-secret process inputs for import probes."""
 
     environment = {
-        "PATH": "/usr/bin:/bin:/opt/homebrew/bin",
         "PYTHONNOUSERSITE": "1",
         "PYTHONPATH": str(python_root),
         "LC_ALL": "C",
     }
+    if os.name == "nt":
+        # A minimal POSIX environment is enough for Unix import probes, but
+        # Windows' asyncio extension needs the system loader inputs and a
+        # system PATH to initialize Winsock providers in _overlapped.
+        system_root = (
+            os.environ.get("SystemRoot")
+            or os.environ.get("WINDIR")
+            or r"C:\Windows"
+        )
+        environment.update(
+            {
+                "PATH": os.pathsep.join(
+                    (
+                        str(Path(sys.executable).parent),
+                        str(Path(system_root) / "System32"),
+                        system_root,
+                    )
+                ),
+                "PATHEXT": os.environ.get(
+                    "PATHEXT", ".COM;.EXE;.BAT;.CMD"
+                ),
+                "SYSTEMROOT": system_root,
+                "WINDIR": os.environ.get("WINDIR", system_root),
+                "COMSPEC": os.environ.get(
+                    "COMSPEC", str(Path(system_root) / "System32" / "cmd.exe")
+                ),
+            }
+        )
+        for variable in ("TEMP", "TMP"):
+            value = os.environ.get(variable)
+            if value:
+                environment[variable] = value
+    else:
+        environment["PATH"] = "/usr/bin:/bin:/opt/homebrew/bin"
     if home is not None:
         environment["HOME"] = str(home)
     return environment
