@@ -107,6 +107,16 @@ async def test_run(
         }
         if _is_pytest_argv(tuple(parts)):
             environment["PYTEST_ADDOPTS"] = "-p no:cacheprovider"
+            if spawn_plan is None:
+                # Legacy/library callers do not have the scheduler-owned
+                # runtime environment that selects the project's plugins.
+                # On macOS the descriptor-bound launcher executes the
+                # canonical Python binary, which can otherwise discover
+                # unrelated host pytest entry points before the command
+                # reaches the task workspace.  Keep this compatibility path
+                # deterministic; scheduler-owned coding runs retain their
+                # explicitly approved plugin environment.
+                environment["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
 
     try:
         command_environment, command_argv = split_command_environment(tuple(parts))
