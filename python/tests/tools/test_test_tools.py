@@ -2,8 +2,10 @@
 
 import asyncio
 import json
+import os
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 from khaos.coding.execution.environment import (
@@ -423,6 +425,45 @@ async def test_test_run_pytest_does_not_create_workspace_cache(tmp_path):
 
     assert result["success"] is True
     assert not (workspace.worktree_path / ".pytest_cache").exists()
+
+
+async def test_test_run_legacy_pytest_preserves_approved_venv_runtime(tmp_path):
+    """macOS launcher staging must not discard the project's pytest runtime."""
+    from types import SimpleNamespace
+
+    class _CaptureExecution:
+        request = None
+
+        async def execute(self, request):
+            self.request = request
+            return SimpleNamespace(
+                return_code=0,
+                stdout="1 passed in 0.1s\n",
+                stderr="",
+                status="completed",
+            )
+
+    execution = _CaptureExecution()
+    result = json.loads(
+        await test_tools.test_run(
+            f"{sys.executable} -m pytest -q",
+            cwd=str(tmp_path),
+            execution_service=execution,
+            task_id="task",
+            workspace_id="workspace",
+        )
+    )
+
+    assert result["success"] is True
+    assert execution.request.environment["PYTHONNOUSERSITE"] == "1"
+    venv_root = Path(sys.executable).expanduser().absolute().parents[1]
+    expected = tuple(
+        str(path.resolve())
+        for path in sorted((venv_root / "lib").glob("python*/site-packages"))
+        if path.is_dir()
+    ) if (venv_root / "pyvenv.cfg").is_file() else ()
+    if expected:
+        assert execution.request.environment["PYTHONPATH"] == os.pathsep.join(expected)
 
 
 async def test_test_run_uses_approved_spawn_plan_environment(tmp_path):

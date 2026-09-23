@@ -107,16 +107,14 @@ async def test_run(
         }
         if _is_pytest_argv(tuple(parts)):
             environment["PYTEST_ADDOPTS"] = "-p no:cacheprovider"
+            # Legacy/library callers do not have the scheduler-owned runtime
+            # environment that selects the project's plugins.  On macOS the
+            # descriptor-bound launcher stages the canonical Python binary;
+            # preserve only the approved venv site-packages and ignore the
+            # user's global site so nested pytest remains deterministic.
             if spawn_plan is None:
-                # Legacy/library callers do not have the scheduler-owned
-                # runtime environment that selects the project's plugins.
-                # On macOS the descriptor-bound launcher executes the
-                # canonical Python binary, which can otherwise discover
-                # unrelated host pytest entry points before the command
-                # reaches the task workspace.  Keep this compatibility path
-                # deterministic; scheduler-owned coding runs retain their
-                # explicitly approved plugin environment.
                 environment["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+                environment["PYTHONNOUSERSITE"] = "1"
 
     try:
         command_environment, command_argv = split_command_environment(tuple(parts))
@@ -148,6 +146,14 @@ async def test_run(
     else:
         environment.update(command_environment)
     parts = list(command_argv)
+    if spawn_plan is None and _is_pytest_argv(tuple(parts)):
+        site_packages = _legacy_python_site_packages(tuple(parts))
+        if site_packages:
+            # This path is derived from the exact absolute interpreter
+            # approved in argv, never from a model-controlled PYTHONPATH
+            # assignment.  PYTHONPATH is intentionally not part of
+            # TASK_ENVIRONMENT_KEYS, so command prefixes cannot override it.
+            environment["PYTHONPATH"] = os.pathsep.join(site_packages)
 
     try:
         result = await execution_service.execute(
@@ -252,6 +258,39 @@ def _is_pytest_argv(argv: tuple[str, ...]) -> bool:
         if value == "-m" and index + 1 < len(argv) and argv[index + 1] == "pytest":
             return True
     return False
+
+
+def _legacy_python_site_packages(argv: tuple[str, ...]) -> tuple[str, ...]:
+    """Locate site-packages for an absolute Python executable in a venv.
+
+    The macOS development launcher stages the interpreter to a private path
+    before ``execve``.  CPython can then lose the lexical ``pyvenv.cfg``
+    lookup, even though the approved executable came from a project venv.
+    Only the venv's existing, absolute site-packages directories are
+    projected into the compatibility environment; relative commands and
+    non-Python executables produce no derived path.
+    """
+    if not argv:
+        return ()
+    executable = Path(argv[0]).expanduser()
+    if not executable.is_absolute():
+        return ()
+    name = executable.name.lower()
+    if name != "python" and not name.startswith(("python3", "pypy")):
+        return ()
+    if len(executable.parents) < 2:
+        return ()
+    venv_root = executable.parents[1]
+    if not (venv_root / "pyvenv.cfg").is_file():
+        return ()
+    lib_root = venv_root / "lib"
+    if not lib_root.is_dir():
+        return ()
+    return tuple(
+        str(path.resolve())
+        for path in sorted(lib_root.glob("python*/site-packages"))
+        if path.is_dir()
+    )
 
 
 def _parse_result(command: str, output: str, exit_code: int) -> dict[str, Any]:
